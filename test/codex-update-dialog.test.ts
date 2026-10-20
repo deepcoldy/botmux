@@ -1,5 +1,10 @@
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { isObserveBackend } from '../src/adapters/backend/types.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CodexUpdateDialogGuard } from '../src/utils/codex-update-dialog.js';
+import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from '../src/utils/codex-update-dialog.js';
 
 describe('CodexUpdateDialogGuard', () => {
   it('detects the numbered Update now / Skip picker through ANSI', () => {
@@ -8,6 +13,33 @@ describe('CodexUpdateDialogGuard', () => {
 
     expect(guard.inspect(menu)).toBe('dismiss');
     expect(guard.inspect(menu)).toBe('suppress');
+  });
+
+  it('detects the Codex 0.154 to 0.155 three-choice picker', () => {
+    const guard = new CodexUpdateDialogGuard();
+    const menu = [
+      '✨ Update available! 0.154.0 -> 0.155.1',
+      '1. Update now (runs `npm install -g @openai/codex`)',
+      '2. Skip',
+      '3. Skip until next version',
+      'Press enter to continue',
+    ].join('\n');
+
+    expect(guard.inspect(menu)).toBe('dismiss');
+    expect(codexUpdateDialogSafeKeys(menu.replace('1. Update now', '› 1. Update now')))
+      .toEqual(['Down', 'Enter']);
+  });
+
+  it.each([
+    ['› 1. Update now\n  2. Skip\n  3. Skip until next version', ['Down', 'Enter']],
+    ['  1. Update now\n› 2. Skip\n  3. Skip until next version', ['Enter']],
+    ['  1. Update now\n  2. Skip\n› 3. Skip until next version', ['Enter']],
+  ] as const)('keeps retries on a non-upgrade selection: %s', (screen, keys) => {
+    expect(codexUpdateDialogSafeKeys(screen)).toEqual(keys);
+  });
+
+  it('waits for a rendered selection cursor instead of guessing', () => {
+    expect(codexUpdateDialogSafeKeys('1. Update now\n2. Skip')).toBeUndefined();
   });
 
   it('detects the newer Remind me later wording across PTY chunks', () => {
@@ -30,5 +62,33 @@ describe('CodexUpdateDialogGuard', () => {
     expect(guard.inspect(menu)).toBe('dismiss');
     guard.reset();
     expect(guard.inspect(menu)).toBe('dismiss');
+  });
+});
+
+it('uses an observer backend in the production tmux selector', () => {
+  const { backend } = selectSessionBackend({ sessionId: 'abcdef1234567890', backendType: 'tmux' });
+  expect(backend instanceof TmuxBackend).toBe(false);
+  expect(isObserveBackend(backend)).toBe(true);
+  expect('capturePaneViewport' in backend).toBe(false);
+});
+it.each([false, true, undefined])('does not count refused special keys (%s)', result => {
+  const start = workerSourceForDelivery.indexOf('  let delivered = false;', workerSourceForDelivery.indexOf('function dismissAidenCodexUpdateDialog('));
+  const end = workerSourceForDelivery.indexOf('  aidenCodexUpdateAttempts += 1;', start);
+  const code = workerSourceForDelivery.slice(start, end).replace('(backend as any)', 'backend');
+  const run = new Function('backend', 'keys', 'log', 'aidenCodexUpdateLastActionAt', code + 'return false;');
+  expect(run({ sendSpecialKeys: () => result }, ['Enter'], () => {}, 1)).toBe(result === false);
+});
+const workerSourceForDelivery = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+describe('Aiden resumed composer redraw', () => {
+  it('requests a redraw only for an empty resumed composer with the configured runtime footer', () => {
+    const screen = 'Previous answer\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /tmp/project · Task title\n';
+    expect(aidenCodexResumeNeedsRedraw(screen)).toBe(true);
+    for (const prefix of ['│ model: loading │\n', 'Resuming session...\n', 'Working (esc to interrupt)\n', 'Queued for capacity\n']) {
+      expect(aidenCodexResumeNeedsRedraw(prefix + screen)).toBe(false);
+    }
+    expect(aidenCodexResumeNeedsRedraw(screen.replace('Ask Codex to do anything', 'unsent draft'))).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw(screen + 'Press enter to continue')).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw('› Ask Codex to do anything\n  ? for shortcuts')).toBe(false);
   });
 });

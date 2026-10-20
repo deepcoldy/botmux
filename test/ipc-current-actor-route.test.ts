@@ -42,6 +42,8 @@ function activeSession(): any {
   };
 }
 
+const SCHEDULED_TURN_ID = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
 describe('POST /api/current-actor', () => {
   it.skipIf(process.platform !== 'linux')('returns only the daemon-resolved actor for a live CLI descendant', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(activeSession());
@@ -56,6 +58,10 @@ describe('POST /api/current-actor', () => {
       schema: 'botmux.current-actor.v2',
       status: 'verified',
       actor: { email: 'current.user@example.com' },
+      // The locators come from the daemon's own session state, not from the
+      // request body — the body above even carries a forged `callerOpenId`.
+      chatId: 'oc_chat',
+      turnId: 'om_turn',
     });
   });
 
@@ -75,5 +81,41 @@ describe('POST /api/current-actor', () => {
       status: 'blocked',
       error: 'current_actor_unverified',
     });
+  });
+
+  it.skipIf(process.platform !== 'linux')('binds an expected scheduled turn to daemon liveness', async () => {
+    const ds = activeSession();
+    ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;
+    ds.scheduledTurnCallers = new Map([[SCHEDULED_TURN_ID, {
+      requestUserOpenId: 'ou_current',
+      requestLarkAppId: 'cli_app',
+      source: 'schedule_creator',
+      taskId: 'abcdef12',
+    }]]);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+
+    const accepted = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 's-actor', expectedScheduledTurnId: SCHEDULED_TURN_ID,
+      }),
+    });
+    expect(accepted.status).toBe(200);
+    // On a scheduled turn `turnId` is the daemon's own id rather than a Lark
+    // message id. It is still what the document reports, because the consumer
+    // binds to "the turn the daemon just re-verified", not to "a message".
+    expect(await accepted.json()).toMatchObject({ turnId: SCHEDULED_TURN_ID });
+
+    ds.scheduledTurnCallers = undefined;
+    const rejected = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 's-actor', expectedScheduledTurnId: SCHEDULED_TURN_ID,
+      }),
+    });
+    expect(rejected.status).toBe(403);
   });
 });

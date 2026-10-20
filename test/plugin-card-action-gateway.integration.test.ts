@@ -100,6 +100,36 @@ const requestsFrom = (logPath: string): Array<Record<string, any>> => {
   return readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 };
 
+/**
+ * Wait until the fixture has logged `count` requests, then return them.
+ *
+ * The fixture appends its log line from `request.on('end')` — i.e. only after it
+ * has read the whole request body. When the gateway aborts on a short
+ * `timeoutMs`, the abort races that read: the request genuinely arrived and the
+ * assertion below is about arrival, but on a loaded CI runner the log line has
+ * not landed yet and `requestsFrom()` returns []. Polling for arrival keeps the
+ * assertion (the request WAS delivered despite the client giving up) while
+ * removing the dependency on which side of the race won.
+ *
+ * Throws on timeout so a genuinely undelivered request still fails the test
+ * rather than silently asserting on a short array.
+ */
+const waitForRequests = async (
+  logPath: string,
+  count: number,
+  timeoutMs = 5_000,
+): Promise<Array<Record<string, any>>> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const requests = requestsFrom(logPath);
+    if (requests.length >= count) return requests;
+    if (Date.now() >= deadline) {
+      throw new Error(`fixture logged ${requests.length} request(s), expected ${count} within ${timeoutMs}ms`);
+    }
+    await new Promise(resolveWait => setTimeout(resolveWait, 20));
+  }
+};
+
 afterEach(async () => {
   await Promise.all([...children].map(stopFixture));
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
@@ -180,7 +210,7 @@ describe('plugin card action gateway loopback integration', () => {
       await expect(gateway.dispatch({
         action: { value: { action: 'example.review.submit' } },
       }, 'cli_current')).resolves.toBeUndefined();
-      expect(requestsFrom(fixture.logPath)).toHaveLength(1);
+      expect(await waitForRequests(fixture.logPath, 1)).toHaveLength(1);
       await stopFixture(fixture.child);
     }
   });

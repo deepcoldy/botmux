@@ -3,37 +3,42 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { locateExecutable } from '../../utils/executable.js';
-import type { CliAdapter, CliId } from './types.js';
+import type { CliAdapter, CliId, StructuredBridgeSpec } from './types.js';
+import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
+export { cliSupportsConfigDir };
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
 import { createRelayAdapter } from './relay.js';
 import { createAidenAdapter } from './aiden.js';
-import { createCocoAdapter } from './coco.js';
-import { createCodexAdapter } from './codex.js';
+import { createCocoAdapter, cocoBridgeSpec } from './coco.js';
+import { createCodexAdapter, codexBridgeSpec } from './codex.js';
 import { createCodexAppAdapter } from './codex-app.js';
-import { createCursorAdapter } from './cursor.js';
+import { createCursorAdapter, cursorBridgeSpec } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createOpenCode2Adapter } from './opencode2.js';
-import { createAntigravityAdapter } from './antigravity.js';
+import { createMiMoCodeAdapter } from './mimocode.js';
+import { createAntigravityAdapter, antigravityBridgeSpec } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
 import { createMirAdapter } from './mir.js';
-import { createTraexAdapter } from './traex.js';
-import { createPiAdapter } from './pi.js';
+import { createTraexAdapter, traexBridgeSpec } from './traex.js';
+import { createPiAdapter, piBridgeSpec } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
-import { createOhMyPiAdapter } from './oh-my-pi.js';
-import { createEbsdAdapter } from './ebsd.js';
+import { createOhMyPiAdapter, ompBridgeSpec } from './oh-my-pi.js';
+import { createEbsdAdapter, ebsdBridgeSpec } from './ebsd.js';
 import { createKimiAdapter } from './kimi.js';
-import { createGrokAdapter } from './grok.js';
+import { createGrokAdapter, grokBridgeSpec } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
 import { createReasonixAdapter } from './reasonix.js';
 import { createDshAdapter } from './dsh.js';
 import { createDshTuiAdapter } from './dsh-tui.js';
 import { createMojoAdapter } from './mojo.js';
+import { createMinimaxAdapter } from './minimax.js';
+import { createRemoteRunnerAdapter } from './remote-runner.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -56,6 +61,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   genius: 'genius',
   opencode: 'opencode',
   opencode2: 'opencode2',
+  mimocode: 'mimo',
   antigravity: 'agy',
   mtr: 'mtr',
   hermes: 'hermes',
@@ -86,6 +92,9 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // Declaring it lets `botmux setup` fail fast on a missing install instead of
   // letting the first IM message die with ENOENT.
   mojo: 'mojo',
+  // MiniMax Code — native exec stream-json, wrapped by minimax-runner.
+  minimax: 'mcode',
+  'remote-runner': 'botmux-remote-runner',
 };
 
 /**
@@ -214,22 +223,35 @@ export function locateOnPath(cmd: string): string | null {
 
 const adapterCache = new Map<string, CliAdapter>();
 
+/** Per-bot launch options that change WHERE an adapter's CLI keeps its data. */
+export interface CliAdapterOptions {
+  /**
+   * CLI config profile dir (`cliConfigDir`). Claude Code only: launched with
+   * `CLAUDE_CONFIG_DIR=<dir>`, and the adapter's data root, hook target,
+   * `.claude.json` and MCP gateway entry all follow it. Ignored for CLIs that do
+   * not support it (see `cliSupportsConfigDir`).
+   */
+  readonly configDir?: string;
+}
+
+
 /** Async adapter factory (uses dynamic import for lazy loading in daemon process). */
-export async function createCliAdapter(id: CliId, pathOverride?: string): Promise<CliAdapter> {
+export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): Promise<CliAdapter> {
   const normalized = id.toLowerCase() as CliId;
-  const key = `${normalized}:${pathOverride ?? ''}`;
+  const configDir = cliSupportsConfigDir(normalized) ? opts?.configDir : undefined;
+  const key = `${normalized}:${pathOverride ?? ''}:${configDir ?? ''}`;
   if (adapterCache.has(key)) return adapterCache.get(key)!;
-  const adapter = createCliAdapterSync(normalized, pathOverride);
+  const adapter = createCliAdapterSync(normalized, pathOverride, { configDir });
   adapterCache.set(key, adapter);
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter };
 
 /** Synchronous version for use in worker process. */
-export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
+export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {
   switch (id.toLowerCase() as CliId) {
-    case 'claude-code': return createClaudeCodeAdapter(pathOverride);
+    case 'claude-code': return createClaudeCodeAdapter(pathOverride, opts?.configDir || undefined);
     case 'seed': return createSeedAdapter(pathOverride);
     case 'relay': return createRelayAdapter(pathOverride);
     case 'aiden': return createAidenAdapter(pathOverride);
@@ -241,6 +263,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'opencode2': return createOpenCode2Adapter(pathOverride);
+    case 'mimocode': return createMiMoCodeAdapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
     case 'hermes': return createHermesAdapter(pathOverride);
@@ -259,6 +282,34 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'dsh': return createDshAdapter(pathOverride);
     case 'dsh-tui': return createDshTuiAdapter(pathOverride);
     case 'mojo': return createMojoAdapter(pathOverride);
+    case 'minimax': return createMinimaxAdapter(pathOverride);
+    case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
+  }
+}
+
+/**
+ * Structured-transcript bridge capability of a CLI, WITHOUT constructing its
+ * adapter. Some factories do real work up front (`createPiAdapter` /
+ * `createOhMyPiAdapter` shell out through `resolveCommand`), and the worker asks
+ * on every bridge tick, so this is a plain static lookup — the same specs that
+ * each adapter exposes as `CliAdapter.bridgeSpec`
+ * (`test/structured-bridge-spec.test.ts` pins the two together).
+ *
+ * hermes / mtr deliberately have none: their transcript is a SQLite store with
+ * dedicated attach and ingest paths in the worker.
+ */
+export function bridgeSpecFor(cliId: string | undefined): StructuredBridgeSpec | undefined {
+  switch (cliId) {
+    case 'codex': return codexBridgeSpec;
+    case 'traex': return traexBridgeSpec;
+    case 'coco': return cocoBridgeSpec;
+    case 'cursor': return cursorBridgeSpec;
+    case 'antigravity': return antigravityBridgeSpec;
+    case 'pi': return piBridgeSpec;
+    case 'oh-my-pi': return ompBridgeSpec;
+    case 'ebsd': return ebsdBridgeSpec;
+    case 'grok': return grokBridgeSpec;
+    default: return undefined;
   }
 }

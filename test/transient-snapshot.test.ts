@@ -56,6 +56,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { snapshotToPng, snapshotToText, tryCapturePipeSnapshot } from '../src/utils/transient-snapshot.js';
 import { captureToPng } from '../src/utils/screenshot-renderer.js';
+import { bufferSpawnResult } from './helpers/spawn-result.js';
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
@@ -70,7 +71,7 @@ function spawnedBackend() {
 beforeEach(() => {
   mockedExecSync.mockReset();
   mockedSpawnSync.mockReset();
-  mockedSpawnSync.mockReturnValue({ status: 0 } as any);
+  mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedCaptureToPng.mockClear();
 });
@@ -167,6 +168,8 @@ describe('snapshotToPng', () => {
     // Transient renderer must be sized off the live pane, not the fallback.
     const opts = mockedCaptureToPng.mock.calls[0][1];
     expect(opts).toEqual({ cols: 200, rows: 60, startY: 0 });
+    // Callers key their dedup on this grid: same ANSI, new canvas → new frame.
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });
 
@@ -187,5 +190,6 @@ describe('snapshotToText', () => {
     expect(result).not.toBeNull();
     expect(result!.content).toContain('line one');
     expect(result!.content).toContain('line two');
+    expect(result).toMatchObject({ cols: 200, rows: 60 });
   });
 });

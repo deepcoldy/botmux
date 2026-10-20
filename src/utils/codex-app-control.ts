@@ -16,7 +16,6 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
-  existsSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -32,6 +31,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, win32 } from 'node:path';
 import type { BackendType } from '../adapters/backend/types.js';
+import { procStatStartTime } from './proc-stat.js';
 import type { ScreenStatus } from '../types.js';
 
 /**
@@ -43,6 +43,11 @@ import type { ScreenStatus } from '../types.js';
 export const CODEX_APP_CONTROL_BOOTSTRAP_ENV = 'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP';
 
 export const CODEX_APP_CONTROL_LINE_MAX_BYTES = 4_096;
+/**
+ * Maximum JSON-serialized payload for a cosmetic CoT marker. This leaves
+ * headroom in the control line for the signed marker envelope.
+ */
+export const CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES = 3_000;
 export const CODEX_APP_CONTROL_FINAL_MAX_BYTES = 1_048_576;
 export const CODEX_APP_CONTROL_FINAL_CHUNK_BYTES = 1_536;
 /** Keep control bootstrap/proof alive for the worker's existing cold-start cap. */
@@ -755,12 +760,7 @@ export interface CodexAppPosixOwnerLeaseOptions {
   onReaperRecordPublished?: (directory: string, reaperRecordPath: string) => void | Promise<void>;
 }
 
-function linuxProcessStartToken(raw: string): string | undefined {
-  const closeParen = raw.lastIndexOf(')');
-  if (closeParen < 0) return undefined;
-  const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-  return fields[19] || undefined;
-}
+const linuxProcessStartToken = procStatStartTime;
 
 export function codexAppPosixProcessProbeEnv(
   base: NodeJS.ProcessEnv = process.env,

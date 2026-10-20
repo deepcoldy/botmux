@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { z } from 'zod';
 
 // ─── Shared primitives ──────────────────────────────────────────────────────
@@ -103,12 +104,17 @@ export const BackoffPolicySchema = z.object({
  * with partial registry data still serializes cleanly.
  */
 export const BotSnapshotSchema = z.object({
+  cliInstanceBinding: z.object({ version: z.literal(1), source: z.literal('default'), instanceId: z.string(), cliId: z.literal('codex'), codexHome: z.string(), authMode: z.literal('isolated') }).optional(),
+  cliRuntime: z.record(z.unknown()).optional(),
   larkAppId: z.string().optional(),
   cliId: z.string().optional(),
   displayName: z.string().optional(),
   workingDir: z.string().optional(),
   cliPathOverride: z.string().optional(),
-  sandbox: z.boolean().optional(),
+  sandbox: z.union([z.boolean(), z.enum(['off', 'oncall', 'scratch'])]).optional(),
+  scratchStorage: z.enum(['tmpfs', 'disk']).optional(),
+  scratchTmpfsSizeMb: z.number().positive().optional(),
+  scratchDenyPaths: z.array(z.string()).optional(),
   // New three-tier fs-policy lists (deny-by-default). Frozen alongside the
   // legacy fields so a historical run's sandbox policy matches what a normal
   // session would build — omitting it would silently drop the readWrite tier +
@@ -121,6 +127,12 @@ export const BotSnapshotSchema = z.object({
   sandboxHidePaths: z.array(z.string()).optional(),
   sandboxReadonlyPaths: z.array(z.string()).optional(),
   sandboxNetwork: z.boolean().optional(),
+  sandboxNetworkPolicy: z.unknown().transform((value, ctx) => {
+    if (value === undefined) return undefined;
+    try { return parseSandboxNetworkPolicy(value); } catch (error) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: (error as Error).message }); return z.NEVER;
+    }
+  }).optional(),
 });
 export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
 

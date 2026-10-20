@@ -100,6 +100,7 @@ describe('dsh worker final_output integration', () => {
       env: {
         ...process.env,
         HOME: root,
+        DSH_HOME: join(root, '.dsh'),
         NODE_ENV: 'test',
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
         BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
@@ -179,6 +180,7 @@ describe('dsh worker final_output integration', () => {
       env: {
         ...process.env,
         HOME: root,
+        DSH_HOME: join(root, '.dsh'),
         NODE_ENV: 'test',
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
         BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),

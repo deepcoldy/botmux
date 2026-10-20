@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { textSpawnResult } from './helpers/spawn-result.js';
 
 // A synchronous `require` inside the factory, not `await vi.importActual(...)`:
 // bun's `vi` shim has no `importActual`, and a fill that resolved without actually
@@ -65,7 +66,7 @@ describe('hermes transcript reader', () => {
 
   it('converts Hermes rows into bridge events and advances by row id', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({
+    spawnSyncMock.mockReturnValue(textSpawnResult({
       status: 0,
       stdout: JSON.stringify([
         { id: 2, session_id: ' h1 ', role: 'user', content: 'hello', timestamp: 100 },
@@ -74,7 +75,7 @@ describe('hermes transcript reader', () => {
         { id: 5, session_id: 'h1', role: 'assistant', content: '', timestamp: 103, finish_reason: 'stop' },
       ]),
       stderr: '',
-    } as any);
+    }));
     const { drainHermesStateDb } = await import('../src/services/hermes-transcript.js');
 
     expect(drainHermesStateDb(1, '/tmp/state.db')).toEqual({
@@ -88,7 +89,7 @@ describe('hermes transcript reader', () => {
 
   it('reads the current max row id as offset', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({ status: 0, stdout: '42\n', stderr: '' } as any);
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 0, stdout: '42\n' }));
     const { currentHermesStateOffset } = await import('../src/services/hermes-transcript.js');
 
     expect(currentHermesStateOffset('/tmp/state.db')).toBe(42);
@@ -96,7 +97,7 @@ describe('hermes transcript reader', () => {
 
   it('checks whether a Hermes native session exists', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({ status: 0, stdout: '1\n', stderr: '' } as any);
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 0, stdout: '1\n' }));
     const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
 
     expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/state.db')).toBe(true);
@@ -105,7 +106,7 @@ describe('hermes transcript reader', () => {
 
   it('returns false when Hermes session is provably absent', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({ status: 0, stdout: '0\n', stderr: '' } as any);
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 0, stdout: '0\n' }));
     const { hermesSessionExists } = await import('../src/services/hermes-transcript.js');
 
     expect(hermesSessionExists('missing-session', '/tmp/state.db')).toBe(false);
@@ -119,7 +120,7 @@ describe('hermes transcript reader', () => {
     expect(spawnSyncMock).not.toHaveBeenCalled();
 
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({ status: 1, stdout: '', stderr: 'broken' } as any);
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 1, stderr: 'broken' }));
     expect(hermesSessionExists('20260716_163643_7782fd', '/tmp/state.db')).toBeUndefined();
   });
 });

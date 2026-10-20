@@ -1,5 +1,19 @@
 import type { CliId } from '../adapters/cli/types.js';
 
+/** Botmux-managed Codex service tiers. Missing on a Bot means inherit Codex. */
+export type CodexServiceTier = 'default' | 'priority' | 'ultrafast';
+
+/** Persisted per-session choice. Legacy sessions without this field inherit. */
+export type CodexServiceTierPreference = CodexServiceTier | 'inherit';
+
+export function isCodexServiceTier(value: unknown): value is CodexServiceTier {
+  return value === 'default' || value === 'priority' || value === 'ultrafast';
+}
+
+export function isCodexServiceTierCliId(cliId: string | undefined): boolean {
+  return cliId === 'codex' || cliId === 'codex-app';
+}
+
 /** Executor-confirmed settings copied from Codex's rollout. */
 export interface CodexThreadSettings {
   model?: string;

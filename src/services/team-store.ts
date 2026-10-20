@@ -17,9 +17,11 @@
  *
  * Storage: `{dataDir}/teams.json`, atomic writes (unique tmp + rename).
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readJsonFileSoft } from '../utils/json-file.js';
 import type { FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import { normalizeFeedbackPolicyLayer } from './feedback-policy-resolver.js';
 
@@ -60,21 +62,18 @@ function filePath(dataDir: string): string {
 }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return { version: 1, teams: [] };
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && Array.isArray(parsed.teams)) return { version: 1, teams: parsed.teams };
-  } catch { /* corrupt — fall through */ }
-  return { version: 1, teams: [] };
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({ version: 1, teams: [] }),
+    validate: (v): v is FileShape => !!v && Array.isArray((v as { teams?: unknown }).teams),
+    label: 'team-store',
+  });
+  return { version: 1, teams: parsed.teams };
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** All teams (empty array if none materialized yet). */

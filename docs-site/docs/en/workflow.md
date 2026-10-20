@@ -1,15 +1,10 @@
 # Workflow (Experimental)
 
-botmux has two workflow engines that share the `botmux workflow` command prefix but serve different purposes:
+One fuzzy goal → auto-interrogate, orchestrate a DAG, execute concurrently; a flow that works can be saved as a **Saved Workflow** and reused. Runs are stored in `~/.botmux/v3-runs`; their state lives in the **Dashboard's v3 view** (every Feishu card carries a "Web details" link straight to it).
 
-| Engine | What it is | Entry point | Runs stored in |
-|------|--------|------|----------|
-| **v3 ad-hoc workflow** (LLM-driven, recommended) | A one-line fuzzy goal → auto-interrogate, orchestrate a DAG, execute concurrently | Feishu `/workflow <goal>` | `~/.botmux/v3-runs` |
-| **v0.2 template workflow** (schema-driven) | A hand-written / generated reusable `workflow.json`, run repeatedly | `/template run <id>` | `~/.botmux/workflow-runs` |
+> ⚠️ Workflow is **off by default**. Turn on the "Workflow" switch on the Dashboard settings page, or set `BOTMUX_WORKFLOW_ENABLED=true`. While it is off, ad-hoc orchestration and running/saving Saved Workflows are refused, but in-flight runs can still be managed with `botmux workflow cancel / retry / grant`.
 
-> ⚠️ The two engines' runs are **not interchangeable**: `botmux workflow ls / tail / show / resume / cancel` only see v0.2 template runs; the state of a v3 ad-hoc workflow lives in the **Dashboard's v3 view** (every Feishu card carries a "Web details" link straight to it).
-
-## Ad-hoc workflow (v3, recommended)
+## Ad-hoc workflow
 
 ### How to use it
 
@@ -35,7 +30,7 @@ Once nodes start, these card types may pop in the topic for you to handle:
 
 ### What a workflow can express (node capabilities)
 
-The architect uses these structures when orchestrating (or you declare them in a v0.2 template), so the flow you see at Gate-2 may not be a straight line:
+The architect uses these structures when orchestrating, so the flow you see at Gate-2 may not be a straight line:
 
 - **Sequential dependencies + concurrency**: nodes with no dependency run in parallel.
 - **Conditional branching**: after a node produces a structured result, downstream edges activate by that result — only the matched branch runs; un-taken branches are skipped at zero cost; multiple upstreams can join by "all / any / quorum".
@@ -51,6 +46,7 @@ Besides tapping cards, you can drive it by command (`runId` is the key throughou
 | `botmux workflow start <runId>` | After approve-dag, hand to the daemon to run (with Feishu approval cards) |
 | `botmux workflow retry <runId> [--node <id>]` | Re-run a blocked node |
 | `botmux workflow grant <runId> [--loop <id>]` | Grant one more round to a loop that ran out of iterations |
+| `botmux workflow cancel <runId> [--reason <text>]` | Cancel an in-flight run |
 
 Changed your mind: requirement → `botmux workflow revise-spec <runId>` (steps back to re-clarify, old DAG discarded); flow only → `botmux workflow revise-dag <runId>` (re-orchestrate only).
 
@@ -75,34 +71,27 @@ Under the hood an ad-hoc workflow is a state machine driven by a series of `botm
 | `botmux workflow approve-dag <runId>` | Gate-2 passed → `dag_approved` |
 | `botmux workflow start <runId>` | Hand to the daemon to drive execution |
 
-## Reusable templates (v0.2)
+## Save and reuse (Saved Workflow)
 
-For a fixed flow you run repeatedly, save it as a template and reuse it:
+Once an ad-hoc workflow works, save it as a Saved Workflow and rerun it with different params:
 
-- Use the `botmux-workflow-create` skill to translate your description into `~/.botmux/workflows/<id>.workflow.json` (an **absolute, global path** — not `./workflows/` under the current directory, since the CLI agent and the daemon don't necessarily share a cwd).
-- `botmux workflow validate <path>` validates the definition file.
-- Run a template: Feishu `/template run <id> key=value` (real execution on the daemon), or CLI `botmux workflow run <id> --param key=value` (**offline stub — no real worker, end-to-end smoke test only**).
+| Entry point | What it does |
+|------|------|
+| Feishu `/workflow save last [name]` / CLI `botmux workflow save [last\|runId] [name]` | Save the latest (or a given runId) run as a Saved Workflow |
+| Feishu `/workflow run <name> [key=value ...]` / CLI `botmux workflow run <name\|workflowId> [--param key=value ...]` | Run a Saved Workflow |
+| Feishu `/workflow list` / CLI `botmux workflow list [--json]` | List saved workflows |
+| Feishu `/workflow show <name>` / CLI `botmux workflow show <name\|workflowId>` | Show a definition |
 
-Params: on the CLI use `--param key=value` for scalars and `--param-json key=<json>` for object / array values (e.g. `--param-json tags='["urgent","cn"]'`); IM `/template run` doesn't yet support object / array params. Params are for **business variables** (chat id, mode switches, thresholds) — don't pass a whole task instruction through params; a node's task definition should live in the `workflow.json`.
+Params: on the CLI pass scalars with `--param key=value` and objects / arrays with `--param-json key=<json>` (e.g. `--param-json tags='["urgent","cn"]'`). Params are for **business variables** (chat id, mode switches, thresholds); don't pass a whole task instruction through params — a node's task definition belongs in the workflow itself.
 
-### Ops & debugging commands for template runs
+## Legacy v2 templates (retired)
 
-These commands operate on **v0.2 template runs** (read/write `~/.botmux/workflow-runs`, overridable via `BOTMUX_WORKFLOW_RUNS_DIR`), **don't require the daemon to be online**, and **can't see v3 ad-hoc workflow runs**:
+The v2 template runtime is retired: `/template run`, `botmux workflow ls / tail / resume / validate` and friends now fail with an error. If you still have old `~/.botmux/workflows/*.workflow.json` definitions or historical runs, use the offline tools:
 
 | Command | Description |
 |------|------|
-| `botmux workflow ls [--all] [--status ...] [--wide] [--json]` | List template runs; non-terminal only by default |
-| `botmux workflow tail <runId> [--from N] [--follow] [--json]` | Print a compact event table; `--follow` keeps tailing |
-| `botmux workflow show <runId>` | Replay events and print a Snapshot summary JSON |
-| `botmux workflow resume <runId>` | Cold-recover from the on-disk runDir (CLI does not spawn new workers) |
-| `botmux workflow cancel <runId> [--reason <text>]` | Write cancelRequested and drive cancel recovery |
-
-```bash
-botmux workflow ls                         # See which template runs are in flight
-botmux workflow tail wf-abc-123 --follow   # Tail a run's event stream
-botmux workflow resume wf-abc-123          # Run stuck / restarted → cold recover
-botmux workflow cancel wf-abc-123 --reason 'external dependency timed out'
-```
+| `botmux template migrate-v3 [workflowId\|path ...] [--all]` | Dry-run by default; `--commit` converts eligible v2 definitions into v3 Saved Workflows |
+| `botmux template archive-runs [--commit] [--verify <archiveId\|path>]` | Scan, archive or verify terminal v2 runs; never executes a v2 workflow and never deletes history directly |
 
 ## Dev / self-test: `botmux v3 run`
 

@@ -30,6 +30,14 @@ function pluginActionFor(value: Record<string, unknown>): string | undefined {
   return typeof action === 'string' && action.trim() ? action.trim() : undefined;
 }
 
+function hasAllowedCallbackBehavior(element: Record<string, unknown>, policy?: InteractiveCardCallbackPolicy): boolean {
+  return !!policy && Array.isArray(element.behaviors) && element.behaviors.some(behavior => {
+    if (!isRecord(behavior) || behavior.type !== 'callback') return false;
+    const action = pluginActionFor(behavior);
+    return !!action && policy.allowsAction(action);
+  });
+}
+
 function hasAllowedFormSubmit(value: unknown, policy: InteractiveCardCallbackPolicy): boolean {
   if (Array.isArray(value)) return value.some(child => hasAllowedFormSubmit(child, policy));
   if (!isRecord(value)) return false;
@@ -83,7 +91,11 @@ export function findDisallowedCardCallback(
     }
     if (value.tag === 'button') {
       if ('value' in value && value.value !== undefined && !allowedPluginAction) return `${path}.value`;
-      if (!allowedPluginAction && !isOpenUrlButton(value)) return `${path}.tag(button)`;
+      // Card 2.0 stores callbacks in behaviors, not on the button itself.
+      // Admit the container only; recursion still validates EVERY behavior.
+      if (!allowedPluginAction && !isOpenUrlButton(value) && !hasAllowedCallbackBehavior(value, policy)) {
+        return `${path}.tag(button)`;
+      }
     }
   }
   if (action && !allowedPluginAction) return `${path}.value.action`;

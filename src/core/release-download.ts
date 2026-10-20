@@ -2,10 +2,8 @@
  * Shared release-asset download: GET a URL through an optional proxy, following
  * redirects, and resolve with the 200 response stream.
  *
- * Extracted from `dashboard/hd2d-assets.ts` so the binary self-update
- * (`core/binary-self-update.ts`) reuses exactly this transport instead of
- * growing a second copy. Both callers fetch GitHub Release assets, and both need
- * the same three things the naive version gets wrong:
+ * Used by the binary self-update (`core/binary-self-update.ts`) to fetch GitHub
+ * Release assets. It needs three things the naive `fetch` version gets wrong:
  *
  *  · `node:http`/`node:https` rather than `fetch`, so an explicitly configured
  *    proxy is actually honoured — undici ignores the proxy env vars, and Bun's
@@ -38,7 +36,7 @@ export function resolveHttpProxy(): string | undefined {
  * optionally tunnelling through an HTTP proxy.
  *
  * @param userAgent sent as `user-agent`; callers pass their own tag so server-side
- *                  logs can tell the game assets apart from a self-update.
+ *                  logs can tell which feature issued the download.
  */
 export function getReleaseStream(
   rawUrl: string,

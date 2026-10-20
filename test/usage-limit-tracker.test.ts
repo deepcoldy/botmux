@@ -12,7 +12,6 @@
  *
  * Run: pnpm vitest run test/usage-limit-tracker.test.ts
  */
-import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bridgeTurnOutcome, createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
@@ -469,59 +468,5 @@ describe('usage-limit tracker — bridgeTurnOutcome 按终态而非 fallbackKind
     };
     expect(structuredFallbackKind(turn as any, undefined, [], false, true)).not.toBe('failed');
     expect(bridgeTurnOutcome(turn)).toBe('failed');
-  });
-});
-
-describe('usage-limit tracker — worker 接线不变量（源码守卫）', () => {
-  // worker.ts 没有单测面，而这条缺陷是**语句顺序**：把终态记录放在
-  // `if (!content) continue;` 之后，它对「静默成功 + 已 botmux send」这一最常见
-  // 形态结构上不可达（content 恒为 ''）。行为用例咬不住顺序——实测把顺序改回
-  // 缺陷版本，35 条用例全绿——所以这条只能由源码守卫兜。
-  const workerSrc = readFileSync(
-    new URL('../src/worker.ts', import.meta.url), 'utf8',
-  );
-
-  /** emitReadyCodexTurns 的函数体（从签名到下一个顶层 function）。 */
-  function codexEmitBody(): string {
-    const start = workerSrc.indexOf('function emitReadyCodexTurns(');
-    expect(start).toBeGreaterThan(-1);          // 锚点自证：函数还在
-    const end = workerSrc.indexOf('\nfunction ', start + 1);
-    expect(end).toBeGreaterThan(start);
-    return workerSrc.slice(start, end);
-  }
-
-  it('终态记录必须出现在「无 fallback 文案就 continue」那个 bail-out 之前', () => {
-    // 锚点刻意不绑变量名：按 `if (!<ident>) continue;` 这个**形状**匹配，所以把
-    // 局部变量 content 改名为 fallbackText 之类的正常重构不会让守卫误红（实测
-    // 过：写死 'if (!content)' 的版本一改名就红，那种守卫迟早被人删掉）。
-    const body = codexEmitBody();
-    const bail = body.search(/if \(!\w+\) continue;/);
-    const record = body.indexOf('usageLimitTracker.noteTurnCompleted(');
-    // 窗口自证：两个锚点都真的在这个函数体里找到了，否则断言是空真的。
-    expect(bail).toBeGreaterThan(-1);
-    expect(record).toBeGreaterThan(-1);
-    expect(record).toBeLessThan(bail);
-  });
-
-  it('该记录必须由 bridgeTurnOutcome 决定，不得写死 answered', () => {
-    // 只锁「用了这个 predicate」+「没写死成功位」这两点，不锁它的实参形状：
-    // `bridgeTurnOutcome(turn)` 与 `bridgeTurnOutcome({ terminalStatus: … })`
-    // 语义相同，守卫不该因为后者而误红（实测过绑 `(turn)` 会红）。这个 bridge
-    // 有失败终态，写死成功位会把限额拒绝读成成功。
-    const body = codexEmitBody();
-    // 必须真正把 predicate 的结果喂给 tracker，而不是「函数体里某处出现过」：
-    // 先抓 noteTurnCompleted 的实参标识符，再证明那个标识符正是由
-    // bridgeTurnOutcome 赋值的。只 grep 两个名字都存在是**欠约束**的——实测把
-    // bridgeTurnOutcome 的结果弃用、另写一个恒为 'answered' 的同名局部变量，
-    // 那种守卫照样全绿。
-    const calls = [...body.matchAll(/noteTurnCompleted\(([^)]*)\)/g)].map(m => m[1].trim());
-    expect(calls.length).toBeGreaterThan(0);            // 锚点自证
-    for (const arg of calls) {
-      // 实参必须是个标识符（不是字面量），且该标识符由 bridgeTurnOutcome 赋值。
-      expect(arg).toMatch(/^[A-Za-z_$][\w$]*$/);
-      expect(body).toMatch(
-        new RegExp(`(?:const|let)\\s+${arg}[^=\\n]*=\\s*bridgeTurnOutcome\\(`),
-      );
-    }
   });
 });

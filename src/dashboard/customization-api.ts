@@ -35,7 +35,7 @@ import {
   rollbackToSnapshot,
   listSnapshots,
 } from '../services/customization-store.js';
-import { PROMPT_FRAGMENTS, validateFragmentOverride } from '../skills/prompt-fragments.js';
+import { PROMPT_FRAGMENTS, PROMPT_STAGES, BLOCK_META, validateFragmentOverride } from '../skills/prompt-fragments.js';
 import { BUILTIN_SKILLS } from '../skills/definitions.js';
 import { frontmatterDescription } from '../skills/injection-mode.js';
 import {
@@ -74,12 +74,15 @@ function buildSnapshot() {
     const out: any = {
       key: f.key,
       block: f.block,
+      stage: f.stage,
       label: f.label,
       kind: f.kind,
       locales: perLocale,
     };
+    if (f.stages && f.stages.length > 0) out.stages = f.stages;
     if (f.placeholders) out.placeholders = f.placeholders;
     if (f.gate) out.gate = f.gate;
+    if (f.gateLabel) out.gateLabel = f.gateLabel;
     if (f.kind === 'conditional') out.conditionForced = state.conditionalLines?.[f.key] ?? null;
     return out;
   });
@@ -97,6 +100,8 @@ function buildSnapshot() {
 
   return {
     enabled: customizationEnabled(),
+    stages: PROMPT_STAGES,
+    blocks: Object.entries(BLOCK_META).map(([id, meta]) => ({ id, ...meta })),
     fragments,
     skills,
     history: listSnapshots(),
@@ -111,10 +116,11 @@ export async function handleCustomizationApi(
 ): Promise<boolean> {
   const p = url.pathname;
   if (!p.startsWith('/api/customization')) return false;
+  const snapshot = () => buildSnapshot();
 
   try {
     if (req.method === 'GET' && p === '/api/customization') {
-      jsonRes(res, 200, buildSnapshot());
+      jsonRes(res, 200, snapshot());
       return true;
     }
 
@@ -133,7 +139,7 @@ export async function handleCustomizationApi(
       const body = await readJsonBody(req);
       if (typeof body.enabled !== 'boolean') { jsonRes(res, 400, { ok: false, error: 'enabled_must_be_boolean' }); return true; }
       setCustomizationEnabled(body.enabled);
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
@@ -146,7 +152,7 @@ export async function handleCustomizationApi(
         if (vErr) { jsonRes(res, 400, { ok: false, error: vErr }); return true; }
       }
       setPromptOverride(body.locale, body.key, value);
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
@@ -155,7 +161,7 @@ export async function handleCustomizationApi(
       if (typeof body.key !== 'string') { jsonRes(res, 400, { ok: false, error: 'bad_key' }); return true; }
       const value: boolean | null = body.value === null || body.value === undefined ? null : Boolean(body.value);
       setConditionalLine(body.key, value);
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
@@ -174,13 +180,13 @@ export async function handleCustomizationApi(
       } catch (e: any) {
         jsonRes(res, 400, { ok: false, error: e?.message ?? 'skill_write_failed' }); return true;
       }
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
     if (req.method === 'POST' && p === '/api/customization/reset-all') {
       resetAllToFactory();
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
@@ -192,7 +198,7 @@ export async function handleCustomizationApi(
       } catch (e: any) {
         jsonRes(res, 400, { ok: false, error: e?.message ?? 'rollback_failed' }); return true;
       }
-      jsonRes(res, 200, { ok: true, snapshot: buildSnapshot() });
+      jsonRes(res, 200, { ok: true, snapshot: snapshot() });
       return true;
     }
 
@@ -205,7 +211,7 @@ export async function handleCustomizationApi(
       const preview = previewBundleImport(bundle);
       if (body.apply === true) {
         applyBundle(bundle, `import bundle${bundle.name ? `: ${bundle.name}` : ''}`);
-        jsonRes(res, 200, { ok: true, applied: true, preview, snapshot: buildSnapshot() });
+        jsonRes(res, 200, { ok: true, applied: true, preview, snapshot: snapshot() });
         return true;
       }
       jsonRes(res, 200, { ok: true, applied: false, preview });

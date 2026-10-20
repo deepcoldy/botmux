@@ -12,7 +12,15 @@ bun run daemon:logs          # 查看日志
 
 - 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
 
-**包管理器是 bun**（`packageManager: bun@1.4.0`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
+（`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
+PATH 解析，那不是写它的环境：2026-09-08 某次 restart 的 PATH 把 `/usr/bin` 排在 fnm shim
+之前 ⟹ 解析成 v18.20.4 ⟹ **55 个 bot daemon 全部启动即崩**，飞书里所有话题看似全丢（57 个
+SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照常打印「✅ daemon 已重启」**
+—— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
+现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
+
+**包管理器是 bun**（`packageManager: bun@1.4.3`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -31,7 +39,7 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.0**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+发版编译用的 Bun 版本**钉在 1.4.3**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
@@ -99,8 +107,20 @@ bun run switch:here && bun run daemon:restart
 - `skills/` — 开箱即用的 Skill 定义 + installer
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
 - `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`
+- `core/command-schema.ts` / `command-router.ts` / `session-phase.ts` / `cli-idle-wait.ts` — 斜杠命令的**分类层**（见下节「命令路由」）
 - `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
 - `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
+
+## 命令路由（改斜杠命令判定必读）
+
+daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）对斜杠命令只做一次
+`classifySlash(...)`（`src/core/command-router.ts`，纯函数），之后按决策执行；设计与决策记录见
+`docs/design/2026-09-11-command-router.md`（§15 是逐期的执行记录）。改动时守住三件事：
+
+- **命令注册只在 `src/core/command-schema.ts`**：名字/别名、会话政策（无会话时预建 / 不建 / 只对已有会话）、两条入口的前置特判位置、多行豁免、help 键。`DAEMON_COMMANDS` 等五个集合都从这张表推导，别再手写集合或在入口里加 `if (cmd === '/xxx')`。加命令 = 加一行 + `handleCommand` 加 case，`test/command-schema.test.ts` 会红到两边对齐。
+- **路由判定的任何变化都会让 `test/command-router-oracle-diff.test.ts` 变红**：它把 `test/legacy-oracle/` 里冻结的老判定（零 src import）与新路由器在 ≈269 万组输入上逐字差分。红了先判断是回归还是有意变化；有意变化要同时登记到差分测试的 `INTENTIONAL` 名单和设计文档 §9 的有意变化表，别去改 oracle。
+- **话题指令头也只在 `src/core/topic-header.ts` 解析**：`/t` `/topic` 与生命周期别名 `/th` `/tw`（= `/t here|worktree`）、`/repo wt <目标> [分支]` 都由它给出 `TopicHeader`，入口不做正则预判；相斥组合（生命周期变体 + `/repo`）由 `topic-spec.ts` 拒绝，不做静默优先级。
+- **会话相位**（`session-phase.ts`）由现有旗标推导，`ds.cliReady` / `cliReadyGeneration` 只由 worker 的 `prompt_ready` 置位、不由 `ready` 清零；runtime 级联（`cli-idle-wait.ts` + daemon 的 `runPassthroughCascade`）只在 PTY 家族后端、非 adopt 会话上跑。
 
 ## 飞书 owner 身份边界（setup/onboarding 改动必读）
 
@@ -134,4 +154,4 @@ bun run switch:here && bun run daemon:restart
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）
 - 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`npm i -g botmux@canary`
+- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）

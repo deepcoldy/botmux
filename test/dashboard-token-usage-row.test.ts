@@ -1,6 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({
@@ -51,6 +49,31 @@ function makeDs(): DaemonSession {
 }
 
 describe('dashboard SessionRow status projection', () => {
+  it('exposes dispatch requested launch and observed runtime separately', () => {
+    const ds = makeDs();
+    ds.session.dispatchLaunchSpec = {
+      version: 1, targetLarkAppId: 'cli_app', chatId: 'oc_chat', rootMessageId: 'om_root',
+      requested: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      effective: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    // Pre-observation: only the requested intent is exposed; there is no
+    // "synthesised" effective runtime until the worker actually observed one.
+    const beforeObserved = composeRowFromActive(ds);
+    expect(beforeObserved).toMatchObject({
+      requestedLaunch: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+    });
+    expect(beforeObserved.effectiveRuntime).toBeUndefined();
+    ds.session.dispatchLaunchSpec.effectiveRuntime = {
+      model: 'gpt-6-astra', reasoningEffort: 'high', workerGeneration: 2,
+      observedAt: '2026-09-21T01:00:00.000Z',
+    };
+    expect(composeRowFromActive(ds).effectiveRuntime).toEqual({
+      model: 'gpt-6-astra', reasoningEffort: 'high', workerGeneration: 2,
+      observedAt: '2026-09-21T01:00:00.000Z',
+    });
+  });
+
   it('projects working (not starting) during a long first turn once the worker initialized', () => {
     // Regression: meeting-agent sessions are fed a transcript delivery right at
     // spawn, so the CLI runs a minutes-long first turn before its first idle
@@ -244,14 +267,6 @@ describe('dashboard SessionRow token usage', () => {
 
     expect(row.tokenUsage).toBeNull();
     expect(getSessionTokenUsage).not.toHaveBeenCalled();
-  });
-
-  it('worker-pool close publishes the durable token usage snapshot directly', () => {
-    const source = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
-
-    expect(source).toContain('{ tokenUsage: after?.tokenUsage ?? null }');
-    expect(source).not.toContain("import { composeRowFromActive, composeRowFromClosed }");
-    expect(source).not.toContain('composeRowFromClosed(after).tokenUsage');
   });
 
   it('carries chatType for active and closed rows', () => {

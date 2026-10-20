@@ -4,9 +4,11 @@
  * Pi stores sessions under:
  *   ~/.pi/agent/sessions/<workspace-encoded>/<timestamp>_<sessionId>.jsonl
  *
- * Bridge contract (same as Codex/Grok/CoCo): emit only
+ * Bridge contract (same structured queue as Codex/Grok/CoCo):
  *   - `user`            — a real user prompt (`message.role === "user"`).
  *   - `assistant_final` — an assistant record carrying a TERMINAL `stopReason`.
+ *   - `cot`             — thinking, interim narration, tool calls and results.
+ *                         Cosmetic only; never starts or closes a turn.
  *
  * ## Turn boundary (verified on pi 0.80.6; `@earendil-works/pi-ai` StopReason
  * union = `"stop" | "length" | "toolUse" | "error" | "aborted"`):
@@ -64,11 +66,14 @@
  * matching turn — identical to Codex/Grok. Non-steered turns stay strictly
  * interleaved (user → assistant_final → user → assistant_final).
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { homedir, platform } from 'node:os';
+import { existsSync, statSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { codexTaskFailureCode, safeFailureSummary } from './codex-transcript.js';
+import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
+import { contentHasToolCall, messageContentText } from './pi-family-content.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import {
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
@@ -76,13 +81,13 @@ import {
 
 const PI_SESSIONS_ROOT = join(homedir(), '.pi', 'agent', 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IS_LINUX = platform() === 'linux';
 
 export interface PiBridgeEvent {
   uuid: string;
   timestampMs: number;
-  kind: 'user' | 'assistant_final';
+  kind: 'user' | 'assistant_final' | 'cot';
   text: string;
+  cotEntries?: CodexCotEntry[];
   /** Best-effort terminal outcome carried by an `assistant_final` (attribution
    *  metadata, NOT a durable receipt — Pi has no reliableTurnTerminal). Undefined
    *  on a `stop`/`length` completion (keeps the historical completed default and
@@ -167,16 +172,9 @@ function matchPiTranscriptPath(target: string): { path: string; cliSessionId: st
   return { path: target, cliSessionId: sid };
 }
 
+/** Text blocks of an array `content`; a bare-string content has no blocks. */
 function joinTextContent(content: unknown): string {
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const item of content) {
-    if (!item || typeof item !== 'object') continue;
-    if ((item as any).type === 'text' && typeof (item as any).text === 'string') {
-      parts.push((item as any).text);
-    }
-  }
-  return parts.join('\n').trim();
+  return Array.isArray(content) ? messageContentText(content) : '';
 }
 
 /** True when an assistant message contains a tool call. Pi's agent loop keeps a
@@ -184,9 +182,48 @@ function joinTextContent(content: unknown): string {
  *  `length` (token-cap) message, whose truncated calls it fails and then loops
  *  again (failToolCallsFromTruncatedMessage → terminate:false). Only a terminal
  *  stopReason on a message WITHOUT tool calls actually ends the turn. */
-function hasToolCall(content: unknown): boolean {
-  if (!Array.isArray(content)) return false;
-  return content.some((item) => item && typeof item === 'object' && (item as any).type === 'toolCall');
+const hasToolCall = contentHasToolCall;
+
+/** Pi persists complete assistant messages before executing their tools and
+ * toolResult messages after execution. Reading both on the existing transcript
+ * cursor covers fresh, resumed and adopted sessions without a second watcher.
+ * Only display blocks are forwarded: signatures, images and result details
+ * stay in the transcript. Final answer text belongs to the reply channel. */
+function piCotEntries(message: Record<string, unknown>, includeText: boolean): CodexCotEntry[] {
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  if (message.role === 'toolResult') {
+    if (typeof message.toolCallId !== 'string' || !message.toolCallId.trim()) return [];
+    const result = joinTextContent(content);
+    return [{
+      kind: 'tool_result', id: message.toolCallId,
+      result: result.length > 800 ? `${result.slice(0, 800)}…` : result,
+    }];
+  }
+  if (message.role !== 'assistant') return [];
+  const entries: CodexCotEntry[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking' && block.redacted !== true && typeof block.thinking === 'string') {
+      if (block.thinking.trim()) entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && includeText && typeof block.text === 'string') {
+      if (block.text.trim()) entries.push({ kind: 'text', text: block.text });
+    } else if (block.type === 'toolCall') {
+      if (typeof block.id !== 'string' || !block.id.trim()
+        || typeof block.name !== 'string' || !block.name.trim()) continue;
+      const input: unknown = block.arguments;
+      // Malformed/truncated arguments must not break the final-answer bridge.
+      let args = '';
+      try { args = JSON.stringify(input) ?? ''; } catch { /* display without arguments */ }
+      const subject = boundSubjectForTransport(subjectFromInputObject(input));
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: args.length > 600 ? `${args.slice(0, 600)}…` : args,
+        ...(subject ? { subject } : {}),
+      });
+    }
+  }
+  return entries;
 }
 
 export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string): string | undefined {
@@ -216,33 +253,9 @@ export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string):
 }
 
 export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchPiTranscriptPath(target);
-        if (hit) return hit;
-      }
-      return undefined;
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
     const hit = matchPiTranscriptPath(target);
     if (hit) return hit;
   }
@@ -371,42 +384,21 @@ export function drainPiTranscript(
    *  production uses wall clock. */
   nowMs: number = Date.now(),
 ): PiDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) {
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind === 'skip') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  if (step.kind === 'idle') {
     return {
       events: flushPiPendingError(path, piSessionIdFromPath(path), nowMs),
-      newOffset: start,
+      newOffset: step.newOffset,
       pendingTail: '',
     };
   }
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  const { completeText, pendingTail, newOffset } = step.window;
 
   const sessionId = piSessionIdFromPath(path);
   const events: PiBridgeEvent[] = [];
   const pending = piPendingTurnState(path);
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;
-      continue;
-    }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, step.start)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
 
@@ -437,7 +429,12 @@ export function drainPiTranscript(
     }
 
     if (obj?.type !== 'message' || !obj.message || typeof obj.message !== 'object') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const rawTs = obj.timestamp ?? (obj.message as any)?.timestamp;
+    const ts = typeof rawTs === 'number'
+      ? rawTs
+      : typeof rawTs === 'string'
+        ? Date.parse(rawTs)
+        : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const role = obj.message.role;
 
@@ -483,8 +480,16 @@ export function drainPiTranscript(
       continue;
     }
 
-    // Only assistant records can close a turn. `toolResult` / `bashExecution`
-    // and any other role are mid-turn plumbing and never a boundary.
+    if (role === 'toolResult') {
+      const cotEntries = piCotEntries(obj.message, false);
+      if (cotEntries.length > 0) events.push({
+        uuid: `${path}:${lineStart}:cot`, timestampMs,
+        kind: 'cot', text: '', cotEntries, sourceSessionId: sessionId,
+      });
+      continue;
+    }
+
+    // Only assistant records can close a turn; other roles are not activity.
     if (role !== 'assistant') continue;
 
     const stopReason =
@@ -552,6 +557,15 @@ export function drainPiTranscript(
       };
       continue;
     }
+
+    // Emit before the terminal so the queue attributes the activity while the
+    // turn is still collecting. A distinct UUID prevents the cosmetic record
+    // from consuming the final's dedup key when both come from the same line.
+    const cotEntries = isHardTerminal ? [] : piCotEntries(obj.message, !isTextTerminal);
+    if (cotEntries.length > 0) events.push({
+      uuid: `${path}:${lineStart}:cot`, timestampMs,
+      kind: 'cot', text: '', cotEntries, sourceSessionId: sessionId,
+    });
 
     if (!isHardTerminal && !isTextTerminal) continue;
 

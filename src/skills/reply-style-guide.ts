@@ -1,4 +1,5 @@
 import { SEND_SKILL } from './definitions.js';
+import { isCrossPrincipalInterruptionEnabled } from '../global-config.js';
 
 /**
  * The subset of per-bot replyStyle that changes botmux-send's writing guide.
@@ -18,6 +19,14 @@ export interface ReplyStyleGuideConfig {
 const RECIPE_START = '### 可选排版配方（参考，不是强制模板）';
 const RECIPE_END = '## 卡住了需要人介入：`--attention`';
 const SESSION_STYLE_ENV = 'BOTMUX_REPLY_STYLE';
+
+/** Bounds of the `--as` section, dropped from the rendered guide while the
+ *  experimental cross-principal isolation switch is off (the default). Without
+ *  isolation a message is never staged, so `--as` classifies nothing and the
+ *  two buttons it describes never appear — documenting it would send agents
+ *  after a flag with no effect. The end anchor is the heading that follows it. */
+const XPI_AS_SECTION_START = '### 对方正在执行任务时：`--as`';
+const XPI_AS_SECTION_END = '### 引用串联（普通群）';
 
 const LAYOUT_GUIDE = `### 可选语义卡头：\`--layout\`
 
@@ -118,6 +127,11 @@ export function renderBotmuxSendSkill(
   }
 
   const sections = [recipeSection, layoutEnabled ? LAYOUT_GUIDE : ''].filter(Boolean).join('\n\n');
-  const rendered = replaceBetween(SEND_SKILL, RECIPE_START, RECIPE_END, sections);
+  let rendered = replaceBetween(SEND_SKILL, RECIPE_START, RECIPE_END, sections);
+  // Experimental XPI switch off (the default) ⇒ drop the `--as` section: with no
+  // isolation there is nothing to classify. Read live, like the routing hints.
+  if (!isCrossPrincipalInterruptionEnabled()) {
+    rendered = replaceBetween(rendered, XPI_AS_SECTION_START, XPI_AS_SECTION_END, '');
+  }
   return layoutEnabled ? addLayoutParameterRow(rendered) : rendered;
 }

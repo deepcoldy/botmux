@@ -14,6 +14,7 @@ import {
   buildSessionCard,
   buildStreamingCard,
   buildRepoSelectCard,
+  REPO_SELECT_CARD_MAX_BYTES,
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
@@ -26,8 +27,11 @@ import {
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
+  frozenIdleLabel,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
+import type { AdoptableSession } from '../src/core/session-discovery.js';
+import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
@@ -117,6 +121,25 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
     expect(texts[0]).not.toContain('Session ID:');
+  });
+
+  it('renders a native title for a live TraeX session instead of the project directory', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux',
+      tmuxTarget: 'traex:0.0',
+      cliPid: 42,
+      cliId: 'traex',
+      sessionId: 'traex-session-id',
+      title: 'Investigate rollout title metadata',
+      cwd: '/Users/test/project-dir',
+      paneCols: 120,
+      paneRows: 40,
+    }], 'om_root', 'en'));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('Investigate rollout title metadata');
+    expect(texts[0]).not.toMatch(/^\*\*project-dir\*\*/);
   });
 
   it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
@@ -232,6 +255,73 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     // Escaped form is "!\[x\](…)"; the unescaped "![x](" must NOT survive.
     expect(md).toContain('\\[x\\]');
     expect(md).not.toContain('![x](');
+  });
+
+  const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
+    source: 'herdr',
+    herdrSessionName: 'collie',
+    herdrPaneId: 'w3:p1',
+    cliId: 'claude-code',
+    cwd: '/work/demo',
+    paneCols: 200,
+    paneRows: 50,
+    ...extra,
+  });
+
+  it('heads a titled live herdr entry with its escaped title, keeping the path and location lines', () => {
+    const titled = cardTexts(parse(buildAdoptSelectCard(
+      [herdrLive({ title: 'fix *login* _page_ [demo]' })], 'om_root', 'en',
+    )))[0]!.split('\n');
+    const untitled = cardTexts(parse(buildAdoptSelectCard([herdrLive()], 'om_root', 'en')))[0]!.split('\n');
+    expect(titled[0]).toBe('**fix \\*login\\* \\_page\\_ \\[demo\\]**');
+    expect(titled).toContain('Path: `/work/demo`');
+    expect(titled).toContain('Location: `collie:w3:p1`');
+    // Everything below the heading is identical to the untitled entry.
+    expect(titled.slice(1)).toEqual(untitled.slice(1));
+  });
+
+  it('falls back to the cwd basename for a live herdr entry without a title', () => {
+    const texts = cardTexts(parse(buildAdoptSelectCard([herdrLive()], 'om_root', 'en')));
+    expect(texts[0]!.split('\n')[0]).toBe('**demo**');
+  });
+
+  it('matches a titled live entry by a title fragment and still by its directory name', () => {
+    const titled = herdrLive({ title: '修复登录页样式' });
+    const other = herdrLive({ herdrPaneId: 'w3:p2', cwd: '/work/other' });
+    const keysFor = (searchQuery: string) => parse(buildAdoptSelectCard([titled, other], 'om_root', 'en', [], { searchQuery }))
+      .body.elements
+      .filter((e: any) => e.tag === 'interactive_container')
+      .map((e: any) => e.behaviors[0].value.entry_key);
+    expect(keysFor('登录页')).toEqual([adoptLiveKey(titled)]);
+    expect(keysFor('demo')).toEqual([adoptLiveKey(titled)]);
+  });
+
+  it('keeps tmux and zellij live entries titled by directory name', () => {
+    const tmux: AdoptableSession = {
+      source: 'tmux', tmuxTarget: 'dev:0.0', cliPid: 42, cliId: 'codex', cwd: '/work/alpha', paneCols: 80, paneRows: 24,
+    };
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex',
+      cwd: '/work/beta', paneCols: 80, paneRows: 24,
+    };
+    const texts = cardTexts(parse(buildAdoptSelectCard([tmux, zellij], 'om_root', 'en')));
+    expect(texts).toEqual([
+      ['**alpha**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/alpha`', 'Location: `dev:0.0`', 'Uptime: unknown'].join('\n'),
+      ['**beta**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/beta`', 'Location: `mywork/terminal\\_1`', 'Uptime: unknown'].join('\n'),
+    ]);
+  });
+
+  it('titles a zellij TraeX entry by the native title its discovery resolved', () => {
+    // zellij discovery only sets `title` for TraeX, through traexLiveTitle
+    // (botmux-origin filtered, cleaned like herdr titles).
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_2', cliPid: 8, cliId: 'traex',
+      cwd: '/work/gamma', paneCols: 80, paneRows: 24, title: '回复确认收到',
+    };
+    const texts = cardTexts(parse(buildAdoptSelectCard([zellij], 'om_root', 'en')));
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.split('\n')[0]).toBe('**回复确认收到**');
+    expect(texts[0]).toContain('Path: `/work/gamma`');
   });
 });
 
@@ -384,6 +474,25 @@ describe('buildSlashListCard', () => {
     expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
     expect(markdown).not.toContain('<at id=all></at>');
   });
+
+  it('renders discovered commands in an auto-height table', () => {
+    const card = parse(buildSlashListCard({
+      cliName: 'codex',
+      builtin: [],
+      custom: [],
+      discovered: [{ name: 'review', description: 'review the current diff' }],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: true,
+    }, 'en'));
+
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    expect(table.rows).toEqual([{ cmd: '`review`', desc: 'review the current diff' }]);
+  });
 });
 
 describe('buildConfigCard', () => {
@@ -453,6 +562,24 @@ describe('buildConfigCard', () => {
       .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'p2pOpen'));
     expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
       .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen']);
+  });
+
+  it('renders the grantRequestToOwnerDm quick-toggle in the security section with a real label', () => {
+    const data = configData(null);
+    data.booleans = [...data.booleans, { key: 'grantRequestToOwnerDm', on: false }];
+    const en = parse(buildConfigCard(data, 'en'));
+    const toggle = allActions(en).find((a: any) => a.value?.field === 'grantRequestToOwnerDm');
+    expect(toggle.value.action).toBe('config_toggle');
+    expect(toggle.type).toBe('default');
+    expect(toggle.text.content).toBe('⚪ Forward requests to owner DM');
+    const zh = parse(buildConfigCard(data, 'zh'));
+    expect(allActions(zh).find((a: any) => a.value?.field === 'grantRequestToOwnerDm').text.content).toBe('⚪ 申请卡转投私聊');
+
+    const securityRow = en.elements
+      .filter((e: any) => e.tag === 'action')
+      .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'grantRequestToOwnerDm'));
+    expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
+      .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm']);
   });
 
   it('shows the p2pOpen toggle as off when the bot has not opted in', () => {
@@ -531,6 +658,8 @@ describe('buildForkPanelCard', () => {
     ], 'en'));
     const table = card.body.elements.find((element: any) => element.tag === 'table');
 
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
     expect(table.rows).toEqual([
       {
         instruction: 'investigate cleanup',
@@ -894,6 +1023,18 @@ describe('buildStreamingCard', () => {
   it('should have wide_screen_mode config', () => {
     const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working'));
     expect(card.config.wide_screen_mode).toBe(true);
+    expect(card.config.update_multi).toBe(true);
+  });
+
+  it('marks every callback action with the patchable streaming-card version', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+    ));
+    const callbackActions = allActions(card).filter((action: any) => action.value?.action);
+    expect(callbackActions.length).toBeGreaterThan(0);
+    for (const action of callbackActions) {
+      expect(action.value.stream_card_version).toBe('1');
+    }
   });
 
   // ── Header / status / template color ───────────────────────────────────
@@ -930,15 +1071,14 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+    it('idle + silentIdle flag renders the silent turn terminal receipt', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, true,
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
-      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
@@ -948,6 +1088,69 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, true,
       ));
       expect(card.header.title.content).toContain('工作中');
+    });
+
+    // transcript 模式：最终回复卡已投递 → idle 卡头展示本轮终态。颜色沿用 idle 的绿色。
+    it("idle + 'completed' label renders the completed turn terminal receipt", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+      expect(card.header.title.content).not.toContain('AI 判断无需回复');
+    });
+
+    it("idle + 'completed' label renders the completed turn terminal receipt in English", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('✓ Turn ended · Awaiting input');
+    });
+
+    it("idle + 'silent' string label equals the legacy boolean flag", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'silent',
+      ));
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
+    });
+
+    it("'completed' label is inert for non-idle statuses (working keeps its label)", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('工作中');
+      expect(card.header.title.content).not.toContain('已完成');
+    });
+
+    // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
+    it('frozenIdleLabel: idleLabel wins, legacy silentIdle maps to silent, neither → undefined', () => {
+      expect(frozenIdleLabel({ idleLabel: 'completed' })).toBe('completed');
+      expect(frozenIdleLabel({ idleLabel: 'completed', silentIdle: true })).toBe('completed');
+      expect(frozenIdleLabel({ silentIdle: true })).toBe('silent');
+      expect(frozenIdleLabel({ silentIdle: false })).toBeUndefined();
+      expect(frozenIdleLabel({})).toBeUndefined();
+
+      const completed = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ idleLabel: 'completed' }),
+      ));
+      expect(completed.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+
+      const legacySilent = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ silentIdle: true }),
+      ));
+      expect(legacySilent.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
@@ -973,6 +1176,21 @@ describe('buildStreamingCard', () => {
       expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
       expect(card.elements.some((element: any) => element.tag === 'column_set'
         && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it.each([
+      { model: 'claude-opus-5-5-high' },
+      { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    ])('shows runtime identity without native metrics: $model', runtime => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'cursor', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null, ...runtime },
+      ));
+      const line = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes(runtime.model));
+      expect(line?.content).toContain(`**${runtime.model}**`);
+      if (runtime.reasoningEffort) expect(line.content).toContain('high');
+      expect(line.content).not.toMatch(/Context|Total|↑|↓|null|undefined/);
     });
 
     it('renders metrics alone (no trailing runtime) when there is no model', () => {
@@ -1207,6 +1425,45 @@ describe('buildStreamingCard', () => {
       expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
     });
 
+    // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
+    const withUnavailable = (imageKey: string | undefined, unavailable: boolean, locale: 'zh' | 'en' = 'zh') =>
+      parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+        'nonce_x', imageKey, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], unavailable,
+      ));
+
+    it('renders an explicit unavailable state instead of waiting when no frame can arrive', () => {
+      const card = withUnavailable(undefined, true);
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(md[0].content).toBe('_(当前没有可用截图，请在会话恢复后刷新。)_');
+      expect(card.elements.some((e: any) => e.tag === 'img')).toBe(false);
+      expect(withUnavailable(undefined, true, 'en').elements.find((e: any) => e.tag === 'markdown').content)
+        .toBe('_(No screenshot is available. Refresh after the session resumes.)_');
+    });
+
+    it('keeps the waiting placeholder when a fresh frame is expected (default)', () => {
+      const card = withUnavailable(undefined, false);
+      expect(card.elements.find((e: any) => e.tag === 'markdown').content).toBe('_(等待第一张截图…)_');
+    });
+
+    it('a cached image always wins over the unavailable flag', () => {
+      const card = withUnavailable('img_cached', true);
+      expect(card.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_cached' });
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
+    });
+
+    it('hidden mode ignores the unavailable flag', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'hidden',
+        'nonce_x', undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], true,
+      ));
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
+    });
+
     it('should include hr separator after screenshot output', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
       expect(card.elements[0].tag).toBe('markdown');
@@ -1299,6 +1556,44 @@ describe('buildStreamingCard', () => {
       const closeBtn = actions.find((a: any) => a.value?.action === 'close');
       expect(closeBtn).toBeDefined();
       expect(closeBtn.type).toBe('danger');
+    });
+
+    it('hides selected streaming-card controls without affecting the others', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['terminal', 'writeLink', 'close'],
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+    });
+
+    it('treats output as one control group and omits empty action containers', () => {
+      const screenshot = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'claude-code', 'screenshot',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output'],
+      ));
+      const screenshotActions = findActions(screenshot);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
+      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+
+      const allHidden = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
+        undefined, undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, false, undefined,
+        ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
+      ));
+      expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
     });
 
     it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
@@ -1714,6 +2009,99 @@ describe('buildRepoSelectCard', () => {
       expect(selectStatic.options).toHaveLength(0);
     });
   });
+
+  // ── Byte budget ────────────────────────────────────────────────────────
+
+  describe('byte budget', () => {
+    // A broad scan root (observed live: 1174 projects) serialized past Feishu's
+    // ~109 KB card limit, the send threw 230025, and the session was left
+    // waiting on a card that was never published.
+    function manyProjects(n: number): ProjectInfo[] {
+      const out: ProjectInfo[] = [];
+      for (let i = 0; i < n; i++) {
+        // Repos first, then worktrees — the scanner's own compareProjects order.
+        const isRepo = i < 40;
+        out.push({
+          name: `project-with-a-fairly-long-name-${i}`,
+          path: `/root/iserver/some/deep/path/project-with-a-fairly-long-name-${i}`,
+          type: isRepo ? 'repo' : 'worktree',
+          branch: isRepo ? 'main' : `botmux-wt-feature-branch-${i}`,
+        });
+      }
+      return out;
+    }
+
+    function switchOptions(card: any): any[] {
+      const actionEl = card.elements.find((e: any) => e.tag === 'action');
+      return actionEl.actions.find((a: any) => a.tag === 'select_static').options;
+    }
+
+    function noteContents(card: any): string[] {
+      return card.elements.filter((e: any) => e.tag === 'note').map((e: any) => e.elements[0].content);
+    }
+
+    it('keeps an oversized scan under the byte budget', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root');
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('stays under budget in multi-picker mode too', () => {
+      const json = buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'zh', true);
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(REPO_SELECT_CARD_MAX_BYTES);
+    });
+
+    it('truncates the tail rather than the head, so 1-based numbering still matches lastRepoScan', () => {
+      const all = manyProjects(3000);
+      const options = switchOptions(parse(buildRepoSelectCard(all, '/root/iserver', 'om_root')));
+      expect(options.length).toBeGreaterThan(0);
+      expect(options.length).toBeLessThan(all.length);
+      // Every visible option keeps its index in the FULL list: `/repo <N>`
+      // indexes lastRepoScan, which the caller stores unsliced.
+      options.forEach((opt: any, i: number) => {
+        expect(opt.text.content).toMatch(new RegExp(`^${i + 1}\\.`));
+        expect(opt.value).toBe(all[i].path);
+      });
+    });
+
+    it('drops worktrees before repos (scanner sorts repos first)', () => {
+      const options = switchOptions(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const repoLabels = options.filter((o: any) => !o.text.content.includes('[worktree]'));
+      expect(repoLabels).toHaveLength(40);
+    });
+
+    it('adds a truncation note naming shown/total and the /repo escape hatch', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root')));
+      const hint = notes.find(n => n.includes('仅显示前'));
+      expect(hint).toBeDefined();
+      expect(hint).toContain('共 3000 个');
+      expect(hint).toContain('/repo <路径|项目名>');
+      // The ordinary usage note survives alongside it.
+      expect(notes.some(n => n.includes('/repo <编号>'))).toBe(true);
+    });
+
+    it('localizes the truncation note', () => {
+      const notes = noteContents(parse(buildRepoSelectCard(manyProjects(3000), '/root/iserver', 'om_root', 'en')));
+      expect(notes.some(n => n.includes('lists only the first') && n.includes('of 3000'))).toBe(true);
+    });
+
+    it('leaves a normally-sized scan untouched: every project shown, no truncation note', () => {
+      const few = manyProjects(30);
+      const card = parse(buildRepoSelectCard(few, '/root/iserver', 'om_root'));
+      expect(switchOptions(card)).toHaveLength(30);
+      expect(noteContents(card).some(n => n.includes('仅显示前'))).toBe(false);
+    });
+
+    it('still shows one option when even a single project would exceed the budget', () => {
+      const huge: ProjectInfo[] = Array.from({ length: 3 }, (_, i) => ({
+        name: 'x'.repeat(REPO_SELECT_CARD_MAX_BYTES),
+        path: `/p/${i}`,
+        type: 'repo',
+        branch: 'main',
+      }));
+      const options = switchOptions(parse(buildRepoSelectCard(huge, '/root/iserver', 'om_root')));
+      expect(options).toHaveLength(1);
+    });
+  });
 });
 
 // ─── buildSessionClosedCard ─────────────────────────────────────────────────
@@ -1794,6 +2182,18 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn).toBeDefined();
     expect(resumeBtn.value.session_id).toBe('sess-4');
     expect(resumeBtn.value.root_id).toBe('om_root_X');
+    expect(resumeBtn.type).toBe('primary');
+  });
+
+  it('keeps Resume available for a closed remote session', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-remote', 'om_root_remote', 'remote topic', 'remote-runner', '/srv/app',
+      null, 'en', 'Remote Runner', false,
+    ));
+    const action = card.elements.find((element: any) => element.tag === 'action');
+    const resumeBtn = action.actions.find((item: any) => item.value?.action === 'resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.session_id).toBe('sess-remote');
     expect(resumeBtn.type).toBe('primary');
   });
 
@@ -2120,6 +2520,10 @@ describe('buildPrivateSnapshotCard', () => {
       .filter((e: any) => e.tag === 'action')
       .flatMap((e: any) => e.actions ?? []);
   }
+
+  it('does not opt private one-shot snapshots into shared PATCH updates', () => {
+    expect(build().config.update_multi).toBeUndefined();
+  });
 
   it('exposes open-terminal link, get_write_link, close for non-Codex/TRAE sessions, with no patch-driven controls', () => {
     const card = build({ screen: 'hello' });

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,6 +19,8 @@ import {
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../src/core/per-bot-env.js';
 import { shellWrapperScript } from '../src/adapters/backend/tmux-backend.js';
 import { tmuxEnv } from '../src/setup/ensure-tmux.js';
+import type { DaemonToWorker } from '../src/types.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const roots: string[] = [];
 
@@ -272,71 +274,88 @@ describe('BOTS_CONFIG plumbing — all four leak vectors', () => {
   });
 });
 
-describe('worker spawnCli wiring (source lock)', () => {
-  // P3 was a param-SHAPE bug that no resolver-level test could ever catch:
-  // `resolveBotmuxConfigDir(process.env)` type-checks (a ProcessEnv is
-  // structurally a valid options bag), so only the real call site proves it.
-  const workerSource = readFileSync(resolvePath('src/worker.ts'), 'utf8');
-  const workerPoolSource = readFileSync(resolvePath('src/core/worker-pool.ts'), 'utf8');
-  const registrySource = readFileSync(resolvePath('src/bot-registry.ts'), 'utf8');
-
-  it('pins on daemon-frozen PROVENANCE, not an existsSync probe or env re-derivation', () => {
-    expect(workerSource).toContain(
-      'resolveChildBotsConfig(\n      cfg.loadedBotsConfigPath,\n      cfg.loadedBotsConfigProvenance,\n    )',
-    );
-    // The existence probe is GONE: it conflated provenance with present
-    // existence and so fail-opened to a foreign registry (round-2 blocker).
-    expect(workerSource).not.toContain('resolveChildBotsConfig(cfg.loadedBotsConfigPath, { exists: existsSync })');
-    // The old shape must be gone: a bare env map read as an options bag meant
-    // any lowercase `env=` / `homeDir=` in the environment silently hijacked it.
-    expect(workerSource).not.toContain('resolveBotmuxConfigDir(process.env)');
-    // And the child must never be handed a re-derivation of its OWN environment.
-    expect(workerSource).not.toContain('childEnv.BOTS_CONFIG = resolveBotsConfigFile');
-  });
-
-  it('assigns OR deletes, never leaving an inherited BOTS_CONFIG to chance', () => {
-    const start = workerSource.indexOf('const pinned = resolveChildBotsConfig(');
-    expect(start).toBeGreaterThan(-1);
-    const block = workerSource.slice(start, start + 400);
-    expect(block).toContain('if (pinned) childEnv.BOTS_CONFIG = pinned;');
-    expect(block).toContain('else delete childEnv.BOTS_CONFIG;');
-  });
-
-  it('the daemon FREEZES provenance alongside the path into the worker init message', () => {
-    expect(workerPoolSource).toContain('loadedBotsConfigProvenance: getLoadedConfigProvenance(),');
-    expect(workerPoolSource).toContain('getLoadedConfigProvenance');
-  });
-
-  it('the registry records provenance at EVERY site that sets loadedConfigPath', () => {
-    // A site that assigns the path but forgets the provenance would leave a stale
-    // verdict from a previous resolution — so assert the pairing structurally.
-    const assignments = [...registrySource.matchAll(/^\s*loadedConfigPath = .*$/gm)];
-    expect(assignments.length).toBeGreaterThanOrEqual(3);
-    for (const m of assignments) {
-      const after = registrySource.slice(m.index!, m.index! + 700);
-      expect(after, `provenance not set near: ${m[0].trim()}`)
-        .toMatch(/loadedConfigProvenance = ('loaded'|'synthetic'|undefined)/);
+describe('worker pins BOTS_CONFIG onto its CLI child by daemon-frozen provenance', () => {
+  // Real worker child + fake CLI that reports what BOTS_CONFIG it was handed.
+  // An inherited ambient value must never survive: BOTS_CONFIG tops the
+  // registry precedence chain, so a stale one redirects the child to a foreign
+  // registry. Only a LOADED authority is pinned.
+  async function childBotsConfig(init: Partial<DaemonToWorker & { type: 'init' }>): Promise<string | null> {
+    const dir = realpathSync(root());
+    const report = join(dir, 'report.json');
+    const cli = join(dir, 'fake-claude');
+    writeFileSync(cli, `#!/usr/bin/env node\nif (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(0); }\nrequire('node:fs').writeFileSync(${JSON.stringify(report)}, JSON.stringify({ botsConfig: process.env.BOTS_CONFIG ?? null }));\nconsole.log('Ready >'); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolvePath('src/worker.ts'), [], {
+      cwd: resolvePath('.'),
+      env: { ...process.env, HOME: dir, SESSION_DATA_DIR: join(dir, 'data'), BOTS_CONFIG: join(dir, 'foreign-fleet.json'), BOTMUX_NO_CLAIM: '1' },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    try {
+      child.send({ type: 'init', sessionId: `bots-config-${roots.length}`, chatId: 'oc_fixture', rootMessageId: 'om_fixture',
+        workingDir: dir, cliId: 'claude-code', cliPathOverride: cli, backendType: 'pty', prompt: '', apiOnly: true,
+        larkAppId: 'app_fixture', larkAppSecret: '', ...init } as DaemonToWorker);
+      const deadline = Date.now() + 15_000;
+      while (!existsSync(report) && child.exitCode === null && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 25));
+      }
+      expect(existsSync(report), logs.join('')).toBe(true);
+      return JSON.parse(readFileSync(report, 'utf8')).botsConfig;
+    } finally {
+      const exited = new Promise(done => child.once('exit', done));
+      if (child.connected) child.send({ type: 'close' }, () => {});
+      const kill = setTimeout(() => child.kill('SIGKILL'), 3000);
+      if (child.exitCode === null && child.signalCode === null) await exited;
+      clearTimeout(kill);
     }
-    // Core-only synthesis is the ONLY 'synthetic' producer.
-    expect(registrySource).toContain("loadedConfigProvenance = 'synthetic';");
-  });
+  }
 
-  it('cli.ts and the registry share ONE home semantic (no win32 fork)', () => {
-    // cli.ts owns setup/start/PM2_HOME/dashboard paths via
-    // `join(homedir(), '.botmux')`. The registry's config dir must resolve from
-    // the same homedir() — never a hand-rolled HOME/USERPROFILE precedence.
-    const configDirSource = readFileSync(resolvePath('src/core/config-dir.ts'), 'utf8');
-    expect(configDirSource).toContain("join(options.homeDir ?? homedir(), '.botmux')");
-    // Strip comments before asserting the absence: the JSDoc deliberately QUOTES
-    // the rejected rule to explain why it is wrong, and a naive substring check
-    // would match that prose forever (and would also have passed pre-fix, when
-    // the real code had it — i.e. it would be a toothless guard).
-    const code = configDirSource
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\/\/[^\n]*/g, '');
-    expect(code).not.toContain('env.HOME');
-    expect(code).not.toContain('env.USERPROFILE');
-    expect(readFileSync(resolvePath('src/cli.ts'), 'utf8'))
-      .toContain("const CONFIG_DIR = join(homedir(), '.botmux');");
+  it('deletes an inherited BOTS_CONFIG when the daemon loaded no registry', async () => {
+    expect(await childBotsConfig({})).toBeNull();
+  }, 30_000);
+
+  it('deletes an inherited BOTS_CONFIG for a core-only synthetic placeholder', async () => {
+    expect(await childBotsConfig({ loadedBotsConfigPath: '/srv/fleet/bots.json', loadedBotsConfigProvenance: 'synthetic' }))
+      .toBeNull();
+  }, 30_000);
+
+  it('replaces it with the exact file the daemon loaded', async () => {
+    expect(await childBotsConfig({ loadedBotsConfigPath: '/srv/fleet/fleet-loaded.json', loadedBotsConfigProvenance: 'loaded' }))
+      .toBe('/srv/fleet/fleet-loaded.json');
+  }, 30_000);
+});
+
+describe('registry provenance tracks every config resolution', () => {
+  it('records loaded vs synthetic on each resolution, never keeping a stale verdict', async () => {
+    const { loadBotConfigs, getLoadedConfigPath, getLoadedConfigProvenance } = await import('../src/bot-registry.js');
+    const home = root();
+    const homeBots = join(home, '.botmux', 'bots.json');
+    const pinnedBots = join(root(), 'fleet.json');
+    const fixture = JSON.stringify([{ larkAppId: 'cli_provenance', larkAppSecret: 'SECRET_REDACTED', cliId: 'claude-code' }]);
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    writeFileSync(homeBots, fixture);
+    writeFileSync(pinnedBots, fixture);
+    const keys = ['HOME', 'BOTS_CONFIG', 'BOTMUX_CORE_ONLY'] as const;
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    const load = (env: Partial<Record<(typeof keys)[number], string | undefined>>) => {
+      for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      loadBotConfigs();
+      return [getLoadedConfigProvenance(), getLoadedConfigPath()];
+    };
+    try {
+      expect(load({ HOME: home, BOTS_CONFIG: undefined, BOTMUX_CORE_ONLY: '1' })).toEqual(['synthetic', homeBots]);
+      expect(load({ BOTMUX_CORE_ONLY: undefined, BOTS_CONFIG: pinnedBots })).toEqual(['loaded', pinnedBots]);
+      expect(load({ BOTS_CONFIG: undefined, BOTMUX_CORE_ONLY: '1' })).toEqual(['synthetic', homeBots]);
+      expect(load({ BOTMUX_CORE_ONLY: undefined })).toEqual(['loaded', homeBots]);
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
   });
 });

@@ -302,6 +302,7 @@ describe('sessionHasNoFeishuTransport (gate verdict)', () => {
   it('flags HTTP virtual sessions even on a normal bot', () => {
     expect(sessionHasNoFeishuTransport({ chatId: 'http_async_abc', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
     expect(sessionHasNoFeishuTransport({ chatId: 'http_wait_xyz', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
+    expect(sessionHasNoFeishuTransport({ chatId: 'headless_hl_abc12345', larkAppId: 'normal_app' }, isApiOnly)).toBe(true);
   });
 
   it('passes a normal bot in a real chat', () => {
@@ -336,6 +337,7 @@ describe('card patch --help', () => {
   it('prints the card command usage with the patch subcommand on `card --help` / no subcommand', () => {
     expect(CARD_COMMAND_USAGE).toContain('botmux card');
     expect(CARD_COMMAND_USAGE).toContain('patch');
+    expect(CARD_COMMAND_USAGE).toContain('stream');
     expect(CARD_COMMAND_USAGE).toContain('--message-id');
     expect(CARD_COMMAND_USAGE).toContain('原地更新');
   });

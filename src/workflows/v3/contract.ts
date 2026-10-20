@@ -89,6 +89,30 @@ export const GOAL_ENV = {
   V3_MARKER: 'BOTMUX_V3_GOAL',
 } as const;
 
+/** Native slash command a goal-mode worker is started with. */
+export const GOAL_COMMAND = '/goal';
+
+/** The objective botmux v3 hands every goal-mode worker (the text after
+ *  `/goal`): a short pointer at the file-backed instructions, see
+ *  `buildGoalCommand` / `renderGoalFile`. Single source shared with
+ *  {@link isBotmuxGoalObjective} so the two cannot drift apart. */
+export const GOAL_COMMAND_OBJECTIVE =
+  `Read $${GOAL_ENV.GOAL_PATH}. Write files in $${GOAL_ENV.OUTPUT_DIR} and manifest at `
+  + `$${GOAL_ENV.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+
+/** True when `text` is the goal botmux v3 sends — with or without the leading
+ *  `/goal`, whitespace-insensitive. Native stores keep it as the thread's first
+ *  input (TraeX 0.210 goal mode: `threads.preview` = the objective, empty
+ *  `first_user_message`), and none of the Lark-envelope checks match it, so
+ *  session discovery needs this to recognise a botmux workflow run. */
+export function isBotmuxGoalObjective(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const objective = normalized.startsWith(`${GOAL_COMMAND} `)
+    ? normalized.slice(GOAL_COMMAND.length + 1).trim()
+    : normalized;
+  return objective === GOAL_COMMAND_OBJECTIVE;
+}
+
 // ─── Runtime human-ask (goal worker → human, rides the blocked+retry rail) ──
 
 /**
@@ -154,13 +178,23 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  envPolicy?: import('../../core/env-policy.js').EnvPolicy;
+  cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+  cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen configured launch prefix.  Workflow workers must use
+   *  the same gateway/runtime selection as ordinary bot sessions. */
+  wrapperCli?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
-   *  these fields when spawning outside the main forkWorker path. */
-  sandbox?: boolean;
+   *  these fields when spawning outside the main forkWorker path. Tri-state:
+   *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  scratchStorage?: 'tmpfs' | 'disk';
+  scratchTmpfsSizeMb?: number;
+  scratchDenyPaths?: string[];
   /** New three-tier fs-policy lists (deny-by-default). Carried alongside the
    *  legacy fields so a workflow worker builds the SAME policy as a normal
    *  session; without it the readWrite tier + user-expressed deny are lost. */
@@ -168,6 +202,7 @@ export interface BotSnapshot {
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** The resolved working directory for this run. */
   workingDir: string;
 }
@@ -180,7 +215,10 @@ export interface BotSnapshot {
 export interface WorkerSessionInfo {
   sessionId: string;
   webPort?: number;
+  /** Private write capability. May return to the runtime result, never journal it. */
   token?: string;
+  /** Per-worker-boot read capability used by card terminal links. */
+  viewToken?: string;
 }
 
 export interface RunNodeRequest {

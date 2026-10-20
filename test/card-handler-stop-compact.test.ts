@@ -70,6 +70,7 @@ const sendWorkerSessionInputMock = vi.fn();
 const isSessionTransferringMock = vi.fn(() => false);
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  setSessionReasoningEffort: vi.fn(() => 'saved'),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: (...args: any[]) => sendWorkerSessionInputMock(...args),
@@ -92,8 +93,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   isSessionTransferring: (...args: any[]) => isSessionTransferringMock(...args),
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
-  buildStreamingCardJson: vi.fn(),
+  buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
   silentIdleCardFlag: vi.fn(() => false),
+  idleCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 
@@ -144,8 +146,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -219,6 +220,38 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const replyCards = await import('../src/core/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_running' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    const update = vi.spyOn(replyCards, 'updateTurnReplyCard').mockResolvedValue(undefined);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_running';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(sendWorkerSessionInputMock).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+      expect(result.card).toBeUndefined();
+      expect(update).toHaveBeenCalled();
+    } finally { read.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects a stale reply-card Stop button while a later turn is running', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_new_turn' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_old_turn';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); }
+  });
   it('sends term_action ctrlc to the worker and re-renders the card as interrupted', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('stop_turn'), depsWith(ds), LARK_APP_ID);
@@ -301,6 +334,31 @@ describe('compact_session card action', () => {
     expect(result.toast.content).toContain('/compact');
   });
 
+  it('keeps the thread root as the reply root for a thread-scope session', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn();
+    await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0][2].replyRootId).toBe(ROOT);
+  });
+
+  it('does not pass the chat id as a reply root for a chat-scope session', async () => {
+    // Chat-scope cards carry the chat id as root_id; treating it as a thread
+    // root froze an unreplyable target for every later rootless post.
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat', rootMessageId: 'om_first' } });
+    const deliver = vi.fn();
+    const deps = depsWith(undefined, deliver);
+    deps.activeSessions.set(sessionKey('oc_chat', LARK_APP_ID), ds);
+    const data = actionData('compact_session');
+    data.action.value.root_id = 'oc_chat';
+    const result = await handleCardAction(data, deps, LARK_APP_ID);
+
+    expect(result.toast.type).toBe('success');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const opts = deliver.mock.calls[0][2];
+    expect(opts.anchor).toBe('oc_chat');
+    expect(opts.replyRootId).toBeUndefined();
+  });
+
   it('falls back to an unsupported toast when the daemon did not wire the dep', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('compact_session'), depsWith(ds, undefined), LARK_APP_ID);
@@ -368,15 +426,48 @@ describe('compact_session card action', () => {
   });
 });
 
-// ─── isSensitive source lock ──────────────────────────────────────────────
+// ─── sensitive-action table lock ───────────────────────────────────────────
 
-describe('stop_turn / compact_session permission gate (source lock)', () => {
-  it('both actions are registered in the isSensitive canOperate gate', () => {
+describe('stop_turn / compact_session permission gate (table lock)', () => {
+  it('both actions are registered in the canOperate gate table', () => {
     // 防止后续重构把两个新 action 误移出权限闸（与 term_action/close 同档）。
-    const source = readFileSync(resolve('src/im/lark/card-handler.ts'), 'utf8');
-    const line = source.split('\n').find(l => l.includes('const isSensitive ='));
-    expect(line).toBeTruthy();
-    expect(line!).toContain('stop_turn');
-    expect(line!).toContain('compact_session');
+    // 清单原先是 card-handler.ts 里 `const isSensitive = …` 的手写数组、靠 grep 源码行锁住；
+    // 现在登记在 SENSITIVE_CARD_ACTIONS，直接断言表本身（行为侧的拒绝用例在上面各 describe 里）。
+    expect(sensitiveCardActionMeta('stop_turn')).toBeDefined();
+    expect(sensitiveCardActionMeta('compact_session')).toBeDefined();
+  });
+});
+
+
+describe('reasoning selector card callback', () => {
+  function setup() {
+    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', sessionOverrides: { reasoningEffort: 'ultra' } });
+    const data = actionData('set_reasoning_effort');
+    Object.assign(data.action.value, { card_nonce: 'nonce', expected_effort: 'ultra' });
+    data.action.option = 'high';
+    return { ds, data };
+  }
+
+  it('dispatches a verified current-card selection and returns updated card data', async () => {
+    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    vi.mocked(setSessionReasoningEffort).mockClear();
+    const { ds, data } = setup();
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['nonce', 'session', 'message', 'selection', 'operator'])('rejects stale or unauthorized %s without mutation', async field => {
+    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    vi.mocked(setSessionReasoningEffort).mockClear();
+    const { ds, data } = setup();
+    if (field === 'nonce') data.action.value.card_nonce = 'old';
+    if (field === 'session') data.action.value.session_id = 'other';
+    if (field === 'message') data.context.open_message_id = 'old';
+    if (field === 'selection') data.action.value.expected_effort = 'low';
+    if (field === 'operator') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(setSessionReasoningEffort).not.toHaveBeenCalled();
   });
 });

@@ -36,6 +36,11 @@ import { appendFileSync } from 'node:fs';
 const scenario = process.env.FAKE_DSH_SCENARIO ?? 'happy';
 const finalText = process.env.FAKE_DSH_FINAL_TEXT ?? '你好，我是 dsh。';
 const logPath = process.env.FAKE_DSH_LOG;
+
+if (process.argv[2] === 'plugin') {
+  process.exit(0);
+}
+if (logPath) appendFileSync(logPath, JSON.stringify({ argv: process.argv.slice(2) }) + '\n');
 const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
   ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
   : {};

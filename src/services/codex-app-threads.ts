@@ -1,16 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from '../adapters/cli/registry.js';
+import { JsonRpcStdioCore } from '../utils/jsonrpc-stdio.js';
 
 type JsonObject = Record<string, any>;
-
-interface PendingRequest {
-  method: string;
-  resolve: (value: any) => void;
-  reject: (err: Error) => void;
-}
 
 class CodexAppServerRequestError extends Error {
   constructor(
@@ -147,9 +142,10 @@ export interface CodexAppThreadMetadata {
 
 class CodexAppServerProbe {
   private child: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private stdoutBuffer = '';
-  private pending = new Map<number, PendingRequest>();
+  private readonly rpc = new JsonRpcStdioCore({
+    mapRpcError: (method, error) => new CodexAppServerRequestError(method, error.code, error.message, error),
+    onMessage: msg => this.onMessage(msg),
+  });
   private lastStderr = '';
   private closed = false;
   private killTimer: NodeJS.Timeout | undefined;
@@ -175,7 +171,7 @@ class CodexAppServerProbe {
       detached: this.useProcessGroup,
     });
     this.unregisterForceClose = registerForceClose?.(() => this.forceClose());
-    this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
+    this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
     this.child.stderr.on('data', chunk => {
       this.lastStderr = (this.lastStderr + chunk.toString('utf8')).slice(-8000);
     });
@@ -277,11 +273,9 @@ class CodexAppServerProbe {
 
   request(method: string, params: unknown): Promise<any> {
     if (this.closed) return Promise.reject(new Error('Codex app-server is closed'));
-    const id = this.nextId++;
+    const id = this.rpc.nextId();
     this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { method, resolve, reject });
-    });
+    return this.rpc.track(id, method);
   }
 
   notify(method: string, params?: unknown): void {
@@ -378,47 +372,17 @@ class CodexAppServerProbe {
     }
   }
 
-  private onStdout(data: string): void {
-    this.stdoutBuffer += data;
-    for (;;) {
-      const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) return;
-      const line = this.stdoutBuffer.slice(0, nl).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (!line) continue;
-      let msg: JsonObject;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (typeof msg.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
-        const pending = this.pending.get(msg.id);
-        if (!pending) continue;
-        this.pending.delete(msg.id);
-        if (msg.error) {
-          pending.reject(new CodexAppServerRequestError(
-            pending.method,
-            msg.error.code,
-            msg.error.message,
-            msg.error,
-          ));
-        } else {
-          pending.resolve(msg.result);
-        }
-        continue;
-      }
-      if (typeof msg.id === 'number' && typeof msg.method === 'string') {
-        this.respondToServerRequest(msg.id, msg.method);
-        continue;
-      }
-      if (typeof msg.method === 'string') this.handleNotification(msg.method, msg.params);
+  /** Server requests and notifications; responses are settled by the RPC core. */
+  private onMessage(msg: JsonObject): void {
+    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+      this.respondToServerRequest(msg.id, msg.method);
+      return;
     }
+    if (typeof msg.method === 'string') this.handleNotification(msg.method, msg.params);
   }
 
   private failAll(err: Error): void {
-    for (const pending of this.pending.values()) pending.reject(err);
-    this.pending.clear();
+    this.rpc.failAll(err);
     if (this.titleTurn && !this.titleTurn.completed) this.titleTurn.reject(err);
     this.titleTurn = undefined;
   }
@@ -708,7 +672,7 @@ export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions):
     opts.registerForceClose,
   );
   try {
-    await client.initialize(timeoutMs);
+    await client.initialize(opts.initializeTimeoutMs ?? timeoutMs);
     if (opts.waitForExistingPreview) {
       await client.waitForThreadPreview(opts.threadId, timeoutMs);
     }
@@ -751,4 +715,35 @@ export async function readCodexAppThreadMetadata(
   } finally {
     client.close();
   }
+}
+
+/** Official app-server lifecycle RPC. Read the persisted path first to make
+ * retries idempotent and to prove the exact storage scope before mutation. */
+export async function setCodexAppThreadArchived(opts: {
+  threadId: string; codexHome: string; codexBin: string; archived: boolean;
+  env?: NodeJS.ProcessEnv; timeoutMs?: number;
+}): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 3000;
+  const client = new CodexAppServerProbe(resolveCommand(opts.codexBin), opts.codexHome,
+    { ...opts.env, CODEX_HOME: opts.codexHome });
+  try {
+    await client.initialize(timeoutMs);
+    const result = await client.withTimeout(client.request('thread/read', {
+      threadId: opts.threadId, includeTurns: false,
+    }), timeoutMs, 'thread/read');
+    if (result?.thread?.id !== opts.threadId || typeof result.thread.path !== 'string') {
+      throw new Error('Codex thread identity/path unavailable');
+    }
+    const home = realpathSync(opts.codexHome);
+    const path = realpathSync(result.thread.path);
+    const inside = (name: string): boolean => {
+      const rel = relative(join(home, name), path);
+      return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+    };
+    const archived = inside('archived_sessions');
+    if (!archived && !inside('sessions')) throw new Error('Codex thread is outside the frozen session home');
+    if (archived === opts.archived) return;
+    const method = opts.archived ? 'thread/archive' : 'thread/unarchive';
+    await client.withTimeout(client.request(method, { threadId: opts.threadId }), timeoutMs, method);
+  } finally { client.close(); }
 }

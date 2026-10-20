@@ -74,6 +74,9 @@ describe('session owner reminder state projection', () => {
       'agent_attention',
       'limited',
     ]);
+    // The live TUI-choice producer: a Codex hook-review stuck-warning card.
+    expect(deriveSessionOwnerReminderStates(session({ stuckWarningCardId: 'om_stuck' }))).toContain('tui_prompt');
+    expect(deriveSessionOwnerReminderStates(session({}))).not.toContain('tui_prompt');
     expect(deriveSessionOwnerReminderStates(session({ worker: null, pendingRepo: true }))).toEqual(['pending_repo']);
     expect(deriveSessionOwnerReminderStates(session({ worker: null, lastScreenStatus: 'limited' }))).toEqual(['dormant']);
   });
@@ -171,6 +174,33 @@ describe('SessionOwnerReminderController', () => {
     await controller.scan([ds], cfg, 30 * 60_000);
     expect(send).not.toHaveBeenCalled();
     await controller.scan([ds], cfg, 60 * 60_000);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('reminds for a pending Codex stuck-warning card and stops once it is resolved', async () => {
+    // Regression: the state used to read only tuiPromptCardId, whose sole
+    // producer (ScreenAnalyzer) was removed, so selecting it never fired.
+    let records: Record<string, SessionOwnerReminderRecord> = {};
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new SessionOwnerReminderController({
+      load: () => records,
+      save: next => { records = structuredClone(next); },
+      send,
+      canSend: () => true,
+    });
+    const cfg = { enabled: true, intervalMinutes: 30, text: 'ping', states: ['tui_prompt'] as const };
+    const ds = session({ lastScreenStatus: 'working', lastMessageAt: 0, stuckWarningCardId: 'om_stuck_1' });
+    await controller.scan([ds], cfg, 0);
+    await controller.scan([ds], cfg, 30 * 60_000);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    ds.stuckWarningCardId = 'om_stuck_2'; // first card resolved, a new one posted
+    await controller.scan([ds], cfg, 31 * 60_000);
+    await controller.scan([ds], cfg, 45 * 60_000);
+    expect(send).toHaveBeenCalledTimes(1); // fresh quiet period for the new card
+
+    ds.stuckWarningCardId = undefined; // resolved: nothing left to remind about
+    await controller.scan([ds], cfg, 120 * 60_000);
     expect(send).toHaveBeenCalledTimes(1);
   });
 

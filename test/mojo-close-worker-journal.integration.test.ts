@@ -34,7 +34,7 @@
  * Run:  pnpm vitest run test/mojo-close-worker-journal.integration.test.ts
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -112,32 +112,6 @@ const APP_ID = 'app';
 const HOOK = resolve('test/fixtures/mojo-e2e-destroy-hook.ts');
 
 /**
- * Does this tree carry the split `admission` contract (review note 3)?
- *
- * The two cases below assert a field that only exists once close_result reports
- * `admission` separately from `recovery`. Detected instead of assumed so this
- * file stays honest when run on a tree that predates it: a hard failure there
- * would say "the fence is broken" when the truth is "the contract is not in this
- * tree yet", and silently deleting the cases would hide the gap entirely.
- */
-/**
- * Does the DURABLE journal persist the exact verdict (review note 4)?
- *
- * Keyed on `commitOnly`, which only the journal block declares. An earlier
- * attempt matched `recovery?:` and silently hit the pre-existing close_result
- * IPC type instead, so the guard read "present" on a tree where the journal has
- * no verdict at all — a guard that lies is worse than no guard.
- */
-const HAS_JOURNAL_VERDICT = readFileSync(
-  resolve('src/types.ts'),
-  'utf-8',
-).includes('commitOnly?: boolean');
-const HAS_ADMISSION_CONTRACT = readFileSync(
-  resolve('src/adapters/backend/types.ts'),
-  'utf-8',
-).includes("admission?: 'restorable' | 'fenced'");
-
-/**
  * Did the daemon try to ROLL BACK? This is the one observable that stays sharp
  * across the whole review series.
  *
@@ -177,6 +151,7 @@ interface CloseResultWire {
  * boundary, independently of how the daemon chose to interpret it.
  */
 let closeResults: CloseResultWire[] = [];
+let closeRequestIds: string[] = [];
 
 async function waitFor(
   predicate: () => boolean,
@@ -189,6 +164,61 @@ async function waitFor(
     await new Promise<void>(r => setTimeout(r, 50));
   }
   throw new Error(describeFailure());
+}
+
+/**
+ * Await THIS test's `close_result`, then return it.
+ *
+ * `close_result` reaches the test through an extra `child.on('message')`
+ * observer, which is NOT synchronised with `closeSession()` resolving. Under CI
+ * load the message lands after the await returns, so reading `closeResults`
+ * synchronously saw `[]` and every field assertion degraded into
+ * `undefined === <expected>` -- the intermittent `expected undefined to be
+ * 'retryable'` that made this file flaky on the blocking `build` leg.
+ *
+ * Waiting on `closeResults.length > 0` is NOT enough: the array is shared across
+ * tests and each test boots its own child, so a late message from an ALREADY
+ * KILLED child can satisfy that predicate and hand the next test a verdict from
+ * the previous one (observed: a probe that delayed the push turned this into
+ * `expected 'uncertain' to be 'retryable'`, borrowing a neighbour's verdict
+ * rather than reporting a missing message).
+ *
+ * Waiting for "a message that arrived after this close" is also not enough: two
+ * late messages from a dead child -- one landing after the snapshot, one right
+ * behind it -- still satisfy that. So key on identity instead: the daemon sends
+ * `{ type: 'close', requestId }` and the worker echoes that id back on
+ * `close_result`, so waiting for THAT id is the only predicate a neighbour's
+ * wire cannot satisfy.
+ */
+async function closeAndAwaitWire(
+  sessionId: string,
+): Promise<{ result: Awaited<ReturnType<typeof closeSession>>; wire: CloseResultWire | undefined }> {
+  const seenIds = new Set(closeRequestIds);
+  const result = await closeSession(sessionId);
+  // The requestId the daemon just sent for THIS close, if it reached the worker.
+  //
+  // Both callers currently go through the explicit-close path, which always sends
+  // a requestId, so the `undefined` branch below is dead code today. It is kept
+  // as a guard for a future close path that sends none: there is no id to key on
+  // there, so it can only fall back to the weaker "any message arrived" predicate
+  // -- i.e. it re-opens the neighbour-verdict hole described above. If such a path
+  // appears, prefer giving it an id over relying on this branch. The failure
+  // message prints `requestId=never sent` so the weak branch is identifiable.
+  const mine = closeRequestIds.find(id => !seenIds.has(id));
+  await waitFor(
+    () => (mine !== undefined
+      ? closeResults.some(r => r.requestId === mine)
+      : closeResults.length > 0),
+    10_000,
+    () => `no close_result crossed the worker boundary for this close`
+      + ` (requestId=${mine ?? 'never sent'})\n${workerLogs.join('')}`,
+  );
+  return {
+    result,
+    wire: mine !== undefined
+      ? closeResults.find(r => r.requestId === mine)
+      : closeResults.at(-1),
+  };
 }
 
 /**
@@ -312,7 +342,12 @@ exit 0
   // real child.send still delivers it.
   const realSend = child.send.bind(child);
   (child as unknown as { send: ChildProcess['send'] }).send = ((message: unknown, ...rest: unknown[]) => {
-    sentToWorker.push((message as { type?: string })?.type ?? 'unknown');
+    const sent = message as { type?: string; requestId?: string };
+    sentToWorker.push(sent?.type ?? 'unknown');
+    // The explicit-close path sends `{ type: 'close', requestId }` and the worker
+    // echoes that id back on `close_result`; recording it lets a test wait for
+    // ITS OWN wire instead of whatever landed in the shared array.
+    if (sent?.type === 'close' && sent.requestId) closeRequestIds.push(sent.requestId);
     return (realSend as (...args: unknown[]) => boolean)(message, ...rest);
   }) as ChildProcess['send'];
 
@@ -393,6 +428,7 @@ beforeEach(() => {
   workerLogs.length = 0;
   sentToWorker = [];
   closeResults = [];
+  closeRequestIds = [];
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-mojo-e2e-'));
   workerRoot = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-e2e-worker-')));
   previousDataDir = config.session.dataDir;
@@ -417,7 +453,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   setActiveSessionsRegistry(new Map());
   config.session.dataDir = previousDataDir;
-  sessionStore.init();
+  sessionStore.init('test-app');
   rmSync(dataDir, { recursive: true, force: true });
   rmSync(workerRoot, { recursive: true, force: true });
 });
@@ -444,10 +480,9 @@ describe('mojo close: a local residual must survive the worker IPC boundary', ()
   it('carries residual across real IPC and publishes a residual close, not a plain one', async () => {
     const { sessionId } = await bootRealWorker({ mode: 'localResidual', cancellable: true });
 
-    const result = await closeSession(sessionId);
+    const { result, wire } = await closeAndAwaitWire(sessionId);
 
     // 1. The producer side: the field crossed the process boundary at all.
-    const wire = closeResults.at(-1);
     expect(wire).toBeDefined();
     expect(wire?.ok).toBe(true);
     expect(wire?.residual).toBe('local_subtree_boundary_unproven');
@@ -492,11 +527,8 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     // reads this row to decide whether re-cancelling is required, forbidden or
     // merely useless, so recording a thrown teardown as `retryable` tells the
     // next daemon it may re-open admission on a lineage whose remote cancel may
-    // already have completed. Guarded because `recovery` is only persisted once
-    // the durable-verdict work (review note 4) is in the tree.
-    if (HAS_JOURNAL_VERDICT) {
-      expect(durableJournal(sessionId)).toMatchObject({ recovery: 'uncertain' });
-    }
+    // already have completed.
+    expect(durableJournal(sessionId)).toMatchObject({ recovery: 'uncertain' });
     // The row stays active, which is what keeps its device-isolation blocker.
     expect(sessionStore.getSession(sessionId)?.status).toBe('active');
   }, 60_000);
@@ -562,7 +594,7 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     expect(sessionStore.getSession(sessionId)?.status).toBe('active');
   }, 60_000);
 
-  it.skipIf(!HAS_ADMISSION_CONTRACT)('keeps writes fenced when recovery says retryable but admission says fenced', async () => {
+  it('keeps writes fenced when recovery says retryable but admission says fenced', async () => {
     // The case where the two answers legitimately DISAGREE, and the only one
     // that can catch a daemon which re-derives `admission` from `recovery`.
     //
@@ -573,12 +605,12 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     // a credentialed process may still be alive (so writes must stay fenced).
     const { sessionId } = await bootRealWorker({ mode: 'unscannable' });
 
-    const result = await closeSession(sessionId);
+    const { result, wire } = await closeAndAwaitWire(sessionId);
 
     expect(result.ok).toBe(false);
     // Proof both fields crossed the process boundary independently, i.e. that
     // `admission` is NOT a function of `recovery`.
-    const wire = closeResults.at(-1);
+    expect(wire).toBeDefined();
     expect(wire?.recovery).toBe('retryable');
     expect(wire?.admission).toBe('fenced');
     // The decisive consequence: a retryable close whose admission is fenced must

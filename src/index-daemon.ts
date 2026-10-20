@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv, stripDashboardH5Env } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv, stripCompanionStartupEnv, stripDashboardH5Env } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -26,6 +26,10 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // redactChildEnv()/tmux-pane-unset strip at every CLI-child boundary stays in
 // place as the second layer of defense.
 stripDashboardH5Env(process.env);
+// The closed companion API is served only by the dashboard fleet member. Bot
+// daemons must not retain its credential path or bound-bot authority, and
+// workers inherit from this process, so remove both before daemon code loads.
+stripCompanionStartupEnv(process.env);
 
 // A daemon is never a session. pm2 startOrRestart injects the caller's
 // environment into restarted apps, so a `botmux restart` issued from inside a

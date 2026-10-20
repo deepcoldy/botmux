@@ -1,11 +1,11 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
 const KIMI_FIRST_WRITE_SETTLE_MS = 250;
 const kimiFirstWriteSeen = new WeakSet<PtyHandle>();
 
@@ -65,7 +65,7 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          const pasted = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+          const pasted = wrapBracketedPaste(content);
           pty.write(pasted);
           await delay(1000);
           pty.write('\r');
@@ -79,12 +79,6 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
-    modelChoices: [
-      'kimi-k2.5',
-      'kimi-k2.5-code',
-      'kimi-k2.7-code',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['kimi'],
   };
 }
-
-export const create = createKimiAdapter;

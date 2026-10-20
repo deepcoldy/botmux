@@ -329,8 +329,8 @@ describe('deliberate-silence closure (turn_terminal nothing_to_send)', () => {
     await vi.waitFor(() => {
       const calls = (buildStreamingCard as any).mock.calls;
       expect(calls.length).toBeGreaterThan(0);
-      // silentIdle is the last positional arg of buildStreamingCard.
-      expect(calls[calls.length - 1][19]).toBe(true);
+      // idle label is the 20th positional arg of buildStreamingCard.
+      expect(calls[calls.length - 1][19]).toBe('silent');
     });
   });
 
@@ -399,14 +399,15 @@ describe('deliberate-silence closure (turn_terminal nothing_to_send)', () => {
 });
 
 /**
- * Every live-card rebuild must carry the silent-idle flag, or an unrelated
- * patch (display-mode toggle, frozen-card migration, runtime badge) silently
- * reverts 「已处理 · 判定无需回复」 back to 「等待输入」 — the exact regression
- * this feature exists to prevent. Enforced structurally because the flag is a
- * positional argument that is trivially forgotten at a NEW call site: a
- * behavioral test only covers the paths someone remembered to write.
+ * Every live-card rebuild must carry the idle-card label (silent / completed),
+ * or an unrelated patch (display-mode toggle, frozen-card migration, runtime
+ * badge) silently reverts 「已处理 · 判定无需回复」/「已完成」 back to 「等待输入」
+ * — the exact regression this feature exists to prevent. Enforced structurally
+ * because the label is a positional argument that is trivially forgotten at a
+ * NEW call site: a behavioral test only covers the paths someone remembered to
+ * write.
  */
-describe('buildStreamingCard call sites all pass silentIdleCardFlag', () => {
+describe('buildStreamingCard call sites all pass idleCardLabel', () => {
   const files = [
     'src/core/worker-pool.ts',
     'src/daemon.ts',
@@ -438,7 +439,12 @@ describe('buildStreamingCard call sites all pass silentIdleCardFlag', () => {
       const calls = callArgs(readFileSync(file, 'utf8'));
       expect(calls.length).toBeGreaterThan(0);
       const missing = calls
-        .filter(c => !/(?:silentIdleCardFlag\(|\.silentIdle\b)/.test(c.args))
+        // Accepted forms: the live-session resolver `idleCardLabel(ds)`, the
+        // frozen-card resolver `frozenIdleLabel(frozen)`, or beginNewTurn's
+        // pre-captured `previousIdleLabel` (captured before the session flags
+        // are cleared). Legacy `silentIdleCardFlag(` / `.silentIdle` stay
+        // accepted so an older call site is not flagged as a miss.
+        .filter(c => !/(?:idleCardLabel\(|frozenIdleLabel\(|previousIdleLabel\b|silentIdleCardFlag\(|\.silentIdle\b|\.idleLabel\b)/.test(c.args))
         .map(c => `${file}:${c.line}`);
       expect(missing).toEqual([]);
     });

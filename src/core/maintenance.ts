@@ -57,7 +57,21 @@ import {
   type BinaryInstallShape,
   type UpdateStrategy,
 } from './binary-self-update.js';
+import { compareVersions } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
+import {
+  captureDetachedRestartEnvFallback,
+  scrubDetachedRestartEnvRefresh,
+  type RestartEnvFallback,
+} from './restart-env-refresh.js';
+import { DAEMON_ENV_KEYS } from '../cli/daemon-lifecycle-env.js';
+import { bindRestartLeaseTo } from '../services/restart-intent-store.js';
+import { readFleetDaemonEnvFile, resolveFleetDaemonEnv, type FleetDaemonEnvFileRead } from './fleet-runtime.js';
+export {
+  DETACHED_RESTART_ENV_FALLBACK,
+  DETACHED_RESTART_ENV_REFRESH,
+  consumeDetachedRestartEnvRefresh,
+} from './restart-env-refresh.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -268,11 +282,12 @@ export async function applyBotmuxUpdate(
   if (strategy.kind === 'unsupported') {
     throw new UnsupportedGlobalInstallError('unknown', process.execPath);
   }
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
+    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target}` };
   }
-  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, `botmux@${version}`);
+  const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
+  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
   installLatestBotmuxSync(plan);
   return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
 }
@@ -335,45 +350,95 @@ export function buildRestartLauncher(
   return { cmd: node, args: entryArgs };
 }
 
-export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function detachedRestartEnv(
+  inheritedEnv: NodeJS.ProcessEnv = process.env,
+  envFileRead: FleetDaemonEnvFileRead = readFleetDaemonEnvFile(),
+): NodeJS.ProcessEnv {
   const env = { ...inheritedEnv };
   // Defense in depth for dashboard/daemon processes resurrected from a stale
-  // PM2 snapshot. `botmux restart` checks workflow mode before pm2Env(), so it
+  // managed-runtime snapshot. `botmux restart` checks workflow mode before
+  // constructing the fresh fleet environment, so it
   // must not inherit node-worker identity even if a host boot scrub regresses.
   scrubWorkflowWorkerEnv(env);
   // The dashboard process legitimately holds the Feishu H5 credential family
   // (index-dashboard.ts dotenv-loads it from ~/.botmux/.env — deliberately NOT
-  // baked into the PM2 env block, see DAEMON_ENV_KEYS), so a detached restart
+  // included in the shared fleet env, see DAEMON_ENV_KEYS), so a detached restart
   // it spawns would inherit the APP_SECRET. The restart driver has no consumer
-  // for any of it and must not carry it toward pm2; the fresh dashboard reloads
-  // the family from .env itself. Not part of the DAEMON_ENV_KEYS mirror below —
-  // this is credential hygiene, not baked-snapshot invalidation.
+  // for any of it and must not carry it toward the fleet; the fresh dashboard reloads
+  // the family from .env itself. This is credential hygiene, separate from the
+  // non-secret lifecycle snapshot retained below.
   stripDashboardH5Env(env);
-  // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
-  // fresh CLI reload these settings from the file.
-  //
-  // This list MUST mirror DAEMON_ENV_KEYS in src/cli/daemon-lifecycle-env.ts:
-  // every key baked into the PM2 env block there has to be stripped here, or a
-  // detached restart (dashboard update/restart, maintenance auto-update) keeps
-  // the stale baked value instead of reloading from the file. Kept as a local
-  // literal so this stays importable from the daemon/dashboard without pulling
-  // in the CLI layer; test/maintenance.test.ts iterates the exported
-  // DAEMON_ENV_KEYS and fails the moment the two drift apart.
-  for (const key of [
-    'WEB_EXTERNAL_HOST',
-    'BOTMUX_DASHBOARD_EXTERNAL_HOST',
-    'BOTMUX_DASHBOARD_HOST',
-    'BOTMUX_DASHBOARD_PORT',
-    'BOTMUX_DAEMON_IPC_BASE_PORT',
-    'BOTMUX_DASHBOARD_PUBLIC_READONLY',
-    'BOTMUX_PUBLIC_URL',
-    // Dashboard control-audit destination + terminal takeover lease TTL.
-    'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
-    'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
-    // Merlin Devbox auto-export switch.
-    'BOTMUX_DEVBOX_AUTO_EXPORT',
-  ]) delete env[key];
+  // Resolve the persisted lifecycle snapshot before the cross-version handoff.
+  // Old receivers only understand ordinary env keys. New receivers authenticate
+  // this same allowlisted snapshot by successfully binding the restart lease.
+  const snapshot = resolveFleetDaemonEnv(inheritedEnv, envFileRead, {
+    refreshPersistedEnv: true,
+    readFailureFallback: captureDetachedRestartEnvFallback(inheritedEnv),
+  });
+  for (const key of DAEMON_ENV_KEYS) env[key] = snapshot[key];
+  // A lease-authenticated new receiver captures this allowlisted outer snapshot
+  // before deleting it. A legacy receiver uses the same keys directly. Do not
+  // send newer one-shot fields: an old supervisor would persist unknown fields
+  // into its long-lived children. Scrub stale copies inherited from an older
+  // intermediate fleet instead.
+  scrubDetachedRestartEnvRefresh(env);
   return env;
+}
+
+export interface RestartDriverContext {
+  refreshPersistedEnv: boolean;
+  readFailureFallback?: RestartEnvFallback;
+}
+
+/**
+ * Validate a detached restart handoff before granting refresh semantics. Old
+ * senders may know no marker or payload, so a successfully bound lease is the
+ * stable cross-version identity signal. The allowlisted outer snapshot is the
+ * fallback understood by both old and new receivers.
+ */
+export function prepareRestartDriverContext(
+  env: NodeJS.ProcessEnv = process.env,
+  pid = process.pid,
+  nowMs = Date.now(),
+): RestartDriverContext {
+  const restartLeaseId = env.BOTMUX_RESTART_LEASE_ID;
+  const restartLeaseDir = env.BOTMUX_RESTART_LEASE_DIR;
+  const outerFallback = captureDetachedRestartEnvFallback(env);
+  scrubDetachedRestartEnvRefresh(env);
+  delete env.BOTMUX_RESTART_LEASE_ID;
+  delete env.BOTMUX_RESTART_LEASE_DIR;
+
+  let leaseBound = false;
+  if (restartLeaseDir && !restartLeaseId) {
+    throw new Error('restart driver lease id is missing');
+  }
+  if (restartLeaseId) {
+    if (!restartLeaseDir) throw new Error('restart driver lease directory is missing');
+    withFileLockSync(globalInstallUpdateLockTargetIn(restartLeaseDir), () => {
+      leaseBound = bindRestartLeaseTo(restartLeaseDir, restartLeaseId, pid, nowMs);
+    });
+    if (!leaseBound) throw new Error('failed to bind restart driver lease');
+  }
+
+  if (leaseBound) {
+    for (const key of DAEMON_ENV_KEYS) {
+      // Companion start/restart flags are one-shot authority for the target
+      // dashboard and must survive the lease handoff; unlike ordinary fleet
+      // settings they cannot be recovered from a stale persisted snapshot.
+      if ((key === 'BOTMUX_COMPANION_SECRET_FILE' || key === 'BOTMUX_COMPANION_BOT_APP_ID')
+        && env[key]?.trim()) continue;
+      delete env[key];
+    }
+    return {
+      refreshPersistedEnv: true,
+      readFailureFallback: outerFallback,
+    };
+  }
+  const sessionRefresh = Boolean(env.BOTMUX_SESSION_ID?.trim());
+  return {
+    refreshPersistedEnv: sessionRefresh,
+    ...(sessionRefresh ? { readFailureFallback: captureDetachedRestartEnvFallback(env) } : {}),
+  };
 }
 
 function setsidAvailable(): boolean {
@@ -467,12 +532,30 @@ export function resolveRestartInvocation(
   launcherPath: string,
   launcherExists: boolean,
   localDev = false,
+  updatedBinary?: string,
 ): { executable: string; selfDispatching: boolean } {
+  if (updatedBinary) return { executable: updatedBinary, selfDispatching: true };
   const executable = resolveStandaloneRestartExecutable(
     standalone, execPath, shape, launcherPath, launcherExists, localDev,
   );
   // The compiled binary IS the CLI; the launcher shim `exec`s it with "$@".
   return { executable, selfDispatching: standalone || executable === launcherPath };
+}
+
+/**
+ * 校验待重启目标仍是可用的官方二进制，返回它实际报告的版本。精确匹配是安装后的
+ * 常态；若重启前被带外升级（如手动跑了更新的 install.sh），接受不低于预期的版
+ * 本并交调用方刷新 pending；更旧、无法执行或不报告合法 semver 版本一律拒绝。
+ */
+export function verifyBinaryRestartTarget(update: { target: string; version: string }): string {
+  const result = spawnSync(update.target, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  });
+  const actual = result.error || result.status !== 0 ? '' : result.stdout.trim();
+  if (actual && compareVersions(actual, update.version) >= 0) return actual;
+  throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期不低于 ${update.version}，实际 ${actual || '无法执行'}）`);
 }
 
 /**
@@ -488,6 +571,7 @@ export function spawnDetachedRestart(
   reason: string,
   activePackageRoot?: string,
   restartLeaseId?: string,
+  updatedBinary?: string,
 ): ReturnType<typeof spawn> {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
@@ -516,13 +600,14 @@ export function spawnDetachedRestart(
     launcher,
     existsSync(launcher),
     isLocalDevInstall(),
+    updatedBinary,
   );
   const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), selfDispatching);
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
     env: {
-      ...detachedRestartEnv(),
+      ...detachedRestartEnv(process.env),
       ...(restartLeaseId ? {
         BOTMUX_RESTART_LEASE_ID: restartLeaseId,
         BOTMUX_RESTART_LEASE_DIR: config.session.dataDir,
@@ -599,7 +684,7 @@ function productionDeps(): MaintenanceDeps {
     runUpdate: () => {
       installedTo = '';
       const strategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (strategy.kind === 'unsupported') {
+      if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') {
         throw new UnsupportedGlobalInstallError('unknown', process.execPath);
       }
       if (strategy.kind === 'self-replace') {

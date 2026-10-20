@@ -93,6 +93,17 @@ export interface V3ProgressView {
   upstreamNonHostFinished?: boolean;
   /** Number only: external payloads and provider errors never enter the card. */
   uncertainHostEffectCount?: number;
+  /**
+   * Most recent live terminal session reported by a `nodeSessionReady` event.
+   * Lets the card deep-link straight into the (now mobile-friendly) terminal
+   * page instead of forcing the SPA round-trip. Absent for runs that never
+   * span a worker (pure gates / finished before any session came up).
+   */
+  terminal?: {
+    sessionId: string;
+    webPort?: number;
+    viewToken?: string;
+  };
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
   updatedAt: string;
 }
@@ -286,6 +297,33 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     .map((node) => node.id)
     .filter((nodeId) => refreshed.has(nodeId));
 
+  // Latest CURRENT live terminal session across all nodes. The final snapshot
+  // is the lifecycle fence: a terminal node, a superseded instance, or a ready
+  // event from an obsolete retry attempt cannot keep a card deep-link alive.
+  // Only outer-node sessions are surfaced (inner loop bodies stay private).
+  let terminal: V3ProgressView['terminal'];
+  for (const event of events) {
+    if (event.type !== 'nodeSessionReady' || !outerIds.has(event.nodeId)) continue;
+    const nodeState = snapshot.nodes.get(event.nodeId);
+    const effectiveInstanceMatches = event.instanceId
+      ? nodeState?.effectiveInstanceId === event.instanceId
+      : nodeState?.effectiveInstanceId === undefined;
+    const currentAttempt = snapshot.attempts.get(event.instanceId ?? event.nodeId);
+    if (
+      nodeState?.status === 'running' &&
+      effectiveInstanceMatches &&
+      currentAttempt === event.attemptId &&
+      event.sessionInfo.sessionId &&
+      event.sessionInfo.viewToken
+    ) {
+      terminal = {
+        sessionId: event.sessionInfo.sessionId,
+        ...(event.sessionInfo.webPort ? { webPort: event.sessionInfo.webPort } : {}),
+        viewToken: event.sessionInfo.viewToken,
+      };
+    }
+  }
+
   // runStarted is a durable start intent, not evidence that any worker/gate
   // actually began. A retry/revisit with every node temporarily pending is
   // still active because it has journal activity beyond that boundary.
@@ -316,6 +354,7 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     ...(snapshot.uncertainHostEffects && snapshot.uncertainHostEffects.length > 0
       ? { uncertainHostEffectCount: snapshot.uncertainHostEffects.length }
       : {}),
+    ...(terminal ? { terminal } : {}),
     updatedAt: lastTs === undefined ? envelope.createdAt : new Date(lastTs).toISOString(),
   };
 }

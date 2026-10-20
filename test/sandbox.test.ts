@@ -9,9 +9,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { dirname, join } from 'node:path';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -60,6 +61,37 @@ describe('credential-only managed-origin carve-out', () => {
     expect(hideParentAt).toBeGreaterThan(-1);
     expect(exposeOwnAt).toBe(hideParentAt + 2);
     expect(args).not.toContain(`${parent}/origin-${'b'.repeat(64)}`);
+  });
+
+  it('groups sibling private directories by parent so one tmpfs does not mask another', () => {
+    const parent = '/srv/botmux/data/read-isolation';
+    const ownA = `${parent}/origin-${'a'.repeat(64)}`;
+    const ownB = `${parent}/origin-${'b'.repeat(64)}`;
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/srv/botmux/device-authority'],
+      hideFiles: ['/srv/botmux/.dashboard-secret'],
+      privateReadonlyDirectories: [
+        { parent, directory: ownB },
+        { parent, directory: ownA },
+        { parent, directory: ownA },
+      ],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    const parentTmpfs = args
+      .map((value, index) => value === '--tmpfs' && args[index + 1] === parent ? index : -1)
+      .filter(index => index >= 0);
+    const binds = args
+      .map((value, index) => value === '--ro-bind'
+        && args[index + 1].startsWith(`${parent}/origin-`)
+        && args[index + 1] === args[index + 2]
+        ? args[index + 1]
+        : null)
+      .filter((value): value is string => value !== null);
+    expect(parentTmpfs).toHaveLength(1);
+    expect(binds).toEqual([ownA, ownB]);
+    expect(parentTmpfs[0]).toBeLessThan(args.indexOf('--chdir'));
   });
 
   it('rejects a private directory outside the hidden parent', () => {
@@ -165,6 +197,7 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       sessionId: 'binlink', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
+      tempDir: join(dir, 'session-temp'),
     });
     // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
     // only assert the canonicalization when it actually produced a plan.
@@ -175,10 +208,264 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     expect(execTarget).toBe(realpathSync(linkBin)); // canonical, not the lexical symlink
     expect(execTarget).not.toBe(linkBin);
     expect(r.args.slice(dashDash + 2)).toEqual(['--v']); // cliArgs preserved verbatim
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) {
+      const index = r.args.indexOf(key);
+      expect(index).toBeGreaterThan(0);
+      expect(r.args[index - 1]).toBe('--setenv');
+      expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
+    }
     r.cleanup();
   });
 });
 
+describe('prepareDirectSandbox mcode data alias', () => {
+  function fixture() {
+    const root = mkdtempSync(join(tmpdir(), 'sbx-mcode-alias-'));
+    const data = join(root, 'native-data');
+    mkdirSync(data);
+    const target = realpathSync(data);
+    const lexicalHome = join(root, 'lexical-home');
+    symlinkSync(root, lexicalHome);
+    const alias = join(lexicalHome, 'native-data');
+    const opts = { sessionId: 'mcode-alias', dataDir: join(root, 'botmux'),
+      policy: { rules: [{ path: target, access: 'readWrite' as const, source: 'internal' as const }], net: true, writeRegexes: [] },
+      chdir: target, home: root, cliBin: '/bin/true', cliArgs: [] };
+    return { root, target, alias, opts };
+  }
+  it.each([false, true])('preserves only the granted native data alias (args file: %s)', useBwrapArgsFile => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
+      if (!plan) return;
+      const args = plan.argsFile ? readFileSync(plan.argsFile, 'utf8').split('\0') : plan.args;
+      const aliasAt = args.findIndex((arg, i) => arg === '--symlink' && args[i + 2] === f.alias);
+      expect(aliasAt).toBeGreaterThan(-1);
+      expect(args[aliasAt + 1]).toBe(f.target);
+      const bindAt = args.findIndex((arg, i) => arg === '--bind' && args[i + 1] === f.target);
+      expect(bindAt).toBeGreaterThan(aliasAt);
+      expect(args[bindAt + 2]).toBe(f.target);
+      // No host bind of the lexical home or additional credential directory.
+      expect(args.filter((arg, i) => ['--bind', '--ro-bind'].includes(args[i - 1])).includes(f.alias)).toBe(false);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each([false, true])('does not add an alias for other CLIs or a canonical data path: %s', canonical => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
+      if (!plan) return;
+      expect(plan.args).not.toContain(f.alias);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each(['missing', 'parent-only', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    const baseline = prepareDirectSandbox(f.opts);
+    try {
+      if (!baseline) return;
+      baseline.cleanup();
+      const rules = scenario === 'missing' ? [] : scenario === 'parent-only'
+        ? [{ path: dirname(f.target), access: 'readWrite' as const, source: 'user' as const }]
+        : [...f.opts.policy.rules,
+        { path: scenario === 'denied' ? f.target : f.alias, access: 'deny' as const, source: 'user' as const }];
+      expect(() => prepareDirectSandbox({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
+      expect(existsSync(join(f.opts.dataDir, 'sandboxes', f.opts.sessionId))).toBe(false);
+    } finally { baseline?.cleanup(); rmSandboxScratch(f.root); }
+  });
+});
+
+describe('prepareDirectSandbox tmux argument transport', () => {
+  it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-tmux-args-'));
+    const dataDir = join(root, 'data');
+    mkdirSync(dataDir);
+    const policyRoot = join(root, 'policy');
+    mkdirSync(policyRoot);
+    const rules = Array.from({ length: 360 }, (_, index) => {
+      const path = join(policyRoot, `entry-${index}-${'x'.repeat(32)}`);
+      mkdirSync(path);
+      return { path, access: 'readOnly' as const, source: 'user' as const };
+    });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'long-tmux',
+        dataDir,
+        policy: { rules, net: true, writeRegexes: [] },
+        chdir: policyRoot,
+        home: root,
+        cliBin: '/bin/printf',
+        cliArgs: ['%s', 'space value', '$literal', 'line\nbreak'],
+        useBwrapArgsFile: true,
+      });
+      if (!plan) return;
+
+      expect(plan.argsFile).toBeDefined();
+      expect(statSync(plan.argsFile!).mode & 0o777).toBe(0o600);
+      expect(Buffer.byteLength([plan.bin, ...plan.args].join('\0'))).toBeLessThan(8 * 1024);
+      expect(plan.args.slice(plan.args.indexOf('--') + 1)).toEqual([
+        realpathSync('/bin/printf'), '%s', 'space value', '$literal', 'line\nbreak',
+      ]);
+      const optionBytes = readFileSync(plan.argsFile!);
+      expect(optionBytes.length).toBeGreaterThan(16 * 1024);
+      expect(optionBytes.includes(Buffer.from('space value'))).toBe(false);
+      plan.cleanup();
+      expect(existsSync(join(dataDir, 'sandboxes', 'long-tmux'))).toBe(false);
+    } finally {
+      plan?.cleanup();
+      if (plan?.argsFile) expect(existsSync(plan.argsFile)).toBe(false);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('reclaims the sandbox tree if compact launch preparation rejects invalid argv', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-tmux-invalid-'));
+    const dataDir = join(root, 'data');
+    const workingDir = join(root, 'work');
+    mkdirSync(dataDir);
+    mkdirSync(workingDir);
+    const sessionRoot = join(realpathSync(dataDir), 'sandboxes', 'invalid-argv');
+    try {
+      expect(() => prepareDirectSandbox({
+        sessionId: 'invalid-argv',
+        dataDir,
+        policy: {
+          rules: [{ path: workingDir, access: 'readWrite', source: 'internal' }],
+          net: true,
+          writeRegexes: [],
+        },
+        chdir: workingDir,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: ['invalid\0argument'],
+        useBwrapArgsFile: true,
+      })).toThrow(/NUL/);
+      expect(existsSync(sessionRoot)).toBe(false);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
+
+
+describe('sandbox tree across a detach-style worker exit', () => {
+  it('outlives the worker only for a persistent pane that owns a tree', () => {
+    for (const backendType of ['tmux', 'zellij', 'herdr', 'zmx']) {
+      expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType, persistentSessionName: 'bmx-1' })).toBe(true);
+    }
+    // PTY owns its CLI: it dies with the worker, so its tree is cleaned up.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'pty', persistentSessionName: 'bmx-1' })).toBe(false);
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'tmux', persistentSessionName: undefined })).toBe(false);
+    // Unsandboxed: nothing to keep.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: false, backendType: 'tmux', persistentSessionName: 'bmx-1' })).toBe(false);
+  });
+
+  it('re-serves the outbox a live pane bound and never recreates a lost one', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-reattach-'));
+    const sessionId = 'live-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const outbox = join(sessionRoot, 'outbox');
+    try {
+      // Tree without its outbox (the pane's bind source is gone): a new
+      // directory would be an inode the pane can never see.
+      mkdirSync(join(sessionRoot, 'empties'), { recursive: true });
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      expect(existsSync(outbox)).toBe(false);
+      // A symlinked outbox is not the directory the pane bound either.
+      const elsewhere = join(root, 'elsewhere');
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, outbox);
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      rmSync(outbox);
+      // The preserved outbox is handed back as-is.
+      mkdirSync(outbox);
+      const inode = statSync(outbox).ino;
+      const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+      expect(plan?.outbox).toBe(join(realpathSync(root), 'sandboxes', sessionId, 'outbox'));
+      expect(statSync(plan!.outbox).ino).toBe(inode);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
+
+describe('sandbox tree cleanup', () => {
+  it.each(['reattach', 'sweep'] as const)('removes a mode-000 mask during %s cleanup', method => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-'));
+    const sessionId = 'closed-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const empty = join(sessionRoot, 'empty');
+    mkdirSync(empty, { recursive: true });
+    mkdirSync(join(sessionRoot, 'outbox'));
+    chmodSync(empty, 0o000);
+    try {
+      if (method === 'reattach') {
+        const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+        expect(plan).not.toBeNull();
+        plan!.cleanup();
+      } else {
+        const old = new Date(Date.now() - 120_000);
+        utimesSync(sessionRoot, old, old);
+        // An active session must retain its mask and outbox.
+        sweepOrphanSandboxes(root, new Set([sessionId]));
+        expect(existsSync(sessionRoot)).toBe(true);
+        expect(statSync(empty).mode & 0o777).toBe(0);
+        sweepOrphanSandboxes(root, new Set());
+      }
+      expect(existsSync(sessionRoot)).toBe(false);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('does not traverse a replaced session root during orphan cleanup', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-root-link-'));
+    const sessionRoot = join(root, 'sandboxes', 'replaced-session');
+    const outside = join(root, 'outside');
+    const outsideEmpty = join(outside, 'empty');
+    mkdirSync(join(root, 'sandboxes'));
+    mkdirSync(outsideEmpty, { recursive: true });
+    symlinkSync(outside, sessionRoot);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(outside, old, old);
+    try {
+      sweepOrphanSandboxes(root, new Set());
+      expect(existsSync(sessionRoot)).toBe(false);
+      expect(existsSync(outsideEmpty)).toBe(true);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('does not follow a replacement mask symlink during cleanup', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-symlink-'));
+    const sessionId = 'closed-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const outside = join(root, 'outside');
+    mkdirSync(join(sessionRoot, 'outbox'), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep'), 'host data');
+    symlinkSync(outside, join(sessionRoot, 'empty'));
+    try {
+      const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+      expect(plan).not.toBeNull();
+      plan!.cleanup();
+      expect(existsSync(sessionRoot)).toBe(false);
+      expect(readFileSync(join(outside, 'keep'), 'utf8')).toBe('host data');
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
 
 // ── validateRelayRequest: pure schema + flag-allowlist boundary ─────────────
 // Regression for the "sandbox makes host read an arbitrary path" confused-deputy
@@ -207,6 +494,7 @@ describe('validateRelayRequest', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
+      completionProposalFile: 'c.completion-proposal.json',
       attachments: ['a.png'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
@@ -216,6 +504,7 @@ describe('validateRelayRequest', () => {
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
+    expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -243,6 +532,43 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('preserves every validated expected link through the sandbox relay', () => {
+    const first = 'https://example.test/problem';
+    const second = 'https://example.test/problem';
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--expected-link', first, '--expected-link', second, '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--expected-link', first, '--expected-link', second, '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--expected-link', 'not-a-url'],
+    })).toMatchObject({ ok: false, error: 'flag --expected-link must be an http(s) URL' });
+  });
+
+  it('allows only the two cross-principal --as choices through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'independent', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'independent', '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'suggestion'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'suggestion'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'maybe'],
+    })).toMatchObject({ ok: false, error: 'flag --as must be independent or suggestion' });
+  });
+
   it('allows only canonical reply layouts through the sandbox relay', () => {
     for (const layout of ['result', 'progress', 'risk', 'blocked', 'handoff']) {
       expect(validateRelayRequest({
@@ -262,6 +588,31 @@ describe('validateRelayRequest', () => {
         error: 'flag --layout must be result, progress, risk, blocked, or handoff',
       });
     }
+  });
+
+  it('allows only validated urgent modes through the sandbox relay', () => {
+    for (const flag of ['--urgent', '--urgent=app', '--urgent=sms', '--urgent=phone']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: [flag, '--mention-back'],
+      })).toMatchObject({ ok: true, value: { flags: [flag, '--mention-back'] } });
+    }
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--urgent=all'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
+  });
+
+  it('allows final schedule self-removal through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: {
+        flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+      },
+    });
   });
 
   it('accepts a custom card file as a plain outbox basename', () => {
@@ -349,6 +700,7 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);

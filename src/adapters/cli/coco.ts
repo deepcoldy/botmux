@@ -1,17 +1,18 @@
-import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { parseDebugModelsJson } from './model-catalog-json.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
+import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from '../../services/coco-transcript.js';
 import { traeHistoryPath } from '../../services/traex-paths.js';
 import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
 import { TRAE_MIGRATION_DONE_MARKERS } from './traex.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 
 /** Legacy global submit log — CoCo / traecli <0.201.5 appends one JSON line
  *  here on every successful user submit across all sessions (mode:"user").
@@ -119,6 +120,23 @@ function submitPrefix(content: string): string {
   return content.slice(0, 40);
 }
 
+/** CoCo events.jsonl. No `spawn` / `adopt` policy: its path is deterministic from the
+ *  botmux session id (attached even before the file exists) and adopt must warn when
+ *  the session directory is already gone, so both keep dedicated worker branches. */
+export const cocoBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainCocoEvents(path, offset),
+  locate: {
+    bySessionId: sessionId => {
+      const path = cocoEventsPathForSession(sessionId);
+      return existsSync(path) ? path : undefined;
+    },
+    byPid: pid => {
+      const probed = findCocoSessionByPid(pid);
+      return probed && existsSync(probed.eventsPath) ? probed.eventsPath : undefined;
+    },
+  },
+};
+
 export function createCocoAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -127,6 +145,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    bridgeSpec: cocoBridgeSpec,
     // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
     // the codex-style SQLite DBs (fcntl locks don't work unless the dir is bound
     // real). ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl
@@ -141,7 +160,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
@@ -149,6 +168,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       if (!disableCliBypass) args.push('--yolo');
+      // CoCo on traecli shares the low-quota picker; use its long config flag.
+      if (hideRateLimitModelNudge) args.push('--config', 'notice.hide_rate_limit_model_nudge=true');
       if (model && model.trim()) {
         // CoCo expects nested key path for model override. `model=...` exits 1,
         // while `model.name=...` starts correctly.
@@ -242,7 +263,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
         }
       } catch {
         return { submitted: false };
@@ -318,12 +339,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     ensureAskHook() { installCocoAskPlugin(this.resolvedBin); },
     // CoCo/Trae CLI reads the same skill root as the Trae-flavoured adapter.
     skillsDir: '~/.trae/skills',
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'Doubao-Seed-Code',
-      'Gemini-3.1-Pro-Preview',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['coco'],
     // Live 模型枚举：coco 与 traex 共用同一 traecli 二进制（见 coco.ts 顶部
     // 说明），`coco debug models` 输出与 `traex debug models` 同构的 JSON 目录，
     // 复用共享解析。整包可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。
@@ -331,23 +347,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // 任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，picker
     // 回退到上面的 modelChoices。
     async detectModels(): Promise<readonly string[] | null> {
-      try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
-        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-        });
-        const models = parseDebugModelsJson(stdout);
-        return models.length > 0 ? models : null;
-      } catch {
-        return null;
-      }
+      return detectModelsViaExec(this.resolvedBin, ['debug', 'models'], parseDebugModelsJson);
     },
   };
 }
-
-export const create = createCocoAdapter;

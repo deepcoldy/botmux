@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -27,6 +28,22 @@ const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (process.env.FAKE_CODEX_INHERITED_STDIO) {
+  // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
+  spawn(process.execPath, ['-e', `
+    const { appendFileSync } = require('node:fs');
+    const log = entry => appendFileSync(process.argv[1], JSON.stringify(entry) + '\\n');
+    process.on('SIGUSR1', () => {
+      process.stdout.write(JSON.stringify({ id: 9001, method: 'stale/request' }) + '\\n',
+        () => log({ staleRequestSent: process.pid }));
+    });
+    log({ stdioHolderPid: process.pid });
+    setTimeout(() => {}, 60_000);
+  `, logPath], { stdio: 'inherit' });
+  if (process.env.FAKE_CODEX_INHERITED_STDIO === 'exit') {
+    process.on('SIGTERM', () => process.exit(0));
+  }
+}
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
   writeFileSync(envLogPath, JSON.stringify({
@@ -42,6 +59,7 @@ let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
+let pendingUserInput;
 let steerCount = 0;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
@@ -99,7 +117,17 @@ function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
 
+const startedAgentItems = new Set();
 function notify(method, params) {
+  const key = `${params.turnId}:${params.item?.id ?? params.itemId}`;
+  if (method === 'item/started' && params.item?.type === 'agentMessage') startedAgentItems.add(key);
+  if (method === 'item/agentMessage/delta' && !startedAgentItems.has(key)
+      && !(behavior === 'async-user-input-no-start' && params.itemId === 'call_async_question')) {
+    // Real streams declare delivery before deltas. Keep the no-start async
+    // case explicit so buffering is tested rather than inferred from sleeps.
+    notify('item/started', { threadId: params.threadId, turnId: params.turnId,
+      item: { type: 'agentMessage', id: params.itemId, delivery: null } });
+  }
   write({ method, params });
 }
 
@@ -107,7 +135,7 @@ function completeTurn(request) {
   const threadId = request.params.threadId;
   const turnId = `turn-fake-${turnAttempt}`;
   const responseLast = behavior === 'start-response-last'
-    || behavior === 'start-response-last-goal';
+    || behavior === 'start-response-last-goal' || behavior === 'async-user-input-early';
   if (!responseLast) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
   // Exercise duplicate pre-response lifecycle notifications: the runner must
@@ -119,6 +147,56 @@ function completeTurn(request) {
       method: 'item/tool/call',
       params: { threadId, turnId, tool: 'forbidden-test-tool' },
     });
+  }
+  if (behavior.startsWith('user-input')) {
+    pendingUserInput = { threadId, turnId, requestId: behavior === 'user-input-string' ? 'native-question-1' : 9200 + turnAttempt };
+    const questions = [
+      { id: 'environment', header: 'Environment', question: 'Choose environment', isOther: true, isSecret: false,
+        options: [{ label: 'Staging (Recommended)', description: 'Test first' }, { label: 'Production', description: 'Live traffic' }] },
+      { id: 'notify', header: 'Notify', question: 'Choose channel', isOther: true, isSecret: false,
+        options: [{ label: 'Lark', description: 'In this chat' }, { label: 'Email', description: 'Send later' }] },
+    ];
+    if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
+    if (behavior === 'user-input-text') questions[1].options = null;
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
+    if (behavior === 'user-input-cancelled') {
+      setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
+    }
+    if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
+  }
+  if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
+      text: 'Which environment?\nPPE (Recommended) / Production', questions: [
+        { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
+        { title: 'Which voice?', options: null },
+      ] };
+    if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
+    if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
+    const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
+    if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
+      item: { ...item, questions: [{ title: '', options: null }] } });
+    if (behavior === 'async-user-input-overlap') {
+      const text = `Example: ${item.text} END EXAMPLE\n`;
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'ordinary-example', delta: text });
+      notify('item/completed', { threadId, turnId, item: { type: 'agentMessage', id: 'ordinary-example', text } });
+    }
+    if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
+    notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
+    notify('item/completed', { threadId: notificationThread, turnId, item });
+    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-limit') {
+      for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
+    }
+    if (responseLast) respond(request.id, { turn: { id: turnId } });
+    if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    setTimeout(() => {
+      const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
+      notify('item/completed', { threadId, turnId,
+        item: { type: 'agentMessage', id: 'async-independent-final', phase: behavior === 'async-user-input-overlap' ? 'commentary' : 'final_answer', text: 'Independent work completed' } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status } });
+    }, 400);
+    return;
   }
   if (behavior === 'hang-turn-completion') return;
   const finish = () => {
@@ -361,7 +439,25 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
-  if (request.result !== undefined || request.error !== undefined) return;
+  if (request.result !== undefined || request.error !== undefined) {
+    if (behavior.startsWith('user-input') && pendingUserInput && request.id === pendingUserInput.requestId) {
+      const { threadId, turnId } = pendingUserInput;
+      pendingUserInput = undefined;
+      notify('item/completed', { threadId, turnId, item: {
+        id: 'message-user-input', type: 'agentMessage', phase: 'final_answer', text: `Answered: ${JSON.stringify(request.result)}`,
+      } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+    }
+    return;
+  }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('user-input')) {
+    if (behavior === 'user-input-interrupt-error') { reject(request.id, -32000, 'interrupt failed'); return; }
+    const pending = pendingUserInput;
+    pendingUserInput = undefined;
+    respond(request.id, {});
+    if (pending) notify('turn/completed', { threadId: pending.threadId, turn: { id: pending.turnId, status: 'interrupted' } });
+    return;
+  }
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {
@@ -370,7 +466,41 @@ function handle(request) {
     return;
   }
   if (request.method === 'thread/start') {
-    respond(request.id, { thread: { id: 'thread-fake' } });
+    respond(request.id, { thread: { id: 'thread-fake' }, model: 'gpt-6-astra' });
+    return;
+  }
+  if (request.method === 'model/list') {
+    if (behavior === 'effort-paginated' && !request.params.cursor) {
+      respond(request.id, { data: [], nextCursor: 'next-model-page' });
+      return;
+    }
+    if (behavior === 'effort-paginated' && request.params.cursor === 'next-model-page') {
+      respond(request.id, { data: [{ model: 'other-model' }], nextCursor: 'last-model-page' });
+      return;
+    }
+    respond(request.id, { data: [{ model: behavior === 'effort-model-missing' ? 'other-model' : 'gpt-6-astra', supportedReasoningEfforts:
+      (behavior === 'effort-empty-choices' ? [] : behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+        .map(reasoningEffort => ({ reasoningEffort })) }], nextCursor: null });
+    return;
+  }
+  if (request.method === 'thread/settings/update') {
+    if (behavior === 'effort-unsupported') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-thread-rejected') reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    else respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/settings/update') {
+    if (behavior === 'effort-partial') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-feature-disabled' || behavior === 'effort-feature-disabled-complete') {
+      reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    } else if (behavior === 'effort-rejected') reject(request.id, -32600, 'another invalid request');
+    else if (behavior === 'effort-serial') setTimeout(() => respond(request.id, { status: 'applied' }), 100);
+    else respond(request.id, { status: behavior === 'effort-race' ? 'targetUnavailable' : 'applied' });
+    if ((behavior === 'effort-complete' || behavior === 'effort-feature-disabled-complete') && activeTurn) {
+      const turn = activeTurn;
+      activeTurn = undefined;
+      setTimeout(() => emitTurnCompletion(turn.threadId, turn.turnId, turn.outputSchema), 100);
+    }
     return;
   }
   if (request.method === 'thread/resume') {
@@ -383,7 +513,11 @@ function handle(request) {
       reject(request.id, -32600, `thread ${request.params.threadId} already has an active writer`);
       return;
     }
-    respond(request.id, { thread: { id: request.params.threadId } });
+    if (behavior === 'resume-different-thread') {
+      respond(request.id, { thread: { id: 'thread-unexpected' } });
+      return;
+    }
+    respond(request.id, { thread: { id: request.params.threadId }, model: 'gpt-6-astra' });
     return;
   }
   if (request.method === 'thread/read') {
@@ -399,11 +533,17 @@ function handle(request) {
     respond(request.id, {
       thread: {
         id: request.params.threadId,
+        ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
         name: currentThreadName ?? null,
         preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
+    return;
+  }
+  if (request.method === 'thread/archive' || request.method === 'thread/unarchive') {
+    if (behavior === 'archive-error') reject(request.id, -32600, 'archive failed');
+    else if (behavior !== 'hang-archive') respond(request.id, request.method === 'thread/archive' ? {} : { thread: { id: request.params.threadId } });
     return;
   }
   if (request.method === 'thread/name/set') {
@@ -686,7 +826,7 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
@@ -695,6 +835,9 @@ function handle(request) {
     }
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    if (behavior.startsWith('effort-')) {
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'effort-progress', delta: 'effort task running' });
+    }
     return;
   }
   if (behavior === 'steer-started-first') {

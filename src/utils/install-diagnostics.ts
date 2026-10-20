@@ -17,6 +17,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { isLocalDevInstallAt, botmuxVersionAt, botmuxInstallRoot } from './install-info.js';
 import { detectGlobalInstallManager } from './global-install.js';
+import { mainPackageRootForSubpackageBinary } from '../core/binary-install-shape.js';
 import { parseVersion } from '../core/update-check.js';
 
 /** Minimum Node major (mirrors package.json `engines.node`). */
@@ -109,14 +110,51 @@ export interface InstallProbeDeps {
  *  is hundreds of KiB, so a small file is the only one worth string-scanning. */
 const MAX_SHIM_BYTES = 4096;
 
-/** Resolve a `botmux` bin on PATH to the install root that runs it.
- *  - a `~/.botmux/bin/botmux` shim → the cli.js path it `exec`s
- *  - an npm-global symlink → the real `<pkg>/dist/cli.js` it points at
- *  Returns null when neither yields a cli.js path. */
+/**
+ * Resolve a `botmux` bin on PATH to the install root that runs it.
+ *
+ * TWO ERAS OF LAUNCHER, and every one of them must land on the SAME root when
+ * they belong to the same install — otherwise the caller counts one install as
+ * several and warns the user about a conflict that does not exist.
+ *
+ *  · Node era   — `exec node "<pkg>/dist/cli.js"`, or a symlink straight to it.
+ *  · Binary era — the package is a compiled platform binary in a subpackage:
+ *      - `bin` links `<pkg>/scripts/botmux-launcher.sh` (npm/pnpm/bun do this
+ *        themselves), and
+ *      - postinstall writes `~/.botmux/bin/botmux` containing
+ *        `exec "<pkg>/node_modules/botmux-<plat>/botmux"`.
+ *    ⚠️ NEITHER of these contains the string `cli.js` anywhere, so the scan
+ *    below can never match them. That is not a size problem: MEASURED by
+ *    removing the size limit entirely, both still resolved to null and the
+ *    caller reported `multiple: true` for one ordinary `npm i -g botmux`.
+ *    Raising MAX_SHIM_BYTES or trimming the launcher's comments fixes nothing.
+ *
+ * Both binary-era forms are therefore mapped through the platform binary they
+ * ultimately exec, which `mainPackageRootForSubpackageBinary` turns back into
+ * the main package root for BOTH layouts npm and pnpm/bun produce.
+ */
 function resolveBin(binPath: string, deps: InstallProbeDeps): { cliJs: string; root: string } | null {
-  let cliJs: string | null = null;
-
   const content = deps.readFile(binPath);
+  const real = deps.realpath(binPath);
+
+  // ── Binary era ────────────────────────────────────────────────────────────
+  // The postinstall shim: `exec "<...>/botmux-<plat>-<arch>[-musl]/botmux" "$@"`.
+  // Match the quoted target and ask the shared classifier what package owns it,
+  // so this stays in agreement with the updater instead of re-deriving layouts.
+  if (content && content.length < MAX_SHIM_BYTES) {
+    const execTarget = content.match(/"([^"]*\/botmux-(?:linux|darwin)-(?:x64|arm64)(?:-musl)?\/botmux)"/);
+    const owned = execTarget ? mainPackageRootForSubpackageBinary(execTarget[1]) : null;
+    if (owned) return { cliJs: execTarget![1], root: owned };
+  }
+  // The `bin` entry the package manager links: <pkg>/scripts/botmux-launcher.sh.
+  // Its realpath is inside the main package, so the package root is two levels
+  // up (`<pkg>/scripts/<file>`), which is the same root the shim above yields.
+  if (real && /[/\\]scripts[/\\]botmux-launcher\.sh$/i.test(real)) {
+    return { cliJs: real, root: dirname(dirname(real)) };
+  }
+
+  // ── Node era ──────────────────────────────────────────────────────────────
+  let cliJs: string | null = null;
   if (content && content.length < MAX_SHIM_BYTES) {
     // Require a path separator before cli.js so a bare "cli.js" literal inside
     // compiled code (if a binary slips through the size guard) can't match.
@@ -124,7 +162,6 @@ function resolveBin(binPath: string, deps: InstallProbeDeps): { cliJs: string; r
     if (m) cliJs = m[1];
   }
   if (!cliJs) {
-    const real = deps.realpath(binPath);
     if (real && /cli\.js$/i.test(real)) cliJs = real;
   }
   if (!cliJs) return null;

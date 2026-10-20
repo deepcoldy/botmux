@@ -27,6 +27,8 @@ import {
   probePersistentBackendTarget,
   killPersistentSession,
   probePersistentSessions,
+  probePersistentBackendTargets,
+  persistentBackendTargetKey,
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   resolveSpawnBackendType,
@@ -183,6 +185,35 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
 });
 
 describe('probePersistentSessions', () => {
+  it('keeps identical ZMX names separate by directory and batches each directory once', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockImplementation(env => ({
+      ok: true,
+      sessions: env?.ZMX_DIR === '/tmp/zmx-a' ? ['bmx-same'] : [],
+      unhealthySessions: [], raw: '',
+    }));
+    try {
+      const a = { backendType: 'zmx' as const, sessionName: 'bmx-same', socketDir: '/tmp/zmx-a' };
+      const b = { ...a, socketDir: '/tmp/zmx-b' };
+      const snapshot = probePersistentBackendTargets([a, b, a, { ...a, sessionName: 'bmx-other' }]);
+      expect(snapshot.get(persistentBackendTargetKey(a))).toBe('exists');
+      expect(snapshot.get(persistentBackendTargetKey(b))).toBe('missing');
+      expect(snapshot.size).toBe(3);
+      expect(probe).toHaveBeenCalledTimes(2);
+    } finally { probe.mockRestore(); }
+  });
+
+  it('uses the persisted directory for workerless teardown and retains the ownership fence', () => {
+    const kill = vi.spyOn(ZmxBackend, 'killManagedSession').mockImplementation(() => {});
+    const target = { backendType: 'zmx' as const, sessionName: 'bmx-owned', socketDir: '/tmp/created-zmx' };
+    try {
+      expect(() => killPersistentBackendTarget(target)).toThrow(/session id/);
+      expect(kill).not.toHaveBeenCalled();
+      killPersistentBackendTarget(target, 'complete-session-id');
+      expect(kill).toHaveBeenCalledWith('bmx-owned', 'complete-session-id', undefined,
+        expect.objectContaining({ ZMX_DIR: '/tmp/created-zmx' }));
+    } finally { kill.mockRestore(); }
+  });
+
   it('classifies all ZMX names from one full-list snapshot', () => {
     const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({
       ok: true,
@@ -261,5 +292,24 @@ describe('isRiffBackendSession (restart guard freeze-once)', () => {
   it('falls back to the persisted backend for a restored worker', () => {
     expect(isRiffBackendSession(ds({ sessionBackend: 'riff' }))).toBe(true);
     expect(isRiffBackendSession(ds({ sessionBackend: 'tmux' }))).toBe(false);
+  });
+});
+
+describe('resolvePairedBackendId (browser-safe spawn pairing)', () => {
+  it('matches reconcileRiffBackendType and resolves override → daemon default', async () => {
+    const { reconcilePairedBackendId, resolvePairedBackendId } = await import('../src/core/remote-cli-ids.js');
+    const { reconcileRiffBackendType } = await import('../src/core/persistent-backend.js');
+    for (const [cli, resolved, fallback] of [
+      ['claude-code', 'tmux', 'zmx'], ['claude-code', 'riff', 'zmx'], ['claude-code', 'riff', 'mojo'],
+      ['riff', 'tmux', 'tmux'], ['mojo', 'pty', 'riff'], ['codex', 'zmx', 'riff'],
+    ] as const) {
+      expect(reconcilePairedBackendId(cli, resolved, fallback)).toBe(reconcileRiffBackendType(cli, resolved as any, fallback as any));
+    }
+    expect(resolvePairedBackendId('claude-code', null, 'riff')).toBe('pty');
+    expect(resolvePairedBackendId('claude-code', 'tmux', 'zmx')).toBe('tmux');
+    expect(resolvePairedBackendId('claude-code', '', 'zmx')).toBe('zmx');
+    expect(resolvePairedBackendId('riff', 'tmux', 'zmx')).toBe('riff');
+    // Older daemon that does not report its default, no override: unknown.
+    expect(resolvePairedBackendId('claude-code', null, null)).toBeUndefined();
   });
 });

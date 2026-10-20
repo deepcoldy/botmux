@@ -33,6 +33,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const GROUPS_ACTION_REFRESH = 'dash_groups_refresh' as const;
 export const GROUPS_ACTION_PAGE = 'dash_groups_page' as const;
@@ -45,20 +46,9 @@ export const GROUPS_ACTION_ONCALL_UNBIND = 'dash_groups_oncall_unbind' as const;
 export const GROUPS_ACTION_ROLE_OPEN = 'dash_groups_role_open' as const;
 export const GROUPS_ACTION_ROLE_SAVE = 'dash_groups_role_save' as const;
 export const GROUPS_ACTION_ROLE_DELETE = 'dash_groups_role_delete' as const;
-/** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
- *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
- *  import). card-handler routes by action prefix, so dispatch lands on the
- *  overview handler regardless of which sub-card emitted it. */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
+export const GROUPS_ACTION_PROJECT_ROLES = 'dash_groups_project_roles' as const;
 
-/** Default page size for standalone and overview-drilldown list cards. */
-const PAGE_SIZE = 5;
 const MAX_PAGE_SIZE = 100;
-
-/** Hard cap on `select_static` option count for the "jump to page" picker.
- *  Lark caps select options around this; we also keep payload small. Above
- *  the cap we fall back to prev/next only. */
-const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from coverage status to a stable colour-emoji prefix. Pure. */
 function statusIcon(status: string): string {
@@ -94,7 +84,7 @@ export interface BuildGroupsCardOpts {
    *  "🔙 返回总览" button, and every button.value carries `origin=overview`
    *  to keep that affordance across rebuilds. Undefined → standalone card,
    *  no overview link. */
-  origin?: 'overview';
+  origin?: 'overview' | 'project_roles';
   /** Dashboard scope. `'global'` returns the full groups matrix rather than
    *  the caller-bot scoped matrix. */
   scope?: 'global';
@@ -105,8 +95,10 @@ interface GroupsNavOpts {
   locale: Locale;
   page?: number;
   pageSize?: number;
-  origin?: 'overview';
+  origin?: 'overview' | 'project_roles';
   scope?: 'global';
+  projectCoordinatorAppId?: string;
+  projectWorkerAppIds?: string[];
 }
 
 type GroupsMatrix = {
@@ -115,15 +107,26 @@ type GroupsMatrix = {
 };
 
 function clampPageSize(pageSize: number | undefined): number {
-  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return DASH_PAGE_SIZE;
   return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
 }
 
-function buildNavFields(opts: { pageSize?: number; origin?: 'overview'; scope?: 'global' }): Record<string, string> {
+function buildNavFields(opts: {
+  pageSize?: number;
+  origin?: 'overview' | 'project_roles';
+  scope?: 'global';
+  projectCoordinatorAppId?: string;
+  projectWorkerAppIds?: string[];
+}): Record<string, string> {
   const navFields: Record<string, string> = {};
   const effectivePageSize = clampPageSize(opts.pageSize);
   if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (opts.origin === 'project_roles') {
+    navFields.origin = 'project_roles';
+    if (opts.projectCoordinatorAppId) navFields.project_coordinator_app_id = opts.projectCoordinatorAppId;
+    if (opts.projectWorkerAppIds?.length) navFields.project_worker_app_ids = opts.projectWorkerAppIds.join(',');
+  }
+  if (effectivePageSize !== DASH_PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
   return navFields;
 }
@@ -375,6 +378,113 @@ export function buildGroupsDetailCard(
   });
 }
 
+export interface ProjectGroupRolesConfig {
+  coordinatorAppId: string;
+  workerAppIds: string[];
+}
+
+/** Focused project-group role surface. It deliberately exposes only role
+ * editing for the configured coordinator/workers; membership, oncall and
+ * project content remain in their existing control surfaces. */
+export function buildProjectGroupRolesCard(
+  matrix: GroupsMatrix,
+  chat: GroupsChatInput,
+  project: ProjectGroupRolesConfig,
+  opts: Omit<GroupsNavOpts, 'origin' | 'projectCoordinatorAppId' | 'projectWorkerAppIds'>,
+): string {
+  const projectIds = [...new Set([project.coordinatorAppId, ...project.workerAppIds].filter(Boolean))];
+  const projectBots = matrix.bots.filter(bot => projectIds.includes(bot.larkAppId));
+  const detail = buildGroupDetail(chat, projectBots);
+  const navOpts: GroupsNavOpts = {
+    ...opts,
+    origin: 'project_roles',
+    projectCoordinatorAppId: project.coordinatorAppId,
+    projectWorkerAppIds: project.workerAppIds,
+  };
+  const navFields = buildNavFields(navOpts);
+  const displayName = detail.name && detail.name !== detail.chatId
+    ? detail.name
+    : t('card.dashboard.groups.unnamed', undefined, opts.locale);
+  const elements: unknown[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `**${escapeLarkMd(displayName)}**\n<font color="grey">${escapeLarkMd(t('card.dashboard.groups.project_roles.help', undefined, opts.locale))}</font>`,
+      },
+    },
+    { tag: 'hr' },
+  ];
+  for (const member of detail.members) {
+    const isCoordinator = member.larkAppId === project.coordinatorAppId;
+    const roleKind = t(
+      isCoordinator ? 'card.dashboard.groups.project_roles.coordinator' : 'card.dashboard.groups.project_roles.worker',
+      undefined,
+      opts.locale,
+    );
+    const roleState = member.hasRole
+      ? t('card.dashboard.groups.role_configured', undefined, opts.locale)
+      : t('card.dashboard.groups.project_roles.inherited', undefined, opts.locale);
+    const valueBase = {
+      action: GROUPS_ACTION_ROLE_OPEN,
+      invoker_open_id: opts.invokerOpenId,
+      chat_id: chat.chatId,
+      app_id: member.larkAppId,
+      ...navFields,
+    };
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `${member.status === 'in' ? '🟢' : '⚪'} **${escapeLarkMd(member.botName)}** · <font color="${isCoordinator ? 'purple' : 'blue'}">${escapeLarkMd(roleKind)}</font>\n<font color="grey">${escapeLarkMd(roleState)}</font>`,
+      },
+    });
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.dashboard.groups.project_roles.edit', undefined, opts.locale) },
+        type: isCoordinator ? 'primary' : 'default',
+        disabled: member.status !== 'in',
+        value: valueBase,
+      }],
+    });
+  }
+  if (detail.members.length === 0) {
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: t('card.dashboard.groups.project_roles.empty', undefined, opts.locale) },
+    });
+  }
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'action',
+    actions: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.dashboard.groups.refresh', undefined, opts.locale) },
+      type: 'default',
+      value: {
+        action: GROUPS_ACTION_PROJECT_ROLES,
+        invoker_open_id: opts.invokerOpenId,
+        chat_id: chat.chatId,
+        ...navFields,
+      },
+    }],
+  });
+  elements.push({
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: t('card.dashboard.groups.project_roles.footer', undefined, opts.locale) }],
+  });
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.dashboard.groups.project_roles.title', undefined, opts.locale) },
+      template: 'purple',
+    },
+    elements,
+  });
+}
+
 function renderDetailMember(
   chatId: string,
   member: GroupDetailMemberDto,
@@ -493,7 +603,13 @@ export function buildGroupsRoleCard(
   const displayName = chat.name && chat.name !== chat.chatId
     ? chat.name
     : t('card.dashboard.groups.unnamed', undefined, opts.locale);
-  const navFields = buildNavFields({ pageSize: opts.pageSize, origin: opts.origin, scope: opts.scope });
+  const navFields = buildNavFields({
+    pageSize: opts.pageSize,
+    origin: opts.origin,
+    scope: opts.scope,
+    projectCoordinatorAppId: opts.projectCoordinatorAppId,
+    projectWorkerAppIds: opts.projectWorkerAppIds,
+  });
   const valueBase = {
     invoker_open_id: opts.invokerOpenId,
     chat_id: chat.chatId,
@@ -570,7 +686,10 @@ export function buildGroupsRoleCard(
           tag: 'button',
           text: { tag: 'plain_text', content: t('card.dashboard.groups.btn.back', undefined, opts.locale) },
           type: 'default',
-          value: { action: GROUPS_ACTION_DETAIL, ...valueBase },
+          value: {
+            action: opts.origin === 'project_roles' ? GROUPS_ACTION_PROJECT_ROLES : GROUPS_ACTION_DETAIL,
+            ...valueBase,
+          },
         },
       ],
     },
@@ -649,24 +768,6 @@ function aggregateCoverageStatus(cells: ReadonlyArray<GroupRowDto['coverage'][nu
   return 'out';
 }
 
-/**
- * Sanitize chat name / chatIdSuffix / workingDir for lark_md inclusion.
- *
- * Chat names are user-controlled (group titles), chatIdSuffix is bot-supplied
- * but echoed near user content, and workingDir comes from the filesystem. All
- * three flow into a `<font color="grey">…</font>` wrapper; without escaping,
- * a payload like `</font><at id=ou_x></at>` would close our wrapper and
- * inject @mention-looking content. Order matters: `&` first so a later `<`
- * → `&lt;` doesn't get re-encoded as `&amp;lt;`.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
-}
-
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
 export interface GroupsCardHandlerDeps {
@@ -676,22 +777,7 @@ export interface GroupsCardHandlerDeps {
   locale?: Locale;
 }
 
-export interface GroupsCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): GroupsCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(
-  textKey: string,
-  params: Record<string, string> | undefined,
-  locale: Locale,
-): GroupsCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type GroupsCardHandlerResult = DashCardHandlerResult;
 
 function cardResult(cardJson: string): GroupsCardHandlerResult {
   return {
@@ -822,11 +908,17 @@ export async function handleGroupsCardAction(
   // Threaded by buildGroupsCard onto every button.value; we parse here so
   // the rebuild path keeps the same shape (origin + page_size persist
   // across refresh/page round-trips).
-  const navOrigin: 'overview' | undefined = value.origin === 'overview' ? 'overview' : undefined;
+  const navOrigin: 'overview' | 'project_roles' | undefined = value.origin === 'overview'
+    ? 'overview'
+    : value.origin === 'project_roles'
+      ? 'project_roles'
+      : undefined;
   const parsedPageSize = Number.parseInt(value.page_size ?? '', 10);
   const navPageSize: number | undefined =
     Number.isFinite(parsedPageSize) && parsedPageSize > 0 ? parsedPageSize : undefined;
   const navScope: 'global' | undefined = value.dashboard_scope === 'global' ? 'global' : undefined;
+  const projectCoordinatorAppId = value.project_coordinator_app_id;
+  const projectWorkerAppIds = (value.project_worker_app_ids ?? '').split(',').map(item => item.trim()).filter(Boolean);
   const pathSuffix = navScope === 'global' ? '?scope=global' : '';
   const navOptsBase: GroupsNavOpts = {
     invokerOpenId: operatorOpenId,
@@ -834,6 +926,8 @@ export async function handleGroupsCardAction(
     pageSize: navPageSize,
     origin: navOrigin,
     scope: navScope,
+    projectCoordinatorAppId,
+    projectWorkerAppIds,
   };
   const chatId = value.chat_id;
   const appId = value.app_id;
@@ -864,6 +958,7 @@ export async function handleGroupsCardAction(
     GROUPS_ACTION_ROLE_OPEN,
     GROUPS_ACTION_ROLE_SAVE,
     GROUPS_ACTION_ROLE_DELETE,
+    GROUPS_ACTION_PROJECT_ROLES,
   ]);
   if (!knownActions.has(String(action))) {
     return ackToast('card.dashboard.settings.invalid_action', locale);
@@ -886,6 +981,15 @@ export async function handleGroupsCardAction(
     ...navOptsBase,
     page,
   }));
+  const renderProjectRoles = (chat: GroupsChatInput): GroupsCardHandlerResult => cardResult(buildProjectGroupRolesCard(
+    matrix,
+    chat,
+    {
+      coordinatorAppId: projectCoordinatorAppId ?? larkAppId,
+      workerAppIds: projectWorkerAppIds,
+    },
+    navOptsBase,
+  ));
 
   if (action === GROUPS_ACTION_REFRESH || action === GROUPS_ACTION_PAGE || action === GROUPS_ACTION_BACK_TO_LIST) {
     return renderList(page);
@@ -895,6 +999,7 @@ export async function handleGroupsCardAction(
   if (!chat) {
     return errorToast('card.dashboard.groups.chat_not_found', undefined, locale);
   }
+  if (action === GROUPS_ACTION_PROJECT_ROLES) return renderProjectRoles(chat);
   if (action === GROUPS_ACTION_DETAIL) return renderDetail(chat);
 
   const member = findDetailMember(matrix, chat, appId);
@@ -1005,5 +1110,16 @@ export async function handleGroupsCardAction(
   const fresh = await loadGroupsMatrix(client, pathSuffix, locale);
   if (!fresh.ok) return fresh.result;
   const freshChat = findChat(fresh.matrix, chat.chatId) ?? chat;
+  if (navOrigin === 'project_roles') {
+    return cardResult(buildProjectGroupRolesCard(
+      fresh.matrix,
+      freshChat,
+      {
+        coordinatorAppId: projectCoordinatorAppId ?? larkAppId,
+        workerAppIds: projectWorkerAppIds,
+      },
+      navOptsBase,
+    ));
+  }
   return cardResult(buildGroupsDetailCard(fresh.matrix, freshChat, { ...navOptsBase, page }));
 }

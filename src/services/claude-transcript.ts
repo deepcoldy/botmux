@@ -12,7 +12,13 @@
  * to keep them unit-testable.
  */
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
+import type { ModelFallbackState } from '../types.js';
+// cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
+// dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -27,6 +33,12 @@ export interface TranscriptEvent {
     /** Claude's API stop reason. `tool_use` is an intra-turn pause; terminal
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
+    /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
+     *  Code writes the placeholder `<synthetic>` on records no model produced:
+     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
+     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
+    model?: string;
   };
   /** API-error records. When the model call fails, Claude Code writes a
    *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
@@ -51,6 +63,43 @@ export interface TranscriptEvent {
     prompt?: unknown;
     commandMode?: string;
   };
+  /** Present on `type:"system"` model-switch records (see
+   *  {@link parseClaudeModelFallbackEvent}). `scope:"local"` marks a sub-agent /
+   *  side-question fallback that leaves the main session model untouched. */
+  scope?: string;
+  trigger?: string;
+  originalModel?: string;
+  fallbackModel?: string;
+  apiRefusalCategory?: string;
+  /** Claude Code writes `isMeta:true` on internal user records (tool results,
+   *  slash-command wrappers, compact summaries). Most are NOT real prompts and
+   *  stay filtered by isMeaningfulUserEvent, but the built-in scheduler's fire
+   *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
+   *  real model turn — see {@link isScheduledTurnStartEvent}. */
+  isMeta?: boolean;
+  /** Turn-origin discriminator written by Claude Code ≥2.1.281. The built-in
+   *  CronCreate scheduler fires turns as user records with
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`).
+   *  Older builds (≤2.1.280) omit it; those fires are recognised via
+   *  `promptSource === "system"` — see {@link isScheduledTurnStartEvent}. */
+  turnOrigin?: string;
+  /** Provenance of a user record. Built-in scheduler fire records on older
+   *  Claude Code builds (≤2.1.280) carry `promptSource:"system"` but no
+   *  turnOrigin. NOTE this field is NOT unique to scheduler fires (cross-
+   *  session messages, task_notification on some builds also set it), so it
+   *  is only consulted after the isMeta guard AND with scheduledFireId set. */
+  promptSource?: string;
+  scheduledTaskId?: string;
+  scheduledFireId?: string;
+  /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
+   *  records — both excluded from meaningful turn attribution. */
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
+  /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
+   *  a FORKED session: the record is history the fork inherited, and the switch
+   *  it describes does NOT apply to this conversation. Treated as positive
+   *  evidence of "no notice here", exactly like a non-Fable switch. */
+  neutralizedByFork?: boolean;
 }
 
 /**
@@ -80,6 +129,374 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
   return '';
 }
 
+/** Kind of automatic model switch Claude Code recorded, mapped from the raw
+ *  `type:"system"` subtype so the card copy can branch on one stable value. */
+export type ClaudeModelFallbackKind = 'refusal' | 'unavailable' | 'consent';
+
+const MODEL_FALLBACK_KIND_BY_SUBTYPE: Record<string, ClaudeModelFallbackKind> = {
+  model_refusal_fallback: 'refusal',
+  model_fallback: 'unavailable',
+  model_consent_fallback: 'consent',
+};
+
+/** One parsed model-switch record. `scope: 'local'` is a sub-agent /
+ *  side-question fallback: the main session model did NOT change, so surfacing
+ *  it would mislead. Builds that predate the field omit it and read as
+ *  'session'.
+ *
+ *  EVERY session-scoped switch parses, including the ones that must NOT raise a
+ *  notice — `fable: false` (a routine Opus 5 → Opus 4.8 downgrade) and
+ *  `neutralizedByFork` (a record a fork inherited). Dropping those at parse time
+ *  was a bug: the backward tail scan would step straight over the newest record
+ *  and resurrect an OLDER Fable one, so a notice the user had already left
+ *  behind came back. They are positive evidence of "no notice", which only the
+ *  newest record can express — see {@link noticeFromSessionRecord}. */
+export interface ClaudeModelFallbackRecord extends ModelFallbackState {
+  scope: 'session' | 'local';
+  /** The configured model this switch fell OFF was a Fable one. Only a fall off
+   *  Fable is a product-visible notice. */
+  fable: boolean;
+  /** The record was copied into a fork and does not apply here. */
+  neutralizedByFork: boolean;
+}
+
+/** Product state the NEWEST session-scoped record implies: the record itself
+ *  when it is a live Fable fallback, or `null` when it says positively that no
+ *  notice applies here (fell off a non-Fable model, or a fork neutralised it).
+ *  `null` is evidence, not absence — the daemon clears on it. */
+function noticeFromSessionRecord(
+  rec: ClaudeModelFallbackRecord,
+): ClaudeModelFallbackRecord | null {
+  return rec.fable && !rec.neutralizedByFork ? rec : null;
+}
+
+/** Normalise a model id for comparison: drop a trailing context-window suffix
+ *  and lower-case. `originalModel` is written as `claude-fable-5-1[1m]` while an
+ *  assistant record's `message.model` is the bare `claude-fable-5-1`; without
+ *  this the "user switched back" check can never fire. */
+export function normalizeClaudeModelId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\[[^\]]*\]$/, '').trim().toLowerCase();
+  return normalized || undefined;
+}
+
+/** True when a model id names a Fable model, whatever its case or context
+ *  suffix (`claude-fable-5-1[1m]`, `Claude-Fable-5[1M]`, …). The single
+ *  PREDICATE behind the product's "Fable only" scope: the parse records its
+ *  verdict on each switch as `fable`, and noticeFromSessionRecord is the only
+ *  place that turns it into "show / do not show". */
+export function isFableModelId(value: string | undefined): boolean {
+  return normalizeClaudeModelId(value)?.startsWith('claude-fable') === true;
+}
+
+/** Parse a `type:"system"` model-switch record. Returns undefined for anything
+ *  else, and fail-closed for a record missing the uuid or either model id —
+ *  a half-written switch must not produce a notice we can never clear. */
+export function parseClaudeModelFallbackEvent(
+  ev: TranscriptEvent,
+): ClaudeModelFallbackRecord | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system') return undefined;
+  const kind = typeof ev.subtype === 'string'
+    ? MODEL_FALLBACK_KIND_BY_SUBTYPE[ev.subtype]
+    : undefined;
+  if (!kind) return undefined;
+  const uuid = typeof ev.uuid === 'string' ? ev.uuid.trim() : '';
+  const originalModel = typeof ev.originalModel === 'string' ? ev.originalModel.trim() : '';
+  const fallbackModel = typeof ev.fallbackModel === 'string' ? ev.fallbackModel.trim() : '';
+  if (!uuid || !originalModel || !fallbackModel) return undefined;
+  const trigger = typeof ev.trigger === 'string' ? ev.trigger.trim() : '';
+  const apiRefusalCategory = typeof ev.apiRefusalCategory === 'string'
+    ? ev.apiRefusalCategory.trim()
+    : '';
+  const observedAt = typeof ev.timestamp === 'string' ? ev.timestamp.trim() : '';
+  return {
+    uuid,
+    kind,
+    originalModel,
+    fallbackModel,
+    scope: ev.scope === 'local' ? 'local' : 'session',
+    // PRODUCT DECISION: only a fall *off Fable* is surfaced. Claude Code also
+    // records ordinary safety downgrades between non-Fable models (Opus 5 →
+    // Opus 4.8), which are routine and must stay invisible. Recorded as a flag
+    // rather than a parse rejection so the newest record still terminates the
+    // tail scan — see {@link ClaudeModelFallbackRecord}.
+    fable: isFableModelId(originalModel),
+    neutralizedByFork: ev.neutralizedByFork === true,
+    ...(trigger ? { trigger } : {}),
+    ...(apiRefusalCategory ? { apiRefusalCategory } : {}),
+    ...(observedAt ? { observedAt } : {}),
+  };
+}
+
+/** Model that actually served an assistant record. Sub-agent output, API-error
+ *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
+ *  model, so they yield undefined rather than a false "model changed". */
+export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
+  if (!ev || typeof ev !== 'object') return undefined;
+  if ((ev as any).isSidechain === true) return undefined;
+  if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
+  if ((ev.message?.role ?? ev.type) !== 'assistant') return undefined;
+  const model = ev.message?.model?.trim();
+  if (!model || model === '<synthetic>') return undefined;
+  return model;
+}
+
+/** Drop the transcript-only parse bookkeeping (`scope`, `fable`,
+ *  `neutralizedByFork`): what ships to the daemon and gets persisted is the
+ *  product state. */
+export function modelFallbackStateOf(rec: ClaudeModelFallbackRecord): ModelFallbackState {
+  const { scope: _scope, fable: _fable, neutralizedByFork: _neutralized, ...state } = rec;
+  return state;
+}
+
+/** Upper bound on the backward scan below. Same guard rationale as
+ *  TRAEX_RUNTIME_SCAN_MAX_BYTES: the fallback notice is advisory and must never
+ *  synchronously parse a multi-GB transcript at bridge start. */
+const CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Recover the current model-fallback state from a transcript's tail, for the
+ *  worker's cold start: baseline cursors straight to EOF, so a switch recorded
+ *  before `--resume` / a daemon restart is never drained again.
+ *
+ *  Scans BACKWARD and stops at the newest session-scoped switch record — the
+ *  newest one DECIDES, whatever it says. When it is a live Fable fallback it is
+ *  returned; when it fell off a non-Fable model or a fork neutralised it, the
+ *  scan returns `fallback: null`, which is positive evidence that no notice
+ *  applies. Stepping over such a record to keep hunting for an older Fable one
+ *  (the previous behaviour) resurrects a notice the session already left
+ *  behind. `fallback` absent means the window simply held no session-scoped
+ *  record — no evidence either way.
+ *
+ *  The serving model is only collected from records NEWER than that stop point
+ *  (an assistant reply written before the switch says nothing about what serves
+ *  now). With no switch record in the window the serving model is simply the
+ *  window's newest one — still useful, because the daemon compares it against
+ *  the fallback IT persisted. A non-newline-terminated tail is excluded via
+ *  baselineJsonlCursor. */
+export function readLatestClaudeModelFallback(path: string): {
+  fallback?: ClaudeModelFallbackRecord | null;
+  servingModel?: string;
+} {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let fallback: ClaudeModelFallbackRecord | null | undefined;
+  let servingModel: string | undefined;
+  const emit = () => ({
+    ...(fallback !== undefined ? { fallback } : {}),
+    ...(servingModel ? { servingModel } : {}),
+  });
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let ev: TranscriptEvent;
+    try { ev = JSON.parse(line) as TranscriptEvent; } catch { return false; }
+    if (!ev || typeof ev !== 'object') return false;
+    const rec = parseClaudeModelFallbackEvent(ev);
+    if (rec) {
+      if (rec.scope === 'local') return false;
+      fallback = noticeFromSessionRecord(rec);
+      return true;
+    }
+    if (!servingModel) servingModel = servingModelFromAssistantEvent(ev);
+    return false;
+  };
+
+  try {
+    // The leading fragment at the byte-cap floor is a truncated historical
+    // partial and is dropped; at true file start it is a complete record.
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => consider(line.toString('utf8')),
+    });
+  } catch {
+    return emit();
+  }
+  return emit();
+}
+
+/** Bound on the tracker's dedupe set. A long session can switch models many
+ *  times, so an unbounded set would leak slowly. */
+const MODEL_FALLBACK_SEEN_UUIDS_MAX = 256;
+
+/** One report from the worker to the daemon: OBSERVED FACTS ONLY, never a
+ *  decision. The worker cannot decide whether the notice should still show —
+ *  its transcript window is bounded and it is younger than the session — so it
+ *  says what it saw and the daemon, which holds the persisted state, merges:
+ *
+ *   - `claudeSessionId` — WHICH Claude conversation these facts are about. The
+ *     state is per Claude session: `/repo`, `/adopt` and a resume onto another
+ *     native session all replace it, and state carried over from the previous
+ *     one is either a notice for a conversation this session is no longer
+ *     having or (worse) one that can never be cleared. Always present.
+ *   - `fallback` — a switch record it had not reported before, or `null` when
+ *     the newest session-scoped record is positive evidence that NO notice
+ *     applies (fell off a non-Fable model, or neutralised by a fork).
+ *   - `servingModel` — the model serving the MAIN thread, whenever that value
+ *     changed since its last report. Not gated on Fable: it also drives the
+ *     card's usage line, since Claude never emits `active_runtime`.
+ *
+ *  An ABSENT `fallback` / `servingModel` means "nothing new observed", never
+ *  "cleared" — only `fallback: null`, or a `claudeSessionId` that disagrees
+ *  with the held state, clears. */
+export interface ModelFallbackObservation {
+  claudeSessionId: string;
+  fallback?: ModelFallbackState | null;
+  servingModel?: string;
+}
+
+/** Running model-fallback observer for ONE Claude session. Owns the record-uuid
+ *  dedupe (the same record is re-drained after a truncation or a jsonl switch),
+ *  the "only report the serving model when it changed" rule, and the binding to
+ *  the Claude session id all of that describes — so the worker is left with
+ *  nothing but "did I see anything worth sending". */
+export class ClaudeModelFallbackTracker {
+  /** Claude session (jsonl basename) every remembered fact belongs to. Empty
+   *  until the first {@link bind}. */
+  private claudeSessionId = '';
+  private readonly seenUuids = new Set<string>();
+  /** Last serving model reported to the daemon, normalised. `undefined` = none
+   *  reported yet for the bound session, so the first one always ships. */
+  private reportedServingModel: string | undefined;
+
+  get boundClaudeSessionId(): string {
+    return this.claudeSessionId;
+  }
+
+  /** Bind to `claudeSessionId`, returning true when that was a SWITCH. A
+   *  different id means the bridge moved to another Claude conversation
+   *  (`/repo`, `/adopt`, a resume onto another native session, an in-pane
+   *  `/clear`): every uuid we deduped and every serving model we reported
+   *  describes the old one, so all of it is dropped. Without this the new
+   *  session inherits the old one's notice, and — when its real model happens
+   *  to equal the old fallback — the serving-model dedupe swallows the very
+   *  observation that would have cleared it, leaving a false notice that
+   *  survives restarts. */
+  bind(claudeSessionId: string): boolean {
+    if (claudeSessionId === this.claudeSessionId) return false;
+    this.claudeSessionId = claudeSessionId;
+    this.reset();
+    return true;
+  }
+
+  /** Forget everything remembered about the bound session. */
+  reset(): void {
+    this.seenUuids.clear();
+    this.reportedServingModel = undefined;
+  }
+
+  /** Fold newly-drained events in, newest last, and return what the daemon has
+   *  not been told yet (or null when there is nothing new). `scope:"local"`
+   *  records are skipped outright: a sub-agent fell back on its own and the
+   *  main session model is untouched. A session-scoped record that is NOT a
+   *  live Fable fallback still counts — it reports `fallback: null`, the
+   *  positive "no notice here" the daemon clears on.
+   *
+   *  Whatever the batch holds, the NEWEST session-scoped record in it decides:
+   *  an older one is only reported when no newer record follows it here. */
+  observe(events: readonly TranscriptEvent[]): ModelFallbackObservation | null {
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
+    let servingModel: string | undefined;
+    for (const ev of events) {
+      const rec = parseClaudeModelFallbackEvent(ev);
+      if (rec) {
+        if (rec.scope === 'local') continue;
+        // Replies written BEFORE the switch say nothing about what serves now;
+        // shipping one alongside the switch would make the daemon clear the
+        // notice the instant it appeared. That holds whether or not the record
+        // is new to us, so the reset comes BEFORE the uuid dedupe: a re-drain
+        // from offset 0 (a jsonl switch, a baseline self-heal) replays the
+        // switch together with every reply that preceded it, and skipping the
+        // reset would let one of those older replies reach the daemon as
+        // "Claude answered on a different model".
+        servingModel = undefined;
+        if (this.seenUuids.has(rec.uuid)) {
+          // Already reported — but it is still the record that DECIDES, so an
+          // OLDER one earlier in the same batch must not outlive it. A drain
+          // from offset 0 (a jsonl switch, a truncation re-read) replays the
+          // whole file, and the older record is unseen whenever it predates
+          // this worker's baseline: without this reset the batch would report
+          // it and resurrect a notice the newest record already retired.
+          fallback = undefined;
+          continue;
+        }
+        this.acceptSwitch(rec.uuid);
+        fallback = noticeFromSessionRecord(rec);
+        continue;
+      }
+      const serving = servingModelFromAssistantEvent(ev);
+      if (serving) servingModel = serving;
+    }
+    return this.report(fallback, servingModel);
+  }
+
+  /** Bind to `claudeSessionId` and report what the transcript tail can show
+   *  (see {@link readLatestClaudeModelFallback}).
+   *
+   *  ALWAYS returns an observation, even when the scan found nothing at all.
+   *  The empty one is not a claim that the daemon's notice is stale — it is the
+   *  worker declaring WHICH Claude session it is now bridging, which is the
+   *  only way state left over from a different one can be dropped. The daemon
+   *  ignores an empty message whose `claudeSessionId` matches what it holds, so
+   *  a plain worker restart still costs nothing. */
+  seed(path: string, claudeSessionId: string): ModelFallbackObservation {
+    this.bind(claudeSessionId);
+    const seeded = readLatestClaudeModelFallback(path);
+    let fallback: ClaudeModelFallbackRecord | null | undefined;
+    if (seeded.fallback === null) {
+      // No uuid to dedupe on, and none needed: re-sending the same "no notice"
+      // is a no-op at the daemon (it lands on the state it already holds).
+      fallback = null;
+    } else if (seeded.fallback && !this.seenUuids.has(seeded.fallback.uuid)) {
+      this.acceptSwitch(seeded.fallback.uuid);
+      fallback = seeded.fallback;
+    }
+    return this.report(fallback, seeded.servingModel)
+      ?? { claudeSessionId: this.claudeSessionId };
+  }
+
+  /** Take a session-scoped switch record we had not seen before.
+   *
+   *  Resetting `reportedServingModel` here is what keeps a switch BACK visible:
+   *  one drain can carry the whole story (fall off Fable → an Opus reply → the
+   *  user switches back → a Fable reply). Without the reset the batch's closing
+   *  Fable equals the model reported before the fall, gets deduped as
+   *  "unchanged", and the daemon receives the fallback with no clearing
+   *  evidence — a notice that hangs forever. The first serving model observed
+   *  after a switch must always ship, even when its value is old news. */
+  private acceptSwitch(uuid: string): void {
+    this.rememberUuid(uuid);
+    this.reportedServingModel = undefined;
+  }
+
+  private report(
+    fallback: ClaudeModelFallbackRecord | null | undefined,
+    servingModel: string | undefined,
+  ): ModelFallbackObservation | null {
+    const normalized = normalizeClaudeModelId(servingModel);
+    const servingChanged = normalized !== undefined && normalized !== this.reportedServingModel;
+    if (servingChanged) this.reportedServingModel = normalized;
+    if (fallback === undefined && !servingChanged) return null;
+    return {
+      claudeSessionId: this.claudeSessionId,
+      ...(fallback !== undefined
+        ? { fallback: fallback === null ? null : modelFallbackStateOf(fallback) }
+        : {}),
+      ...(servingChanged && servingModel ? { servingModel } : {}),
+    };
+  }
+
+  private rememberUuid(uuid: string): void {
+    this.seenUuids.add(uuid);
+    if (this.seenUuids.size > MODEL_FALLBACK_SEEN_UUIDS_MAX) {
+      const oldest = this.seenUuids.values().next().value;
+      if (oldest !== undefined) this.seenUuids.delete(oldest);
+    }
+  }
+}
+
 /** Provider-neutral terminal semantics derived from one Claude transcript
  * event. The classifier is deliberately fail-closed: an `unknown` API error is
  * retryable only when its bounded text matches a verified transient signature. */
@@ -95,6 +512,37 @@ function normalizedApiErrorCode(ev: TranscriptEvent): string {
 
 function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Model placeholder Claude Code writes on assistant records no model produced. */
+export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
+
+/**
+ * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
+ * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
+ * bridge resume of a turn that was cut mid-flight):
+ *
+ *     {"type":"assistant","isApiErrorMessage":false,
+ *      "message":{"model":"<synthetic>","stop_reason":"stop_sequence",
+ *                 "content":[{"type":"text","text":"No response requested."}],
+ *                 "usage":{"input_tokens":0,"output_tokens":0,...}}}
+ *
+ * It is always preceded (same timestamp) by an `isMeta` user record
+ * "Continue from where you left off.", and it carries no `requestId`.
+ *
+ * Such a record has every attribute the queue reads as "the model's final
+ * answer" — visible text block, terminal `stop_reason`, not an API error — but
+ * the user's message was never answered. Treating it as `completed` closes the
+ * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
+ * them directly after a Lark-delivered user message, none surfaced anywhere).
+ * Only `message.model` distinguishes it from a real reply.
+ */
+export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
 }
 
 export function classifyClaudeTerminalEvent(
@@ -135,6 +583,14 @@ export function classifyClaudeTerminalEvent(
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
   if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  // No model call happened, so nothing was answered; the input is still intact
+  // in the transcript, so a continuation can pick it up. `provider_` prefix on
+  // purpose: the daemon routes Claude execution failures (Wait-Mode settle,
+  // async sink, failure card) on that prefix, and the retry offer stays
+  // `caveated` — the cut turn may have run tools before it was resumed.
+  if (isSyntheticNoModelReplyEvent(ev)) {
+    return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
+  }
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return undefined;
   const reason = ev.message?.stop_reason;
@@ -163,6 +619,146 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason.length > 0
     && reason !== 'tool_use'
     && reason !== 'pause_turn';
+}
+
+/** The launch-ack a background Agent/Task tool_result carries the moment it is
+ *  dispatched: the tool call returns immediately with "launched"/"in the
+ *  background" text and an `agentId:` line, and the real result only arrives
+ *  later as a re-injected `<task-notification>`. Anchored on both markers so an
+ *  ordinary synchronous tool_result that merely mentions "background" is not
+ *  mistaken for an async dispatch. */
+const BACKGROUND_LAUNCH_ACK_RE = /launched|in the background/i;
+const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
+
+/** Identify a background Agent/Task dispatch from an assistant event: returns
+ *  the tool_use ids that dispatched async work. Empty when the event dispatched
+ *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
+ *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
+export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && (block.name === 'Agent' || block.name === 'Task')) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Read a background launch-ack out of a user event's tool_result blocks. Maps
+ *  each async-dispatch tool_use_id to the durable agent id minted in its ack
+ *  text (the id `<task-notification>` later reports under `<task-id>`). Only
+ *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
+ *  line qualify, so a synchronous tool result is never counted. */
+export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; agentId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    if (!BACKGROUND_LAUNCH_ACK_RE.test(text)) continue;
+    const m = BACKGROUND_LAUNCH_AGENT_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, agentId: m[1] });
+  }
+  return acks;
+}
+
+/** A `<task-notification>` re-injected when a background agent stops. It is a
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
+ *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
+ *  `status` is the agent's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
+  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  if (!taskId) return undefined;
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
+  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+}
+
+/** Live count of background Agent/Task dispatches whose completion notification
+ *  has not yet arrived, folded from a transcript event stream. The worker keeps
+ *  one per session and consults `pending()` at the PTY idle edge: while a main
+ *  turn is only idle because it is awaiting a background sub-agent, the session
+ *  card must stay `working` rather than freezing to idle (which Lark surfaces as
+ *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
+ *  duplicate notification or a re-drained dispatch cannot double-count. */
+export class BackgroundTaskTracker {
+  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
+  private readonly live = new Map<string, string>();
+  /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
+  private readonly ackByToolUse = new Map<string, string>();
+  /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
+  private readonly awaitingAck = new Set<string>();
+
+  observe(ev: TranscriptEvent): void {
+    // A genuine user-typed prompt starts a new turn and supersedes any prior
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
+      this.reset();
+      return;
+    }
+    for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
+      const agentId = this.ackByToolUse.get(toolUseId);
+      if (agentId) this.live.set(agentId, toolUseId);
+      else this.awaitingAck.add(toolUseId);
+    }
+    for (const ack of backgroundTaskDispatchAcks(ev)) {
+      this.ackByToolUse.set(ack.toolUseId, ack.agentId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+    }
+    const note = parseTaskNotification(ev);
+    if (note) this.live.delete(note.taskId);
+  }
+
+  /** Number of background agents still in flight. */
+  pending(): number {
+    return this.live.size;
+  }
+
+  reset(): void {
+    this.live.clear();
+    this.ackByToolUse.clear();
+    this.awaitingAck.clear();
+  }
 }
 
 /** Extract the user-typed prompt text for a "turn start" event — works for
@@ -207,64 +803,23 @@ export function drainTranscript(
   path: string,
   fromOffset: number,
 ): DrainResult {
-  if (!existsSync(path)) {
-    return { events: [], newOffset: 0, pendingTail: '' };
-  }
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return { events: [], newOffset: fromOffset, pendingTail: '' };
-  }
-  let start = fromOffset;
-  if (size < start) {
-    // Truncated/rotated — re-read from the top.
-    start = 0;
-  }
-  if (size === start) {
-    return { events: [], newOffset: start, pendingTail: '' };
-  }
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  let read = 0;
-  const fd = openSync(path, 'r');
-  try {
-    read = readSync(fd, buf, 0, len, start);
-  } finally {
-    closeSync(fd);
-  }
-  const text = buf.subarray(0, read).toString('utf8');
-
-  // Find the last '\n' — anything after it is a partial line we shouldn't
-  // commit yet. Adjust newOffset to exclude the partial tail so the next
-  // drain re-reads it.
-  const lastNl = text.lastIndexOf('\n');
-  let toParse: string;
-  let pendingTail: string;
-  let newOffset: number;
-  if (lastNl < 0) {
-    // No complete line at all — treat the whole buffer as pending.
-    toParse = '';
-    pendingTail = text;
-    newOffset = start;
-  } else {
-    toParse = text.substring(0, lastNl);
-    pendingTail = text.substring(lastNl + 1);
-    newOffset = start + Buffer.byteLength(text.substring(0, lastNl + 1), 'utf8');
-  }
+  // Truncated/rotated (size < fromOffset) re-reads from the top.
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  // Anything after the last '\n' is a partial line we shouldn't commit yet:
+  // it stays out of `newOffset` so the next drain re-reads it.
+  const { completeText, pendingTail, newOffset } = step.window;
 
   const events: TranscriptEvent[] = [];
-  if (toParse) {
-    for (const line of toParse.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
-      } catch {
-        // Malformed line — skip silently. Claude Code's writer is atomic per
-        // line, so this means a debug/non-JSON line snuck in; not our concern.
-      }
+  for (const line of completeText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
+    } catch {
+      // Malformed line — skip silently. Claude Code's writer is atomic per
+      // line, so this means a debug/non-JSON line snuck in; not our concern.
     }
   }
   return { events, newOffset, pendingTail };
@@ -338,7 +893,9 @@ export function extractAssistantThinking(event: TranscriptEvent): string {
 
 /** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
  *  contents, long prompts) and results (file reads, command output) can be
- *  hundreds of KB — the bubble only needs a recognisable preview. */
+ *  hundreds of KB — the bubble only needs a recognisable preview.
+ *  args 截断不再影响气泡标题：标题用的 `subject` 在截断之前从完整 input 上
+ *  单独提取（见 extractCotEntries）。 */
 const COT_TOOL_ARGS_MAX_CHARS = 600;
 const COT_TOOL_RESULT_MAX_CHARS = 800;
 
@@ -350,7 +907,14 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
 
 /** Flatten a tool_result block's content (string, or array of text blocks)
@@ -367,12 +931,21 @@ function stringifyToolResultContent(content: unknown): string {
 /**
  * Extract the CoT (thinking process) entries from one transcript event, in
  * content-block order:
- *   - assistant events → `thinking` blocks and `tool_use` blocks
- *     (id + name + JSON-stringified input, truncated);
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
  *   - user events → `tool_result` blocks (tool_use_id + flattened text,
  *     truncated).
  * Returns [] for events carrying neither. Sidechain / error filtering is the
  * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
  */
 export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
   const content = event.message?.content;
@@ -382,10 +955,18 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (!block || typeof block !== 'object') continue;
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
+      const subject = boundSubjectForTransport(subjectFromInputObject(block.input));
       let args = '';
       try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
-      entries.push({ kind: 'tool_call', id: block.id, name: block.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) });
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+        ...(subject ? { subject } : {}),
+      });
     } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
       const result = stringifyToolResultContent(block.content);
       entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });
@@ -422,8 +1003,23 @@ function hasToolUseBlock(ev: TranscriptEvent): boolean {
  * never contribute: only uuids in `turnAssistantUuids` are collected.
  * Returns '' for a turn with no text after its last tool_use (nothing worth
  * falling back with — e.g. the turn ended in a `botmux send` call).
+ *
+ * `opts.isHousekeepingToolUse` (transcript-delivery sessions only): Claude
+ * Code's auto-memory step can run AFTER the answer — answer text, memory file
+ * writes, then a short postscript ("I also saved two notes…"). The plain walk
+ * stops at those writes and returns only the postscript, so the answer never
+ * reaches Lark. When the tool calls separating the trailing run from the text
+ * before it are all housekeeping, that earlier run is the answer if it is
+ * substantive and longer than the trailing one; the usual shape — a one-line
+ * "saving memory" note before the writes and the real answer after them —
+ * keeps the trailing run alone. A trailing run that `opts.endsWithSentinel`
+ * flags is returned as is: the model declared its output complete there.
  */
-export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+export function trailingAssistantText(
+  events: TranscriptEvent[],
+  turnAssistantUuids: readonly string[],
+  opts: TrailingAnswerOptions = {},
+): string {
   if (turnAssistantUuids.length === 0) return '';
   const uuids = new Set(turnAssistantUuids);
   const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
@@ -442,23 +1038,127 @@ export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUu
     if (role === 'assistant' && hasToolUseBlock(ev)) return '';
     if (role === 'user' && isMeaningfulUserEvent(ev)) break;
   }
-  const tail: TranscriptEvent[] = [];
+  const { run, boundary } = collectTrailingTextRun(events, end, uuids);
+  const trailing = joinAssistantText(run);
+  if (!opts.isHousekeepingToolUse || !trailing || opts.endsWithSentinel?.(trailing)) return trailing;
+  const answer = textBeforeHousekeeping(events, boundary, uuids, opts.isHousekeepingToolUse);
+  return answer.length >= HOUSEKEEPING_ANSWER_MIN_CHARS && answer.length > trailing.length
+    ? `${answer}\n\n${trailing}`
+    : trailing;
+}
+
+/** Below this the text before housekeeping writes is a narration note
+ *  ("saving memory first"), not an answer. Longer notes exist but precede a
+ *  still longer answer, which the length comparison already keeps alone. */
+const HOUSEKEEPING_ANSWER_MIN_CHARS = 200;
+
+export interface TrailingAnswerOptions {
+  /** tool_use blocks that are bookkeeping rather than work, e.g. Claude Code's
+   *  own memory writes ({@link isClaudeMemoryToolUse}). */
+  isHousekeepingToolUse?: (block: { name?: unknown; input?: unknown }) => boolean;
+  /** The trailing text ends with the nothing-to-send sentinel line. */
+  endsWithSentinel?: (text: string) => boolean;
+}
+
+/** Walk back from `end` over this turn's contiguous assistant-text run.
+ *  `boundary` is the index of the tool_use / user event that ended the walk
+ *  (-1 when it reached the start of the transcript). */
+function collectTrailingTextRun(
+  events: TranscriptEvent[],
+  end: number,
+  uuids: ReadonlySet<string>,
+): { run: TranscriptEvent[]; boundary: number } {
+  const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
     if (!ev || typeof ev !== 'object') continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant') {
-      if (hasToolUseBlock(ev)) break;
-      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      if (hasToolUseBlock(ev)) return { run, boundary: i };
+      if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
       // Thinking-only / non-turn assistant lines: cross unless they belong to
       // a DIFFERENT turn's visible text (then we've walked past our turn).
-      if (pickAssistantTextEvents([ev]).length > 0) break;
+      if (pickAssistantTextEvents([ev]).length > 0) return { run, boundary: i };
       continue;
     }
-    if (role === 'user') break;
+    if (role === 'user') return { run, boundary: i };
     // system / attachment / meta lines (last-prompt, ai-title, …): cross.
   }
-  return joinAssistantText(tail);
+  return { run, boundary: -1 };
+}
+
+/** The turn's text run that directly precedes a run of housekeeping-only tool
+ *  calls ending at `boundary`. '' unless every tool call crossed is
+ *  housekeeping, every tool_result crossed answers one of them, and the run
+ *  belongs to this turn. */
+function textBeforeHousekeeping(
+  events: TranscriptEvent[],
+  boundary: number,
+  uuids: ReadonlySet<string>,
+  isHousekeeping: (block: { name?: unknown; input?: unknown }) => boolean,
+): string {
+  const toolUseIds = new Set<string>();
+  const toolResultIds: string[] = [];
+  let i = boundary;
+  for (; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
+    if (role === 'assistant') {
+      const hasText = pickAssistantTextEvents([ev]).length > 0;
+      const uses = content.filter(b => b?.type === 'tool_use');
+      if (uses.length === 0) {
+        if (hasText) break;
+        continue;
+      }
+      if (hasText || !uses.every(isHousekeeping)) return '';
+      for (const use of uses) if (typeof use.id === 'string') toolUseIds.add(use.id);
+      continue;
+    }
+    if (role === 'user') {
+      if (!isPureToolResultUserEvent(ev.message?.content)) return '';
+      for (const block of content) toolResultIds.push(block.tool_use_id);
+      continue;
+    }
+  }
+  if (i < 0 || toolUseIds.size === 0) return '';
+  if (!toolResultIds.every(id => typeof id === 'string' && toolUseIds.has(id))) return '';
+  if (!events[i].uuid || !uuids.has(events[i].uuid!)) return '';
+  return joinAssistantText(collectTrailingTextRun(events, i, uuids).run);
+}
+
+/**
+ * True when a Claude Code tool_use only maintains the CLI's own auto-memory —
+ * `<dataDir>/projects/<project>/memory/` of the data dir that owns
+ * `transcriptPath` (`<dataDir>/projects/<project>/<session>.jsonl`). The
+ * project slug is not compared: a worktree session keeps its memory under the
+ * main repo's project dir.
+ */
+export function isClaudeMemoryToolUse(
+  block: { name?: unknown; input?: unknown },
+  transcriptPath: string | undefined,
+): boolean {
+  if (!transcriptPath) return false;
+  const marker = '/projects/';
+  const at = transcriptPath.lastIndexOf(marker);
+  if (at === -1) return false;
+  const projectsRoot = transcriptPath.slice(0, at + marker.length);
+  const input = (block.input && typeof block.input === 'object' ? block.input : {}) as Record<string, unknown>;
+  const home = homedir();
+  const roots = [projectsRoot];
+  if (home && projectsRoot.startsWith(`${home}/`)) roots.push(`~${projectsRoot.slice(home.length)}`);
+  const escaped = roots.map(r => r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  if (block.name === 'Write' || block.name === 'Edit' || block.name === 'MultiEdit') {
+    return typeof input.file_path === 'string'
+      && new RegExp(`^(?:${escaped})[^/]+/memory/`).test(input.file_path);
+  }
+  if (block.name === 'Bash') {
+    // e.g. `cd ~/.claude/projects/-repo/memory && printf … >> MEMORY.md`
+    return typeof input.command === 'string'
+      && new RegExp(`(?:${escaped})[^/\\s'"\`]+/memory(?![\\w.-])`).test(input.command);
+  }
+  return false;
 }
 
 /** XML wrappers Claude Code uses for synthetic user events that aren't real
@@ -497,6 +1197,108 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   return true;
 }
 
+/** Claude Code's built-in CronCreate tool name. Its tool_result ack carries
+ *  the session-scoped job id that later fire records report as
+ *  `scheduledTaskId`. */
+export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
+
+/** Assistant-event tool_use block ids that called the built-in CronCreate.
+ *  The scheduled job id only comes back in the FOLLOWING user tool_result, so
+ *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
+ *  as background Task dispatches. */
+export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && block.name === CLAUDE_CRON_CREATE_TOOL) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Parse the CronCreate success ack. Real Claude Code (2.1.276 / 2.1.284,
+ *  and a scan of 821 local session transcripts) uses DISTINCT nouns:
+ *   - recurring: "Scheduled recurring job 02b077c4 (Every hour at :11) ..."
+ *   - one-shot:  "Scheduled one-shot task bf15f538 (34 18 20 9 *) ..."
+ *  An earlier regex only accepted `job`, so 13/16 real one-shot creates in
+ *  the corpus never paired and their fires routed as unknown tasks. The
+ *  `one-shot job` alternative stays for older builds that printed it. The
+ *  caller gates acceptance on a pending CronCreate tool_use id, so a quoted
+ *  ack inside unrelated output can never register a task; the tight shape
+ *  here is defence in depth. */
+const CRON_CREATE_ACK_TASK_ID_RE =
+  /Scheduled\s+(?:recurring\s+job|one-shot\s+(?:job|task))\s+([0-9A-Za-z_-]{4,})\b/i;
+
+export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
+  Array<{ toolUseId: string; taskId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; taskId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    const m = CRON_CREATE_ACK_TASK_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, taskId: m[1] });
+  }
+  return acks;
+}
+
+/** True when a `type:'user'` event is the fire record of a Claude Code
+ *  **built-in** CronCreate scheduled turn. Two transcript shapes qualify:
+ *
+ *   - Claude Code ≥2.1.281: `isMeta:true` + `turnOrigin:"scheduled"`;
+ *   - Claude Code ≤2.1.280: `isMeta:true` + `promptSource:"system"` with
+ *     NO `turnOrigin`.
+ *
+ *  Both additionally require a non-empty `scheduledFireId`. These records are
+ *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
+ *  machinery, not human typing — but they DO open a genuine model turn whose
+ *  final answer the user expects in the originating Lark thread.
+ *
+ *  The guards are deliberately tight (validated against 820 real session
+ *  transcripts): the isMeta check MUST precede the promptSource fallback —
+ *  many non-scheduler records (incl. task_notification) carry
+ *  `promptSource:"system"` with isMeta NOT true; and scheduledFireId is
+ *  mandatory — cross-session-message records are isMeta:true +
+ *  promptSource:"system" but have no fire id. A future build that drops
+ *  scheduledFireId fails closed (silent bucket, never mis-delivered). A
+ *  present turnOrigin other than "scheduled" (human/sdk/task_notification)
+ *  is rejected outright. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns carry daemon-assigned
+ *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
+export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  // Hard guard: only internal meta records. Must stay ahead of the
+  // promptSource fallback below.
+  if (ev.isMeta !== true) return false;
+  if (ev.turnOrigin !== undefined) {
+    // Newer builds stamp the discriminator explicitly.
+    if (ev.turnOrigin !== 'scheduled') return false;
+  } else {
+    // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
+    // promptSource. isMeta already passed; scheduledFireId still required.
+    if (ev.promptSource !== 'system') return false;
+  }
+  // Require the fire identity: every real CronCreate fire carries it, and it
+  // rules out isMeta + promptSource:'system' lookalikes (cross-session
+  // messages) that happen to lack it.
+  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
+  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
+  return true;
+}
+
 /** True when a `type:'attachment'` line carries a queued-command payload
  *  representing a real submitted prompt. Claude writes one of these when it
  *  dequeues a type-ahead submission (right before the assistant's reply for
@@ -510,6 +1312,15 @@ export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
+  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
+  // a turn is running, Claude Code logs an attachment(queued_command) rendered
+  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
+  // This is intra-turn context, NOT a new conversation turn boundary.
+  if ((ev as any).renderedRole === 'system') return false;
+  const rendered = (ev as any).rendered;
+  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
+    return false;
+  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;

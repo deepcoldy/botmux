@@ -24,7 +24,9 @@ vi.mock('../src/im/lark/client.js', () => {
 });
 
 import { downloadMessageResource, UserTokenMissingError } from '../src/im/lark/client.js';
-import { downloadResources } from '../src/core/session-manager.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import { downloadResources, formatAttachmentsHint } from '../src/core/session-manager.js';
 
 const img = { type: 'image' as const, key: 'k', name: 'k.jpg' };
 
@@ -74,4 +76,19 @@ describe('downloadResources — needLogin gating', () => {
     expect(needLogin).toBe(false);
     expect(downloadMessageResource as any).not.toHaveBeenCalled();
   });
+});
+
+it('normalizes actual GIF bytes and carries the temporal hint into the CLI prompt', async () => {
+  vi.mocked(downloadMessageResource).mockImplementation(async (_app, _msg, _key, _type, path) => {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
+  });
+  const { attachments, needLogin } = await downloadResources('app', 'om_gif_format', [img]);
+  expect(needLogin).toBe(false);
+  expect(attachments[0]).toMatchObject({ name: 'k.gif', resourceKey: 'k', mimeType: 'image/gif' });
+  const prompt = formatAttachmentsHint(attachments);
+  expect(prompt).toContain('k.gif');
+  expect(prompt).toContain('mime_type="image/gif"');
+  expect(prompt).toContain('Inspect or extract frames in time order');
+  expect(formatAttachmentsHint([{ type: 'image', name: 'old.jpg', path: '/tmp/old.jpg' }])).toContain('<image n="1" path="/tmp/old.jpg" />');
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -55,12 +55,6 @@ const CRASH_DASHBOARD = `
 process.exit(1);
 `;
 
-const GRACEFUL_DASHBOARD = `
-// A dashboard that exits 90 (the graceful sentinel) on its own after a beat —
-// the supervisor must NOT restart it (operator-initiated shutdown semantics).
-setTimeout(() => process.exit(90), 100);
-`;
-
 describe('dashboard launcher — wiring (pure, no HOME)', () => {
   it('resolveDashboardSpec is a dashboard-entry member named botmux-dashboard, no bot index', () => {
     const spec = resolveDashboardSpec();
@@ -91,45 +85,6 @@ describe('dashboard launcher — wiring (pure, no HOME)', () => {
   it('the __dashboard self-spawn token round-trips to the dashboard entry', () => {
     expect(ENTRY_SUBCOMMANDS.has('__dashboard')).toBe(true);
     expect(entryForSubcommand('__dashboard')).toBe('dashboard');
-  });
-});
-
-describe('dashboard launcher — source pins', () => {
-  const read = (rel: string) => readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
-
-  it('index-supervisor.ts supervises fleet MEMBERS (bots + dashboard), not bots alone', () => {
-    const src = read('index-supervisor.ts');
-    // The supervisor must start the member set that includes the dashboard.
-    expect(src).toContain('resolveFleetMembers');
-    expect(src).toContain('supervisor.start(members)');
-    // Guard against a regression back to bots-only supervision.
-    expect(src).not.toContain('supervisor.start(bots)');
-  });
-
-  it('cli.ts self-spawn dispatcher routes __dashboard to index-dashboard.js', () => {
-    const cli = read('cli.ts');
-    expect(cli).toContain("__entrySubcommand === 'dashboard') await import('./index-dashboard.js')");
-  });
-
-  it('cmdRestart health-gates on fleet MEMBERS so a down dashboard fails the restart', () => {
-    const cli = read('cli.ts');
-    expect(cli).toContain('fleetMemberNames');
-  });
-
-  it('bot-onboarding.ts STATIC-imports qrcode vendor files so the compiled binary embeds them', () => {
-    // The compiled (bun --compile) dashboard crashed with "Cannot find module
-    // 'qrcode-terminal/vendor/QRCode'" because a `createRequire(...)` of a bare
-    // dir path is not traced/embedded by the bundler. Static `.js` imports are.
-    // (Verified end-to-end: the fix takes the 1.4 compiled dashboard from
-    // crashloop → online.) Guard against a regression back to createRequire.
-    const src = read('dashboard/bot-onboarding.ts');
-    expect(src).toContain("import QRCode from 'qrcode-terminal/vendor/QRCode/index.js'");
-    expect(src).toContain("import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js'");
-    // No actual createRequire CALL or dynamic vendor require (the prose comment
-    // mentions createRequire, so match the code forms, not the bare word).
-    expect(src).not.toContain("createRequire(import.meta");
-    expect(src).not.toContain("import { createRequire }");
-    expect(src).not.toMatch(/require\(\s*['"]qrcode-terminal\/vendor/);
   });
 });
 
@@ -189,26 +144,52 @@ describe('FleetSupervisor manages the dashboard like a bot daemon (live)', () =>
     await sup.stopAll();
   });
 
-  it('does NOT restart the dashboard on a graceful exit (code 90)', async () => {
+  it('restarts the dashboard on an unsolicited code 90 (self-heals like a bot daemon)', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');
+    const beats = join(root, 'dash-launches.txt');
+    const UNSOLICITED_90 = `
+require('fs').appendFileSync(${JSON.stringify(beats)}, 'x');
+setTimeout(() => process.exit(90), 100);
+`;
     const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, GRACEFUL_DASHBOARD), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 10, restartDelayMs: 50 }, log: () => {},
+      statePath, distDir: fakeDist(root, UNSOLICITED_90), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
     });
     sup.start([dashboardSpec]);
-    // The child exits 90 on its own; decideOnExit maps 90 → stop (no restart).
-    const stopped = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard');
-      return p?.status === 'stopped';
+    // The child exits 90 on its own WITHOUT a supervisor-initiated stop. The
+    // sentinel is no longer trusted as operator intent on an ordinary exit
+    // path, so the dashboard self-heals (same contract as a bot daemon).
+    const relaunched = await waitFor(() =>
+      existsSync(beats) && readFileSync(beats, 'utf-8').length >= 2);
+    expect(relaunched).toBe(true);
+    expect(await waitFor(() =>
+      (readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard')?.restarts ?? 0) >= 1)).toBe(true);
+    await sup.stopAll();
+    await delay(100); // let the tight crash-loop settle before tmp cleanup
+  });
+
+  it('keeps the dashboard stopped when the supervisor itself stops it (graceful sentinel honoured)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY_DASHBOARD), daemonEnv: {}, cwd: root, logDir,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
     });
-    expect(stopped).toBe(true);
-    // Give a restart-delay window to prove it stays down (no respawn).
+    sup.start([dashboardSpec]);
+    const online = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard');
+      return !!p && p.status === 'online' && p.pid > 1;
+    });
+    expect(online).toBe(true);
+    const stoppedPid = readFleetState(statePath)!.procs.find((x) => x.name === 'botmux-dashboard')!.pid;
+
+    await sup.stopAll(); // the supervisor initiates → the 90 sentinel is honoured
     await delay(250);
     const p = readFleetState(statePath)?.procs.find((x) => x.name === 'botmux-dashboard');
     expect(p?.status).toBe('stopped');
     expect(p?.restarts).toBe(0);
-    expect(pidAlive(p?.pid ?? 0)).toBe(false);
-    await sup.stopAll();
+    expect(pidAlive(stoppedPid)).toBe(false);
   });
 });

@@ -38,6 +38,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const SCHEDULES_ACTION_REFRESH = 'dash_schedules_refresh' as const;
 export const SCHEDULES_ACTION_PAGE = 'dash_schedules_page' as const;
@@ -46,16 +47,6 @@ export const SCHEDULES_ACTION_PAUSE = 'dash_schedules_pause' as const;
 export const SCHEDULES_ACTION_RESUME = 'dash_schedules_resume' as const;
 export const SCHEDULES_ACTION_DELIVERY = 'dash_schedules_delivery' as const;
 export const SCHEDULES_ACTION_BACK_TO_LIST = 'dash_schedules_back_to_list' as const;
-/** Action emitted by "🔙 返回总览" on overview-origin sub-cards. Same string
- *  as overview-card's OVERVIEW_ACTION_REFRESH (kept in sync; we don't import
- *  to avoid a circular dep). */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
-
-/** Default page size for standalone and overview-drilldown list cards. */
-const PAGE_SIZE = 5;
-
-/** Hard cap on `select_static` jump-page option count. */
-const JUMP_PAGE_MAX_OPTIONS = 50;
 
 function toneIcon(tone: string): string {
   switch (tone) {
@@ -120,7 +111,7 @@ export function buildSchedulesCard(
   const effectivePageSize =
     typeof opts.pageSize === 'number' && Number.isFinite(opts.pageSize) && opts.pageSize > 0
       ? Math.floor(opts.pageSize)
-      : PAGE_SIZE;
+      : DASH_PAGE_SIZE;
   const sorted = sortForList(tasks);
   const { items, total, page, totalPages } = paginateSchedules(sorted, opts.page, effectivePageSize);
 
@@ -128,7 +119,7 @@ export function buildSchedulesCard(
   // page/detail/detail-back rebuilds keep the same drilldown state.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (effectivePageSize !== DASH_PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const enabledCount = sorted.filter(t => t.enabled).length;
@@ -365,6 +356,8 @@ function deliveryLabel(detail: ScheduleDetailDto, locale: Locale): string {
       return t('card.dashboard.schedules.delivery.local', undefined, locale);
     case 'new-topic':
       return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+    case 'task':
+      return t('schedulePos.cardDeliveryTask', undefined, locale);
     case 'chat':
     default:
       return t('card.dashboard.schedules.delivery.top_level', undefined, locale);
@@ -428,7 +421,7 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
   );
-  if (detail.executionPlacement === 'new-topic' && detail.raw.topicTitle) {
+  if ((detail.executionPlacement === 'new-topic' || detail.executionPlacement === 'task') && detail.raw.topicTitle) {
     infoLines.push(
       t(
         'card.dashboard.schedules.detail.topic_title_label',
@@ -548,7 +541,7 @@ export function buildSchedulesDetailCard(
     typeof opts.pageSize === 'number'
     && Number.isFinite(opts.pageSize)
     && opts.pageSize > 0
-    && opts.pageSize !== PAGE_SIZE
+    && opts.pageSize !== DASH_PAGE_SIZE
   ) {
     navFields.page_size = String(Math.floor(opts.pageSize));
   }
@@ -593,9 +586,11 @@ export function buildSchedulesDetailCard(
       content: t(
         deliveryTarget === 'new-topic'
           ? 'card.dashboard.schedules.btn.use_fresh_topic'
-          : deliveryTarget === 'topic'
-            ? 'card.dashboard.schedules.btn.use_origin'
-            : 'card.dashboard.schedules.btn.use_new_topic',
+          : deliveryTarget === 'task'
+            ? 'schedulePos.cardBtnUseTaskTopic'
+            : deliveryTarget === 'topic'
+              ? 'card.dashboard.schedules.btn.use_origin'
+              : 'card.dashboard.schedules.btn.use_new_topic',
         undefined,
         opts.locale,
       ),
@@ -715,22 +710,13 @@ function mapDeliveryDisabledReason(reasonKey: string | undefined): string | unde
       return 'card.dashboard.schedules.delivery.disabled.alreadyTopLevel';
     case 'schedules.action.delivery.alreadyNewTopic':
       return 'card.dashboard.schedules.delivery.disabled.alreadyNewTopic';
+    case 'schedules.action.delivery.alreadyTask':
+      return 'schedulePos.cardAlreadyTask';
+    case 'schedules.action.delivery.taskMultiChat':
+      return 'schedulePos.cardTaskMultiChatUnsupported';
     default:
       return undefined;
   }
-}
-
-/**
- * Sanitize user-/CLI-supplied text for inclusion in lark_md. See
- * `sessions-card.ts:escapeLarkMd` for the order rationale: `&` first to
- * avoid `&` → `&amp;` then `<` → `&lt;` getting re-encoded as `&amp;lt;`.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
 }
 
 /** ─── Handler ─────────────────────────────────────────────────────────── */
@@ -744,18 +730,7 @@ export interface SchedulesCardHandlerDeps {
   nowMs?: () => number;
 }
 
-export interface SchedulesCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): SchedulesCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SchedulesCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type SchedulesCardHandlerResult = DashCardHandlerResult;
 
 /** Dispatch a `dash_schedules_*` action callback. Mirrors sessions-card. */
 export async function handleSchedulesCardAction(
@@ -954,7 +929,7 @@ export async function handleSchedulesCardAction(
       ? 'topic'
       : value.target_delivery === 'new-topic' ? 'top-level' : undefined;
     const targetPosition =
-      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic'
+      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic' || value.target_position === 'task'
         ? value.target_position
         : legacyTarget;
     if (!targetPosition) {
@@ -993,11 +968,13 @@ export async function handleSchedulesCardAction(
       return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
+    const responsePositionBody = (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition;
     const responsePosition =
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'topic' ||
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'top-level' ||
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'new-topic'
-        ? (resp.body as { executionPosition: 'topic' | 'top-level' | 'new-topic' }).executionPosition
+      responsePositionBody === 'topic' ||
+      responsePositionBody === 'top-level' ||
+      responsePositionBody === 'new-topic' ||
+      responsePositionBody === 'task'
+        ? responsePositionBody as 'topic' | 'top-level' | 'new-topic' | 'task'
         : targetPosition;
     const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
     let after: ScheduleCardTaskInput | undefined;
@@ -1010,7 +987,7 @@ export async function handleSchedulesCardAction(
       // target position; the next refresh converges to the owner snapshot.
       after = {
         ...before,
-        scope: responsePosition === 'topic' ? 'thread' : 'chat',
+        scope: responsePosition === 'topic' || responsePosition === 'task' ? 'thread' : 'chat',
         executionPosition: responsePosition,
       };
     }

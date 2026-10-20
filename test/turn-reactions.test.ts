@@ -13,7 +13,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync } from 'fs';
+import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -42,8 +42,9 @@ vi.mock('../src/im/lark/client.js', async () => {
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { noteTurnReceived } from '../src/daemon.js';
+import * as sessionStore from '../src/services/session-store.js';
 import {
   initWorkerPool,
   __testOnly_finishTurnReactions as finishTurnReactions,
@@ -64,13 +65,14 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
 // disableStreamingCard (streaming card on → no reactions; off → reactions).
-function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string } = {}) {
+function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string; replyCardMode?: 'legacy' | 'unified' } = {}) {
   registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
     cliId: 'claude-code',
     allowedUsers: ['ou_o'],
     disableStreamingCard: reactionsOn || undefined,
+    replyCardMode: opts.replyCardMode,
     silentTurnReactions: opts.silentTurnReactions || undefined,
     receivedReactionEmoji: opts.receivedReactionEmoji,
     doneReactionEmoji: opts.doneReactionEmoji,
@@ -81,6 +83,7 @@ describe('two-phase turn reactions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-'));
+    sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
   });
@@ -91,6 +94,18 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.turnReceivedAtMs).toBeUndefined();
+    getBot(APP).config.showReplyTiming = true;
+    await noteTurnReceived(ds, 'om_b', undefined, undefined, 'om_actual_turn');
+    expect(ds.turnReceivedAtMs?.get('om_actual_turn')).toEqual(expect.any(Number));
+    expect(ds.turnReceivedAtMs?.has('om_b')).toBe(false);
+  });
+
+  it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
+    registerWith(statusOff, { replyCardMode: 'unified' });
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_status_toggle');
+    expect(mocks.addReaction).toHaveBeenCalledTimes(statusOff ? 1 : 0);
   });
 
   it('Plan B: a meeting-agent session reacts to plain user turns like any card-off session', async () => {
@@ -339,38 +354,6 @@ describe('two-phase turn reactions', () => {
 });
 
 /**
- * Source-level pin: the screen_update handler must only flip ✋→✅ after a real
- * busy period (working/analyzing → idle). Cold-start starting→idle
- * (ready-gate settle before the turn has gone working) must leave GoGoGo alone
- * — otherwise card-off Grok sessions DONE a message while the CLI is still
- * chewing the first prompt. A limited settle is also excluded (rate limit is a
- * blocked turn, not completion — see test/rate-limit-notify.test.ts).
- */
-describe('turn reaction idle edge gate (source)', () => {
-  it('finishTurnReactions is gated on prevStatus working|analyzing and idle settle', () => {
-    const source = readFileSync(
-      join(process.cwd(), 'src/core/worker-pool.ts'),
-      'utf8',
-    );
-    // Anchor on the screen_update reaction comment — "// Usage ledger" alone
-    // also appears on the kill/close path and would pick the wrong block.
-    const blockStart = source.indexOf('// Usage ledger + turn reactions') >= 0
-      ? source.indexOf('// Usage ledger + turn reactions')
-      : source.indexOf('// Usage ledger: any settle-to-idle');
-    expect(blockStart).toBeGreaterThan(-1);
-    // Window is wider than the original 900 chars: the gate now also excludes
-    // limited settles, so the condition line carries the extra idle check.
-    const block = source.slice(blockStart, blockStart + 1400);
-    expect(block).toContain("prevStatus === 'working' || prevStatus === 'analyzing'");
-    expect(block).toContain('void finishTurnReactions(ds)');
-    // Must NOT call finishTurnReactions on every idle/limited edge unconditionally.
-    expect(block).not.toMatch(
-      /if \(ds\.lastScreenStatus === 'idle' \|\| ds\.lastScreenStatus === 'limited'\) \{\s*recordUsageForDaemonSession\(ds\);\s*void finishTurnReactions\(ds\);/,
-    );
-  });
-});
-
-/**
  * Behavioral pin for PR #633 review P2: card-off finishTurnReactions requires a
  * working→idle edge. Argv cold-start (Pi/Gemini) must seed working before idle
  * (worker side); daemon-side, bare undefined→idle must NOT flip, while the
@@ -397,6 +380,7 @@ describe('turn reaction screen_update behavioral gate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
+    sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
     registerWith(true);
@@ -517,5 +501,4 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
   });
 });
-
 

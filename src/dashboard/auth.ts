@@ -1,5 +1,7 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { dirname } from 'node:path';
+
+import { WORKBENCH_DOCK_IMMERSIVE_ENTRY, WORKBENCH_IMMERSIVE_ENTRY } from '../core/workbench-shell.js';
 import {
   readSecureHostFileSync,
   UnsafeHostAuthorityFileError,
@@ -461,8 +463,7 @@ export function decideDashboardAuth(opts: {
       // and every probe it runs is the visitor's own browser calling the same
       // gated APIs under the visitor's own (possibly absent) credentials.
       pathname === '/workbench-doctor' ||
-      pathname.startsWith('/assets/') ||
-      pathname.startsWith('/game/')
+      pathname.startsWith('/assets/')
     );
 
   // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换端点。URL 路径里的票据本身
@@ -495,11 +496,12 @@ export function decideDashboardAuth(opts: {
       // The fragment-free Workbench entries are redirects themselves. Sending
       // the cleaned URL back to the same path would bounce between "strip the
       // token" and "redirect again", so resolve them to their real destination
-      // in this one hop.
+      // in this one hop. They are direct entries, so the destination carries the
+      // immersive (chrome-less) marker — see core/workbench-shell.ts.
       redirectTo: pathname === '/workbench'
-        ? '/#/agent-workbench'
+        ? WORKBENCH_IMMERSIVE_ENTRY
         : pathname === '/workbench/dock'
-          ? '/#/agent-workbench-dock'
+          ? WORKBENCH_DOCK_IMMERSIVE_ENTRY
           : pathname || '/',
     };
   }

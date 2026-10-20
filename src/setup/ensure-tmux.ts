@@ -63,7 +63,19 @@ function childFailureReason(command: string, failure: any, timeoutMs: number): s
   const code = failure?.code ?? nested?.code;
   const signal = failure?.signal ?? nested?.signal;
   const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
+  const rawMessage = nested?.message ?? failure?.message;
 
+  // Seccomp/container sandboxes that block clone3 (without the clone fallback)
+  // let the tmux binary exec but kill its first fork with EPERM. The binary is
+  // installed — telling the user to install tmux sends them the wrong way.
+  if (
+    code === 'EPERM'
+    || /clone3/i.test(stderr) || /clone3/i.test(rawMessage ?? '')
+    || /operation not permitted/i.test(stderr) || /operation not permitted/i.test(rawMessage ?? '')
+  ) {
+    return `${command} 启动失败：tmux 已安装，但当前运行环境（容器 seccomp/沙箱）禁止进程克隆`
+      + '（clone3 返回 EPERM / Operation not permitted），tmux server 无法启动';
+  }
   if (code === 'ENOENT') return `${command} 启动失败：找不到 tmux 可执行文件（ENOENT）`;
   if (code === 'EACCES') return `${command} 启动失败：tmux 不可执行（EACCES）`;
   if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
@@ -73,11 +85,55 @@ function childFailureReason(command: string, failure: any, timeoutMs: number): s
   }
   if (stderr) return `${command} 失败：${stderr}`;
   if (typeof failure?.status === 'number') return `${command} 失败（exit ${failure.status}）`;
-  const message = nested?.message ?? failure?.message;
-  return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
+  return `${command} 启动/探测失败${rawMessage ? `：${rawMessage}` : ''}`;
 }
 
-function probeTmuxVersion(): TmuxVersionProbe {
+/** Coarse class of a tmux probe failure reason string, used to pick the
+ *  user-facing gate copy. `env-denied` means the binary exists but the daemon's
+ *  runtime blocks process cloning (container seccomp clone3 EPERM); `missing`
+ *  matches the authoritative ENOENT wording. Anything uncertain stays generic. */
+export type TmuxProbeFailureClass = 'missing' | 'env-denied' | 'generic';
+
+export function classifyTmuxProbeFailure(reason: string): TmuxProbeFailureClass {
+  const text = String(reason ?? '');
+  if (/clone3|EPERM|operation not permitted/i.test(text)) return 'env-denied';
+  if (/ENOENT|找不到 tmux/.test(text)) return 'missing';
+  return 'generic';
+}
+
+export interface TmuxVersion {
+  major: number;
+  minor: number;
+}
+
+/** Parse `tmux -V` output (`tmux 3.3a`, `tmux 2.8`, …). Letter suffixes are
+ *  ignored; unparseable input returns null. */
+export function parseTmuxVersion(raw: string): TmuxVersion | null {
+  const match = /(\d+)\.(\d+)/.exec(String(raw ?? ''));
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+// Successful probes are cached for process lifetime; a failed probe is cached
+// only briefly (a resize fires on every viewport change, and a tmux backend
+// only reaches these paths once a server is reachable, so a missing -V answer
+// is normally transient), after which it is re-probed.
+const NULL_VERSION_CACHE_TTL_MS = 10_000;
+let cachedTmuxVersion: TmuxVersion | null | undefined;
+let cachedTmuxVersionNullAt = 0;
+
+export function resetTmuxVersionCacheForTests(): void {
+  cachedTmuxVersion = undefined;
+  cachedTmuxVersionNullAt = 0;
+}
+
+/** Cached `tmux -V` version. Never throws — any failure returns null. */
+export function getTmuxVersionCached(): TmuxVersion | null {
+  if (cachedTmuxVersion) return cachedTmuxVersion;
+  if (cachedTmuxVersion === null && Date.now() - cachedTmuxVersionNullAt < NULL_VERSION_CACHE_TTL_MS) {
+    return null;
+  }
+  let version: TmuxVersion | null = null;
   try {
     const out = execFileSync('tmux', ['-V'], {
       encoding: 'utf-8',
@@ -85,12 +141,60 @@ function probeTmuxVersion(): TmuxVersionProbe {
       timeout: 3000,
       env: tmuxEnv(),
     });
+    version = parseTmuxVersion(out);
+  } catch {
+    version = null;
+  }
+  if (version) {
+    cachedTmuxVersion = version;
+  } else {
+    cachedTmuxVersion = null;
+    cachedTmuxVersionNullAt = Date.now();
+  }
+  return version;
+}
+
+/** Version comparison: true iff `version` is a known release >= major.minor.
+ *  Deliberately false for null (unknown) — callers keep legacy behaviour on an
+ *  unknown version rather than silently skipping commands. */
+export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, minor: number): boolean {
+  if (!version) return false;
+  return version.major > major || (version.major === major && version.minor >= minor);
+}
+
+/**
+ * Child-process budgets for the worker-gate capability probe.
+ *
+ * These are fork+exec budgets, not tmux-work budgets: `tmux -V` answers in
+ * ~10ms and `new-session -d` well under a second on an idle host — what eats
+ * the budget is waiting to be scheduled. Measured `new-session -d` at 0.93–4.45s
+ * on a host at load ~4, i.e. already brushing the old 5s budget, and at load ~70
+ * `tmux -V` blew a 3s budget outright, turning a healthy tmux into a false
+ * "tmux 不可用" hard gate. A slower correct answer beats a fast false negative
+ * that refuses the user's session. Kept moderate (not unbounded) because the
+ * gate retries the probe and a genuinely hung tmux (restricted /tmp, broken
+ * install) must still fail in bounded time. The gate only runs this probe after
+ * an AUTHORITATIVE 'missing' existence answer, so these budgets are not on the
+ * load-timeout path for live sessions at all.
+ */
+export const TMUX_VERSION_PROBE_TIMEOUT_MS = 8_000;
+export const TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS = 10_000;
+export const TMUX_PROBE_CLEANUP_TIMEOUT_MS = 5_000;
+
+function probeTmuxVersion(): TmuxVersionProbe {
+  try {
+    const out = execFileSync('tmux', ['-V'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(),
+    });
     return { ok: true, version: out.trim() };
   } catch (err: any) {
     const code = err?.code;
     return {
       ok: false,
-      reason: childFailureReason('tmux -V', err, 3000),
+      reason: childFailureReason('tmux -V', err, TMUX_VERSION_PROBE_TIMEOUT_MS),
       // Only ENOENT proves absence. Timeout/EMFILE/EACCES must not be turned
       // into the old, misleading "not on PATH" diagnosis or a startup hard
       // gate; they prove only that this particular probe got no answer.
@@ -264,15 +368,15 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // startup) and report "ok: false" even on a perfectly healthy install.
   const run = spawnSync('tmux', ['-L', sockName, 'new-session', '-d', '-s', 'probe', 'true'], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    timeout: 5000,
+    timeout: TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS,
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
-    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
     cleanupTmuxProbeSocket(sockName);
     return {
       ok: false,
-      reason: childFailureReason('tmux new-session', run, 5000),
+      reason: childFailureReason('tmux new-session', run, TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS),
       binaryPresent: true,
       retryable: (run.error as NodeJS.ErrnoException | undefined)?.code !== 'EACCES',
       version,
@@ -281,7 +385,7 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // Tear down the probe server and remove the socket file. Some platforms leave
   // bmx-probe-* sockets behind after the server exits; thousands of stale
   // entries make later probe storms slower and easier to time out.
-  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
   cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
 }

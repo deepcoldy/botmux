@@ -21,11 +21,13 @@ import {
   brandFooterSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
+  contextOverCompactThreshold,
   createReplyCard,
   DEFAULT_BRAND_LABEL,
   extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
+  REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
@@ -197,6 +199,102 @@ describe('buildCardBodyElements', () => {
     expect(content).toMatch(/```\n\nnext prose/);
   });
 
+  it('lifts a code fence out of an ordered list into its own card element', () => {
+    const input = [
+      '1. Read the value.',
+      '2. When it is missing, run:',
+      '   ```cpp',
+      '   values.assign(128, 0.f);',
+      '   return true;',
+      '   ```',
+      '3. Continue processing.',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '1. Read the value.\n2. When it is missing, run:' },
+      { tag: 'markdown', content: '```cpp\nvalues.assign(128, 0.f);\nreturn true;\n```' },
+      { tag: 'markdown', content: '3. Continue processing.' },
+    ]);
+  });
+
+  it.each([
+    ['- Run:', '  ', '- Done.'],
+    ['- Outer\n  - Run:', '    ', '  - Done.'],
+    ['> Run:', '> ', '> Done.'],
+    ['> - Run:', '>   ', '> - Done.'],
+  ])('lifts nested fences after %s without treating code as prose', (before, prefix, after) => {
+    const code = ['if (ready) {', '  execute();', '', '', '', '}', '![literal](https://example.com/image.png)', '', ''];
+    const input = [before, prefix + '````text', ...code.map(line => prefix + line), prefix + '````', after].join('\n');
+    const elements = buildCardBodyElements(input);
+    expect(elements).toHaveLength(3);
+    expect(elements[1]).toEqual({ tag: 'markdown', content: '````text\n' + code.join('\n') + '\n````' });
+    expect(elements[0].content).toContain('Run:');
+    expect(elements[2].content).toContain('Done.');
+  });
+
+  it('keeps multiple code blocks and intervening list-item prose in order', () => {
+    const input = [
+      '- Start', '  ```js', '  first();', '  ```',
+      '', '  Continue', '',
+      '  ~~~js', '  second();', '  ~~~', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue' },
+      { tag: 'markdown', content: '~~~js\nsecond();\n~~~' },
+      { tag: 'markdown', content: '- Done' },
+    ]);
+  });
+
+  it('lifts indented code in a list without closing on literal backticks', () => {
+    const input = ['- Example:', '', '      ```', '      literal', '      ```', '', '- Done'].join('\n');
+    expect(buildCardBodyElements(input)[1]).toEqual({
+      tag: 'markdown', content: '````\n```\nliteral\n```\n````',
+    });
+  });
+
+  it('does not turn deeply indented continuation paragraphs into code after a lifted fence', () => {
+    const input = [
+      '- Outer', '  - Start', '    ```js', '    first();', '    ```',
+      '', '    Continue', '', '    Another paragraph', '', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Outer\n  - Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue\n\nAnother paragraph\n\n- Done' },
+    ]);
+  });
+
+  it('keeps code-only list items and empty code fences', () => {
+    expect(buildCardBodyElements('- ```js\n  run();\n  ```\n- ```\n  ```')).toEqual([
+      { tag: 'markdown', content: '```js\nrun();\n```' },
+      { tag: 'markdown', content: '```\n```' },
+    ]);
+  });
+
+  it('keeps other blocks between lifted code and continuation paragraphs', () => {
+    const input = '- Start\n  ```js\n  run();\n  ```\n\n  ### Details\n\n  First paragraph\n\n  Second paragraph';
+    const elements = buildCardBodyElements(input);
+    expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
+  });
+
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
+  });
+
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
     // CommonMark treats this as TWO adjacent code blocks (the "outer" closes
     // at the first inner ```). markdown-it parses the same way. The
@@ -255,6 +353,28 @@ describe('buildCardBodyElements', () => {
       { c0: 'a1', c1: 'b1' },
       { c0: 'a2', c1: 'b2' },
     ]);
+  });
+
+  it('native table auto-sizes wrapped rows instead of single-line ellipsis clipping', () => {
+    // Regression: row_height was hardcoded to 'low', pinning every row to one
+    // line so any cell whose text wrapped was truncated with an ellipsis.
+    const longCell = 'one '.repeat(40).trim();
+    const input = [
+      '| A rather long header that itself needs to wrap | B |',
+      '| --- | --- |',
+      `| ${longCell} | b1 |`,
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+    const table = out.find(e => e.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    // Feishu caps auto rows at 32px–999px; without an explicit cap the
+    // component default is only 124px, which still clips dense cells.
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    // The full cell content survives into the row data; wrapping is the
+    // renderer's job, not a reason to clip at build time.
+    expect(table.rows[0].c0).toBe(longCell);
   });
 
   it('table flanked by prose → prose, table, prose are separate elements', () => {
@@ -912,29 +1032,37 @@ describe('buildMarkdownCard', () => {
   it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Sol** xhigh');
     // no effort -> model only, no trailing space/placeholder
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-4o' },
-      true,
     )).toBe('**gpt-4o**');
     // no model -> nothing
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, reasoningEffort: 'xhigh' },
-      true,
     )).toBeNull();
-    // no metric line to anchor to -> nothing (matches footer contract)
-    expect(cardUsageRuntimeSegment(
-      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      false,
-    )).toBeNull();
+  });
+
+  it('preserves Cursor effort and fast variants encoded in the selected model ID', () => {
+    for (const model of ['claude-opus-5-5-high', 'claude-opus-5-5-high-fast']) {
+      expect(cardUsageRuntimeSegment({ context: null, tokens: null, model })).toBe(`**${model}**`);
+    }
+  });
+
+  it('includes known model/effort in a signed final footer without token metrics', () => {
+    const card = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown: 'Answer', brand: '',
+      usage: { context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    }));
+    const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+    expect(footer.content).toContain('**gpt-5.6-sol** high');
+    expect(footer.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer.content).not.toMatch(/Context|上下文|↑|↓/);
   });
 
   it('renders a backend variant between the model and reasoning effort', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Terra** Max · xhigh');
   });
 
@@ -943,21 +1071,18 @@ describe('buildMarkdownCard', () => {
     // underscores are markdown-escaped by the shared compact formatter.
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'model_hub/es1_orange_o48' },
-      true,
     )).toBe('**es1\\_orange\\_o48**');
     // a value with no slash is untouched
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-5.6-sol' },
-      true,
     )).toBe('**gpt-5.6-sol**');
     // only a clean single-token prefix + one slash is removed
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'a/b/c' },
-      true,
     )).toBe('**b/c**');
   });
 
-  it('does not create a standalone runtime line without native usage metrics', () => {
+  it('keeps the metric formatter empty when only runtime identity is known', () => {
     expect(cardUsageFooterSegment(
       {
         context: null,
@@ -978,7 +1103,6 @@ describe('buildMarkdownCard', () => {
         model: `[very-long-${'x'.repeat(60)}] <at id=ou_fake></at>`,
         reasoningEffort: '*xhigh*',
       },
-      true,
     )!;
     expect(seg).toContain('**\\[very-long-');
     expect(seg).toContain('…** \\*xhigh\\*');
@@ -1076,6 +1200,15 @@ describe('buildMarkdownCard', () => {
 });
 
 describe('buildReplyCardFooter', () => {
+  it('keeps timing-only footers identifiable and omits invalid timing', () => {
+    const footer = buildReplyCardFooter({ brand: '', executionDurationMs: 0, locale: 'en' });
+    expect(footer?.content).toContain('Execution time 0.0s');
+    expect(footer?.element.element_id).toBe('botmux_reply_footer');
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: -1 })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.NaN })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.POSITIVE_INFINITY })).toBeNull();
+  });
+
   it('centralizes brand, usage, and ordered recipients for every reply-card path', () => {
     const footer = buildReplyCardFooter({
       brand: 'Acme',
@@ -1088,10 +1221,11 @@ describe('buildReplyCardFooter', () => {
     });
 
     expect(footer?.content).toContain(
-      'Acme [·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+      `Acme ·${REPLY_CARD_FOOTER_MARKER} `
       + '上下文 12.3K · '
       + '发送给：<at id=ou_owner></at> <at id=ou_reviewer></at>',
     );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
     // Footer is context-only — the cumulative token line does not appear here.
     expect(footer?.content).not.toContain('Token');
     expect(footer?.content).not.toContain('\u200B');
@@ -1121,9 +1255,7 @@ describe('buildReplyCardFooter', () => {
       element_id: 'botmux_reply_footer',
     });
     expect(card.body.elements.at(-1).content).toContain('Sent to: <at id=ou_owner></at>');
-    expect(card.body.elements.at(-1).content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(card.body.elements.at(-1).content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
   it('rejects caller-supplied cards without schema-2 body elements', () => {
@@ -1206,35 +1338,38 @@ describe('buildReplyCardFooter', () => {
     );
   });
 
-  it('still signs a usage-only footer (brand disabled) with the versioned marker', () => {
+  it('signs a usage-only footer with non-link text', () => {
     const footer = buildReplyCardFooter({
       brand: '', // brand off
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 
-  it('still signs a recipient-only footer (brand disabled) with the versioned marker', () => {
+  it('does not render a separator or link when brand is disabled and only recipient remains', () => {
     const footer = buildReplyCardFooter({
       brand: '',
       recipientOpenIds: ['ou_abc'],
     });
-    expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
-    );
+    expect(footer?.content).toContain('⁣');
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+    expect(footer?.content).not.toContain('·');
     expect(footer?.content).toContain('<at id=ou_abc></at>');
+    expect(footer?.content.replaceAll(REPLY_CARD_FOOTER_MARKER, '')).toBe(
+      "<font color='grey'>发送给：<at id=ou_abc></at></font>",
+    );
   });
 
-  it('signs a default-brand + usage footer (marker as the first separator)', () => {
+  it('signs a default-brand + usage footer with a plain separator', () => {
     const footer = buildReplyCardFooter({
       usage: { context: { usedTokens: 5_000, windowTokens: 200_000, percentUsed: 2.5 }, tokens: null, turnTokens: null },
     });
     expect(footer?.content).toContain(DEFAULT_BRAND_LABEL);
     expect(footer?.content).toContain(
-      '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      `${DEFAULT_BRAND_LABEL} ·${REPLY_CARD_FOOTER_MARKER} 上下文 5K/200K (3%)`,
     );
+    expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
 });
 
@@ -1358,6 +1493,45 @@ describe('buildCardBodyElements image rows', () => {
 describe('buildImageCardElements', () => {
   const K = ['img_v2_a', 'img_v2_b', 'img_v2_c', 'img_v2_d'];
 
+  it.each([
+    ['medium', 2], ['small', 3], ['tiny', 4],
+  ])('fits the whole image in a proportional column: %s', (mode, columnCount) => {
+    for (const [markdown, keys] of [['截图', [K[0]]], ['![截图](img:0)', [K[0]]], ['![截图](img_v2_a)', []]] as const) {
+      const out = buildImageCardElements(markdown, [...keys], undefined, undefined, mode as string);
+      const row = out.find(e => e.tag === 'column_set');
+      expect(row).toMatchObject({ flex_mode: 'none', horizontal_spacing: '0px' });
+      expect(row.columns).toHaveLength(columnCount as number);
+      for (const column of row.columns) expect(column).toMatchObject({ width: 'weighted', weight: 1 });
+      for (const column of row.columns.slice(1)) expect(column.elements).toEqual([]);
+      const img = row.columns[0].elements[0];
+      expect(img).toMatchObject({ tag: 'img', img_key: K[0], scale_type: 'fit_horizontal', preview: true });
+      expect(img).not.toHaveProperty('mode');
+      expect(img).not.toHaveProperty('size');
+      expect(img).not.toHaveProperty('custom_width');
+    }
+  });
+
+  it('keeps the default output identical, including explicit fit_horizontal', () => {
+    const legacy = buildCardBodyElements('截图\n\n![](img_v2_a)');
+    expect(buildImageCardElements('截图', [K[0]])).toEqual(legacy);
+    expect(buildImageCardElements('截图', [K[0]], undefined, undefined, 'fit_horizontal')).toEqual(legacy);
+  });
+
+  it('sizes standalone placeholders and trailing images without resizing a grid', () => {
+    const out = buildImageCardElements('![预览](img:0)\n\n![](img:1,2)', K, undefined, undefined, 'tiny');
+    const rows = out.filter(e => e.tag === 'column_set');
+    expect(rows[0].columns[0].elements[0]).toMatchObject({ img_key: K[0], scale_type: 'fit_horizontal', alt: { content: '预览' } });
+    expect(rows[2].columns[0].elements[0]).toMatchObject({ img_key: K[3], scale_type: 'fit_horizontal' });
+    expect(rows[1]).toEqual(buildImageCardElements('![](img:0,1)', [K[1], K[2]])[0]);
+  });
+
+  it('keeps fenced code, indented code, inline prose and remote images as Markdown', () => {
+    for (const markdown of ['```\n![](img_v2_a)\n```', '    ![](img_v2_a)', 'see ![](img_v2_a) here', '![](https://example.com/a.png)']) {
+      expect(buildCardBodyElements(markdown, undefined, undefined, 'small')).toEqual(buildCardBodyElements(markdown));
+    }
+  });
+
+
   it('no images → identical to buildCardBodyElements', () => {
     expect(buildImageCardElements('hello **world**', [])).toEqual(
       buildCardBodyElements('hello **world**'),
@@ -1442,11 +1616,11 @@ describe('buildImageCardElements', () => {
     expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
   });
 
-  it('group with all indices out of range → literal text preserved', () => {
+  it('group with all indices out of range → readable omitted-image notice', () => {
     const out = buildImageCardElements('![](img:7,8)', [K[0]]);
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
     const md = mdElements(out).map(e => e.content).join('');
-    expect(md).toContain('![](img:7,8)');
+    expect(md).toContain('[Image omitted] [](img:7,8)');
   });
 });
 
@@ -1486,5 +1660,102 @@ describe('buildContextualReplyCard footer brand', () => {
     })).body.elements;
     expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
+  });
+});
+
+describe('cardUsageFooterSegment — Claude Code statusline quota (ctx / 5h / 7d)', () => {
+  it('footer renders the plain-percentage form `ctx 23% · 5h 18% · 7d 5%` (no bars, no absolutes, no resets_at)', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: null,
+        tokens: null,
+        quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5, sevenDayResetsAtMs: 1_788_086_400_000 },
+      },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    // en 同值（纯文本标签两语言一致）
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'en',
+    )).toBe('ctx 23% · 5h 18% · 7d 5%');
+  });
+
+  it('quota overrides the transcript absolute form even when context tokens are present', () => {
+    // Claude Code 的 transcript 有 usedTokens 但没有窗口；statusline 有百分比 → 只渲染 ctx N%。
+    const seg = cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: { in: 1, out: 2 }, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    expect(seg).not.toContain('159.9K');
+    expect(seg).not.toContain('上下文');
+  });
+
+  it('omits 7d when only 5h is known; omits ctx when the statusline gave no context percent', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18 } },
+      'zh',
+    )).toBe('ctx 23% · 5h 18%');
+    // 无 contextPercent（例如窗口已滚动只剩重置时间）→ 落回 transcript 绝对值分支
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('ctx 62% · 7d 5%');
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('上下文 159.9K · 7d 5%');
+    // quota 里一个可渲染字段都没有 → 与无 quota 相同
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { fiveHourResetsAtMs: 1_788_000_000_000 } },
+      'zh',
+    )).toBeNull();
+  });
+
+  it('quota null / absent renders byte-identically to today', () => {
+    const base = { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } };
+    const today = cardUsageFooterSegment(base, 'zh');
+    expect(today).toBe('上下文 80.7K/258.4K (31%)');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh')).toBe(today);
+    expect(cardUsageFooterSegment({ ...base, quota: undefined }, 'zh')).toBe(today);
+    const todayStreaming = cardUsageFooterSegment(base, 'zh', 'streaming');
+    expect(todayStreaming).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh', 'streaming')).toBe(todayStreaming);
+    // 卡片级：footer 元素逐字节相同
+    const cardWithout = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', base);
+    const cardWithNull = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', { ...base, quota: null });
+    expect(cardWithNull).toBe(cardWithout);
+  });
+
+  it('streaming variant keeps the three quota segments and appends 本轮 / 累计', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 159_861 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        turnTokens: { in: 5_000, out: 1_200 },
+        quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 },
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5% · 本轮 ↑5K ↓1.2K · 累计 ↑1.4M ↓7.8K');
+  });
+
+  it('compact hint fires from quota.contextPercent (transcript has no window)', () => {
+    const usage = { context: { usedTokens: 159_861 }, tokens: null, quota: { contextPercent: 91, fiveHourPercent: 18 } };
+    expect(contextOverCompactThreshold(usage, 90)).toBe(true);
+    expect(contextOverCompactThreshold(usage, 95)).toBe(false);
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 90 }))
+      .toBe('ctx 91% · 建议压缩 · 5h 18%');
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 95 }))
+      .toBe('ctx 91% · 5h 18%');
+  });
+
+  it('rounds and clamps quota percentages like the context percentage', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23.6, fiveHourPercent: 140, sevenDayPercent: -1 } },
+      'zh',
+    )).toBe('ctx 24% · 5h 100%');
   });
 });

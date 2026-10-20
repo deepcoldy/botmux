@@ -1,0 +1,669 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+
+const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+function extractMobileInputScript(source = workerSource()): string {
+  const start = source.indexOf("if(isTouch&&hasToken){(function(){\n  document.body.classList.add('has-token');");
+  expect(start, 'worker.ts 里找不到手机输入栏脚本').toBeGreaterThan(-1);
+  const endMarker = '\n})();}\n</script>';
+  const end = source.indexOf(endMarker, start);
+  expect(end, '手机输入栏脚本没有正常闭合').toBeGreaterThan(-1);
+  // Execute the browser script after the outer TypeScript template literal has
+  // consumed one escaping layer (worker.ts source has \\x1b; served HTML has \x1b).
+  return source.slice(start, end + '\n})();}'.length).replaceAll('\\\\', '\\');
+}
+
+type Listener = (event: Record<string, unknown>) => void;
+
+class FakeElement {
+  value = '';
+  textContent = '';
+  disabled = false;
+  scrollHeight = 38;
+  offsetHeight = 91;
+  rectHeight: number | undefined;
+  style: Record<string, string> = {};
+  descendants: FakeElement[] = [];
+  readonly attributes = new Map<string, string>();
+  readonly listeners = new Map<string, Listener[]>();
+  readonly classes = new Set<string>();
+  readonly classList = {
+    add: (...names: string[]) => names.forEach(name => this.classes.add(name)),
+    remove: (...names: string[]) => names.forEach(name => this.classes.delete(name)),
+  };
+
+  constructor(readonly id: string, attrs: Record<string, string> = {}) {
+    for (const [name, value] of Object.entries(attrs)) this.attributes.set(name, value);
+  }
+
+  addEventListener(type: string, listener: Listener): void {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type: string, event: Record<string, unknown> = {}): void {
+    const payload = {
+      preventDefault: () => {},
+      isComposing: false,
+      ...event,
+    };
+    for (const listener of this.listeners.get(type) ?? []) listener(payload);
+  }
+
+  setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
+  getAttribute(name: string): string | null { return this.attributes.get(name) ?? null; }
+  focus(): void {}
+  blur(): void {}
+  getBoundingClientRect(): { height: number } {
+    return { height: this.rectHeight ?? this.offsetHeight };
+  }
+
+  querySelectorAll(selector: string): FakeElement[] {
+    if (selector === 'button,textarea') return this.descendants;
+    // The bar cancels pointerdown on its buttons only — the textarea must keep
+    // taking focus, so this selector deliberately excludes it.
+    if (selector === 'button') return this.descendants.filter(node => node.id !== 'mobile-input');
+    return [];
+  }
+}
+
+interface MobileHarness {
+  bar: FakeElement;
+  textarea: FakeElement;
+  controls: FakeElement[];
+  shortcut(action: string): FakeElement | undefined;
+  sentInputs(): string[];
+  rootProperty(name: string): string | undefined;
+  viewportResizeCount(): number;
+  setWriteState: ((value: boolean | null) => void) | null;
+  setInputMode?: ((mode: string) => void) | null;
+}
+
+function bootMobileInput(options: {
+  wsHasWrite: boolean | null;
+  readyState?: number;
+  barHeight?: number;
+  barRectHeight?: number;
+  textareaScrollHeight?: number;
+  initialMode?: 'buffer' | 'live';
+  onSyncMode?: (mode: string) => void;
+}): MobileHarness {
+  const source = workerSource();
+  const formStart = source.indexOf('<form id="mobile-input-bar"');
+  const formEnd = source.indexOf('</form>', formStart);
+  const form = source.slice(formStart, formEnd);
+  const shortcutButtons = [...form.matchAll(/<button([^>]*data-sk="([^"]+)"[^>]*)>/g)].map(match => {
+    const id = match[1].match(/id="([^"]+)"/)?.[1] ?? `shortcut-${match[2]}`;
+    return new FakeElement(id, { 'data-sk': match[2] });
+  });
+
+  const bar = new FakeElement('mobile-input-bar');
+  bar.offsetHeight = options.barHeight ?? 91;
+  bar.rectHeight = options.barRectHeight;
+  const textarea = new FakeElement('mobile-input');
+  textarea.scrollHeight = options.textareaScrollHeight ?? 38;
+  const mode = new FakeElement('mobile-mode');
+  const send = new FakeElement('mobile-send');
+  const hint = new FakeElement('mobile-live-hint');
+  const terminal = new FakeElement('terminal');
+  const controls = [mode, textarea, send, ...shortcutButtons];
+  bar.descendants = controls;
+
+  const byId = new Map<string, FakeElement>([
+    [bar.id, bar],
+    [textarea.id, textarea],
+    [mode.id, mode],
+    [send.id, send],
+    [hint.id, hint],
+    [terminal.id, terminal],
+    ...shortcutButtons.map(button => [button.id, button] as const),
+  ]);
+  const rootProperties = new Map<string, string>();
+  const body = new FakeElement('body');
+  const documentStub = {
+    body,
+    documentElement: {
+      style: {
+        setProperty: (name: string, value: string) => rootProperties.set(name, value),
+      },
+    },
+    getElementById: (id: string) => byId.get(id) ?? null,
+    querySelectorAll: (selector: string) => selector === '#mobile-bar-keys button' ? shortcutButtons : [],
+  };
+  const windowStub = {
+    innerHeight: 844,
+    visualViewport: undefined,
+  };
+  const sent: string[] = [];
+  const ws = {
+    readyState: options.readyState ?? 1,
+    send: (payload: string) => sent.push(payload),
+  };
+  let resizeCount = 0;
+  const resizeObservers: Array<() => void> = [];
+  class ResizeObserverStub {
+    constructor(callback: () => void) { resizeObservers.push(callback); }
+    observe(): void {}
+  }
+
+  const result = new Function(
+    'isTouch',
+    'hasToken',
+    'document',
+    'window',
+    'navigator',
+    'ws_',
+    'wsHasWrite',
+    'onViewportResize',
+    'ResizeObserver',
+    '_wbMobileWriteState',
+    '_wbInitialMobileInputMode',
+    '_wbSyncMobileInputMode',
+    `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState,setInputMode:_wbSetMobileInputMode};`,
+  )(
+    true,
+    true,
+    documentStub,
+    windowStub,
+    {},
+    ws,
+    options.wsHasWrite,
+    () => { resizeCount += 1; },
+    ResizeObserverStub,
+    null,
+    options.initialMode,
+    options.onSyncMode,
+  ) as {
+    setWriteState: ((value: boolean | null) => void) | null;
+    setInputMode: ((mode: string) => void) | null;
+  };
+
+  for (const callback of resizeObservers) callback();
+  return {
+    bar,
+    textarea,
+    controls,
+    shortcut: action => shortcutButtons.find(button => button.getAttribute('data-sk') === action),
+    sentInputs: () => sent.map(payload => JSON.parse(payload).data as string),
+    rootProperty: name => rootProperties.get(name),
+    viewportResizeCount: () => resizeCount,
+    setWriteState: result.setWriteState,
+    setInputMode: result.setInputMode,
+  };
+}
+
+describe('手机 Web 终端输入栏', () => {
+  it('把实测底栏高度留给终端，390×844 时内容区不会落到底栏后面', () => {
+    const page = bootMobileInput({ wsHasWrite: true, barHeight: 88, barRectHeight: 88.1875 });
+    expect(page.rootProperty('--mobile-bar-h')).toBe('89px');
+    expect(844 - Number.parseInt(page.rootProperty('--mobile-bar-h')!, 10)).toBe(755);
+    expect(page.viewportResizeCount()).toBeGreaterThan(0);
+  });
+
+  it('空输入保持单行，有换行内容时输入框随内容长高', () => {
+    const page = bootMobileInput({ wsHasWrite: true, textareaScrollHeight: 54 });
+    expect(page.textarea.style.height).toBe('42px');
+
+    page.textarea.value = '需要换行的较长命令';
+    page.textarea.scrollHeight = 68;
+    page.textarea.dispatch('input');
+    expect(page.textarea.style.height).toBe('68px');
+  });
+
+  it('断线或权限未知时禁用输入且保留未发送草稿，恢复可写后再发送并清空', () => {
+    const disconnected = bootMobileInput({ wsHasWrite: null, readyState: 3 });
+    disconnected.textarea.value = 'keep this draft';
+    disconnected.bar.dispatch('submit');
+    expect(disconnected.sentInputs()).toEqual([]);
+    expect(disconnected.textarea.value).toBe('keep this draft');
+    expect(disconnected.controls.every(control => control.disabled)).toBe(true);
+
+    const connected = bootMobileInput({ wsHasWrite: true });
+    connected.textarea.value = 'ship it';
+    connected.bar.dispatch('submit');
+    // 上屏 types the text into the CLI's input box and stops — no trailing
+    // newline, which would land there as a literal blank line.
+    expect(connected.sentInputs()).toEqual(['ship it']);
+    expect(connected.textarea.value).toBe('');
+  });
+
+  it('重连状态通过同一写权限钩子切换控件，已有草稿原样保留', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.setWriteState).toBeTypeOf('function');
+    page.textarea.value = 'draft across reconnect';
+    page.setWriteState?.(null);
+    expect(page.controls.every(control => control.disabled)).toBe(true);
+    expect(page.textarea.value).toBe('draft across reconnect');
+    page.setWriteState?.(true);
+    expect(page.controls.every(control => !control.disabled)).toBe(true);
+  });
+
+  it('快捷键行提供 ←/→，发送标准 ANSI 左右方向序列', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const left = page.shortcut('left');
+    const right = page.shortcut('right');
+    expect(left).toBeDefined();
+    expect(right).toBeDefined();
+    left?.dispatch('click');
+    right?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['\x1b[D', '\x1b[C']);
+  });
+
+  it('上移、删除和下移归入可滚动快捷键行，仍发送原有终端序列', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const up = page.shortcut('up');
+    const backspace = page.shortcut('bs');
+    const down = page.shortcut('down');
+    expect(up).toBeDefined();
+    expect(backspace).toBeDefined();
+    expect(down).toBeDefined();
+    up?.dispatch('click');
+    backspace?.dispatch('click');
+    down?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['\x1b[A', '\x7f', '\x1b[B']);
+  });
+
+  it('缓冲模式的按钮叫「上屏」并说明还要按 Enter，实时模式才叫「发送」', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const send = page.controls.find(control => control.id === 'mobile-send');
+    expect(send?.textContent).toBe('上屏');
+    expect(send?.getAttribute('aria-label')).toContain('Enter');
+    const mode = page.controls.find(control => control.id === 'mobile-mode');
+    expect(mode?.getAttribute('aria-label')).toContain('Enter');
+
+    // Switching to live mode makes the button a real submit again.
+    mode?.dispatch('click');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    mode?.dispatch('click');
+    expect(send?.textContent).toBe('上屏');
+  });
+
+  it('长按 ⌫ 连续删除，松手即停，且 Enter/Ctrl+C 这类一次性键从不重复', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true });
+      const backspace = page.shortcut('bs');
+      expect(backspace).toBeDefined();
+
+      // A press shorter than the repeat delay must not add any repeat tick.
+      backspace?.dispatch('pointerdown');
+      vi.advanceTimersByTime(200);
+      backspace?.dispatch('pointerup');
+      vi.advanceTimersByTime(600);
+      expect(page.sentInputs()).toEqual([]);
+
+      // Holding past the delay repeats at a steady cadence…
+      backspace?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 5);
+      const whileHeld = page.sentInputs().length;
+      expect(whileHeld).toBe(5);
+      expect(page.sentInputs().every(sequence => sequence === '\x7f')).toBe(true);
+
+      // …and releasing stops it immediately (no ticks after pointerup).
+      backspace?.dispatch('pointerup');
+      // The browser always sends a click when the finger lifts — it arrives
+      // AFTER the repeat ticks, so it must be swallowed rather than delete one
+      // more character than the user watched tick by.
+      backspace?.dispatch('click');
+      vi.advanceTimersByTime(600);
+      expect(page.sentInputs().length).toBe(whileHeld);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('一次性键长按不重复，手指移开或断线都会停下重复', () => {
+    vi.useFakeTimers();
+    try {
+      // Repeating Enter would run the command several times; Ctrl+C would spray
+      // interrupts. Neither may gain a repeat handler.
+      const oneShot = bootMobileInput({ wsHasWrite: true });
+      for (const action of ['enter', 'ctrlc', 'esc', 'tab', 'stab', 'paste']) {
+        oneShot.shortcut(action)?.dispatch('pointerdown');
+        vi.advanceTimersByTime(450 + 60 * 10);
+        oneShot.shortcut(action)?.dispatch('pointerup');
+      }
+      expect(oneShot.sentInputs()).toEqual([]);
+
+      // Sliding the finger off the key stops the repeat too.
+      const slide = bootMobileInput({ wsHasWrite: true });
+      slide.shortcut('left')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 3);
+      const beforeLeave = slide.sentInputs().length;
+      expect(beforeLeave).toBe(3);
+      slide.shortcut('left')?.dispatch('pointerleave');
+      vi.advanceTimersByTime(600);
+      expect(slide.sentInputs().length).toBe(beforeLeave);
+
+      // A socket that stops accepting input mid-hold must not spin forever.
+      const dropped = bootMobileInput({ wsHasWrite: true });
+      dropped.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 2);
+      const beforeDrop = dropped.sentInputs().length;
+      expect(beforeDrop).toBe(2);
+      dropped.setWriteState?.(null);
+      vi.advanceTimersByTime(600);
+      expect(dropped.sentInputs().length).toBe(beforeDrop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('长按后手指滑开(无 click)，下一次单击仍然生效——吞掉尾随 click 的标志必须每次按下重置', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true });
+
+      // Slide off after the repeat has started: pointerleave stops the ticks and
+      // the browser sends NO click, so the swallow flag is left armed.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(450 + 60 * 3);
+      page.shortcut('bs')?.dispatch('pointerleave');
+      const afterSlide = page.sentInputs().length;
+      expect(afterSlide).toBe(3);
+
+      // The next plain tap must still delete one character. Without the reset on
+      // pointerdown the stale flag eats it and the key silently does nothing.
+      page.shortcut('bs')?.dispatch('pointerdown');
+      vi.advanceTimersByTime(100);
+      page.shortcut('bs')?.dispatch('pointerup');
+      page.shortcut('bs')?.dispatch('click');
+      expect(page.sentInputs().length).toBe(afterSlide + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('「上屏」只把正文送上终端，不追加换行——追加的换行会在 CLI 输入框里留下一个空行', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = '继续';
+    page.bar.dispatch('submit');
+
+    const sent = page.sentInputs();
+    expect(sent).toEqual(['继续']);
+    // The regression this pins: a trailing \n is NOT a submit in a TUI, it is an
+    // inserted line break, so the text showed up with a stray empty line after it.
+    expect(sent.some(sequence => sequence.endsWith('\n'))).toBe(false);
+    // …and it must not silently become a real submit either — that would throw
+    // away the deliberate two-step 上屏 → 检查 → Enter semantics.
+    expect(sent.some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // The Enter key is what actually runs it, and it still does.
+    page.shortcut('enter')?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['继续', '\r']);
+  });
+
+  it('实时模式的「发送」仍然真提交，两步语义只属于缓冲模式', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    page.textarea.value = 'ls';
+    page.bar.dispatch('submit');
+    // live mode diffs the mirror and appends a carriage return: a real submit.
+    expect(page.sentInputs().join('').endsWith('\r')).toBe(true);
+  });
+
+  it('实时模式下输入框已空时，系统键盘的删除键仍然删得掉终端里的字符', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+
+    // The regression this pins: live mode only ever sends what the textarea's
+    // `input` event diffs, and deleting from an EMPTY box changes nothing — so a
+    // real browser fires beforeinput but NO input event at all (verified with
+    // Playwright + a real worker). Every Backspace was silently dropped, which
+    // is exactly what "上屏 的字用系统键盘删不掉" looks like: the text is on the
+    // terminal, the box is empty, and the key does nothing.
+    page.textarea.value = '';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+
+    // A pending IME draft must still edit locally instead of eating terminal
+    // characters, so a non-empty box is left to the diff path (which the browser
+    // does drive with a real input event).
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['\x7f']);
+  });
+
+  it('缓冲模式下「上屏」后输入框已空，系统键盘的删除键同样删得掉终端里的字符', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+
+    // 上屏 puts the text on the terminal and empties the box.
+    page.textarea.value = 'hello';
+    page.bar.dispatch('submit');
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // An empty box has no draft to edit, so Backspace can only sensibly mean
+    // "delete on the terminal" — the same thing the bottom bar's ⌫ (aria-label
+    // 删除终端字符) already does in this exact state. Gating the forwarding on
+    // live mode made the two disagree while looking identical to the user: the
+    // text sits on the terminal, the box is empty, ⌫ erases it and the system
+    // keyboard's delete key does nothing.
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
+  });
+
+  it('缓冲模式下输入框非空时，删除键仍然只编辑草稿，不碰终端', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+    page.textarea.value = 'ab';
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual([]);
+  });
+
+  it('「上屏」之后输入框已空，系统键盘按 Enter 仍然要提交——两步语义的第 3 步不能蒸发', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = '继续';
+    page.bar.dispatch('submit');
+    expect(page.sentInputs()).toEqual(['继续']);
+    expect(page.textarea.value).toBe('');
+
+    // 上屏 → 检查 → Enter is the whole point of buffer mode, and after 上屏 the
+    // box is empty by design. sendBuffered() bails on empty text while the
+    // keydown handler has already called preventDefault(), so without the empty
+    // box branch this key vanishes with no fallback — the user watches 上屏 put
+    // the text on the terminal and then cannot run it from the system keyboard.
+    page.textarea.dispatch('keydown', { key: 'Enter' });
+    expect(page.sentInputs()).toEqual(['继续', '\r']);
+  });
+
+  it('同一状态下系统键盘 Enter 与底栏 ⏎ 必须发出同一个字节，两种模式都一致', () => {
+    // The defect this pins is an inconsistency between two entry points in one
+    // visible state, which is the same shape as the Backspace gap above: the
+    // key-row ⏎ worked after 上屏 while the system keyboard did nothing.
+    const viaKeyboard = (live: boolean): string[] => {
+      const page = bootMobileInput({ wsHasWrite: true });
+      if (live) page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+      page.textarea.value = '';
+      page.textarea.dispatch('keydown', { key: 'Enter' });
+      return page.sentInputs();
+    };
+    const viaButton = (live: boolean): string[] => {
+      const page = bootMobileInput({ wsHasWrite: true });
+      if (live) page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+      page.textarea.value = '';
+      page.shortcut('enter')?.dispatch('click');
+      return page.sentInputs();
+    };
+    expect(viaKeyboard(false)).toEqual(['\r']);
+    expect(viaButton(false)).toEqual(['\r']);
+    expect(viaKeyboard(true)).toEqual(['\r']);
+    expect(viaButton(true)).toEqual(['\r']);
+  });
+
+  it('输入法组合中按删除键不转发给终端，待选草稿的退格只能编辑草稿', () => {
+    // Load-bearing guard with no coverage before this: dropping
+    // `!mirror.composing && !e.isComposing` still left every other case green,
+    // but a Chinese/Japanese IME candidate-editing backspace would then eat a
+    // terminal character instead of editing the pending draft.
+    for (const live of [false, true]) {
+      // composition tracked through compositionstart (mirror.composing)
+      const viaEvent = bootMobileInput({ wsHasWrite: true });
+      if (live) viaEvent.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+      const baseline = viaEvent.sentInputs().length;
+      viaEvent.textarea.dispatch('compositionstart');
+      viaEvent.textarea.value = '';
+      viaEvent.textarea.dispatch('keydown', { key: 'Backspace' });
+      expect(viaEvent.sentInputs().length, `composing backspace leaked (live=${live})`).toBe(baseline);
+
+      // …and through the event's own isComposing flag
+      const viaFlag = bootMobileInput({ wsHasWrite: true });
+      if (live) viaFlag.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+      const flagBaseline = viaFlag.sentInputs().length;
+      viaFlag.textarea.value = '';
+      viaFlag.textarea.dispatch('keydown', { key: 'Backspace', isComposing: true });
+      expect(viaFlag.sentInputs().length, `isComposing backspace leaked (live=${live})`).toBe(flagBaseline);
+    }
+  });
+
+  it('切进实时模式时，输入框里没上屏的文字要送上终端而不是隐形留着', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.value = 'hello';
+    page.controls.find(control => control.id === 'mobile-mode')?.dispatch('click');
+
+    // Live mode renders the textarea transparent, so leftover text is invisible
+    // to the user while still being the mirror's baseline mismatch: the next
+    // keystroke diffed '' → 'hell' and INSERTED the stale text into the terminal
+    // instead of deleting anything. Flush it the way 上屏 does.
+    expect(page.sentInputs()).toEqual(['hello']);
+    expect(page.textarea.value).toBe('');
+
+    // …and it must stay an insert, not a submit — the two-step semantics hold.
+    expect(page.sentInputs().some(sequence => sequence.endsWith('\r'))).toBe(false);
+
+    // With the box actually empty, the very next Backspace reaches the terminal.
+    page.textarea.dispatch('keydown', { key: 'Backspace' });
+    expect(page.sentInputs()).toEqual(['hello', '\x7f']);
+  });
+
+  it('点底栏按钮不会让输入框失焦——失焦会收起系统键盘、底栏整体下移导致点错', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+
+    // The regression this pins: a button tap moved focus mobile-input → BODY
+    // (measured in a real browser). iOS retracts the software keyboard the
+    // instant the focused element blurs, and this bar rides above the keyboard
+    // (transform: -var(--keyboard-inset)), so the whole bar drops ~300px while
+    // the finger is still down — the next button is no longer where the user
+    // aimed. Cancelling pointerdown suppresses the pointer-driven focus
+    // transfer without touching click / submit / :active / row scrolling.
+    const prevented: Array<string | null> = [];
+    for (const control of page.controls) {
+      control.dispatch('pointerdown', { preventDefault: () => prevented.push(control.id) });
+    }
+
+    // Every button cancels it…
+    expect(prevented).toEqual(
+      page.controls.filter(control => control.id !== 'mobile-input').map(control => control.id),
+    );
+    // …and the textarea deliberately does NOT: it has to keep taking focus and
+    // placing the caret where the finger landed.
+    expect(prevented).not.toContain('mobile-input');
+  });
+
+  it('抑制失焦不能顺带吃掉按钮本身的功能：click、上屏提交、长按重复都照旧', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+
+    // preventDefault on pointerdown does not cancel the click that follows, so
+    // every key still sends its sequence.
+    page.shortcut('bs')?.dispatch('pointerdown');
+    page.shortcut('bs')?.dispatch('click');
+    expect(page.sentInputs()).toEqual(['\x7f']);
+
+    // 上屏 is type="submit"; the form submit still fires.
+    page.textarea.value = 'hi';
+    page.bar.dispatch('submit');
+    expect(page.sentInputs()).toEqual(['\x7f', 'hi']);
+  });
+
+  it('记住沿用上一次设置：若服务端记录为 live，初始即为「发送」和「实时」', () => {
+    const page = bootMobileInput({ wsHasWrite: true, initialMode: 'live' });
+    const send = page.controls.find(c => c.id === 'mobile-send');
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+  });
+
+  it('切换输入模式时触发多设备同步钩子，向服务端同步最新状态', () => {
+    const synced: string[] = [];
+    const page = bootMobileInput({ wsHasWrite: true, onSyncMode: m => synced.push(m) });
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    mode?.dispatch('click');
+    expect(synced).toEqual(['live']);
+    mode?.dispatch('click');
+    expect(synced).toEqual(['live', 'buffer']);
+  });
+
+  it('多设备实时一致：收到服务端广播的其他设备切换事件时即时切换', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const send = page.controls.find(c => c.id === 'mobile-send');
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    expect(send?.textContent).toBe('上屏');
+    expect(mode?.textContent).toBe('缓冲');
+
+    page.setInputMode?.('live');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+
+    page.setInputMode?.('buffer');
+    expect(send?.textContent).toBe('上屏');
+    expect(mode?.textContent).toBe('缓冲');
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+  });
+
+  it('客户端线协议：_wbSyncMobileInputMode 将模式切换序列化为 JSON 发往服务端', () => {
+    const source = workerSource();
+    const match = source.match(/var _wbSyncMobileInputMode=(function\(m\)\{[\s\S]*?\});/);
+    expect(match, 'worker.ts 中必须定义 _wbSyncMobileInputMode').not.toBeNull();
+
+    const sent: string[] = [];
+    const mockWs = {
+      readyState: 1,
+      send: (data: string) => sent.push(data),
+    };
+
+    const createSyncFn = new Function('ws_', `return (${match![1]});`) as (ws_: unknown) => (m: string) => void;
+    const syncFn = createSyncFn(mockWs);
+
+    syncFn('live');
+    expect(sent).toEqual([JSON.stringify({ type: 'mobile_input_mode', mode: 'live' })]);
+
+    sent.length = 0;
+    syncFn('buffer');
+    expect(sent).toEqual([JSON.stringify({ type: 'mobile_input_mode', mode: 'buffer' })]);
+
+    // WebSocket 未就绪时不发送且不抛出异常
+    const closedSync = createSyncFn({ readyState: 0, send: () => {} });
+    expect(() => closedSync('live')).not.toThrow();
+  });
+
+  // 源码结构护栏(K4)：页面端解析 OSC 1989 mobile_input_mode 的正则写在 worker.ts 模板字符串里的浏览器脚本中，
+  // 无法 import 与服务端格式化器比对；只能读源码确认它由共享导出 MOBILE_INPUT_MODE_OSC_REGEX 编译、且确实用于解析
+  // 下行数据，从而与 formatMobileInputModeOsc 不会漂移（共享正则与格式化器的往返由 web-terminal-settings-store.test.ts 覆盖）。#1716
+  it('服务端到客户端线协议：页面使用服务端共享 MOBILE_INPUT_MODE_OSC_REGEX 编译并提取模式', () => {
+    const source = workerSource();
+    expect(source).toMatch(/_wbMimRegex\s*=\s*new RegExp\([^;]*MOBILE_INPUT_MODE_OSC_REGEX\.source/);
+    expect(source).toMatch(/\.match\(_wbMimRegex\)/);
+  });
+
+  // 源码结构护栏(K2)：web 终端 WS 消息分发在 worker.ts 的巨型闭包里，单测无 seam（行为验证需起真 worker 走完整鉴权链路）。
+  // 守的是权限边界：只读/未鉴权连接不能改写持久化的输入模式，鉴权检查必须先于 setWebTerminalInputMode，
+  // 广播也只发给其它已鉴权客户端。#1716
+  it('服务端线协议分发：只接受已鉴权连接的 mobile_input_mode，并只向其他已授权客户端广播', () => {
+    const source = workerSource();
+    const branchStart = source.indexOf("msg.type === 'mobile_input_mode'");
+    expect(branchStart).toBeGreaterThan(-1);
+    const branch = source.slice(branchStart, source.indexOf("ws.on('close'", branchStart));
+    const authIdx = branch.indexOf('authedClients.has(ws)');
+    expect(authIdx).toBeGreaterThan(-1);
+    expect(branch.indexOf('setWebTerminalInputMode(')).toBeGreaterThan(authIdx);
+    expect(branch).toMatch(/client !== ws && authedClients\.has\(client\)/);
+  });
+});

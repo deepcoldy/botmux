@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { stripComments } from './helpers/bun-leg-selectors.js';
 import {
   evaluateReadIsolationGate,
   evaluateCredentialOnlyIsolationGate,
@@ -206,6 +207,28 @@ describe('mandatory device credential isolation', () => {
       expect(isCredentialIsolationReservedBasename(name), name).toBe(true);
     }
   });
+
+  it('credential-only isolation leaves the session skill manifest, skill snapshot and store readable (`botmux skill show` works)', () => {
+    // Credential-only (sandbox off + device-credential marker) is allow-default:
+    // only the device authority namespace + reserved/dashboard top-level files
+    // are hidden. Guard against a future widening that would silently mask the
+    // skill reader's inputs. (No cross-session read isolation is promised in
+    // this mode — that is the full fs-policy sandbox's job.)
+    for (const botmuxHome of ['/home/agent/.botmux', '/srv/botmux-runtime']) {
+      const rules = buildCredentialIsolationRules({ homeDir: '/home/agent', botmuxHome });
+      for (const path of [
+        `${botmuxHome}/data/skill-manifests/s.json`,
+        `${botmuxHome}/data/runtime-skills/s/snapshot/deploy/SKILL.md`,
+        '/home/agent/.botmux/skills/store/deploy/SKILL.md',
+      ]) {
+        expect(rules.denyPaths.some(deny => path === deny || path.startsWith(`${deny}/`)), path).toBe(false);
+        expect(rules.denyRegexes.some(rx => new RegExp(rx).test(path)), path).toBe(false);
+      }
+    }
+    for (const name of ['data', 'skills']) {
+      expect(isCredentialIsolationReservedBasename(name), name).toBe(false);
+    }
+  });
 });
 
 
@@ -338,6 +361,69 @@ describe('isolatedPaneReattachSafe', () => {
     ), {
       requiredCapabilities: ['credential', 'read'],
       requireOriginChannel: true,
+    })).toBe(false);
+  });
+
+  it('binds Linux warm reattach to the managed-origin digest so install-root or native-hook protocol changes cold-spawn', () => {
+    const linuxDigestA = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/a'],
+      readWriteExtraPaths: ['/native-hook-protocol/v1'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const linuxDigestB = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/b'],
+      readWriteExtraPaths: ['/native-hook-protocol/v1'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const linuxDigestProtocolBump = isolationPanePolicyDigest({
+      readIsolation: false,
+      writeSandbox: false,
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      readOnlyExtraPaths: ['/checkout/a'],
+      readWriteExtraPaths: ['/native-hook-protocol/v2'],
+      cliId: 'traex',
+      resolvedBin: '/usr/bin/traex',
+    });
+    const marker = isolationPaneMarkerContent('linux-fresh', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: false,
+      writeSandbox: false,
+      policyDigest: linuxDigestA,
+    });
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestA,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestB,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      exactCapabilities: true,
+      readIsolation: false,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: linuxDigestProtocolBump,
     })).toBe(false);
   });
 });
@@ -833,6 +919,80 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     expect(isolatedPaneReattachSafe(currentVersionNoState, ['credential', 'read', 'write'])).toBe(false);
     expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(12);
   });
+
+  it('cold-spawns panes predating the canonical session-data root contract', () => {
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(13);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 13,
+      bootId: 'lexical-data-root',
+      state: 'committed',
+      capabilities: ['credential', 'read', 'write'],
+    }), ['credential', 'read', 'write'])).toBe(false);
+  });
+
+  it('cold-spawns v14 panes that lack the Linux kernel isolation stamp', () => {
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(14);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 14,
+      bootId: 'before-kernel-marker',
+      state: 'committed',
+      capabilities: ['credential', 'read', 'write'],
+    }), ['credential', 'read', 'write'])).toBe(false);
+  });
+
+  it('cold-spawns v16 credential-only panes that lack the relay scope marker', () => {
+    // v17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only wrapper env;
+    // a v16 pane never received it, so its legacy dispatch forms stay refused.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(16);
+    const current = JSON.parse(isolationPaneMarkerContent('boot', ['credential'])) as Record<string, unknown>;
+    expect(isolatedPaneReattachSafe(JSON.stringify(current), ['credential'])).toBe(true);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ ...current, version: 16 }), ['credential'])).toBe(false);
+  });
+
+  it('restore path: a v17 sandboxed pane (no skill manifest / snapshot binds) is killed + cold-spawned; a current one warm-reattaches', () => {
+    // v18 adds spawn-time read-only binds for the session's skill manifest and
+    // its skill snapshot dir. Warm reattach keeps the old process + mounts
+    // and skips skill generation, so a v17 pane would never get them. Compose
+    // the worker's own gate: isolatedPaneReattachSafe (as spawnCli calls it for
+    // the policy-ON arm) → evaluatePersistentPaneMigration.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(17);
+    const digest = 'ab'.repeat(32);
+    for (const { label, readIsolation, writeSandbox } of [
+      { label: 'linux oncall (bwrap)', readIsolation: false, writeSandbox: false },
+      { label: 'darwin oncall (Seatbelt)', readIsolation: true, writeSandbox: true },
+    ]) {
+      const caps = ['credential', 'read', 'write'] as const;
+      const expected = {
+        requiredCapabilities: caps, exactCapabilities: true,
+        readIsolation, writeSandbox, requireOriginChannel: true, policyDigest: digest,
+      };
+      const current = JSON.parse(isolationPaneMarkerContent('boot', caps, {
+        originChannelId: G1, readIsolation, writeSandbox, policyDigest: digest,
+      })) as Record<string, unknown>;
+      const decide = (marker: Record<string, unknown>) => evaluatePersistentPaneMigration({
+        appliedIsolationCapabilities: [...caps],
+        isolationCapableBackend: true,
+        noTransport: false,
+        isolationMarkerPresent: true,
+        policyOffTombstonePresent: false,
+        policyOffTombstoneValid: false,
+        paneProbe: 'exists',
+        pendingProvenancePresent: false,
+        isolationMarkerReattachSafe: isolatedPaneReattachSafe(JSON.stringify(marker), expected),
+      });
+      expect(decide(current), label).toEqual({ action: 'reattach' });
+      expect(decide({ ...current, version: 17 }), label).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+    }
+  });
+
+  it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
+    // A pane spawned before this change keeps its ORIGINAL process environment, so
+    // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep
+    // failing TLS on UnknownIssuer — before any output, so the symptom is a pane that
+    // simply never answers. The marker version is the only lever that turns such a
+    // pane into kill + cold-spawn, so bumping past 12 is load-bearing.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(12);
+  });
 });
 
 // ─── #714: new spawn-time sandbox mount (traex/coco migration markers) ────────
@@ -868,117 +1028,119 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
   });
 });
 
-describe('worker capability carve-out ordering', () => {
-  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+describe('worker read-isolation fences', () => {
+  const strippedSource = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'));
 
-  it('publishes each child-visible capability before the sandbox starts', () => {
-    const macPathAt = source.indexOf("readIsolationOriginCapabilityFile = process.platform === 'darwin'");
-    const macPublishAt = source.indexOf(
-      'publishSandboxRelayCapability({ failClosed: true })',
-      macPathAt,
-    );
-    const policyAt = source.indexOf('const fsPolicyCtx = {', macPublishAt);
-    expect(macPathAt).toBeGreaterThanOrEqual(0);
-    expect(macPublishAt).toBeGreaterThan(macPathAt);
-    expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(source).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
-
-    const credentialPathAt = source.indexOf(
-      'if (readIsolationOriginChannelId && !sandboxRequested)',
-    );
-    const credentialPublishAt = source.indexOf(
-      'publishSandboxRelayCapability({ failClosed: true })',
-      credentialPathAt,
-    );
-    const credentialWrapperAt = source.indexOf(
-      'if (!willReattachPersistent && credentialOnlyBwrap)',
-      credentialPublishAt,
-    );
-    expect(credentialPathAt).toBeGreaterThanOrEqual(0);
-    expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
-    expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
-
-    const relayAt = source.indexOf('sandboxRelayOutbox = sbx.outbox');
-    const relayPublishAt = source.indexOf('publishSandboxRelayCapability();', relayAt);
-    expect(relayAt).toBeGreaterThan(policyAt);
-    expect(relayPublishAt).toBeGreaterThan(relayAt);
-    expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
+  // 源码结构护栏(K2)：sandbox=true 下本会话 skill manifest 的放行是 mandatory read-only（按深度压过一切 deny），
+  // 在 worker.ts spawnCli 闭包里组装，fs-policy 单测只喂手工 grant、没有 seam。不变量：只放行通过 lstat
+  // 确认是普通文件的那一个 `<sid>.json`，且只 canonical 父目录——叶子若是植入的 symlink，canonical/bind
+  // 会把这条强制只读放行转到任意目标上（d0ba221b20，#1036）。
+  it('grants the own skill manifest read-only only when lstat proves a regular file', () => {
+    const decl = strippedSource.match(/const (\w+) = sessionSkillManifestPath\(cfg\.sessionId\b/);
+    expect(decl).not.toBeNull();
+    const v = decl![1];
+    expect(strippedSource).toMatch(new RegExp(
+      `if \\(lstatSync\\(${v}\\)\\.isFile\\(\\)\\) \\{\\s*mandatoryReadOnlyPaths\\.push\\([^;]*\\b${v}\\b`,
+    ));
+    expect(strippedSource.match(new RegExp(`ReadOnlyPaths\\.push\\([^;]*\\b${v}\\b`, 'g'))).toHaveLength(1);
+    expect(strippedSource).not.toMatch(new RegExp(`canonical\\(${v}\\)`));
   });
 
-  it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
-    const regexAt = source.indexOf('sessionMcpGatewayPathRegex(gatewaySocketRoot)');
-    const denyAt = source.indexOf('mandatoryDenyRegexes.push(', regexAt - 80);
-    const allowAt = source.indexOf(
-      'mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
-      regexAt,
-    );
-    const profileAt = source.indexOf('const fsPolicyCtx = {', allowAt);
-    expect(regexAt).toBeGreaterThanOrEqual(0);
-    expect(denyAt).toBeGreaterThanOrEqual(0);
-    expect(denyAt).toBeLessThanOrEqual(regexAt);
-    expect(allowAt).toBeGreaterThan(denyAt);
-    expect(profileAt).toBeGreaterThan(allowAt);
-    expect(source).toContain('mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath');
-  });
+  // 源码结构护栏(K2)：强制凭证隔离的两道闸都在 spawnCli 闭包里、无 seam，删掉会静默开洞——
+  // ① adopt 观察的是外部已在跑、无法补套边界的 CLI，必须在任何 adopt 分支之前拒绝；
+  // ② credential-only Seatbelt/bwrap 必须是最外层 launch wrapper（在 wrapperCli 包装之后、
+  // backend.spawn 之前套上），否则 wrapperCli 及其子孙跑在边界之外（ec167c403a）。
+  it('refuses adopt under mandatory credential isolation and keeps credential confinement the outermost wrapper', () => {
+    const gateAt = strippedSource.search(/if \(mandatoryCredentialIsolation && cfg\.adoptMode\)\s*\{\s*throw /);
+    expect(gateAt).toBeGreaterThan(0);
+    const adoptBranches = [...strippedSource.matchAll(/if \(cfg\.adoptMode && [^{]*adopt(?:Source|TmuxTarget|ZellijPaneId|Herdr)/g)];
+    expect(adoptBranches.length).toBeGreaterThan(0);
+    for (const branch of adoptBranches) expect(gateAt).toBeLessThan(branch.index!);
 
-  it('carves back only the prepared Pi session prompt directory after masking the shared root', () => {
-    expect(source).toContain('readonlyRoots: keepExisting([');
-    expect(source).toContain('...piInitialPromptReadonlyRoots,');
-    expect(source).not.toContain(
-      'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
-    );
-  });
-
-  it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {
-    // Guards a call-site blind spot: the adapter test only checks the method's
-    // RETURN value and the fs-policy test hand-feeds readonlyRoots, so if this
-    // spread were deleted the markers would silently stop reaching the sandbox
-    // and BOTH of those tests would stay green (goal-mode traex would wedge again
-    // on the migration prompt). Assert the worker actually threads the method
-    // output into readonlyRoots.
-    // The call site passes the merged child/per-bot env so env-driven adapters
-    // (e.g. ebsd's repository root) resolve against bot config, not daemon env.
-    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.({')
-    expect(source).toContain('}) ?? [])].map(expandTildeLexical),');
-  });
-
-  it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
-    const gateAt = source.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
-    const adoptAt = source.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
-    const wrapperAt = source.indexOf('if (cfg.wrapperCli && cfg.wrapperCli.trim())');
-    const credentialWrapperAt = source.indexOf('if (!willReattachPersistent && credentialOnlySeatbelt)');
-    const spawnAt = source.indexOf('backend.spawn(spawnBin, spawnArgs, {');
-    expect(gateAt).toBeGreaterThanOrEqual(0);
-    expect(gateAt).toBeLessThan(adoptAt);
-    expect(credentialWrapperAt).toBeGreaterThan(wrapperAt);
-    expect(credentialWrapperAt).toBeLessThan(spawnAt);
-    expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
-    expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
-    expect(source).toContain('exactCapabilities: true');
+    const wrapperAt = strippedSource.search(/if \(cfg\.wrapperCli\b/);
+    const spawnAt = strippedSource.search(/backend\.spawn\(spawnBin, spawnArgs\b/);
+    expect(wrapperAt).toBeGreaterThan(0);
+    for (const flavour of ['credentialOnlySeatbelt', 'credentialOnlyBwrap']) {
+      const at = strippedSource.search(new RegExp(`if \\(!willReattachPersistent && ${flavour}\\)`));
+      expect(at, flavour).toBeGreaterThan(wrapperAt);
+      expect(at, flavour).toBeLessThan(spawnAt);
+    }
   });
 });
 
 describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-  const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
 
-  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
-    expect(cliSource).toContain(
-      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
-    );
-    expect(cliSource).toContain(
-      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
-    );
-    expect(cliSource).toContain(
-      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
-    );
-    expect(cliSource).toContain(
-      'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',
-    );
-    expect(vcSource).toContain(
-      'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
-    );
+  /**
+   * Comment text blanked to spaces, every other character left AT ITS OFFSET. The
+   * shared `stripComments` helper deletes comment text instead, so its output no
+   * longer addresses the original source — the enclosing-function scan below needs
+   * the two to line up. Same two regexes, and the same deliberate over-strip on a
+   * `//` inside a string literal: that direction is safe here because over-stripping
+   * can only HIDE a mention, which turns these assertions red, never green.
+   */
+  const blankComments = (source: string): string => source
+    .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (m, p1: string) => p1 + ' '.repeat(m.length - p1.length));
+
+  /** Name of the top-level `function` (column-0 declaration) whose body encloses `at`. */
+  const enclosingFunctionName = (source: string, at: number): string | undefined => {
+    const head = source.slice(0, at);
+    const decls = [...head.matchAll(/^(?:export )?(?:async )?function ([A-Za-z0-9_$]+)\(/gm)];
+    return decls.at(-1)?.[1];
+  };
+
+  const code = blankComments(cliSource);
+
+  // 源码结构护栏(K2)：`botmux send` 的读隔离分类与拒绝在 cmdSend 长函数里，内核 deny 无法在单测里伪造，
+  // 没有 seam。不变量：固定 sentinel 被内核拒读即判定为读隔离发送；读隔离却拿不到绑定的 capability 时
+  // 必须 fail-closed 退出，绝不降级成普通直发路径（ccbf2c672c，#602）。
+  it('fail-closes a read-isolated send without a bound capability instead of downgrading to the direct path', () => {
+    const sentinelAt = code.search(/managedOriginIsolationSentinelAccess\(\w+\)\s*===\s*'sandbox_denied'/);
+    const refusalAt = code.search(/isolatedSendRequired && !isolatedCapabilityCtx\)\s*\{[^}]*process\.exit\(/);
+    expect(sentinelAt).toBeGreaterThan(0);
+    expect(refusalAt).toBeGreaterThan(sentinelAt);
+    expect(enclosingFunctionName(code, sentinelAt)).toBe('cmdSend');
+    expect(enclosingFunctionName(code, refusalAt)).toBe('cmdSend');
+  });
+
+  /**
+   * The reporter resolves the live origin itself rather than trusting a
+   * caller-supplied identity — EXCEPT for the turn-idle v2 report, whose origin
+   * (turnId/attempt/capability) was frozen by the in-CLI plugin AT THE EVENT and is
+   * transported verbatim (see cmdTurnIdle). That widening is only acceptable because
+   * the exemption is unreachable from every user-facing command:
+   * `postSessionScopedSignal` is module-local, only `cmdTurnIdle` (the versioned
+   * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
+   * command line) constructs a frozen origin, and only its `/api/turn-idle` call
+   * passes one. Wire a caller-supplied origin into `send` / reply / relay (or into
+   * the session-ready call, or into any new transport call) and one of these
+   * assertions goes red — the mention/ carrier sets are computed from the source,
+   * not from a substring's presence.
+   */
+  // 源码结构护栏(K2)：调用方可供给的身份只能经内部 turn-idle 事件进入 reporter，其余入口必须自己解析
+  // live origin；这是跨函数的可达性约束，只能对源码做函数归属扫描（8da52fe7ab）。
+  it('keeps the frozen origin reachable only from the internal turn-idle event', () => {
+    // Every mention — the opts type, the opts read, the field assignments, the
+    // construction and the pass-through — must sit in one of these two functions.
+    expect(
+      [...new Set([...code.matchAll(/frozenOrigin/g)]
+        .map(m => enclosingFunctionName(code, m.index!)))].sort(),
+    ).toEqual(['cmdTurnIdle', 'postSessionScopedSignal']);
+    // Without a frozen origin the reporter re-resolves the live one itself.
+    expect(code).toMatch(/liveOrigin = frozenOrigin \? undefined : resolveSessionContext\(/);
+    // Exactly one producer, inside cmdTurnIdle, behind the v2 payload check.
+    const producers = [...code.matchAll(/frozenOrigin = \{/g)];
+    expect(producers).toHaveLength(1);
+    const versionCheckAt = code.lastIndexOf('TURN_IDLE_PROTOCOL_VERSION', producers[0].index!);
+    expect(enclosingFunctionName(code, versionCheckAt)).toBe('cmdTurnIdle');
+    // …and exactly two carriers. session-ready passes NO opts (so it must resolve
+    // the live origin itself); turn-idle passes the frozen one.
+    expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
+      .map(m => enclosingFunctionName(code, m.index!)).sort())
+      .toEqual(['cmdSessionReady', 'cmdTurnIdle']);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/session-ready', \{[^}]*\}\);/);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/turn-idle', \{[^}]*\}, \{\s*frozenOrigin\s*\}\);/);
   });
 });
 

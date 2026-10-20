@@ -94,7 +94,13 @@ describe('renderBrandTemplate', () => {
   });
 
   it('{cwd} 输出展开后的绝对路径，不是字面量 ~/...', () => {
-    expect(renderBrandTemplate('{cwd}', '~/foo')).toBe(join(homedir(), 'foo'));
+    // {cwd} 走同一套 lark_md 转义。Linux CI 的临时 home 不含被转义的字符，macOS 的
+    // `/var/folders/xx/<随机串>_…` 含下划线——所以不能拿裸路径当期望值，也不在测试里
+    // 复刻转义规则：断言 `~/foo` 与展开后的绝对路径渲染结果一致，且没有留下字面量 ~。
+    const rendered = renderBrandTemplate('{cwd}', '~/foo');
+    expect(rendered).toBe(renderBrandTemplate('{cwd}', join(homedir(), 'foo')));
+    expect(rendered).not.toMatch(/^~/);
+    expect(rendered).toContain('foo');
   });
 
   // ── codex 复验抓出的 2 条残留 ────────────────────────────────────────

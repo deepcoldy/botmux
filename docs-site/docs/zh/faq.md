@@ -28,11 +28,13 @@
 
 ### B. 别人不能用 / 弹授权卡
 
-botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)）：**对话权**（谁能问）和**操作权**（谁能 `/cd` `/restart` 点按钮）。默认只有 owner 有对话权，所以别人 @ 会被拒 / 弹授权卡。
+botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速查见下 [权限怎么分](#权限怎么分谁能操作)）：**对话权**（谁能问）和**操作权**（谁能 `/cd` `/restart` 点按钮）。默认只有 `allowedUsers` 名单内的人有对话权，所以别人 @ 会被拒 / 弹授权卡。**把 bot 拉进群本身不会授权任何成员。**
 
-- **让整个群都能用**：给 bot 配 `allowedChatGroups`（该群全员可对话），或用 `/grant` 授权指定群。
-- **群 @ 策略**（必须 @ vs 免 @）：默认多人群必须 @；话题内免 @ / 全群免 @ 可在群 @ 策略里配。注意「1 个人 + 1 个 bot」的 1v1 群本来就免 @。
+- **让整个群都能用**：群里裸发 `@bot /grant`（写入 `allowedChatGroups`，全员即时生效、无额度），或 Dashboard「群组 → 管理」里**整群一键授权**；不必逐个加人。
+- **只给个别人试用**：`@bot /grant @某人` 发卡，默认 3 条 / 1 小时，卡上可调额度与有效期；Dashboard 群成员弹层还能多选**批量授权**（≤50 人）。
+- **群 @ 策略**（必须 @ vs 免 @）：默认多人群必须 @；`/mention-mode topic|never|ambient` 可改，语义与 8 个免 @ 例外见 [@ 策略](/mention-mode)。注意「1 个人 + 1 个 bot」的 1v1 群本来就免 @。
 - **oncall 场景**（每工单一个新群、全员免 @ 直接问）：见 [Oncall 模式](/oncall)。
+- **拉黑某人**：Dashboard「Bot 配置 → `blockedUsers`」，群聊私聊全局拦截且不再弹申请卡。
 
 ### C. 终端有输出但没发飞书
 
@@ -95,7 +97,27 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ## 权限怎么分？谁能操作？
 
-三层：`allowedChatGroups` / `globalGrants` 给**对话权**（群内全员可问）；`allowedUsers` 给**操作权**（owner 才能 `/cd` `/restart` `/close` 点按钮）。配了 `allowedChatGroups` 时 `allowedUsers` 至少要有一个 owner。
+速查：`allowedUsers` 给**操作权**（owner 与管理员，能 `/cd` `/restart` `/close` 点按钮、改 `/card` `/cot` `/mention-mode`）；`allowedChatGroups`（裸 `/grant`，整群无额度）、oncall（整群恒放行 + 绑目录）、`chatGrants` / `globalGrants`（按人、默认 3 条 / 1 小时）给**对话权**；`blockedUsers` 是优先于一切放行腿的全局否决。完整分层、额度、有效期、申请卡见 [权限与授权](/permissions)。
+
+## 怎么让整个群都能用，不用逐个授权？
+
+群里裸发 `@bot /grant`（等价 `/grant all`）：一次性把该群加入 `allowedChatGroups`，群里所有人立即能对话，无额度、无期限，新成员自动生效、退群自动失权；收回用裸 `/revoke`。话题群里按 `oc_` 群生效，覆盖群内全部话题。Dashboard「群组 → 管理」也有**整群一键授权**。注意它只给对话权，操作权仍只在 `allowedUsers`。
+
+## 只想让某人先试 3 条消息怎么配？
+
+`@bot /grant @某人`，bot 回的授权卡默认就是**每人 3 条 / 1 小时**；想直接指定条数用 `@bot /grant @某人 20`，时长与额度都能在卡上改（1 小时 / 8 小时 / 1 天 / 7 天 / 永久；额度留空表示不限）。
+
+## oncall 和裸 `/grant` 有什么区别？
+
+两者都只给对话权、不给操作权、都不限额。区别在目录：`/oncall bind <目录>` 还把群锚定到工作目录，新话题跳过选仓库直接开工；裸 `/grant` 只放开对话、不绑目录。值班答疑用 oncall，只想让群成员能在已选好仓库的话题里提问用 `/grant`。
+
+## 为什么群里必须 @ 机器人？能不能免 @？
+
+默认 `always` 模式下，普通群里明确 @ 才回应，避免多 bot / 多人群里乱抢答。群里发 `/mention-mode` 可改：`topic`（自有话题内免 @）、`never`（全群免 @）、`ambient`（免 @ 但点名叫别人时让路）。修改需操作权，仅普通群可设；另有 8 个免 @ 例外（1 人 1 bot 群、消息监听器等），见 [@ 策略](/mention-mode)。
+
+## 能禁止别人把这个 bot 拉进群吗？
+
+「谁能把机器人加进群」由**飞书平台侧**控制（应用可用范围 / 群机器人添加权限），botmux 没有、也伪造不了这个开关。bot 侧能做的两件事：① Dashboard「Bot 默认 → 主动开工」关掉「**被拉进新群自动开工**」（`autoStartOnGroupJoin`，且该闸本身还要求群里有授权用户）；② 保持限制态——**拉群不等于授权**，非名单成员 @ 它会被拦并弹申请卡给 owner。是否自动把 owner 拉进新群由 `autoInviteOwnerOnGroupAdd` 控制（默认开）：可在 Dashboard「Bot 默认 → 主动开工」关、飞书 `/botconfig set autoInviteOwnerOnGroupAdd off` 关，也可写 `bots.json`；关闭适用于告警/oncall 平台批量把 bot 拉进事件群、不想打扰 owner 的场景。
 
 ## 运行中的会话能临时追问 / 打断吗？
 
@@ -140,7 +162,25 @@ v2.95.0 起 botmux 会检测这种"会话没真正起来"的情况并发一张�
 
 ## 怎么升级？
 
-`botmux upgrade`——它会按你的安装方式自动选路：curl 安装的原地换二进制，npm 安装的交回 `npm i -g botmux@latest`。curl 用户也可以直接重跑一遍安装命令（同样是原地升级，不会重复写 PATH）。会话内的 `botmux` wrapper 版本始终跟 daemon 一致，无需单独升级。升级后记得 `botmux restart` 让新版本生效。
+**一律重跑安装命令（curl），与当初怎么装的无关**——npm / pnpm 全局安装的也用它升：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+它把自包含二进制原地替换到 `~/.botmux/bin/botmux`：下载后先在本机试跑，跑不起来会明确报错并**保留旧版本**；幂等，不会重复写 PATH；全程不需要 Node。装完**开一个新终端**再执行 `botmux restart`——installer 已把 `~/.botmux/bin` 前置到 PATH，新终端才能保证 `botmux` 命中新版本（老 npm 安装的当前 shell 里，`botmux` 可能仍指向 npm 全局目录）。会话内的 `botmux` wrapper 始终跟 daemon 同版本，无需单独升级。
+
+**装指定版本**（回滚 / 锁版本同理；版本标签必须带 `v` 前缀）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` 必须写在管道**右侧的 `sh` 前面**。写成 `BOTMUX_VERSION=… curl … | sh` 时变量只对 curl 生效、`sh` 收不到，会静默改装最新版。
+
+### 为什么 v3.18.0 之前的老版本不能用 npm 升级？
+
+v3.18.0 起 npm 包从「Node + `dist/` 源码」改成**平台二进制子包**，`node-pty` 移出了依赖。老版本自带的 `botmux upgrade` 当时就是交回 npm；npm 跨这个边界安装时会把旧目录里的 `node-pty` 清掉，而旧 daemon 重启的第一步仍是 `node …/dist/cli.js restart`——该文件仍静态 import `node-pty`，于是 `ERR_MODULE_NOT_FOUND`、重启驱动死掉、整个 daemon 舰队起不回来（输出里却可能已经提示「正在重启以应用更新」）。curl 直接落新二进制并让启动器指向它，不经过旧目录、也不看 npm 怎么剪依赖，是跨这个边界唯一稳妥的方式。≥3.18 的二进制安装上 `botmux upgrade` 与重跑 curl 等价；不确定自己是什么安装形态时，统一用 curl 即可。
 
 ## CoCo 忙时发消息丢失？
 

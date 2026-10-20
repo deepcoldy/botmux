@@ -8,6 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import type { V3RunEnvelope } from '../../workflows/v3/run-envelope.js';
+import { short, escapeMd } from './v3-card-common.js';
 
 export const V3_RUN_SAVE_ACTION = 'v3_run_save';
 export const V3_RUN_SAVE_CONFIRM_ACTION = 'v3_run_save_confirm';
@@ -158,16 +159,9 @@ export function buildV3RunSavedCard(input: {
   });
 }
 
-function short(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, max)}…`;
-}
-
 function plainTitle(value: string, max: number): string {
   const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   const chars = Array.from(normalized || 'Saved Workflow');
   return chars.length <= max ? chars.join('') : `${chars.slice(0, max).join('')}…`;
 }
 
-function escapeMd(value: string): string {
-  return value.replace(/[\\*_~`\[\]]/g, (char) => `\\${char}`);
-}

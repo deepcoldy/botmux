@@ -103,6 +103,8 @@ function assertBundleInputsAllowed(metafile) {
   // module means adding it to this set on purpose — that review is the point.
   const allowedSourceInputs = new Set([
     'src/utils/canonical-input-hash.ts',
+    'src/utils/proc-stat.ts',        // leaf: no imports (pure /proc/<pid>/stat parsing)
+    'src/utils/process-alive.ts',    // leaf: no imports (kill(pid, 0) predicates)
     'src/utils/file-lock.ts',
     'src/utils/fs-durability.ts',
     'src/utils/logger.ts',

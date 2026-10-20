@@ -55,14 +55,16 @@ vi.mock('../src/im/lark/client.js', async () => {
 });
 
 import { registerBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { noteTurnReceived } from '../src/daemon.js';
 import {
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
   clearUsageLimitState,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 const APP_CARD_OFF = 'ratelimit_cardoff_app';
 const APP_CARD_ON = 'ratelimit_cardon_app';
@@ -78,7 +80,9 @@ function makeDs(over: Partial<DaemonSession> = {}, app = APP_CARD_OFF): DaemonSe
     status: 'active',
     ownerOpenId: OWNER,
   };
-  return { session, larkAppId: app, chatId: 'oc_x', scope: 'chat', ...over } as unknown as DaemonSession;
+  const ds = { session, larkAppId: app, chatId: 'oc_x', scope: 'chat', ...over } as unknown as DaemonSession;
+  setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+  return ds;
 }
 
 function makeFakeWorker() {
@@ -128,6 +132,7 @@ describe('rate-limit proactive notification', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-ratelimit-'));
+    sessionStore.init(APP_CARD_OFF);
     registerBot({
       larkAppId: APP_CARD_OFF,
       larkAppSecret: 's',

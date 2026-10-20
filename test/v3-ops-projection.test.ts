@@ -8,6 +8,7 @@ import {
   projectRunById,
   listRuns,
   isValidRunId,
+  liveV3TerminalPortForSession,
   ptyLogPathFor,
 } from '../src/workflows/v3/ops-projection.js';
 
@@ -28,7 +29,7 @@ function buildRun(runsDir: string, runId: string, opts: { reportRunning?: boolea
   appendEvent(jp, { type: 'nodeDispatched', nodeId: 'research', attemptId: 'research/attempts/001' });
   appendEvent(jp, {
     type: 'nodeSessionReady', nodeId: 'research', attemptId: 'research/attempts/001',
-    sessionInfo: { sessionId: 'sess-r', webPort: 5101 },
+    sessionInfo: { sessionId: 'sess-r', webPort: 5101, viewToken: 'view-r' },
     ptyLogPath: join(runDir, 'research/attempts/001/pty.log'),
   });
   appendEvent(jp, { type: 'nodeSucceeded', nodeId: 'research', attemptId: 'research/attempts/001', manifestPath: join(runDir, 'research/attempts/001/manifest.json') });
@@ -37,7 +38,7 @@ function buildRun(runsDir: string, runId: string, opts: { reportRunning?: boolea
     appendEvent(jp, { type: 'nodeDispatched', nodeId: 'report', attemptId: 'report/attempts/001' });
     appendEvent(jp, {
       type: 'nodeSessionReady', nodeId: 'report', attemptId: 'report/attempts/001',
-      sessionInfo: { sessionId: 'sess-p', webPort: 5102 },
+      sessionInfo: { sessionId: 'sess-p', webPort: 5102, viewToken: 'view-p' },
       ptyLogPath: join(runDir, 'report/attempts/001/pty.log'),
     });
   }
@@ -67,6 +68,7 @@ describe('v3 ops-projection — projectRun', () => {
       expect(research.hasPtyLog).toBe(true);
       // 安全：read-only DTO 不暴露 token，也不直出绝对 ptyLogPath
       expect((research.webTerminal as Record<string, unknown>).token).toBeUndefined();
+      expect((research.webTerminal as Record<string, unknown>).viewToken).toBeUndefined();
       expect((research as Record<string, unknown>).ptyLogPath).toBeUndefined();
       // 安全铁律：整个 RunView 序列化后不得含 runDir 绝对路径（codex review）
       expect(JSON.stringify(view)).not.toContain(runDir);
@@ -143,6 +145,72 @@ describe('v3 ops-projection — projectRunById 安全 + listRuns', () => {
       const runs = listRuns(base);
       expect(runs.map((r) => r.runId)).toEqual(['b-260602-0900', 'a-260602-0800']);
       expect(runs[0].nodeCount).toBe(2);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('v3 live terminal resolver', () => {
+  it('只解析当前运行 attempt，并在节点终态后立即撤销中央 /s 路由', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-terminal-resolver-'));
+    try {
+      const runDir = buildRun(base, 'route-260602-0907', { reportRunning: true });
+      expect(liveV3TerminalPortForSession(base, 'sess-p')).toBe(5102);
+      expect(liveV3TerminalPortForSession(base, 'sess-r')).toBeUndefined();
+      expect(liveV3TerminalPortForSession(base, 'missing')).toBeUndefined();
+
+      appendEvent(join(runDir, 'journal.ndjson'), {
+        type: 'nodeSucceeded',
+        nodeId: 'report',
+        attemptId: 'report/attempts/001',
+        manifestPath: join(runDir, 'report/attempts/001/manifest.json'),
+      });
+      expect(liveV3TerminalPortForSession(base, 'sess-p')).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('忽略重试期间旧 attempt 迟到的 ready，只接通新 attempt', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-terminal-resolver-'));
+    try {
+      const runId = 'retry-260602-0908';
+      const runDir = join(base, runId);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+        runId,
+        nodes: [{ id: 'research', type: 'goal', goal: 'research', depends: [], inputs: [] }],
+      }));
+      const journal = join(runDir, 'journal.ndjson');
+      appendEvent(journal, { type: 'runStarted', runId });
+      appendEvent(journal, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' });
+      appendEvent(journal, {
+        type: 'nodeSessionReady', nodeId: 'research', attemptId: '001',
+        sessionInfo: { sessionId: 'sess-old', webPort: 5201, viewToken: 'view-old' },
+      });
+      appendEvent(journal, {
+        type: 'nodeBlocked', nodeId: 'research', attemptId: '001', errorClass: 'workerError',
+      });
+      appendEvent(journal, { type: 'runBlocked', blockedNodeId: 'research' });
+      appendEvent(journal, {
+        type: 'nodeRetryRequested', nodeId: 'research', previousAttemptId: '001',
+        nextAttemptId: '002', reason: 'blockedRetry',
+      });
+      appendEvent(journal, { type: 'nodeDispatched', nodeId: 'research', attemptId: '002' });
+      appendEvent(journal, {
+        type: 'nodeSessionReady', nodeId: 'research', attemptId: '001',
+        sessionInfo: { sessionId: 'sess-stale', webPort: 5202, viewToken: 'view-stale' },
+      });
+
+      expect(liveV3TerminalPortForSession(base, 'sess-old')).toBeUndefined();
+      expect(liveV3TerminalPortForSession(base, 'sess-stale')).toBeUndefined();
+
+      appendEvent(journal, {
+        type: 'nodeSessionReady', nodeId: 'research', attemptId: '002',
+        sessionInfo: { sessionId: 'sess-current', webPort: 5203, viewToken: 'view-current' },
+      });
+      expect(liveV3TerminalPortForSession(base, 'sess-current')).toBe(5203);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

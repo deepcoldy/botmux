@@ -26,6 +26,11 @@ import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import { readProcessIdentity } from '../src/adapters/backend/mojo-process-tree.js';
 import { isLinux } from './helpers/synthetic-proc.js';
 
+/** The fake `mojo` is a bash script spawned per turn; under a loaded parallel
+ *  vitest run its first stdout line can take well over vi.waitFor's 1s default
+ *  (observed on macOS: green alone, red in the full suite). Budget, not a sleep. */
+const SESSION_ID_WAIT_MS = 15_000;
+
 let binDir: string;
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-failclosed-')); });
 afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
@@ -95,7 +100,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-stuck","war
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-stuck'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-stuck'), { timeout: SESSION_ID_WAIT_MS });
 
     // Simulate an UNINTERRUPTIBLE process: signals are delivered but change
     // nothing, which is the only way a SIGKILL-proof state can be reproduced (a
@@ -168,7 +173,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-escaped","w
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('spawn a tool that escapes');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-escaped'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-escaped'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
     const escaped = Number(readFileSync(pidFile, 'utf-8').trim());
     const rootPid = backend.getChildPid();
@@ -201,7 +206,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-immortal","
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('spawn an unkillable tool');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-immortal'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-immortal'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
     const escaped = Number(readFileSync(pidFile, 'utf-8').trim());
 
@@ -279,7 +284,7 @@ sleep 60`);
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-immune'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-immune'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => expect(existsSync(readyFile)).toBe(true));
     const childPid = backend.getChildPid();
     expect(typeof childPid).toBe('number');
@@ -298,7 +303,7 @@ sleep 30`);
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-pgid'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-pgid'), { timeout: SESSION_ID_WAIT_MS });
     const childPid = backend.getChildPid() as number;
 
     const pgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(childPid)], { encoding: 'utf-8' }).trim());

@@ -52,6 +52,24 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     MessageWithdrawnError,
   };
 
+  it.each([false, true])('keeps the exact native author on a quote and withdrawn fallback=%s', async withdrawn => {
+    const groupContextAuthorOrigin = {
+      appId: 'cli_app', chatId: 'oc_chat', sessionId: 'sid_1', turnId: 'om_turn', epoch: 'native_epoch',
+    };
+    const replyMessage = vi.fn(async () => {
+      if (withdrawn) throw new MessageWithdrawnError('withdrawn');
+      return 'om_reply';
+    });
+    const sendMessage = vi.fn(async () => 'om_send');
+    await dispatchPrimaryMessage({ replyMessage, sendMessage }, {
+      ...baseOptions, quoteTargetId: 'om_quote', content: 'Authored answer', msgType: 'text',
+      groupContextAuthorOrigin, suppressHook: true, dispatch: vi.fn(async () => 'unused'),
+    });
+    expect(replyMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    if (withdrawn) expect(sendMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    else expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it('passes hookContext when quote reply succeeds', async () => {
     const replyMessage = vi.fn(async () => 'om_reply');
     const sendMessage = vi.fn(async () => 'om_send');
@@ -330,6 +348,23 @@ describe('validateVideoAttachments', () => {
 });
 
 describe('normalizeInteractiveCardInput', () => {
+  it('rejects a forged completion proposal callback from a custom card', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '继续处理' },
+        behaviors: [{ type: 'callback', value: {
+          action: 'completion_proposal_decide',
+          proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+          decision: 'accept',
+        } }],
+      }] },
+    }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('callback');
+  });
+
   const card = {
     schema: '2.0',
     body: {
@@ -383,6 +418,22 @@ describe('normalizeInteractiveCardInput', () => {
 
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain('callback');
+  });
+
+  it('accepts Card 2.0 callback behaviors only for the selected plugin', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [{
+      tag: 'button', text: { tag: 'plain_text', content: 'approve' },
+      behaviors: [{ type: 'callback', value: { action: 'example.approve' } }],
+    }] } });
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'example.approve' },
+    });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) expect(accepted.cardJson).toBe(raw);
+    expect(normalizeInteractiveCardInput(raw).ok).toBe(false);
+    expect(normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another.submit' },
+    }).ok).toBe(false);
   });
 
   it('accepts form callbacks only through an explicitly selected plugin action route', () => {

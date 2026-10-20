@@ -15,6 +15,8 @@
 import type { BackendType } from './types.js';
 import { buildBotmuxEnvAssignments } from './tmux-backend.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
+import { buildForgeTraexLaunch, type CliLaunchMode } from '../../core/cli-launch-mode.js';
+import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
 
 /** POSIX 单引号转义，安全用于 bash 粘贴。 */
 function shq(value: string): string {
@@ -36,11 +38,16 @@ export function selectReproduceLaunch(input: {
   baseBin: string;
   baseArgs: string[];
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   sandboxOn: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
 }): { bin: string; args: string[] } {
-  const { baseBin, baseArgs, wrapperCli, sandboxOn } = input;
+  const { baseBin, baseArgs, wrapperCli, cliLaunchMode, sandboxOn } = input;
+  if (cliLaunchMode === 'forge-traex' && !sandboxOn) {
+    const launch = buildForgeTraexLaunch(baseArgs, input.binResolver ?? ((b) => b));
+    return { bin: launch.bin, args: launch.args };
+  }
   if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
     const launch = buildWrappedLaunch(
       wrapperCli,
@@ -73,7 +80,7 @@ export interface ReproduceCommandInput {
 // env 前缀取 buildBotmuxEnvAssignments（BOTMUX_* / SESSION_DATA_DIR /
 // CLAUDE_CONFIG_DIR / CODEX_HOME / 代理 / per-bot 凭证），每个 VAL 做 bash 单引号转义。
 export function buildReproduceCommand(input: ReproduceCommandInput): string | null {
-  if (input.backendType === 'riff' || input.backendType === 'mojo') return null;
+  if (isRemoteBackendId(input.backendType)) return null;
   if (!input.bin) return null;
 
   const parts: string[] = [];

@@ -2,11 +2,9 @@
  * Regression coverage for document-comment session routing races.
  *
  * Most of the delivery pipeline intentionally remains private to daemon.ts, so
- * the tests combine behavioural coverage of the small routing primitives with
- * source-order guards at the private integration points. This mirrors the
- * established daemon closure coverage in initial-passthrough-ownership.test.ts.
+ * these tests cover the small routing primitives it exports for tests; the
+ * end-to-end handleDocComment / prewarm races live in daemon-rename-route.test.ts.
  */
-import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -19,18 +17,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     WSClient: FakeWSClient,
     EventDispatcher: FakeEventDispatcher,
     LoggerLevel: { info: 2 },
+    withUserAccessToken: () => ({ lark: {} }),
   };
 });
-
-const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
-
-function asyncFnRegion(name: string, nextName: string): string {
-  const start = src.indexOf(`async function ${name}(`);
-  const end = src.indexOf(`async function ${nextName}(`, start + 1);
-  expect(start, `${name} not found in daemon.ts`).toBeGreaterThanOrEqual(0);
-  expect(end, `${nextName} not found after ${name}`).toBeGreaterThan(start);
-  return src.slice(start, end);
-}
 
 function makeDs(sessionId: string, rootMessageId = 'om_doc_root'): DaemonSession {
   return {
@@ -362,6 +351,39 @@ describe('document-comment routing generation primitives', () => {
     expect(winner.session.status).toBe('active');
   });
 
+  it('does not retire an ephemeral session while another turn reserves it or after acceptance', async () => {
+    const daemon = await import('../src/daemon.js');
+    const candidate = makeDocDs('candidate');
+    const key = 'doc:doccnFILE::app-doc';
+    daemon.__testOnly_activeSessions.set(key, candidate);
+    daemon.__testOnly_markEphemeralDocCommentSession(candidate);
+    const releaseOld = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-old');
+    const releaseNew = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-new');
+
+    releaseOld();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(candidate);
+
+    daemon.__testOnly_acceptDocCommentSession(candidate);
+    releaseNew();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(candidate);
+  });
+
+  it('retires an unaccepted ephemeral session only after its final reservation releases', async () => {
+    const daemon = await import('../src/daemon.js');
+    const candidate = makeDocDs('candidate');
+    const key = 'doc:doccnFILE::app-doc';
+    daemon.__testOnly_activeSessions.set(key, candidate);
+    daemon.__testOnly_markEphemeralDocCommentSession(candidate);
+    const release = daemon.__testOnly_reserveDocCommentSession(candidate, 'turn-only');
+
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(false);
+    release();
+    expect(daemon.__testOnly_claimUnacceptedDocCommentSessionRetirement(candidate)).toBe(true);
+    expect(daemon.__testOnly_activeSessions.has(key)).toBe(false);
+  });
+
   it('makes a concurrent follower await the owner failure instead of reporting success', async () => {
     const daemon = await import('../src/daemon.js');
     let failOwner!: () => void;
@@ -392,68 +414,24 @@ describe('document-comment routing generation primitives', () => {
     await expect(daemon.__testOnly_runClaimedDocCommentTurn('app-doc:file:reply-1', retryWork)).resolves.toBe(true);
     expect(retryWork).toHaveBeenCalledOnce();
   });
-});
 
-describe('document-comment routing integration', () => {
-  it('registers auto-created sessions through CAS and hands loser comments to the winner', () => {
-    const fullRegion = asyncFnRegion('autoCreateDocSession', 'handleDocComment');
-    const region = fullRegion.slice(0, fullRegion.indexOf('const handledDocCommentTurns'));
-    expect(region).not.toContain('activeSessions.set(');
-    expect(region).not.toContain('resolveSender(');
-    expect(region).not.toContain('docCommentTurns');
-    expect(region).not.toContain('docCommentTargets');
-    expect(region).toContain('const virtualAnchor = virtualChatId;');
-    expect(region).toContain('registerDocSessionCandidate(routingKey, ds)');
-    expect(region).toContain('persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds)');
-    expect(region).toContain('return selected;');
-  });
+  it('keeps a failed claim held until owner cleanup finishes, so a late follower shares the failure', async () => {
+    const daemon = await import('../src/daemon.js');
+    daemon.__testOnly_resetDocCommentClaims();
+    const lateWork = vi.fn(async () => {});
+    let lateFollower: Promise<boolean> | undefined;
+    const owner = daemon.__testOnly_runClaimedDocCommentTurn(
+      'app-doc:file:reply-cleanup',
+      async () => { throw new Error('delivery failed'); },
+      async () => {
+        // Arrives while the owner is still rolling back: must not win a fresh claim.
+        lateFollower = daemon.__testOnly_runClaimedDocCommentTurn('app-doc:file:reply-cleanup', lateWork);
+      },
+    );
 
-  it('revalidates prewarm after sender resolution before mutating or dispatching', () => {
-    const region = asyncFnRegion('prewarmDocCommentSession', 'autoCreateDocSession');
-    expect(region).toMatch(/const generation = captureRoutingGeneration\(ds\);[\s\S]*await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'prewarm:sender'\)/);
-    const guard = region.indexOf("ensureCurrentRoutingGeneration(generation, 'prewarm:sender')");
-    expect(guard).toBeGreaterThanOrEqual(0);
-    expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(guard);
-    expect(region.indexOf('sendWorkerInput(ds, cliInput', guard)).toBeGreaterThan(guard);
-    expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
-  });
-
-  it('revalidates comment delivery after every key await and before send/fork', () => {
-    const region = asyncFnRegion('handleDocComment', 'pollWatchedDocComments');
-    expect(region).toContain('resolveBoundDocSession(sub, larkAppId)');
-    expect(region).toMatch(/await addCommentReaction[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:reaction'\)/);
-    expect(region).toMatch(/await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:sender'\)/);
-    expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:live-note'\)[\s\S]*sendWorkerInput/);
-    expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*forkWorker/);
-  });
-
-  it('rolls back only this turn target and an already-landed Typing reaction before releasing the claim', () => {
-    const region = asyncFnRegion('handleDocComment', 'pollWatchedDocComments');
-    expect(region).toContain('targetMatchesThisTurn(runtimeTarget)');
-    expect(region).toContain('deliveryDs.docCommentTurns?.delete(turnId)');
-    expect(region).toContain('targetMatchesThisTurn(persistedTarget)');
-    expect(region).toContain('delete deliverySession.docCommentTargets?.[turnId]');
-    expect(region).toContain('sessionStore.getOwnedSession(deliverySession.sessionId) === deliverySession');
-    expect(region).toMatch(/if \(reactionId && userReplyId\)[\s\S]*await removeCommentReaction/);
-    expect(region).toMatch(/\(ds\.session\.docCommentTargets \?\?= \{\}\)\[turnId\] = docTarget/);
-    expect(region).toContain('}, cleanupFailedDelivery)');
-  });
-
-  it('shares an in-flight Promise result and deletes a failed claim only after cleanup', () => {
-    const region = asyncFnRegion('runClaimedDocCommentTurn', 'handleDocComment');
-    expect(src).toContain('new BoundedMap<string, Promise<boolean>>');
-    expect(region).toContain('if (existing) return await existing;');
-    const cleanup = region.indexOf('await onOwnerFailure?.(err)');
-    const deletion = region.indexOf('handledDocCommentTurns.delete(claimKey)', cleanup);
-    const settle = region.indexOf('resolveClaim(false)', deletion);
-    expect(cleanup).toBeGreaterThanOrEqual(0);
-    expect(deletion).toBeGreaterThan(cleanup);
-    expect(settle).toBeGreaterThan(deletion);
-  });
-
-  it('uses only the current bot-owned session store during subscription restore', () => {
-    const region = asyncFnRegion('restoreDocSubscriptions', 'startDaemon');
-    expect(region).toContain('sessionStore.getOwnedSession(sub.sessionId)');
-    expect(region).not.toContain('sessionStore.getSession(sub.sessionId)');
+    await expect(owner).rejects.toThrow('delivery failed');
+    expect(lateFollower).toBeDefined();
+    await expect(lateFollower).resolves.toBe(false);
+    expect(lateWork).not.toHaveBeenCalled();
   });
 });

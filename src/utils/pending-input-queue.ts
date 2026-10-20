@@ -1,6 +1,13 @@
-import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
+import type {
+  CodexAppTurnInput,
+  TaskContinuationDispatchMarker,
+  TrustedCaller,
+  VcMeetingImTurnOrigin,
+} from '../types.js';
+import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface PendingCliInput {
+  queueAfterActiveTurn?: true;
   content: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
@@ -9,6 +16,12 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** This item belongs to the durable-primary Lark Inbox commit protocol. */
+  durablePrimaryInbox?: true;
+  /** Open id of the human whose turn this is. The worker publishes it beside
+   *  the live-turn marker so the identity wrapper can keep a same-principal
+   *  credential across consecutive turns. */
+  turnCallerOpenId?: string;
   codexAppDispatchId?: string;
   /** Explicit positive steer authorization copied from the daemon ledger entry
    * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
@@ -16,6 +29,8 @@ export interface PendingCliInput {
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   trustedCaller?: TrustedCaller;
+  /** Stable authenticated controller of the surrounding session/task. */
+  trustedController?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
   /** Best-effort CLI-native title to apply after this exact user input has
    * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
@@ -42,6 +57,7 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  taskContinuation?: TaskContinuationDispatchMarker;
 }
 
 /**
@@ -97,14 +113,21 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
+    || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
-    || tail.logicalContent || next.logicalContent) return false;
+    || tail.logicalContent || next.logicalContent
+    || tail.taskContinuation || next.taskContinuation) return false;
+  // Caller attribution is part of the logical envelope. Older code merged two
+  // queued messages and kept only the later turnId while silently retaining no
+  // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
+  // legacy callers fail closed and stay as separate turns.
+  if (!sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
@@ -112,14 +135,19 @@ export function mergeQueuedCliInput(
 
 /** Durable delivery and ordinary IM turns share one CLI but must not steer
  *  into each other. Adapter type-ahead remains available only while neither
- *  the active turn nor the next queued input is a durable attempt. */
+ *  the active turn nor the next queued input is a durable attempt. Direct RPC
+ *  is also forced serial while its current native turn is unresolved: unlike
+ *  Codex App's runner, that engine has no turn/steer grouping contract, so a
+ *  second turn/start against the busy thread would have an ambiguous outcome. */
 export function pendingInputAllowsTypeAhead(
   adapterSupportsTypeAhead: boolean,
   durableTurnInFlight: boolean,
   next: PendingCliInput | undefined,
+  directRpcTurnInFlight = false,
 ): boolean {
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
+    && !directRpcTurnInFlight
     && next?.dispatchAttempt === undefined
     && !next?.vcMeetingImTurnOrigin;
 }
@@ -131,11 +159,13 @@ export function pendingInputAllowsTypeAhead(
  * launch-argument path; adopt observes an already-running process. */
 export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
+  durableInitialPromptViaArgs?: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
   queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
+    && !opts.durableInitialPromptViaArgs
     && !opts.adoptMode
     && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }
@@ -205,15 +235,15 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
 
 /**
  * Whether markPromptReady must treat the first post-spawn ready as
- * "pre-execution SessionStart" (report working, keep busy) rather than true
+ * "pre-execution working" (report working, keep busy) rather than true
  * end-of-turn idle.
  *
- * Strict conditions (PR #633 review):
+ * Strict conditions:
  *  - adapter actually bakes the first prompt into argv (`passesInitialPromptViaArgs`)
  *  - an argv prompt exists and was NOT deferred to the write queue
- *  - SessionStart ready exists (`injectsReadyHook`) so first ready ≠ completion
- *  - turn terminal is authoritative (`reliableTurnTerminal`) so a later
- *    assistant_final/fireIdle will produce a real idle edge
+ *  - turn terminal is authoritative (`reliableTurnTerminal`), meaning turn
+ *    completion is signaled independently (e.g. structured updates.jsonl)
+ *    rather than by quiescence / initial ready edge.
  *
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
@@ -221,27 +251,35 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
+ *
+ * Grok passes prompt via argv and provides an authoritative turn terminal
+ * via updates.jsonl (`reliableTurnTerminal`), so its first ready (when the
+ * composer/TUI mounts) is pre-execution / in-flight (not completion) and must
+ * arm busy to avoid a false working→idle transition before updates.jsonl completes.
  */
 export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   passesInitialPromptViaArgs: boolean;
   preparedInitialPrompt?: string | null;
   queuedInitialPrompt?: string | null;
-  injectsReadyHook: boolean;
   reliableTurnTerminal: boolean;
 }): boolean {
   if (!shouldTrackArgvBakedFirstPrompt(opts)) return false;
-  if (!opts.injectsReadyHook) return false;
   if (!opts.reliableTurnTerminal) return false;
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  allowBackToBackWrites = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !allowBackToBackWrites
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

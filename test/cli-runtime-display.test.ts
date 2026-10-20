@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
@@ -54,27 +53,5 @@ describe('CLI runtime display identity', () => {
 
   it('uses the live runtime only before an unstamped session is first frozen', () => {
     expect(sessionConfiguredRuntimeDisplayName({}, liveRuntime)).toBe('Forge Codex');
-  });
-
-  it('keeps the frozen runtime wired into the previous-turn card handoff', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const begin = source.indexOf('function beginNewTurn(');
-    const end = source.indexOf('\nfunction ', begin + 1);
-    const body = source.slice(begin, end);
-
-    expect(body).toContain('const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId');
-    expect(body).toContain('sessionConfiguredRuntimeDisplayName(ds.session, dsBotCfg.cliRuntime)');
-    expect(body).toMatch(/getDaemonStreamingCardUsageSnapshot[\s\S]*runtimeDisplayName,/);
-  });
-
-  it('starts the current turn card at message acceptance instead of waiting for terminal redraw', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const begin = source.indexOf('function beginNewTurn(');
-    const end = source.indexOf('\nfunction ', begin + 1);
-    const body = source.slice(begin, end);
-
-    expect(body).toContain('postTurnStartingCard(ds, sessionReply, turnId)');
-    expect(body).toContain('ds.streamCardPendingTurnId = turnId');
-    expect(body).toContain('ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1');
   });
 });

@@ -3,18 +3,23 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { piTurnBoundaryExtensionPath } from './pi.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
+import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-transcript.js';
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
+
+export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -88,7 +93,7 @@ async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<b
     // Emit the markers ourselves instead of relying on backend pasteText():
     // tmux/zellij implement bracketed paste, while herdr's pasteText is only a
     // literal write. One explicit wire format keeps every backend equivalent.
-    if (!sendLiteral(pty, `${BRACKETED_PASTE_START}${chunk}${BRACKETED_PASTE_END}`)) return false;
+    if (!sendLiteral(pty, wrapBracketedPaste(chunk))) return false;
     await delay(OMP_INPUT_THROTTLE_MS);
   }
   return true;
@@ -111,7 +116,27 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 }
 
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
-export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
+/** OMP isolated-session JSONL, addressed only by the botmux adapter session id (no pid
+ *  or cwd discovery). Holds a provisional terminal in driver state until a decisive
+ *  record or a quiet tick proves no plugin continuation follows. */
+export const ompBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainOmpTranscript(
+    path,
+    offset,
+    (ctx.state as OmpTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => ompTranscriptPath(sessionId) ?? undefined,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+};
+
+export function createOhMyPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
   let composerDirty = false;
   let lastClearAttemptAt = 0;
@@ -138,6 +163,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
   return {
     id: 'oh-my-pi',
+    bridgeSpec: ompBridgeSpec,
     authPaths: ['~/.omp/agent'],
     resolvedBin: bin,
 
@@ -147,7 +173,24 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     // as positional launch args: OMP deposits those in the TUI composer but
     // does not auto-submit them. Route prompts through writeInput, where botmux
     // controls the final submit key.
-    buildArgs({ sessionId, resume, model, workingDir, disableCliBypass }) {
+    buildArgs({
+      sessionId,
+      resume,
+      model,
+      workingDir,
+      disableCliBypass,
+      locale,
+      botName,
+      botOpenId,
+      replyDelivery,
+      triggerUserAuth,
+      larkToolAppId,
+      noTransport,
+      solo,
+      skillPluginDir,
+      env,
+      promptInjection,
+    }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
       if (resume) {
@@ -160,8 +203,49 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       }
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
+      if (promptInjection !== 'none') {
+        args.push('--plugin-dir', OMP_PLUGIN_DIR);
+        if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      }
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        larkToolAppId,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // the extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: OMP's CLI
+      // disables native automatic discovery of project/user/foreign APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict complex profile/project/overlay Settings precedence. Appending
+      // via the extension after native discovery completes preserves 100% faithful
+      // native Settings resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension for OMP; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+      args.push('--extension', turnBoundaryExt);
+
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
       return args;
     },
+
+    injectsSessionContext: true,
+    pluginDir: OMP_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     // OMP positional prompts are not an auto-submit channel; stdin injection is
     // the reliable path.
@@ -219,10 +303,8 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     busyPattern: /Working(?:\.\.\.|…)/,
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: [],
     altScreen: true,
     skillsDir: '~/.omp/agent/skills',
   };
 }
-
-export const create = createOhMyPiAdapter;

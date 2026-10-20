@@ -30,6 +30,8 @@ import { join } from 'node:path';
 import * as tmuxBackend from '../src/adapters/backend/tmux-backend.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
+import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
+import { installAidenCodexShim } from '../src/services/aiden-codex-shim.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -43,6 +45,163 @@ import {
 } from '../src/adapters/backend/tmux-backend.js';
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
+
+describe('host session scope reaches the pane', () => {
+  it.each(['thread', 'chat', undefined])('passes host scope %s and rejects inherited or configured replacements', (scope) => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-pane-'));
+    try {
+      const result = spawnSync('/bin/sh', [
+        '-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(
+          { BOTMUX_SESSION_ID: 'fresh-session', BOTMUX_SESSION_SCOPE: scope },
+          { BOTMUX_SESSION_SCOPE: 'configured-stale' },
+        ),
+        '/bin/sh', '-c', 'printf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID"',
+      ], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_SCOPE: 'inherited-stale', BOTMUX_SESSION_ID: 'old-session' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(`${scope ?? 'unset'}\nfresh-session\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const hasTmux = !spawnSync('tmux', ['-V']).error;
+  it.skipIf(!hasTmux)('replaces stale server scope for thread and chat panes and clears it for an unscoped pane', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-tmux-'));
+    const socket = `bmx-scope-${process.pid}-${Date.now()}`;
+    const clientEnv = { PATH: process.env.PATH, HOME: dir };
+    const runTmux = (args: string[], env: NodeJS.ProcessEnv = clientEnv) => {
+      const result = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
+      expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
+    };
+    try {
+      runTmux(['-f', '/dev/null', 'new-session', '-d', '-s', 'holder', '/bin/sleep', '60'],
+        { ...clientEnv, BOTMUX_SESSION_SCOPE: 'stale-server' });
+      const probe = join(dir, 'probe');
+      writeFileSync(probe, '#!/bin/sh\nprintf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID" > "$1"\ntmux -L "$2" wait-for -S "$3"\n', { mode: 0o755 });
+      for (const [index, scope] of ['thread', 'chat', undefined].entries()) {
+        const resultPath = join(dir, `result-${index}`);
+        const signal = `done-${index}`;
+        runTmux(['new-session', '-d', '-s', `probe-${index}`,
+          ...shellCommandArgv({ shell: '/bin/sh', flags: [] }, shellWrapperScript(dir), [
+            dir,
+            ...buildBotmuxEnvAssignments({ BOTMUX_SESSION_ID: `session-${index}`, BOTMUX_SESSION_SCOPE: scope }),
+            probe, resultPath, socket, signal,
+          ]),
+        ]);
+        runTmux(['wait-for', signal]);
+        expect(readFileSync(resultPath, 'utf8')).toBe(`${scope ?? 'unset'}\nsession-${index}\n`);
+      }
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server'], { env: clientEnv, timeout: 10_000 });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('Aiden Codex pane launch', () => {
+  it.each(['high', 'xhigh', 'max', 'ultra'])('carries %s through wrapper selection, pane env and the executable shim', (effort) => {
+    const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-'));
+    try {
+      const realBin = join(dir, 'real codex');
+      writeFileSync(realBin, '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "shim-env=%s/%s/%s\\n" "${BOTMUX_AIDEN_CODEX_REAL_BIN-unset}" "${BOTMUX_AIDEN_CODEX_REASONING_EFFORT-unset}" "${BOTMUX_AIDEN_CODEX_PARENT_PATH-unset}"\nprintf "path=%s\\n" "$PATH"\n', { mode: 0o755 });
+      const shimDir = installAidenCodexShim(join(dir, 'shim with spaces'));
+      const fakeAiden = join(dir, 'aiden');
+      writeFileSync(fakeAiden, '#!/bin/sh\nshift 2\nexec codex \"$@\"\n', { mode: 0o755 });
+      const launch = buildWrappedLaunch('aiden x codex', ['--model', 'gpt-5.6-sol', '-c', `model_reasoning_effort="${effort}"`], b => b === 'aiden' ? fakeAiden : b, {
+        aidenCodexRealBin: realBin, aidenCodexShimDir: shimDir, childPath: '/usr/bin:/bin',
+      });
+      const result = spawnSync('/bin/sh', ['-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(launch.env), launch.bin, ...launch.args], {
+        encoding: 'utf8', env: { PATH: '/usr/bin:/bin', BOTMUX_AIDEN_CODEX_REAL_BIN: '/stale/codex', BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'low' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const lines = result.stdout.trim().split('\n');
+      expect(lines.slice(0, 5)).toEqual(['-c', `model_reasoning_effort="${effort}"`, '--model', 'gpt-5.6-sol', 'shim-env=unset/unset/unset']);
+      expect(lines[5]).toMatch(/^path=.+/);
+      expect(lines[5]).not.toContain(shimDir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers shell-env config overrides to the real codex through the pane env and shim', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-cfg-'));
+    try {
+      const realBin = join(dir, 'real codex');
+      writeFileSync(realBin, '#!/bin/sh\ni=0\nfor a in "$@"; do printf "argv[%s]=<%s>\\n" "$i" "$a"; i=$((i+1)); done\n',
+        { mode: 0o755 });
+      const shimDir = installAidenCodexShim(join(dir, 'shim'));
+      // Simulate the worker's writeAidenShellConfigs persistence callback.
+      const cfgFile = join(shimDir, 'shell-configs');
+      writeFileSync(cfgFile, [
+        'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+        'shell_environment_policy.set.ZDOTDIR="/data/x/shell"',
+        'shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh"',
+      ].join('\n') + '\n', { mode: 0o600 });
+      const fakeAiden = join(dir, 'aiden');
+      writeFileSync(fakeAiden, '#!/bin/sh\nshift 2\nexec codex "$@"\n', { mode: 0o755 });
+      const launch = buildWrappedLaunch(
+        'aiden x codex',
+        [
+          '--no-alt-screen',
+          '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+          '-c', 'shell_environment_policy.set.ZDOTDIR="/data/x/shell"',
+          '-c', 'shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh"',
+          'resume', 'cid',
+        ],
+        b => b === 'aiden' ? fakeAiden : b,
+        {
+          aidenCodexRealBin: realBin,
+          aidenCodexShimDir: shimDir,
+          writeAidenShellConfigs: () => cfgFile,
+        },
+      );
+      // The config file PATH rides the same pane-env allowlist as the other
+      // shim settings.
+      const assigns = buildBotmuxEnvAssignments(launch.env)
+        .filter(a => a.startsWith('BOTMUX_AIDEN_CODEX_'));
+      expect(assigns.some(a => a.startsWith('BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE='))).toBe(true);
+      const result = spawnSync('/bin/sh', ['-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(launch.env), launch.bin, ...launch.args], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const lines = result.stdout.trim().split('\n');
+      // All -c overrides are prepanded ahead of the resume subcommand; order of
+      // the distinct keys is reversed by the prepend but irrelevant to codex.
+      expect(lines.slice(0, 6)).toEqual([
+        'argv[0]=<-c>',
+        'argv[1]=<shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh">',
+        'argv[2]=<-c>',
+        'argv[3]=<shell_environment_policy.set.ZDOTDIR="/data/x/shell">',
+        'argv[4]=<-c>',
+        'argv[5]=<shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x">',
+      ]);
+      expect(lines.slice(6)).toEqual([
+        'argv[6]=<--no-alt-screen>',
+        'argv[7]=<resume>',
+        'argv[8]=<cid>',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears stale shim settings for unrelated panes', () => {
+    const result = spawnSync('/bin/sh', ['-c', shellWrapperScript('/tmp'), '_', tmpdir(), '/bin/sh', '-c',
+      'printf "%s/%s" "${BOTMUX_AIDEN_CODEX_REAL_BIN-unset}" "${BOTMUX_AIDEN_CODEX_REASONING_EFFORT-unset}"'], {
+      encoding: 'utf8', env: { PATH: '/usr/bin:/bin', BOTMUX_AIDEN_CODEX_REAL_BIN: '/stale/codex', BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'low' },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('unset/unset');
+  });
+});
 type ShellWrapperScriptForKind = (binDir: string, kind?: ShellKindUnderTest) => string;
 type DebugKeepShellScriptForKind = (shellPath: string, binDir: string, kind?: ShellKindUnderTest) => string;
 
@@ -74,6 +233,20 @@ function firstExistingPath(paths: readonly string[]): string | undefined {
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
+
+describe('buildBotmuxEnvAssignments() — CA bundle', () => {
+  it('forwards SSL_CERT_FILE per pane (it is deliberately not on the injected allowlist)', () => {
+    // The value reaches the pane through this per-pane injection, NOT through
+    // BOTMUX_INJECTED_ENV_KEYS — listing it there would also make every pane
+    // `unset` it and let daemon startup delete a user's own tmux server value.
+    const out = buildBotmuxEnvAssignments({ SSL_CERT_FILE: '/private/etc/ssl/cert.pem' });
+    expect(out).toContain('SSL_CERT_FILE=/private/etc/ssl/cert.pem');
+  });
+
+  it('omits SSL_CERT_FILE when the worker resolved none and the operator set none', () => {
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(a => a.startsWith('SSL_CERT_FILE='))).toBe(false);
+  });
+});
 
 describe('buildBotmuxEnvAssignments()', () => {
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
@@ -205,6 +378,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
+  it('forwards BOTMUX_STATUSLINE_CHAIN so `botmux statusline` inside the pane can chain the user statusLine', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_STATUSLINE_CHAIN: 'bash ~/.claude/statusline.sh',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_STATUSLINE_CHAIN=bash ~/.claude/statusline.sh');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('forwards only a Codex App bootstrap path and strips the retired shared-secret env', () => {
     const retiredSharedSecret = 'A'.repeat(43);
     const bootstrapPath = '/private/bot-home/control.bootstrap';
@@ -302,6 +485,38 @@ describe('buildBotmuxEnvAssignments()', () => {
     // The per-bot value must come last so env(1) applies it last.
     expect(out.indexOf('HTTPS_PROXY=http://bot-proxy:3128'))
       .toBeGreaterThan(out.indexOf('HTTPS_PROXY=http://daemon-proxy:8080'));
+  });
+
+  // ── Workflow (v3 goal-mode) env forwarding (WORKFLOW_WORKER_ENV_KEYS) ──────
+  it('forwards workflow identity (BOTMUX_WORKFLOW / BOTMUX_GOAL_*) so a v3 worker on tmux sees the goal', () => {
+    // The PTY backend passed the full env, so it never needed this; the tmux
+    // backend forwards only allowlisted keys, and these live on their own table
+    // (not BOTMUX_INJECTED_ENV_KEYS). Without this loop a v3 worker on tmux
+    // loses its whole workflow env and the CLI can't see the goal.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_WORKFLOW_RUN_ID: 'run-123',
+      BOTMUX_GOAL_PATH: '/runs/run-123/goal.md',
+      BOTMUX_GOAL_ATTEMPT_DIR: '/runs/run-123/architect/attempts/001',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_WORKFLOW=1');
+    expect(out).toContain('BOTMUX_WORKFLOW_RUN_ID=run-123');
+    expect(out).toContain('BOTMUX_GOAL_PATH=/runs/run-123/goal.md');
+    expect(out).toContain('BOTMUX_GOAL_ATTEMPT_DIR=/runs/run-123/architect/attempts/001');
+    // Non-allowlisted env (PATH) still never leaks in.
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
+  it('skips workflow keys whose value is undefined (a normal, non-workflow pane)', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      SESSION_DATA_DIR: '/d',
+      // No BOTMUX_WORKFLOW / BOTMUX_GOAL_* set at all.
+    });
+    expect(out).toEqual(['BOTMUX=1', 'SESSION_DATA_DIR=/d']);
+    expect(out.some(s => /^(BOTMUX_WORKFLOW|BOTMUX_GOAL_|BOTMUX_V3_GOAL)/.test(s))).toBe(false);
   });
 
   it('preserves values with spaces, quotes, equals, newlines (argv array, no shell parsing)', () => {

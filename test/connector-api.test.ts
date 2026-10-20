@@ -418,6 +418,57 @@ describe('connector-api write routes', () => {
     expect(created.connector.lifecycleExtractors).toBeNull();
   });
 
+  it('round-trips new-group lifecycle group names and drops them outside new-group mode', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Per-event rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'fixed', text: '  固定处理群  ' },
+      }),
+    }));
+    expect(created.connector.lifecycleGroupName).toEqual({ mode: 'fixed', text: '固定处理群' });
+
+    const templated = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.name}} {{dedupKey}}' },
+      }),
+    }));
+    expect(templated.connector.lifecycleGroupName).toEqual({
+      mode: 'template',
+      text: '告警 {{alert.name}} {{dedupKey}}',
+    });
+
+    const fixedTarget = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(fixedTarget.connector.lifecycleGroupName).toBeUndefined();
+  });
+
+  it('rejects invalid lifecycle group name templates', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Bad rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.*}}' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({
+      ok: false,
+      error: 'lifecycle_group_name_template_invalid',
+    });
+  });
+
   it('stores a dedup-only lifecycleExtractors (status dropped) for new-group', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

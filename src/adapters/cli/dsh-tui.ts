@@ -1,16 +1,25 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
+function configuredDshHome(): string {
+  return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+}
+
+function dshAuthPaths(): string[] {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
+}
 
 function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
-  const framed = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+  const framed = wrapBracketedPaste(content);
   if (pty.sendText) return pty.sendText(framed) !== false;
   return pty.write(framed) !== false;
 }
@@ -38,6 +47,8 @@ function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
 export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'dsh-tui';
   let cachedBin: string | undefined;
+  let cachedBridge: DshQuestionBridgePatch | null | undefined;
+  const bridgePatch = () => (cachedBridge ??= ensureDshQuestionBridgePatch({ cliId: 'dsh-tui' }));
   // The launcher spawns `dsh` as a second-stage child. Inside the file sandbox
   // /run is masked, so an nvm/fnm-installed dsh would vanish — re-expose it
   // (same pattern as the dsh adapter's dsh binary).
@@ -50,6 +61,11 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       return [(cachedDshBin ??= resolveCommand('dsh'))];
     },
 
+    sandboxReadonlyPaths() {
+      const bridge = bridgePatch();
+      return bridge ? [bridge.readonlyRoot] : [];
+    },
+
     buildArgs({ resume, resumeSessionId }) {
       // Pre-create the authPaths in the real HOME before the worker enters the
       // sandbox: the sandbox's keepExisting filter drops authPaths that don't
@@ -57,9 +73,17 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       // resume.txt — without this, sandbox:true would silently break cross-
       // session resume (same pattern as the dsh adapter's mkdirSync).
       const home = homedir();
+      const activeDshHome = configuredDshHome();
       mkdirSync(join(home, '.dsh'), { recursive: true });
+      mkdirSync(activeDshHome, { recursive: true });
+      mkdirSync(join(activeDshHome, 'profiles'), { recursive: true });
       mkdirSync(join(home, '.dsh-tui'), { recursive: true });
       const args: string[] = [];
+      const bridge = bridgePatch();
+      // dsh-tui's launcher treats a split `--patch /abs/path` value as a
+      // workspace target. Keep the DSH overlay as one token so it reaches
+      // `dsh --profile dsh-tui` intact.
+      if (bridge) args.push(`--patch=${bridge.patchPath}`);
       if (resume) {
         // Bare --resume makes the launcher read ~/.dsh-tui/resume.txt; an
         // explicit session id is passed through verbatim.
@@ -108,19 +132,69 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /❯/,
     completionPattern: undefined,
     systemHints: [],
+    // Type-ahead: the TUI's PromptInput stays mounted and writable while a
+    // turn is working — a non-empty draft submitted with Enter is routed
+    // through channel.steer (injected at the active turn's next step boundary)
+    // rather than dropped. The worker input gate can therefore write queued
+    // Lark messages while the TUI is busy instead of waiting for an idle
+    // detection, which the incremental renderer would otherwise starve (the
+    // static screen never re-emits the ❯ row while a turn is in flight, so
+    // readyPattern alone never proves idle again after the first turn).
+    //
+    // Semantics note: botmux's writeInput always submits with Enter, so every
+    // queued message is STEERED into the active turn (a follow-up amendment) —
+    // it is not queued as a fresh topic after the turn, and there is no
+    // structured transcript bridge to attribute the merged reply. That matches
+    // the codex/pi type-ahead contract and is the intended behaviour for
+    // follow-ups; a brand-new question mid-turn lands on the same steer path.
+    supportsTypeAhead: true,
     // The TUI's Ink startup render can swallow stdin sent before the composer
-    // is mounted; hold the first prompt until ❯ appears (90s hard cap in worker).
+    // is mounted; hold the first prompt until ❯ appears. The TUI boots in
+    // three stages (launcher shell → profile node bin → `dsh --profile`), and
+    // a first run additionally runs `dsh plugin add` (a pnpm install) — that
+    // path can exceed any soft timeout, so we keep the 90s hard cap. With
+    // type-ahead enabled the hard-cap fallback is a safe flush for a booted
+    // TUI (decideHardTimeoutAction -> 'flush'), so deferring does not
+    // reintroduce the queued-message stall: it only delays the first write
+    // until idle is proven or the hard cap fires.
     deferFirstPromptTimeoutUntilReady: true,
+    // Structured readiness instead of PTY quiescence: the TUI repaints a
+    // blinking cursor ~2x/s even while idle, so IdleDetector Strategy 2's
+    // QUIESCENCE_MS is never satisfied and the first prompt would have to wait
+    // for the 90s hard cap. The generated wrapper plugin (this process) fires
+    // `BOTMUX_READY_COMMAND` once dsh-tui publishes its inject-channel record —
+    // i.e. right after `await render(tree)` flushed the first frame. The worker
+    // arms its ready-gate on this flag and holds the first prompt until the
+    // signal lands — cold start shows the composer at ~+5s, so the gate is
+    // released on evidence in ~10s total.
+    //
+    // The gate's OWN fallback is aligned with this adapter's hard cap (see
+    // resolveReadySignalTimeoutMs) — it must never release the first prompt at
+    // 45s, which — with supportsTypeAhead — would flush into a composer that may
+    // not be mounted yet and pre-empt the 90s protection above. That alignment
+    // is this explicit opt-in, not a derivation from the shared
+    // `deferFirstPromptTimeoutUntilReady` + readyPattern flags: the other
+    // adapters carrying both of those (Hermes, Grok) do not arm the gate at all.
+    injectsReadyHook: true,
+    readyGateFallbackAlignedWithHardCap: true,
+    // Turn ends come from the same plugin, not from PTY silence: `agent/status`
+    // flips to idle exactly once per finished turn (`dsh-agent-loop` only emits
+    // on a real transition), which the worker turns into fireIdle() after
+    // matching the report against its own current turn. The plugin freezes the
+    // (turnId, dispatchAttempt[, per-dispatch token]) triple inside that callback
+    // and carries it end-to-end, so a report about turn A can never claim the
+    // turn B the worker wrote after A finished. Without this channel the idle
+    // detector never fires again after the first turn, so a queued follow-up has
+    // no ready edge to wait for.
+    injectsTurnIdleHook: true,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
-    authPaths: ['~/.dsh', '~/.dsh-tui'],
+    get authPaths(): string[] { return dshAuthPaths(); },
     // Model is NOT injected: the TUI resolves its (provider, model) route from
     // its own profile config / persisted /model choice, and the bot's model
     // field carries no provider — hardcoding deepseek-official would break
     // multi-provider setups. Users pick the model in the TUI (/model).
-    modelChoices: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    modelChoices: CLI_MODEL_CHOICES['dsh-tui'],
   };
 }
-
-export const create = createDshTuiAdapter;

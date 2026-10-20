@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -18,6 +18,7 @@ beforeEach(() => {
   invalidateCustomizationCache();
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   setPromptOverrideResolver(undefined);
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
@@ -72,6 +73,12 @@ describe('customization dashboard API', () => {
     expect(intro.locales.zh.factory).toContain('botmux send');
     expect(intro.locales.zh.override).toBeNull();
     expect(r.body.skills.length).toBeGreaterThan(0);
+  });
+
+  it('does not return a bot roster: zero injection moved to Bot / Agent config', async () => {
+    const result = await call('GET', '/api/customization');
+    expect(result.status).toBe(200);
+    expect(result.body).not.toHaveProperty('bots');
   });
 
   it('PUT prompt override then snapshot reflects it', async () => {

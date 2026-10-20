@@ -14,12 +14,26 @@
  * same lockout while every existing onboarding regression test remains green.
  */
 import { type Brand, sdkDomain } from '../im/lark/lark-hosts.js';
+import {
+  LARK_CODE_CONTACT_INVALID_PARAM,
+  LARK_CODE_CONTACT_NO_SUCH_USER,
+  LARK_CODE_CROSS_APP_OPEN_ID,
+} from '../im/lark/lark-errors.js';
+import { larkGet } from '../im/lark/lark-get.js';
 import { isMobileEntry, normalizeMobileEntry } from './bot-config-editor.js';
 
 /** open_id belongs to another app. Retrying with the same app can never fix it. */
-const CROSS_APP_OPEN_ID_CODE = 99992361;
-const DEFINITIVE_USER_ID_CODES = new Set([CROSS_APP_OPEN_ID_CODE, 41012, 40001]);
+const CROSS_APP_OPEN_ID_CODE = LARK_CODE_CROSS_APP_OPEN_ID;
+const DEFINITIVE_USER_ID_CODES = new Set([
+  CROSS_APP_OPEN_ID_CODE,
+  LARK_CODE_CONTACT_NO_SUCH_USER,
+  LARK_CODE_CONTACT_INVALID_PARAM,
+]);
 
+// 刻意不复用 lark-errors.extractLarkBusinessCode：本函数是 owner 身份边界的
+// fail-closed 判定，语义与通用提取器不同——接受 `data.code` 与数字字符串、按候选
+// 顺序取第一个可解析者，且**没有** message 尾部 `(code: N)` 回落（不能让一段
+// 恰好含该字样的文本把身份判成「确定性无效」）。常量值只是共用同一份定义。
 function larkErrorCode(err: unknown): number | undefined {
   const value = err as {
     code?: unknown;
@@ -110,10 +124,15 @@ export async function detectUnusableOwnerEntries(
         // target-app-invalid open_id (41012 / 40001) or a code:0-without-user
         // response slip through and be written as the sole owner — the same
         // lockout this module exists to prevent.
-        const res = await client.contact.v3.user.get({
-          path: { user_id: entry },
-          params: { user_id_type: entry.startsWith('ou_') ? 'open_id' : 'union_id' },
-        });
+        // No-body GET (larkGet), NOT the generated contact.v3.user.get: the
+        // SDK attaches `{}` as the GET body and some gateways answer HTTP 411
+        // before OpenAPI sees the request. That throw is inconclusive below,
+        // so a foreign-app ou_ would silently pass this boundary.
+        const res = await larkGet(
+          client,
+          `/open-apis/contact/v3/users/${encodeURIComponent(entry)}`,
+          { user_id_type: entry.startsWith('ou_') ? 'open_id' : 'union_id' },
+        );
         // A clean response without a target-app open_id is a definitive miss
         // (cross-app open_id, or a union_id this app cannot resolve).
         // Permission/scope failures remain inconclusive so onboarding can

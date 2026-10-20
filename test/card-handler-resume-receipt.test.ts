@@ -68,6 +68,7 @@ function configureBot(overrides: Record<string, unknown> = {}): void {
     ...overrides,
   }], null, 2));
   process.env.BOTS_CONFIG = cfg;
+  process.env.SESSION_DATA_DIR = dir;
 }
 
 function makeDs(cliId: string, cliSessionId?: string): DaemonSession {
@@ -110,6 +111,8 @@ function resumeAction(): any {
 
 async function fresh() {
   vi.resetModules();
+  const sessionStore = await import('../src/services/session-store.js');
+  sessionStore.init(APP_ID);
   const registry = await import('../src/bot-registry.js');
   const handler = await import('../src/im/lark/card-handler.js');
   const sessionManager = await import('../src/core/session-manager.js');
@@ -328,10 +331,12 @@ describe('card-handler resume receipt', () => {
 
   it('does not repost a live card when streaming cards are disabled for the bot', async () => {
     configureBot({ disableStreamingCard: true });
-    const { handler, resumeSession: mockedResume } = await fresh();
-    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('copilot', 'cli-sess-9');
+    mockedResume.mockResolvedValue({ ok: true, ds });
     const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
-    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
     await receiptDone;
@@ -340,12 +345,46 @@ describe('card-handler resume receipt', () => {
     expect(textReceipt(sessionReply)).toContain('会话已恢复');
   });
 
+  it('reports a remote provider start failure without reposting a live card', async () => {
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('remote-runner');
+    mockedResume.mockResolvedValue({ ok: false, error: 'resume_start_failed' });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('恢复进程未能启动');
+    expect(textReceipt(sessionReply)).toContain('仍保持关闭');
+  });
+
+  it('reports remote recovery as started until the provider becomes ready', async () => {
+    configureBot({ disableStreamingCard: true });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('remote-runner');
+    mockedResume.mockResolvedValue({ ok: true, ds, recoveryPending: true });
+    const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+    await receiptDone;
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('远程恢复已启动');
+    expect(textReceipt(sessionReply)).not.toContain('✅ 会话已恢复');
+  });
+
   it('does not repost a live card when streaming cards are disabled for the chat', async () => {
     configureBot({ noCardChats: [CHAT_ID] });
-    const { handler, resumeSession: mockedResume } = await fresh();
-    mockedResume.mockResolvedValue({ ok: true, ds: makeDs('copilot', 'cli-sess-9') });
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('copilot', 'cli-sess-9');
+    mockedResume.mockResolvedValue({ ok: true, ds });
     const { sessionReply, receipt: receiptDone } = replyWithReceiptBarrier();
-    const deps = { activeSessions: new Map(), sessionReply, lastRepoScan: new Map() } as any;
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
 
     await handler.handleCardAction(resumeAction(), deps, APP_ID);
     await receiptDone;

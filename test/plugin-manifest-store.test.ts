@@ -9,7 +9,7 @@ import { pluginHome, pluginMaterializedPath, pluginMcpPrivatePath, pluginRegistr
 import { readPluginRegistry, upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from '../src/core/plugins/effective.js';
 import { assertPluginBindingTransition, enabledPluginDependents } from '../src/core/plugins/dependencies.js';
-import { pluginPm2AppName } from '../src/core/plugins/pm2.js';
+import { pluginServiceName } from '../src/core/plugins/supervisor-store.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { collectPluginCliCommands } from '../src/core/plugins/runtime.js';
 import { dematerializePlugin, materializePlugin } from '../src/core/plugins/materializer.js';
@@ -111,8 +111,8 @@ describe('plugin manifest and registry basics', () => {
   });
 
   it('derives the PM2 service name only from the unique plugin id', () => {
-    expect(pluginPm2AppName('agent-chrome')).toBe('botmux-plugin-agent-chrome');
-    expect(pluginPm2AppName('demo-addon')).toBe('botmux-plugin-demo-addon');
+    expect(pluginServiceName('agent-chrome')).toBe('botmux-plugin-agent-chrome');
+    expect(pluginServiceName('demo-addon')).toBe('botmux-plugin-demo-addon');
   });
 
   it('ignores unconsumed manifest fields for forward compatibility', () => {

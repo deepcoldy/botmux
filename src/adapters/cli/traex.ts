@@ -1,10 +1,9 @@
-import { existsSync, statSync } from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { parseDebugModelsJson } from './model-catalog-json.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
   findTraexSessionIdByBotmuxSessionId,
@@ -12,9 +11,17 @@ import {
   traexHistorySize,
   findTraexRolloutSetByPid,
   traexHistorySidIsOwned,
+  drainTraexRollout,
+  findTraexRolloutByPid,
+  findTraexRolloutBySessionId,
+  traexSessionIdFromRolloutPath,
+  readTraexThreadDetails,
+  readTraexThreadIndex,
+  traexRolloutUserInputs,
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
+import { traexViewportFooterBusy } from './traex-footer.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -102,15 +109,24 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *    "Thinking…", "Reasoning through it…", "Mulling it over…",
  *    "Pondering…", "Working it out…", "Piecing it together…".
  *  - Spinner label set 2 (approval/working/queue): "Reviewing approval
- *    request", "Working…", "Working on it…", "Queued for capacity".
+ *    request", "Working…", "Working on it…", "Queued for capacity",
+ *    "Queued for next turn".
  *  - Standalone queue notice: "Too many requests right now. You're in the
  *    queue."
  *
- * TraeX forked from Codex and DELETED the "esc to interrupt" footer hint —
- * `grep -a -c "esc to interrupt"` returns 0 across every local release and
- * the 94MB TUI logs — so the Codex pattern's second anchor is invalid here.
+ * Older local releases had deleted Codex's "esc to interrupt" footer, but
+ * TraeX 0.207.x renders it again while a turn is active. Keep it line-anchored
+ * with the standalone queue states so quoted prose does not become busy proof.
+ * A live TraeX 0.201.6 turn also renders an `esc to interrupt` activity
+ * footer while retaining the visible composer and context bar. Raw PTY and
+ * 100ms screen captures verified seven rotating glyphs and ordinary activity
+ * labels as well as PreToolUse/PostToolUse/UserPromptSubmit hook-runner rows.
+ * TraeX 0.209.1 (tmux capture) renders the capacity queue in the same shape:
+ * "◆ Queued for capacity (1s • esc to interrupt)" followed by an indented
+ * "└ Too many requests right now. …" child row — neither is caught by the
+ * line-start-anchored queue arms, so the activity-row arm must cover it.
  *
- * Three branches:
+ * Four branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
  *     never appears in transcript prose, so assistant output like
  *     "Working… on the fix" cannot revive a completed card. Covers the
@@ -123,7 +139,13 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *     so the frame anchor must not be required for it. The line anchor keeps
  *     assistant prose quoting the string mid-sentence ("…says Queued for
  *     capacity whenever…") from registering as busy.
- *  3. (staticBusyPattern below) the same queue evidence as a pre-idle latch
+ *  3. Line-anchored activity rows. These require one of the seven observed
+ *     rotating glyphs, a no-parentheses activity label, and an elapsed-time /
+ *     `esc to interrupt` footer in one pair of parentheses. A closing quote
+ *     immediately after the footer is rejected so `◆ Ran echo "(...)"`
+ *     history cannot revive an already-idle session. Hook-runner rows use the
+ *     same footer shape, so they need no event-name-specific arm.
+ *  4. (staticBusyPattern below) the same queue evidence as a pre-idle latch
  *     inside IdleDetector — see TRAEX_STATIC_BUSY_PATTERN.
  *
  * Both states must be covered: the worker's busy-pattern idle probe marks
@@ -133,7 +155,7 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  */
 const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 
-const TRAEX_SPINNER_LABELS = [
+export const TRAEX_SPINNER_LABELS = [
   // Set 1 — thinking/working rotation (compiled-in spinner string table).
   'Thinking longer…',
   'Deep in thought…',
@@ -160,19 +182,36 @@ const TRAEX_SPINNER_LABELS = [
   'Working…',
   'Working on it…',
   'Queued for capacity',
+  'Queued for next turn',
 ] as const;
 
-/** Line-anchored standalone capacity-queue strings. Shared by the active
+/** Line-anchored standalone busy/queue strings. Shared by the active
  *  busy pattern and the pre-idle static latch (see below). */
 const TRAEX_QUEUE_STATIC_ARMS = [
   'Queued for capacity',
+  'Queued for next turn',
+  'esc to interrupt',
   "Too many requests right now\\. You're in the queue",
 ];
+
+/** Rotating activity glyphs observed on live TraeX activity rows. */
+const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
+
+/** TraeX activity footer captured from live 0.201.6 / 0.209.1 TUIs. Keep it
+ *  line- and glyph-anchored: no-alt-screen history can contain the same words.
+ *  The lookahead right after `(` confirms the `esc to interrupt` phrase lives
+ *  inside this same parenthesis before consuming anything: a long near-miss
+ *  line (glyph + parenthesis full of elapsed-time tokens but no footer phrase)
+ *  otherwise backs off quadratically — observed ~18s on a 144K PTY chunk vs
+ *  <1ms with the guard. IdleDetector feeds unbounded chunks here, so the
+ *  pattern must fail fast rather than merely stay rare. */
+const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[${TRAEX_ACTIVITY_GLYPHS}][ \t]*[^()\r\n]{0,240}\((?=[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b)[^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
 
 const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   [
     `[${TRAEX_SPINNER_FRAMES}][ \\t]?(?:${TRAEX_SPINNER_LABELS.join('|')})`,
     ...TRAEX_QUEUE_STATIC_ARMS.map((arm) => `(?:^|[\\n\\r])[ \\t]*${arm}`),
+    TRAEX_ACTIVITY_PATTERN,
   ].join('|'),
   'i',
 );
@@ -208,11 +247,30 @@ const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
  *  model-catalog-json.js 共享；旧名 re-export 保持既有引用（含测试）可用。 */
 export { parseDebugModelsJson as parseTraexModelsJson };
 
+/** TRAE rollouts are byte-identical to Codex's; only discovery differs. Unlike codex,
+ *  adopt follows the shared skeleton, and a pid-probed rollout also reveals the
+ *  native session id (persisted by the worker). */
+export const traexBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainTraexRollout(path, offset, { adoptMode: ctx.adoptMode }),
+  locate: {
+    bySessionId: sessionId => findTraexRolloutBySessionId(sessionId),
+    byPid: pid => findTraexRolloutByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware' },
+  adopt: {
+    attach: 'split-live',
+    // Segment-aware parser (resumed rollouts are `…-<sid>_<turn>.jsonl`). An
+    // arrow, not a bare reference, so the import is read at call time.
+    pidProbedSessionId: path => traexSessionIdFromRolloutPath(path),
+  },
+};
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
   return {
     id: 'traex',
+    bridgeSpec: traexBridgeSpec,
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
     // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
     // default file sandbox a path not in authPaths doesn't exist, so the DBs are
@@ -227,7 +285,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      // TraeX shares Codex's low-quota picker and notice setting. Disable it
+      // per process so a message-submit Enter cannot confirm a model switch.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -236,7 +299,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
         // so an interactive update dialog would freeze the resume. TraeX shares
         // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
       const baseArgs = [
         ...(!disableCliBypass ? [
@@ -252,17 +315,31 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
+        ...modelNudgeArgs,
         ...goalEnvConfigArgs(),
       ];
+      // Keep trigger-user identity wrappers available in tool shells. Set only
+      // the requested keys, without inheriting the entire worker environment.
+      for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (value === undefined) continue;
+        baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+      }
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       if (modelBackendVariant) baseArgs.push('-c', `model_backend_variant=${JSON.stringify(modelBackendVariant)}`);
+      if (nativeSubagentRuntimeHookCommand) {
+        baseArgs.push('-c', traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand));
+      }
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
-      return ['resume', ...baseArgs, traeSessionId];
+      // Session fork: TraeX exposes the same native subcommand shape as Codex
+      // (`traecli fork <id>`). It mints a new thread while leaving the source
+      // untouched. The worker sets forkSession only for a fork child's first
+      // spawn; later restarts use ordinary resume against the child's new id.
+      return [forkSession ? 'fork' : 'resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -274,7 +351,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     /** Import path: TRAE writes Codex-family rollout files under
      *  `<TRAE_HOME>/cli/sessions`. */
     listResumableSessions({ limit, exclude }) {
-      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
+      // Ordering needs only the cheap per-thread index; prompt-bearing detail
+      // columns are read lazily for the candidates discovery actually parses.
+      const metadataById = new Map([...readTraexThreadIndex()].map(([id, entry]) => [id, {
+        cwd: entry.cwd,
+        lastActivityAt: entry.updatedAtMs,
+        rolloutPath: entry.rolloutPath,
+      }]));
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude, {
+        dialect: 'traex',
+        metadataById,
+        loadSessionDetails: ids => readTraexThreadDetails(ids),
+        userInputTexts: traexRolloutUserInputs,
+        sessionIdFromPath: traexSessionIdFromRolloutPath,
+      });
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -334,7 +424,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       try {
         if (pty.pasteText) pty.pasteText(content);
-        else pty.write('\x1b[200~' + content + '\x1b[201~');
+        else pty.write(wrapBracketedPaste(content));
       } catch {
         return { submitted: false };
       }
@@ -390,6 +480,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // required.
     busyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
     idleToBusyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
+    // TraeX 0.209's glyph status row is recognisable only by its position
+    // above the composer, which needs the WHOLE viewport (busyPattern sees a
+    // tail region). The worker consults this before busyPattern in both the
+    // prompt-ready veto and the idle probe, and supplies the getter only for
+    // an authoritative screen. See traex-footer.ts.
+    isSessionBusy({ getCurrentScreen }) {
+      try {
+        const screen = getCurrentScreen?.();
+        return !!screen && traexViewportFooterBusy(screen);
+      } catch {
+        return false;
+      }
+    },
     // Pre-idle latch for the static capacity-queue screen — holds the session
     // busy before the first idle on backends (ZMX) where the busyPattern
     // viewport probe is forbidden from mutating state. See the
@@ -407,54 +510,55 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
     readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Skeleton composer gate, same cells and regexes as Codex (fork). Real
+    // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
+    // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the
+    // `100% context left` bar (both match readyPattern above) while the banner
+    // cell is still `model:     loading` (directory already resolved); the
+    // 1.5s frame has both `model:` and `directory:` cells resolved. The ready
+    // banner on 0.201.1-alpha.6 has the identical two-cell shape. The `›` and
+    // 2s of silence therefore do not prove submit readiness on cold start.
+    // deferFirstPromptTimeoutUntilReady is already set below, so the worker's
+    // first-prompt timeouts wait for this gate without worker-side changes.
+    startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
+    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     systemHints: BOTMUX_SHELL_HINTS,
-    // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
-    // a turn is running is parked and merged into the active turn.
+    // Healthy TraeX turns accept parked input while working. The worker fences
+    // delivery independently after a terminal/composer conflict or an unknown
+    // history receipt, so ordinary corrections need not wait for completion.
     supportsTypeAhead: true,
     // task_complete in the per-session rollout is an explicit durable turn
     // boundary; worker.ts drains it independently of screen-idle detection.
     reliableTurnTerminal: true,
+    // task_complete closes the business turn, not the TUI generation. Require
+    // a real ›/❯ composer on authoritative PTY screens before releasing input.
+    postTerminalPromptFence: true,
+    // A missing history receipt is ambiguous: block successors in this backend
+    // generation and never replay the unconfirmed message automatically.
+    quarantineUnconfirmedSubmits: true,
     // TRAE's trust/advisory startup screens can accept stdin before the real
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
     deferFirstPromptTimeoutUntilReady: true,
-    buildSessionRenameCommand: (title) => `/rename ${title}`,
+    // TraeX treats a literal "@" in the composer as a file-mention trigger.
+    // If an automatic title contains a Lark mention (for example "@Bot"), the
+    // Enter meant to submit /rename selects a file instead and the next user
+    // message is appended to the still-open rename command. Preserve the title
+    // text with a full-width at sign so the command remains a single submit.
+    buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`
     // lists the rest; the setup flow always appends an "Other / custom"
     // free-text option so users aren't locked out.
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'gpt-5.5',
-      'gpt-5',
-      'o3',
-      'Doubao_1_8',
-      'DeepSeek-V4-Pro',
-      'kimi-k2.6',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['traex'],
     // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
     // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
     // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动
     // 路径上；任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，
     // picker 回退到上面的 modelChoices。
     async detectModels(): Promise<readonly string[] | null> {
-      try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
-        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-        });
-        const models = parseDebugModelsJson(stdout);
-        return models.length > 0 ? models : null;
-      } catch {
-        return null;
-      }
+      return detectModelsViaExec(this.resolvedBin, ['debug', 'models'], parseDebugModelsJson);
     },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a
@@ -464,4 +568,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   };
 }
 
-export const create = createTraexAdapter;
+/** Render one process-layer hook entry. Trae merges this launch layer with
+ * global/project hooks; this does not read or mutate either config source. */
+export function traexNativeSubagentHookConfig(command: string): string {
+  return `hooks.PreToolUse=[{matcher="spawn_agent",hooks=[{type="command",command=${JSON.stringify(command)}}]}]`;
+}

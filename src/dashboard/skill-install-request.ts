@@ -23,6 +23,7 @@ const AUTO_LINK_SKILL_ROOT_MARKERS = new Set([
   '.cursor',
   '.gemini',
   '.opencode',
+  'mimocode',
 ]);
 
 export type DashboardSkillInstallRequest =

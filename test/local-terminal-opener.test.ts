@@ -1,6 +1,16 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { localCliCommandForSession, localTerminalCapable, terminalLaunchArgs } from '../src/core/local-terminal-opener.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+const originalPath = process.env.PATH;
+
+afterEach(() => {
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
+});
 
 function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -66,6 +76,33 @@ describe('localCliCommandForSession', () => {
     if (result.ok) {
       expect(result.executable).toBe('sh');
       expect(result.command).toContain('exec sh resume codex-native-session');
+    }
+  });
+
+  it('decorates TraeX resume commands with Forge launch mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-local-terminal-'));
+    try {
+      writeFileSync(join(dir, 'forge'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(dir, 'forge'), 0o755);
+      process.env.PATH = originalPath ? `${dir}:${originalPath}` : dir;
+
+      const result = localCliCommandForSession(session({
+        session: {
+          ...session().session,
+          cliId: 'traex',
+          cliPathOverride: undefined,
+          cliLaunchMode: 'forge-traex',
+          cliSessionId: 'trae-session',
+        },
+      }));
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.executable).toBe('forge');
+        expect(result.command).toContain("exec forge run --agent traex --agent-args 'resume trae-session'");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

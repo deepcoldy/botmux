@@ -80,19 +80,34 @@ describe('botmuxWrapperFiles — standalone (compiled binary) form', () => {
 
   it('windows .cmd form also targets the binary, never node', () => {
     const files = botmuxWrapperFiles(BUNFS_CLI, BINARY, 'win32', true);
-    expect(files.map(f => f.name)).toEqual(['botmux', 'botmux.cmd']);
+    expect(files.map(f => f.name)).toEqual([
+      'botmux',
+      'botmux-native-subagent-runtime-hook',
+      'botmux.cmd',
+      'botmux-native-subagent-runtime-hook.cmd',
+    ]);
     const cmd = files.find(f => f.name === 'botmux.cmd')!;
+    const nativeHookCmd = files.find(f => f.name === 'botmux-native-subagent-runtime-hook.cmd')!;
     expect(cmd.content).toBe(`@echo off\r\n"${BINARY}" %*\r\n`);
+    expect(nativeHookCmd.content).toBe(`@echo off\r\n"${BINARY}" native-subagent-runtime-hook %*\r\n`);
     expect(cmd.content).not.toContain('$bunfs');
   });
 
-  it('the Node (non-standalone) form is unchanged — default stays backward-compatible', () => {
+  it('the Node (non-standalone) form pins the interpreter — default stays consistent', () => {
     // Same expectation as the pre-existing test, asserted here too so a future
     // edit cannot "fix" standalone by breaking the Node path.
     const viaDefault = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/usr/bin/node', 'linux');
     const viaExplicitFalse = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/usr/bin/node', 'linux', false);
-    expect(viaDefault[0].content).toBe('#!/bin/sh\nexec node "/opt/botmux/dist/cli.js" "$@"\n');
+    expect(viaDefault[0].content).toBe('#!/bin/sh\nexec "/usr/bin/node" "/opt/botmux/dist/cli.js" "$@"\n');
     expect(viaExplicitFalse).toEqual(viaDefault);
+  });
+
+  it('pins whatever interpreter it is handed — Bun hosts the same wrapper shape', () => {
+    // Under `bun dist/cli.js` process.execPath IS the bun binary; Bun runs
+    // dist/*.js and supplies bun:sqlite, so no runtime-specific branch is needed.
+    const [sh] = botmuxWrapperFiles('/opt/botmux/dist/cli.js', '/home/u/.bun/bin/bun', 'linux');
+    expect(sh.content).toBe('#!/bin/sh\nexec "/home/u/.bun/bin/bun" "/opt/botmux/dist/cli.js" "$@"\n');
+    expect(sh.content).not.toMatch(/exec node /);
   });
 });
 
@@ -100,8 +115,8 @@ describe('daemon wrapper write — refuses to clobber the running executable', (
   /**
    * Mirrors the guard in src/daemon.ts writePidFile(). Kept as a local
    * reimplementation because writePidFile is not exported and pulling in daemon.ts
-   * boots a whole daemon; the SOURCE PIN below ties this logic to the real one so
-   * the two cannot silently drift.
+   * boots a whole daemon; the source-structure guard at the end of this block ties
+   * this logic to the real one so the two cannot silently drift.
    */
   function wouldSkip(wrapperPath: string, execPath: string): boolean {
     const { realpathSync } = require('node:fs') as typeof import('node:fs');
@@ -152,18 +167,24 @@ describe('daemon wrapper write — refuses to clobber the running executable', (
     expect(wouldSkip(join(dir, 'botmux'), process.execPath)).toBe(false);
   });
 
-  it('SOURCE PIN: daemon.ts really has the guard and passes standalone through', () => {
-    // These pin the wiring, because every behavioral test above runs against a
-    // local reimplementation. If daemon.ts loses the guard, the bug returns while
-    // the tests above still pass — so assert on the real source.
+  // 源码结构护栏(K1/K3)：编译态单文件二进制的自毁防线。writePidFile 在 daemon.ts 闭包里、未导出，
+  // 起 daemon 才能走到（smoke 用空 bots.json 结构上到不了），上面的用例跑的都是本地复刻，
+  // 所以只能读真实源码确认：标志真的传进了 wrapper 生成器，且「wrapper 路径就是正在运行的二进制」时
+  // 先 continue 跳过、再轮到写盘。丢了它，install.sh 装的 ~94MB 二进制每次启动都会被覆盖成 47 字节的壳
+  // （8386f34dde，CLAUDE.md「编译态注意」）。
+  it('daemon writePidFile passes the standalone flag and skips the running executable before any write', () => {
     const src = readFileSync(resolve('src/daemon.ts'), 'utf-8');
-    const region = src.slice(src.indexOf('function writePidFile('), src.indexOf('PID file written'));
+    const start = src.indexOf('function writePidFile(');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = src.slice(start, src.indexOf('\nfunction ', start + 1));
     expect(region).toContain('isStandaloneBinary()');
-    // The wrapper generator must receive the standalone flag (4th arg).
-    expect(region).toMatch(/botmuxWrapperFiles\(\s*cliScript,\s*process\.execPath,\s*process\.platform,\s*standalone\s*\)/);
-    // The clobber guard itself.
-    expect(region).toContain('realpathSync(wrapper) === realpathSync(process.execPath)');
-    // It must `continue` (skip this file), not fall through to the write.
-    expect(region).toMatch(/isRunningBinary\s*\)\s*\{[\s\S]{0,400}?continue;/);
+    // The wrapper generator receives a 4th (standalone) argument.
+    expect(region).toMatch(/botmuxWrapperFiles\(\s*[^,()]+,\s*process\.execPath,\s*[^,()]+,\s*[^,()\s]+\s*\)/);
+    const guard = region.search(/realpathSync\([^)]*\)\s*===\s*realpathSync\(process\.execPath\)/);
+    const skip = region.indexOf('continue;', guard);
+    const write = region.indexOf('atomicWriteFileSync(wrapper', guard);
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(skip).toBeGreaterThan(guard);
+    expect(write).toBeGreaterThan(skip);
   });
 });

@@ -73,8 +73,11 @@ function seedTerminalAdHocRun(
     owner?: SavedWorkflowOwner;
     chatId?: string;
     title?: string;
-    status?: 'succeeded' | 'failed' | 'blocked';
+    status?: 'succeeded' | 'failed' | 'blocked' | 'running';
     includeBinding?: boolean;
+    /** When status is 'running', park node 'work' on a human gate so the run
+     *  reports a node-level `gateWaiting`. */
+    gateWaiting?: boolean;
   },
 ): string {
   const actor = opts.owner ?? OWNER;
@@ -128,7 +131,13 @@ function seedTerminalAdHocRun(
   const status = opts.status ?? 'succeeded';
   if (status === 'succeeded') appendEvent(journal, { type: 'runSucceeded' });
   else if (status === 'failed') appendEvent(journal, { type: 'runFailed', failedNodeId: 'work' });
-  else appendEvent(journal, { type: 'runBlocked', blockedNodeId: 'work' });
+  else if (status === 'blocked') appendEvent(journal, { type: 'runBlocked', blockedNodeId: 'work' });
+  else if (status === 'running' && opts.gateWaiting) {
+    // Non-terminal: parked on a human gate → node 'work' is gateWaiting, run
+    // stays 'running'.
+    appendEvent(journal, { type: 'gateDispatched', nodeId: 'work', waitId: 'wait-1' });
+  }
+  // status === 'running' without a gate: just runStarted, no terminal event.
   return runDir;
 }
 
@@ -711,5 +720,113 @@ describe('Saved Workflow application service', () => {
       source: 'last',
       context: context(),
     })).resolves.toBe(valid);
+  });
+
+  // ── Bug B: `save last` diagnostic must not misreport an owned-but-unfinished
+  //    run as "not found", and must never leak another actor's runId ──────────
+
+  it('explicit runId: owned but non-terminal run reports source_not_terminal with runId + status, not not_found', async () => {
+    const runId = 'still-running';
+    seedTerminalAdHocRun(sourceDir, { runId, status: 'running' });
+
+    await expect(resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: runId,
+      context: context(),
+    })).rejects.toMatchObject({
+      code: 'source_not_terminal',
+      detail: { runId, runStatus: 'running' },
+    });
+
+    const err = await resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: runId,
+      context: context(),
+    }).catch((e) => e as SavedWorkflowServiceError);
+    expect(err.message).toContain(runId);
+    expect(err.message).toContain('还没结束');
+    expect(err.message).toContain('status=running');
+  });
+
+  it('last: only an owned non-terminal run present → reports source_not_terminal, not not_found', async () => {
+    const runId = 'lonely-running';
+    seedTerminalAdHocRun(sourceDir, { runId, status: 'running' });
+
+    await expect(resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: 'last',
+      context: context(),
+    })).rejects.toMatchObject({
+      code: 'source_not_terminal',
+      detail: { runId, runStatus: 'running' },
+    });
+  });
+
+  it('last / explicit runId agree on wording for the same non-terminal run', async () => {
+    const runId = 'agree-running';
+    seedTerminalAdHocRun(sourceDir, { runId, status: 'running' });
+
+    const lastErr = await resolveOwnedTerminalRunDir({
+      baseDir: sourceDir, source: 'last', context: context(),
+    }).catch((e) => e as SavedWorkflowServiceError);
+    const explicitErr = await resolveOwnedTerminalRunDir({
+      baseDir: sourceDir, source: runId, context: context(),
+    }).catch((e) => e as SavedWorkflowServiceError);
+
+    expect(lastErr.code).toBe('source_not_terminal');
+    expect(explicitErr.code).toBe('source_not_terminal');
+    expect(lastErr.message).toBe(explicitErr.message);
+  });
+
+  it('non-terminal run parked on a human gate names the waiting node', async () => {
+    const runId = 'gate-parked';
+    seedTerminalAdHocRun(sourceDir, { runId, status: 'running', gateWaiting: true });
+
+    const err = await resolveOwnedTerminalRunDir({
+      baseDir: sourceDir, source: runId, context: context(),
+    }).catch((e) => e as SavedWorkflowServiceError);
+    expect(err.code).toBe('source_not_terminal');
+    expect(err.detail).toMatchObject({ runId, runStatus: 'running', waitingNode: 'work' });
+    expect(err.message).toContain('正在等待');
+    expect(err.message).toContain('work');
+  });
+
+  it('last: truly empty scope still reports not_found', async () => {
+    await expect(resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: 'last',
+      context: context(),
+    })).rejects.toMatchObject({ code: 'not_found' });
+  });
+
+  // 🔴 ownership red line: a non-terminal run belonging to ANOTHER actor must
+  //    never surface — `save last` reports not_found and the message must not
+  //    contain that foreign runId.
+  it('last: a foreign non-terminal run is silently dropped; reports not_found without leaking its runId', async () => {
+    const foreignRunId = 'someone-elses-running';
+    seedTerminalAdHocRun(sourceDir, {
+      runId: foreignRunId,
+      owner: OTHER,
+      status: 'running',
+    });
+
+    const err = await resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: 'last',
+      context: context(),
+    }).catch((e) => e as SavedWorkflowServiceError);
+    expect(err.code).toBe('not_found');
+    expect(err.message).not.toContain(foreignRunId);
+  });
+
+  it('last: prefers an owned terminal run over an owned non-terminal one', async () => {
+    const terminal = seedTerminalAdHocRun(sourceDir, { runId: 'a-terminal', status: 'succeeded' });
+    seedTerminalAdHocRun(sourceDir, { runId: 'z-running', status: 'running' });
+
+    await expect(resolveOwnedTerminalRunDir({
+      baseDir: sourceDir,
+      source: 'last',
+      context: context(),
+    })).resolves.toBe(terminal);
   });
 });

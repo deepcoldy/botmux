@@ -12,6 +12,19 @@ import {
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
 
+function rmTree(root: string): void {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== 'ENOTEMPTY' && code !== 'EBUSY') || attempt === 7) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
+
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
@@ -100,7 +113,7 @@ describe('Riff worker session environment', () => {
       });
     } finally {
       stop();
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   });
 
@@ -281,7 +294,7 @@ describe('Riff worker session environment', () => {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   }, 25_000);
 });

@@ -1,10 +1,17 @@
 import { extname } from 'node:path';
 import { formatLarkError } from '../bot-registry.js';
 import {
+  contentAuditSendRemediation,
+  isLarkContentAuditError,
+  larkErrorCode,
+} from '../im/lark/content-audit.js';
+import {
   findDisallowedCardCallback,
   type InteractiveCardCallbackPolicy,
 } from '../core/card-callback-policy.js';
 import type { ManagedHookOrigin } from '../services/hook-runner.js';
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -13,7 +20,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -24,7 +31,7 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
@@ -32,10 +39,16 @@ export type DispatchPrimaryDeps = {
   replyMessage: ReplyMessageFn;
 };
 
-/** Keep provider details visible without leaking Axios config or headers. */
+/** Keep provider details visible without leaking Axios config or headers.
+ *  Content-audit rejections are permanent and content-specific: append an
+ *  actionable remediation line so the model in the worker PTY corrects the
+ *  payload instead of resending verbatim (which fails identically). */
 export function describeSendFailure(err: unknown): string {
-  return formatLarkError(err)
+  const detail = formatLarkError(err)
     ?? (err instanceof Error && err.message ? err.message : String(err));
+  return isLarkContentAuditError(err)
+    ? `${detail}\n${contentAuditSendRemediation(larkErrorCode(err))}`
+    : detail;
 }
 
 /**
@@ -369,9 +382,12 @@ export type DispatchPrimaryOptions = {
   /** Revalidate immediately before the distinct post-provider hook effect. */
   beforeHook?: () => void | Promise<void>;
   hookOrigin?: ManagedHookOrigin;
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
+  /** Passed into the transport gate, including its queued retries. */
+  beforeWrite?: () => void | Promise<void>;
   /** Revalidate managed authority immediately before each provider call. */
   beforeEffect?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
@@ -396,6 +412,16 @@ export async function dispatchPrimaryMessage(
     };
   }
 
+  const hookOptions: OutboundMessageOptions | undefined = opts.suppressHook || opts.beforeHook || opts.groupContextAuthorOrigin || opts.beforeWrite
+    ? {
+        ...(opts.suppressHook ? { suppressHook: true } : opts.beforeHook ? {
+          beforeHook: opts.beforeHook,
+          ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+        } : {}),
+        ...(opts.groupContextAuthorOrigin ? { groupContextAuthorOrigin: opts.groupContextAuthorOrigin } : {}),
+        ...(opts.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+      }
+    : undefined;
   try {
     await opts.beforeEffect?.();
     const args = [
@@ -407,14 +433,6 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const hookOptions = opts.suppressHook
-      ? { suppressHook: true as const }
-      : opts.beforeHook
-        ? {
-            beforeHook: opts.beforeHook,
-            ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-          }
-        : undefined;
     const messageId = hookOptions
       ? await deps.replyMessage(...args, hookOptions)
       : await deps.replyMessage(...args);
@@ -429,7 +447,7 @@ export async function dispatchPrimaryMessage(
       else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
-        messageId: await (opts.suppressHook
+        messageId: await (hookOptions
           ? deps.sendMessage(
               opts.appId,
               opts.targetChatId,
@@ -437,29 +455,16 @@ export async function dispatchPrimaryMessage(
               opts.msgType,
               opts.uuid,
               opts.hookContext,
-              { suppressHook: true },
+              hookOptions,
             )
-          : opts.beforeHook
-            ? deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-                {
-                  beforeHook: opts.beforeHook,
-                  ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-                },
-              )
-            : deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-              )),
+          : deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+            )),
         primaryQuotedId: null,
       };
     }

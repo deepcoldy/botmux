@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/mojo-identity-freeze.test.ts
  */
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -52,7 +52,7 @@ async function boot(mojo?: MojoConfig) {
   const registry = await import('../src/bot-registry.js');
   registry.loadBotConfigs().forEach((c: never) => registry.registerBot(c));
   const store = await import('../src/services/session-store.js');
-  store.init();
+  store.init(APP_ID);
   // Leaf module on purpose: no worker/spawn graph, so this stays a cheap unit test.
   const identity = await import('../src/core/mojo-session-identity.js');
   // worker-pool is a heavy module (spawn wiring, dashboard, IM). Loaded lazily so
@@ -95,10 +95,15 @@ function seedAsCreated(store: Booted['store'], patch: Partial<Session> = {}): Se
 
 /** Raw on-disk contents, for asserting what actually reached the file. */
 function rawStoreFiles(): string {
-  return readdirSync(dir)
-    .filter(f => f.startsWith('sessions'))
-    .map(f => readFileSync(join(dir, f), 'utf-8'))
-    .join('\n');
+  const top = readdirSync(dir).filter(f => f.startsWith('sessions'));
+  const storeDir = join(dir, 'session-stores', APP_ID);
+  const nested = existsSync(storeDir)
+    ? readdirSync(storeDir).filter(f => f.startsWith('sessions'))
+    : [];
+  return [
+    ...top.map(f => readFileSync(join(dir, f), 'utf-8')),
+    ...nested.map(f => readFileSync(join(storeDir, f), 'utf-8')),
+  ].join('\n');
 }
 
 beforeEach(() => {

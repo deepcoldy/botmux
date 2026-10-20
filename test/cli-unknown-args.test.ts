@@ -216,3 +216,38 @@ describe('botmux history：未知参数一律中止', () => {
     expect(r.stderr).not.toContain('未知参数');
   });
 });
+
+describe('botmux autostart：帮助与额外参数不得产生副作用', () => {
+  it.each([
+    ['enable', '--help'],
+    ['enable', '-h'],
+    ['disable', '--help'],
+    ['status', '--help'],
+    ['install', '--help'],
+    ['uninstall', '--help'],
+  ])('botmux autostart %s %s → rc=0，只打印帮助', (subcommand, flag) => {
+    const r = runCli(['autostart', subcommand, flag]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('用法: botmux autostart <enable|disable|status>');
+    expect(r.homeUnchanged).toBe(true);
+  });
+
+  it.each([
+    ['enable', '--dry-run'],
+    ['disable', '--force'],
+    ['status', 'extra'],
+  ])('botmux autostart %s %s → rc=2，不执行', (subcommand, extra) => {
+    const r = runCli(['autostart', subcommand, extra]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('未知参数');
+    expect(r.stderr).toContain(extra);
+    expect(r.homeUnchanged).toBe(true);
+  });
+
+  it('未知子命令同样在创建配置目录前中止', () => {
+    const r = runCli(['autostart', 'typo']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('未知参数: typo');
+    expect(r.homeUnchanged).toBe(true);
+  });
+});

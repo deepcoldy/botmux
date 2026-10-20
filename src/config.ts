@@ -4,6 +4,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
   globalVcMeetingAgentListenerBotAppId,
+  isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
 } from './global-config.js';
@@ -114,6 +115,28 @@ export interface HerdrTraexPluginRuntimeConfig {
   ref: string;
 }
 
+/** Startup-only handoff for a local companion process.
+ *
+ * This is deliberately a path, not a secret value: this resolver performs no
+ * file IO. The startup boundary validates/loads the dedicated file and never
+ * logs or falls back to the Dashboard/internal HMAC secret. */
+export interface CompanionStartupConfig {
+  secretFile: string | undefined;
+  botAppId: string | undefined;
+}
+
+/** The sole supported private secret-file configuration input. */
+export const COMPANION_SECRET_FILE_ENV = 'BOTMUX_COMPANION_SECRET_FILE';
+export const COMPANION_BOT_APP_ID_ENV = 'BOTMUX_COMPANION_BOT_APP_ID';
+
+/** Resolve the fixed scoped startup handoff without touching the secret file. */
+export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.env): CompanionStartupConfig {
+  return {
+    secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]),
+    botAppId: nonBlankHost(env[COMPANION_BOT_APP_ID_ENV]),
+  };
+}
+
 /**
  * Current-chat bot discovery via Lark `/members/bots`.
  *
@@ -128,13 +151,14 @@ export interface HerdrTraexPluginRuntimeConfig {
  */
 export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): ChatBotDiscoveryConfig {
   const envFlag = env.BOTMUX_LARK_LIST_BOTS_API_ENABLED;
+  const timeoutMs = Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS);
   const listBotsApiEnabled =
     envFlag != null && envFlag !== ''
       ? envFlag.toLowerCase() === 'true'
       : readGlobalConfig().dashboard?.chatBotDiscovery !== false; // default ON
   return {
     listBotsApiEnabled,
-    listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
+    listBotsApiTimeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 3_000,
   };
 }
 
@@ -193,11 +217,57 @@ export function resolveForwardFollowupWaitMs(env: NodeJS.ProcessEnv = process.en
   return Math.min(MAX_FORWARD_FOLLOWUP_WAIT_MS, Math.max(1, Math.trunc(value)));
 }
 
+const DEFAULT_RECOVERY_FORK_BATCH_SIZE = 5;
+const DEFAULT_RECOVERY_FORK_DELAY_MS = 250;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function parseBoundedInteger(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const normalized = raw?.trim();
+  if (!normalized) return fallback;
+
+  const value = Number(normalized);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env): {
+  batchSize: number;
+  delayMs: number;
+} {
+  return {
+    batchSize: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_BATCH,
+      DEFAULT_RECOVERY_FORK_BATCH_SIZE,
+      1,
+    ),
+    delayMs: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_DELAY_MS,
+      DEFAULT_RECOVERY_FORK_DELAY_MS,
+      0,
+      MAX_TIMER_DELAY_MS,
+    ),
+  };
+}
+
+const recoveryForkConfig = resolveRecoveryForkConfig();
+
+function resolvePositiveRuntimeTimeout(raw: string | undefined, fallback: number): number {
+  return parseBoundedInteger(raw, fallback, 1, MAX_TIMER_DELAY_MS);
+}
+
+export function resolveStuckDetectorTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.STUCK_DETECTOR_TIMEOUT_MS, 45_000);
+}
+
+export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS, 5_000);
+}
+
 export const config = {
-  lark: {
-    appId: process.env.LARK_APP_ID ?? '',
-    appSecret: process.env.LARK_APP_SECRET ?? '',
-  },
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
     // Writable for back-compat: callers/tests historically assigned
@@ -214,7 +284,6 @@ export const config = {
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
-    cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as BackendType,
     /** Auto-recovery throttle: on restart every surviving persistent-backend
      *  session is eagerly re-forked to re-attach its pane. With dozens of
@@ -222,12 +291,11 @@ export const config = {
      *  once spikes CPU/IO, so the re-fork is staggered: spawn `batchSize`
      *  workers, wait `delayMs`, repeat. Tune via BOTMUX_RECOVERY_FORK_BATCH /
      *  BOTMUX_RECOVERY_FORK_DELAY_MS. */
-    recoveryForkBatchSize: Math.max(1, Number(process.env.BOTMUX_RECOVERY_FORK_BATCH) || 5),
-    recoveryForkDelayMs: Math.max(0, Number(process.env.BOTMUX_RECOVERY_FORK_DELAY_MS ?? 250)),
+    recoveryForkBatchSize: recoveryForkConfig.batchSize,
+    recoveryForkDelayMs: recoveryForkConfig.delayMs,
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
-    allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
@@ -274,6 +342,10 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
+  // A local companion process consumes this typed handoff. Keep it separate
+  // from dashboard/daemon HMAC configuration: there is intentionally no
+  // default path and therefore no credential reuse.
+  companion: resolveCompanionStartupConfig(),
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input
@@ -288,7 +360,7 @@ export const config = {
     enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
     /** Milliseconds after a write before the detector checks whether the turn
      *  is still unresolved. */
-    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
+    timeoutMs: resolveStuckDetectorTimeoutMs(),
   },
   worktreeSlugAI: {
     /**
@@ -301,7 +373,7 @@ export const config = {
     baseUrl: process.env.BOTMUX_WORKTREE_SLUG_AI_BASE_URL ?? '',
     apiKey: process.env.BOTMUX_WORKTREE_SLUG_AI_API_KEY ?? '',
     model: process.env.BOTMUX_WORKTREE_SLUG_AI_MODEL ?? '',
-    timeoutMs: Number(process.env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS) || 5_000,
+    timeoutMs: resolveWorktreeSlugAiTimeoutMs(),
     /** Extra headers for the API request (JSON string). */
     extraHeaders: (() => {
       try { return JSON.parse(process.env.BOTMUX_WORKTREE_SLUG_AI_EXTRA_HEADERS ?? '{}'); }
@@ -317,7 +389,6 @@ export const config = {
   // cached) on each access so a Settings change takes effect without a daemon
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
-  get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
   // sessions without a daemon restart. The daemon ORs this with each bot's own
@@ -327,6 +398,10 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Default OFF (experimental; only an explicit stored true enables). Read live
+  // so a Dashboard change gates the next session upgrade without restarting
+  // daemons or changing the current turn.
+  get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without
@@ -335,6 +410,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental cross-principal
+  // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
+  // daemon delivers another principal's message normally instead of diverting it
+  // into a staged record, i.e. exactly the pre-#1348 behavior. Read per message
+  // so a Settings flip applies to the next turn without a daemon restart; the
+  // worker reads the same switch through isCrossPrincipalInterruptionEnabled so
+  // both ends of the IPC agree. `BOTMUX_XPI_ENABLED` overrides for one process.
+  get crossPrincipalInterruption(): boolean { return isCrossPrincipalInterruptionEnabled(); },
   // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
   // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
   // effect on the next session without a daemon restart (existing panes keep their
@@ -342,7 +425,7 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
 };
 
-// allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
 export type Config = typeof config;

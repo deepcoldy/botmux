@@ -1,14 +1,25 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, LoadingState, ToggleRow as BaseToggleRow, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
-import { updateResponseNeedsRestart } from './update-action.js';
+import {
+  updateResponseNeedsRestart,
+  pollUpdateStatus,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  binaryProgressText,
+} from './update-action.js';
 import { ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
+import {
+  IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
+  type IdleCleanupHours,
+} from '../session-cleanup.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -28,7 +39,10 @@ interface DashboardSettings {
     recommendedRef: string;
   };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -65,6 +79,7 @@ interface DashboardSettings {
     targetDaemonOnline: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -77,9 +92,13 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
+  sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
+  /** GitHub Release 下载代理（二进制自更新）；'' = 未配置（读 HTTPS_PROXY / HTTP_PROXY）。 */
+  httpProxy: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -118,12 +137,15 @@ interface UpdateStatus {
   /** Local-dev checkout is a git worktree → self-update via git pull + build. */
   localDevUpdatable?: boolean;
   updateSupported: boolean;
+  releaseInstallRequired?: boolean;
   // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
   // 自己下载 release 资产替换自身。
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
 }
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
@@ -177,8 +199,12 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
+    autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
+    // default ON — only an explicit persisted false disables (server snapshot)
+    cardBrandLabel: s?.cardBrandLabel !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -213,6 +239,7 @@ function parseSettings(s: any): DashboardSettings {
       targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
+    crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -225,8 +252,20 @@ function parseSettings(s: any): DashboardSettings {
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
+    sessionCleanup: {
+      archiveCodex: s?.sessionCleanup?.archiveCodex === true,
+      enabled: s?.sessionCleanup?.enabled === true,
+      olderThanHours: (IDLE_CLEANUP_HOUR_OPTIONS as readonly unknown[]).includes(s?.sessionCleanup?.olderThanHours)
+        ? s.sessionCleanup.olderThanHours as IdleCleanupHours
+        : 168,
+      intervalMinutes: typeof s?.sessionCleanup?.intervalMinutes === 'number' && s.sessionCleanup.intervalMinutes >= 5
+        ? Math.floor(s.sessionCleanup.intervalMinutes)
+        : 60,
+    },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
+    httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -256,6 +295,7 @@ function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
+  const updatePollStopRef = useRef<(() => void) | null>(null);
   const [settings, setSettings] = useState<DashboardSettings | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -362,6 +402,8 @@ function SettingsPage() {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
     };
   }, [clearTimers, loadSettings]);
 
@@ -576,11 +618,58 @@ function SettingsPage() {
     if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    const stopUpdatePoll = (): void => {
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
+    };
+    // Standalone-binary updates download a ~174MB asset; surface measured byte
+    // progress from /api/update/status while the long POST is in flight.
+    updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+      if (mountedRef.current && snap.binaryUpdate) {
+        setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+      }
+    }, 1000);
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
+        // Another update (another dashboard tab, the CLI, or scheduled
+        // maintenance) owns the shared install lock. Track it via status rather
+        // than reporting a failure: the cross-process flag is invisible, so
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
+        if (body?.error === 'update_in_flight') {
+          const startVersion = String(s.current);
+          stopUpdatePoll();
+          updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+            if (!mountedRef.current) return;
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
+              stopUpdatePoll();
+              setUpBusy(false);
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
+              return;
+            }
+            if (kind === 'progress' && snap.binaryUpdate) {
+              setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+            } else {
+              setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
+            }
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
+          return;
+        }
+        stopUpdatePoll();
         // Dirty worktree fails closed — surface the file list so the user can act.
         if (body?.error === 'dirty_worktree') {
           setUpBusy(false);
@@ -592,6 +681,7 @@ function SettingsPage() {
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
+      stopUpdatePoll();
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
@@ -617,6 +707,7 @@ function SettingsPage() {
         await fetchStatus();
       }
     } catch (e) {
+      stopUpdatePoll();
       if (!mountedRef.current) return;
       setUpBusy(false);
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
@@ -720,7 +811,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -795,6 +886,13 @@ function SettingsBody(props: {
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
+            title={tr('settings.cardBrandLabel')}
+            help={tr('settings.cardBrandLabelHelp')}
+            checked={settings.cardBrandLabel}
+            disabled={dis || savingKey === 'cardBrandLabel'}
+            onChange={value => saveBoolean('cardBrandLabel', value)}
+          />
+          <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
             checked={settings.openTerminalInFeishu}
@@ -864,11 +962,25 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('codexRpcInput', value)}
           />
           <ToggleRow
+            title={tr('settings.autoUpgradeCodexSessions')}
+            help={tr('settings.autoUpgradeCodexSessionsHelp')}
+            checked={settings.autoUpgradeCodexSessions}
+            disabled={dis || savingKey === 'autoUpgradeCodexSessions'}
+            onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
             disabled={dis || savingKey === 'bypassCodexHookTrust'}
             onChange={value => saveBoolean('bypassCodexHookTrust', value)}
+          />
+          <ToggleRow
+            title={tr('settings.hideCodexRateLimitModelNudge')}
+            help={tr('settings.hideCodexRateLimitModelNudgeHelp')}
+            checked={settings.hideCodexRateLimitModelNudge}
+            disabled={dis || savingKey === 'hideCodexRateLimitModelNudge'}
+            onChange={value => saveBoolean('hideCodexRateLimitModelNudge', value)}
           />
           <CodexNotifierSettingsEditor
             value={settings.codexNotifier}
@@ -882,6 +994,13 @@ function SettingsBody(props: {
             checked={settings.noVisibleOutputHint}
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+          <ToggleRow
+            title={tr('settings.crossPrincipalInterruption')}
+            help={tr('settings.crossPrincipalInterruptionHelp')}
+            checked={settings.crossPrincipalInterruption}
+            disabled={dis || savingKey === 'crossPrincipalInterruption'}
+            onChange={value => saveBoolean('crossPrincipalInterruption', value)}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
@@ -914,6 +1033,17 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionMultiTopic')}>
+          <ToggleRow
+            title={tr('settings.multiTopicEnable')}
+            help={tr('settings.multiTopicEnableHelp')}
+            checked={settings.multiTopic.enabled}
+            disabled={dis || savingKey === 'multiTopic'}
+            onChange={value => {
+              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
         <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
           <div className="settings-field-row">
             <FieldTitle help={tr('settings.repoPickerModeHelp')}>{tr('settings.repoPickerMode')}</FieldTitle>
@@ -941,6 +1071,17 @@ function SettingsBody(props: {
                 'scheduleTimeZone',
                 { scheduleTimeZone: tz },
                 s => ({ ...s, scheduleTimeZone: tz ?? '' }),
+              );
+            }}
+          />
+          <SessionCleanupRow
+            value={settings.sessionCleanup}
+            disabled={dis || savingKey === 'sessionCleanup'}
+            onSave={patch => {
+              void props.onSave(
+                'sessionCleanup',
+                { sessionCleanup: patch },
+                s => ({ ...s, sessionCleanup: { ...s.sessionCleanup, ...patch } }),
               );
             }}
           />
@@ -1053,6 +1194,15 @@ function SettingsBody(props: {
               />
             </div>
           </div>
+          <HttpProxyRow
+            value={settings.httpProxy}
+            disabled={!canWrite || savingKey === 'httpProxy'}
+            onSave={value => props.onSave(
+              'httpProxy',
+              { httpProxy: value },
+              st => ({ ...st, httpProxy: value }),
+            )}
+          />
         </SettingsBlock>
         <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
@@ -1477,30 +1627,87 @@ export function TimeZoneRow(props: {
   );
 }
 
-function ToggleRow(props: {
-  title: string;
-  help: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange(value: boolean): void;
-}) {
-  return (
-    <label className="toggle-row">
-      <input
-        type="checkbox"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={e => props.onChange(e.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx">
-        <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
-      </span>
-    </label>
-  );
+/** settings 页的开关行：共享 ToggleRow + 本页的标题样式钩子。 */
+function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleComponent' | 'titleClassName'>) {
+  return <BaseToggleRow {...props} titleClassName="settings-toggle-title" />;
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+function SessionCleanupRow(props: {
+  value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  disabled: boolean;
+  onSave(patch: { archiveCodex?: boolean; enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
+}) {
+  const tr = useT();
+  const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
+  useEffect(() => setIntervalDraft(String(props.value.intervalMinutes)), [props.value.intervalMinutes]);
+
+  const parsedInterval = Number(intervalDraft);
+  const intervalValid = Number.isFinite(parsedInterval) && parsedInterval >= 5 && Number.isInteger(parsedInterval);
+  const intervalDirty = intervalValid && Math.floor(parsedInterval) !== props.value.intervalMinutes;
+
+  return (
+    <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupArchiveCodex')}
+        help={tr('settings.sessionCleanupArchiveCodexHelp')}
+        checked={props.value.archiveCodex === true}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ archiveCodex: value })}
+      />
+      <ToggleRow
+        title={tr('settings.sessionCleanupEnable')}
+        help={tr('settings.sessionCleanupEnableHelp')}
+        checked={props.value.enabled}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ enabled: value })}
+      />
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupOlderThanHelp')}>{tr('settings.sessionCleanupOlderThan')}</FieldTitle>
+        <div
+          className="idle-cleanup-threshold-options"
+          role="radiogroup"
+          aria-label={tr('settings.sessionCleanupOlderThan')}
+        >
+          {IDLE_CLEANUP_HOUR_OPTIONS.map(hours => {
+            const active = hours === props.value.olderThanHours;
+            return (
+              <button
+                type="button"
+                key={hours}
+                className={active ? 'active' : undefined}
+                aria-pressed={active ? 'true' : 'false'}
+                disabled={props.disabled || !props.value.enabled}
+                onClick={() => { if (hours !== props.value.olderThanHours) props.onSave({ olderThanHours: hours }); }}
+              >
+                {idleCleanupHoursLabel(hours)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupIntervalHelp')}>{tr('settings.sessionCleanupInterval')}</FieldTitle>
+        <input
+          type="number"
+          min={5}
+          step={1}
+          inputMode="numeric"
+          value={intervalDraft}
+          disabled={props.disabled || !props.value.enabled}
+          onChange={e => setIntervalDraft(e.currentTarget.value)}
+          onBlur={() => {
+            if (intervalDirty) props.onSave({ intervalMinutes: Math.floor(parsedInterval) });
+            else setIntervalDraft(String(props.value.intervalMinutes));
+          }}
+          onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function GroupNamePrefixRow(props: {
   value: string;
@@ -1571,6 +1778,75 @@ export function currentBrowserOrigin(): string {
 
 /** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
  *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+/** Mirrors the server's normalizeHttpProxy: `http://[user:pass@]host[:port]`,
+ *  no path / query (the download tunnel dials the proxy over plain HTTP). */
+export function isValidHttpProxy(raw: string): boolean {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!/^http:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !!url.hostname && url.pathname === '/' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy for downloading new botmux binaries from GitHub Releases. */
+export function HttpProxyRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串合法（= 清除配置，退回环境变量）。
+  const valid = trimmed === '' || isValidHttpProxy(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-http-proxy-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.httpProxyHelp')}>{tr('settings.httpProxy')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="httpProxy"
+          value={draft}
+          placeholder={tr('settings.httpProxyPlaceholder')}
+          disabled={props.disabled}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-http-proxy-hint>
+        {trimmed === ''
+          ? tr('settings.httpProxyUnset')
+          : valid ? tr('settings.httpProxyActive') : tr('settings.httpProxyInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="http-proxy-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.httpProxySave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function isValidOAuthRedirectBase(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value)) return false;
@@ -1828,8 +2104,10 @@ function UpdateCard(props: {
           <span>{tr('update.current')}: <strong>v{s.current}</strong></span>{' '}
           <UpdateBadge status={s} />
         </p>
+        {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
+        {s.releaseInstallRequired ? <p className="hint">{tr('update.installReleaseHint')}</p> : null}
         {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
@@ -1868,7 +2146,7 @@ function UpdateCard(props: {
   );
 }
 
-function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
   const tr = useT();
   return (
     <div className="cli-runtime-updates">
@@ -1893,6 +2171,8 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
             <code>{entry.binPath}</code>
             {entry.updateAvailable && entry.updateCommand ? (
               <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommandUnknown')}</small>
             ) : null}
           </li>
         ))}

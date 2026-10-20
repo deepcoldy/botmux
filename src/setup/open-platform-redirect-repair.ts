@@ -33,6 +33,7 @@ import {
   createOpenPlatformApiClient,
   missingRedirectUrls,
   OpenPlatformApiError,
+  openPlatformWebSessionExpired,
   prepareFeishuWebSession,
   safeErrorMessage,
   writeRedirectWhitelist,
@@ -266,7 +267,16 @@ async function runRepair(
   for (const bot of targets.repairable) {
     // 超时后循环立刻停：结果已经没人接收，继续打 console 只是白白消耗配额。
     if (!ctx.isCurrent()) break;
-    results.push(await repairOne(postJson, bot.larkAppId, wanted));
+    try {
+      results.push(await repairOne(postJson, bot.larkAppId, wanted));
+    } catch (err) {
+      if (!openPlatformWebSessionExpired(err)) throw err;
+      return {
+        ok: false,
+        reason: 'login_required',
+        message: `飞书开放平台登录态已失效，请重新扫码后重试：${safeErrorMessage(err)}`,
+      };
+    }
   }
 
   const summary = countByStatus(results);
@@ -314,6 +324,9 @@ async function repairOne(
     }
     return { appId, status: 'fixed', redirectUrls: written.redirectUrls };
   } catch (err) {
+    // 登录态是整批 bot 共用的；不能把它压成某个 app 的 failed，
+    // 否则 dashboard 看不到 login_required，也就不会弹扫码框。
+    if (openPlatformWebSessionExpired(err)) throw err;
     if (isOwnerAccessDenied(err)) {
       return {
         appId,

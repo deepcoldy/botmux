@@ -1,0 +1,890 @@
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { TURN_IDLE_PROTOCOL_VERSION } from '../utils/turn-idle-report.js';
+import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../core/managed-origin-capability.js';
+import { READY_SIGNAL_LOG_DIR_NAME, READY_SIGNAL_LOG_MAX_BYTES } from '../services/ready-signal-log.js';
+import { hookCommandParts } from './hook-command.js';
+
+const BRIDGE_VERSION = 1;
+const BRIDGE_ROOT_DIR = '.botmux/dsh-question-bridge';
+const DEFAULT_DSH_TUI_PROFILE = 'dsh-tui';
+
+type DshBridgeCliId = 'dsh' | 'dsh-tui';
+
+export interface DshQuestionBridgePatch {
+  readonly patchPath: string;
+  readonly readonlyRoot: string;
+  readonly pluginPath: string;
+}
+
+interface HookCommandParts {
+  readonly cmd: string;
+  readonly args: readonly string[];
+}
+
+export interface EnsureDshQuestionBridgePatchOptions {
+  readonly cliId: DshBridgeCliId;
+  /** Test/packaging override. Defaults to os.homedir(). */
+  readonly homeDir?: string;
+  /** Profile directory used only for dsh-tui wrapper original-module resolution. */
+  readonly dshTuiProfileDir?: string;
+  /** Test override; production uses hookCommandParts(cliId). */
+  readonly hookCommand?: HookCommandParts;
+  /** Extra salt so different checkout/build identities cannot overwrite each other. */
+  readonly buildSalt?: string;
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function yamlSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function jsonLiteral(value: unknown): string {
+  return (JSON.stringify(value) ?? 'undefined').replace(/<\//g, '<\\/');
+}
+
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); } catch { return path; }
+}
+
+function dshConfigHome(homeDir: string): string {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? canonicalPath(resolve(configured)) : join(homeDir, '.dsh');
+}
+
+function defaultDshTuiProfileDir(homeDir: string): string {
+  return join(dshConfigHome(homeDir), 'profiles', DEFAULT_DSH_TUI_PROFILE);
+}
+
+function findPackageRootFromEntry(entry: string): string | null {
+  let dir = dirname(entry);
+  for (;;) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function resolvePackageExportEntry(pkgRoot: string): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8')) as Record<string, unknown>;
+    const exportsField = pkg.exports;
+    if (exportsField && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
+      const dot = (exportsField as Record<string, unknown>)['.'];
+      if (dot && typeof dot === 'object' && !Array.isArray(dot)) {
+        const imp = (dot as Record<string, unknown>).import ?? (dot as Record<string, unknown>).default;
+        if (typeof imp === 'string' && imp) return imp;
+      }
+      if (typeof dot === 'string' && dot) return dot;
+    }
+    if (typeof pkg.module === 'string' && pkg.module) return pkg.module;
+    if (typeof pkg.main === 'string' && pkg.main) return pkg.main;
+  } catch { /* fall back below */ }
+  return 'lib/types/index.js';
+}
+
+export function resolveOriginalDshTuiEntryUrl(
+  profileDir: string = defaultDshTuiProfileDir(homedir()),
+): string | null {
+  try {
+    const directPkgPath = join(profileDir, 'node_modules', '@deepseek-harness-tui', 'dsh-tui', 'package.json');
+    if (existsSync(directPkgPath)) {
+      const entry = resolve(dirname(directPkgPath), resolvePackageExportEntry(dirname(directPkgPath)));
+      return existsSync(entry) ? pathToFileURL(canonicalPath(entry)).href : null;
+    }
+    const requireFromProfile = createRequire(join(profileDir, 'package.json'));
+    const publicEntry = requireFromProfile.resolve('@deepseek-harness-tui/dsh-tui');
+    const pkgRoot = findPackageRootFromEntry(publicEntry);
+    if (!pkgRoot) return existsSync(publicEntry) ? pathToFileURL(canonicalPath(publicEntry)).href : null;
+    const entry = resolve(pkgRoot, resolvePackageExportEntry(pkgRoot));
+    if (!existsSync(entry)) return null;
+    return pathToFileURL(canonicalPath(entry)).href;
+  } catch {
+    return null;
+  }
+}
+
+function buildRuntimeBridgeSnippet(parts: HookCommandParts, runtime: DshBridgeCliId): string {
+  return `
+const CMD = ${jsonLiteral(parts.cmd)};
+const ARGS = ${jsonLiteral([...parts.args])};
+const RUNTIME = ${jsonLiteral(runtime === 'dsh-tui' ? 'tui' : 'official')};
+const MAX_STDOUT_BYTES = 1024 * 1024;
+const MAX_LABEL_LENGTH = 200;
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isBotmuxSessionEnv(env) {
+  return !!(env.BOTMUX_SESSION_ID && env.BOTMUX_CHAT_ID && env.BOTMUX_LARK_APP_ID);
+}
+
+function bridgeError(code, message) {
+  const err = new Error(message);
+  err.name = 'UserQuestionError';
+  err.code = code;
+  return err;
+}
+
+function timeoutMs() {
+  const raw = process.env.BOTMUX_DSH_ASK_TIMEOUT_MS || process.env.BOTMUX_ASK_TIMEOUT_MS || '3600000';
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 3600000;
+}
+
+function runHook(payload, signal) {
+  return new Promise((resolve) => {
+    let input;
+    try { input = JSON.stringify(payload); }
+    catch (error) {
+      resolve({ ok: false, reason: 'payload-serialize-error', detail: String(error && error.message || error) });
+      return;
+    }
+    let settled = false;
+    let out = '';
+    let child;
+    let timer;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { signal && signal.removeEventListener && signal.removeEventListener('abort', onAbort); } catch {}
+      resolve(result);
+    };
+    const onAbort = () => {
+      try { child && child.kill(); } catch {}
+      done({ ok: false, reason: 'aborted', detail: 'ask_user_question was aborted' });
+    };
+    try {
+      child = spawn(CMD, ARGS, {
+        stdio: ['pipe', 'pipe', 'ignore'],
+        env: { ...process.env, BOTMUX_ASK_TIMEOUT_MS: String(timeoutMs()) },
+      });
+    } catch (error) {
+      done({ ok: false, reason: 'spawn-error', detail: String(error && error.message || error) });
+      return;
+    }
+    if (signal && signal.aborted) return onAbort();
+    try { signal && signal.addEventListener && signal.addEventListener('abort', onAbort, { once: true }); } catch {}
+    timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      done({ ok: false, reason: 'timeout', detail: 'botmux hook timed out' });
+    }, timeoutMs() + 100);
+    if (typeof timer.unref === 'function') timer.unref();
+    child.stdout.on('data', (d) => {
+      out += d.toString('utf8');
+      if (Buffer.byteLength(out, 'utf8') > MAX_STDOUT_BYTES) {
+        try { child.kill(); } catch {}
+        done({ ok: false, reason: 'stdout-overflow', detail: 'botmux hook stdout exceeded 1MiB' });
+      }
+    });
+    child.on('error', (error) => done({ ok: false, reason: 'child-error', detail: String(error && error.message || error) }));
+    child.on('close', (code) => {
+      if (code !== 0) done({ ok: false, reason: 'nonzero-exit', detail: 'botmux hook exited ' + code });
+      else if (!out.trim()) done({ ok: false, reason: 'passthrough', detail: 'botmux hook returned empty stdout' });
+      else done({ ok: true, text: out.trim() });
+    });
+    try { child.stdin.end(input); }
+    catch (error) {
+      try { child.kill(); } catch {}
+      done({ ok: false, reason: 'stdin-error', detail: String(error && error.message || error) });
+    }
+  });
+}
+
+function handleBridgeFailure(result, next) {
+  if (RUNTIME === 'tui') return next();
+  if (result.reason === 'aborted') {
+    throw bridgeError('ASK_ABORTED', result.detail || 'ask_user_question was aborted');
+  }
+  throw bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge failed: ' + result.reason + (result.detail ? ' (' + result.detail + ')' : ''));
+}
+
+function isValidLabel(value) {
+  return typeof value === 'string'
+    && value.trim().length > 0
+    && value.length <= MAX_LABEL_LENGTH
+    && !value.includes(String.fromCharCode(10))
+    && !value.includes(String.fromCharCode(13));
+}
+
+function classifyRequest(request) {
+  if (!isRecord(request) || !Array.isArray(request.questions) || request.questions.length === 0) {
+    return { ok: false, reason: 'missing questions' };
+  }
+  for (let i = 0; i < request.questions.length; i++) {
+    const q = request.questions[i];
+    if (!isRecord(q)) return { ok: false, reason: 'question ' + (i + 1) + ' is malformed' };
+    if (typeof q.id !== 'string' || !q.id.trim()) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid id' };
+    if (typeof q.question !== 'string' || !q.question.trim()) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid text' };
+    if (isRecord(q.intent) && q.intent.kind === 'plan-review') return { ok: false, reason: 'plan-review is not supported by botmux bridge' };
+    if (!Array.isArray(q.options) || q.options.length < 2) return { ok: false, reason: 'question ' + (i + 1) + ' has fewer than two options' };
+    const labels = new Set();
+    for (const opt of q.options) {
+      if (!isRecord(opt) || !isValidLabel(opt.label)) return { ok: false, reason: 'question ' + (i + 1) + ' has invalid option label' };
+      if (labels.has(opt.label)) return { ok: false, reason: 'question ' + (i + 1) + ' has duplicate option label' };
+      labels.add(opt.label);
+    }
+  }
+  return { ok: true };
+}
+
+function sanitizedQuestions(request) {
+  return request.questions.map((q) => ({
+    id: q.id,
+    question: q.question,
+    ...(typeof q.header === 'string' ? { header: q.header } : {}),
+    ...(typeof q.detail === 'string' ? { detail: q.detail } : {}),
+    options: q.options.map((opt) => ({
+      label: opt.label,
+      ...(typeof opt.description === 'string' ? { description: opt.description } : {}),
+    })),
+    ...(typeof q.multiSelect === 'boolean' ? { multiSelect: q.multiSelect } : {}),
+    ...(typeof q.multi_select === 'boolean' ? { multi_select: q.multi_select } : {}),
+  }));
+}
+
+function validateAnswer(value, request) {
+  if (!isRecord(value) || !Array.isArray(value.answers)) throw new Error('answer must contain answers[]');
+  if (value.answers.length !== request.questions.length) throw new Error('answer count does not match question count');
+  const answers = [];
+  for (let i = 0; i < request.questions.length; i++) {
+    const q = request.questions[i];
+    const answer = value.answers[i];
+    if (!isRecord(answer)) throw new Error('answer ' + (i + 1) + ' is malformed');
+    if (answer.id !== q.id) throw new Error('answer ' + (i + 1) + ' id mismatch');
+    if (!Array.isArray(answer.selected) || !answer.selected.every((item) => typeof item === 'string')) {
+      throw new Error('answer ' + (i + 1) + ' selected must be string[]');
+    }
+    const allowed = new Set(q.options.map((opt) => opt.label));
+    for (const selected of answer.selected) {
+      if (!allowed.has(selected)) throw new Error('answer ' + (i + 1) + ' selected unknown option');
+    }
+    if (answer.custom !== undefined && typeof answer.custom !== 'string') throw new Error('answer ' + (i + 1) + ' custom must be string');
+    answers.push({ id: answer.id, selected: [...answer.selected], ...(answer.custom !== undefined ? { custom: answer.custom } : {}) });
+  }
+  return { answers };
+}
+
+async function bridgeAsk(request, next) {
+  const classified = classifyRequest(request);
+  if (!classified.ok) return handleBridgeFailure({ reason: 'unsupported', detail: classified.reason }, next);
+  const safeRequest = { questions: sanitizedQuestions(request) };
+  const result = await runHook({ hook_event_name: 'user-questions/request', tool_input: safeRequest }, request && request.signal);
+  if (!result.ok) return handleBridgeFailure(result, next);
+  try { return validateAnswer(JSON.parse(result.text), request); }
+  catch (error) { return handleBridgeFailure({ reason: 'malformed-answer', detail: String(error && error.message || error) }, next); }
+}
+
+function installWaterfallBridge(ctx) {
+  if (typeof ctx.on !== 'function') return undefined;
+  return ctx.on('user-questions/request', (request, next) => bridgeAsk(request, next), { prepend: true });
+}
+
+function installLegacyOfficialProvider(ctx, service) {
+  if (service.provider !== undefined) return undefined;
+  try {
+    const dispose = service.registerProvider({ ask: request => bridgeAsk(request, () => Promise.reject(bridgeError('BOTMUX_ASK_BRIDGE_UNAVAILABLE', 'botmux question bridge declined request'))) });
+    try { ctx.effect(() => dispose, 'botmux-dsh-question-bridge.legacy-provider'); } catch {}
+    return dispose;
+  } catch (error) {
+    if (error && error.code === 'DUPLICATE_PROVIDER') return undefined;
+    throw error;
+  }
+}
+`;
+}
+
+function buildOrdinaryBridgePlugin(parts: HookCommandParts): string {
+  return `// botmux generated DSH question bridge v${BRIDGE_VERSION}
+import { spawn } from 'node:child_process';
+${buildRuntimeBridgeSnippet(parts, 'dsh')}
+export const name = 'botmux-dsh-question-bridge';
+export function apply(ctx) {
+  if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return;
+  const service = ctx.get && ctx.get('userQuestions');
+  if (service && typeof service.registerProvider === 'function') {
+    installLegacyOfficialProvider(ctx, service);
+    return;
+  }
+  installWaterfallBridge(ctx);
+}
+`;
+}
+
+/**
+ * Structured readiness / turn-idle reporting for the dsh-tui wrapper plugin.
+ *
+ * WHY this exists: dsh-tui repaints a blinking cursor cell several times a
+ * second even while completely idle. The worker's IdleDetector Strategy 2
+ * requires `QUIESCENCE_MS` of PTY silence and re-arms on every feed, so a
+ * dsh-tui session NEVER satisfies it → `markPromptReady()` is never called →
+ * the first queued prompt is only written by the 90s hard timeout, and every
+ * later turn end has no idle edge either.
+ *
+ * READINESS. The TUI hands us a precise in-process signal. Its
+ * `openInjectChannel()` runs immediately after `await render(tree)` (first
+ * frame flushed, composer mounted) and publishes
+ * `~/.dsh-tui/inject/servers.json` with `{pid, sessionId, cwd, socketPath,
+ * startedAt}` — the same record `dsh.nvim` discovers. Matching our own
+ * `process.pid` there is the earliest trustworthy "UI is ready" evidence, so
+ * the plugin fires `BOTMUX_READY_COMMAND` exactly once, and keeps the matched
+ * session id as this process's own identity for the turn-idle channel below.
+ *
+ * TURN IDLE. `agent/status` is deliberately NOT the readiness trigger:
+ * dsh-agent-loop only emits on a status CHANGE and the loop starts out idle,
+ * so a fresh boot emits nothing at all. At the END of a turn the same property
+ * makes it the perfect edge — one event per finished turn, never a synthetic
+ * one at boot — so `status === 'idle'` fires `BOTMUX_TURN_IDLE_COMMAND`, which
+ * the worker turns into `idleDetector.fireIdle()`.
+ *
+ * The turn identity is FROZEN INSIDE that callback, and carried in the payload
+ * (protocol v2, see utils/turn-idle-report.ts). It must not be resolved later,
+ * by the detached `botmux __turn-idle-v2` child: the worker rewrites the published
+ * (turn, dispatch generation) pair before every literal write, and dsh-tui
+ * steers busy-period input, so a report about turn A that reads the pair after
+ * the next dispatch would claim turn B — and satisfy the worker's exact-match
+ * fence while B was still running. Two CLI-visible sources are read
+ * synchronously, newest evidence first:
+ *   · `$BOTMUX_SEND_RELAY/${RELAY_ORIGIN_CAPABILITY_BASENAME}` — the
+ *     per-dispatch token the worker rotates for read-isolated/sandboxed
+ *     sessions, which also carries that generation's turn/attempt. Reporting it
+ *     as the capability binds the claim to the generation it was minted for.
+ *   · `$SESSION_DATA_DIR/cli-identity/<sessionId>.bin/.data/turn.json` — the
+ *     same pair published for the trigger-user identity wrapper (see
+ *     publishActiveTurn in core/cli-identity.ts). No token: the daemon still
+ *     binds the claim to the origin its live capability names.
+ * Neither readable ⇒ no report at all. "Late, never early": a lost edge only
+ * leaves that turn to the existing paths, while an early one writes into a busy
+ * CLI and settles the wrong turn.
+ *
+ * Everything here is fail-quiet: a missing env var, an unreadable discovery
+ * file, or a failed spawn must never break the TUI boot. The worker keeps its
+ * own fallback timeout, so a lost readiness signal degrades to the adapter's own
+ * readyPattern / hard-cap path (the worker aligns its gate fallback with that
+ * cap — a missing signal must not pre-empt it); a lost turn-idle just leaves
+ * that turn to the existing paths.
+ *
+ * The inject path is resolved at RUNTIME through `homedir()` — the same way
+ * dsh-tui itself computes `~/.dsh-tui` (utils/paths.js: `join(homedir(),
+ * '.dsh-tui')`) — so it follows the session's HOME inside a sandbox instead of
+ * pinning the worker's home.
+ */
+function buildDshTuiStatusSnippet(): string {
+  return `
+const BOTMUX_TURN_IDLE_PROTOCOL = ${TURN_IDLE_PROTOCOL_VERSION};
+const BOTMUX_RELAY_CAPABILITY_FILE = ${jsonLiteral(RELAY_ORIGIN_CAPABILITY_BASENAME)};
+const BOTMUX_READY_POLL_MS = 250;
+const BOTMUX_STATUS_SIGNAL_TIMEOUT_MS = 15_000;
+// Bounded: this adapter's ready-gate fallback is aligned with its own first-prompt
+// hard cap (90s, see resolveReadySignalTimeoutMs), so polling much past that only
+// keeps a timer alive for a signal nobody is waiting for anymore.
+const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
+// Our own process start as an epoch-ms instant. A discovery record published by
+// a PREVIOUS process that owned this same pid is not ours to claim: binding to
+// it would publish "UI ready" for a TUI that has not rendered, and its session
+// id would filter out every real agent/status event below.
+const BOTMUX_PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1000);
+const BOTMUX_PID_REUSE_TOLERANCE_MS = 1_000;
+// Birth-stamp plausibility bounds (see botmuxRecordRejection). Epoch-ms floor:
+// 2001-09-09, below which the value is a seconds stamp or a raw counter. Future
+// allowance: clock skew only — a record claiming to be born a minute or more
+// after this process started is not ours to claim either.
+const BOTMUX_BIRTH_STAMP_MIN_MS = 1_000_000_000_000;
+const BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS = 60_000;
+// Diagnostic trail for the fail-closed decisions below and for the ready
+// dispatch. Rejections are silent by design (never disturb the TUI, never exec
+// anything), which makes a genuine mis-kill — the feature quietly degrading to
+// the 90s hard cap — impossible to tell apart from "the TUI has not published
+// its record yet". One JSONL line per distinct event in the session's own data
+// dir (\`<SESSION_DATA_DIR>/${READY_SIGNAL_LOG_DIR_NAME}/<BOTMUX_SESSION_ID>.log\`:
+// the sandbox grants exactly that file readWrite, pre-created by the worker);
+// the TUI's stdout is the screen, so stderr/console is deliberately NOT used.
+const BOTMUX_SIGNAL_LOG_DIR = ${jsonLiteral(READY_SIGNAL_LOG_DIR_NAME)};
+const BOTMUX_SIGNAL_LOG_MAX_BYTES = ${READY_SIGNAL_LOG_MAX_BYTES};
+const BOTMUX_SIGNAL_LOG_MAX_KEYS = 32;
+
+let botmuxReadySignalled = false;
+let botmuxReadyPollTimer;
+let botmuxInjectSessionId;
+let botmuxIdleSeq = 0;
+const botmuxLoggedSignalEvents = new Set();
+
+function botmuxStatusCommand(envKey) {
+  const raw = process.env[envKey];
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
+}
+
+/** Best-effort JSONL diagnostics; never throws, never writes twice per key.
+ *
+ *  Bounded twice: at most one line per (event, key) and at most
+ *  BOTMUX_SIGNAL_LOG_MAX_KEYS lines PER PROCESS, and the file itself is
+ *  truncated IN PLACE once it reaches BOTMUX_SIGNAL_LOG_MAX_BYTES — a session
+ *  that restarts its TUI many times would otherwise grow one file without
+ *  bound. In-place truncation (not replace) keeps the inode, which matters
+ *  because the sandbox binds exactly this file. */
+function botmuxLogSignalEvent(event, fields) {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  if (!dataDir || !sessionId) return;
+  const key = event + ':' + (fields?.sessionId ?? '') + ':' + String(fields?.startedAt ?? fields?.reason ?? '');
+  if (botmuxLoggedSignalEvents.has(key) || botmuxLoggedSignalEvents.size >= BOTMUX_SIGNAL_LOG_MAX_KEYS) return;
+  botmuxLoggedSignalEvents.add(key);
+  const path = join(dataDir, BOTMUX_SIGNAL_LOG_DIR, sessionId + '.log');
+  try {
+    const existing = statSync(path, { throwIfNoEntry: false });
+    if (existing && existing.size >= BOTMUX_SIGNAL_LOG_MAX_BYTES) truncateSync(path, 0);
+    appendFileSync(path, JSON.stringify({ at: Date.now(), event, ...fields }) + '\\n', { mode: 0o600 });
+  } catch { /* diagnostics must never break the TUI boot */ }
+}
+
+/** FAIL-CLOSED birth check on a record's start instant.
+ *
+ *  Only an epoch-ms value inside [this process's start − 1s, now + clock skew]
+ *  can be ours. Anything else — missing, non-finite, a seconds stamp, a raw
+ *  counter like 1, or a significantly future value — is rejected rather than
+ *  guessed at: accepting it is exactly how a PID-reuse leftover (or a
+ *  hand-written row) claims our pid, releases the first-prompt gate for a TUI
+ *  that has not rendered yet, and then filters out every real agent/status
+ *  event because the bound session id is not the one the agent reports.
+ *
+ *  The record's startedAt is written by our own TUI right after the first
+ *  frame (verified against live ~/.dsh-tui/inject/servers.json), so a genuine
+ *  record always carries it. "never early" wins over "always signal": a lost
+ *  readiness edge degrades to the adapter's readyPattern / 90s hard cap, while
+ *  an early one writes into a TUI that cannot accept input.
+ *
+ *  Returns the rejection REASON (or undefined when the record is ours) so the
+ *  caller can leave a diagnostic trail — the decision is deliberately silent,
+ *  and a mis-kill must be distinguishable from "no record yet". */
+function botmuxRecordRejection(entry) {
+  const stamp = entry.startedAt;
+  if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return 'missing-or-invalid-startedAt';
+  if (stamp < BOTMUX_BIRTH_STAMP_MIN_MS) return 'startedAt-not-epoch-ms';
+  if (stamp > Date.now() + BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS) return 'startedAt-in-the-future';
+  if (stamp < BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS) return 'startedAt-before-this-process';
+  return undefined;
+}
+
+/** The TUI process's own inject-channel record, or undefined while it has not
+ *  published one yet (i.e. before its first frame). Records for our pid that
+ *  fail the birth check above (PID-reuse leftovers, malformed stamps) are
+ *  dropped — and logged once each; when several of ours exist (dsh-tui
+ *  republishes on restart) the newest wins. */
+function readBotmuxInjectRecord() {
+  try {
+    const parsed = JSON.parse(readFileSync(join(homedir(), '.dsh-tui', 'inject', 'servers.json'), 'utf8'));
+    if (!Array.isArray(parsed)) return undefined;
+    const mine = [];
+    for (const entry of parsed) {
+      if (!entry || entry.pid !== process.pid || typeof entry.sessionId !== 'string') continue;
+      const rejection = botmuxRecordRejection(entry);
+      if (rejection) {
+        botmuxLogSignalEvent('inject-record-rejected', {
+          reason: rejection,
+          pid: entry.pid,
+          sessionId: entry.sessionId,
+          startedAt: typeof entry.startedAt === 'number' ? entry.startedAt : null,
+        });
+        continue;
+      }
+      mine.push(entry);
+    }
+    let best;
+    for (const entry of mine) {
+      const stamp = typeof entry.startedAt === 'number' ? entry.startedAt : -Infinity;
+      const bestStamp = best && typeof best.startedAt === 'number' ? best.startedAt : -Infinity;
+      if (!best || stamp >= bestStamp) best = entry;
+    }
+    return best;
+  } catch {
+    // Absent/corrupt discovery file, or the TUI has not rendered yet.
+    return undefined;
+  }
+}
+
+/** Bind — or RE-bind — this process to the session id of its own record. A
+ *  one-shot claim kept a stale/reused-pid record's session id forever, which
+ *  silently filtered out every real agent/status event afterwards. */
+function botmuxBindInjectSession(record) {
+  const live = record || readBotmuxInjectRecord();
+  if (!live) return botmuxInjectSessionId;
+  botmuxInjectSessionId = live.sessionId;
+  return botmuxInjectSessionId;
+}
+
+/** Fire-and-forget "botmux <status>" subcommand. Never awaited, never blocks
+ *  the TUI, never surfaces an error into the render loop. When the caller passes
+ *  an \`outcome\` label, the exec's RESULT is recorded as
+ *  \`<prefix>-spawned/-error/-exit/-timeout\`: that is the only way to tell "the
+ *  signal never reached the worker" apart from "it was dispatched and the CLI
+ *  died". Bounded (one line per outcome, whole trail capped) and never thrown.
+ *  The per-turn idle reports pass no label: a turn can end many times per
+ *  session and that channel has no bounded outcome vocabulary. */
+function spawnBotmuxStatusCommand(command, payload, outcome) {
+  const logOutcome = (kind, fields) => {
+    if (!outcome) return;
+    botmuxLogSignalEvent(outcome.prefix + '-' + kind, { sessionId: outcome.sessionId, ...fields });
+  };
+  let child;
+  let timedOut = false;
+  try {
+    child = spawn(command, { shell: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+  } catch (error) {
+    logOutcome('error', { reason: 'spawn-threw', detail: String(error && error.message || error) });
+    return;
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    logOutcome('timeout', { reason: 'still-running-at-timeout' });
+    try { child.kill(); } catch {}
+  }, BOTMUX_STATUS_SIGNAL_TIMEOUT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  // 'spawn' is the only positive evidence a fire-and-forget exec can offer: the
+  // OS really started it (an exit code alone would not distinguish "never ran").
+  child.on('spawn', () => logOutcome('spawned', { pid: child.pid }));
+  child.on('error', (error) => {
+    clearTimeout(timer);
+    logOutcome('error', {
+      reason: String(error && error.code || 'spawn-error'),
+      detail: String(error && error.message || error),
+    });
+  });
+  child.on('exit', (code, signal) => {
+    clearTimeout(timer);
+    logOutcome('exit', {
+      code: typeof code === 'number' ? code : null,
+      signal: signal ?? null,
+      timedOut,
+    });
+  });
+  try { child.stdin.end(JSON.stringify(payload)); }
+  catch { try { child.kill(); } catch {} }
+  // A command that exits before reading stdin closes the pipe, and the write
+  // above then fails ASYNCHRONOUSLY — an unhandled stream 'error' would take the
+  // whole TUI down (EPIPE), which is the one thing this fire-and-forget path
+  // promises never to do. The child's own 'error' above is a different event.
+  try { child.stdin.on('error', () => {}); } catch {}
+  try { child.unref(); } catch {}
+}
+
+function stopBotmuxReadyPoll() {
+  if (!botmuxReadyPollTimer) return;
+  clearInterval(botmuxReadyPollTimer);
+  botmuxReadyPollTimer = undefined;
+}
+
+/** Exactly one exec per process: the ready edge is a one-shot startup event and
+ *  a second "session_ready" would only re-open an already-released gate. */
+function publishBotmuxReady() {
+  if (botmuxReadySignalled) return;
+  botmuxReadySignalled = true;
+  stopBotmuxReadyPoll();
+  const command = botmuxStatusCommand('BOTMUX_READY_COMMAND');
+  const sessionId = botmuxInjectSessionId;
+  if (!command) {
+    // No consumer exists: nothing was dispatched. Say exactly that, instead of
+    // logging a "ready" edge the worker can never receive.
+    botmuxLogSignalEvent('ready-dispatch-skipped', { sessionId, reason: 'no-ready-command', pid: process.pid });
+    return;
+  }
+  // Diagnostic counterpart to the rejection trail above: proves the channel DID
+  // fire (and which record it bound to), so "no signal" can be told apart from
+  // "mis-killed record". Deliberately named for what it proves — the exec has
+  // not even been spawned yet, so it is an ATTEMPT, not a delivery.
+  botmuxLogSignalEvent('ready-dispatch-attempted', { sessionId, pid: process.pid });
+  spawnBotmuxStatusCommand(command, {}, { prefix: 'ready-dispatch', sessionId });
+}
+
+function pollBotmuxReady(startedAt) {
+  if (botmuxReadySignalled) return;
+  const record = readBotmuxInjectRecord();
+  if (record) {
+    botmuxBindInjectSession(record);
+    publishBotmuxReady();
+    return;
+  }
+  if (Date.now() - startedAt >= BOTMUX_READY_POLL_LIMIT_MS) stopBotmuxReadyPoll();
+}
+
+/** Validate a published (turn, generation[, token]) triple. A missing/invalid
+ *  turn id means "no identity" — the report is dropped rather than guessed. */
+function botmuxFrozenTurnIdentity(rawTurnId, rawAttempt, rawCapability) {
+  const turnId = typeof rawTurnId === 'string' && rawTurnId.length > 0 && rawTurnId.length <= 256
+    ? rawTurnId
+    : undefined;
+  if (!turnId) return undefined;
+  const attempt = Number.isSafeInteger(rawAttempt) && rawAttempt > 0 ? rawAttempt : undefined;
+  const capability = typeof rawCapability === 'string' && /^[a-f0-9]{32,128}$/i.test(rawCapability)
+    ? rawCapability
+    : undefined;
+  return {
+    turnId,
+    ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+    ...(capability ? { capability } : {}),
+  };
+}
+
+/** Per-dispatch token + turn/attempt, as rotated by the worker for isolated
+ *  sessions. This is the only source that also proves WHICH generation the
+ *  claim belongs to, so it is preferred when present. */
+function readBotmuxRelayTurnIdentity() {
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  if (!relayDir) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(join(relayDir, BOTMUX_RELAY_CAPABILITY_FILE), 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    if (typeof parsed.sessionId === 'string' && parsed.sessionId !== process.env.BOTMUX_SESSION_ID) {
+      return undefined;
+    }
+    const token = typeof parsed.capability === 'string' ? parsed.capability : parsed.token;
+    return botmuxFrozenTurnIdentity(parsed.turnId, parsed.dispatchAttempt, token);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The turn/attempt pair the worker published for the turn now executing
+ *  (publishActiveTurn, core/cli-identity.ts). Same layout, so keep in sync. */
+function readBotmuxPublishedTurnIdentity() {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  if (!dataDir || !sessionId || !/^[A-Za-z0-9._-]{1,200}$/.test(sessionId)) return undefined;
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(dataDir, 'cli-identity', sessionId + '.bin', '.data', 'turn.json'), 'utf8'),
+    );
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    return botmuxFrozenTurnIdentity(parsed.turnId, parsed.dispatchAttempt, undefined);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the identity AT THE EVENT. Called synchronously from the agent/status
+ *  handler, before anything is spawned: that instant is the only one where the
+ *  published pair is guaranteed to still name the turn that just ended. */
+function readBotmuxFrozenDispatchIdentity() {
+  return readBotmuxRelayTurnIdentity() || readBotmuxPublishedTurnIdentity();
+}
+
+/** Structured end-of-turn idle edge for BOTMUX_TURN_IDLE_COMMAND. */
+function reportBotmuxTurnIdle(identity) {
+  const command = botmuxStatusCommand('BOTMUX_TURN_IDLE_COMMAND');
+  // No inject binding means this process never published its discovery record,
+  // so we cannot prove which session it owns. Stay silent: a mis-attributed
+  // idle would settle a turn that is still running (never early).
+  if (!command || !botmuxInjectSessionId || !identity) return;
+  botmuxIdleSeq += 1;
+  spawnBotmuxStatusCommand(command, {
+    v: BOTMUX_TURN_IDLE_PROTOCOL,
+    seq: botmuxIdleSeq,
+    pid: process.pid,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    ...(identity.capability ? { capability: identity.capability } : {}),
+  });
+}
+
+function installBotmuxStatusChannel(ctx) {
+  const startedAt = Date.now();
+  pollBotmuxReady(startedAt);
+  if (!botmuxReadySignalled) {
+    botmuxReadyPollTimer = setInterval(() => pollBotmuxReady(startedAt), BOTMUX_READY_POLL_MS);
+    if (typeof botmuxReadyPollTimer.unref === 'function') botmuxReadyPollTimer.unref();
+    if (typeof ctx.effect === 'function') {
+      try { ctx.effect(() => stopBotmuxReadyPoll, 'botmux-dsh-tui-status-channel'); } catch {}
+    }
+  }
+  if (typeof ctx.on !== 'function') return;
+  let previousStatus;
+  try {
+    ctx.on('agent/status', ({ agent, status } = {}) => {
+      const wasIdle = previousStatus === 'idle';
+      previousStatus = status;
+      // dsh-agent-loop emits only when the status actually changed, so this is
+      // exactly one report per finished turn (the loop starts out idle and
+      // emits nothing at boot).
+      if (status !== 'idle' || wasIdle) return;
+      const identity = readBotmuxFrozenDispatchIdentity();
+      const boundSessionId = botmuxBindInjectSession();
+      const agentSessionId = agent && agent.session && agent.session.id;
+      // Bind to the agent that owns THIS process's TUI: a sibling session
+      // mounted in the same process must not settle our turn.
+      if (!agentSessionId || agentSessionId !== boundSessionId) return;
+      reportBotmuxTurnIdle(identity);
+    });
+  } catch {
+    // Event registration is best-effort; readiness keeps working without it.
+  }
+}
+`;
+}
+
+function buildDshTuiWrapperPlugin(parts: HookCommandParts, originalDshTuiUrl: string): string {
+  return `// botmux generated dsh-tui question wrapper v${BRIDGE_VERSION}
+import { spawn } from 'node:child_process';
+import { appendFileSync, readFileSync, statSync, truncateSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import * as original from ${jsonLiteral(originalDshTuiUrl)};
+${buildRuntimeBridgeSnippet(parts, 'dsh-tui')}
+${buildDshTuiStatusSnippet()}
+export const name = original.name;
+export const inject = original.inject;
+export const Config = original.Config;
+function rawService(service) {
+  return service && service[Symbol.for('cordis.original')] || service;
+}
+function isJsExpression(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && typeof value.__jsExpr === 'string';
+}
+function isConfigObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function evaluateJsExpression(ctx, value) {
+  return Function('ctx', 'with (ctx) { return eval(' + JSON.stringify(value.__jsExpr) + '); }')(ctx);
+}
+function resolveDshTuiConfigExpressions(ctx, value) {
+  if (!isJsExpression(value)) return value;
+  return evaluateJsExpression(ctx, value);
+}
+function materializeDshTuiConfig(ctx, config) {
+  if (!isConfigObject(config)) return config;
+  const workspace = resolveDshTuiConfigExpressions(ctx, config.workspace);
+  const preset = resolveDshTuiConfigExpressions(ctx, config.preset);
+  const sessionId = resolveDshTuiConfigExpressions(ctx, config.sessionId);
+  if (Object.is(workspace, config.workspace) && Object.is(preset, config.preset) && Object.is(sessionId, config.sessionId)) {
+    return config;
+  }
+  return { ...config, workspace, preset, sessionId };
+}
+function originalDshTuiConfig(ctx, wrapperConfig) {
+  let originalConfig;
+  try {
+    const entry = [...ctx.loader.entries()].find((candidate) => candidate.options && candidate.options.id === 'dsh-tui');
+    if (entry && entry.options && entry.options.config !== undefined) originalConfig = entry.options.config;
+  } catch {}
+  if (originalConfig !== undefined) return materializeDshTuiConfig(ctx, originalConfig);
+  if (isConfigObject(wrapperConfig) && Object.keys(wrapperConfig).length > 0) return materializeDshTuiConfig(ctx, wrapperConfig);
+  throw new Error('botmux dsh-tui wrapper could not find original dsh-tui config');
+}
+function wrapLegacyProvider(service) {
+  const target = rawService(service);
+  if (!target || typeof target.registerProvider !== 'function') return () => {};
+  const own = Object.getOwnPropertyDescriptor(target, 'registerProvider');
+  const originalRegister = target.registerProvider.bind(target);
+  let used = false;
+  const restore = () => {
+    try {
+      if (own) Object.defineProperty(target, 'registerProvider', own);
+      else delete target.registerProvider;
+    } catch {}
+  };
+  target.registerProvider = (nativeProvider) => {
+    if (used) return originalRegister(nativeProvider);
+    used = true;
+    const composite = {
+      ask: async (request) => {
+        try { return await bridgeAsk(request, () => nativeProvider.ask(request)); }
+        catch (error) { throw error; }
+      },
+    };
+    return originalRegister(composite);
+  };
+  return restore;
+}
+export async function apply(ctx, config) {
+  const effectiveConfig = originalDshTuiConfig(ctx, config);
+  const botmuxSession = isBotmuxSessionEnv(process.env);
+  // Readiness / turn-idle reporting is independent of the question-bridge kill
+  // switch: disabling the bridge must not silently restore the 90s stall.
+  if (botmuxSession) installBotmuxStatusChannel(ctx);
+  if (!botmuxSession || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, effectiveConfig);
+  const service = ctx.get && ctx.get('userQuestions');
+  const legacyRestore = service && typeof service.registerProvider === 'function'
+    ? wrapLegacyProvider(service)
+    : undefined;
+  if (legacyRestore && typeof ctx.effect === 'function') {
+    try { ctx.effect(() => () => legacyRestore(), 'botmux-dsh-tui-question-bridge.legacy-wrap'); } catch {}
+  }
+  if (!legacyRestore) installWaterfallBridge(ctx);
+  try { return await original.apply(ctx, effectiveConfig); }
+  finally { try { legacyRestore && legacyRestore(); } catch {} }
+}
+`;
+}
+
+function buildOrdinaryBridgePatch(pluginUrl: string, hash: string): string {
+  return [
+    '- insert:',
+    `    - id: botmux-dsh-question-bridge-${hash}`,
+    `      name: ${yamlSingleQuoted(pluginUrl)}`,
+    '      inject:',
+    '        - userQuestions',
+    '',
+  ].join('\n');
+}
+
+function buildDshTuiWrapperPatch(pluginUrl: string, hash: string): string {
+  return [
+    '- id: dsh-tui',
+    '  disabled: true',
+    '- insert:',
+    `    - id: botmux-dsh-tui-wrapper-${hash}`,
+    `      name: ${yamlSingleQuoted(pluginUrl)}`,
+    '      inject:',
+    '        - workspaceRegistry',
+    '        - agents',
+    '        - tuiWorkspaces',
+    '        - tuiScenes',
+    '        - tuiDialogs',
+    '        - tuiStatus',
+    '        - tuiShortcuts',
+    '        - tuiRenderers',
+    '        - tuiThemes',
+    '        - userQuestions',
+    '',
+  ].join('\n');
+}
+
+export function ensureDshQuestionBridgePatch(
+  opts: EnsureDshQuestionBridgePatchOptions,
+): DshQuestionBridgePatch | null {
+  if (process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return null;
+  const hook = opts.hookCommand ?? hookCommandParts(opts.cliId);
+  const runtime = opts.cliId === 'dsh-tui' ? 'tui' : 'official';
+  const originalDshTuiUrl = runtime === 'tui'
+    ? resolveOriginalDshTuiEntryUrl(opts.dshTuiProfileDir ?? defaultDshTuiProfileDir(opts.homeDir ?? homedir()))
+    : undefined;
+  if (runtime === 'tui' && !originalDshTuiUrl) return null;
+  const content = runtime === 'tui'
+    ? buildDshTuiWrapperPlugin(hook, originalDshTuiUrl!)
+    : buildOrdinaryBridgePlugin(hook);
+  const salt = opts.buildSalt ?? '';
+  const hash = sha256(JSON.stringify({ version: BRIDGE_VERSION, cliId: opts.cliId, hook, originalDshTuiUrl, salt, content })).slice(0, 16);
+  const bridgeHome = canonicalPath(opts.homeDir ?? homedir());
+  const root = join(bridgeHome, BRIDGE_ROOT_DIR, hash);
+  const pluginPath = join(root, runtime === 'tui' ? 'dsh-tui-wrapper.mjs' : 'bridge.mjs');
+  const pluginUrl = pathToFileURL(pluginPath).href;
+  if (runtime === 'tui' && originalDshTuiUrl === pluginUrl) return null;
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const patchPath = join(root, 'cordis.patch.yml');
+  atomicWriteFileSync(pluginPath, content, { mode: 0o600 });
+  const patch = runtime === 'tui'
+    ? buildDshTuiWrapperPatch(pluginUrl, hash)
+    : buildOrdinaryBridgePatch(pluginUrl, hash);
+  atomicWriteFileSync(patchPath, patch, { mode: 0o600 });
+  return { patchPath, readonlyRoot: root, pluginPath };
+}

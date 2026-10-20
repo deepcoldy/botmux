@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { textSpawnResult } from './helpers/spawn-result.js';
 
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -46,9 +47,8 @@ describe('mtr transcript reader', () => {
 
   it('converts completed MTR messages into bridge events', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({
+    spawnSyncMock.mockReturnValue(textSpawnResult({
       status: 0,
-      stderr: '',
       stdout: JSON.stringify([
         {
           message_id: 'msg_user',
@@ -91,7 +91,7 @@ describe('mtr transcript reader', () => {
           part_data: JSON.stringify({ type: 'text', text: 'hi there' }),
         },
       ]),
-    } as any);
+    }));
     const { drainMtrSession } = await import('../src/services/mtr-transcript.js');
 
     expect(drainMtrSession({ dbPath: '/tmp/mtr-alpha.db', sessionId: 'ses_1' }, 999)).toEqual({
@@ -117,7 +117,7 @@ describe('mtr transcript reader', () => {
 
   it('re-reads a small timestamp overlap to avoid same-ms cursor misses', async () => {
     existsSyncMock.mockReturnValue(true);
-    spawnSyncMock.mockReturnValue({ status: 0, stderr: '', stdout: '[]' } as any);
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 0, stdout: '[]' }));
     const { drainMtrSession } = await import('../src/services/mtr-transcript.js');
 
     expect(drainMtrSession({ dbPath: '/tmp/mtr-alpha.db', sessionId: 'ses_1' }, 10_000)).toEqual({
@@ -134,8 +134,14 @@ describe('mtr transcript reader', () => {
     readdirSyncMock.mockReturnValue(['mtr.db', 'mtr-alpha.db', 'mtr-alpha.db-wal'] as any);
     statSyncMock.mockReturnValue({ isFile: () => true } as any);
     spawnSyncMock
-      .mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ id: 'ses_old', time_updated: 10 }), stderr: '' } as any)
-      .mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ id: 'ses_new', time_updated: 20 }), stderr: '' } as any);
+      .mockReturnValueOnce(textSpawnResult({
+        status: 0,
+        stdout: JSON.stringify({ id: 'ses_old', time_updated: 10 }),
+      }))
+      .mockReturnValueOnce(textSpawnResult({
+        status: 0,
+        stdout: JSON.stringify({ id: 'ses_new', time_updated: 20 }),
+      }));
     const { findLatestMtrSessionByDirectory } = await import('../src/services/mtr-transcript.js');
 
     expect(findLatestMtrSessionByDirectory('/repo', ['/tmp/mtr.db', '/tmp/mtr-alpha.db'])).toEqual({

@@ -20,6 +20,11 @@ import {
   isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readMinimaxUsage } from '../services/minimax-usage.js';
+import { readCursorUsage } from '../services/cursor-usage.js';
+import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -973,7 +978,6 @@ function readCodexTokenAggregateCached(
     };
   };
 
-  let scanned: JsonlCursor;
   let completeBytes: number;
   let previewAgg: TokenUsageAggregate;
   let pendingTailIsInitialResidualLine: boolean;
@@ -986,7 +990,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else if (!oversized) {
     baseOffset = 0;
     const win = scanFromWindow(baseOffset, true);
@@ -995,7 +999,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
     // Oversized cold/bounded read. Fast path: scan the last tail window. Widen
     // ONCE to the back-scan budget and re-scan that whole window when the fast
@@ -1034,7 +1038,7 @@ function readCodexTokenAggregateCached(
         win = widened;
       }
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
@@ -1311,6 +1315,10 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
   }
+  if (q.cliId === 'antigravity') {
+    if (!q.cliSessionId) return null;
+    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
+  }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
   const read = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
@@ -1369,10 +1377,22 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+  if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
   return readSessionUsage(q)?.result ?? null;
 }
 
 export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  if (q.cliId === 'cursor') {
+    return readCursorUsage(cursorConfigDirForBot(q.larkAppId), config.session.dataDir,
+      q.sessionId, q.cliSessionId || q.sessionId, q.fresh, q.pricing);
+  }
+  if (q.cliId === 'minimax') {
+    const resolved = resolveSessionTranscriptPath(q);
+    const snapshot = resolved ? readMinimaxUsage(resolved.path, q.cliSessionId || q.sessionId, q.fresh) : null;
+    const costCny = snapshot?.tokens ? estimateCostCny(snapshot.tokens, q.pricing) : null;
+    return { ...(snapshot ?? { context: null, tokens: null, turnTokens: null }),
+      ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}) };
+  }
   const read = readSessionUsage(q);
   const agg = read?.agg;
   // Per-turn delta only for dialects that track it (Claude family). Codex/coco

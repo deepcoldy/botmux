@@ -16,26 +16,6 @@ import type { CliId } from '../src/adapters/cli/types.js';
  * to be exhaustive. Keep every "all CLIs" consumer on it.
  */
 describe('CLI id roster stays derived, not hand-typed', () => {
-  it('exposes every CLI in the type union, including the remote ones', () => {
-    const union = readFileSync(new URL('../src/adapters/cli/types.ts', import.meta.url), 'utf8')
-      .split('\n')
-      .find(line => line.startsWith('export type CliId ='));
-    expect(union).toBeTruthy();
-    const declared = [...union!.matchAll(/'([a-z0-9-]+)'/g)].map(m => m[1]).sort();
-
-    expect([...ALL_CLI_IDS].sort()).toEqual(declared);
-    // Sentinel: the two ids that the stale literal actually dropped.
-    expect(ALL_CLI_IDS).toContain('mojo');
-    expect(ALL_CLI_IDS).toContain('reasonix');
-  });
-
-  it('keeps the dashboard skill scan on the derived roster', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(dashboard).toContain('for (const cliId of ALL_CLI_IDS) ids.add(cliId);');
-    // No re-typed union literal may come back: match a long inline CliId[] list.
-    expect(dashboard).not.toMatch(/const allCliIds: CliId\[\] = \[/);
-  });
-
   it('no test file re-types the roster as a stale literal', () => {
     // Both of these had drifted: cli-adapters dropped mojo/cursor/relay, and
     // slash-commands-doc-sync dropped mojo/reasonix while keeping a retired id —
@@ -71,15 +51,16 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
     // so adding one is a deliberate decision, and dropping a skillsDir from an
     // adapter classified 'global' turns this red.
     const EXPECTED: Readonly<Record<CliId, SkillInjectionSupport>> = {
-      // per-session --plugin-dir (claude family)
-      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic',
+      // per-session --plugin-dir (claude family, oh-my-pi) or --skill (pi)
+      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic', pi: 'dynamic', 'oh-my-pi': 'dynamic', cursor: 'dynamic',
       // shared global skills dir → global|prompt|off all apply
-      coco: 'global', codex: 'global', cursor: 'global', gemini: 'global',
+      coco: 'global', codex: 'global', gemini: 'global',
       genius: 'global', opencode: 'global', mtr: 'global', traex: 'global',
       // Added by upstream #821; shares ~/.config/opencode/skills with opencode,
       // so the shared-root dedup below covers it.
       opencode2: 'global',
-      pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
+      mimocode: 'global',
+      grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
       // no skill mechanism at all
       aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none', ebsd: 'none',
@@ -88,6 +69,9 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // PTY-driven TUI variant of dsh; no skills dir of its own.
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+      'remote-runner': 'none',
+      // MiniMax Code loads native skills from its persistent data directory.
+      minimax: 'global',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes

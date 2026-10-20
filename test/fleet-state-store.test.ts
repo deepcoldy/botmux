@@ -10,7 +10,10 @@ function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-state-')); 
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
 const state = (procs = [freshProc('botmux-0', 'cli_a', 100, 'T')]): FleetState =>
-  ({ supervisorPid: 42, supervisorStartedAt: 'T', procs });
+  ({
+    supervisorPid: 42, supervisorStartedAt: 'T', supervisorProcessStart: 'boot:123',
+    supervisorPidNamespace: 'pid:[100]', supervisorCommand: '/opt/botmux __supervisor', procs,
+  });
 
 describe('fleet-state-store', () => {
   it('returns null for an absent file', () => {
@@ -22,6 +25,9 @@ describe('fleet-state-store', () => {
     writeFleetState(p, state());
     const back = readFleetState(p)!;
     expect(back.supervisorPid).toBe(42);
+    expect(back.supervisorProcessStart).toBe('boot:123');
+    expect(back.supervisorPidNamespace).toBe('pid:[100]');
+    expect(back.supervisorCommand).toBe('/opt/botmux __supervisor');
     expect(back.procs).toHaveLength(1);
     expect(back.procs[0]).toMatchObject({ name: 'botmux-0', appId: 'cli_a', pid: 100, status: 'online' });
   });

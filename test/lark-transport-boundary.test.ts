@@ -15,11 +15,24 @@ const getBotMock = vi.fn();
 // A fake Lark client whose calls would resolve — so if the gate DIDN'T fire, the
 // primitive would "succeed" and the test's rejects.toThrow would fail.
 const fakeClient = {
+  request: vi.fn(async () => ({ code: 0 })),
   im: {
     v1: {
-      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })) },
+      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })), forward: vi.fn(async () => ({ code: 0, data: { message_id: 'om_fwd' } })) },
       pin: { create: vi.fn(async () => ({ code: 0 })), delete: vi.fn(async () => ({ code: 0 })) },
       messageReaction: { create: vi.fn(async () => ({ code: 0, data: { reaction_id: 'r' } })), delete: vi.fn(async () => ({ code: 0 })) },
+    },
+  },
+  cardkit: {
+    v1: {
+      card: {
+        idConvert: vi.fn(async () => ({ code: 0, data: { card_id: 'card_x' } })),
+        settings: vi.fn(async () => ({ code: 0 })),
+      },
+      cardElement: {
+        content: vi.fn(async () => ({ code: 0 })),
+        patch: vi.fn(async () => ({ code: 0 })),
+      },
     },
   },
 };
@@ -42,8 +55,10 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => {
 });
 
 import {
-  sendMessage, replyMessage, updateMessage, deleteMessage,
+  sendMessage, replyMessage, forwardMessage, updateMessage, deleteMessage,
   pinMessage, unpinMessage,
+  resolveCardKitId, updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
+  urgentMessage,
   addReaction, removeReaction, sendUserMessage, sendEphemeralCard,
   deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
@@ -63,7 +78,19 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     getBotMock.mockReturnValue(bot(true));
     await expect(sendMessage(APIONLY, 'oc', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(replyMessage(APIONLY, 'om', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(urgentMessage(APIONLY, 'om', ['ou_x'])).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(forwardMessage(APIONLY, 'om', 'oc')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateMessage(APIONLY, 'om', '{}')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(resolveCardKitId(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(updateCardStreamingSettings(APIONLY, 'card', {
+      streamingMode: true, sequence: 1, uuid: 'u',
+    })).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(updateCardStreamElementContent(
+      APIONLY, 'card', 'main', 'text', 2, 'u2',
+    )).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(patchCardStreamElement(
+      APIONLY, 'card', 'loader', { img_key: 'img_x' }, 3, 'u3',
+    )).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(deleteMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(pinMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(unpinMessage(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
@@ -81,8 +108,60 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
   it('a normal bot is unaffected — sendMessage/updateMessage proceed to the client', async () => {
     getBotMock.mockReturnValue(bot(false));
     await expect(sendMessage(NORMAL, 'oc', 'hi')).resolves.toBeDefined();
+    await expect(forwardMessage(NORMAL, 'om', 'oc')).resolves.toBe('om_fwd');
     await expect(updateMessage(NORMAL, 'om', '{}')).resolves.toBeUndefined();
+    await expect(resolveCardKitId(NORMAL, 'om')).resolves.toBe('card_x');
+    await expect(updateCardStreamingSettings(NORMAL, 'card_x', {
+      streamingMode: true,
+      sequence: 1,
+      uuid: 'u1',
+      print: { frequencyMs: 70, step: 1, strategy: 'fast' },
+    })).resolves.toBeUndefined();
+    await expect(updateCardStreamElementContent(
+      NORMAL, 'card_x', 'main', 'text', 2, 'u2',
+    )).resolves.toBeUndefined();
+    await expect(patchCardStreamElement(
+      NORMAL, 'card_x', 'loader', { img_key: 'img_x' }, 3, 'u3',
+    )).resolves.toBeUndefined();
     expect(fakeClient.im.v1.message.create).toHaveBeenCalled();
+    expect(fakeClient.im.v1.message.forward).toHaveBeenCalledWith({
+      path: { message_id: 'om' },
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: 'oc' },
+    });
     expect(fakeClient.im.v1.message.patch).toHaveBeenCalled();
+    expect(fakeClient.cardkit.v1.card.idConvert).toHaveBeenCalledWith({ data: { message_id: 'om' } });
+    expect(fakeClient.cardkit.v1.card.settings).toHaveBeenCalledWith({
+      path: { card_id: 'card_x' },
+      data: {
+        settings: JSON.stringify({
+          config: {
+            streaming_mode: true,
+            streaming_config: {
+              print_frequency_ms: { default: 70 },
+              print_step: { default: 1 },
+              print_strategy: 'fast',
+            },
+          },
+        }),
+        sequence: 1,
+        uuid: 'u1',
+      },
+    });
+    expect(fakeClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
+      path: { card_id: 'card_x', element_id: 'main' },
+      data: { content: 'text', sequence: 2, uuid: 'u2' },
+    });
+    expect(fakeClient.cardkit.v1.cardElement.patch).toHaveBeenCalledWith({
+      path: { card_id: 'card_x', element_id: 'loader' },
+      data: { partial_element: JSON.stringify({ img_key: 'img_x' }), sequence: 3, uuid: 'u3' },
+    });
+  });
+
+  it('returns an available successful patch timestamp without inventing one for empty acknowledgements', async () => {
+    getBotMock.mockReturnValue(bot(false));
+    fakeClient.im.v1.message.patch.mockResolvedValueOnce({ code: 0, data: { update_time: '1791280000456' } } as any);
+    await expect(updateMessage(NORMAL, 'om', '{}', true)).resolves.toEqual({ update_time: '1791280000456' });
+    await expect(updateMessage(NORMAL, 'om', '{}')).resolves.toBeUndefined();
   });
 });

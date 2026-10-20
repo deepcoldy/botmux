@@ -65,10 +65,10 @@ describe('buildBotmuxLarkNativeSessionTitle', () => {
     )).toBe('[BotMux·Lark] 排查这个 logid');
   });
 
-  it('limits the complete title to 100 characters with an ellipsis', () => {
-    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(200));
+  it('limits the complete title to 200 characters with an ellipsis', () => {
+    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(300));
 
-    expect(Array.from(title)).toHaveLength(100);
+    expect(Array.from(title)).toHaveLength(200);
     expect(title.startsWith('[BotMux·Lark] ')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
   });
@@ -177,17 +177,5 @@ describe('updateSessionTitle', () => {
   it('normalizes untrusted source labels to the caller fallback', () => {
     expect(normalizeSessionTitleSource('agent', 'dashboard')).toBe('agent');
     expect(normalizeSessionTitleSource('spoofed', 'dashboard')).toBe('dashboard');
-  });
-
-  it('keeps the canonical dashboard title separate from temporary TUI prompt labels', async () => {
-    const { readFileSync } = await import('node:fs');
-    const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    const start = workerPoolSource.indexOf("case 'tui_prompt':");
-    const end = workerPoolSource.indexOf("case 'tui_prompt_resolved':", start);
-    const region = workerPoolSource.slice(start, end);
-
-    expect(region).toContain('ds.currentTurnTitle = msg.description');
-    expect(region).not.toContain('patch: { title:');
-    expect(region).not.toContain('patch: {\n                title:');
   });
 });

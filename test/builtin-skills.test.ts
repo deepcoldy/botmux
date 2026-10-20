@@ -25,6 +25,7 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('只有 `--card-json` / `--card-file` 的卡片输入才按 JSON 解析');
     expect(skill!.content).toContain('JSON.stringify');
     expect(skill!.content).toContain('外层工具协议会自行编码命令字符串');
+    expect(skill!.content).toContain('字面量 `\\n\\n` 还原为段落空行');
     expect(skill!.content).toContain('字面量 `\\n` 反解成换行');
   });
 
@@ -66,6 +67,27 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('使用 `botmux ask`');
     expect(skill!.content).toContain('不要在普通回复里画不能点击的按钮');
     expect(skill!.content).not.toContain('纯文本走普通消息');
+  });
+});
+
+describe('built-in botmux-session-rename skill', () => {
+  it('is registered and teaches the self-scoped rename command + naming rules', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-session-rename');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux session rename');
+    // No escape hatch to target another session.
+    expect(skill!.content).toContain('--session-id');
+    // Naming convention + examples + stability rules.
+    expect(skill!.content).toContain('类型｜具体事项');
+    expect(skill!.content).toContain('排障｜支付链路超时');
+    expect(skill!.content).toContain('开发｜权限黑名单');
+    expect(skill!.content).toMatch(/阶段/);
+    // Distinct from the whole-chat rename skill.
+    expect(skill!.content).toContain('botmux-chat-rename');
+    expect(skill!.content).toContain('群名');
+    // Feishu thread titles are not changeable; only the botmux/Dashboard title is.
+    expect(skill!.content).toMatch(/omt|话题/);
+    expect(skill!.content).toContain('Dashboard');
   });
 });
 

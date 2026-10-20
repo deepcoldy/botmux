@@ -47,10 +47,6 @@ export function pluginServiceStatePath(pluginId: string): string {
   return join(pluginHome(pluginId), 'service.json');
 }
 
-export function pluginServicePm2ConfigPath(pluginId: string): string {
-  return join(pluginHome(pluginId), 'service.pm2.json');
-}
-
 export function pluginMaterializedPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'materialized.json');
 }

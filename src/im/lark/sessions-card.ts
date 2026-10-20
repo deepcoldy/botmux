@@ -30,6 +30,7 @@ import { type Locale, t } from '../../i18n/index.js';
 
 import { terminalMultiUrl } from './card-builder.js';
 import type { CardActionData } from './card-handler.js';
+import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
 export const SESSIONS_ACTION_REFRESH = 'dash_sessions_refresh' as const;
 export const SESSIONS_ACTION_PAGE = 'dash_sessions_page' as const;
@@ -40,20 +41,8 @@ export const SESSIONS_ACTION_BACK_TO_LIST = 'dash_sessions_back_to_list' as cons
 export const SESSIONS_ACTION_LOCATE = 'dash_sessions_locate' as const;
 /** Replaces close when status === 'closed'; refetches after resume. */
 export const SESSIONS_ACTION_RESUME = 'dash_sessions_resume' as const;
-/** Action emitted by the "🔙 返回总览" button on overview-origin sub-cards.
- *  Same string as overview-card's OVERVIEW_ACTION_REFRESH (avoids a circular
- *  import). card-handler routes by action prefix, so dispatch lands on the
- *  overview handler regardless of which sub-card emitted it. */
-const BACK_TO_OVERVIEW_ACTION = 'dash_overview_refresh' as const;
 
-/** Default page size for standalone and overview-drilldown list cards. */
-const PAGE_SIZE = 5;
 const MAX_PAGE_SIZE = 100;
-
-/** Hard cap on `select_static` option count for the "jump to page" picker.
- *  Lark caps select options around this; we also keep payload small. Above
- *  the cap we fall back to prev/next only. */
-const JUMP_PAGE_MAX_OPTIONS = 50;
 
 /** Mapping from `StatusDot.tone` to a stable colour-emoji prefix. Pure. */
 function toneIcon(tone: string): string {
@@ -71,7 +60,7 @@ function displayStatusLabel(status: string, locale: Locale): string {
 }
 
 function clampPageSize(pageSize: number | undefined): number {
-  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return PAGE_SIZE;
+  if (typeof pageSize !== 'number' || !Number.isFinite(pageSize) || pageSize <= 0) return DASH_PAGE_SIZE;
   return Math.min(Math.floor(pageSize), MAX_PAGE_SIZE);
 }
 
@@ -107,7 +96,7 @@ export function buildSessionsCard(
   // page/detail/detail-back rebuilds keep the same dashboard context.
   const navFields: Record<string, string> = {};
   if (opts.origin === 'overview') navFields.origin = 'overview';
-  if (effectivePageSize !== PAGE_SIZE) navFields.page_size = String(effectivePageSize);
+  if (effectivePageSize !== DASH_PAGE_SIZE) navFields.page_size = String(effectivePageSize);
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
   const activeCount = sorted.filter(e => e.status !== 'closed').length;
@@ -399,7 +388,7 @@ export function buildSessionsDetailCard(
   if (typeof opts.sourcePage === 'number' && Number.isFinite(opts.sourcePage) && opts.sourcePage >= 1) {
     backNav.page = String(Math.floor(opts.sourcePage));
   }
-  if (effectivePageSize !== PAGE_SIZE) backNav.page_size = String(effectivePageSize);
+  if (effectivePageSize !== DASH_PAGE_SIZE) backNav.page_size = String(effectivePageSize);
   if (opts.scope === 'global') backNav.dashboard_scope = 'global';
   // Track reason notes to render below the action row in row order.
   const reasonNotes: { key: string; titleKey?: string }[] = [];
@@ -619,27 +608,6 @@ function formatRelativeForDetail(fromMs: number, nowMs: number): string {
   return `${day}d ago`;
 }
 
-/**
- * Sanitize user/filesystem-supplied text for inclusion in a Lark `lark_md`
- * element — particularly inside our `<font color="grey">…</font>` wrapper.
- *
- * Session titles come from chat content and workingDir comes from the
- * filesystem. Both flow into a span we wrap with `<font>`; without escaping, a payload containing
- * `</font><at id=ou_x></at>` would close our wrapper and inject a
- * @mention-looking element. We also need to handle `*_~\``-style markdown
- * controls so plain filenames don't render as bold/italic.
- *
- * Order matters: escape `&` FIRST so a later `<` → `&lt;` doesn't get
- * re-encoded as `&amp;lt;`.
- */
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
-}
-
 /** ─── Handler ─────────────────────────────────────────────────────────── */
 
 export interface SessionsCardHandlerDeps {
@@ -654,20 +622,7 @@ export interface SessionsCardHandlerDeps {
   nowMs?: () => number;
 }
 
-export interface SessionsCardHandlerResult {
-  /** Optional — success returns ONLY a `card` (single-pass render). Errors,
-   *  permission denials still return a toast (no card to render). */
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
-
-function ackToast(textKey: string, locale: Locale): SessionsCardHandlerResult {
-  return { toast: { type: 'info', content: t(textKey, undefined, locale) } };
-}
-
-function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SessionsCardHandlerResult {
-  return { toast: { type: 'error', content: t(textKey, params, locale) } };
-}
+export type SessionsCardHandlerResult = DashCardHandlerResult;
 
 /**
  * Dispatch a `dash_sessions_*` action callback. Awaits the Route B GET
@@ -862,6 +817,12 @@ export async function handleSessionsCardAction(
           locale,
         ),
       });
+    }
+    if (body.archiveError) {
+      const elements = Array.isArray((card as { elements?: unknown }).elements)
+        ? (card as { elements: unknown[] }).elements : undefined;
+      elements?.unshift({ tag: 'markdown', content: t('card.dashboard.sessions.codex_archive_failed',
+        { detail: String(body.archiveError) }, locale) });
     }
     return { card: { type: 'raw', data: card } };
   }

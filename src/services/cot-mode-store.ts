@@ -18,7 +18,7 @@ import { logger } from '../utils/logger.js';
 
 /**
  * Toggle the CoT-message switch for a chat. `off=true` suppresses the thinking
- * bubble; `off=false` restores it (subject to the bot-level `thinkingCard`
+ * bubble; `off=false` restores it (subject to the bot-level `cotEnabled`
  * master switch). `changed` reports whether the set actually moved (idempotent
  * re-toggles return false).
  */

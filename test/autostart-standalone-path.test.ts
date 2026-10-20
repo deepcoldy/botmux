@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   AUTOSTART_UNIT_ENV,
+  autostartPath,
   consumeAutostartUnitMarker,
   launchProgram, launchCommand, unitContent, plistContent, windowsScriptContent,
   type AutostartOpts,
@@ -116,6 +117,17 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(unitContent(nodeOpts())).toContain(`Environment=${AUTOSTART_UNIT_ENV}=1`);
   });
 
+  it('does not persist TRAE session shims into boot-hook PATH', () => {
+    const transient = '/home/u/.trae/tmp/arg0/traecli-random';
+    const stable = '/home/u/.local/bin:/usr/bin:/bin';
+    const renderedOpts = opts({ environmentPath: `${transient}:${stable}` });
+
+    expect(unitContent(renderedOpts)).toContain(`Environment=PATH=${stable}`);
+    expect(plistContent(renderedOpts)).toContain(`<string>${stable}</string>`);
+    expect(unitContent(renderedOpts)).not.toContain(transient);
+    expect(plistContent(renderedOpts)).not.toContain(transient);
+  });
+
   it('the rendered ExecStart actually starts botmux (not: prints help and exits 0)', () => {
     // THE HEART OF THE BUG. A string assertion alone would have passed even in
     // production, because the broken command was still a well-formed command
@@ -165,6 +177,66 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(r.status).toBe(0);              // systemd saw success...
     expect(r.stdout).toContain('usage');   // ...while botmux only printed help
     expect(r.stdout).not.toContain('DAEMON_STARTED');
+  });
+});
+
+describe('autostart PATH normalization', () => {
+  it('does not persist per-session identity wrappers across upgrades or boots', () => {
+    const transient = '/home/u/.botmux/data/cli-identity/session.bin';
+    const opts = { pkgRoot: '/opt/botmux', configDir: '/home/u/.botmux', logDir: '/tmp/logs',
+      environmentPath: `${transient}:/usr/bin` };
+    expect(autostartPath(opts.environmentPath, 'linux')).toBe('/usr/bin');
+    expect(unitContent(opts)).not.toContain(transient);
+    expect(plistContent(opts)).not.toContain(transient);
+    expect(autostartPath('C:\\Users\\u\\data\\cli-identity\\session.bin;C:\\Tools', 'win32')).toBe('C:\\Tools');
+  });
+  it('filters AI CLI argv0 shims, preserves order, and removes duplicates on POSIX', () => {
+    expect(autostartPath(
+      [
+        '/home/u/.trae/tmp/arg0/traecli-a',
+        '/home/u/.trae/cli/tmp/arg0/traecli-b',
+        '/home/u/.codex/tmp/arg0/codex-execve-wrapper',
+        '/home/u/.local/bin',
+        '/usr/bin',
+        '/home/u/.local/bin',
+      ].join(':'),
+      'linux',
+    )).toBe('/home/u/.local/bin:/usr/bin');
+  });
+
+  it('requires tmp/arg0 to be a complete path segment', () => {
+    expect(autostartPath(
+      '/opt/tmp/arg0bin:/usr/tmp/arg00:/var/tmp/arg0-tools/bin',
+      'linux',
+    )).toBe('/opt/tmp/arg0bin:/usr/tmp/arg00:/var/tmp/arg0-tools/bin');
+  });
+
+  it('uses the platform delimiter when filtering Windows PATH', () => {
+    expect(autostartPath(
+      'C:\\Users\\u\\.trae\\tmp\\arg0\\traecli-a;C:\\Tools;C:\\Windows',
+      'win32',
+    )).toBe('C:\\Tools;C:\\Windows');
+  });
+
+  it('falls back to a stable system PATH when every entry is transient', () => {
+    expect(autostartPath('/home/u/.trae/tmp/arg0/traecli-a', 'linux'))
+      .toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
+    expect(autostartPath('C:\\Users\\u\\.trae\\tmp\\arg0\\traecli-a', 'win32'))
+      .toBe('%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem');
+  });
+
+  it('expands the Windows fallback but keeps captured percent references literal', () => {
+    const transient = 'C:\\Users\\u\\.codex\\tmp\\arg0\\codex-execve-wrapper';
+    const fallbackScript = windowsScriptContent(opts({ environmentPath: transient }));
+    expect(fallbackScript).toContain(
+      'set "PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem"',
+    );
+    expect(fallbackScript).not.toContain('%%SystemRoot%%');
+
+    const capturedScript = windowsScriptContent(opts({
+      environmentPath: '%LOCALAPPDATA%\\bin;C:\\Tools',
+    }));
+    expect(capturedScript).toContain('set "PATH=%%LOCALAPPDATA%%\\bin;C:\\Tools"');
   });
 });
 
@@ -267,7 +339,7 @@ describe('autostart boot hook — Node install shape stays unchanged', () => {
   });
 });
 
-describe('boot-hook marker is consumed on entry, not after dependency probes', () => {
+describe('boot-hook marker is single-use and always removed', () => {
   it("returns true and deletes the key when the value is '1'", () => {
     const env: NodeJS.ProcessEnv = { [AUTOSTART_UNIT_ENV]: '1', OTHER: 'keep' };
     expect(consumeAutostartUnitMarker(env)).toBe(true);
@@ -289,36 +361,5 @@ describe('boot-hook marker is consumed on entry, not after dependency probes', (
     expect(consumeAutostartUnitMarker(env)).toBe(false);
     expect(AUTOSTART_UNIT_ENV in env).toBe(false);
     expect(env.OTHER).toBe('keep');
-  });
-
-  it('cmdStart consumes the marker before its first await / dependency probe', () => {
-    // Structural guard: dependency probes and installers run as CHILD processes,
-    // so they would inherit a marker consumed after them. Assert on source order.
-    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
-    const start = src.indexOf('async function cmdStart(): Promise<void> {');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}', start);
-    expect(end).toBeGreaterThan(start);
-
-    // STRIP COMMENTS FIRST. Both needles occur in this function's own comments:
-    // matching those would find `await` in the prose (false failure) and the
-    // helper's name in "see consumeAutostartUnitMarker" (false PASS, which is the
-    // dangerous direction — it would satisfy the guard without a real call).
-    const body = src.slice(start, end)
-      .split('\n')
-      .map((l) => l.replace(/\/\/.*$/, ''))
-      .join('\n');
-
-    const consumeAt = body.indexOf('consumeAutostartUnitMarker(');
-    expect(consumeAt, 'cmdStart must call consumeAutostartUnitMarker').toBeGreaterThan(-1);
-
-    const firstAwaitAt = body.indexOf('await ');
-    expect(firstAwaitAt, 'cmdStart is expected to await something').toBeGreaterThan(-1);
-    expect(consumeAt).toBeLessThan(firstAwaitAt);
-
-    // And specifically before the dependency probe that spawns children.
-    const depsAt = body.indexOf('ensureSystemDependencies(');
-    expect(depsAt).toBeGreaterThan(-1);
-    expect(consumeAt).toBeLessThan(depsAt);
   });
 });

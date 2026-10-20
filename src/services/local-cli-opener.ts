@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
+import { decorateResumeForCliLaunchMode } from '../core/cli-launch-mode.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
@@ -21,6 +22,7 @@ export const LOCAL_CLI_IDS = [
   'genius',
   'opencode',
   'opencode2',
+  'mimocode',
   'antigravity',
   'mtr',
   'hermes',
@@ -47,6 +49,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'genius': 'genius --resume',
   'opencode': 'opencode -s',
   'opencode2': 'opencode2 -s',
+  'mimocode': 'mimo -s',
   'antigravity': 'agy --conversation',
   'mtr': 'mtr --session',
   'hermes': 'hermes --resume',
@@ -275,8 +278,8 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     }
     return { ok: true, command: `herdr session attach ${shellQuote(target.sessionName)}` };
   }
-  if (backendType === 'zmx') {
-    const socketEnv = ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR']
+  if (target.backendType === 'zmx') {
+    const socketEnv = (target.socketDir === undefined ? ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR'] : [])
       .flatMap((key) => process.env[key] ? [`export ${key}=${shellQuote(process.env[key]!)}`] : []);
     const prelude = [
       'unset ZMX_SESSION ZMX_SESSION_PREFIX',
@@ -288,6 +291,7 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
       '__zmx-attach-managed',
       shellQuote(target.sessionName),
       shellQuote(ds.session.sessionId),
+      ...(target.socketDir !== undefined ? [shellQuote(target.socketDir)] : []),
     ].join(' ');
     return {
       ok: true,
@@ -350,8 +354,10 @@ function buildLocalCliResumeCommand(
   const quotedResumeCommand = quoteKnownResumeCommand(cliId, rawResume);
   if (!quotedResumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
   const resumeCommand = replaceFrozenResumeExecutable(cliId, quotedResumeCommand, runtimeExecutable);
+  const launchMode = ds.session.cliLaunchMode ?? ds.initConfig?.cliLaunchMode;
+  const decoratedResumeCommand = decorateResumeForCliLaunchMode(resumeCommand, launchMode);
 
-  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
+  return { ok: true, command: `cd ${shellQuote(workingDir)} && ${decoratedResumeCommand}` };
 }
 
 /** Pure preflight for local CLI opening. It performs the same attach/resume

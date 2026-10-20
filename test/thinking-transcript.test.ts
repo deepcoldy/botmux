@@ -55,7 +55,7 @@ describe('extractAssistantThinking', () => {
 });
 
 describe('extractCotEntries', () => {
-  it('extracts thinking and tool_use blocks in content order', () => {
+  it('extracts thinking, text and tool_use blocks in content order', () => {
     const ev: TranscriptEvent = {
       type: 'assistant',
       uuid: 'a1',
@@ -68,9 +68,12 @@ describe('extractCotEntries', () => {
         ],
       },
     };
+    // The text block travels too: it is the model's narration, and with
+    // extended thinking off it is the ONLY prose the bubble would ever get.
     expect(extractCotEntries(ev)).toEqual([
       { kind: 'thinking', text: 'need to list files' },
-      { kind: 'tool_call', id: 'toolu_1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_call', id: 'toolu_1', name: 'Bash', args: '{"command":"ls"}', subject: 'ls' },
+      { kind: 'text', text: 'visible answer' },
     ]);
   });
 
@@ -110,8 +113,50 @@ describe('extractCotEntries', () => {
     expect(result.result.endsWith('…')).toBe(true);
   });
 
-  it('returns [] for plain text events', () => {
-    expect(extractCotEntries(textEvent('a1', 'hi'))).toEqual([]);
+  it('extracts plain text events as narration entries', () => {
+    expect(extractCotEntries(textEvent('a1', 'hi'))).toEqual([{ kind: 'text', text: 'hi' }]);
+  });
+
+  it('skips blank text blocks — an empty node would be a gap in the bubble', () => {
+    expect(extractCotEntries(textEvent('a1', '   \n  '))).toEqual([]);
+  });
+
+  /**
+   * `subject` 在 args 截断**之前**从完整 input 上提取：气泡标题是唯一载体，
+   * 截断后的 JSON 解析不出长命令 / 大 content 的 Write 路径。
+   */
+  describe('subject (title carrier) taken before the args cut', () => {
+    const toolUse = (name: string, input: unknown): any => extractCotEntries({
+      type: 'assistant', uuid: 'a1',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name, input } as any] },
+    })[0];
+
+    it('keeps the FULL command even though args are cut at 600 chars', () => {
+      const command = `echo ${'x'.repeat(695)}`;
+      expect(command.length).toBe(700);
+      const call = toolUse('Bash', { command });
+      expect(call.args.length).toBe(601); // 600 + '…'
+      expect(call.subject).toBe(command);
+    });
+
+    it('Write: the path is the subject even when content dwarfs it', () => {
+      const call = toolUse('Write', { file_path: '/a/b/module.ts', content: 'x'.repeat(2000) });
+      expect(call.args.endsWith('…')).toBe(true);
+      expect(call.subject).toBe('/a/b/module.ts');
+    });
+
+    it('omits the key entirely when no priority field is present', () => {
+      const call = toolUse('TaskUpdate', { taskId: '1', status: 'done' });
+      expect(call).toEqual({ kind: 'tool_call', id: 'toolu_1', name: 'TaskUpdate', args: '{"taskId":"1","status":"done"}' });
+      expect('subject' in call).toBe(false);
+    });
+
+    it('bounds the subject at the transport cap (1000 + ellipsis)', () => {
+      const call = toolUse('Bash', { command: 'y'.repeat(1500) });
+      expect(call.subject.length).toBe(1001);
+      expect(call.subject.endsWith('…')).toBe(true);
+      expect(call.subject.startsWith('y'.repeat(1000))).toBe(true);
+    });
   });
 });
 

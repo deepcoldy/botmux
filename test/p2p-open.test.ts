@@ -3,7 +3,6 @@
  * Run: pnpm vitest run test/p2p-open.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -12,6 +11,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import { canTalk, canOperate, evaluateTalk } from '../src/im/lark/event-dispatcher.js';
+import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { sessionKey } from '../src/core/types.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 
 describe('p2pOpen', () => {
   beforeEach(() => {
@@ -71,18 +73,47 @@ describe('p2pOpen', () => {
     expect(canOperate('p3', 'oc_group', 'ou_anyone')).toBe(false);
   });
 
-  it('Saved Workflow 的独立 quota 闸把 chatType 传进 canTalk 复查', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function handleV3SavedWorkflowCommandIfAny(');
-    const end = source.indexOf('async function replyInvalidWorkingDirs(', start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const block = source.slice(start, end);
-    // 只钉住 chatType 确实被传进这道复查（漏了它，p2pOpen 放行的私聊会在这里被丢掉）。
-    // 不锁它是不是最后一个实参——后面又追加了 botSender（bot 发送方走 evaluateBotTalk），
-    // 把「参数列表到此为止」写进断言只会让每次加参数都误报。
-    expect(block).toMatch(
-      /consumeMessageQuotaOnce:\s*\(\)\s*=>\s*enforceMessageQuotaForCliInput\([\s\S]*memberUnionId,\s*chatType,/,
-    );
+  // /quote 的 confirm 按钮能触发真实 CLI turn（sendWorkerInput / forkWorker），所以点击时要现场复查权限：
+  // 与命令入口同一个谓词 canRunDaemonCommand('/quote')、带上 ds.chatType（漏了它 p2pOpen 腿失效），
+  // operator 缺失时 fail-closed。会话设成 busy：过了权限闸就停在「忙」提示，不会去拉话题、碰网络。
+  describe('/quote confirm 点击时的权限复查', () => {
+    const loc = () => localeForBot('p1');
+    const quoteSession = (chatType: 'p2p' | 'group', chatId: string) => ({
+      chatId, chatType, session: { sessionId: 'quote-session' },
+      worker: { killed: false }, lastScreenStatus: 'working',
+    });
+    const clickConfirm = (ds: ReturnType<typeof quoteSession>, operatorOpenId: string | undefined, invokerOpenId?: string) => {
+      const activeSessions = new Map([[sessionKey('om_quote_root', 'p1'), ds]]);
+      return handleCardAction({
+        ...(operatorOpenId ? { operator: { open_id: operatorOpenId } } : {}),
+        action: { value: {
+          action: 'quote_confirm', chat_id: ds.chatId, root_id: 'om_quote_root',
+          container_id: 'omt_quoted', invoker_open_id: invokerOpenId,
+        } },
+      } as any, { activeSessions, sessionReply: vi.fn(), lastRepoScan: new Map() } as any, 'p1');
+    };
+    const toast = (key: string) => t(key, undefined, loc());
+
+    it('operator 缺失或不是召唤者时 fail-closed', async () => {
+      const ds = quoteSession('p2p', 'oc_dm');
+      expect((await clickConfirm(ds, undefined))?.toast?.content).toBe(toast('card.quote.toast_not_invoker'));
+      expect((await clickConfirm(ds, 'ou_stranger', 'ou_owner'))?.toast?.content).toBe(toast('card.quote.toast_not_invoker'));
+    });
+
+    it('/quote 交给 talk-only 时，私聊陌生人（p2pOpen）能通过复查——chatType 与命令名都传对了', async () => {
+      getBot('p1').config.canTalkDaemonCommands = ['/quote'];
+      const result = await clickConfirm(quoteSession('p2p', 'oc_dm'), 'ou_stranger', 'ou_stranger');
+      expect(result?.toast?.content).toBe(toast('card.quote.toast_busy'));
+    });
+
+    it('/quote 没交给 talk-only、或在未放开的群里时，陌生人点确认被拒', async () => {
+      expect((await clickConfirm(quoteSession('p2p', 'oc_dm'), 'ou_stranger', 'ou_stranger'))?.toast?.content)
+        .toBe(toast('card.quote.toast_need_auth'));
+      getBot('p1').config.canTalkDaemonCommands = ['/quote'];
+      expect((await clickConfirm(quoteSession('group', 'oc_group'), 'ou_stranger', 'ou_stranger'))?.toast?.content)
+        .toBe(toast('card.quote.toast_need_auth'));
+      expect((await clickConfirm(quoteSession('group', 'oc_group'), 'ou_owner', 'ou_owner'))?.toast?.content)
+        .toBe(toast('card.quote.toast_busy'));
+    });
   });
 });

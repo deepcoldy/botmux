@@ -17,8 +17,10 @@ import {
   filterRoleGroups,
   filterRoleProfiles,
   formatListenerPreviewTime,
+  hashBotId,
   hashChatId,
   isValidProfileId,
+  mergeListenerContentPolicy,
   previewMessageListener,
   runMessageListenerPreview,
   saveInjectMode,
@@ -90,6 +92,16 @@ describe('team federation helpers', () => {
   });
 });
 
+describe('message listener content policy helpers', () => {
+  it('preserves keywords when the title-resolution checkbox is toggled', () => {
+    const withKeywords = mergeListenerContentPolicy(undefined, { includeKeywords: ['智能纪要'] });
+    expect(mergeListenerContentPolicy(withKeywords, {
+      includeKeywords: [...(withKeywords.includeKeywords ?? [])],
+      resolveDocumentTitles: true,
+    })).toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
+  });
+});
+
 describe('roles helpers', () => {
   const groups: GroupInfo[] = [{
     chatId: 'oc_chat_a',
@@ -108,6 +120,8 @@ describe('roles helpers', () => {
     expect(isValidProfileId('bad space')).toBe(false);
     expect(hashChatId('#/roles/profile?chatId=oc_chat_a')).toBe('oc_chat_a');
     expect(hashChatId('#/roles/profile?chatId=')).toBeNull();
+    expect(hashBotId('#/roles?chatId=oc_chat_a&botId=cli_a')).toBe('cli_a');
+    expect(hashBotId('#/roles?chatId=oc_chat_a')).toBeNull();
   });
 
   it('filters groups/profiles and counts only bots currently in chat', () => {

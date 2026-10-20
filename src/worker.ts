@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
+import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
+import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
+import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import { GOAL_ENV } from './workflows/v3/contract.js';
+import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
  * Forked by the daemon, communicates via Node.js IPC.
@@ -12,11 +19,16 @@
  *   6. On 'close', kills CLI and exits
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
-import { createHash, randomBytes } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
+import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
+import { tokenStoreProtection } from './services/trigger-user-auth.js';
+import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -29,6 +41,7 @@ import {
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
+  resolveReadIsolationPaneProbe,
   executePersistentPaneMigration,
   type PersistentPaneMigrationEffects,
   persistentTeardownKillKind,
@@ -56,23 +69,30 @@ import {
 } from './core/terminal-write-frame.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
+import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  firstPromptSeedStillWaiting,
+  resolveReadySignalTimeoutMs,
+  shouldArmFirstPromptTimeoutPromptSeed,
   shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  screenShowsFramedPrompt,
   POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
@@ -83,7 +103,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
+import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
   parseReadOnlyRemoteScrollPayload,
@@ -91,9 +111,24 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
-import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
+import {
+  formatMobileInputModeOsc,
+  getWebTerminalInputMode,
+  MOBILE_INPUT_MODE_OSC_REGEX,
+  setWebTerminalInputMode,
+  type WebTerminalInputMode,
+} from './services/web-terminal-settings-store.js';
+import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
+import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
+import {
+  ClaudeBtwCaptureGuard,
+  claudeBtwOverlayVisible,
+  claudeBtwQuestion,
+  parseClaudeBtwOverlay,
+} from './utils/claude-btw-overlay.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
+import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
@@ -109,27 +144,41 @@ import {
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
+import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
+import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
-import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach } from './core/startup-commands.js';
+import { spawnHasStartupWork } from './core/initial-native-rename.js';
+import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
+import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
+import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
+import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
   clearBridgeTurnJournal,
+  planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
   selectRestorableBridgeTurns,
   writeBridgeTurnJournal,
 } from './services/bridge-turn-journal.js';
+import {
+  readScheduledTaskAnchors,
+  upsertScheduledTaskAnchor,
+} from './services/bridge-scheduled-anchors.js';
+import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
+  pinSessionMcpGatewaySocketRoot,
+  sessionMcpGatewaySocketRoot,
   sessionMcpGatewaySocketPath,
   startSessionMcpGatewayHost,
   type SessionMcpGatewayHost,
@@ -144,12 +193,21 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
+import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
+import {
+  awaitTrustedResultDeliveryAck,
+  consumeTrustedResultDeliverySources,
+  sendTrustedDeliveryIpcWithBackpressure,
+  trustedResultTerminalObservation,
+} from './core/plugins/mcp/trusted-result-delivery.js';
+import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import {
   readSessionMcpRuntimeManifest,
   sessionMcpRuntimeHostOnlyPaths,
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { sessionSkillManifestPath } from './core/skills/manifest-store.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import {
   buildPluginCardActionCapabilitiesSnapshot,
@@ -160,10 +218,22 @@ import {
   loadBotConfigs,
   resolveBrandLabel,
   resolveUsageDisplay,
+  resolveReplyFooterPreferences,
   type BotConfig,
 } from './bot-registry.js';
-import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
 import {
+  readGlobalConfig,
+  isCrossPrincipalInterruptionEnabled,
+  isMultiTopicOrchestrationEnabled,
+  isWorkflowFeatureEnabled,
+} from './global-config.js';
+import {
+  stopSessionScope,
+  sessionScopePayloadPid,
+  wrapCommandInSessionScope,
+} from './core/session-scope.js';
+import {
+  deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
@@ -177,6 +247,7 @@ import {
   verifyTerminalControlGrant,
   verifyTerminalViewForward,
 } from './core/terminal-control-grant.js';
+import { terminalStatusHtml } from './core/terminal-status-page.js';
 import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { buildPlatformDashboardLoginUrl } from './core/dashboard-url.js';
@@ -194,37 +265,43 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit } from './services/codex-bridge-queue.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
+import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
   generateCodexAppThreadTitle,
   readCodexAppThreadMetadata,
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
-import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
+import { findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
-import { drainPiTranscript } from './services/pi-transcript.js';
-import { drainOmpTranscript, type OmpTranscriptState } from './services/omp-transcript.js';
-import { drainEbsdTranscript, type EbsdTranscriptState } from './services/ebsd-transcript.js';
+import type { OmpTranscriptState } from './services/omp-transcript.js';
 import {
-  drainGrokUpdates,
   findGrokSessionByPid,
   grokSessionIdFromPath,
 } from './services/grok-transcript.js';
 import { resolveFileBridgePath } from './services/file-bridge-path.js';
 import {
+  STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
+  STRUCTURED_BRIDGE_ZERO_PROMPT_CLI_IDS,
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
   isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
-import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
+import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
+import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import type { AntigravityTranscriptState } from './services/antigravity-transcript.js';
+import { decideAntigravityTickerAction } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -248,6 +325,7 @@ import type {
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from './types.js';
+import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -261,13 +339,25 @@ import {
   clamp,
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
-import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal } from './adapters/cli/registry.js';
+import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
+import { resolveCodexUpgradeCommand } from './services/codex-upgrade-target.js';
+import {
+  CodexSessionUpgradeMonitor, hasCodexAutonomousGoal, isCodexProcess, isRestartableCodexHelper,
+  probeCodexExecutable, probeRunningCodex, readUpgradeProcessTable, upgradeProcessTree,
+  upgradeRequired, waitForCodexExit,
+  type CodexExecutable, type CodexProcess,
+} from './services/codex-session-upgrade.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
+import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import {
   findLaunchedCliPid,
   scheduleWrapperRealCliPid,
   readComm,
+  readCmdline,
+  getChildPids,
+  cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
   bareShellLaunchGuidance,
@@ -275,18 +365,27 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
-import { sessionReadyHookCommand } from './adapters/hook-command.js';
+import { decideTurnIdleReport } from './utils/turn-idle-report.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
+import { statuslineDir } from './services/statusline-snapshot.js';
+import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
+import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
+import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
+import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
+import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
+import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
@@ -312,6 +411,9 @@ import {
   backendSandboxCompatibilityError,
   backendSandboxCompatibilityUserMessage,
   decideBackendGate,
+  persistentReattachBias,
+  reconcileBiasedReattachProbe,
+  resolveTmuxBackendGate,
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
@@ -320,6 +422,7 @@ import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
   isValidRiffBaseUrl,
+  isValidRiffJwtHome,
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
@@ -330,12 +433,34 @@ import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
   credentialOnlySandboxAvailable,
+  prepareCredentialOnlyRelayOutbox,
+  attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
+  sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
   sandboxEnabled,
   localSandboxApplies,
+  resolveLocalSandboxMode,
+  autoWorktreeFallbackSandboxError,
 } from './adapters/backend/sandbox.js';
+import {
+  prepareScratchSandbox,
+  attachScratchSession,
+  scratchHostView,
+  type ScratchStorage,
+} from './adapters/backend/scratch-sandbox.js';
+import {
+  prepareMacScratchSandbox,
+  attachMacScratchSession,
+} from './adapters/backend/scratch-sandbox-darwin.js';
+import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
+import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
+import {
+  reconcileSandboxTreeFlavour,
+  recordedSandboxTreeFlavour,
+  requestedSandboxTreeFlavour,
+} from './adapters/backend/sandbox-tree-teardown.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -348,9 +473,18 @@ import type {
   SessionShutdownDetachResult,
 } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
-import { probeZmxVersion } from './setup/ensure-zmx.js';
+import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
-import { IdleDetector } from './utils/idle-detector.js';
+import {
+  IdleDetector,
+  stripAnsiScreenText,
+  type IdleEvidenceSource,
+} from './utils/idle-detector.js';
+import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
+import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
+import { busyProbeRegion } from './utils/busy-probe.js';
+import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -358,7 +492,6 @@ import {
 } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
-import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
 import {
@@ -368,7 +501,8 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
@@ -383,9 +517,10 @@ import {
 import {
   cancelSubmitFailureChainForTerminal,
   createSubmitFailureChainController,
-  submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
+import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
+import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -393,15 +528,15 @@ import {
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
-import * as pty from 'node-pty';
+import * as pty from './utils/pty.js';
 import {
   hasInstalledSessionReadyHook,
   installHook,
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
-import { hookCommandFor } from './adapters/hook-command.js';
-import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
-import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
+import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
+import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
@@ -429,6 +564,7 @@ import {
   replaceManagedOriginCapabilityFile,
   sweepManagedOriginAttestationProofs,
 } from './core/managed-origin-capability.js';
+import { isLinuxIsolationLauncher } from './core/linux-isolation.js';
 import {
   CodexRpcEngine,
   type CodexRpcTurnIdentity,
@@ -442,6 +578,18 @@ import {
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
 import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
+import {
+  CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
+  claudeAuthOverrideKeys,
+  claudeAuthOverridesInSettingsLayers,
+  claudeStateAuthOverrides,
+  planCredentialSource,
+  readCredentialSource,
+  readCredentialSourceStamp,
+  reconcileClaudeAccountState,
+  writeCredentialSourceStamp,
+  writeFileAtomic0600,
+} from './services/cli-credential-source.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -461,7 +609,6 @@ import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-aut
 import {
   applyTrustedCodexAppActivityMarker,
   applyTrustedCodexAppStateMarker,
-  CODEX_APP_NO_PROGRESS_TIMEOUT_MS,
   CodexAppFlushPromptReplay,
   CodexAppReadyAuthority,
   CodexAppTurnLiveness,
@@ -515,7 +662,6 @@ import {
   type CodexAppControlState,
   type CodexAppControlIdentity,
   type CodexAppPosixOwnerLease,
-  type CodexAppSignedControlMarker,
 } from './utils/codex-app-control.js';
 
 // Never inherit a session-level CLI home from the daemon's launch environment.
@@ -531,6 +677,7 @@ scrubClaudeSessionMarkerEnv(process.env);
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let cliAdapter: CliAdapter | null = null;
+let codexCleanupLaunchTarget: { codexBin: string; codexHome: string } | undefined;
 let backend: SessionBackend | null = null;
 let backendScreenRevision = 0;
 let idleScreenSettleTask: {
@@ -548,6 +695,7 @@ let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let rpcEnginePidMarker: string | null = null;
+let taskContinuationRpcGeneration: string | undefined;
 const piInitialPromptCleanupPaths: string[] = [];
 const piInitialPromptCleanupDirs: string[] = [];
 let piInitialPromptReadonlyRoots: string[] = [];
@@ -704,6 +852,7 @@ function stopCodexRpcEngine(): void {
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
   const engine = codexRpcEngine;
+  taskContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
     ...rpcLifecycleFailClosedOwners.keys(),
@@ -806,16 +955,16 @@ function stopCodexRpcEngine(): void {
  *  handler BEFORE spawnCli runs (effectiveBackendType is stale there). A wrong
  *  guess is safe: an assumed-tmux session that is really pty just has no live
  *  session → treated as fresh. Returns null for non-persistent backends. */
-function persistentPaneInfo(backendType: string, sessionId: string): { name: string; live: boolean } | null {
+function persistentPaneInfo(backendType: string, sessionId: string, target?: PersistentBackendTarget): { name: string; live: boolean } | null {
   let name: string | undefined;
   if (backendType === 'tmux') name = TmuxBackend.sessionName(sessionId);
   else if (backendType === 'herdr') name = HerdrBackend.sessionName(sessionId);
   else if (backendType === 'zellij') name = ZellijBackend.sessionName(sessionId);
-  else if (backendType === 'zmx') name = ZmxBackend.sessionName(sessionId);
+  else if (backendType === 'zmx') name = target?.backendType === 'zmx' ? target.sessionName : ZmxBackend.sessionName(sessionId);
   if (!name) return null;
   const live = backendType === 'tmux' ? TmuxBackend.hasSession(name)
     : backendType === 'zellij' ? ZellijBackend.hasSession(name)
-      : backendType === 'zmx' ? ZmxBackend.probeManagedSession(name, sessionId).state === 'compatible'
+      : backendType === 'zmx' ? ZmxBackend.probeManagedSession(name, sessionId, zmxEnv(process.env, target?.backendType === 'zmx' ? target.socketDir : undefined)).state === 'compatible'
       : HerdrBackend.hasSession(name);
   return { name, live };
 }
@@ -829,8 +978,9 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
 function persistentPaneProbe(
   backendType: PersistentBackendType,
   name: string,
+  target?: PersistentBackendTarget,
 ): 'live' | 'gone' | 'unknown' {
-  const probe: SessionProbe = backendType === 'tmux' ? TmuxBackend.probeSession(name)
+  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : backendType === 'tmux' ? TmuxBackend.probeSession(name)
     : backendType === 'zellij' ? ZellijBackend.probeSession(name)
       : backendType === 'herdr' ? HerdrBackend.probeSession(name)
         : ZmxBackend.probeSession(name);
@@ -843,8 +993,9 @@ function probeOwnedZmxSession(
   name: string,
   sessionId: string,
   expectedPid?: number,
+  socketDir?: string,
 ): { probe: SessionProbe; pid?: number; reason?: string } {
-  const managed = ZmxBackend.probeManagedSession(name, sessionId);
+  const managed = ZmxBackend.probeManagedSession(name, sessionId, zmxEnv(process.env, socketDir));
   if (managed.state === 'missing') return { probe: 'missing' };
   if (managed.state === 'unknown') return { probe: 'unknown', reason: managed.reason };
   if (managed.state === 'incompatible') {
@@ -871,10 +1022,11 @@ async function killPersistentSessionVerified(
   backendType: PersistentBackendType,
   name: string,
   sessionId?: string,
+  target?: PersistentBackendTarget,
 ): Promise<boolean> {
   return killAndVerifyPersistentPane(name, {
-    kill: (resolvedName) => killPersistentSession(backendType, resolvedName, sessionId),
-    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName),
+    kill: (resolvedName) => target ? killPersistentBackendTarget(target, sessionId) : killPersistentSession(backendType, resolvedName, sessionId),
+    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName, target),
     wait: delay,
   });
 }
@@ -903,8 +1055,8 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
 
 function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...redactChildEnv(process.env),
-    ...sanitizePerBotEnv(cfg.env),
+    ...buildSessionChildEnv(process.env, cfg.envPolicy),
+    ...botInjectedEnv(cfg.env, cfg.envPolicy),
   };
   env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
   return env;
@@ -1060,7 +1212,7 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') return false;
+  if (isRemoteBackendType(effectiveBackendType)) return false;
   nativeSessionTitleRevision += 1;
   nativeSessionTitleAppliedThreadId = undefined;
   cfg.nativeSessionTitle = trimmed;
@@ -1094,8 +1246,8 @@ async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexR
     }
     const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
     const env: NodeJS.ProcessEnv = {
-      ...redactChildEnv(process.env),
-      ...sanitizePerBotEnv(cfg.env),
+      ...buildSessionChildEnv(process.env, cfg.envPolicy),
+      ...botInjectedEnv(cfg.env, cfg.envPolicy),
     };
     env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
     const abortController = new AbortController();
@@ -1134,62 +1286,6 @@ async function prepareCodexNativeTitleGeneration(
   if (threadId) await captureCodexResumeTitleBaseline(threadId, engine);
 }
 
-type RpcUserInputAnswer = { answers: Record<string, { answers: string[] }> };
-
-/** Bridge TRAE app-server's native request_user_input request to botmux's
- * existing Lark ask broker. The app-server owns tool execution in RPC mode, so
- * returning this response resumes the same turn without terminal key driving. */
-async function bridgeTraexUserInput(
-  cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  params: unknown,
-): Promise<RpcUserInputAnswer> {
-  const parsed = parseTraexUserInputQuestions(params);
-  if (parsed.kind === 'unsupported') {
-    // Returning empty answers makes TraeX silently complete the tool as if no
-    // one answered, dropping the whole batch. Throw instead so the RPC engine
-    // replies with a JSON-RPC error and the failure is visible on the turn.
-    throw new Error(`requestUserInput cannot be represented as an ask card: ${parsed.reason}`);
-  }
-  const { questions } = parsed;
-  const daemon = findOnlineDaemon(cfg.larkAppId);
-  if (!daemon) throw new Error(`daemon not found for larkAppId=${cfg.larkAppId}`);
-
-  const response = await fetchDaemonIpc(daemon.ipcPort, '/api/asks', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: cfg.sessionId,
-      chatId: cfg.chatId,
-      larkAppId: cfg.larkAppId,
-      rootMessageId: cfg.rootMessageId || null,
-      questions: questions.map(entry => entry.question),
-      timeoutMs: 3_600_000,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`ask broker HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
-  }
-  const result = await response.json() as {
-    kind?: string;
-    answers?: ReadonlyArray<ReadonlyArray<string>>;
-    comment?: string | null;
-  };
-  // Timeout/cancel/invalidated — surface as an error rather than an empty answer
-  // that TraeX would treat as "no one answered" and silently skip.
-  if (result.kind !== 'answered') {
-    throw new Error(`ask not answered (${result.kind ?? 'unknown'})`);
-  }
-
-  const customText = result.comment?.trim() ?? '';
-  const answers: RpcUserInputAnswer['answers'] = {};
-  questions.forEach((entry, index) => {
-    const selected = result.answers?.[index] ?? [];
-    const values = selected.length > 0 ? [...selected] : customText ? [customText] : [];
-    if (values.length > 0) answers[entry.id] = { answers: values };
-  });
-  return { answers };
-}
-
 /** Stand up (or re-establish) the per-session codex app-server + botmux-owned
  *  thread and point remote{WsUrl,ThreadId} at it, so the next spawnCli launches
  *  `codex --remote <ws> resume <thread>` and input flows over JSON-RPC. Fully
@@ -1206,6 +1302,9 @@ async function bridgeTraexUserInput(
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   stopCodexRpcEngine();
@@ -1227,8 +1326,12 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // generation so a late terminal from an old server can never retire a
     // same-(turnId,attempt) entry installed by its replacement.
     const engineCliGeneration = cliSpawnGeneration + 1;
-    const cliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
-    const engineEnv: NodeJS.ProcessEnv = { ...redactChildEnv(process.env) };
+    const resolvedCliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
+    let cliBin = resolvedCliBin;
+    if (cfg.cliId === 'codex') {
+      try { cliBin = realpathSync(resolvedCliBin); } catch { /* launch may resolve through engineEnv.PATH */ }
+    }
+    const engineEnv: NodeJS.ProcessEnv = { ...buildSessionChildEnv(process.env, cfg.envPolicy) };
     engineEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), engineEnv.PATH);
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     // In Codex/TraeX RPC mode the app-server, not the remote viewer TUI, runs
@@ -1253,17 +1356,36 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // per-bot provider env (base-url + token, proxy, feature flags) spawnCli
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
-    Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    Object.assign(engineEnv, botInjectedEnv(cfg.env, cfg.envPolicy));
+    if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(engineEnv);
+    applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
+    // RPC shell tools execute here, before the viewer CLI is even spawned.
+    const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    if (!boundLark && process.env.SESSION_DATA_DIR) {
+      cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+      delete engineEnv.BOTMUX_LARK_TOOL_BINDING;
+    }
+    const identityPolicy = boundLark && cfg.triggerUserAuth
+      ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+      : cfg.triggerUserAuth;
+    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+    if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
+      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
-      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
+      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
-      onRequestUserInput: cfg.cliId === 'traex'
-        ? (params: unknown) => bridgeTraexUserInput(cfg, params)
+      appServerConfig: cfg.cliId === 'traex'
+        ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
+      onRequestUserInput: (params, signal, identity) => bridgeCodexUserInput({
+        sessionId: cfg.sessionId, larkAppId: cfg.larkAppId, chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId, originTurnId: identity?.turnId,
+        originDispatchAttempt: identity?.dispatchAttempt,
+      }, params, signal),
       onTurnTerminal: (terminal) => {
         if (!engine) return;
         handleRpcTurnTerminal(terminal, {
@@ -1298,7 +1420,16 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // Shell tools run under the app-server process tree, not the viewer TUI.
     // Mark its pid before the first turn so `botmux send` resolves the current
     // per-turn identity instead of falling back to a stale/session-only env.
+    codexCleanupLaunchTarget = undefined;
+    try {
+      codexCleanupLaunchTarget = freezeCodexCleanupLaunch(cfg.cliId, cliBin, [],
+        engineEnv.CODEX_HOME ?? join(homedir(), '.codex'));
+    } catch (error) { log(`Codex cleanup launch target unavailable: ${error}`); }
     enginePidMarker = registerRpcEnginePidMarker(engine.appServerPid);
+    // The opening turn can start executing tools before the remote viewer TUI
+    // exists. Publish the independently attested engine root immediately so
+    // current-actor remains available during that narrow startup window.
+    publishLocalProcessAttestation(undefined, engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     assertRpcEngagementCurrent();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
@@ -1337,6 +1468,11 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         clearRpcEnginePidMarker();
         try { engine.stop(); } catch { /* best effort */ }
         return 'not-engaged';
+      }
+      if (first.outcome === 'accepted') {
+        // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
+        // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
+        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId);
       }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
@@ -1427,6 +1563,13 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     codexRpcEngine = engine;
+    taskContinuationRpcGeneration = randomBytes(16).toString('hex');
+    send({
+      type: 'task_continuation_rpc_status',
+      sessionId: cfg.sessionId,
+      rpcGeneration: taskContinuationRpcGeneration,
+      eligible: cfg.cliId === 'traex',
+    });
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
     persistCliSessionId(threadId);
@@ -1535,11 +1678,113 @@ let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
+/** This CLI generation's per-session sandbox tree (oncall / scratch file
+ *  sandbox or credential-only relay) belongs to a persistent pane that keeps
+ *  running when this worker exits (tmux/zellij/herdr/zmx `kill()` only
+ *  detaches). A detach-style exit (daemon restart, IPC disconnect, watchdog,
+ *  crash) must then leave the tree for the successor worker to re-serve; only a
+ *  real close / in-worker restart / a PTY-owned CLI tears it down. See
+ *  sandboxTreeSurvivesWorkerExit. */
+let sandboxTreeOutlivesWorker = false;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
+let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
+const pendingPluginResultDeliveries = new Map<string, {
+  resolve: (value: { messageIds: string[] }) => void;
+  reject: (error: Error) => void;
+}>();
+
+const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
+  const { identity, delivery } = input;
+  const cfg = lastInitConfig;
+  if (!cfg || !identity.turnId || !identity.caller?.requestUserUnionId) {
+    throw new Error('plugin_result_delivery_missing_identity');
+  }
+  const artifactStore = new PluginResultArtifactStore();
+  const artifact = artifactStore.create({
+    pluginId: input.pluginId,
+    delivery,
+    ownerUnionId: identity.caller.requestUserUnionId,
+    ...(identity.caller.requestUserOpenId ? { ownerOpenId: identity.caller.requestUserOpenId } : {}),
+    larkAppId: cfg.larkAppId,
+    sessionId,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+  });
+  const requestId = randomUUID();
+  let resolveResponse!: (value: { messageIds: string[] }) => void;
+  let rejectResponse!: (error: Error) => void;
+  const responsePromise = new Promise<{ messageIds: string[] }>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  pendingPluginResultDeliveries.set(requestId, {
+    resolve: resolveResponse,
+    reject: rejectResponse,
+  });
+  const payload: WorkerToDaemon = {
+    type: 'plugin_result_delivery',
+    requestId,
+    sessionId,
+    pluginId: input.pluginId,
+    turnId: identity.turnId!,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    ...(identity.caller?.requestUserOpenId ? { callerOpenId: identity.caller.requestUserOpenId } : {}),
+    callerUnionId: identity.caller!.requestUserUnionId!,
+    deliveryId: delivery.deliveryId,
+    viewToken: artifact.viewToken,
+    expiresAt: artifact.expiresAt,
+    fileCount: artifact.fileCount,
+    responseKind: delivery.responseKind ?? 'final',
+  };
+  try {
+    await sendTrustedDeliveryIpcWithBackpressure({
+      get connected() { return process.connected; },
+      send(message, callback) {
+        if (!process.send) throw new Error('plugin_result_delivery_ipc_unavailable');
+        return process.send(message, callback);
+      },
+    }, payload);
+  } catch (error) {
+    pendingPluginResultDeliveries.delete(requestId);
+    artifactStore.revoke(artifact.artifactId);
+    rejectResponse(error instanceof Error ? error : new Error(String(error)));
+    // Observe the rejected promise before rethrowing the enqueue failure.
+    await responsePromise.catch(() => undefined);
+    throw error;
+  }
+  const response = await awaitTrustedResultDeliveryAck(responsePromise, {
+    revoke: () => artifactStore.revoke(artifact.artifactId),
+  }).finally(() => {
+    pendingPluginResultDeliveries.delete(requestId);
+  });
+  try {
+    consumeTrustedResultDeliverySources(delivery);
+  } catch (error) {
+    // The host snapshot and entry card are already durable. Cleanup failure
+    // must not turn a working result into a broken link; retain the source for
+    // operator cleanup and keep it out of the model-facing receipt.
+    log(`[plugin-result] source cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if ((delivery.responseKind ?? 'final') === 'final') {
+    const terminal = trustedResultTerminalObservation(response.messageIds);
+    send({
+      type: 'explicit_reply_observed',
+      turnId: identity.turnId,
+      messageId: terminal.messageId,
+      responseKind: 'final',
+      terminalCarrier: terminal.terminalCarrier,
+    });
+  }
+  return {
+    delivered: true as const,
+    deliveryId: delivery.deliveryId,
+    fileCount: delivery.files?.length ?? 0,
+  };
+};
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
  *  the SECONDARY guard so an adapter whose checkResumeTargetExists misses
  *  (returns undefined) or whose resume target vanishes between the check and
@@ -1553,6 +1798,29 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** True once the claude-family transcript bridge has evidence that the CLI
+ *  session produced user-visible history. Two setters, covering every bridge
+ *  mode:
+ *    - `bridgeAbsorbBaseline()` — attach/lazy-baseline/restart-resume modes,
+ *      where the JSONL already exists when baselined;
+ *    - the `bridgeIngest()` drain — fresh-empty mode never runs a baseline
+ *      (its file is created by the CLI's first submit), so the flag arms on
+ *      the first drained transcript event instead.
+ *  A launch that dies before the CLI writes anything leaves no user-visible
+ *  history; its resume-fallback is a recovery detail, not context loss.
+ *
+ *  Cross-process trade-off (deliberate): the flag is NOT persisted — a worker
+ *  restart resets it to false. Persisting it would risk a stale `true`
+ *  suppressing the fallback notice for a session whose transcript is actually
+ *  gone (a false "nothing was lost" silence); resetting errs the other way —
+ *  at worst we MISS one reminder that history would not carry over. The miss
+ *  window is small: when the daemon rebuilds a worker for a session whose
+ *  transcript still exists, the resume path baselines that file via
+ *  `bridgeAbsorbBaseline()` and re-arms the flag before any fallback could
+ *  fire, so only "worker restart AND transcript already gone" can slip
+ *  through — which is exactly the case the tier-1 probe is about to
+ *  re-derive anyway — 宁可漏发一次提醒，也不误发。 */
+let cliTranscriptEverExisted = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
 
@@ -1585,6 +1853,10 @@ function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): void {
+  if (cfg.promptInjection === 'none' && (!supportsZeroPromptInjection(cfg.cliId, cfg)
+    || process.env[GOAL_ENV.V3_MARKER] === '1')) {
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+  }
   const bot = resolvePluginGenerationBot(cfg);
 
   const generation = prepareCliPluginGeneration({
@@ -1597,6 +1869,7 @@ function refreshCliPluginGeneration(
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
+    promptInjection: cfg.promptInjection,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -1652,6 +1925,22 @@ async function prepareCliPluginGenerationAndGateway(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): Promise<SessionMcpRuntimeManifest | null> {
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    // RPC calls this before spawnCli. Fence the surviving pane before changing
+    // its gateway/catalog, and install the config before either CLI process
+    // (app-server or TUI) has a chance to read it.
+    if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
+      TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+    }
+    if (adapter.mcpGateway) {
+      const gateway = adapter.mcpGateway;
+      const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
+      const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
+        id: adapter.id, mcpGateway: { ...gateway, configPath: instanceConfig },
+      }));
+      if (report.warning) throw new Error('Codex instance MCP configuration could not be initialized safely');
+    }
+  }
   refreshCliPluginGeneration(cfg, adapter);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
@@ -1681,6 +1970,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     sessionId,
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
+    trustedResultDelivery: deliverPluginResultThroughHost,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -1702,6 +1992,15 @@ function provisionIsolatedBotHome(
   hookInstall: HookInstallConfig | undefined,
   codexAuthSync: CodexAuthSyncMode,
   log: (m: string) => void,
+  /** Set when `credentialsSourceDir` supplies this bot's Claude login: the shared
+   *  credential must NOT be seeded (the caller copies the source afterwards and
+   *  fails closed on error, outside this best-effort block). */
+  claudeCredFromSource = false,
+  /** The bot's Claude config profile (`cliConfigDir`), resolved. When set it is
+   *  the provisioning SOURCE in place of the global `~/.claude`: its settings
+   *  env, its login and its `.claude.json` seed the per-bot dir, so a sandboxed
+   *  bot runs the same profile an unsandboxed one would — never the global one. */
+  claudeProfileDir?: string,
 ): void {
   try {
     if (isClaude) {
@@ -1718,7 +2017,8 @@ function provisionIsolatedBotHome(
           installHook(cliId, {
             ...hookInstall,
             configPath: isolatedSettingsPath,
-            inheritClaudeEnvFrom: join(homedir(), '.claude', 'settings.json'),
+            inheritClaudeEnvFrom: join(claudeProfileDir ?? join(homedir(), '.claude'), 'settings.json'),
+            ...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {}),
           }, hookCommandFor(cliId));
         } catch (e) {
           log(`[read-isolation] WARN per-bot settings/hook install failed: ${(e as Error).message}`);
@@ -1729,8 +2029,13 @@ function provisionIsolatedBotHome(
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
       // just seeding once) means a re-login elsewhere self-heals on the next cold
       // spawn — no separate sync step needed. Same shared account for every bot.
-      const fresh = freshestClaudeCred();
+      // A profile carries its own login (or none, when it authenticates through
+      // its settings env): never fall back to the shared global account for it.
+      const fresh = claudeCredFromSource
+        ? null
+        : claudeProfileDir ? readClaudeCredFile(join(claudeProfileDir, '.credentials.json')) : freshestClaudeCred();
       if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
+      else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
         !existsSync(join(cdir, '.credentials.json'))
         && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
@@ -1740,7 +2045,12 @@ function provisionIsolatedBotHome(
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
       // onboarding/promo "seen" flags + account so no dialogs appear, without leaking
       // other projects' data), then trust this bot's cwd. Merge-safe on resume.
-      seedAndTrustClaudeState(join(cdir, '.claude.json'), workingDir, log);
+      seedAndTrustClaudeState(
+        join(cdir, '.claude.json'),
+        workingDir,
+        log,
+        claudeProfileDir ? join(claudeProfileDir, '.claude.json') : undefined,
+      );
     } else {
       const cdir = provisionCodexAuth({ botHome, mode: codexAuthSync, log });
       // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
@@ -1796,6 +2106,16 @@ function freshestClaudeCred(): string | null {
   return cands[0].raw;
 }
 
+/** Raw credential JSON from one file, or null when absent / empty / unreadable. */
+function readClaudeCredFile(path: string): string | null {
+  try {
+    const raw = readFileSync(path, 'utf-8').trim();
+    return raw || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Write a credential file (mode 0600) only when its content actually changed —
  *  avoids needless mtime churn on every spawn. Trailing-newline differences are
  *  ignored for the comparison; the written form is newline-terminated. */
@@ -1811,14 +2131,20 @@ function writeCredIfChanged(dst: string, raw: string): void {
  *  so onboarding/promo dialogs are pre-dismissed and the account is recognized, then
  *  mark this bot's realpath(cwd) trusted. Merge-safe: only seeds when absent; always
  *  refreshes the cwd trust. */
-function seedAndTrustClaudeState(statePath: string, workingDir: string, log: (m: string) => void): void {
+function seedAndTrustClaudeState(
+  statePath: string,
+  workingDir: string,
+  log: (m: string) => void,
+  /** Seed source; defaults to the global `~/.claude.json` (a config profile passes its own). */
+  seedFrom: string = join(homedir(), '.claude.json'),
+): void {
   try {
     let data: Record<string, any> = {};
     if (existsSync(statePath)) {
       try { data = JSON.parse(readFileSync(statePath, 'utf-8')); } catch { data = {}; }
     } else {
       try {
-        const g = JSON.parse(readFileSync(join(homedir(), '.claude.json'), 'utf-8')) as Record<string, any>;
+        const g = JSON.parse(readFileSync(seedFrom, 'utf-8')) as Record<string, any>;
         const { projects: _drop, ...top } = g;
         data = top;
       } catch { data = {}; }
@@ -1854,6 +2180,14 @@ let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
 let activeRestartAttemptId: string | undefined;
+/** Launch settings (cwd / env / model / larkToolBinding) the current restart
+ *  window's replacement is built from. Reset when a window (owned restart or
+ *  Codex auto-upgrade) begins; set when it captures `restartCfg`. */
+let restartWindowLaunch: RestartLaunchSettings | undefined;
+/** A correlated restart folded into the current window asked for launch
+ *  settings the window's replacement does not run (see foldRestartIntoWindow).
+ *  Its attempt is settled only by the convergence replacement that follows. */
+let pendingLaunchConvergence: { attemptId?: string; requested: RestartLaunchSettings } | undefined;
 /** Distinguishes a replacement's synchronous ready signal (Riff) from a late
  * idle callback emitted by the backend being torn down. */
 let replacementSpawnInProgress = false;
@@ -1872,16 +2206,93 @@ let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
+let lastSpawnArgvDurableInitialPrompt = false;
+let lastSpawnArgvDurableInitialPromptSubmission: { baseline: number | null; content: string } | undefined;
+let argvDurableInitialPromptCompletionTimer: ReturnType<typeof setInterval> | null = null;
+let argvDurableInitialPromptCompletion: {
+  baseline: number;
+  content: string;
+  cliSessionId?: string;
+  turnId: string;
+  dispatchAttempt: number;
+  adapter: CliAdapter;
+} | undefined;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
+
+function watchArgvDurableInitialPromptCompletion(opts: {
+  baseline: number;
+  cliSessionId: string;
+  turnId: string;
+  dispatchAttempt: number;
+  adapter: CliAdapter;
+  backend: SessionBackend;
+  generation: number;
+}): void {
+  if (argvDurableInitialPromptCompletionTimer) {
+    clearInterval(argvDurableInitialPromptCompletionTimer);
+    argvDurableInitialPromptCompletionTimer = null;
+  }
+  const check = () => {
+    if (cliSpawnGeneration !== opts.generation || backend !== opts.backend) {
+      if (argvDurableInitialPromptCompletionTimer) {
+        clearInterval(argvDurableInitialPromptCompletionTimer);
+        argvDurableInitialPromptCompletionTimer = null;
+      }
+      return;
+    }
+    if (!opts.adapter.isInitialPromptComplete?.(opts.baseline, opts.cliSessionId)) return;
+    if (argvDurableInitialPromptCompletionTimer) {
+      clearInterval(argvDurableInitialPromptCompletionTimer);
+      argvDurableInitialPromptCompletionTimer = null;
+    }
+    argvDurableInitialPromptCompletion = undefined;
+    emitTurnTerminal(opts.turnId, 'completed', undefined, opts.dispatchAttempt);
+  };
+  check();
+  if (argvDurableInitialPromptCompletionTimer) return;
+  argvDurableInitialPromptCompletionTimer = setInterval(check, 1_000);
+  argvDurableInitialPromptCompletionTimer.unref?.();
+}
+
+function drainArgvDurableInitialPromptCompletion(): boolean {
+  const completion = argvDurableInitialPromptCompletion;
+  if (!completion
+    || completion.turnId !== currentBotmuxTurnId
+    || completion.dispatchAttempt !== currentBotmuxDispatchAttempt) return false;
+  const submission = completion.cliSessionId
+    ? { submitted: true, cliSessionId: completion.cliSessionId }
+    : completion.adapter.findInitialPromptArgSubmission?.(
+      completion.baseline,
+      completion.content,
+    );
+  if (!submission?.submitted
+    || !submission.cliSessionId
+    || !completion.adapter.isInitialPromptComplete?.(
+      completion.baseline,
+      submission.cliSessionId,
+    )) return false;
+  argvDurableInitialPromptCompletion = undefined;
+  emitTurnTerminal(completion.turnId, 'completed', undefined, completion.dispatchAttempt);
+  return true;
+}
 // True when this session runs under an outer bwrap supervisor (file sandbox OR
 // Linux credential-only bwrap) — both make getChildPid() the supervisor, not the
 // CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
 // cfg at gate-check time; capture the spawn-time verdict for currentTraexObservedPid.
 let lastSpawnOuterBwrapActive = false;
+// True when getChildPid() may be a launcher above the real TRAE process. This
+// includes bwrap and Forge; keep it separate from lastSpawnOuterBwrapActive
+// because prompt-readiness code has bwrap-specific shell handling.
+let lastSpawnTraexLauncherActive = false;
+let lastSpawnCodexLauncherActive = false;
+// Configured Codex-compatible executable name of the latest spawn, used to
+// recognise a renamed native binary when deciding whether getChildPid() is
+// already the real leaf. undefined for the official `codex` binary.
+let lastSpawnCodexExecutable: string | undefined;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
- * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
+ * baked first prompt + reliable turn terminal (Grok-class). First markPromptReady
  * then reports working (not idle). Cleared on first consume. Must stay false
  * for Riff/queue-after-spawn and for quiescence-only argv adapters.
  */
@@ -1912,6 +2323,20 @@ let spawnArgvTurnStartBusyScanTail = '';
 let spawnArgvTurnStartEvidenceDeadlineMs = 0;
 let spawnArgvTurnStartFailOpenTimer: ReturnType<typeof setTimeout> | null = null;
 let idleDetector: IdleDetector | null = null;
+let programStatusStream: ProgramStatusFramingStream | null = null;
+
+function shouldEnableProgramStatus(cliId: string | undefined, adapter?: CliAdapter | null): boolean {
+  if (adapter?.supportsProgramStatus !== undefined) {
+    return adapter.supportsProgramStatus;
+  }
+  if (!cliId) return false;
+  try {
+    const probe = createCliAdapterSync(cliId as CliId);
+    return probe.supportsProgramStatus === true;
+  } catch {
+    return false;
+  }
+}
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
 let crashDiagnosticTmuxParked = false;
@@ -1950,10 +2375,6 @@ let lastAbortedCloseRequestId: string | null = null;
 /** Graceful daemon-shutdown detach stays alive until lineage commit. */
 let shutdownDetachRequestId: string | null = null;
 let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
-/** pty-under-zellij backend (BACKEND_TYPE=zellij). Behaves like the non-tmux
- *  pty path for the worker (renderer screenshots, relay web terminal) but owns
- *  a persistent zellij session that survives daemon restart. */
-let isZellijMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -1972,15 +2393,14 @@ const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
 // daemon restart re-forks every worker — a per-process random token would 403
 // every previously-issued operate link).
 let writeToken = randomBytes(16).toString('hex');
-// Per-BOOT random read capability, reported to the daemon in `ready` and
-// embedded in Feishu card 「打开 Web 终端」 links. Deliberately NOT the stable
-// per-session HMAC any more (P1-5): a stable view token could never be revoked
-// — a viewer who fetched it once kept terminal read access forever, across
-// worker restarts included. Per-boot randomness bounds every card link to this
-// worker generation (restart ⇒ all previously issued view tokens die), and the
-// dashboard view-link API mints its own short-lived signed read grants instead
-// of ever handing this value out (see resolveTerminalAccessForReq).
+// Per-BOOT random read capability used to pin dashboard-minted grants to this
+// exact worker generation. It is deliberately separate from the revocable
+// session-lifecycle card capability below.
 let viewToken = randomBytes(32).toString('base64url');
+// Lark cards outlive worker processes. Keep their read capability stable only
+// within this logical Session lifecycle; the daemon persists/rotates the epoch.
+// Dashboard-minted grants remain pinned to the per-boot viewToken above.
+let cardViewToken = viewToken;
 
 // Active dashboard token, persisted by the dashboard process at this stable
 // path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
@@ -1989,35 +2409,6 @@ let viewToken = randomBytes(32).toString('base64url');
 const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 
-// Test-only seam (inert in production): widen the SYNCHRONOUS `.dashboard-secret`
-// read that happens twice inside the terminal WS handshake — once at
-// `verifyClient`, once at the post-upgrade `connection` re-check — so the
-// integration test can land a capability's expiry inside that gap and prove the
-// second check still fail-closes it (see worker-terminal-read-auth P1-3). A real
-// slow HOME (NFS/slow disk) produces the same window in production. The old test
-// bloated the secret file with 32MB of whitespace to force this delay, which is
-// incompatible with #920's strict 0600 host-authority reader (its 256-byte cap
-// rejects a padded file); this env-gated busy-wait reproduces the timing without
-// an oversized or otherwise unsafe credential file. Only ever set by that test.
-const HANDSHAKE_SECRET_READ_DELAY_MS = Number.isFinite(
-  Number(process.env.BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS),
-)
-  ? Math.max(0, Number(process.env.BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS))
-  : 0;
-
-/** Read the dashboard secret on the terminal WS-handshake path. Identical to
- *  {@link loadDashboardSecret} in production; adds a bounded synchronous delay
- *  ONLY when the test seam env var is set, to make the handshake read window
- *  observable without an oversized secret file. */
-function loadHandshakeSecret(): string | null {
-  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
-  if (HANDSHAKE_SECRET_READ_DELAY_MS > 0) {
-    const until = Date.now() + HANDSHAKE_SECRET_READ_DELAY_MS;
-    while (Date.now() < until) { /* busy-wait: mimic a slow synchronous fs read */ }
-  }
-  return secret;
-}
-
 /** Re-derive the stable write (operate) token from the host-only dashboard
  *  secret so a restarted worker mints the SAME token — keeping already-issued
  *  「操作链接」/write links valid across restarts. Falls back to the random
@@ -2025,6 +2416,13 @@ function loadHandshakeSecret(): string | null {
 function refreshTerminalWriteToken(): void {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (secret && sessionId) writeToken = deriveTerminalWriteToken(secret, sessionId);
+}
+
+function refreshTerminalCardViewToken(epoch: string | undefined): void {
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  cardViewToken = secret && sessionId && epoch
+    ? deriveTerminalCardViewToken(secret, sessionId, epoch)
+    : viewToken;
 }
 
 /**
@@ -2073,9 +2471,11 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   if (safeTerminalTokenEqual(url.searchParams.get('token'), writeToken)) {
     return { hasRead: true, hasWrite: true, platformReadonly: false };
   }
-  // `?viewToken=` read capability, two accepted forms (P1-5):
-  //   • this worker's per-boot random token (Feishu card links) — plain
-  //     equality; dies with the worker generation;
+  // `?viewToken=` read capability, three accepted forms (P1-5):
+  //   • this worker's per-boot random token — plain equality; dies with the
+  //     worker generation and anchors dashboard-minted grants;
+  //   • the epoch-bound Lark-card token — survives worker replacement within
+  //     one logical Session lifecycle;
   //   • a short-lived signed read grant minted by the dashboard view-link API.
   // The retired stable per-session HMAC matches neither form, so every
   // previously issued stable view token fails closed on this worker.
@@ -2096,11 +2496,12 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   //      though `.dashboard-secret` is unchanged.
   // The WebSocket is additionally closed at the grant's expiresAt.
   const viewParam = url.searchParams.get('viewToken');
-  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken);
+  let viewTokenMatches = safeTerminalTokenEqual(viewParam, viewToken)
+    || safeTerminalTokenEqual(viewParam, cardViewToken);
   let viewGrantUser: string | undefined;
   let viewGrantExpiresAt: number | undefined;
   if (!viewTokenMatches && looksLikeTerminalControlGrant(viewParam) && sessionId) {
-    const secret = loadHandshakeSecret();
+    const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
     if (secret && verifyTerminalViewForward(secret, viewParam, req.headers[TERMINAL_VIEW_FORWARD_HEADER])) {
       const viewGrant = verifyTerminalControlGrant(secret, viewParam, sessionId);
       if (viewGrant.ok
@@ -2128,7 +2529,7 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
   // second synchronous secret-file read on that hot path; only the central
   // front proxy supplies this internal header.
   if (req.headers['x-botmux-terminal-control'] === undefined) return legacy;
-  const secret = loadHandshakeSecret();
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (!secret || !sessionId) return legacy;
   const grant = verifyTerminalControlGrant(
     secret,
@@ -2167,6 +2568,49 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+
+/** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
+ *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
+ *  fail-closed 等于历史行为。 */
+function replyDeliveryMode(): 'send' | 'transcript' {
+  return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
+}
+
+/** 实验性、默认关闭：daemon 在 init 上冻结 per-bot 开关。只有显式 true 时，
+ *  失败兜底才信任本轮本次尝试已带回执的显式 final 而不再补发；读不到一律
+ *  false——等于历史行为。 */
+function deliveredFinalFailureNoticeSuppressed(): boolean {
+  return lastInitConfig?.suppressDeliveredFinalFailureNotice === true;
+}
+
+function zeroPromptTerminalSync(): boolean {
+  return lastInitConfig?.promptInjection === 'none' && !lastInitConfig.adoptMode
+    && !lastInitConfig.apiOnly;
+}
+
+/** Claude-family transcript proof: the owned session's JSONL holds a user or
+ *  dequeued queued_command record whose normalised text contains the whole
+ *  marked input. Fingerprint-prefix / truncation binds attribute replies but
+ *  do not prove envelope consumption, so they stay on the terminal fallback. */
+function notifyNativeTranscriptConsumedLarkTurn(
+  turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
+  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
+): void {
+  if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
+  if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) return;
+  const base = evidence.sourceJsonlPath ? basename(evidence.sourceJsonlPath) : '';
+  const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
+    ? base.slice(0, -'.jsonl'.length)
+    : undefined;
+  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId);
+}
+
+function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
+  if (zeroPromptTerminalSync()) {
+    send({ type: 'terminal_turn_started', turnId: turn.turnId, startedAtMs: turn.markTimeMs ?? Date.now(),
+      ...(turn.replyContextTurnId ? { replyContextTurnId: turn.replyContextTurnId } : {}) });
+  }
+}
 let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
@@ -2174,12 +2618,11 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
     : undefined)
-    ?? CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '']
+    ?? lookupCliDisplayName(lastInitConfig?.cliId ?? '')
     ?? 'CLI';
 }
 
@@ -2187,6 +2630,9 @@ function supportsPostSubmitRenameSessionTitle(cliId: string | undefined): boolea
   return cliId === 'traex';
 }
 let isPromptReady = false;
+/** Prompt-ready edges published by markPromptReady(). A backend compares it with
+ *  its spawn-time value to tell whether its CLI has shown a confirmed prompt yet. */
+let promptReadyEdges = 0;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 /** An init prompt exists but spawn/RPC policy has not yet established whether
@@ -2203,6 +2649,273 @@ let cliRestartInProgress = false;
  * type-ahead fallback. Keep them fenced across an owned restart until the
  * replacement generation reaches its prompt. */
 let rawInputRestartGate = false;
+let codexAutoUpgrade: {
+  stage: 'stopping' | 'restoring' | 'failed';
+  threadId: string;
+  ready?: () => void;
+  reject?: (error: Error) => void;
+} | undefined;
+let codexUpgradeTimer: ReturnType<typeof setInterval> | undefined;
+let codexUpgradeInspectionBlock: string | undefined;
+let codexRuntimeObservedGeneration = -1;
+
+function codexUpgradeBlocked(): string | undefined {
+  if (!lastInitConfig || !backend || !isPromptReady || awaitingFirstPrompt) return 'waiting for a ready session';
+  if (lastInitConfig.adoptMode || lastInitConfig.existingAppServerEndpoint) return 'externally owned session';
+  if (lastInitConfig.wrapperCli?.trim()) return 'a configured CLI wrapper controls the runtime';
+  if (cliRestartInProgress || codexAutoUpgrade || tmuxRestartTimer) return 'another restart is in progress';
+  if (isFlushing || injectionFlushing || commandLineWritesPending || initialInputOwnershipPending
+      || pendingMessages.length || pendingRawInputs.length || pendingInjections.length
+      || pendingAdoptMessages.length || sessionRenameInFlight() || pendingSessionRename
+      || durableTurnInFlight || tuiPromptBlocking || hookReviewInputHold || bareShellCheckInProgress
+      || ambiguousSubmissionRecoveryHold || submitFailureChains.size() || queuedActivationReceipts.size()
+      || codexAppTurnLiveness.hasActiveTurn() || codexAppCompletionAwaitingFinal
+      || codexAppTurnDispatchQueue.size() || codexAppRecoveredDispatches.length
+      || hasStructuredLifecycleBlock()) return 'waiting for the current turn and input queues';
+  // Web terminal writes can bypass normal input queues. Never replace a CLI
+  // while a terminal client is attached, including during a pending handshake.
+  if (wsClients.size || clientPtys.size) return 'a Web Terminal is attached';
+  return codexUpgradeInspectionBlock;
+}
+
+async function inspectCodexUpgradeRuntime(): Promise<CodexProcess[]> {
+  const roots = [currentCodexObservedPid(), codexRpcEngine?.appServerPid]
+    .filter((pid): pid is number => typeof pid === 'number' && pid > 1);
+  if (!roots.length) throw new Error('Codex runtime PID is not available');
+  const tree = upgradeProcessTree(await readUpgradeProcessTable(), roots);
+  const native = tree.filter(isCodexProcess);
+  if (!native.length) throw new Error('Codex runtime process is not observable');
+  return Promise.all(native.map(probeRunningCodex));
+}
+
+async function observeCodexRuntimeVersionOnReady(): Promise<void> {
+  const versionObservationBackend = backend;
+  const observedGeneration = cliSpawnGeneration;
+  const running = await inspectCodexUpgradeRuntime();
+  // A late observation must not label another backend generation, or bypass
+  // the upgrade's own runtime/thread verification before it releases input.
+  if (!versionObservationBackend || backend !== versionObservationBackend || cliSpawnGeneration !== observedGeneration
+      || cliRestartInProgress || codexAutoUpgrade) return;
+  const version = running[0]?.version;
+  if (!version || running.some(item => item.version !== version)) {
+    throw new Error('Running Codex processes do not identify a single version');
+  }
+  send({ type: 'cli_runtime_version', version });
+}
+
+async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]): Promise<void> {
+  /** Restore passes before giving up on launch settings that keep moving (the
+   *  upgrade pass plus at most two launch-config convergence passes). */
+  const MAX_RESTORE_PASSES = 3;
+  // No await may separate this final safety check and closing the input gates.
+  const blocked = codexUpgradeBlocked();
+  if (blocked || !config.autoUpgradeCodexSessions) throw new Error(blocked ?? 'automatic upgrade disabled');
+  const cfg = lastInitConfig!;
+  const threadId = remoteThreadId ?? cfg.cliSessionId;
+  if (!threadId) throw new Error('An exact Codex thread ID is required for automatic upgrade');
+  codexAutoUpgrade = { stage: 'stopping', threadId };
+  cliRestartInProgress = true;
+  restartWindowLaunch = undefined;
+  rawInputRestartGate = true;
+  cliSpawnGeneration++;
+  intentionalRestartBackend = backend!;
+  // What EVERY restore pass of this upgrade inherits — the first one and any
+  // launch-config convergence pass alike. A convergence pass is not an
+  // ordinary restart: it must keep the upgrade's guarantees, or it would undo
+  // the upgrade right after verifying it.
+  const upgradeContext = {
+    threadId,
+    /** The verified executable (lastInitConfig never learns it: an ordinary
+     *  restart would fall back to whatever `codex` resolves to on PATH). */
+    executable: target.path,
+    version: target.version,
+    /** Accepted input AND accepted slash injections survive every teardown
+     *  (the slash endpoint already answered "queued"). */
+    killOptions: { preservePending: true, preservePolicyCapability: true, preserveInjections: true },
+    // Exact resume (no fresh fallback, no tier-2 FRESH) is enforced by spawnCli
+    // while `codexAutoUpgrade.stage === 'restoring'`; runtime version + thread fd
+    // verification runs after every pass, before anything is settled; inputs
+    // stay fenced (cliRestartInProgress / rawInputRestartGate) across passes.
+  } as const;
+  /** `thread`: the upgrade pass resumes the thread on its own model / effort.
+   *  `requested`: a convergence pass runs the launch settings a restart folded
+   *  into the upgrade asked for (the latest lastInitConfig). */
+  const restoreCfg = (launch: 'thread' | 'requested') => ({
+    ...cfg, resume: true, prompt: '', cliSessionId: upgradeContext.threadId, forkSession: false,
+    cliPathOverride: upgradeContext.executable,
+    nativeSessionTitle: undefined, nativeSessionTitlePrompt: undefined,
+    ...(launch === 'thread' ? { model: undefined, reasoningEffort: undefined } : {}),
+  });
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Stop the current generation and resume the exact thread on the verified
+   *  executable; returns the verified replacement processes. */
+  const restorePass = async (pass: number, launch: 'thread' | 'requested', stopping: CodexProcess[]): Promise<CodexProcess[]> => {
+    if (pass > 1) {
+      codexAutoUpgrade!.stage = 'stopping';
+      replacementSpawnInProgress = false;
+      cliSpawnGeneration++;
+      intentionalRestartBackend = backend!;
+    }
+    const oldBackend = backend!;
+    await Promise.race([
+      Promise.resolve(oldBackend.destroySession?.()),
+      new Promise<never>((_, reject) => {
+        readyTimer = setTimeout(() => reject(new Error('Old Codex teardown timed out')), 22_000);
+      }),
+    ]);
+    if (readyTimer) clearTimeout(readyTimer);
+    killCli(upgradeContext.killOptions);
+    await waitForCodexExit(stopping);
+    codexAutoUpgrade!.stage = 'restoring';
+    const ready = new Promise<void>((resolve, reject) => {
+      codexAutoUpgrade!.ready = resolve;
+      codexAutoUpgrade!.reject = reject;
+      readyTimer = setTimeout(() => reject(new Error('New Codex did not become ready')), 90_000);
+    });
+    // Attach rejection handling before spawn, which can itself fail or emit an
+    // exit notification. The original error is still awaited below.
+    void ready.catch(() => undefined);
+    const restartCfg = restoreCfg(launch);
+    // This pass's launch snapshot: a restart folded in from here on is judged
+    // against what this replacement actually runs (foldRestartIntoWindow).
+    restartWindowLaunch = restartLaunchSettings(restartCfg);
+    adoptPendingLaunchConvergence();
+    let pluginGenerationPrepared = false;
+    if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
+      await prepareCliPluginGenerationAndGateway(restartCfg, createCliAdapterSync(restartCfg.cliId as CliId, upgradeContext.executable));
+      pluginGenerationPrepared = true;
+      const outcome = await engageCodexRpc(restartCfg);
+      if (outcome !== 'resumed' || remoteThreadId !== upgradeContext.threadId) {
+        throw new Error('Codex RPC did not resume the original thread');
+      }
+    }
+    awaitingFirstPrompt = true;
+    startScreenUpdates();
+    startStuckDetector();
+    replacementSpawnInProgress = true;
+    await spawnCli(restartCfg, { pluginGenerationPrepared });
+    await ready;
+    if (readyTimer) clearTimeout(readyTimer);
+    const replacement = await inspectCodexUpgradeRuntime();
+    const resumedOriginal = replacement.some(item => {
+      const open = findCodexRolloutSetByPid(item.pid);
+      return open?.size === 1 && open.has(upgradeContext.threadId.toLowerCase());
+    });
+    if (replacement.some(item => item.version !== upgradeContext.version)
+        || !resumedOriginal || (remoteThreadId ?? lastInitConfig?.cliSessionId) !== upgradeContext.threadId) {
+      throw new Error('Replacement Codex runtime or thread identity did not match');
+    }
+    return replacement;
+  };
+  try {
+    let stopping = running;
+    let launch: 'thread' | 'requested' = 'thread';
+    for (let pass = 1; ; pass++) {
+      stopping = await restorePass(pass, launch, stopping);
+      // Launch settings, by value. After the upgrade pass: what a restart
+      // folded into the upgrade asked for, plus any cwd / env change since the
+      // snapshot (which used to fail the upgrade and leave input closed). After
+      // a convergence pass (built from the latest settings): only a request
+      // folded in after its snapshot. A difference runs one more restore pass
+      // with the SAME upgrade context; the folded attempt is settled only once
+      // that verified replacement exists (or failed if the pass fails).
+      const converge = launch === 'thread'
+        ? decideUpgradeLaunchConvergence({
+          upgradeLaunch: restartWindowLaunch ?? restartLaunchSettings(restoreCfg(launch)),
+          current: restartLaunchSettings(lastInitConfig),
+          restartRequested: pendingLaunchConvergence?.requested
+            ?? (activeRestartAttemptId ? restartLaunchSettings(lastInitConfig) : undefined),
+        })
+        : !!pendingLaunchConvergence;
+      if (!converge) break;
+      if (pass >= MAX_RESTORE_PASSES) {
+        throw new Error('Session launch settings kept changing during upgrade; restart is required');
+      }
+      log(`Codex auto-upgrade pass ${pass} verified; launch settings changed during the upgrade — converging with another restore pass before settling the folded restart`);
+      adoptPendingLaunchConvergence();
+      launch = 'requested';
+    }
+    send({ type: 'cli_runtime_version', version: upgradeContext.version });
+    codexAutoUpgrade = undefined;
+    cliRestartInProgress = false;
+    adoptPendingLaunchConvergence();
+    // A restart merged into the upgrade window was held until now (the prompt
+    // edge alone proves nothing before runtime/thread/settings verification).
+    if (isPromptReady) settleRestartAttemptOnReady('Codex auto-upgrade verified', { republishPromptReady: true });
+    releaseRawInputRestartGate();
+    void flushPendingInjections();
+    void flushPending();
+  } catch (error) {
+    // Keep the worker and its accepted queues alive. Automatic crash recovery
+    // can demote resume to a fresh thread, so it is not a valid upgrade fallback.
+    codexAutoUpgrade = { stage: 'failed', threadId };
+    cliRestartInProgress = true;
+    rawInputRestartGate = true;
+    // A restart merged into the upgrade window did not get a usable CLI: input
+    // stays closed until the next /restart, so the daemon's fence must stay
+    // down too. Fail the adopted (or pending) attempt instead of leaving it to
+    // time out.
+    failPendingLaunchConvergence();
+    if (activeRestartAttemptId) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'failed',
+        category: 'spawn_failed',
+      });
+      activeRestartAttemptId = undefined;
+    }
+    send({ type: 'user_notify', message: `Codex 会话自动升级未完成，原会话和待处理消息已保留。请检查后在当前会话发送 /restart 重启。原因：${error instanceof Error ? error.message : String(error)}` });
+    throw error;
+  } finally {
+    replacementSpawnInProgress = false;
+    if (readyTimer) clearTimeout(readyTimer);
+  }
+}
+
+const codexUpgradeMonitor = new CodexSessionUpgradeMonitor({
+  enabled: () => config.autoUpgradeCodexSessions
+    && isCodexFamilyCliId(lastInitConfig?.cliId)
+    && !lastInitConfig?.adoptMode && !lastInitConfig?.existingAppServerEndpoint
+    && !lastInitConfig?.wrapperCli?.trim()
+    && !codexAutoUpgrade && !cliRestartInProgress,
+  check: async () => {
+    if (!backend || !isPromptReady || awaitingFirstPrompt) return undefined;
+    const checkedGeneration = cliSpawnGeneration;
+    const target = await probeCodexExecutable(resolveCodexUpgradeCommand(lastInitConfig!));
+    const running = await inspectCodexUpgradeRuntime();
+    if (!upgradeRequired(target, running)) return undefined;
+    codexUpgradeInspectionBlock = undefined;
+    const roots = running.map(item => item.pid);
+    const tree = upgradeProcessTree(await readUpgradeProcessTable(), roots);
+    if (tree.some(row => !isCodexProcess(row)
+        && !isRestartableCodexHelper(row, tree, running, defaultGatewayEntry().command))) {
+      codexUpgradeInspectionBlock = 'background processes are still attached to Codex';
+    }
+    const threadId = remoteThreadId ?? lastInitConfig?.cliSessionId;
+    const owner = codexRpcEngine?.appServerPid
+      ?? running.find(item => findCodexRolloutSetByPid(item.pid)?.has(threadId?.toLowerCase() ?? ''))?.pid;
+    const open = owner ? findCodexRolloutSetByPid(owner) : undefined;
+    if (!threadId || !open || open.size !== 1 || !open.has(threadId.toLowerCase())) {
+      codexUpgradeInspectionBlock = 'waiting for exclusive ownership of the original thread';
+    }
+    const rollout = owner ? findCodexRolloutByPid(owner) : undefined;
+    if (!rollout || await hasCodexAutonomousGoal(rollout.path)) {
+      codexUpgradeInspectionBlock = 'native Goal state cannot be safely resumed without inference';
+    }
+    if (checkedGeneration !== cliSpawnGeneration) return undefined;
+    return { target, running };
+  },
+  blocked: codexUpgradeBlocked,
+  upgrade: autoUpgradeCodex,
+  report: (state, reason) => log(`Codex session upgrade ${state}: ${reason}`),
+});
+/** Worker-lifetime one-shot for `initialNativeRename`. Unlike hasRunStartupCommands,
+ *  spawnCli must NOT re-arm this: an in-worker CLI restart replays `/effort` and
+ *  the like, but replaying `/rename` would overwrite a session name the user
+ *  changed inside the CLI after the first spawn. */
+let hasRunInitialNativeRename = false;
+
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -2252,9 +2965,21 @@ const FIRST_PROMPT_TIMEOUT_MS = 15_000;
 /** Hard cap for startup screens that outlive the soft fallback. Prevents a
  *  changed/missing readyPattern from trapping the first queued input forever. */
 const FIRST_PROMPT_HARD_TIMEOUT_MS = CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS;
+/** Re-check cadence while an explicit `loading` banner holds the queue. Bounded
+ *  by FIRST_PROMPT_HARD_TIMEOUT_MS, so the hold stays observable but can never
+ *  outlive the first-prompt budget. */
+const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
+/** Last byte forwarded from a writable web-terminal client straight to the
+ *  backend. Such input bypasses the queue and in-flight tracking, so fallbacks
+ *  that trust a quiet screen must also treat it as activity. */
+let lastWebTerminalInputAtMs = 0;
+/** Monotonic count of those forwards (timestamps can collide within a millisecond). */
+let webTerminalInputGeneration = 0;
+/** webTerminalInputGeneration at the latest SessionStart boundary. */
+let webTerminalInputGenerationAtBoundary = 0;
 /** After the SessionStart signal fires, Ink's startup rendering or sibling
  *  hooks may still be active — typing immediately can trip Claude's
  *  paste-burst heuristic and the `\` soft-newline markers (claude-code
@@ -2368,6 +3093,23 @@ function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: bool
   }
 }
 
+/** Cancel a post-release quiescence settle that is still pending.
+ *
+ *  Called by the FIRST-PROMPT HARD CAP, which is the adapter's own deadline: for
+ *  an adapter that defers its first prompt, the ready-gate's own fallback is
+ *  aligned WITH that cap (resolveReadySignalTimeoutMs), so both timers land in
+ *  the same tick and the gate's release starts a settle that `flushPending()`
+ *  then honours for up to READY_FLUSH_SETTLE_CAP_MS — the "90s hard cap" would
+ *  really be 96s of held input. The cap wins over a settle still in flight
+ *  (including one started by a real ready signal shortly before the cap); a
+ *  settle that already finished is a no-op here. */
+function cancelFirstFlushSettle(): void {
+  if (!readyFlushSettleTimer && !isSettlingFirstFlush) return;
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
+  log('First prompt hard timeout — cancelling the pending ready-gate settle (cap is the deadline)');
+}
+
 /** Per-startup-command quiescence: how long the PTY must be quiet before sending
  *  the next command, capped so a slow/redrawing command can't stall the queue. */
 const STARTUP_CMD_QUIET_MS = 500;
@@ -2474,10 +3216,9 @@ async function runStartupCommands(): Promise<void> {
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
   // 远端后端：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
-  // 200ms 后 write 回车），对 riff/mojo 每条会裂成两个独立远端 turn 并打乱血缘。
-  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行）；mojo 无对应机制，
-  // 其环境准备由 --cloud 沙箱镜像负责。两者这里都必须跳过。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  // 200ms 后 write 回车），对结构化远端后端每条会裂成两个独立 turn 并打乱血缘。
+  // Provider-specific initialization belongs in the provider implementation.
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`Skipping ${cmds.length} generic startup command(s) — ${effectiveBackendType} backend has no PTY to drive`);
     return;
   }
@@ -2495,6 +3236,35 @@ async function runStartupCommands(): Promise<void> {
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
   isPromptReady = false;
   idleDetector?.reset();
+}
+
+/** Type the fresh-spawn `/rename` once per worker. Not part of startupCommands,
+ *  so the re-arm in spawnCli cannot replay it. Once an attempt actually starts,
+ *  a later restart must not apply the original title over a name the user may
+ *  already have changed. A restart that is already in progress does not consume
+ *  the command; the replacement flush does. */
+async function runInitialNativeRename(): Promise<void> {
+  const cmd = lastInitConfig?.initialNativeRename?.trim();
+  if (!cmd || hasRunInitialNativeRename) return;
+  // A restart that began while startup commands were still typing owns the next
+  // flush. Leave the command in place so that flush can apply it once; consuming
+  // it here would rename the process already being torn down and then skip the
+  // replacement.
+  if (cliRestartInProgress) return;
+  hasRunInitialNativeRename = true;
+  if (lastInitConfig) lastInitConfig.initialNativeRename = undefined;
+  if (lastInitConfig?.adoptMode || !backend) return;
+  if (isRemoteBackendType(effectiveBackendType)) {
+    log(`Skipping initial native rename — ${effectiveBackendType} backend has no PTY to drive`);
+    return;
+  }
+  try {
+    await sendRawCommandLineWithRecoveryFence(backend, cmd);
+    await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+    log(`Initial native rename sent: ${cmd}`);
+  } catch (e: any) {
+    log(`Initial native rename failed (${cmd}): ${e?.message ?? e}`);
+  }
 }
 
 const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
@@ -2678,13 +3448,34 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
-        currentBotmuxTurnId = msg.turnId;
-        currentBotmuxDispatchAttempt = undefined;
-        currentGatewayTrustedCaller = undefined;
+        if (currentBotmuxTurnId && currentBotmuxTurnId !== msg.turnId) {
+          markTurnRetired(currentBotmuxTurnId);
+        }
+        setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId);
         currentVcMeetingImTurnOrigin = undefined;
+        if (!activeTurnAuthority.inheritOrStartControl(
+          msg.turnId,
+          Date.now(),
+          msg.trustedController,
+        )) {
+          throw new Error(`turn authority mismatch before raw CLI write (${msg.turnId ?? '-'})`);
+        }
+        // A passthrough is a real CLI turn and can settle with a terminal, so it
+        // gets the same write-anchored execution window as a queued message.
+        markTurnExecutionStart(msg.turnId, undefined);
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
+        // A mid-session `/effort <level>` opens a Yes/No "Change effort level?"
+        // confirm dialog; arm the guard so onPtyData can auto-accept it. Armed
+        // before the bytes land (not after the submission is acknowledged) so
+        // a dialog that renders during the acceptance wait is not missed. Bare
+        // `/effort` opens a level picker (unknown target) and is left alone.
+        if (isEffortLevelCommand(msg.content)) armEffortConfirm();
+        // `/btw <question>` answers in an overlay that never reaches the
+        // transcript; arm the capture before the bytes land.
+        const btwQuestion = claudeBtwQuestion(msg.content);
+        if (btwQuestion) armBtwCapture(btwQuestion, msg.turnId);
       });
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
@@ -2698,6 +3489,8 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : undefined;
+      disarmEffortConfirm();
+      disarmBtwCapture();
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
@@ -2791,6 +3584,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 undefined,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -2819,6 +3613,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         ? () => {
             sendToPty(msg.followUpContent!, msg.followUpTurnId, {
               codexAppInput: msg.followUpCodexAppInput,
+              ...(msg.turnCallerOpenId ? { turnCallerOpenId: msg.turnCallerOpenId } : {}),
             });
             log(`Enqueued follow-up after raw input (${msg.followUpContent!.length} chars)`);
           }
@@ -2837,32 +3632,242 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
-let currentGatewayTrustedCaller: TrustedCaller | undefined;
+/** Open id of the human whose turn currentBotmuxTurnId belongs to. Published
+ *  alongside the live-turn marker so the identity wrapper can keep a
+ *  same-principal credential across consecutive turns. */
+let currentBotmuxCallerOpenId: string | undefined;
+/** Monotonic per worker PROCESS (never reset by a CLI restart). Bumped only
+ * when the capture tuple really changes; frames carry the revision they were
+ * captured under so the daemon can match them to an exact identity. */
+let captureRevision = 0;
+let captureIdentityAnnounced = false;
+
+/** The ONLY writer of the screenshot capture identity. Called at real CLI
+ * write/activation points (IM/HTTP flush, raw input, adopt, opening argv,
+ * queued-turn promotion and PID-marker restoration) and on CLI exit/kill.
+ * Merely enqueueing type-ahead input or acknowledging it never calls it.
+ * The first call always announces a snapshot, even for (undefined, undefined). */
+function setCaptureIdentity(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  callerOpenId?: string,
+): void {
+  const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  currentBotmuxTurnId = turnId;
+  currentBotmuxDispatchAttempt = dispatchAttempt;
+  currentBotmuxCallerOpenId = callerOpenId;
+  if (!changed && captureIdentityAnnounced) return;
+  if (changed && captureIdentityAnnounced) captureRevision += 1;
+  captureIdentityAnnounced = true;
+  send({
+    type: 'capture_identity',
+    revision: captureRevision,
+    ...(turnId !== undefined ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  });
+}
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
+let currentTurnSteerPromoted = false;
+interface QueuedTypeAheadTurnRecord {
+  turnId: string;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  turnCallerOpenId?: string;
+}
+let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
+let queuedTurnAdvanceConsumedForPrompt = false;
+const retiredTurnIds = new Set<string>();
+function markTurnRetired(turnId?: string): void {
+  if (!turnId) return;
+  retiredTurnIds.add(turnId);
+  if (retiredTurnIds.size > 256) {
+    const oldest = retiredTurnIds.values().next().value;
+    if (oldest) retiredTurnIds.delete(oldest);
+  }
+}
 let durableTurnInFlight = false;
+/** A remote provider declared one already-submitted turn during resume. This is
+ * distinct from currentBotmuxTurnId: a fresh initial prompt reserves that id
+ * before submitTurn awaits the provider ready handshake. */
+let remoteRunnerRecoveredTurnInFlight = false;
+const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
+  // Ordered IPC reaches the daemon before any output attributed to the steer.
+  send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
+});
+
+function turnAuthorityIdentity(input: {
+  turnId?: string;
+  queueAfterActiveTurn?: true;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+}): TurnAuthorityIdentity {
+  return {
+    ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...(input.dispatchAttempt !== undefined
+      ? { dispatchAttempt: input.dispatchAttempt }
+      : {}),
+    ...(input.trustedCaller ? { caller: input.trustedCaller } : {}),
+    ...(input.trustedController ? { controller: input.trustedController } : {}),
+  };
+}
+
+/**
+ * Experimental XPI switch (default OFF) — the one seam that turns the whole
+ * cross-principal isolation on and off inside this worker.
+ *
+ * `blocks()`, `reserve()` and `markStarted()` all deny through the same
+ * `mayControlActiveTurn` predicate, so gating the read here is what makes the
+ * feature-off path coherent: skipping only the rejection below would let the
+ * message enqueue and then die in `markActiveTurnStarted`, which THROWS
+ * `turn authority mismatch before CLI write` on exactly the mismatch this
+ * predicate reports. Reporting "not blocked" instead means reserve/markStarted
+ * are never reached with a tuple they would refuse.
+ *
+ * Off ⇒ pre-#1348 behavior: a different principal's input is delivered to the
+ * active turn like any other message. Same-principal serialization, type-ahead
+ * batching and the authority tuple itself are untouched either way — those
+ * exist for turn attribution, not for the cross-principal gate.
+ */
+function crossPrincipalIsolationOn(): boolean {
+  return isCrossPrincipalInterruptionEnabled();
+}
+
+function activeTurnBlocks(input: {
+  turnId?: string;
+  queueAfterActiveTurn?: true;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+}): boolean {
+  // Group FIFO is independent of the experimental cross-principal question gate.
+  if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;
+  return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
+}
+
+/**
+ * Second half of the XPI off-switch: the authority must also stop REFUSING.
+ *
+ * `activeTurnBlocks` keeps the message from being rejected, but `reserve()` and
+ * `markStarted()` consult `mayControlActiveTurn` on their own, so a delivered
+ * cross-principal turn would still fail them — and `markActiveTurnStarted`
+ * turns that into a thrown `turn authority mismatch before CLI write`. With the
+ * feature off there is no principal gate to honour, so the incoming message
+ * takes over the TURN ENVELOPE, which is what pre-#1348 code did by overwriting
+ * `currentBotmuxTurnId` outright. It must not take over the authenticated
+ * caller: the disabled-mode product contract merges B's interruption into A's
+ * active work and keeps tool calls running as A. The MCP gateway therefore sees
+ * B's turnId/dispatchAttempt paired with A's frozen caller/controller.
+ *
+ * Returns false only when the authority refuses even after the takeover, which
+ * cannot happen for a turnId-bearing identity — the callers keep their existing
+ * failure handling rather than assuming that.
+ */
+function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boolean {
+  if (identity.queueAfterActiveTurn) return false;
+  if (crossPrincipalIsolationOn()) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (!activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)) return false;
+  log(
+    `Adopted turn ${identity.turnId?.slice(0, 12) ?? '-'} over turn `
+    + `${active?.turnId?.slice(0, 12) ?? '-'} while preserving the active caller `
+    + `(cross-principal isolation disabled)`,
+  );
+  return true;
+}
+
+function reserveActiveTurn(input: {
+  queueAfterActiveTurn?: true;
+  turnId?: string;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+}): boolean {
+  const identity = turnAuthorityIdentity(input);
+  if (!identity.turnId) return true;
+  const reserved = activeTurnAuthority.reserve(identity);
+  if (reserved) return true;
+  if (adoptActiveTurnWhenIsolationOff(identity)) return true;
+  const active = activeTurnAuthority.snapshot();
+  log(
+    `Rejected turn ${identity.turnId.slice(0, 12)} from this worker while turn `
+    + `${active?.turnId?.slice(0, 12) ?? '-'} owns a different principal`,
+  );
+  return false;
+}
+
+function markActiveTurnStarted(input: {
+  queueAfterActiveTurn?: true;
+  turnId?: string;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+}): void {
+  const identity = turnAuthorityIdentity(input);
+  if (!identity.turnId) return;
+  if (activeTurnAuthority.reserve(identity) && activeTurnAuthority.markStarted(identity)) return;
+  // Isolation off ⇒ no principal gate to enforce, so a mismatch is a takeover,
+  // not an error. Only an enforcing authority may throw here.
+  if (adoptActiveTurnWhenIsolationOff(identity) && activeTurnAuthority.markStarted(identity)) return;
+  throw new Error(`turn authority mismatch before CLI write (${identity.turnId})`);
+}
+
+function releaseActiveTurnAuthority(
+  reason: string,
+  exact?: { turnId: string; dispatchAttempt?: number },
+): boolean {
+  const released = exact
+    ? activeTurnAuthority.releaseExact(exact)
+    : activeTurnAuthority.clear();
+  if (!released) return false;
+  completeManagedTurnOriginRevocation(
+    sandboxRelayCapability,
+    released.turnId,
+    released.dispatchAttempt,
+    { revokePolicy: false },
+  );
+  log(`Released active turn authority ${released.turnId?.slice(0, 12) ?? '-'} (${reason})`);
+  queueMicrotask(() => { void flushPending(); });
+  return true;
+}
 
 function currentGatewayTrustedTurnIdentity() {
-  return {
-    ...(currentGatewayTrustedCaller ? { caller: currentGatewayTrustedCaller } : {}),
-    ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
-    ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
-  };
+  return activeTurnAuthority.identity();
 }
 
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
   const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
+  const policyCapability = sandboxPolicyCapability ?? randomBytes(32).toString('hex');
+  const activeIdentity = activeTurnAuthority.identity();
+  const authorityTurnId = activeIdentity.turnId ?? currentBotmuxTurnId;
+  const authorityDispatchAttempt = activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt;
   const capability = {
     token: randomBytes(32).toString('hex'),
-    ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
-    ...(currentBotmuxDispatchAttempt !== undefined
-      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+    ...(authorityTurnId ? { turnId: authorityTurnId } : {}),
+    ...(authorityDispatchAttempt !== undefined
+      ? { dispatchAttempt: authorityDispatchAttempt }
       : {}),
   };
   const files = [
     ...(sandboxRelayOutbox
       ? [{
           path: join(sandboxRelayOutbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
-          body: JSON.stringify({ token: capability.token }),
+          body: JSON.stringify({
+            sessionId,
+            ...(readIsolationOriginChannelId ? { channelId: readIsolationOriginChannelId } : {}),
+            token: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
+            ...(capability.turnId ? { turnId: capability.turnId } : {}),
+            ...(capability.dispatchAttempt !== undefined
+              ? { dispatchAttempt: capability.dispatchAttempt }
+              : {}),
+            ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
+          }),
         }]
       : []),
     ...(readIsolationOriginChannelId
@@ -2876,6 +3881,9 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             sessionId,
             channelId: readIsolationOriginChannelId,
             capability: capability.token,
+            policyCapability,
+            ...(lastInitConfig?.larkAppId ? { larkAppId: lastInitConfig.larkAppId } : {}),
+            ...(lastInitConfig?.daemonBootId ? { bootInstanceId: lastInitConfig.daemonBootId } : {}),
             ...(capability.turnId ? { turnId: capability.turnId } : {}),
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
@@ -2904,19 +3912,21 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
     // by the revocation helper as well.
     completeManagedTurnOriginRevocation(
       sandboxRelayCapability,
-      currentBotmuxTurnId,
-      currentBotmuxDispatchAttempt,
+      authorityTurnId,
+      authorityDispatchAttempt,
     );
     if (opts.failClosed) throw publishError;
     return false;
   }
 
   sandboxRelayCapability = capability;
+  sandboxPolicyCapability = policyCapability;
   if (sessionId) {
     send({
       type: 'managed_turn_origin',
       sessionId,
       capability: capability.token,
+      policyCapability,
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2949,17 +3959,21 @@ function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
+  opts: { revokePolicy?: boolean } = {},
 ): void {
   // Clear local authority before queuing daemon IPC. A forked/delayed process
   // can otherwise win the small window between terminal publication and
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
+  const revokedPolicyCapability = opts.revokePolicy ? sandboxPolicyCapability : null;
+  if (opts.revokePolicy) sandboxPolicyCapability = null;
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
     send({
       type: 'managed_turn_origin_revoked',
       sessionId,
       ...(revoked ? { capability: revoked.token } : {}),
+      ...(revokedPolicyCapability ? { policyCapability: revokedPolicyCapability } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -2982,25 +3996,15 @@ function completeManagedTurnOriginRevocation(
  */
 function revokeManagedTurnOriginForRestart(): void {
   const revoked = sandboxRelayCapability;
+  const activeIdentity = activeTurnAuthority.identity();
   completeManagedTurnOriginRevocation(
     revoked,
-    currentBotmuxTurnId,
-    currentBotmuxDispatchAttempt,
+    activeIdentity.turnId ?? currentBotmuxTurnId,
+    activeIdentity.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    { revokePolicy: false },
   );
 }
 
-/** Revoke only the capability generation bound to this exact terminal. A late
- * terminal from turn N must not clear the token already rotated for turn N+1. */
-function revokeManagedTurnOriginForTerminal(
-  turnId: string,
-  dispatchAttempt: number | undefined,
-): void {
-  const revoked = sandboxRelayCapability;
-  if (!revoked
-    || revoked.turnId !== turnId
-    || revoked.dispatchAttempt !== dispatchAttempt) return;
-  completeManagedTurnOriginRevocation(revoked, turnId, dispatchAttempt);
-}
 function authorizeManagedSend(
   claim: { capability?: string },
 ): {
@@ -3027,8 +4031,10 @@ function authorizeManagedSend(
   // stale-authorize turn N or reject turn N+1 after daemon settlement.
   const session = sessionStore.getSessionFresh(sessionId);
   const ledger = session?.codexAppDispatchLedger ?? [];
-  const codexAppManagedOrigin = lastInitConfig?.cliId === 'codex-app'
-    || session?.cliId === 'codex-app';
+  // 刻意取「worker 当前 init 的 cliId」与「会话库里的 cliId」两者之一：任一方认定是
+  // Codex App 就必须按 ledger 精确校验（fail-closed）。daemon 侧 /api/send 两处同形。
+  const codexAppManagedOrigin = isCodexAppCliId(lastInitConfig?.cliId)
+    || isCodexAppCliId(session?.cliId);
   const codexLedgerDecision = validateCodexAppManagedSendOrigin(
     ledger,
     capability,
@@ -3088,26 +4094,312 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
   }
 }
 
+function adoptInitialActiveTurn(parsed: {
+  turnId: string;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+  steerPromotedTurn?: boolean;
+  callerOpenId?: string;
+}): void {
+  setCaptureIdentity(
+    parsed.turnId,
+    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+    // Fall back to the durable trusted provenance when the marker predates
+    // caller persistence: an empty caller would refuse a same-principal
+    // continuation the marker itself already witnessed.
+    parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
+  );
+  currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
+  activeTurnAuthority.clear();
+  activeTurnAuthority.reserve({
+    turnId: parsed.turnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    caller: parsed.trustedCaller,
+    controller: parsed.trustedController,
+  });
+  activeTurnAuthority.markStarted({
+    turnId: parsed.turnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    caller: parsed.trustedCaller,
+    controller: parsed.trustedController,
+  });
+}
+
+function adoptDisplacedActiveTurn(parsed: {
+  turnId: string;
+  dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+  steerPromotedTurn?: boolean;
+  callerOpenId?: string;
+}): void {
+  const currentCaller = activeTurnAuthority.snapshot()?.caller;
+  const currentController = activeTurnAuthority.snapshot()?.controller;
+  const displaced: QueuedTypeAheadTurnRecord = {
+    turnId: currentBotmuxTurnId!,
+    ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    ...(currentCaller ? { trustedCaller: currentCaller } : {}),
+    ...(currentController ? { trustedController: currentController } : {}),
+    ...(currentVcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin: currentVcMeetingImTurnOrigin } : {}),
+    ...(currentBotmuxCallerOpenId ? { turnCallerOpenId: currentBotmuxCallerOpenId } : {}),
+  };
+  const prevTurnId = currentBotmuxTurnId;
+  markTurnRetired(prevTurnId);
+  setCaptureIdentity(
+    parsed.turnId,
+    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+    parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId,
+  );
+  currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
+  if (!queuedTypeAheadTurns.some(q => q.turnId === displaced.turnId)) {
+    queuedTypeAheadTurns.unshift(displaced);
+  }
+  activeTurnAuthority.clear();
+  activeTurnAuthority.reserve({
+    turnId: parsed.turnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    caller: parsed.trustedCaller,
+    controller: parsed.trustedController,
+  });
+  activeTurnAuthority.markStarted({
+    turnId: parsed.turnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    caller: parsed.trustedCaller,
+    controller: parsed.trustedController,
+  });
+}
+
 function writeCliPidMarker(): void {
   if (!sessionId) return;
+  // Publish the turn the CLI is actually executing, for the trigger-user
+  // identity wrapper. It rides this function because every point that changes
+  // `currentBotmuxTurnId` already calls it — including the ones that bypass the
+  // normal queue (adopt writes, passthrough, init). A separate call at each site
+  // would be one `git rebase` away from missing one, and a missed site means
+  // stale turn ⇒ refused commands.
+  //
+  // Distinct from the pid marker's own `turnId` field: that file is JSON (the
+  // wrapper is /bin/sh and must not spawn jq) and lives where the CLI could
+  // rewrite it. This one is a single line under the 0700 identity dir.
+  if (process.env.SESSION_DATA_DIR) {
+    publishActiveTurn(
+      process.env.SESSION_DATA_DIR,
+      sessionId,
+      currentBotmuxTurnId,
+      currentBotmuxDispatchAttempt,
+      currentBotmuxCallerOpenId,
+    );
+  }
+  // NOTE: withFileLockSync is NOT re-entrant. Do NOT acquire marker locks within this block.
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath) continue;
     try {
-      // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-      const markerPid = Number(basename(markerPath));
-      const procStart = Number.isInteger(markerPid) && markerPid > 0
-        ? readProcessStartIdentity(markerPid)
-        : undefined;
-      atomicWriteFileSync(markerPath, JSON.stringify({
-        sessionId,
-        turnId: currentBotmuxTurnId ?? null,
-        dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
-        ...(procStart ? { procStart } : {}),
-      }));
+      withFileLockSync(markerPath, () => {
+        if (existsSync(markerPath)) {
+          try {
+            const raw = readFileSync(markerPath, 'utf-8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+              if (retiredTurnIds.has(parsed.turnId)) {
+                // Disk holds an older turn that worker memory has already retired/advanced past.
+                // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
+              } else {
+                const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
+                if (idx >= 0) {
+                  const prevTurnId = currentBotmuxTurnId;
+                  markTurnRetired(prevTurnId);
+                  const advancedRecord = queuedTypeAheadTurns[idx]!;
+                  setCaptureIdentity(
+                    parsed.turnId,
+                    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
+                    parsed.callerOpenId ?? advancedRecord.turnCallerOpenId,
+                  );
+                  currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+                  currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
+                  queuedTypeAheadTurns.splice(0, idx + 1);
+                  markActiveTurnStarted(advancedRecord);
+                  publishSandboxRelayCapability();
+                  queuedTurnAdvanceConsumedForPrompt = true;
+                  log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
+                } else if (!currentBotmuxTurnId) {
+                  adoptInitialActiveTurn(parsed);
+                  queuedTurnAdvanceConsumedForPrompt = true;
+                } else {
+                  const prevTurnId = currentBotmuxTurnId;
+                  adoptDisplacedActiveTurn(parsed);
+                  queuedTurnAdvanceConsumedForPrompt = true;
+                  publishSandboxRelayCapability();
+                  log(`Adopted foreign promoted disk turnId ${parsed.turnId?.slice(0, 12)} before write, preserved memory turn ${prevTurnId?.slice(0, 12)} in queue`);
+                }
+              }
+            }
+            if (parsed && Array.isArray(parsed.queuedTurns)) {
+              for (const qt of parsed.queuedTurns) {
+                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+                  queuedTypeAheadTurns.push({
+                    turnId: qt.turnId,
+                    ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+                    ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
+                    ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
+                    ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+                  });
+                }
+              }
+            }
+          } catch {
+            // best-effort
+          }
+        }
+        const markerPid = Number(basename(markerPath));
+        const procStart = Number.isInteger(markerPid) && markerPid > 0
+          ? readProcessStartIdentity(markerPid)
+          : undefined;
+        const queuedTurns = queuedTypeAheadTurns.map(t => ({
+          turnId: t.turnId,
+          ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+          ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
+          ...(t.trustedController ? { trustedController: t.trustedController } : {}),
+          ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
+        }));
+        const queuedTurnId = queuedTurns[0]?.turnId;
+        const effectiveCaller = activeTurnAuthority.snapshot()?.caller;
+        const effectiveController = activeTurnAuthority.snapshot()?.controller;
+        atomicWriteFileSync(markerPath, JSON.stringify({
+          sessionId,
+          turnId: currentBotmuxTurnId ?? null,
+          dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+          ...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {}),
+          ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
+          ...(effectiveController ? { trustedController: effectiveController } : {}),
+          ...(queuedTurnId ? { queuedTurnId } : {}),
+          ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+          ...(procStart ? { procStart } : {}),
+          ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
+        }));
+      });
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }
   }
+}
+
+function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
+  if (!existsSync(markerPath)) return;
+  try {
+    withFileLockSync(markerPath, () => {
+      const raw = readFileSync(markerPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
+        if (!currentBotmuxTurnId) {
+          adoptInitialActiveTurn(parsed);
+        } else if (currentBotmuxTurnId !== parsed.turnId && !retiredTurnIds.has(parsed.turnId)) {
+          adoptDisplacedActiveTurn(parsed);
+        }
+      }
+      if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
+        for (const t of parsed.queuedTurns) {
+          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
+            queuedTypeAheadTurns.push({
+              turnId: t.turnId,
+              ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
+              ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
+              ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
+              ...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {}),
+            });
+          }
+        }
+      } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
+        if (parsed.queuedTurnId !== currentBotmuxTurnId && !retiredTurnIds.has(parsed.queuedTurnId) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
+          queuedTypeAheadTurns.push({ turnId: parsed.queuedTurnId });
+        }
+      }
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function syncQueuedTurnsFromMarkerDisk(): boolean {
+  let anySynced = false;
+  for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
+    if (!markerPath || !existsSync(markerPath)) continue;
+    try {
+      withFileLockSync(markerPath, () => {
+        const raw = readFileSync(markerPath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+          if (retiredTurnIds.has(parsed.turnId)) {
+            // Disk holds an older turn that worker memory has already retired/advanced past.
+          } else {
+            const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
+            if (idx >= 0) {
+              const prevTurnId = currentBotmuxTurnId;
+              markTurnRetired(prevTurnId);
+              const advancedRecord = queuedTypeAheadTurns[idx]!;
+              setCaptureIdentity(
+                parsed.turnId,
+                typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
+                parsed.callerOpenId ?? advancedRecord.turnCallerOpenId,
+              );
+              currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+              currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
+              queuedTypeAheadTurns.splice(0, idx + 1);
+              markActiveTurnStarted(advancedRecord);
+              publishSandboxRelayCapability();
+              anySynced = true;
+              queuedTurnAdvanceConsumedForPrompt = true;
+              log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+            } else if (!currentBotmuxTurnId) {
+              adoptInitialActiveTurn(parsed);
+              anySynced = true;
+              queuedTurnAdvanceConsumedForPrompt = true;
+            } else {
+              const prevTurnId = currentBotmuxTurnId;
+              adoptDisplacedActiveTurn(parsed);
+              anySynced = true;
+              queuedTurnAdvanceConsumedForPrompt = true;
+              publishSandboxRelayCapability();
+              log(`Retained foreign promoted disk turnId ${parsed.turnId?.slice(0, 12)}, preserved memory turn ${prevTurnId?.slice(0, 12)} in queue`);
+            }
+          }
+        }
+        if (parsed && Array.isArray(parsed.queuedTurns)) {
+          for (const qt of parsed.queuedTurns) {
+            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+              queuedTypeAheadTurns.push({
+                turnId: qt.turnId,
+                ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+                ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
+                ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
+                ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+              });
+            }
+          }
+        }
+      });
+    } catch {
+      // ignore
+    }
+  }
+  return anySynced;
+}
+
+function advanceQueuedTypeAheadTurn(reason: string): boolean {
+  if (syncQueuedTurnsFromMarkerDisk()) return true;
+  if (queuedTypeAheadTurns.length === 0) return false;
+  const next = queuedTypeAheadTurns.shift()!;
+  const prevTurnId = currentBotmuxTurnId;
+  markTurnRetired(prevTurnId);
+  setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
+  currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
+  currentTurnSteerPromoted = true;
+  queuedTurnAdvanceConsumedForPrompt = true;
+  markActiveTurnStarted(next);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+  return true;
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -3143,7 +4435,6 @@ let codexAppPosixOwnerLease: CodexAppPosixOwnerLease | undefined;
 let codexAppPosixOwnerLeaseSessionId: string | undefined;
 let codexAppPosixOwnerLeasePromise: Promise<void> | undefined;
 let codexAppControlActiveSocket: Socket | undefined;
-let codexAppControlActiveIdentity: CodexAppControlIdentity | undefined;
 let codexAppFreshCandidateGeneration: string | undefined;
 let codexAppUnprovenPromptDeferred = false;
 let codexAppRejectedControlLogged = false;
@@ -3243,7 +4534,6 @@ function stopCodexAppControlChannel(
   }
   codexAppControlConnections.clear();
   codexAppControlActiveSocket = undefined;
-  codexAppControlActiveIdentity = undefined;
   const server = codexAppControlServer;
   codexAppControlServer = undefined;
   try { server?.close(); } catch { /* worker exit/restart */ }
@@ -3294,6 +4584,12 @@ function failCodexAppControlGeneration(reason: string): void {
   }
   try { backend?.kill(); } catch { /* process exit is the final fail-close */ }
   backend = null;
+  if (codexAutoUpgrade) {
+    // The rejected replacement stays unusable, but the worker must retain
+    // messages accepted during an automatic version change.
+    codexAutoUpgrade.reject?.(new Error(reason));
+    return;
+  }
   queueMicrotask(() => {
     void sendFatalWorkerErrorAndExit(
       new Error(reason),
@@ -3348,7 +4644,6 @@ function activateCodexAppControlConnection(
       );
     });
   }
-  codexAppControlActiveIdentity = identity;
   codexAppControlReplayWindow.retainOnly(identity.generation);
   connection.authenticated = true;
   connection.identity = identity;
@@ -3606,7 +4901,6 @@ function acceptCodexAppControlSocket(
     const wasActive = codexAppControlActiveSocket === socket;
     if (wasActive) {
       codexAppControlActiveSocket = undefined;
-      codexAppControlActiveIdentity = undefined;
       codexAppControlProven = false;
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
@@ -3933,7 +5227,7 @@ async function prepareCodexAppControlGeneration(
   codexAppUnprovenPromptDeferred = false;
   codexAppRejectedControlLogged = false;
   codexAppMalformedControlLogged = false;
-  if (cfg.cliId !== 'codex-app') return;
+  if (!isCodexAppCliId(cfg.cliId)) return;
 
   const dataDir = process.env.SESSION_DATA_DIR;
   const windowsRoot = process.platform === 'win32' ? codexAppWindowsControlRoot() : undefined;
@@ -3983,7 +5277,7 @@ function prepareFreshCodexAppControlBootstrap(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   persistentGeneration: boolean,
 ): void {
-  if (cfg.cliId !== 'codex-app') return;
+  if (!isCodexAppCliId(cfg.cliId)) return;
   if (!codexAppControlDirectoryForSpawn || !codexAppControlLocatorPathValue) {
     throw new Error('Codex App control channel was not prepared');
   }
@@ -4009,7 +5303,7 @@ function finalizeCodexAppControlGeneration(
   _actuallyReattached: boolean,
   persistentGeneration: boolean,
 ): void {
-  if (cfg.cliId !== 'codex-app') return;
+  if (!isCodexAppCliId(cfg.cliId)) return;
   codexAppControlPersistentGeneration = persistentGeneration;
   // A live runner can answer while synchronous backend.spawn is still
   // returning. Authentication already persisted the active public identity;
@@ -4051,7 +5345,7 @@ type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
  * anything: both actions could duplicate model/tool side effects.
  */
 function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): RuntimeScreenStatus {
-  if (lastInitConfig?.cliId !== 'codex-app') return base;
+  if (!isCodexAppCliId(lastInitConfig?.cliId)) return base;
   base = projectCodexAppControlReadinessStatus(base, {
     controlProven: codexAppControlProven,
     signedStateObserved: codexAppSignedStateObserved,
@@ -4061,13 +5355,16 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
   if (liveness.shouldNotify) {
     send({
       type: 'user_notify',
+      // Lets the daemon apply the per-bot enabled mute against the LIVE
+      // registry (immediate effect, even for the turn stalled right now).
+      kind: 'codex_app_no_progress',
       turnId: liveness.turnId ?? currentBotmuxTurnId,
       ...(liveness.turnId === currentBotmuxTurnId
         && currentBotmuxDispatchAttempt !== undefined
         ? { dispatchAttempt: currentBotmuxDispatchAttempt }
         : {}),
       message: t('worker.codex_app.no_progress', {
-        seconds: Math.round(CODEX_APP_NO_PROGRESS_TIMEOUT_MS / 1000),
+        seconds: Math.round(codexAppTurnLiveness.getTimeoutMs() / 1000),
       }),
     });
   }
@@ -4086,13 +5383,15 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
  * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
  * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
  * real limit. So we suppress the screen-scan `rate` verdict and let the
- * structured path be the sole authority. `usage` (quota "hit your limit …") has
- * no structured equivalent yet, so it still comes from the screen.
+ * structured path be the sole authority. `usage` (quota "hit your limit …") is
+ * never suppressed on screen; for codex it is ALSO structured (a
+ * `usage_limit_exceeded` terminal, including a collaboration sub-agent's),
+ * because the screen scan is muted while the CLI is still working.
  *
  * Gate on the two capability fields (`claudeDataDir` for the Claude family;
  * `emitsStructuredRateLimit` for codex), NOT on `reliableTurnTerminal`. The
  * structured rate-limit EMIT only exists where those fields are set: codex's
- * emit runs under the `structuredBridgeIsCodex()` gate, so among the
+ * emit runs under the `structuredBridgeIs('codex')` gate, so among the
  * codexBridgeQueue CLIs only codex carries the flag. The rest (grok / traex /
  * pi / hermes / mtr / cursor) map an `error` terminal to a failed/ambiguous
  * receipt but publish NO `limited` state — suppressing their screen `rate`
@@ -4204,8 +5503,20 @@ let bridgeStalePidStateSessionId: string | undefined;
  *  turn references the path anymore. */
 const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
-let bridgePendingTail = '';
-const bridgeQueue = new BridgeTurnQueue();
+const bridgeQueue = new BridgeTurnQueue(
+  notifyTerminalTurnStarted,
+  (taskId, anchor) => {
+    persistScheduledTaskAnchor(taskId, anchor);
+    syncCronTaskAnchorsToDaemon();
+  },
+  notifyNativeTranscriptConsumedLarkTurn,
+);
+/** Counts background Agent/Task dispatches whose completion notification has
+ *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
+ *  turn that only went quiet because it is awaiting a background sub-agent must
+ *  keep the session card `working`, not flip it to idle (which Lark surfaces as
+ *  「已完成」) and then back to 「进行中」when the `<task-notification>` re-wakes it. */
+const backgroundTaskTracker = new BackgroundTaskTracker();
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -4223,6 +5534,19 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Codex collaboration sub-agents spawned during live ingest. Their quota
+ *  failures land in their own rollouts and reach the parent only as tool
+ *  results, so they are tailed separately and fed into the same structured
+ *  limit emit (see codex-subagent-limit-tracker.ts). */
+const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
+  () => codexBridgeRolloutPath ? codexSessionsRootFromRolloutPath(codexBridgeRolloutPath) : undefined,
+);
+/** Claude Code's automatic model switches for this bridge. The tracker owns the
+ *  binding to the CURRENT Claude session id, the record-uuid dedupe and the
+ *  "only report the serving model when it changed" rule; every transcript drain
+ *  reaches it through observeModelFallbackEvents. The worker reports
+ *  observations only — the daemon owns the state and decides. */
+const modelFallbackTracker = new ClaudeModelFallbackTracker();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
 let herdrAdoptBridgeQuietTimer: NodeJS.Timeout | null = null;
@@ -4253,9 +5577,9 @@ const THINKING_EMIT_INTERVAL_MS = 1_500;
 const THINKING_ACCUMULATED_CAP = 60_000;
 let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
-/** Thinking paragraphs + tool calls/results in transcript order — each
- *  becomes its own node in the native CoT message. Append-only within a
- *  turn. */
+/** Thinking paragraphs, interim assistant narration and tool calls/results
+ *  in transcript order — each becomes its own node in the native CoT message.
+ *  Append-only within a turn. */
 let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
@@ -4263,7 +5587,8 @@ let thinkingCapNoted = false;
 function cotEntryChars(e: CotEntry): number {
   switch (e.kind) {
     case 'thinking': return e.text.length;
-    case 'tool_call': return e.name.length + e.args.length;
+    case 'text': return e.text.length;
+    case 'tool_call': return e.name.length + e.args.length + (e.subject?.length ?? 0);
     case 'tool_result': return e.result.length;
   }
 }
@@ -4274,10 +5599,41 @@ let thinkingLastEmitMs = 0;
  *  timeline (resetting when the turn changes) and schedule a throttled emit.
  *  Claude feeds this via transcript attribution, Codex via the structured
  *  bridge queue's cot observer. */
+/**
+ * Drop the nothing-to-send sentinel from a narration entry before it reaches
+ * the bubble.
+ *
+ * The sentinel travels as an ordinary `text` block, so once the CoT timeline
+ * started carrying `text` it would render the bare token to the user — on a
+ * silent turn the bubble would consist of nothing else. The reply card never
+ * shows it (`bridge-fallback-gate` strips it downstream); the bubble is a
+ * separate channel and had no such filter.
+ *
+ * Filtering here rather than in `extractCotEntries` is deliberate:
+ * `claude-transcript.ts` sits at the bottom of the dependency graph
+ * (bridge-fallback-gate → bridge-turn-queue → claude-transcript), so importing
+ * the gate there would close a cycle. This module already imports the gate, and
+ * is the accumulation core BOTH Claude and Codex feed — so a sentinel filtered
+ * here never enters the timeline, the 60KB budget, or the IPC payload.
+ *
+ * Returns null when nothing survives (skip the entry), otherwise the entry with
+ * a trailing sentinel line removed. `stripTrailingBridgeSentinelLine` only
+ * matches a trailing line, so an inline mention stays untouched.
+ */
+function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
+  if (entry.kind !== 'text') return entry;
+  const stripped = stripTrailingBridgeSentinelLine(entry.text);
+  if (stripped.trim().length === 0) return null;
+  return stripped === entry.text ? entry : { kind: 'text', text: stripped };
+}
+
 function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
   if (entries.length === 0) return;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
+    // Preserve the previous turn's trailing update before a steer/new turn
+    // replaces the accumulator inside the throttle window.
+    flushThinkingUpdate();
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
@@ -4292,9 +5648,16 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     }
     return;
   }
+  // Adopt mode keeps the literal token: the adopted CLI does not know botmux
+  // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
+  // the reply card shows it verbatim. Stripping it from the bubble alone would
+  // make the two messages of one turn contradict each other.
+  const adoptMode = lastInitConfig?.adoptMode === true;
   for (const entry of entries) {
-    thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    const kept = adoptMode ? entry : cotEntryWithoutSentinel(entry);
+    if (!kept) continue;
+    thinkingEntries.push(kept);
+    thinkingTotalChars += cotEntryChars(kept);
   }
   scheduleThinkingEmit();
 }
@@ -4312,18 +5675,25 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
 function scheduleThinkingEmit(): void {
   if (thinkingEmitTimer) return;
   const wait = Math.max(0, THINKING_EMIT_INTERVAL_MS - (Date.now() - thinkingLastEmitMs));
-  thinkingEmitTimer = setTimeout(() => {
-    thinkingEmitTimer = null;
-    if (!thinkingTurn || thinkingEntries.length === 0) return;
-    thinkingLastEmitMs = Date.now();
-    send({
-      type: 'thinking_update',
-      ...(sessionId ? { sessionId } : {}),
-      entries: thinkingEntries.slice(),
-      turnId: thinkingTurn.turnId,
-      ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
-    });
-  }, wait);
+  thinkingEmitTimer = setTimeout(flushThinkingUpdate, wait);
+}
+
+/** Drain a pending update synchronously before its terminal IPC. A short turn
+ * can be read in one batch; emitting after turn_terminal would open a bubble
+ * that never receives its completion. */
+function flushThinkingUpdate(): void {
+  if (!thinkingEmitTimer) return;
+  clearTimeout(thinkingEmitTimer);
+  thinkingEmitTimer = null;
+  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  thinkingLastEmitMs = Date.now();
+  send({
+    type: 'thinking_update',
+    ...(sessionId ? { sessionId } : {}),
+    entries: thinkingEntries.slice(),
+    turnId: thinkingTurn.turnId,
+    ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
+  });
 }
 
 function resetThinkingChannel(): void {
@@ -4347,26 +5717,52 @@ function resetThinkingChannel(): void {
 // gate function are CLI-agnostic and shared.
 let codexBridgeRolloutPath: string | undefined;
 let codexBridgeOffset = 0;
+/** Driver-owned incremental state of the active transcript driver (codex drain
+ *  state, OMP / ebsd / antigravity provisional-terminal state). Opaque to the
+ *  worker's generic drain path: it is handed back to `bridgeSpec.drain` verbatim
+ *  and reset on every attach / detach / stop. One slot is enough — a worker
+ *  drives exactly one CLI. */
+let structuredBridgeDriverState: unknown;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+let codexAdoptRecoveryAttempted = false;
+let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
-const codexBridgeQueue = new CodexBridgeQueue();
-// Codex CoT: rollout reasoning/tool events attributed to the collecting turn
-// feed the same thinking channel as Claude's transcript attribution. Other
-// structured bridges (traex/cursor/pi/…) never emit 'cot' events, so this
-// observer is inert for them. Local (adopt) turns are skipped for the same
-// reason as Claude's: no Lark turn to anchor the bubble to.
+const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
+// Structured rollout CoT: Codex/Pi messages and TraeX history mutations emit
+// rollout reasoning/tool events attributed to the collecting turn, feeding
+// the same thinking channel as Claude's transcript attribution. The observer
+// is inert for bridges without 'cot' events. Local (adopt) turns are skipped for the same reason as
+// Claude's: no Lark turn to anchor the bubble to.
 codexBridgeQueue.setCotObserver((entries, turn) => {
   if (turn.isLocal) return;
   observeCotEntries(entries, turn);
 });
+codexBridgeQueue.setCotSupersededObserver((turn) => {
+  if (!sessionId || turn.isLocal) return;
+  const ownsThinking = thinkingTurn?.turnId === turn.turnId
+    && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
+  // A successor may answer without ever producing CoT. Flush and close the
+  // retired timeline at the queue's confirmed steer edge, not its successor's
+  // first update/terminal. Never synthesize a durable terminal for this UI.
+  // A dynamic reply card can exist before any activity was observed.
+  // Still retire that card, without flushing/resetting another turn's CoT.
+  if (ownsThinking) flushThinkingUpdate();
+  send({
+    type: 'thinking_superseded', sessionId, turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+  });
+  if (ownsThinking) resetThinkingChannel();
+});
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
-let ompBridgeState: OmpTranscriptState = {};
-let ebsdBridgeState: EbsdTranscriptState = {};
 let ompQuietCandidateKey: string | undefined;
 let ompQuietCandidateCompleteOffset: number | undefined;
+/** Antigravity's two-tick quiet-probe latch (its held provisional terminal lives
+ *  in `structuredBridgeDriverState`), same shape as OMP's. */
+let antigravityQuietCandidateKey: string | undefined;
+let antigravityQuietCandidateCompleteOffset: number | undefined;
 const ompRetiredTranscriptPaths = new Set<string>();
 const ebsdRetiredTranscriptPaths = new Set<string>();
 /** Settings are observed on the same append-only cursor as bridge output.
@@ -4421,12 +5817,19 @@ let codexAdoptPendingPid: number | undefined;
  *  but BEFORE the rollout was located still reach the Lark thread. 5s
  *  skew tolerance is applied on top, mirroring the Lark/Claude bridges. */
 let codexAdoptStartMs: number | undefined;
+/** Spawn time for the current antigravity worker generation. Distinguishes a
+ *  resumed conversation (old transcript → baseline) from a `/new`-minted one
+ *  (new file carrying the live turn → ingest from byte 0), mirroring cursor's
+ *  birthtime-based late-attach rule. Set in the spawn bridge arm. */
+let antigravitySpawnStartMs: number | undefined;
 /** Open-fd discovery is cheap via /proc on Linux but shells out to lsof on
  * macOS/BSD. Lark-driven Grok rotation is immediate through writeInput; this
  * throttled poll exists for direct terminal/adopt rotation and cold collision
  * recovery, where a few seconds of latency is acceptable. */
 let grokBridgePidProbeLastMs = 0;
 const GROK_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
+let traexBridgePidProbeLastMs = 0;
+const TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 
 /** Adopt-only: 一次性发送的 "/adopt 前最后一轮" preamble 是否已经触发过。
  *  codexBridgeAttach 在 split-live 分支会查 history 取最后一对 user/assistant
@@ -4474,7 +5877,7 @@ function emptyCompletedBridgeFallbackContent(): string {
   return t('worker.empty_final_completed', { cliName: cliName() });
 }
 
-function failedBridgeFallbackContent(errorCode?: string, summary?: string, partialText?: string): string {
+function failedBridgeFailureText(errorCode?: string, summary?: string): string {
   const reason = summary || t('worker.failed_reason_unavailable');
   const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
     ? 'worker.empty_final_failed_invalid_request'
@@ -4482,12 +5885,11 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
       ? 'worker.empty_final_failed_auth'
       : errorCode === CODEX_CONNECTION_ERROR_CODE
         ? 'worker.empty_final_failed_connection'
-        : errorCode === CODEX_UPSTREAM_ERROR_CODE
+        : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
           ? 'worker.empty_final_failed_upstream'
           : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
-  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
+  return failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -4519,6 +5921,84 @@ function bridgeMarkerPath(): string | undefined {
 function bridgeTurnJournalFilePath(): string | undefined {
   if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
   return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.json`);
+}
+
+function structuredBridgeJournalPath(): string | undefined {
+  const base = bridgeTurnJournalFilePath();
+  if (!base || !codexBridgeFallbackActive()) return undefined;
+  if (lastInitConfig?.adoptMode && structuredBridgeIs('codex')) return undefined;
+  return `${base}.structured`;
+}
+
+function codexAdoptJournalPath(): string | undefined {
+  const base = bridgeTurnJournalFilePath();
+  return base && lastInitConfig?.adoptMode && structuredBridgeIs('codex') ? `${base}.codex-adopt` : undefined;
+}
+
+function checkpointCodexAdoptRecovery(): void {
+  const path = codexAdoptJournalPath();
+  // The first attach must consume the previous generation's journal before a
+  // new pre-path input or an early empty drain can replace it.
+  if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
+  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+function checkpointStructuredBridgeRecovery(): void {
+  const path = structuredBridgeJournalPath();
+  if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
+  catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+/** Per-session durable file of built-in CronCreate task → topic anchors.
+ *  Sibling of the pending-turn journal; lets a re-attached worker keep
+ *  routing scheduled reports to the topic each task was created in. */
+function scheduledTaskAnchorsFilePath(): string | undefined {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return undefined;
+  return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.cron-anchors.json`);
+}
+
+function persistScheduledTaskAnchor(taskId: string, anchor: string | undefined): void {
+  const path = scheduledTaskAnchorsFilePath();
+  if (!path) return;
+  try {
+    upsertScheduledTaskAnchor(path, taskId, anchor);
+  } catch (err: any) {
+    log(`Scheduled task anchor persist failed (${err.message}) for task ${taskId.substring(0, 8)}`);
+  }
+}
+
+/** Push the worker's full task→turnId anchor snapshot to the daemon, which
+ *  mirrors it onto the session and pins the referenced replyTargets records
+ *  against its 32-entry eviction. Full snapshot (not deltas) keeps the two
+ *  sides self-healing after either side restarts. Best-effort: a missed sync
+ *  only loses the eviction exemption; the worker file stays authoritative. */
+function syncCronTaskAnchorsToDaemon(): void {
+  try {
+    send({ type: 'cron_task_anchors_sync', anchors: bridgeQueue.scheduledTaskAnchorsSnapshot() });
+  } catch (err: any) {
+    log(`Cron task anchor sync failed (${err.message})`);
+  }
+}
+
+/** One-shot: seed the queue's task→anchor map from disk before any live
+ *  transcript events are ingested, so a worker re-attaching to a long-lived
+ *  Claude process keeps the create-time topic for every surviving cron task. */
+let scheduledAnchorsRestored = false;
+function restoreScheduledTaskAnchorsOnce(): void {
+  if (scheduledAnchorsRestored) return;
+  scheduledAnchorsRestored = true;
+  const path = scheduledTaskAnchorsFilePath();
+  if (!path) return;
+  const restored = readScheduledTaskAnchors(path);
+  if (restored.size > 0) {
+    bridgeQueue.restoreScheduledTaskAnchors(restored);
+    log(`Bridge restored ${restored.size} scheduled task anchor(s) from disk`);
+  }
+  // Re-assert the pins on the daemon even when the file is empty: a fresh
+  // worker's empty authoritative snapshot must not leave stale pins behind.
+  syncCronTaskAnchorsToDaemon();
 }
 
 function journalBridgeTurnMark(entry: {
@@ -4553,6 +6033,8 @@ function clearBridgeTurnJournalFile(): void {
   const path = bridgeTurnJournalFilePath();
   if (!path) return;
   try { clearBridgeTurnJournal(path); } catch { /* best-effort — session is closing */ }
+  try { clearBridgeTurnJournal(`${path}.codex-adopt`); } catch { /* best-effort */ }
+  try { clearBridgeTurnJournal(`${path}.structured`); } catch { /* best-effort */ }
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
@@ -4575,26 +6057,33 @@ function readSendMarkers(): BridgeSendMarker[] {
   }
 }
 
-function explicitReplyMarkerForTurnWindow(
+function attributableExplicitReplyMarkersForTurnWindow(
+  turnId: string,
   turn: { markTimeMs: number | undefined; isLocal: boolean | undefined },
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
-): BridgeSendMarker | undefined {
-  if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return undefined;
+): BridgeSendMarker[] {
+  if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return [];
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper);
-  return inWindow.at(-1);
+  return markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && marker.turnId === turnId);
 }
 
-function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | undefined): void {
-  if (!marker) return;
-  send({
-    type: 'explicit_reply_observed',
-    turnId,
-    ...(marker.messageId ? { messageId: marker.messageId } : {}),
-  });
+function notifyExplicitRepliesObserved(
+  turnId: string,
+  markers: readonly BridgeSendMarker[],
+): void {
+  for (const marker of markers) {
+    send({
+      type: 'explicit_reply_observed',
+      turnId,
+      ...(marker.messageId ? { messageId: marker.messageId } : {}),
+      ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
+      ...(marker.terminalCarrier ? { terminalCarrier: marker.terminalCarrier } : {}),
+    });
+  }
 }
 
 // ─── Mojo final-answer bridge ───────────────────────────────────────────────
@@ -4625,7 +6114,7 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
-function deliverMojoTurnFinal(text: string): void {
+function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
   if (!text.trim()) return;
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
@@ -4633,12 +6122,12 @@ function deliverMojoTurnFinal(text: string): void {
   // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
   // which is the safe direction for a bug whose symptom is silence.
   const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
-  const turnId = mark?.turnId ?? currentBotmuxTurnId;
+  const turnId = exactTurnId ?? mark?.turnId ?? currentBotmuxTurnId;
   // Without a turn id the daemon cannot resolve a reply target, and lastUuid
   // would not dedupe a retry. Dropping is right: this can only be output that
   // belongs to no Lark turn.
   if (!turnId) {
-    log('Mojo final bridge skipped: no turn id for this answer');
+    log('Remote final bridge skipped: no turn id for this answer');
     return;
   }
   const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
@@ -4647,22 +6136,24 @@ function deliverMojoTurnFinal(text: string): void {
   const adoptMode = lastInitConfig?.adoptMode === true;
   const markers = adoptMode ? [] : readSendMarkers();
   const gateInput = {
+    turnId,
+    dispatchAttempt,
     markTimeMs: mark?.markTimeMs,
     isLocal: false,
     finalText: text,
   };
-  if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode)) {
+  notifyExplicitRepliesObserved(
+    turnId,
+    attributableExplicitReplyMarkersForTurnWindow(turnId, gateInput, undefined, markers, adoptMode),
+  );
+  if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode, replyDeliveryMode())) {
     log(
-      `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
+      `Remote final bridge suppressed for turn ${turnId.substring(0, 12)} `
       + `(${isBridgeNothingToSendFinal(text) ? 'nothing-to-send sentinel' : 'model already called botmux send'})`,
     );
     // Same as the structured bridge: an explicit send IS this turn's reply, so
     // tell observers rather than leaving them waiting on a final that the gate
     // deliberately swallowed.
-    notifyExplicitReplyObserved(
-      turnId,
-      explicitReplyMarkerForTurnWindow(gateInput, undefined, markers, adoptMode),
-    );
     return;
   }
   // Strip a trailing sentinel line: "prose + sentinel" with no send is the
@@ -4678,7 +6169,102 @@ function deliverMojoTurnFinal(text: string): void {
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  log(`Mojo final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+  log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+}
+
+async function deliverRemoteRunnerOutboundMessage(
+  message: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessage,
+): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessageResult> {
+  const authority = activeTurnAuthority.identity();
+  if (!sessionId || !lastInitConfig
+    || message.turnId !== currentBotmuxTurnId
+    || authority.turnId !== message.turnId
+    || (authority.dispatchAttempt !== undefined
+      && authority.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+    return {
+      outcome: 'rejected',
+      code: 'outbound_turn_stale',
+      message: 'The outbound message no longer belongs to the worker\'s active turn.',
+    };
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    SESSION_DATA_DIR: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+    BOTMUX_LARK_APP_ID: lastInitConfig.larkAppId,
+    BOTMUX_CHAT_ID: lastInitConfig.chatId,
+    BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
+    BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+    BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
+  };
+  const pinnedConfig = resolveChildBotsConfig(
+    lastInitConfig.loadedBotsConfigPath,
+    lastInitConfig.loadedBotsConfigProvenance,
+  );
+  if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
+  else delete env.BOTS_CONFIG;
+
+  return sendRemoteRunnerOutboundMessage(message, {
+    sessionId,
+    turnId: message.turnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    env,
+  });
+}
+
+async function deliverRemoteRunnerSessionTool(
+  operation: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolOperation,
+): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolResult> {
+  const authority = activeTurnAuthority.identity();
+  if (!sessionId || !lastInitConfig
+    || operation.turnId !== currentBotmuxTurnId
+    || authority.turnId !== operation.turnId
+    || (authority.dispatchAttempt !== undefined
+      && authority.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+    return {
+      outcome: 'rejected',
+      code: 'session_tool_turn_stale',
+      message: 'The session tool no longer belongs to the worker\'s active turn.',
+    };
+  }
+  if (operation.controllerOpenId && authority.caller?.senderType !== 'bot') {
+    return {
+      outcome: 'rejected',
+      code: 'session_tool_controller_forbidden',
+      message: 'A provider-selected schedule controller is only valid for a bot-authored turn.',
+    };
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    SESSION_DATA_DIR: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+    BOTMUX_LARK_APP_ID: lastInitConfig.larkAppId,
+    BOTMUX_CHAT_ID: lastInitConfig.chatId,
+    BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
+    BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+    BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
+  };
+  const pinnedConfig = resolveChildBotsConfig(
+    lastInitConfig.loadedBotsConfigPath,
+    lastInitConfig.loadedBotsConfigProvenance,
+  );
+  if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
+  else delete env.BOTS_CONFIG;
+
+  return runRemoteRunnerSessionTool(operation.request, {
+    sessionId,
+    turnId: operation.turnId,
+    chatId: lastInitConfig.chatId,
+    ...(operation.controllerOpenId ? { controllerOpenId: operation.controllerOpenId } : {}),
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    env,
+  });
 }
 
 function submitActivityEvidenceSince(
@@ -4810,6 +6396,16 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
 
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
+  // The transcript file exists (or just appeared): this CLI session HAS
+  // user-visible history. Recorded here (attach/lazy-baseline modes; the
+  // other setter is the fresh-empty first-drain in bridgeIngest) so the
+  // resume-fallback notice can distinguish real context loss from a
+  // first-turn launch that died before the CLI ever wrote its session file.
+  cliTranscriptEverExisted = true;
+  // Restore CronCreate task→topic anchors before ANY transcript ingest on
+  // every attach path (journal-restore below, normal baseline, /adopt), so a
+  // re-attached worker keeps routing surviving scheduled jobs correctly.
+  restoreScheduledTaskAnchorsOnce();
   if (!lastInitConfig?.adoptMode) {
     // Restart recovery: if the previous generation left pending Lark turns in
     // the durable journal (worker/daemon died mid-turn), re-mark them and
@@ -4819,14 +6415,13 @@ function bridgeAbsorbBaseline(): void {
     if (tryRestoreInterruptedBridgeTurns()) return;
     const cursor = baselineJsonlCursor(bridgeJsonlPath);
     bridgeOffset = cursor.newOffset;
-    bridgePendingTail = cursor.pendingTail;
     bridgeBaselineDone = true;
     return;
   }
   const result = drainTranscript(bridgeJsonlPath, 0);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
   bridgeQueue.absorb(result.events);
+  observeModelFallbackEvents(bridgeJsonlPath, result.events);
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
@@ -4879,6 +6474,30 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
     try { writeBridgeTurnJournal(journalPath, restorable); } catch { /* best-effort */ }
   }
   if (restorable.length === 0) return false;
+  let transcriptSize = Number.NaN;
+  try { transcriptSize = statSync(bridgeJsonlPath).size; } catch { /* plan fails closed below */ }
+  const recoveryPlan = planBridgeTurnRecovery(restorable, transcriptSize);
+  const skipRecovery = (reason: string): true => {
+    const cursor = baselineJsonlCursor(bridgeJsonlPath!);
+    bridgeOffset = cursor.newOffset;
+    bridgeBaselineDone = true;
+    clearBridgeTurnJournal(journalPath);
+    log(`Bridge recovery skipped ${restorable.length} pending turn(s): ${reason}; baselined at offset=${bridgeOffset}`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ BotMux 跳过了 ${restorable.length} 条中断回合的历史输出补投，因为可恢复历史范围无效、过大或读取失败。原 CLI 输入没有重放；请先核对终端或已有回复，再按需重发。`,
+    });
+    return true;
+  };
+  if (recoveryPlan.kind === 'skip') {
+    return skipRecovery(`${recoveryPlan.reason} range=${recoveryPlan.recoveryBytes} max=${recoveryPlan.maxBytes}`);
+  }
+  let drained: ReturnType<typeof drainTranscript>;
+  try {
+    drained = drainTranscript(bridgeJsonlPath, recoveryPlan.fromOffset);
+  } catch (error) {
+    return skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   for (const entry of restorable) {
     bridgeQueue.mark(
       entry.turnId,
@@ -4889,16 +6508,14 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
       { restoredFromJournal: true },
     );
   }
-  const fromOffset = Math.min(...restorable.map(entry => entry.offsetAtMark));
-  const drained = drainTranscript(bridgeJsonlPath, fromOffset);
   bridgeOffset = drained.newOffset;
-  bridgePendingTail = drained.pendingTail;
   const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
+  observeModelFallbackEvents(bridgeJsonlPath, drained.events);
   bridgeBaselineDone = true;
-  log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
+  log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${recoveryPlan.fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
   return true;
 }
 
@@ -4956,7 +6573,6 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeJsonlDir = dirname(matched);
-  bridgePendingTail = '';
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
   // History (pre-mark) is absorbed into the seen set so the iTerm-side
   // turns the user accumulated before this Lark message DON'T re-emit
@@ -4965,10 +6581,14 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // performRotationSwitch already does for fd-rotation rotations.
   const drained = drainTranscript(matched, 0);
   bridgeOffset = drained.newOffset;
-  bridgePendingTail = drained.pendingTail;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, matched);
+  // The switch moved us onto another Claude session: rebind the fallback
+  // tracker to it (seed always publishes, so the daemon drops whatever the
+  // previous session left behind) before folding this file's own events in.
+  seedModelFallbackFromTranscript();
+  observeModelFallbackEvents(matched, drained.events);
   bridgeBaselineDone = true;
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
   bridgeRememberSessionIdForPath(matched);
@@ -5228,16 +6848,18 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   }
   bridgeJsonlPath = newPath;
   bridgeJsonlDir = dirname(newPath);
-  bridgePendingTail = '';
 
   // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
   // — that would emit the preamble we want to suppress on rotation).
   const result = drainTranscript(newPath, 0);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  // Same as the fingerprint switch: rebind the fallback tracker to the Claude
+  // session we just rotated onto, then fold this file's own events in.
+  seedModelFallbackFromTranscript();
+  observeModelFallbackEvents(newPath, result.events);
   bridgeBaselineDone = true;
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
 
@@ -5408,8 +7030,15 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   bridgeJsonlPath = resolved.path;
   bridgeJsonlDir = dirname(resolved.path);
   bridgeOffset = 0;
-  bridgePendingTail = '';
   bridgeBaselineDone = true;
+  // Same as the fingerprint and fd-rotation switches: the bridge is now on
+  // another Claude conversation, so re-declare which one before any of its
+  // bytes are folded in. Waiting for the next ingest to rebind would leave the
+  // daemon showing the PREVIOUS session's notice for as long as the new
+  // transcript holds nothing observable (a rotation onto a file with no
+  // assistant reply yet), and would let the secondary-path sweep fold the old
+  // session's trailing bytes in as if they were the bound session's.
+  seedModelFallbackFromTranscript();
   try {
     bridgeWatcher = fsWatch(resolved.path, { persistent: false }, () => {
       try { performBridgeIngestAndScheduleQuietEmit(); } catch (err: any) { log(`Bridge ingest error: ${err.message}`); }
@@ -5418,6 +7047,15 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
     log(`Bridge fs.watch unavailable on rotated target (${err.message}); relying on fallback poller`);
   }
   return 'switched';
+}
+
+/** True while the head Lark/API turn's terminal marker has not been read from
+ *  the Claude transcript yet. Locally typed turns never hold a settle. */
+function bridgeHeadTurnAwaitingTerminal(): boolean {
+  if (!bridgeJsonlPath || lastInitConfig?.adoptMode) return false;
+  try { bridgeIngest(); } catch { /* best effort */ }
+  const head = bridgeQueue.peek()[0];
+  return !!head && !head.isLocal && !head.terminalObserved;
 }
 
 function bridgeIngest(): void {
@@ -5497,18 +7135,41 @@ function bridgeIngest(): void {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
     bridgeAbsorbBaseline();
+    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
+    // the non-adopt branch cursors straight to EOF, so a switch already written
+    // to the file is never drained and only the tail scan can recover it. It
+    // also binds the tracker to this file's Claude session. Idempotent with the
+    // adopt branch's own observe: the same record is deduped by uuid.
+    seedModelFallbackFromTranscript();
     return;
   }
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
-  if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  if (result.events.length > 0) {
+    lastStructuredBridgeActivityAtMs = Date.now();
+    // First drained event = the CLI session now holds user-visible history.
+    // bridgeAbsorbBaseline() (the flag's original setter) never runs in
+    // fresh-empty mode — that mode declares baseline-done up front so the
+    // first turn stays attributable — so without this, a fresh session that
+    // ran real turns would keep `cliTranscriptEverExisted === false` and a
+    // later resume fallback would silently drop its context without the
+    // user-facing notice. For attach/lazy-baseline modes this is a no-op:
+    // the flag was already set at baseline. Chosen over comment-only
+    // narrowing because the flag's name and consumer both mean "history
+    // exists", which this makes true in every mode.
+    cliTranscriptEverExisted = true;
+  }
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  // Fold background Agent/Task dispatch and their `<task-notification>`
+  // completions so the idle edge (markPromptReady) knows whether this turn is
+  // only quiet because it is awaiting a background sub-agent.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
+  observeModelFallbackEvents(bridgeJsonlPath, result.events);
   // Transcript terminal markers are authoritative and may settle a durable
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
@@ -5542,6 +7203,79 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
     log(`Structured rate-limit detected in Claude transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return; // one limited emit per ingest is enough; state key is stable
   }
+}
+
+/** THE single entry every Claude transcript drain feeds — history and live
+ *  alike. bridgeIngest is only ONE of the drains that reach the bridge queue:
+ *  the adopt baseline, the journal restore, the fingerprint switch, the
+ *  fd-rotation switch, drainPathInto and the secondary-path sweep all pull
+ *  transcript events too, and a switch record that arrives through any of them
+ *  is just as real. Routing them all through here is what stops a `/clear` or a
+ *  rotation from silently swallowing one.
+ *
+ *  Routing is by the PATH's Claude session id, never by which drain called:
+ *    - the bound session → observe;
+ *    - a different session that IS the current primary path → the bridge moved
+ *      to another Claude conversation, so rebind (dropping the previous
+ *      session's dedupe state) and observe;
+ *    - a different session on a secondary / already-retired path → ignore.
+ *      Those are trailing bytes of a conversation this session no longer runs
+ *      on; folding them in would resurrect its notice or its serving model.
+ *
+ *  The notice is a claude-code-only product affordance, so the cliId gate is
+ *  explicit rather than implied by the call sites. */
+function observeModelFallbackEvents(
+  path: string | null | undefined,
+  events: readonly TranscriptEvent[],
+): void {
+  if (lastInitConfig?.cliId !== 'claude-code') return;
+  if (!path || events.length === 0) return;
+  const claudeSessionId = sessionIdFromJsonlPath(path);
+  if (!claudeSessionId) return;
+  if (claudeSessionId !== modelFallbackTracker.boundClaudeSessionId) {
+    if (path !== bridgeJsonlPath) return;
+    modelFallbackTracker.bind(claudeSessionId);
+  }
+  reportModelFallbackObservation(modelFallbackTracker.observe(events));
+}
+
+/** Bind the tracker to the CURRENT primary path's Claude session and publish
+ *  one observation from its tail. Called at every bind/switch of
+ *  bridgeJsonlPath (watcher start, lazy baseline, fingerprint switch, rotation
+ *  switch): baseline cursors to EOF, so a switch recorded before `--resume`, a
+ *  daemon restart or the switch itself is never drained, and a bounded backward
+ *  scan is the only way to recover it (same shape as Codex/TRAE runtime
+ *  seeding).
+ *
+ *  This ALWAYS sends, including when the scan found nothing. The empty message
+ *  is not a claim that the daemon's notice is stale — it names the Claude
+ *  session the bridge is now on, which is how the daemon drops a notice that
+ *  belonged to a different conversation. An empty message for the SAME session
+ *  changes nothing there, so a plain worker restart still costs nothing. */
+function seedModelFallbackFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  const claudeSessionId = sessionIdFromJsonlPath(bridgeJsonlPath);
+  if (!claudeSessionId) return;
+  let seeded: ModelFallbackObservation;
+  try { seeded = modelFallbackTracker.seed(bridgeJsonlPath, claudeSessionId); }
+  catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); return; }
+  reportModelFallbackObservation(seeded);
+}
+
+/** Ship one observation. Facts only: the worker never decides that a notice is
+ *  over. The two shapes that CAN clear are both positive evidence — a
+ *  `claudeSessionId` naming a different Claude conversation, and `fallback:
+ *  null` from a newest session-scoped record that is not a live Fable
+ *  fallback — and the daemon applies them, not us. */
+function reportModelFallbackObservation(observed: ModelFallbackObservation | null): void {
+  if (!observed) return;
+  const rec = observed.fallback;
+  if (rec) {
+    log(`Claude model fallback observed (kind=${rec.kind}, ${rec.originalModel} → ${rec.fallbackModel}, trigger=${rec.trigger ?? 'n/a'})`);
+  } else if (rec === null) {
+    log(`Claude model fallback cleared by the newest session switch record (session=${observed.claudeSessionId})`);
+  }
+  send({ type: 'model_fallback', ...observed });
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -5624,7 +7358,6 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     // baseline=done with offset=0 up front: the very first events drained
     // from the file are eligible for attribution against pending Lark turns.
     bridgeOffset = 0;
-    bridgePendingTail = '';
     bridgeBaselineDone = true;
     log(`Bridge fresh-empty mode: ${bridgeJsonlPath} (waiting for file to appear; no baseline absorb)`);
   } else if (existsSyncSafe(bridgeJsonlPath)) {
@@ -5633,6 +7366,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   } else {
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
+  seedModelFallbackFromTranscript();
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.
@@ -5722,7 +7456,6 @@ function bridgeMarkPendingTurn(
       jsonlFileExists: existsSyncSafe(bridgeJsonlPath),
     })) {
       bridgeOffset = 0;
-      bridgePendingTail = '';
       bridgeBaselineDone = true;
       log(`Bridge baseline self-healed: guessed transcript ${bridgeJsonlPath} absent; fresh-empty readiness armed for fingerprint recovery`);
     } else {
@@ -5816,7 +7549,17 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // a send credit into turn N's window via shouldSuppressBridgeEmit.
   const markers = adoptMode ? [] : readSendMarkers();
   const remainingPending = bridgeQueue.peek();
-  const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
+  // Only a STARTED pending turn can bound the last ready turn's send window.
+  // An unstarted mark's user event hasn't landed, so it has produced no sends
+  // to leak backwards — and under type-ahead its markTimeMs is the early
+  // flush-time mark, often EARLIER than a ready turn that was inserted ahead
+  // of it (a built-in scheduled fire or a local turn). Using it then inverts
+  // the window [ready.markTimeMs, earlier) and excludes every real marker,
+  // letting an explicit final `botmux send` escape suppression → duplicate.
+  // Mirrors the codex bridge's identical guard below.
+  const nextPendingMarkTimeMs = remainingPending.length > 0 && remainingPending[0].started
+    ? remainingPending[0].markTimeMs
+    : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
   // Turns suppressed as GENUINE SILENCE — see emitReadyCodexTurns for the full
   // rationale. Tracked by object identity across this function's two loops so
@@ -5829,11 +7572,35 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
-      const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
-      log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+    // Built-in scheduled turns MUST NOT run this pre-text gate: without
+    // finalText the gate treats "any in-window marker" as already-delivered
+    // (empty final is covered by a single progress send), so a turn that sent
+    // a short progress note and then produced its real long final gets
+    // suppressed here before the text is even read — the materially-longer
+    // check at the gate below can never run. Scheduled turns are always
+    // evaluated AFTER the transcript text is available, where NOTHING_TO_SEND
+    // and send-marker dedup (incl. the length comparison) have the final.
+    if (!turn.isScheduled && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+      log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;
     }
+
+    // Carrier discovery is independent of transcript text. A successful
+    // explicit `botmux send` can be followed by an empty assistant-final block;
+    // still publish its marker before turn_terminal so daemon auto mode can
+    // PATCH the actual visible reply instead of mistaking the turn for bodyless.
+    const carrierGateInput = {
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      isScheduled: turn.isScheduled,
+      forwardLocalFinal: zeroPromptTerminalSync(),
+    };
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
 
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
@@ -5850,12 +7617,20 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // material-longer gate, re-posting turns the model already `botmux send`ed.
     // Adopt keeps the full join: transcript drain is that mode's only channel,
     // so interim narration is the user's only window into the turn.
-    const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
+    // Transcript delivery also has no other channel: an answer written before
+    // Claude Code's post-answer memory writes must not be cut down to the
+    // postscript that follows them.
+    const assistantText = adoptMode
+      ? joinAssistantText(matched)
+      : trailingAssistantText(drained.events, turn.assistantUuids, replyDeliveryMode() === 'transcript'
+        ? { isHousekeepingToolUse: block => isClaudeMemoryToolUse(block, path), endsWithSentinel: hasTrailingBridgeSentinelLine }
+        : {});
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
-    const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled, finalText: assistantText,
+      forwardLocalFinal: zeroPromptTerminalSync() };
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
       // Hardcoded 'answered' rather than bridgeTurnOutcome(turn): this queue has
@@ -5863,17 +7638,13 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       // turn here already means completed. The claude family's limits arrive via
       // maybeEmitStructuredRateLimit → noteStructuredLimit, which revokes this.
       usageLimitTracker.noteTurnCompleted('answered');
-      const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
+      const reason = turn.isScheduled ? 'scheduled turn already sent / silent' : 'local-typed';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       // Positive silence evidence for the terminal — only a bare nothing-to-send
       // sentinel (no prose, no send), never "already sent" / local-typed.
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
       continue;
     }
 
@@ -5890,7 +7661,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
 
-    if (turn.isLocal) {
+    if (turn.isLocal && !turn.isScheduled && !zeroPromptTerminalSync()) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
@@ -5947,6 +7718,15 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       content: deliveredText,
       lastUuid,
       turnId: turn.turnId,
+      // A built-in scheduled turn has no Lark turn of its own: anchor its reply
+      // to the topic captured when its task was created (restored from the
+      // durable anchor store after a re-attach). Thread scope ignores this and
+      // routes to the session root. Omitted in zero-injection mode —
+      // terminalLocal owns routing there.
+      ...(turn.isScheduled && !zeroPromptTerminalSync() && turn.replyAnchorTurnId
+        ? { replyTurnId: turn.replyAnchorTurnId }
+        : {}),
+      ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
   }
@@ -5958,9 +7738,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (turn.rateLimited) continue;
     const outcome = turn.terminalOutcome;
     // A SYNTHESISED local turn has no Lark turn behind it: `local-*` /
-    // `local-headless-*` ids are minted by the queue for transcript activity
-    // that matched no pending mark (terminal-typed input, or — after a restart
-    // — replayed history whose original mark is long gone). Letting its FAILURE
+    // `local-headless-*` / `scheduled-*` ids are minted by the queue for
+    // transcript activity that matched no pending mark (terminal-typed input,
+    // a built-in CronCreate fire, or — after a restart — replayed history
+    // whose original mark is long gone). Letting its FAILURE
     // terminal through means the daemon posts a 「本轮执行失败」card for a turn
     // the user never sent — and, because the daemon stamps the card with
     // `new Date()` and the session's *current* lastUserPrompt, that card names
@@ -6011,6 +7792,14 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 function drainPathInto(path: string, fromOffset: number): { offset: number; tail: string } {
   const result = drainTranscript(path, fromOffset);
   bridgeQueue.ingest(result.events, path);
+  // Drain-before-switch runs while `path` is still the primary, so these are
+  // the bound session's own trailing bytes — a switch record Claude wrote just
+  // before the rotation lands here and nowhere else.
+  observeModelFallbackEvents(path, result.events);
+  // Same reasoning for background-task bookkeeping: a dispatch launch-ack or a
+  // `<task-notification>` can land on the trailing bytes of a rotating path and
+  // reach the tracker nowhere else.
+  for (const ev of result.events) backgroundTaskTracker.observe(ev);
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -6026,9 +7815,16 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 
 function codexBridgeFallbackActive(): boolean {
   // Transcript-backed CLIs whose final output can be harvested when the
-  // model forgets to call `botmux send`. Cursor is adopt-only — see
-  // services/structured-bridge-clis.ts (single source of the allowlist).
-  return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
+  // model forgets to call `botmux send`. Cursor is adopt-only by default —
+  // see services/structured-bridge-clis.ts (single source of the allowlist).
+  // Cursor + antigravity additionally activate for botmux-spawned sessions
+  // under promptInjection:'none' (zero-prompt: there IS no `botmux send`
+  // channel, so the transcript is the only delivery path).
+  return isStructuredBridgeFallbackActive(
+    lastInitConfig?.cliId,
+    lastInitConfig?.adoptMode === true,
+    lastInitConfig?.promptInjection === 'none',
+  );
 }
 
 /** A Codex App shared-adopt starts a SECOND official `codex --remote` client
@@ -6062,40 +7858,25 @@ function hasStructuredLifecycleBlock(): boolean {
     && codexBridgeQueue.hasBlockingTurn();
 }
 
-function structuredBridgeIsCodex(): boolean {
-  return lastInitConfig?.cliId === 'codex';
+/** 当前 worker 驱动的结构化桥接 CLI 是不是 `cliId`。
+ *  取代原来 10 个 `structuredBridgeIsXxx()` 一行函数；id 类型取自
+ *  services/structured-bridge-clis.ts 的清单，拼错会编译失败。 */
+type StructuredBridgeCliId =
+  | (typeof STRUCTURED_BRIDGE_ALWAYS_CLI_IDS)[number]
+  | (typeof STRUCTURED_BRIDGE_ZERO_PROMPT_CLI_IDS)[number];
+
+function structuredBridgeIs(cliId: StructuredBridgeCliId): boolean {
+  return lastInitConfig?.cliId === cliId;
 }
 
-function structuredBridgeIsTraex(): boolean {
-  return lastInitConfig?.cliId === 'traex';
+/** OMP's held provisional terminal (valid only while the OMP driver is active). */
+function ompBridgeState(): OmpTranscriptState {
+  return (structuredBridgeDriverState as OmpTranscriptState | undefined) ?? {};
 }
 
-function structuredBridgeIsHermes(): boolean {
-  return lastInitConfig?.cliId === 'hermes';
-}
-
-function structuredBridgeIsMtr(): boolean {
-  return lastInitConfig?.cliId === 'mtr';
-}
-
-function structuredBridgeIsPi(): boolean {
-  return lastInitConfig?.cliId === 'pi';
-}
-
-function structuredBridgeIsOmp(): boolean {
-  return lastInitConfig?.cliId === 'oh-my-pi';
-}
-
-function structuredBridgeIsEbsd(): boolean {
-  return lastInitConfig?.cliId === 'ebsd';
-}
-
-function structuredBridgeIsGrok(): boolean {
-  return lastInitConfig?.cliId === 'grok';
-}
-
-function codexBridgeIsCursor(): boolean {
-  return lastInitConfig?.cliId === 'cursor';
+/** Antigravity's held provisional terminal (valid only while that driver is active). */
+function antigravityBridgeState(): AntigravityTranscriptState {
+  return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
 }
 
 function currentHermesBridgeDbPath(): string {
@@ -6105,33 +7886,27 @@ function currentHermesBridgeDbPath(): string {
 function structuredBridgeIngestPath(
   path: string,
   offset: number,
-  opts: { flushOmpTrailingFinal?: boolean } = {},
-) {
-  if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
-  // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
-  // transcript text verbatim, so a synthesised token would leak into Lark.
-  if (structuredBridgeIsTraex()) {
-    return drainTraexRollout(path, offset, { adoptMode: lastInitConfig?.adoptMode === true });
-  }
-  if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
-  if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
-  if (structuredBridgeIsEbsd()) {
-    const result = drainEbsdTranscript(path, offset, ebsdBridgeState);
-    ebsdBridgeState = result.state;
-    return result;
-  }
-  if (structuredBridgeIsOmp()) {
-    const result = drainOmpTranscript(path, offset, ompBridgeState, {
-      flushTrailingFinal: opts.flushOmpTrailingFinal,
+  opts: { flushOmpTrailingFinal?: boolean; flushAntigravityTrailingFinal?: boolean } = {},
+): StructuredBridgeDrainResult {
+  const spec = bridgeSpecFor(lastInitConfig?.cliId);
+  if (spec) {
+    const result = spec.drain(path, offset, {
+      // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
+      // transcript text verbatim, so a synthesised token would leak into Lark.
+      adoptMode: lastInitConfig?.adoptMode === true,
+      state: structuredBridgeDriverState,
+      // The two flags are never set for the "other" driver: every caller sits
+      // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
+      flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
-    ompBridgeState = result.state;
+    if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
     return result;
   }
-  if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
-  if (structuredBridgeIsHermes()) {
+  if (structuredBridgeIs('hermes')) {
     const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };
   }
+  // Legacy default (it was the final fallthrough before specs): CoCo events.
   return drainCocoEvents(path, offset);
 }
 
@@ -6153,7 +7928,7 @@ function codexBridgeStartTimer(): void {
   // before late-attach could leave a bare fingerprint at the head forever.
   codexBridgeTimer = setInterval(() => {
     try {
-      if (structuredBridgeIsHermes()) {
+      if (structuredBridgeIs('hermes')) {
         // Use lastSpawnEffectiveResume (written by spawnCli AFTER the
         // two-tier fallback), NOT lastInitConfig.resume. Otherwise a
         // Tier-1/Tier-2 demotion to fresh would still baseline the empty
@@ -6163,7 +7938,7 @@ function codexBridgeStartTimer(): void {
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
-      if (structuredBridgeIsMtr()) {
+      if (structuredBridgeIs('mtr')) {
         if (!mtrBridgeSource) {
           const source =
             findMtrSessionById(codexBridgePendingSessionId)
@@ -6180,26 +7955,92 @@ function codexBridgeStartTimer(): void {
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
-      if (codexBridgeIsCursor()) {
+      if (structuredBridgeIs('cursor')) {
         // Late-attach: the transcript usually exists at adopt time (the
         // session is already running), so cursorBridgeAttach in setup wins.
         // This covers the rare race where pid→chatId resolved but the JSONL
         // hadn't been created yet. Resolution order: chatId (cliSessionId) →
-        // path; then adopt pid → store.db fd → chatId → path.
+        // path; then the observed cursor pid → store.db fd → chatId → path.
+        // Adopt uses the adopt pid + baseline attach; botmux-spawned
+        // (zero-prompt) uses the live backend pid (wrapper-resolved) and a
+        // fresh/resume attach so the argv-baked first turn stays attributable.
         if (!codexBridgeRolloutPath) {
-          let path = codexBridgePendingSessionId
+          let path: string | undefined = codexBridgePendingSessionId
             ? findCursorTranscriptByChatId(codexBridgePendingSessionId)
             : undefined;
-          if (!path && codexAdoptPendingPid) {
-            path = findCursorTranscriptByPid(codexAdoptPendingPid)?.path;
+          if (!path) {
+            const pid = lastInitConfig?.adoptMode
+              ? codexAdoptPendingPid
+              : currentCursorObservedPid();
+            if (pid) path = findCursorTranscriptByPid(pid)?.path;
           }
           if (path) {
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
-            cursorBridgeAttach(path, cursorLateAttachMode(path));
+            if (lastInitConfig?.adoptMode) {
+              cursorBridgeAttach(path, cursorLateAttachMode(path));
+            } else {
+              // The spawn observer normally starts the CoT reader; cover the
+              // race where the ticker's pid probe binds the transcript first.
+              ensureCursorCotReader(path.split('/').slice(-2, -1)[0]);
+              codexBridgeAttach(path, structuredSpawnAttachMode());
+            }
           }
         }
         codexBridgeIngest();
+        if (isPromptReady) emitReadyCodexTurns();
+        return;
+      }
+      if (structuredBridgeIs('antigravity')) {
+        // Antigravity has no /adopt bridge: this branch runs only for
+        // botmux-spawned zero-prompt sessions. writeInput's pid probe usually
+        // reports the conversation id through codexBridgeNotifyCliSessionId;
+        // the pid fallback here recovers a probe that lost the race.
+        //
+        // Resolve while UNBOUND or while a lazy-created conversation is still
+        // pending — the latter also covers a /new rotation: the notify path
+        // stored the new id while its brain file did not exist yet, and the
+        // retired conversation's path is still bound. Gating only on
+        // !codexBridgeRolloutPath would leave the new file unattached forever.
+        if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
+          const action = decideAntigravityTickerAction({
+            boundPath: codexBridgeRolloutPath,
+            pendingSid: codexBridgePendingSessionId,
+            resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
+            resolveByPid: () => {
+              const pid = currentAntigravityObservedPid();
+              return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
+            },
+          });
+          if (action.kind === 'rotate') {
+            // A new conversation resolved while the retired one is bound
+            // (either the pending SID authoritatively, or the pid's open
+            // conversation switched): release the retired conversation's held
+            // final, then bind the new one fresh so its live turn is ingested
+            // from byte 0 (never as history).
+            codexBridgePendingSessionId = undefined;
+            codexAdoptPendingPid = undefined;
+            try {
+              codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+              emitReadyCodexTurns();
+            } catch (err: any) {
+              log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+            }
+            codexBridgeDetachFile();
+            codexBridgeAttach(action.path, 'fresh-empty');
+          } else if (action.kind === 'bind-initial') {
+            codexBridgePendingSessionId = undefined;
+            codexAdoptPendingPid = undefined;
+            codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
+          } else if (action.kind === 'clear-pending') {
+            // Provenance: only a direct SID hit reaches here. A pid hit on the
+            // bound path returns 'idle' and leaves a pending NEW id intact
+            // (the retired conversation's fd can still be the one open).
+            codexBridgePendingSessionId = undefined;
+          }
+        }
+        codexBridgeIngest();
+        maybeFlushAntigravityTrailingFinalOnQuietTick();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -6226,7 +8067,7 @@ function codexBridgeStartTimer(): void {
         const path = resolveFileBridgePath(lastInitConfig?.cliId, {
           sessionId: codexBridgePendingSessionId,
           cwd: lastInitConfig?.workingDir,
-          pid: codexAdoptPendingPid,
+          pid: lastInitConfig?.adoptMode ? codexAdoptPendingPid : undefined,
         });
         // Codex/TRAE defense-in-depth: resolveFileBridgePath resolves
         // sessionId-first, so a pending sid that is actually a shared-home
@@ -6236,16 +8077,18 @@ function codexBridgeStartTimer(): void {
         // lazily-opened owned fd is picked up on a later tick. Skip the gate
         // only when we have no pid to prove ownership with (keeps the sid/pid
         // resolution working for non-adopt / pid-less flows).
-        const codexAttachGated = structuredBridgeIsCodex() && lastInitConfig?.adoptMode && path && currentCodexObservedPid();
-        const traexAttachGated = structuredBridgeIsTraex() && lastInitConfig?.adoptMode && path && currentTraexObservedPid();
+        const codexAttachGated = structuredBridgeIs('codex') && lastInitConfig?.adoptMode && path && currentCodexObservedPid();
+        const traexAttachGated = structuredBridgeIs('traex') && lastInitConfig?.adoptMode && path && currentTraexObservedPid();
         const attachOk = codexAttachGated
           ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
           : traexAttachGated
-            ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
+            ? (() => { const sid = traexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
             : true;
         if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
-            const discoveredSessionId = codexSessionIdFromRolloutPath(path);
+            const discoveredSessionId = structuredBridgeIs('traex')
+              ? traexSessionIdFromRolloutPath(path)
+              : codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
           codexBridgePendingSessionId = undefined;
@@ -6256,6 +8099,7 @@ function codexBridgeStartTimer(): void {
       }
       codexBridgeIngest();
       maybeFlushOmpTrailingFinalOnQuietTick();
+      maybeFlushAntigravityTrailingFinalOnQuietTick();
       if (isPromptReady) emitReadyCodexTurns();
     } catch (err: any) {
       log(`Codex bridge tick error: ${err.message}`);
@@ -6352,12 +8196,14 @@ function mtrBridgeIngest(): void {
 }
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
-  ompBridgeState = {};
-  ebsdBridgeState = {};
+  structuredBridgeDriverState = undefined;
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
+  antigravityQuietCandidateKey = undefined;
+  antigravityQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
-  if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
+  codexSubagentLimitTracker.clear();
+  if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
@@ -6366,6 +8212,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge fresh-empty: ${rolloutPath}`);
   } else if (mode === 'split-live' && existsSync(rolloutPath)) {
     // Adopt mode: drain everything, then split by adoptStartMs. History
@@ -6378,9 +8225,18 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
     const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
-    const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    const journalPath = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
+    const recover = journalPath && !codexAdoptRecoveryAttempted;
+    const { history, live, restored } = recover
+      ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
+      : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
+    if (journalPath) {
+      codexAdoptRecoveryAttempted = true;
+      structuredBridgeRecoveryAttempted = true;
+    }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
+    if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
     // Late attach can discover an already-completed live turn in the same
     // drain. Re-drive prompt readiness from that terminal event immediately;
@@ -6392,7 +8248,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
-    if (structuredBridgeIsCodex()) {
+    if (structuredBridgeIs('codex')) {
       const codex = result as CodexDrainResult;
       codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
       // Reuse this drain's turn_context observation — split-live already read
@@ -6401,10 +8257,18 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         model: codex.latestModel,
         reasoningEffort: codex.latestReasoningEffort,
       });
+      // The cursor jumps to EOF below, so sub-agents started on the live side
+      // of the cutoff must be registered from this drain or never at all.
+      // Pre-cutoff ones are history, same as the absorbed parent events.
+      codexSubagentLimitTracker.observe(
+        codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+        Date.now(),
+      );
+      maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
     }
     // Reuse this drain's runtime observation instead of a second full-file
     // scan — split-live already read the whole rollout above.
-    if (structuredBridgeIsTraex()) {
+    if (structuredBridgeIs('traex')) {
       const traex = result as TraexDrainResult;
       publishActiveRuntime({
         model: traex.latestModel,
@@ -6421,30 +8285,113 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (mode === 'baseline-existing-skip-tail' && existsSync(rolloutPath)) {
-    let size = 0;
-    try { size = statSync(rolloutPath).size; } catch { /* degrade below */ }
-    codexBridgeOffset = size;
+    // Cursor (the only skip-tail caller) parks the baseline at a trailing
+    // `turn_ended` footer: the next turn truncates the footer and rewrites
+    // from its start, which a plain EOF baseline would sit past. One snapshot
+    // decides the offset — no separate stat a concurrent rewrite could skew.
+    let offset = structuredBridgeIs('cursor')
+      ? baselineCursorTranscript(rolloutPath, { skipTail: true })?.newOffset
+      : undefined;
+    if (offset === undefined) {
+      offset = 0;
+      try { offset = statSync(rolloutPath).size; } catch { /* degrade below */ }
+    }
+    codexBridgeOffset = offset;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
-    const cursor = baselineJsonlCursor(rolloutPath);
-    codexBridgeOffset = cursor.newOffset;
-    codexBridgePendingTail = cursor.pendingTail;
-    codexBridgeBaselineDone = true;
-    log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    const journalPath = structuredBridgeJournalPath() ?? codexAdoptJournalPath();
+    // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
+    // timestamp-cutoff replay cannot partition Cursor history, so Cursor stays on the offset EOF baseline.
+    const canRecover = journalPath && !structuredBridgeRecoveryAttempted && !structuredBridgeIs('cursor');
+    const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath }) : [];
+    if (journalPath) structuredBridgeRecoveryAttempted = true;
+    if (restorable.length > 0 && journalPath) {
+      let rolloutSize = Number.NaN;
+      try { rolloutSize = statSync(rolloutPath).size; } catch { /* plan fails closed below */ }
+      const recoveryPlan = planBridgeTurnRecovery(restorable, rolloutSize);
+      const skipRecovery = (reason: string): void => {
+        const cursor = baselineJsonlCursor(rolloutPath);
+        codexBridgeOffset = cursor.newOffset;
+        codexBridgePendingTail = cursor.pendingTail;
+        codexBridgeBaselineDone = true;
+        log(`Structured bridge recovery skipped ${restorable.length} pending turn(s): ${reason}; baselined at offset=${codexBridgeOffset}`);
+        send({
+          type: 'user_notify',
+          message: `⚠️ BotMux 跳过了 ${restorable.length} 条中断回合的历史输出补投，因为可恢复历史范围无效、过大或读取失败。原 CLI 输入没有重放；请先核对终端或已有回复，再按需重发。`,
+        });
+      };
+      if (recoveryPlan.kind === 'skip') {
+        skipRecovery(`${recoveryPlan.reason} range=${recoveryPlan.recoveryBytes} max=${recoveryPlan.maxBytes}`);
+      } else {
+        try {
+          const result = structuredBridgeIngestPath(rolloutPath, recoveryPlan.fromOffset);
+          const minMarkTime = Math.min(...restorable.map(e => e.markTimeMs));
+          const cutoff = minMarkTime - 5_000;
+          const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
+          codexBridgeQueue.absorb(history);
+          codexBridgeQueue.ingest(live);
+          if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
+          emitReadyCodexTurns();
+          if (live.some(event => event.kind === 'assistant_final')) {
+            idleDetector?.fireIdle();
+          }
+          codexBridgeOffset = result.newOffset;
+          codexBridgePendingTail = result.pendingTail;
+          codexBridgeBaselineDone = true;
+          if (structuredBridgeIs('codex')) {
+            const codex = result as CodexDrainResult;
+            codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
+            publishActiveRuntime({
+              model: codex.latestModel,
+              reasoningEffort: codex.latestReasoningEffort,
+            });
+            // Same as split-live: the cursor jumps to EOF, so live-side sub-agents
+            // must be registered from this drain or never at all.
+            codexSubagentLimitTracker.observe(
+              codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+              Date.now(),
+            );
+            maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
+          }
+          if (structuredBridgeIs('traex')) {
+            const traex = result as TraexDrainResult;
+            publishActiveRuntime({
+              model: traex.latestModel,
+              reasoningEffort: traex.latestReasoningEffort,
+            });
+          }
+          log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+        } catch (error) {
+          skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    } else {
+      // Cursor (zero-prompt resume) needs the footer-aware baseline for the
+      // same reason as the skip-tail branch above.
+      const cursor = (structuredBridgeIs('cursor') ? baselineCursorTranscript(rolloutPath) : undefined)
+        ?? baselineJsonlCursor(rolloutPath);
+      codexBridgeOffset = cursor.newOffset;
+      codexBridgePendingTail = cursor.pendingTail;
+      codexBridgeBaselineDone = true;
+      log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    }
   } else {
     // baseline-existing requested but file missing — degrade to fresh
     // semantics so the lazy-appearing file isn't accidentally absorbed.
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge transcript not yet present at ${rolloutPath}; treating as fresh`);
   }
   if (
-    structuredBridgeIsCodex()
+    structuredBridgeIs('codex')
     && mode !== 'fresh-empty'
     && mode !== 'split-live'
   ) {
@@ -6460,7 +8407,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   // from its own drain; fresh-empty has no history and picks it up on first
   // live ingest.
   if (
-    structuredBridgeIsTraex()
+    structuredBridgeIs('traex')
     && mode !== 'fresh-empty'
     && mode !== 'split-live'
   ) {
@@ -6479,6 +8426,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   // 在 macOS 上会卡死，永远收不到模型回复。Linux 上 poller 多 tick 也无害
   // （codexBridgeIngest 在 offset 未推进时是 no-op）。
   codexBridgeStartTimer();
+  checkpointStructuredBridgeRecovery();
 }
 
 type CursorAttachMode = 'baseline-existing' | 'fresh-empty';
@@ -6503,7 +8451,82 @@ function cursorLateAttachMode(path: string): CursorAttachMode {
  *  old in-flight output and must not be attributed to the next Lark turn. If
  *  the transcript is created after /adopt, attach fresh so the first
  *  post-adopt Lark/user turn can still be attributed. */
+let cursorCotReaderChatId: string | undefined;
+
+/** Start the session-long CoT reader once the Cursor chat's store is known.
+ *  Entries arriving with no active botmux turn are dropped by the callback
+ *  (cosmetic channel, never buffered). One session-long reader — instead of
+ *  per-turn arm hooks — covers every delivery mode: ordinary queued turns,
+ *  argv-baked first prompts, adopted sessions and autonomous Goal turns.
+ *  The reader chat is marked only on success so an unresolved store cannot
+ *  make later attempts short-circuit. */
+function ensureCursorCotReader(chatId: string): void {
+  if (!chatId || cursorCotReaderChatId === chatId) return;
+  const ok = startCursorCot(chatId, (entries: readonly CursorCotEntry[]) => {
+    if (!currentBotmuxTurnId) return;
+    observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  });
+  if (ok) {
+    cursorCotReaderChatId = chatId;
+    log(`Cursor CoT reader started for chat ${chatId}`);
+  }
+}
+
+/** Start the Cursor thinking bubble as soon as the chatId is resolvable —
+ *  from the observed native session id, or the live process's store.db fd.
+ *  Called from spawn/observation, adopt and Goal paths. */
+function armCursorCotForTurn(): void {
+  if (lastInitConfig?.cliId !== 'cursor') return;
+  let chatId = lastSpawnEffectiveCliSessionId;
+  if (!chatId) {
+    const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+    if (pid) chatId = findCursorChatIdByPid(findLaunchedCliPid(pid, 'cursor') ?? pid);
+  }
+  if (!chatId) return;
+  ensureCursorCotReader(chatId);
+}
+
+let antigravityCotReaderSessionId: string | undefined;
+
+function ensureAntigravityCotReader(cliSessionId: string): void {
+  if (!cliSessionId || antigravityCotReaderSessionId === cliSessionId) return;
+  const previousId = antigravityCotReaderSessionId;
+  antigravityCotReaderSessionId = cliSessionId;
+  if (previousId) {
+    if (typeof stopAntigravityCot === 'function') {
+      stopAntigravityCot(previousId);
+    } else if (typeof (startAntigravityCot as any)?.stop === 'function') {
+      (startAntigravityCot as any).stop(previousId);
+    }
+  }
+  const boundSessionId = cliSessionId;
+  const ok = startAntigravityCot(cliSessionId, (entries: readonly AntigravityCotEntry[]) => {
+    if (antigravityCotReaderSessionId !== boundSessionId) return;
+    if (!currentBotmuxTurnId) return;
+    observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  });
+  if (ok) {
+    log(`Antigravity CoT reader started for session ${cliSessionId}`);
+  }
+}
+
+function armAntigravityCotForTurn(): void {
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  let cid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+  if (!cid) {
+    const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+    const effectivePid = pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
+    cid = effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined;
+  }
+  if (!cid) return;
+  persistCliSessionId(cid);
+  ensureAntigravityCotReader(cid);
+}
+
 function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
+  // Transcript path: .../agent-transcripts/<chatId>/<chatId>.jsonl
+  const chatId = path.split('/').slice(-2, -1)[0];
+  ensureCursorCotReader(chatId);
   if (mode === 'baseline-existing' && existsSync(path)) {
     try {
       const full = drainCursorTranscript(path, 0);
@@ -6525,23 +8548,74 @@ function codexBridgeDetachFile(): void {
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
-  ompBridgeState = {};
-  ebsdBridgeState = {};
+  structuredBridgeDriverState = undefined;
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
+  antigravityQuietCandidateKey = undefined;
+  antigravityQuietCandidateCompleteOffset = undefined;
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
  *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
 function currentCodexObservedPid(): number | undefined {
-  return (backend as { cliPid?: number } | null)?.cliPid
+  const wired = (backend as { cliPid?: number } | null)?.cliPid;
+  if (wired) return wired;
+  const child = backend?.getChildPid?.();
+  if (child) return resolveCodexOwnershipPid(child, lastSpawnCodexLauncherActive, lastSpawnCodexExecutable);
+  return codexAdoptPendingPid;
+}
+
+/** The live cursor-agent pid holding the chat's store.db open. backend.cliPid
+ *  can be a wrapper launcher, so descend like armCursorCotForTurn does; adopt
+ *  sessions keep using their dedicated adopt pid. */
+function currentCursorObservedPid(): number | undefined {
+  if (lastInitConfig?.adoptMode) return codexAdoptPendingPid;
+  const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
+  return pid ? (findLaunchedCliPid(pid, 'cursor') ?? pid) : undefined;
+}
+
+/** The live `agy` conversation-holding pid (antigravity's pid probe scans the
+ *  pid's children too, but the wrapper descent matches the CoT arm path). */
+function currentAntigravityObservedPid(): number | undefined {
+  const pid = (backend as { cliPid?: number } | null)?.cliPid
     ?? backend?.getChildPid?.()
     ?? codexAdoptPendingPid;
+  return pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
+}
+
+/** Structured-bridge attach mode for a botmux-SPAWNED session: a fresh spawn
+ *  ingests from byte 0 (the first user turn was marked pre-spawn, incl.
+ *  cursor's argv-baked prompt); a resume spawn baselines the tail so history
+ *  from the previous worker run never replays into Lark. Adopt uses its own
+ *  split-live / birthtime-based modes elsewhere. */
+function structuredSpawnAttachMode(): 'fresh-empty' | 'baseline-existing' {
+  return lastSpawnEffectiveResume ? 'baseline-existing' : 'fresh-empty';
+}
+
+/** Attach mode for an antigravity transcript resolved AFTER spawn (lazy file
+ *  creation or a `/new` rotation discovered through writeInput). Even on a
+ *  resume spawn, a file born after spawn is a brand-new conversation whose
+ *  bytes are the live turn, not history. */
+function antigravityLateAttachMode(transcriptPath: string): 'fresh-empty' | 'baseline-existing' {
+  if (!lastSpawnEffectiveResume) return 'fresh-empty';
+  try {
+    const birthtimeMs = statSync(transcriptPath).birthtimeMs;
+    if (Number.isFinite(birthtimeMs) && birthtimeMs >= (antigravitySpawnStartMs ?? Date.now()) - 5_000) {
+      return 'fresh-empty';
+    }
+  } catch { /* fall back to the resume-safe baseline */ }
+  return 'baseline-existing';
 }
 
 /** Ownership gate for binding a Codex bridge to a session id that came from the
+ *  shared history. A live thread-id footer proves a daemon-backed TUI's
+ *  exact thread for this backend generation; otherwise retain the legacy fd
+ *  membership gate below. Never consult the shared daemon's combined fd set.
+ *
+ *  Legacy ownership gate for a session id that came from the
  *  GLOBAL history.jsonl. That file is shared by every Codex pane under one
  *  CODEX_HOME, so a concurrent sibling pane submitting identical text can make
  *  writeInput's history match return a FOREIGN session id. Before attaching (or
@@ -6558,6 +8632,7 @@ function currentCodexObservedPid(): number | undefined {
  *  AND the initial-attach guard) call this one wrapper — there is no parallel
  *  decision copy that could drift. */
 function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
+  if (backend && codexTerminalSessionIsBound(backend, cliSessionId)) return true;
   const pid = currentCodexObservedPid();
   const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
   const owned = codexHistorySidIsOwned(cliSessionId, ownedRollouts);
@@ -6567,31 +8642,63 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** The pane process is a Codex-compatible native leaf when its OWN comm
+ *  identifies as one. A direct standalone install lands here; only the npm
+ *  launcher (comm `node`) and sandbox supervisors need descendant discovery. */
+function codexProcessIsNativeLeaf(pid: number, filterExecutable?: string): boolean {
+  const comm = readComm(pid);
+  return !!comm && cliIdForComm(comm, 'codex', filterExecutable) === 'codex';
+}
+
+/** Resolve the pid that actually holds a Codex rollout open, given a candidate
+ *  that may be a bwrap supervisor or the npm Node launcher. Under the
+ *  file/scratch sandbox, botmux launches `bwrap --unshare-pid -- codex`, so
+ *  the tmux pane leaf / getChildPid() is the bwrap process — its /proc/<pid>/fd
+ *  holds no rollout, and the ownership gate would fail. A standard npm install
+ *  is a resident Node launcher that forks the packaged native binary; the
+ *  recorded pid there is the launcher for the same reason. In both shapes the
+ *  real codex leaf is reachable via ppid links, so a comm-based BFS descends to
+ *  it. When the candidate already IS a codex native leaf (direct standalone
+ *  install, or the leaf already forked at an earlier retry tick), return it
+ *  unchanged WITHOUT scanning descendants — that scan is pure waste and runs
+ *  30+ times per spawn otherwise. Also fail closed to the candidate when no
+ *  leaf has been forked yet, rather than guess. */
+function resolveCodexOwnershipPid(
+  candidatePid: number,
+  launcherActive: boolean,
+  filterExecutable?: string,
+): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
+  if (codexProcessIsNativeLeaf(candidatePid, filterExecutable)) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex', 6, {}, filterExecutable) ?? candidatePid;
+}
+
 /** Resolve the pid that actually holds a TRAE rollout open, given a candidate
  *  that may be a bwrap supervisor. Under the file sandbox, botmux launches
  *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
  *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
  *  would always fail. The real traex leaf is host-visible across the pid ns
- *  (ps -A ppid links), so a comm-based BFS descends to it. Outside the sandbox
- *  (or if traex hasn't been forked yet) the candidate already is the leaf, so
- *  we return it unchanged — fail closed to the launcher pid rather than guess. */
-function resolveTraexOwnershipPid(candidatePid: number, sandbox: boolean): number {
-  if (!sandbox || !candidatePid) return candidatePid;
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Forge x TraeX has
+ *  the same launcher shape (`forge` launcher → `traex` child). Outside such
+ *  launcher shapes (or if traex hasn't been forked yet) the candidate already
+ *  is the leaf, so we return it unchanged — fail closed to the launcher pid
+ *  rather than guess. */
+function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
   return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;
 }
 
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
  *  this worker observes (spawned child or adopted pane). Same resolution order
  *  — the wired backend.cliPid first, then the live pane child pid, then the
- *  adopt-pending pid (which is populated for TRAE too, see the codex/traex
- *  branch around line 3674). backend.cliPid is already sandbox-resolved at wire
+ *  adopt-only pending pid. backend.cliPid is already sandbox-resolved at wire
  *  time; the getChildPid() fallback is not, so descend it here too (no-op
- *  outside the sandbox / when already a leaf). */
+ *  outside launcher shapes / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
   const wired = (backend as { cliPid?: number } | null)?.cliPid;
   if (wired) return wired;
   const child = backend?.getChildPid?.();
-  if (child) return resolveTraexOwnershipPid(child, lastSpawnOuterBwrapActive);
+  if (child) return resolveTraexOwnershipPid(child, lastSpawnTraexLauncherActive);
   return codexAdoptPendingPid;
 }
 
@@ -6638,7 +8745,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // re-attach), and a rotated-away rollout is quiescent before the next prompt
     // is submitted — so there is no post-ingest window in which a legitimate
     // terminal is appended to the old path and lost.
-    if (structuredBridgeIsCodex()) {
+    if (structuredBridgeIs('codex')) {
       const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
       if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
       // Ownership gate: only re-attach to a session id THIS pid actually holds
@@ -6653,12 +8760,12 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
       const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
       if (next && next !== codexBridgeRolloutPath) {
         const attachMode = codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty';
-        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); re-attaching bridge to ${next}`);
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (terminal pid ${pid} verified); re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
         codexBridgeAttach(next, attachMode);
       } else if (!next) {
-        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); waiting for rollout`);
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (terminal pid ${pid} verified); waiting for rollout`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = cliSessionId;
         codexBridgeStartTimer();
@@ -6667,9 +8774,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     // Already attached — first-attach-wins for most CLIs. Exceptions: TRAE
     // and Grok can rotate their native session in the same process.
-    if (structuredBridgeIsTraex()) {
-      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
-      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+    if (structuredBridgeIs('traex')) {
+      const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      const sameSession = currentSid?.toLowerCase() === cliSessionId.toLowerCase();
+      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
+      if (sameSession && (!next || next === codexBridgeRolloutPath)) return;
       // Ownership gate: the reported id came from the GLOBAL history.jsonl, so a
       // sibling pane's identical text (e.g. a bare adopt-mode reply with no
       // unique <session_id>) could surface a foreign id. Only rotate the bridge
@@ -6679,7 +8788,6 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`Keeping current TRAE bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
         return;
       }
-      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
       // Close any terminal already committed to the retired rollout before
       // switching. A durable turn is a worker HOL barrier, so a legitimate
       // session rotation cannot overtake an unfinished durable delivery.
@@ -6690,11 +8798,13 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`TRAE pre-rotation bridge drain failed: ${err.message}`);
       }
       if (next && next !== codexBridgeRolloutPath) {
-        log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        const reason = sameSession ? `rollout segment moved for ${cliSessionId}`
+          : `session rotated ${currentSid ?? '?'} → ${cliSessionId}`;
+        log(`TRAE ${reason}; re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
         codexBridgeAttach(next, 'fresh-empty');
-      } else if (!next) {
+      } else if (!next && !sameSession) {
         log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for rollout`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = cliSessionId;
@@ -6708,7 +8818,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // session id on the very next submit. Without a re-attach the bridge
     // stays wedged on the old updates.jsonl and the reply fallback / idle
     // signal go dark for the rest of the session.
-    if (structuredBridgeIsGrok()) {
+    if (structuredBridgeIs('grok')) {
       const currentSid = grokSessionIdFromPath(codexBridgeRolloutPath);
       if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
       const next = resolveFileBridgePath('grok', {
@@ -6747,7 +8857,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  if (structuredBridgeIsMtr()) {
+  if (structuredBridgeIs('mtr')) {
     const source = findMtrSessionById(cliSessionId);
     if (source) {
       codexBridgePendingSessionId = undefined;
@@ -6758,14 +8868,61 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
-  if (codexBridgeIsCursor()) {
+  if (structuredBridgeIs('cursor')) {
     // Cursor's cliSessionId is the chatId — the same UUID naming the
     // agent-transcript JSONL, so it resolves the path directly.
     const cursorPath = resolveFileBridgePath('cursor', { sessionId: cliSessionId });
     if (cursorPath) {
       codexBridgePendingSessionId = undefined;
-      cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
+      if (lastInitConfig?.adoptMode) {
+        cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
+      } else {
+        // Botmux-spawned (zero-prompt): NOT cursorBridgeAttach — its
+        // baseline-existing mode drains an adopt preamble, which is wrong for
+        // a spawned session. Fresh/resume decides whether the argv-baked
+        // first turn must be ingested from byte 0; the CoT reader is owned by
+        // the spawn observer (observeCursorCliSessionId), not by the attach.
+        codexBridgeAttach(cursorPath, structuredSpawnAttachMode());
+      }
     } else {
+      codexBridgePendingSessionId = cliSessionId;
+      codexBridgeStartTimer();
+    }
+    return;
+  }
+  if (structuredBridgeIs('antigravity')) {
+    // cliSessionId is agy's conversation UUID, which names the brain
+    // transcript directory. writeInput reports the id on EVERY submit (it is
+    // also how `/new` surfaces the freshly-minted conversation in the same
+    // process), so this is both the first-attach and the rotation path.
+    const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
+    if (agyPath === codexBridgeRolloutPath) {
+      codexBridgePendingSessionId = undefined;
+      return;
+    }
+    if (agyPath) {
+      if (codexBridgeRolloutPath) {
+        // Conversation rotated (/new): drain the retired transcript so a
+        // trailing final is not stranded, then rebind. The new conversation's
+        // existing bytes are THIS session's live turn, never history →
+        // fresh-empty regardless of the spawn resume flag.
+        try {
+          // Flush the retired conversation's held candidate: the new
+          // conversation starting proves the old loop ended.
+          codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+          emitReadyCodexTurns();
+        } catch (err: any) {
+          log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+        }
+        codexBridgeDetachFile();
+        codexBridgeAttach(agyPath, 'fresh-empty');
+      } else {
+        codexBridgeAttach(agyPath, antigravityLateAttachMode(agyPath));
+      }
+      codexBridgePendingSessionId = undefined;
+    } else {
+      // The brain file is created lazily after submit — keep id pending and
+      // let the 1s ticker late-attach (pid probe covers a lost race).
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
     }
@@ -6782,7 +8939,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   // the bridge — the poller's pid fallback stays ambiguous→undefined forever and
   // the owned line never re-triggers this callback). Keep the adopt pid pending
   // so the poller can bind once a uniquely-owned rollout appears.
-  if (structuredBridgeIsCodex() && lastInitConfig?.adoptMode && currentCodexObservedPid()) {
+  if (structuredBridgeIs('codex') && lastInitConfig?.adoptMode && currentCodexObservedPid()) {
     if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
       log(`Codex initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentCodexObservedPid()}`);
       codexBridgePendingSessionId = undefined;
@@ -6795,7 +8952,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   // a foreign sid from any other path can't first-attach the bridge in adopt
   // mode. Fail closed identically: keep the poller armed on the adopt pid rather
   // than pinning an unverified sid (which would wedge the bridge).
-  if (structuredBridgeIsTraex() && lastInitConfig?.adoptMode && currentTraexObservedPid()) {
+  if (structuredBridgeIs('traex') && lastInitConfig?.adoptMode && currentTraexObservedPid()) {
     if (!traexHistorySidOwnedByCurrentPid(cliSessionId)) {
       log(`TRAE initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentTraexObservedPid()}`);
       codexBridgePendingSessionId = undefined;
@@ -6824,7 +8981,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
  * process-scoped, so sibling Grok sessions in the same cwd cannot steal this
  * bridge. `codexBridgeNotifyCliSessionId` owns the drain-before-detach switch. */
 function maybeFollowGrokSessionRotationViaPid(): void {
-  if (!structuredBridgeIsGrok() || !codexBridgeRolloutPath || !backend) return;
+  if (!structuredBridgeIs('grok') || !codexBridgeRolloutPath || !backend) return;
   const now = Date.now();
   if (now - grokBridgePidProbeLastMs < GROK_BRIDGE_PID_PROBE_INTERVAL_MS) return;
   grokBridgePidProbeLastMs = now;
@@ -6844,12 +9001,16 @@ function maybeFollowGrokSessionRotationViaPid(): void {
  * adopted pane. `codexBridgeNotifyCliSessionId` performs the drain-before-
  * detach switch and persists the newly observed native session id. */
 function maybeFollowTraexSessionRotationViaPid(): void {
-  if (!structuredBridgeIsTraex() || !codexBridgeRolloutPath || !backend) return;
+  if (lastInitConfig?.adoptMode !== true
+    || !structuredBridgeIs('traex') || !codexBridgeRolloutPath || !backend) return;
+  const now = Date.now();
+  if (now - traexBridgePidProbeLastMs < TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS) return;
+  traexBridgePidProbeLastMs = now;
   const pid = (backend as { cliPid?: number }).cliPid
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
   if (!pid) return;
-  const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
   const observed = findTraexRolloutByPid(pid, currentSid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
@@ -6860,7 +9021,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
 /** OMP may create a new JSONL in the same isolated Botmux session directory.
  * Follow only that exact directory; no pid/global-session discovery is used. */
 function maybeFollowOmpTranscriptRotation(): void {
-  if (!structuredBridgeIsOmp() || !codexBridgeRolloutPath
+  if (!structuredBridgeIs('oh-my-pi') || !codexBridgeRolloutPath
     || !lastSpawnEffectiveAdapterSessionId) return;
   const next = resolveFileBridgePath('oh-my-pi', {
     sessionId: lastSpawnEffectiveAdapterSessionId,
@@ -6882,7 +9043,7 @@ function maybeFollowOmpTranscriptRotation(): void {
 /** ebsd may rotate its JSONL while resuming the same exact BotMux session.
  * Keep this independent from OMP's provisional-terminal state and quiet flush. */
 function maybeFollowEbsdTranscriptRotation(): void {
-  if (!structuredBridgeIsEbsd() || !codexBridgeRolloutPath
+  if (!structuredBridgeIs('ebsd') || !codexBridgeRolloutPath
     || !lastSpawnEffectiveAdapterSessionId) return;
   const next = resolveFileBridgePath('ebsd', {
     sessionId: lastSpawnEffectiveAdapterSessionId,
@@ -6905,6 +9066,7 @@ function codexBridgeIngest(opts: {
   signalIdle?: boolean;
   hydrationOwnerKey?: string;
   flushOmpTrailingFinal?: boolean;
+  flushAntigravityTrailingFinal?: boolean;
 } = {}): void {
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
@@ -6915,28 +9077,34 @@ function codexBridgeIngest(opts: {
     rpcTurnsAwaitingActivation.keys(),
     opts.hydrationOwnerKey,
   )) return;
-  if (structuredBridgeIsHermes()) {
+  if (structuredBridgeIs('hermes')) {
     hermesBridgeIngest();
     return;
   }
-  if (structuredBridgeIsMtr()) {
+  if (structuredBridgeIs('mtr')) {
     mtrBridgeIngest();
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
+    flushAntigravityTrailingFinal: opts.flushAntigravityTrailingFinal,
   });
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
-  if (structuredBridgeIsTraex()) {
+  if (bridgeSpecFor(lastInitConfig?.cliId)?.stateCommit === 'ingest') {
+    // Antigravity commits its held provisional terminal only on the steady-state
+    // ingest tick, never from an attach-time drain (see StructuredBridgeSpec.stateCommit).
+    structuredBridgeDriverState = result.state ?? {};
+  }
+  if (structuredBridgeIs('traex')) {
     const traex = result as TraexDrainResult;
     publishActiveRuntime({
       model: traex.latestModel ?? publishedActiveRuntime.model,
       reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
     });
   }
-  if (structuredBridgeIsCodex()) {
+  if (structuredBridgeIs('codex')) {
     const codex = result as CodexDrainResult;
     codexServiceTierTracker.observe(codexBridgeRolloutPath, codex.latestThreadSettings);
     publishActiveRuntime({
@@ -6944,9 +9112,21 @@ function codexBridgeIngest(opts: {
       reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
     });
     maybeEmitCodexStructuredRateLimit(result.events);
+    codexSubagentLimitTracker.observe(codex.spawnedSubagents, Date.now());
+    maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
+  if (cliAdapter?.postTerminalPromptFence === true) {
+    const turns = codexBridgeQueue.peek();
+    if (turns.some(turn => turn.started && turn.finalText === undefined)) {
+      // A queued, fingerprint-matched successor has actually started. Busy
+      // output now belongs to live work, not the preceding completed turn.
+      postTerminalInputFence = null;
+    } else if (turns.some(turn => turn.started && turn.finalText !== undefined)) {
+      armPostTerminalInputFence();
+    }
+  }
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
@@ -6957,7 +9137,16 @@ function codexBridgeIngest(opts: {
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
-  if (opts.signalIdle !== false && result.events.some(event => event.kind === 'assistant_final')) {
+  //
+  // Antigravity is excluded: its assistant_final is PROVISIONAL (held in
+  // antigravityBridgeState()) and is released only by
+  // maybeFlushAntigravityTrailingFinalOnQuietTick after the viewport itself
+  // proves idle + ready. Firing idle on the intermediate "Wait for task …"
+  // step would mark the turn done while a background-task SYSTEM_MESSAGE is
+  // about to wake the planner for another round.
+  if (opts.signalIdle !== false
+    && !structuredBridgeIs('antigravity')
+    && result.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
 }
@@ -6966,8 +9155,8 @@ function codexBridgeIngest(opts: {
  * and an authoritative current viewport with no busy marker. This deliberately
  * runs while lifecycle blocking is asserted; ingesting the final releases it. */
 function maybeFlushOmpTrailingFinalOnQuietTick(): void {
-  if (!structuredBridgeIsOmp()) return;
-  const candidate = ompBridgeState.provisionalFinal;
+  if (!structuredBridgeIs('oh-my-pi')) return;
+  const candidate = ompBridgeState().provisionalFinal;
   if (!candidate) {
     ompQuietCandidateKey = undefined;
     ompQuietCandidateCompleteOffset = undefined;
@@ -6996,12 +9185,62 @@ function maybeFlushOmpTrailingFinalOnQuietTick(): void {
   codexBridgeIngest({ flushOmpTrailingFinal: true });
 }
 
+/**
+ * Confirm an Antigravity held (provisional) terminal only after one complete
+ * quiet bridge tick AND a viewport that is on the ready marker with no busy
+ * marker. The held candidate is the content-only "Wait for task …" shape ~17%
+ * of turns produce before a background-task/stop-hook SYSTEM_MESSAGE wakes the
+ * planner; releasing it the moment it lands would post the interim narration
+ * and lose the real final.
+ *
+ * Unlike OMP this driver is NOT lifecycle-blocking, so the screen evidence is
+ * the only gate: require BOTH ready (`? for shortcuts`) and not-busy
+ * (`esc to cancel`). The intermediate background-task wait shows the READY
+ * marker, but the subsequent wake-up produces a busy screen within ~1s, so the
+ * two-tick unchanged-offset latch lets that continuation cancel the candidate
+ * before it is flushed. */
+function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
+  if (!structuredBridgeIs('antigravity')) return;
+  const candidate = antigravityBridgeState().provisionalFinal;
+  if (!candidate || antigravityBridgeState().hasPendingTask) {
+    // No candidate, or the transcript itself proves a background task is still
+    // outstanding (the TUI shows the ready composer during that wait — do not
+    // arm the quiet latch on screen evidence the transcript contradicts).
+    antigravityQuietCandidateKey = undefined;
+    antigravityQuietCandidateCompleteOffset = undefined;
+    return;
+  }
+  const key = candidate.uuid;
+  if (antigravityQuietCandidateKey !== key
+    || antigravityQuietCandidateCompleteOffset !== codexBridgeOffset) {
+    antigravityQuietCandidateKey = key;
+    antigravityQuietCandidateCompleteOffset = codexBridgeOffset;
+    return;
+  }
+  if (codexBridgePendingTail || !backend
+    || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || !cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
+  try {
+    const screen = captureBackendScreen(backend);
+    if (!screen) return;
+    if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
+    if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
+  } catch (err: any) {
+    log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
+    return;
+  }
+
+  antigravityQuietCandidateKey = undefined;
+  antigravityQuietCandidateCompleteOffset = undefined;
+  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+}
+
 /** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */
 function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]): void {
   for (const ev of events) {
     if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
     emittedRateLimitUuids.add(ev.uuid);
-    const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    const usageLimit = structuredCodexLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests', ev.terminalLimitKind);
     usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',
@@ -7011,7 +9250,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
-    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, kind=${usageLimit.kind}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return;
   }
 }
@@ -7019,6 +9258,26 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
 /** Mark a pending Lark turn for Codex. Crucially this works even before a
  *  rollout path is known — the queue is path-agnostic, and ingest after
  *  late-attach picks up the user_message and matches the fingerprint. */
+function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMark: number } | undefined {
+  if (codexBridgeRolloutPath) {
+    return { jsonlPath: codexBridgeRolloutPath, offsetAtMark: codexBridgeOffset };
+  }
+  const cliId = lastInitConfig?.cliId;
+  const spec = bridgeSpecFor(cliId);
+  const sessionIdAtMark = codexBridgePendingSessionId
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (spec?.spawn?.sessionId === 'cli-or-adapter' ? lastSpawnEffectiveAdapterSessionId : undefined)
+    ?? lastInitConfig?.cliSessionId;
+  if (!sessionIdAtMark) return undefined;
+  const jsonlPath = resolveFileBridgePath(cliId, {
+    sessionId: sessionIdAtMark,
+    cwd: lastInitConfig?.workingDir,
+  });
+  if (!jsonlPath) return undefined;
+  const cursor = baselineJsonlCursor(jsonlPath);
+  return { jsonlPath, offsetAtMark: cursor.newOffset };
+}
+
 function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
@@ -7027,7 +9286,10 @@ function codexBridgeMarkPendingTurn(
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
+  const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark);
+  checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   return turnId;
 }
 
@@ -7399,7 +9661,7 @@ function codexBridgeDrainAndMaybeEmit(opts: {
   hydrationOwnerKey?: string;
 } = {}): void {
   if (!codexBridgeFallbackActive()) return;
-  if (structuredBridgeIsHermes() || structuredBridgeIsMtr() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
+  if (structuredBridgeIs('hermes') || structuredBridgeIs('mtr') || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(opts); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
   emitReadyCodexTurns();
@@ -7432,7 +9694,12 @@ function drainReliableTerminalBeforeInterrupt(): void {
 
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
+  checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   if (ready.length === 0) return;
+  if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+    armPostTerminalInputFence();
+  }
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
   // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
   // both the emit loop and the terminal loop below iterate this same `ready`
@@ -7467,12 +9734,15 @@ function emitReadyCodexTurns(): void {
     // no pending Lark fingerprint and must be forwarded like terminal
     // `/adopt`, including both the App prompt and its final reply.
     const adoptMode = terminalAdoptMode
-      || (sharedAppServerBridge && turn.isLocal === true);
-    const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
+      || (sharedAppServerBridge && turn.isLocal === true && !zeroPromptTerminalSync());
+    const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
+      forwardLocalFinal: zeroPromptTerminalSync(),
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
       terminalErrorCode: turn.terminalErrorCode,
@@ -7481,10 +9751,17 @@ function emitReadyCodexTurns(): void {
     // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
     // generic failed fallback would post nothing at all.
     const fallbackKind = structuredFallbackKind(
-      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
+      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIs('codex'), replyDeliveryMode(),
     );
     const content = fallbackKind === 'failed'
-      ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
+      ? composeFailedBridgeFallbackContent(
+          failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+          gateInput,
+          nextBoundaryMs,
+          markers,
+          adoptMode,
+          replyDeliveryMode(),
+        )
       : fallbackKind === 'final'
         ? turn.finalText ?? ''
         : fallbackKind === 'empty_completed'
@@ -7501,12 +9778,19 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    if (!content || shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
+    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
-      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
+      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
+        + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
       // turn, local-typed). Only the former is positive evidence that the model
@@ -7517,10 +9801,6 @@ function emitReadyCodexTurns(): void {
       if (!adoptMode && isBridgeNothingToSendFinal(turn.finalText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
       continue;
     }
     // NON-ADOPT only: strip a trailing sentinel line so the literal token never
@@ -7532,7 +9812,7 @@ function emitReadyCodexTurns(): void {
     // already refuses to interpret the sentinel under adoptMode.
     const postContent = bridgePostText(content, adoptMode);
     if (!adoptMode && postContent.trim().length === 0) continue;
-    if (turn.isLocal) {
+    if (turn.isLocal && !zeroPromptTerminalSync()) {
       // Local turn (adopt only): user typed in iTerm. Surface both sides
       // so the Lark thread sees a complete exchange instead of an orphan
       // reply. formatLocalTurnFields caps both texts to keep within
@@ -7561,14 +9841,23 @@ function emitReadyCodexTurns(): void {
       content: postContent,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
+      ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       // Failure-fallback notice (not a model answer): lets the daemon add a
       // human @mention so e.g. a model-gateway outage doesn't scroll by
       // silently in bot-to-bot sessions.
-      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
+      ...(fallbackKind === 'failed' ? {
+        turnFailed: true,
+        turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
+        turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+      } : {}),
     });
   }
   for (const turn of ready) {
+    releaseInputDeliveryQuarantineForStructuredTerminal(
+      turn.turnId,
+      turn.dispatchAttempt,
+    );
     retireRpcLifecycleFromStructuredTerminal({
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined
@@ -7599,12 +9888,14 @@ function stopCodexBridge(): void {
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
-  ompBridgeState = {};
-  ebsdBridgeState = {};
+  structuredBridgeDriverState = undefined;
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
+  antigravityQuietCandidateKey = undefined;
+  antigravityQuietCandidateCompleteOffset = undefined;
   ompRetiredTranscriptPaths.clear();
   ebsdRetiredTranscriptPaths.clear();
   hermesBridgeOffset = 0;
@@ -7616,10 +9907,15 @@ function stopCodexBridge(): void {
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
+  stopAllCursorCot();
+  cursorCotReaderChatId = undefined;
+  stopAllAntigravityCot();
+  antigravityCotReaderSessionId = undefined;
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
   grokBridgePidProbeLastMs = 0;
+  traexBridgePidProbeLastMs = 0;
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -7650,6 +9946,10 @@ function drainSecondaryPaths(): void {
     try {
       const result = drainTranscript(path, offset);
       if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
+      // Retired paths belong to a Claude session we already left, so the router
+      // drops them; routed anyway so the "every queue-feeding drain goes
+      // through one entry" rule has no exception to reason about.
+      observeModelFallbackEvents(path, result.events);
       bridgeSecondaryPaths.set(path, result.newOffset);
     } catch (err: any) {
       log(`Bridge secondary-path drain failed (${path}): ${err.message}`);
@@ -7713,6 +10013,10 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 let herdrWebHistory: HerdrWebHistoryState | null = null;
+/** Bumped when an adopted Herdr pane's grid changes. The pane text can stay
+ *  identical, so the PTY-activity watermark alone would never re-capture the
+ *  screen at the new geometry (see startScreenUpdates). */
+let observedPaneGridRevision = 0;
 let herdrWebScrollDirection: HerdrWebScrollDirection = null;
 let herdrWebCursor: HerdrWebTerminalCursor | null = null;
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
@@ -7736,7 +10040,11 @@ function usesHerdrSnapshotWebHistory(): boolean {
 }
 
 function herdrWebCursorSequence(cursor = herdrWebCursor): string {
-  return cursor ? `\x1b[${cursor.row + 1};${cursor.col + 1}H` : '';
+  if (cursor) return `\x1b[${cursor.row + 1};${cursor.col + 1}H`;
+  // Herdr exposes no cursor for a pane botmux does not attach to. Hide xterm's
+  // cursor instead of leaving it where the snapshot text ended, and park it at
+  // column 1 so the focused input helper doesn't drag the view to the far right.
+  return lastInitConfig?.adoptMode && backend instanceof HerdrBackend ? '\r\x1b[?25l' : '';
 }
 
 function relayHerdrWebCursor(cursor: HerdrWebTerminalCursor): void {
@@ -7745,6 +10053,20 @@ function relayHerdrWebCursor(cursor: HerdrWebTerminalCursor): void {
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(sequence);
   }
+}
+
+/** Fixed-grid pin each viewer of an adopted pane was last sent. */
+const adoptWebGridPins = new WeakMap<WebSocket, string>();
+
+/**
+ * Adopted Herdr snapshots carry the user's pane width. Viewers are pinned to
+ * that grid when they connect; when the user resizes the pane, re-pin each
+ * viewer before the next frame or every full-width row wraps in the browser.
+ */
+function herdrAdoptWebGridPin(): string {
+  if (!lastInitConfig?.adoptMode || !(backend instanceof HerdrBackend) || wsClients.size === 0) return '';
+  const size = backend.getPaneSize();
+  return size && size.cols > 0 && size.rows > 0 ? `\x1b]1989;${size.cols};${size.rows}\x07` : '';
 }
 
 function relayHerdrWebSnapshot(snapshot: string): void {
@@ -7757,9 +10079,44 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   herdrWebHistory = merged.state;
   herdrWebScrollDirection = null;
   scrollback = renderHerdrWebHistory(merged.state);
+  // The browser only recognises a history frame at the start of a message,
+  // so a grid pin travels as its own frame ahead of it.
+  const pin = herdrAdoptWebGridPin();
   const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}${herdrWebCursorSequence()}`;
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (pin && adoptWebGridPins.get(ws) !== pin) {
+      ws.send(pin);
+      adoptWebGridPins.set(ws, pin);
+    }
+    ws.send(payload);
+  }
+}
+
+/** Replace, rather than append, one Remote Runner full-screen snapshot.
+ *
+ * Remote Runner providers publish the complete current viewport.  Replaying
+ * those frames through onPtyData would retain one mostly-overlapping TUI screen
+ * per poll in `scrollback`; a page refresh would faithfully replay that bogus
+ * history and scrolling would expose duplicated UI frames.  Reuse the existing
+ * snapshot-aware browser control frame so every connected xterm resets to one
+ * bounded viewport.  This is O(cols * rows) and independent of session age.
+ */
+function relayRemoteRunnerWebSnapshot(snapshot: string): void {
+  const frame = mergeHerdrWebSnapshot(null, snapshot, null, MAX_SCROLLBACK).state;
+  scrollback = renderHerdrWebHistory(frame);
+  const payload = `\x1b]1989;history;0\x07${scrollback}`;
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // A view-capability client is a follower: it may inspect the authoritative
+    // remote grid but must not resize that shared TUI. Keep its xterm pinned to
+    // the provider-reported pane size so a narrow browser does not wrap the
+    // snapshot locally after its resize request is rejected below.
+    if (!authedClients.has(ws) && effectiveBackendType === 'remote-runner') {
+      const size = backend?.getPaneSize?.();
+      if (size) ws.send(`\x1b]1989;${size.cols};${size.rows}\x07`);
+    }
+    ws.send(payload);
   }
 }
 
@@ -7779,6 +10136,26 @@ function applyHerdrWebBindingResult(
       !herdrWebBackend.isWebTerminalOwner(client)
     ) {
       client.send(`\x1b]1989;follower;${size.cols};${size.rows}\x07`);
+    }
+  }
+}
+
+/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+ *
+ * A read-only socket never drives the shared pane, but a writable socket may
+ * resize it later. Without a fresh pin those existing followers keep rendering
+ * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize/getPaneSize are synchronous, so publish the authoritative post-resize
+ * grid rather than trusting the browser request.
+ */
+function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
+  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+  const size = backend?.getPaneSize?.();
+  if (!size) return;
+  const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN && !authedClients.has(client)) {
+      client.send(payload);
     }
   }
 }
@@ -7841,6 +10218,73 @@ function clearPostHookEvidenceFallback(): void {
   }
 }
 
+/**
+ * 把当前渲染画面交给 IdleDetector 判定启动横幅（loading → 已初始化）。
+ *
+ * 快照型后端（ZMX 用 `zmx history` 取当前屏）不会把「原地重绘」当成 PTY 追加
+ * 输出，已初始化的横幅只会走 screen resync，永远到不了 feed()，启动闸因此无法
+ * 解除。这里主动拉一次权威画面补上这条证据；与 screenShowsReadyPattern() 同样
+ * 只读当前渲染视口，并保留横幅边框与列间距：默认 rawSnapshot() 仍会清理
+ * box drawing，导致适配器的结构正则永远不匹配；scrollback 日志则可能含旧横幅。
+ */
+function observeStartupBannerOnScreen(): boolean {
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen) return false;
+  if (idleDetector?.observeStartupScreen(screen) !== true) return false;
+  log(`${cliName()} initialized banner observed on screen; releasing the startup hold`);
+  // Initialization is not an idle/turn boundary. It only lifts the startup veto
+  // on adapters that already permit input while busy. Re-kick their held queue
+  // through the normal writer (which retains restart, principal, hook-review,
+  // and submission-recovery gates), without publishing a false prompt_ready.
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
+}
+
+/** ZMX's complete cached history can carry a restoration header that no
+ * synthetic renderer viewport retains. Both resync and append-only captures
+ * update this cache before notifying us; neither path may strand startup.
+ *
+ * ZMX-only: its `captureCurrentScreen()` returns a cheap in-memory snapshot
+ * cache, so calling it on every PTY chunk is free. Byte-stream backends
+ * (tmux/PTY) whose `captureCurrentScreen()` shells out must NOT be polled
+ * per-chunk here — they run the same history predicate on the bounded
+ * first-prompt recheck schedule via observeRestoredStartupHistoryOnScreen(). */
+function observeRestoredStartupHistory(): void {
+  if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
+  if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
+  log(`${cliName()} restored history observed; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
+/** Backend-agnostic restore-history compensation for the first-prompt recheck
+ * loop. A resumed CLI (e.g. Codex 0.154 `resume`) can paint straight into a
+ * restored composer without ever repainting the loaded banner AND without the
+ * "Earlier messages" restoration marker reaching the byte stream. In that
+ * layout neither feed()'s banner match, observeStartupScreen(), nor the
+ * startupHistorySeen-gated quiescence capture can lift the startup veto — only
+ * the adapter's own startupReadyFromHistory() predicate recognizes the
+ * restored composer (it accepts the `· Context N% left/used` footer as
+ * positive initialization evidence, guarded against loading/busy/queued/
+ * draft/picker screens). The ZMX path above runs it for snapshot backends;
+ * run it here for byte-stream backends (tmux/PTY) as well.
+ *
+ * Reads the renderer, NOT backend.captureCurrentScreen(): the rendered snapshot
+ * is the same viewport the banner path already trusts, avoids a per-recheck
+ * tmux capture-pane shell-out, and — critically — excludes scrollback, so a
+ * stale `esc to interrupt` / restoration marker far above the composer cannot
+ * be misread as current readiness. No-op for adapters without the predicate
+ * (only the Codex family declares startupReadyFromHistory). */
+function observeRestoredStartupHistoryOnScreen(): boolean {
+  if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
+  log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
+}
+
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
 function screenShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
@@ -7873,6 +10317,81 @@ function armPostHookPromptEvidenceFallback(
     // markIdle('screen') → markPromptReadyFromPty() 链路清除等待标记。
     if (idleDetector?.seedReadyEvidence()) {
       log(`Post-SessionStart evidence fallback: screen quiet ${quietMs}ms with readyPattern on screen; accepting existing prompt`);
+    }
+  }, delayMs);
+  postHookEvidenceFallbackTimer.unref?.();
+}
+
+/** 当前渲染画面里，最后一个提示符是否落在上下都有横线的输入框里（见 screenShowsFramedPrompt）。
+ *  必须 preserveFormatting：默认的 rawSnapshot() 会把 ─ 清洗成空格，框线判据永远不成立。 */
+function screenShowsFramedReadyPrompt(): boolean {
+  const pattern = cliAdapter?.readyPattern;
+  if (!pattern) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  return screenShowsFramedPrompt(screen, pattern);
+}
+
+/**
+ * First-prompt-timeout fallback: the SessionStart boundary never saw a fresh
+ * prompt and nothing was queued (see shouldArmFirstPromptTimeoutPromptSeed).
+ * Shares the post-hook fallback's timer so every spawn/kill path that clears
+ * that one clears this too. It only accepts a screen frozen since arming: any
+ * PTY output, queued or in-flight input, or a prompt that became ready by
+ * itself stops it (see firstPromptSeedStillWaiting). From then on the normal
+ * idle path owns the prompt; seeding evidence under a live turn — including
+ * one submitted straight into the web terminal, which no queue records —
+ * could finish it early.
+ */
+function armFirstPromptTimeoutPromptSeed(
+  observedBackend: SessionBackend,
+  armed: {
+    at: number;
+    outputGeneration: number;
+    webInputGeneration: number;
+    turnId: string | undefined;
+  } = {
+    at: Date.now(),
+    outputGeneration: ptyOutputGeneration.snapshot(),
+    webInputGeneration: webTerminalInputGeneration,
+    turnId: currentBotmuxTurnId,
+  },
+  delayMs: number = 0,
+): void {
+  clearPostHookEvidenceFallback();
+  postHookEvidenceFallbackTimer = setTimeout(() => {
+    postHookEvidenceFallbackTimer = null;
+    // Web-terminal input counts as activity for the quiet window too: a
+    // submission typed just before arming may not have produced output yet.
+    const quietMs = Date.now() - Math.max(lastPtyOutputAtMs, lastWebTerminalInputAtMs);
+    const decision = decidePostHookPromptEvidence({
+      stillWaiting: firstPromptSeedStillWaiting({
+        sameBackend: backend === observedBackend,
+        promptReady: isPromptReady,
+        hasPendingInput: hasPendingInputForFlush(),
+        hasUnackedInput: inflightInputs.hasUnacked(),
+        // Real PTY chunks only. An authoritative screen resync (observer
+        // reconnect) is not activity: it resets the idle detector without
+        // feeding it, so stopping here would strand the prompt again. It still
+        // restarts the quiet window, and the framed-prompt check reads the
+        // resynced screen.
+        outputSinceArm: !ptyOutputGeneration.isCurrent(armed.outputGeneration),
+        inputSinceArm: webTerminalInputGeneration !== armed.webInputGeneration
+          || currentBotmuxTurnId !== armed.turnId,
+      }),
+      // The window restarts with a resync (the only screen change that does not
+      // stop this fallback), so a late resync still gets its full quiet window.
+      elapsedMs: Date.now() - Math.max(armed.at, lastPtyOutputAtMs),
+      quietMs,
+      screenHasReadyPattern: screenShowsFramedReadyPrompt(),
+    });
+    if (decision.action === 'stop') return;
+    if (decision.action === 'retry') {
+      armFirstPromptTimeoutPromptSeed(observedBackend, armed, decision.retryInMs ?? POST_HOOK_EVIDENCE_RETRY_MS);
+      return;
+    }
+    if (idleDetector?.seedReadyEvidence()) {
+      log(`First-prompt-timeout evidence fallback: screen quiet ${quietMs}ms with a framed prompt on screen; accepting existing prompt`);
     }
   }, delayMs);
   postHookEvidenceFallbackTimer.unref?.();
@@ -7942,7 +10461,6 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   crashDiagnosticTmuxParked = true;
   isTmuxMode = true;
   isPipeMode = false;
-  isZellijMode = false;
   // The CLI is gone; stop the screen-update + analyzer loops so a stale
   // `status='working'` tick can't un-freeze the daemon's frozen crash card.
   // The web terminal is served by per-client tmux-attach PTYs, not these loops,
@@ -8006,6 +10524,7 @@ async function writeAdoptMessage(
   dispatchAttempt?: number,
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
   trustedCaller?: TrustedCaller,
+  trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -8013,13 +10532,21 @@ async function writeAdoptMessage(
     return 'stale-before-write';
   }
   const adoptBackend = executionFence.backend;
+  if (cliAdapter?.postTerminalPromptFence === true
+    && (currentInputDeliveryQuarantine()
+      || await postTerminalInputIsBlocked(adoptBackend))) {
+    return 'stale-before-write';
+  }
+  if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
 
   renderer?.markNewTurn();
   const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-  currentBotmuxTurnId = turnId;
-  currentBotmuxDispatchAttempt = dispatchAttempt;
-  currentGatewayTrustedCaller = trustedCaller;
+  if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
+    markTurnRetired(currentBotmuxTurnId);
+  }
+  setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
+  markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
   publishSandboxRelayCapability();
@@ -8035,16 +10562,23 @@ async function writeAdoptMessage(
   const prepareAdoptWrite = (): void => {
     if (adoptWritePrepared) return;
     adoptWritePrepared = true;
+    // Same anchor rule as flushPending: the execution window opens at the
+    // literal adopt write, inside the submission transaction, so a refused
+    // write never leaves a start armed for work that never began.
+    markTurnExecutionStart(turnId, dispatchAttempt);
     beginCliWriteCycle();
     if (bridgeJsonlPath) {
       try { bridgeIngest(); } catch { /* best effort */ }
       bridgeMarkPendingTurn(content, turnId, dispatchAttempt);
     } else if (codexBridgeFallbackActive()) {
-      if (codexBridgeIsCursor()) {
+      if (structuredBridgeIs('cursor')) {
         // Cursor may append the current line before IPC handling; mark first so
         // the pre-existing line can fingerprint-match instead of becoming seen.
         adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
         try { codexBridgeIngest(); } catch { /* best effort */ }
+        // Re-arm the thinking bubble's rowid baseline at this turn's write so
+        // only the new turn's reasoning/tool nodes render.
+        armCursorCotForTurn();
       } else {
         try { codexBridgeIngest(); } catch { /* best effort */ }
         adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
@@ -8052,6 +10586,8 @@ async function writeAdoptMessage(
       if (adoptStructuredBridgeTurnId) {
         codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
+    } else if (lastInitConfig?.cliId === 'antigravity') {
+      armAntigravityCotForTurn();
     }
   };
 
@@ -8087,6 +10623,7 @@ async function writeAdoptMessage(
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
     const submissionBackend = adoptBackend;
     let recoveryFailureReason: string | undefined;
+    let deliveryQuarantine: InputDeliveryQuarantine | null = null;
     // Refuse adopt input while the local composer still holds an unsubmitted
     // human draft, BEFORE any bridge attribution or terminal write — otherwise
     // the Lark message would be appended onto the human's half-typed line.
@@ -8136,6 +10673,12 @@ async function writeAdoptMessage(
         if (recoveryFailureReason) {
           notifyAmbiguousSubmissionRecovery(recoveryFailureReason, { turnId, dispatchAttempt });
         } else {
+          if (!result?.failureReason) {
+            deliveryQuarantine = armInputDeliveryQuarantine(
+              submissionBackend,
+              { turnId, dispatchAttempt },
+            );
+          }
           scheduleSubmitFailureNotify(
             content,
             result?.recheck,
@@ -8146,6 +10689,12 @@ async function writeAdoptMessage(
             { turnId, dispatchAttempt },
             'failed',
             true,
+            () => {
+              releaseInputDeliveryQuarantine(
+                deliveryQuarantine,
+                'authoritative deferred adopt-submit evidence',
+              );
+            },
           );
         }
       }
@@ -8258,6 +10807,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.dispatchAttempt,
       item.vcMeetingImTurnOrigin,
       item.trustedCaller,
+      item.trustedController,
       fence,
     ),
   });
@@ -8404,6 +10954,10 @@ let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
 let lastShotHash = '';
 // Throttle for the happy-path upload log in captureAndUpload (one line/min).
 let lastUploadLogAtMs = 0;
+let screenshotCaptureInFlight = false;
+// Bumped whenever the display mode is (re)applied, so a frame captured under
+// an earlier show/hide cycle cannot be delivered after a later one.
+let screenshotDisplayGeneration = 0;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -8457,6 +11011,36 @@ function scheduleOneShotAfterAction(): void {
   }, POST_ACTION_DELAY_MS);
 }
 
+/**
+ * Lazily-backed, injectable indirection to @napi-rs/canvas's PNG renderer.
+ *
+ * WHY a module-scope wrapper instead of a `const { captureToPng } = await
+ * import(...)` inside captureAndUpload(): @napi-rs/canvas is a native addon a
+ * compiled binary may lack, so the import MUST stay lazy (a static import would
+ * fail the worker at module init, not just a screenshot). But declaring the
+ * binding inside captureAndUpload broke the capture path's dependency-injection
+ * seam: test/worker-screenshot-upload-hardening.test.ts slices this function's
+ * body into `new Function('deps', …)` and injects `captureToPng` as a FREE
+ * variable — a block-scoped `const` shadows it, and the extra `await import`
+ * also pushed the render past the harness's two-tick flush.
+ *
+ * Keeping the import inside a module-scope function named `captureToPng` puts
+ * the lazy load back behind the SAME free identifier the harness injects, so
+ * the seam is intact while worker init still never touches the native addon.
+ * The dynamic `import()` is cached by the module system, so repeat calls are
+ * cheap. NOTE: no explicit "stale after import" checkpoint is needed here —
+ * the import performs no rendering, and captureAndUpload's existing
+ * `if (frameIsStale()) cancelStale('render')` right after the awaited render is
+ * what actually prevents a stale frame from uploading.
+ */
+async function captureToPng(
+  terminal: Parameters<typeof import('./utils/screenshot-renderer.js')['captureToPng']>[0],
+  opts: Parameters<typeof import('./utils/screenshot-renderer.js')['captureToPng']>[1],
+): Promise<Buffer> {
+  const { captureToPng: renderPng } = await import('./utils/screenshot-renderer.js');
+  return renderPng(terminal, opts);
+}
+
 async function captureAndUpload(): Promise<void> {
   // displayMode mismatch should be impossible during a running loop (start/stop
   // gate on it). Logging here exists to surface the unexpected case — e.g. a
@@ -8465,68 +11049,129 @@ async function captureAndUpload(): Promise<void> {
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
   if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
+  if (screenshotCaptureInFlight)    { logScreenshotSkip('capture/upload already in flight'); return; }
 
-  let png: Buffer;
-  let usageLimitContent = '';
+  // Bind the frame's FULL identity before the first await: capture revision,
+  // turn/attempt tuple and display generation. Every later await boundary
+  // re-checks it; a frame that outlived its identity is cancelled (never
+  // uploaded once known stale, never sent) and retaken under the current one.
+  const capturedRevision = captureRevision;
+  const capturedTurnId = currentBotmuxTurnId;
+  const capturedAttempt = currentBotmuxDispatchAttempt;
+  const capturedDisplayGeneration = screenshotDisplayGeneration;
+  const frameIsStale = (): boolean => displayMode !== 'screenshot'
+    || capturedRevision !== captureRevision
+    || capturedDisplayGeneration !== screenshotDisplayGeneration
+    || capturedTurnId !== currentBotmuxTurnId
+    || capturedAttempt !== currentBotmuxDispatchAttempt;
+  // Dedup is bound to the full identity: the same pixels under a new capture
+  // identity or display cycle are a NEW first frame, never a duplicate.
+  const dedupKey = (pixelHash: string): string =>
+    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}`;
+  let recaptureAfterStaleFrame = false;
+  let ownedKey: string | null = null;
+  let previousShotHash = lastShotHash;
+  /** Roll back only the dedup key THIS capture committed; a newer reset or a
+   * newer identity's key is never overwritten. */
+  const releaseOwnedKey = (): void => {
+    if (ownedKey !== null && lastShotHash === ownedKey) lastShotHash = previousShotHash;
+  };
+  const cancelStale = (where: string): void => {
+    releaseOwnedKey();
+    logScreenshotSkip(`stale frame (identity/display changed during ${where})`);
+    recaptureAfterStaleFrame = true;
+  };
+  screenshotCaptureInFlight = true;
   try {
-    // Preferred path: pipe-pane backends ask tmux for a fresh viewport
-    // snapshot and render it through a transient xterm-headless. This
-    // avoids the accumulated-buffer drift that produced duplicated /
-    // staircase content under the legacy long-lived renderer.
-    const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
-    if (pipeResult) {
-      if (pipeResult.ansi === lastShotHash) return;
-      lastShotHash = pipeResult.ansi;
-      png = pipeResult.png;
-      usageLimitContent = pipeResult.content;
-    } else {
-      // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
-      // still drive the long-lived renderer.
-      if (!renderer) { logScreenshotSkip('renderer=null'); return; }
-      const term = renderer.xterm;
-      const startY = term.buffer.active.baseY;
-      const snap = renderer.rawSnapshot();
-      const hash = createHash('md5').update(snap).digest('hex');
-      if (hash === lastShotHash) return;
-      lastShotHash = hash;
-      usageLimitContent = snap;
-      const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
-      const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
-      png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+    let png: Buffer;
+    let usageLimitContent = '';
+    try {
+      // Preferred path: pipe-pane backends ask tmux for a fresh viewport
+      // snapshot and render it through a transient xterm-headless. This
+      // avoids the accumulated-buffer drift that produced duplicated /
+      // staircase content under the legacy long-lived renderer.
+      const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+      if (frameIsStale()) { cancelStale('snapshot'); return; }
+      if (pipeResult) {
+        // Same ANSI on a resized canvas is a different picture.
+        const key = dedupKey(`${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`);
+        if (key === lastShotHash) return;
+        previousShotHash = lastShotHash;
+        ownedKey = key;
+        lastShotHash = key;
+        png = pipeResult.png;
+        usageLimitContent = pipeResult.content;
+      } else {
+        // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
+        // still drive the long-lived renderer.
+        if (!renderer) { logScreenshotSkip('renderer=null'); return; }
+        const term = renderer.xterm;
+        const startY = term.buffer.active.baseY;
+        const snap = renderer.rawSnapshot();
+        const key = dedupKey(createHash('md5').update(snap).digest('hex'));
+        if (key === lastShotHash) return;
+        previousShotHash = lastShotHash;
+        ownedKey = key;
+        lastShotHash = key;
+        usageLimitContent = snap;
+        const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
+        const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        // `captureToPng` is the module-scope lazy wrapper above: the canvas native
+        // is still only loaded on first use, never at worker init.
+        png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+        if (frameIsStale()) { cancelStale('render'); return; }
+      }
+    } catch (err: any) {
+      releaseOwnedKey();
+      logError(`Screenshot render failed: ${err?.message ?? err}`);
+      return;
     }
-  } catch (err: any) {
-    logError(`Screenshot render failed: ${err?.message ?? err}`);
-    return;
-  }
 
-  let imageKey: string;
-  try {
-    imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
-  } catch (err: any) {
-    logError(`Screenshot upload failed: ${err?.message ?? err}`);
-    return;
-  }
+    let imageKey: string;
+    try {
+      imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
+    } catch (err: any) {
+      // Restore only our own key so the next regular tick retries this
+      // unchanged frame; a newer reset/identity stands.
+      releaseOwnedKey();
+      logError(`Screenshot upload failed: ${err?.message ?? err}`);
+      if (frameIsStale()) recaptureAfterStaleFrame = true;
+      return;
+    }
 
-  const status = projectedRuntimeScreenStatus();
-  // Success is otherwise completely silent (skips and failures log above), which
-  // made "loop alive and uploading" indistinguishable from "loop never started"
-  // in the daemon log. One throttled line keeps the happy path observable.
-  const nowMs = Date.now();
-  if (nowMs - lastUploadLogAtMs >= 60_000) {
-    lastUploadLogAtMs = nowMs;
-    log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    if (frameIsStale()) { cancelStale('upload'); return; }
+
+    const status = projectedRuntimeScreenStatus();
+    // Success is otherwise completely silent (skips and failures log above), which
+    // made "loop alive and uploading" indistinguishable from "loop never started"
+    // in the daemon log. One throttled line keeps the happy path observable.
+    const nowMs = Date.now();
+    if (nowMs - lastUploadLogAtMs >= 60_000) {
+      lastUploadLogAtMs = nowMs;
+      log(`Screenshot uploaded (${png.length}B, key=${imageKey.slice(0, 12)}…)`);
+    }
+    send({
+      type: 'screenshot_uploaded',
+      imageKey,
+      ...classifyScreenUsageLimit(usageLimitContent, status),
+      turnId: capturedTurnId,
+      dispatchAttempt: capturedAttempt,
+      captureRevision: capturedRevision,
+    });
+  } finally {
+    screenshotCaptureInFlight = false;
+    // A capture requested meanwhile (e.g. the immediate frame for a new
+    // identity) was skipped by the single-flight guard; take it now. Never
+    // while output is hidden.
+    if (recaptureAfterStaleFrame && displayMode === 'screenshot') {
+      setTimeout(() => { void captureAndUpload(); }, 0);
+    }
   }
-  send({
-    type: 'screenshot_uploaded',
-    imageKey,
-    ...classifyScreenUsageLimit(usageLimitContent, status),
-    turnId: currentBotmuxTurnId,
-    dispatchAttempt: currentBotmuxDispatchAttempt,
-  });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
   displayMode = mode;
+  screenshotDisplayGeneration += 1;
   lastShotHash = '';
   if (mode === 'screenshot') startScreenshotLoop();
   else stopScreenshotLoop();
@@ -8572,7 +11217,7 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
   // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
@@ -8665,6 +11310,64 @@ async function handleTermAction(key: TermActionKey): Promise<void> {
   scheduleOneShotAfterAction();
 }
 
+/** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
+ * active turn. This is deliberately separate from card `term_action`: a stale
+ * HTTP request must never interrupt a newer turn that reused this CLI process. */
+async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
+  if (turnId !== currentBotmuxTurnId) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
+  // Codex App and codexRpcInput use the pane as a viewer while actual work is
+  // driven through app-server/RPC. Writing ETX here would kill that transport
+  // process, not safely interrupt the exact model turn. Match the card stop
+  // contract and fail closed until their native turn-interrupt protocol exists.
+  if (isCodexAppCliId(lastInitConfig?.cliId)
+      || lastInitConfig?.codexRpcInput === true
+      || effectiveBackendType === 'riff'
+      || effectiveBackendType === 'mojo'
+      || effectiveBackendType === 'remote-runner'
+      || !backend) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
+    return;
+  }
+  const targetBackend = backend;
+  let delivered = false;
+  try {
+    delivered = await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
+      if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return false;
+      return sendCriticalControlKey('ctrlc', () => {
+        if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return true;
+        return sendTermActionOnce(targetBackend, 'ctrlc');
+      });
+    });
+  } catch (err) {
+    log(`Exact interrupt ${turnId.substring(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (backend !== targetBackend || currentBotmuxTurnId !== turnId) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
+    return;
+  }
+  if (delivered) {
+    // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
+    // only this exact turn BEFORE acknowledging interruption to the daemon;
+    // otherwise the caller sees interrupted while auto-restart executes it again.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
+    }
+  }
+  send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
+  if (delivered) {
+    if (tuiPromptBlocking) {
+      tuiPromptBlocking = false;
+      void flushPending();
+    }
+    log(`Exact interrupt delivered for turn ${turnId.substring(0, 8)}`);
+    scheduleOneShotAfterAction();
+  }
+}
+
 /** Key name → ANSI escape sequence (for PtyBackend) */
 const KEY_TO_ANSI: Record<string, string> = {
   Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
@@ -8743,6 +11446,8 @@ let injectionFlushing = false;
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
+  if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
   if (cliRestartInProgress) return;
@@ -9017,12 +11722,18 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
-// Codex:       "› 1. Yes, continue  2. No, quit" (ANSI cursor codes strip spaces from
-//               longer phrases like "Do you trust…", but "Yes, continue" survives intact
-//               in a single PTY chunk)
-const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
+// Codex:       older versions used "› 1. Yes, continue"; 0.155+ uses
+//               "› 1. Trust and continue". ANSI cursor codes strip spaces from
+//               longer phrases like "Do you trust…", but the option label survives
+//               intact in a single PTY chunk.
+const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue|Trust and continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
+const AIDEN_CODEX_UPDATE_RETRY_MS = 1_000;
+const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;
+let aidenCodexUpdateLastActionAt = 0;
+let aidenCodexUpdateAttempts = 0;
+let aidenCodexUpdateLimitNotified = false;
 // Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
 // Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
 // and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
@@ -9050,6 +11761,133 @@ function armEffortConfirm(): void {
     effortConfirmTimer = null;
     effortConfirmGuard.disarm();
   }, EFFORT_CONFIRM_WINDOW_MS);
+  effortConfirmTimer.unref?.();
+}
+
+// Relay Claude Code's `/btw` side answer to the IM thread: watch the screen
+// for our overlay to finish, press `c`, forward the OSC 52 payload. Armed
+// only by botmux's own `/btw <question>` passthrough; see claude-btw-overlay.ts.
+const btwCaptureGuard = new ClaudeBtwCaptureGuard();
+let btwCaptureTurnId: string | undefined;
+let btwCaptureTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyTimer: ReturnType<typeof setTimeout> | null = null;
+let btwScreenCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyAttempts = 0;
+let btwCaptureGeneration = 0;
+// A side question is answered without tools; give slow models room but never
+// leave the guard armed indefinitely.
+const BTW_ANSWER_WINDOW_MS = 180_000;
+// The OSC 52 payload follows the `c` keypress almost immediately.
+const BTW_COPY_WINDOW_MS = 3_000;
+// Screen reads are throttled, not debounced: a busy main turn repaints its
+// spinner continuously, so a quiet window may never come.
+const BTW_SCREEN_CHECK_MS = 150;
+const BTW_MAX_COPY_ATTEMPTS = 3;
+
+function disarmBtwCapture(): void {
+  if (btwCaptureTimer) clearTimeout(btwCaptureTimer);
+  if (btwCopyTimer) clearTimeout(btwCopyTimer);
+  if (btwScreenCheckTimer) clearTimeout(btwScreenCheckTimer);
+  btwCaptureTimer = btwCopyTimer = btwScreenCheckTimer = null;
+  btwCopyAttempts = 0;
+  btwCaptureGuard.disarm();
+  btwCaptureTurnId = undefined;
+}
+
+function armBtwCapture(question: string, turnId: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  // Remote runners deliver screens, not a byte stream with OSC 52.
+  if (isRemoteBackendType(effectiveBackendType)) return;
+  disarmBtwCapture();
+  btwCaptureGeneration += 1;
+  btwCaptureGuard.arm(question);
+  btwCaptureTurnId = turnId;
+  btwCaptureTimer = setTimeout(() => {
+    btwCaptureTimer = null;
+    log('/btw answer not captured within the answer window; giving up');
+    giveUpBtwCapture();
+  }, BTW_ANSWER_WINDOW_MS);
+  btwCaptureTimer.unref?.();
+}
+
+/** The live renderer (fed every PTY chunk) rather than lastAnalyzerSnapshot,
+ *  which refreshes at most every 2s; with preserveFormatting so indentation
+ *  (question vs. answer, nested lists) survives. */
+function btwOverlayScreen(): string {
+  return renderer?.rawSnapshot({ preserveFormatting: true }) || lastAnalyzerSnapshot || '';
+}
+
+/** Close the overlay, which otherwise swallows the next keystrokes botmux
+ *  types (`f` forks, `x` clears history). Only while the freshest screen
+ *  shows it: with the overlay gone, Esc would interrupt the running turn.
+ *  The headless renderer parses asynchronously, so the repaint that came
+ *  with the triggering chunk (e.g. "Copied to clipboard") may be half
+ *  applied right now; look again a few times before concluding it is gone. */
+const BTW_CLOSE_CHECKS_MS = [100, 300, 700];
+
+function closeBtwOverlayIfVisible(attempt = 0, generation = btwCaptureGeneration): void {
+  const timer = setTimeout(() => {
+    // A newer `/btw` owns whatever overlay is on screen now.
+    if (!backend || generation !== btwCaptureGeneration) return;
+    if (claudeBtwOverlayVisible(btwOverlayScreen())) {
+      log('/btw overlay still open; closing it');
+      sendTermActionOnce(backend, 'esc');
+    } else if (attempt + 1 < BTW_CLOSE_CHECKS_MS.length) {
+      closeBtwOverlayIfVisible(attempt + 1, generation);
+    }
+  }, BTW_CLOSE_CHECKS_MS[attempt] - (BTW_CLOSE_CHECKS_MS[attempt - 1] ?? 0));
+  timer.unref?.();
+}
+
+function giveUpBtwCapture(): void {
+  closeBtwOverlayIfVisible();
+  disarmBtwCapture();
+}
+
+function deliverBtwAnswer(question: string, answer: string, source: 'clipboard' | 'screen'): void {
+  const turnId = btwCaptureTurnId;
+  disarmBtwCapture();
+  log(`/btw answer captured from ${source} (${answer.length} chars)`);
+  send({ type: 'btw_answer', question, answer, source, ...(turnId ? { turnId } : {}) });
+  closeBtwOverlayIfVisible();
+}
+
+function scheduleBtwScreenCheck(): void {
+  if (btwScreenCheckTimer) return;
+  btwScreenCheckTimer = setTimeout(checkBtwOverlayScreen, BTW_SCREEN_CHECK_MS);
+  btwScreenCheckTimer.unref?.();
+}
+
+function checkBtwOverlayScreen(): void {
+  btwScreenCheckTimer = null;
+  if (!backend || btwCaptureGuard.inspectScreen(btwOverlayScreen()).kind !== 'copy') return;
+  btwCopyAttempts += 1;
+  btwCaptureGuard.markCopyRequested();
+  backend.write('c');
+  btwCopyTimer = setTimeout(finishBtwCaptureFromScreen, BTW_COPY_WINDOW_MS);
+  btwCopyTimer.unref?.();
+}
+
+/** No OSC 52 arrived after `c`: read the answer from the rendered overlay
+ *  (viewport only, so the daemon marks it as possibly partial). If the
+ *  overlay is still answering, wait for the finished footer again. */
+function finishBtwCaptureFromScreen(): void {
+  btwCopyTimer = null;
+  if (!btwCaptureGuard.isCopying()) return;
+  const overlay = parseClaudeBtwOverlay(btwOverlayScreen());
+  const next = btwCaptureGuard.copyFallback(overlay, btwCopyAttempts, BTW_MAX_COPY_ATTEMPTS);
+  if (next.kind === 'deliver') {
+    deliverBtwAnswer(btwCaptureGuard.question, next.answer, 'screen');
+    return;
+  }
+  if (next.kind === 'wait') {
+    log('/btw overlay still answering after the copy request; waiting for it to finish');
+    btwCaptureGuard.revertToAnswering();
+    scheduleBtwScreenCheck();
+    return;
+  }
+  log('/btw answer finished but neither the clipboard nor the screen yielded it');
+  giveUpBtwCapture();
 }
 
 /**
@@ -9059,7 +11897,7 @@ function armEffortConfirm(): void {
  * cjadk and ttadk launches never need this path because they accept the
  * config override. Adopted panes are user-owned and must not be driven.
  */
-function dismissAidenCodexUpdateDialog(data: string): boolean {
+function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen' = 'stream'): boolean {
   if (
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
@@ -9076,14 +11914,428 @@ function dismissAidenCodexUpdateDialog(data: string): boolean {
   // Cancel any ready match from an earlier partial menu redraw before it can
   // flush the first queued Lark message into the picker.
   idleDetector?.reset();
-  if (action === 'suppress') return true;
-
-  log('Codex startup update dialog detected behind Aiden, selecting the non-upgrade option...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Down', 'Enter');
-  } else {
-    backend?.write('\x1b[B\r');
+  if (aidenCodexUpdateAttempts >= AIDEN_CODEX_UPDATE_MAX_ATTEMPTS) {
+    if (source === 'screen' && !aidenCodexUpdateLimitNotified) {
+      aidenCodexUpdateLimitNotified = true;
+      log(`Codex startup update dialog remained after ${aidenCodexUpdateAttempts} Aiden auto-dismiss attempts`);
+      send({
+        type: 'user_notify',
+        message: `Codex 升级菜单自动跳过 ${aidenCodexUpdateAttempts} 次后仍未继续。已停止自动操作，请打开网页终端选择「2. Skip」。`,
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
   }
+
+  const keys = codexUpdateDialogSafeKeys(data);
+  if (!keys || Date.now() - aidenCodexUpdateLastActionAt < AIDEN_CODEX_UPDATE_RETRY_MS) return true;
+
+  aidenCodexUpdateLastActionAt = Date.now();
+  let delivered = false;
+  try {
+    if (backend && 'sendSpecialKeys' in backend) {
+      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
+    } else {
+      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      delivered = backend?.write(input) === true;
+    }
+  } catch (error) {
+    log(`Codex startup update dialog navigation failed; will retry: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!delivered) {
+    aidenCodexUpdateLastActionAt = 0;
+    return true;
+  }
+  aidenCodexUpdateAttempts += 1;
+  log(`Codex startup update dialog detected behind Aiden, selecting the non-upgrade option (${keys.join('+')}, attempt ${aidenCodexUpdateAttempts}/${AIDEN_CODEX_UPDATE_MAX_ATTEMPTS})...`);
+  return true;
+}
+
+/** Aiden can finish drawing the picker before the PTY listener is attached.
+ * Re-check the rendered viewport while startup is held so a menu that only
+ * exists in the authoritative screen cannot strand the queued first turn. */
+function inspectAidenCodexUpdateDialogOnScreen(): boolean {
+  if (
+    lastInitConfig?.cliId !== 'codex'
+    || lastInitConfig.adoptMode
+    || !lastInitConfig.wrapperCli
+    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || !awaitingFirstPrompt
+  ) return false;
+
+  let screen = '';
+  try {
+    screen = backend
+      ? captureBackendScreen(backend)
+      : (renderer?.rawSnapshot({ preserveFormatting: true }) ?? '');
+  } catch { return false; }
+  return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');
+}
+
+// ─── Codex model-migration picker ────────────────────────────────────────────
+
+// Codex 0.162 paints a skeleton composer before initialization and then, once
+// per CODEX_HOME whenever the configured model has an unacknowledged upgrade,
+// replaces it with a modal "Meet <model>: 1. Try new model / 2. Use existing
+// model" picker. The idle detector had already latched ready evidence from the
+// skeleton, so two quiet seconds on the picker flushed the first queued message
+// into it: the paste was dropped and its submit Enter confirmed "Try new model"
+// (silently switching the user's global model), leaving the turn
+// submit_unconfirmed. There is no process-level opt-out (see
+// codex-model-migration-dialog.ts), so resolve it on screen with "Use existing
+// model" and keep every input path held until the normal composer returns.
+const codexModelMigrationGuard = new CodexModelMigrationDialogGuard();
+// The picker's key handler is not ready the instant it paints — the same
+// warm-up race as the trust dialog (openai/codex#39487).
+const CODEX_MODEL_MIGRATION_SETTLE_MS = 400;
+const CODEX_MODEL_MIGRATION_RETRY_MS = 1_000;
+const CODEX_MODEL_MIGRATION_POLL_MS = 2_000;
+const CODEX_MODEL_MIGRATION_MAX_ATTEMPTS = 3;
+/** Input is held for the picker (seen, or an unreadable capture while held). */
+let codexModelMigrationPending = false;
+/** The authoritative screen was verified picker-free after startup. The picker
+ *  only precedes the first prompt of a CLI process, so later input skips the
+ *  screen capture until the next spawn. */
+let codexModelMigrationCleared = false;
+/** PTY output generation at the latest rejected ready edge (screen idle or
+ *  first-prompt timeout). If nothing was output since, that edge cannot recur
+ *  on its own and the release must re-drive it. */
+let codexModelMigrationHeldReadyGeneration: number | undefined;
+/** A queued writer (flush, injection, raw passthrough) returned early. */
+let codexModelMigrationHeldWrite = false;
+/** Own retry loop, independent of the chat screen-update timer (which v3
+ *  workflow workers never start). */
+let codexModelMigrationRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+let codexModelMigrationUnreadableLogged = false;
+let codexModelMigrationLastActionAt = 0;
+let codexModelMigrationAttempts = 0;
+let codexModelMigrationLimitNotified = false;
+/** Startup readiness re-seed after a release (see the release function). */
+let codexModelMigrationReseedTimer: ReturnType<typeof setTimeout> | null = null;
+const CODEX_MODEL_MIGRATION_RESEED_QUIET_MS = 2_000;
+const CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES = 15;
+
+/** All picker state is per CLI process: called on every spawn and kill. */
+function resetCodexModelMigrationState(): void {
+  codexModelMigrationGuard.reset();
+  if (codexModelMigrationRecheckTimer) {
+    clearTimeout(codexModelMigrationRecheckTimer);
+    codexModelMigrationRecheckTimer = null;
+  }
+  if (codexModelMigrationReseedTimer) {
+    clearTimeout(codexModelMigrationReseedTimer);
+    codexModelMigrationReseedTimer = null;
+  }
+  codexModelMigrationPending = false;
+  codexModelMigrationCleared = false;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  codexModelMigrationUnreadableLogged = false;
+  codexModelMigrationLastActionAt = 0;
+  codexModelMigrationAttempts = 0;
+  codexModelMigrationLimitNotified = false;
+}
+
+/** Owned Codex TUI whose screen may drive synthesized keys. ZMX snapshots are
+ *  not authoritative for that (see onBackendScreenResync). */
+function codexModelMigrationInScope(): boolean {
+  return lastInitConfig?.cliId === 'codex'
+    && !lastInitConfig.adoptMode
+    && !lastInitConfig.existingAppServerEndpoint
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+}
+
+function codexModelMigrationCheckNeeded(): boolean {
+  return codexModelMigrationInScope() && !!backend && !codexModelMigrationCleared;
+}
+
+/** Drain the PTY renderer before the screen is judged. On the renderer
+ *  screen path (PTY: no native capture) xterm parses renderer.write()
+ *  asynchronously, so a picker repaint that has just arrived can still be
+ *  invisible to a synchronous capture. Returns false when output kept
+ *  arriving through every round: the frame is then UNVERIFIED and callers
+ *  must hold, never proceed. tmux/herdr captures come from the multiplexer
+ *  and need no drain. */
+async function settleCodexModelMigrationRenderer(): Promise<boolean> {
+  if (!renderer || !backend || backend.captureViewport || backend.captureCurrentScreen) return true;
+  for (let round = 0; round < 3; round++) {
+    const target: TerminalRenderer | null = renderer;
+    if (!target) return true;
+    const revision = backendScreenRevision;
+    try { await target.writeAndFlush(''); } catch { return false; }
+    if (renderer !== target) return false;
+    if (backendScreenRevision === revision) return true;
+  }
+  return false;
+}
+
+type CodexModelMigrationObservation =
+  | { state: 'picker'; screen: string }
+  | { state: 'clear' }
+  /** The capture threw or came back blank (TmuxPipeBackend returns '' on a
+   *  capture timeout): proves nothing about the picker. */
+  | { state: 'unreadable' }
+  /** No screen source at all (e.g. a PTY backend in a workflow worker, which
+   *  has no renderer): nothing can be resolved, keep the previous behaviour. */
+  | { state: 'unobservable' };
+
+function observeCodexModelMigrationScreen(): CodexModelMigrationObservation {
+  if (!backend || !canCaptureBusyPatternScreen(backend)) return { state: 'unobservable' };
+  let screen = '';
+  try {
+    screen = captureBackendScreen(backend);
+  } catch { return { state: 'unreadable' }; }
+  if (!stripAnsiScreenText(screen).trim()) return { state: 'unreadable' };
+  return isCodexModelMigrationScreen(screen) ? { state: 'picker', screen } : { state: 'clear' };
+}
+
+/** Stream side: chunks place the picker's words with cursor addressing, so the
+ *  selected row is only knowable from the rendered screen. Schedule a screen
+ *  check once the picker's key handler is live; do NOT consume the chunk. One
+ *  coalesced read can carry the picker repaint AND the composer that replaced
+ *  it, and that composer evidence must still reach the idle detector. Holding
+ *  input is decided only by the authoritative screen, so a stream match alone
+ *  can never strand startup. */
+function noticeCodexModelMigrationDialog(data: string): void {
+  if (!awaitingFirstPrompt || !codexModelMigrationCheckNeeded() || !codexModelMigrationGuard.inspect(data)) return;
+  scheduleCodexModelMigrationRecheck(CODEX_MODEL_MIGRATION_SETTLE_MS);
+}
+
+function scheduleCodexModelMigrationRecheck(delayMs: number): void {
+  if (codexModelMigrationRecheckTimer) return;
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationRecheckTimer = setTimeout(() => {
+    codexModelMigrationRecheckTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void recheckCodexModelMigration(backendAtSchedule, generationAtSchedule);
+  }, delayMs);
+}
+
+/** Timer-driven re-check: retries the picker while it stays open and releases
+ *  held input once a readable screen shows it gone. */
+async function recheckCodexModelMigration(expectedBackend: typeof backend, expectedGeneration: number): Promise<void> {
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  // Still open (or unverified): the gate re-armed this loop. Gone: it
+  // scheduled the release.
+  await codexModelMigrationAdmit('recheck');
+}
+
+function holdCodexModelMigrationInput(): void {
+  codexModelMigrationPending = true;
+  scheduleCodexModelMigrationRecheck(codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS
+    ? CODEX_MODEL_MIGRATION_POLL_MS
+    : CODEX_MODEL_MIGRATION_RETRY_MS);
+}
+
+/** Runs the release outside the observing caller: a writer that just saw the
+ *  picker gone must not re-enter flushPending from inside itself. */
+function scheduleCodexModelMigrationRelease(): void {
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  setTimeout(() => {
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    releaseCodexModelMigrationHold();
+  }, 0);
+}
+
+/** The picker is gone: re-drive whatever it held. Checks never reset idle
+ *  evidence, so a composer redraw fed after a rejected ready edge already runs
+ *  its own quiescence cycle; only a rejected edge with no output since needs
+ *  re-firing (same rule as the structured pre-start gate). */
+function releaseCodexModelMigrationHold(): void {
+  const heldReady = codexModelMigrationHeldReadyGeneration;
+  const heldWrite = codexModelMigrationHeldWrite;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  log('Codex model-migration picker cleared; releasing held input');
+  if (heldReady !== undefined && ptyOutputGeneration.isCurrent(heldReady)) {
+    idleDetector?.reset();
+    idleDetector?.fireIdle();
+  }
+  // Newer output does not guarantee another idle edge: after the rejected
+  // idle, feed() dropped readySeen, and cursor/footer-only redraws carry no
+  // prompt marker to re-arm quiescence. Once the PTY is quiet, verify the
+  // prompt on screen and re-seed it (a no-op if the detector re-armed).
+  if (awaitingFirstPrompt) scheduleCodexModelMigrationReseed(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS, CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES);
+  // During startup the idle path (re-driven above, or the composer redraw's
+  // own cycle) owns the first flush: kicking flushPending here would bypass the
+  // startup readiness gate that sendToPty applies (shouldWriteNow).
+  if (!heldWrite || awaitingFirstPrompt) return;
+  if (pendingInjections.length > 0) void flushPendingInjections();
+  if (hasPendingInputForFlush()) void flushPending();
+}
+
+function scheduleCodexModelMigrationReseed(delayMs: number, triesLeft: number): void {
+  if (codexModelMigrationReseedTimer) clearTimeout(codexModelMigrationReseedTimer);
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationReseedTimer = setTimeout(() => {
+    codexModelMigrationReseedTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void reseedCodexModelMigrationReadiness(backendAtSchedule, generationAtSchedule, triesLeft);
+  }, Math.max(0, delayMs));
+}
+
+/** Same rule as the post-SessionStart evidence fallback: a quiet PTY plus a
+ *  prompt on the authoritative screen re-seeds readySeen; IdleDetector still
+ *  runs its full quiescence check, and the screen-idle gate still applies. */
+async function reseedCodexModelMigrationReadiness(
+  expectedBackend: typeof backend,
+  expectedGeneration: number,
+  triesLeft: number,
+): Promise<void> {
+  // Ready already published, or the picker is back (its gate owns startup).
+  if (!awaitingFirstPrompt || codexModelMigrationPending || !expectedBackend) return;
+  const retry = (delayMs: number) => {
+    if (triesLeft > 1) scheduleCodexModelMigrationReseed(delayMs, triesLeft - 1);
+  };
+  const quietMs = Date.now() - lastPtyOutputAtMs;
+  if (quietMs < CODEX_MODEL_MIGRATION_RESEED_QUIET_MS) {
+    retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS - quietMs);
+    return;
+  }
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  if (!awaitingFirstPrompt || codexModelMigrationPending) return;
+  if (!settled) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  let screen = '';
+  try {
+    screen = captureBackendScreen(expectedBackend);
+  } catch { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  const text = stripAnsiScreenText(screen);
+  if (!text.trim()) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  if (isCodexModelMigrationScreen(screen) || !cliAdapter?.readyPattern?.test(text)) return;
+  if (idleDetector?.seedReadyEvidence()) {
+    log(`Codex model-migration picker cleared: screen quiet ${quietMs}ms with a prompt; re-seeding readiness`);
+  }
+}
+
+/**
+ * Synchronous picker gate on the current screen; reached only through
+ * codexModelMigrationAdmit(), which drains the renderer first. Returns true
+ * while input must stay queued: the authoritative screen shows the picker as
+ * the active input surface, or the frame is unreadable/unverified while a hold
+ * is in force (or during startup). It then selects "Use existing model"
+ * (bounded retries, then one user notice). It never resets idle evidence: a
+ * stale observation must not erase a composer redraw.
+ */
+function codexModelMigrationBlocksInput(override?: CodexModelMigrationObservation): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  const observed = override ?? observeCodexModelMigrationScreen();
+  if (observed.state === 'unobservable') return false;
+  if (observed.state === 'unreadable') {
+    // Not evidence that the picker closed: keep an existing hold (and stay
+    // held during startup), never cache it as cleared. A readable recheck
+    // decides.
+    if (!codexModelMigrationPending && !awaitingFirstPrompt) return false;
+    if (!codexModelMigrationUnreadableLogged) {
+      codexModelMigrationUnreadableLogged = true;
+      log('Codex screen capture unreadable while checking the model-migration picker; holding input until a readable capture');
+    }
+    holdCodexModelMigrationInput();
+    return true;
+  }
+  codexModelMigrationUnreadableLogged = false;
+  if (observed.state === 'clear') {
+    const wasPending = codexModelMigrationPending;
+    codexModelMigrationPending = false;
+    if (!awaitingFirstPrompt) codexModelMigrationCleared = true;
+    if (wasPending) scheduleCodexModelMigrationRelease();
+    return false;
+  }
+  holdCodexModelMigrationInput();
+  if (codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS) {
+    if (!codexModelMigrationLimitNotified) {
+      codexModelMigrationLimitNotified = true;
+      log(`Codex model-migration picker remained after ${codexModelMigrationAttempts} automatic attempts; input stays held`);
+      send({
+        type: 'user_notify',
+        message: t('worker.codex_model_migration_unresolved', { cliName: cliName(), attempts: codexModelMigrationAttempts }),
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
+  }
+  if (Date.now() - codexModelMigrationLastActionAt < CODEX_MODEL_MIGRATION_RETRY_MS) return true;
+  codexModelMigrationLastActionAt = Date.now();
+  // Every throttled attempt spends the bounded budget, including one where the
+  // highlighted row is unreadable or the keys were refused: a persistent
+  // failure must surface to the user instead of holding the turn silently.
+  codexModelMigrationAttempts += 1;
+  const attempt = `attempt ${codexModelMigrationAttempts}/${CODEX_MODEL_MIGRATION_MAX_ATTEMPTS}`;
+  const keys = codexModelMigrationSafeKeys(observed.screen);
+  if (!keys) {
+    log(`Codex model-migration picker visible but its selected row is unreadable; holding input (${attempt})`);
+    return true;
+  }
+  let delivered = false;
+  try {
+    if ('sendSpecialKeys' in backend!) {
+      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
+    } else {
+      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      delivered = backend!.write(input) === true;
+    }
+  } catch (error) {
+    log(`Codex model-migration picker navigation failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  log(delivered
+    ? `Codex model-migration picker detected, keeping the configured model (${keys.join('+')}, ${attempt})`
+    : `Codex model-migration picker keys were not delivered (${attempt})`);
+  return true;
+}
+
+/**
+ * THE admission point for the picker guard. Every Codex PTY writer
+ * (flushPending — queued and type-ahead messages, raw passthrough deferred by
+ * codexModelMigrationHoldsRawInput, startup commands, rename — and
+ * flushPendingInjections), every startup ready edge (screen idle, first-prompt
+ * timeout) and the retry timer pass through here, and only here:
+ * renderer drain first, then the synchronous gate on a verified frame. An
+ * unverified frame takes the same hold + retry path as an unreadable capture.
+ * `superseded` means the CLI generation changed during the drain.
+ */
+async function codexModelMigrationAdmit(
+  kind: 'write' | 'ready' | 'recheck',
+  readyGeneration?: number,
+): Promise<'proceed' | 'held' | 'superseded'> {
+  if (!codexModelMigrationCheckNeeded()) return 'proceed';
+  const expectedBackend = backend;
+  const expectedGeneration = cliSpawnGeneration;
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return 'superseded';
+  if (!codexModelMigrationBlocksInput(settled ? undefined : { state: 'unreadable' })) return 'proceed';
+  // Remember what was held so the release can re-drive it.
+  if (kind === 'write') codexModelMigrationHeldWrite = true;
+  if (kind === 'ready' && readyGeneration !== undefined) codexModelMigrationHeldReadyGeneration = readyGeneration;
+  return 'held';
+}
+
+/** Raw passthrough normally writes literally, even while busy. While the
+ *  picker guard is live (startup, or a hold in force) it is queued instead —
+ *  synchronously, in arrival order — so flushPending, the single admission
+ *  point serialized by isFlushing, delivers it after the gate and never
+ *  interleaved with a normal message's paste/Enter. The picker only precedes
+ *  a CLI process's first prompt, so afterwards raw keeps its legacy path. */
+function codexModelMigrationHoldsRawInput(): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  if (!awaitingFirstPrompt && !codexModelMigrationPending) return false;
+  codexModelMigrationHeldWrite = true;
+  return true;
+}
+
+/** Screen-idle gate: a picker that replaced Codex's composer is not a prompt,
+ *  even when the stream chunk that painted it was missed. */
+async function codexModelMigrationHoldsIdleInput(idleBackend: typeof backend): Promise<boolean> {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  // Evidence generation of THIS idle edge, before any await.
+  const readyGeneration = ptyOutputGeneration.snapshot();
+  const admission = await codexModelMigrationAdmit('ready', readyGeneration);
+  // Superseded generation: never mark ready from it.
+  if (admission === 'superseded' || backend !== idleBackend) return true;
+  if (admission === 'proceed') return false;
+  log('Codex model-migration picker owns the input surface; holding queued input');
   return true;
 }
 
@@ -9105,6 +12357,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // "Continue without trusting" through the Web Terminal when Codex presents
   // its Hooks review menu.
   if (lastInitConfig?.existingAppServerEndpoint) return false;
+
+  // Checked before the trust latch: the migration picker follows the trust
+  // dialog on a first launch. Observation only — the chunk is not consumed.
+  noticeCodexModelMigrationDialog(data);
 
   if (trustHandled) return false;
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -9139,7 +12395,7 @@ function handleVisibleStartupInteraction(data: string): boolean {
 // does not (PR #597): its signed Unix-socket channel is independent of the
 // terminal/backend rendering (including Herdr and Zellij), so it is no longer
 // in the terminal-OSC decode set.
-const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);
+const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
@@ -9200,7 +12456,7 @@ async function retireCodexAppDispatchForDurableReplay(
   turnId: string,
   dispatchAttempt: number,
 ): Promise<boolean> {
-  if (lastInitConfig?.cliId !== 'codex-app') {
+  if (!isCodexAppCliId(lastInitConfig?.cliId)) {
     for (let index = pendingMessages.length - 1; index >= 0; index--) {
       const item = pendingMessages[index];
       if (item.turnId === turnId && item.dispatchAttempt === dispatchAttempt) {
@@ -9251,8 +12507,39 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number },
 ): Promise<boolean> {
+  if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    if (typeof payload.requestId !== 'string'
+      || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
+      || (payload.reason !== undefined
+        && (payload.status !== 'future_only'
+          || !['step_model_switching_disabled', 'target_unavailable'].includes(String(payload.reason))))
+      || (payload.choices !== undefined && (!Array.isArray(payload.choices)
+        || !payload.choices.every(choice => typeof choice === 'string')))) return false;
+    send({
+      type: 'codex_app_effort_result', requestId: payload.requestId,
+      status: payload.status as import('./types.js').CodexAppEffortResult['status'],
+      ...(payload.choices ? { choices: payload.choices as string[] } : {}),
+      ...(payload.reason ? { reason: payload.reason as import('./types.js').CodexAppEffortResult['reason'] } : {}),
+    });
+    return true;
+  }
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
+    return true;
+  }
+
+  if (kind === 'thinking' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const marker = normalizeCodexAppCotMarker(payload);
+    if (!marker) {
+      rejectCodexAppControlMarker('invalid signed thinking marker');
+      return false;
+    }
+    const turn = codexAppTurnDispatchQueue.findByTurnId(marker.turnId);
+    if (!turn) {
+      log(`${cliName()} dropped thinking marker for unknown turn ${marker.turnId.substring(0, 12)}`);
+      return true;
+    }
+    observeCotEntries(marker.entries, turn);
     return true;
   }
 
@@ -9306,7 +12593,7 @@ async function handleTrustedCodexAppMarker(
     return true;
   }
 
-  if (kind === 'state' && lastInitConfig?.cliId === 'codex-app') {
+  if (kind === 'state' && isCodexAppCliId(lastInitConfig?.cliId)) {
     const readiness = codexAppSignedStateReadiness(payload);
     if (readiness === 'invalid') {
       rejectCodexAppControlMarker('signed state missing boolean acceptingInput');
@@ -9391,7 +12678,7 @@ async function handleTrustedCodexAppMarker(
     return true;
   }
 
-  if (kind === 'diagnostic' && lastInitConfig?.cliId === 'codex-app') {
+  if (kind === 'diagnostic' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (payload.code !== 'native_turn_identity_conflict'
         || typeof payload.message !== 'string') {
       rejectCodexAppControlMarker('invalid signed diagnostic');
@@ -9406,7 +12693,7 @@ async function handleTrustedCodexAppMarker(
     return true;
   }
 
-  if (kind === 'activity' && lastInitConfig?.cliId === 'codex-app') {
+  if (kind === 'activity' && isCodexAppCliId(lastInitConfig?.cliId)) {
     const activity = applyTrustedCodexAppActivityMarker(
       codexAppTurnLiveness,
       payload,
@@ -9448,7 +12735,7 @@ async function handleTrustedCodexAppMarker(
       return false;
     }
     if (isSuperseded
-        && (lastInitConfig?.cliId !== 'codex-app'
+        && (!isCodexAppCliId(lastInitConfig?.cliId)
           || finalContent !== ''
           || payload.usage !== undefined
           || !codexAppCompletionAwaitingFinal)) {
@@ -9474,7 +12761,7 @@ async function handleTrustedCodexAppMarker(
     let dispatchAttempt: number | undefined;
     let codexAppDispatchId: string | undefined;
     let codexAppDispatchHandle: number | undefined;
-    if (lastInitConfig?.cliId === 'codex-app') {
+    if (isCodexAppCliId(lastInitConfig?.cliId)) {
       // flushPending may finish writing N+1 before final N arrives.  Attribute
       // only from the immutable worker-owned FIFO head; currentBotmuxTurnId is
       // intentionally not consulted here.
@@ -9565,11 +12852,18 @@ async function handleTrustedCodexAppMarker(
       // be invisible and a longer-than-send narration would leak (same class as
       // the transcript-path bug this fixes).
       const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
+      notifyExplicitRepliesObserved(
+        turnId,
+        attributableExplicitReplyMarkersForTurnWindow(
+          turnId, gateInput, completedAtMs + 5_001, suppressMarkers, false,
+        ),
+      );
       suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
         gateInput,
         completedAtMs + 5_001,
         suppressMarkers,
         false,
+        replyDeliveryMode(),
       );
       if (suppressDelivery) {
         log(`${cliName()} final_output suppressed (model already called botmux send)`);
@@ -9580,16 +12874,16 @@ async function handleTrustedCodexAppMarker(
         // suppressDelivery:true, which the daemon short-circuits WITHOUT calling
         // deliverFinalOutput — the only site that otherwise marks run-preview
         // replied — so without this the preview shows "running" forever (F3).
-        notifyExplicitReplyObserved(
-          turnId,
-          explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, suppressMarkers, false),
-        );
       }
     }
 
     if (codexAppDispatchId) {
       if (!control || codexAppDispatchHandle === undefined) return false;
       const requestId = randomBytes(16).toString('hex');
+      // Read (do NOT consume) this turn's execution window: the daemon persists a
+      // synthesized terminal from this settlement before our own emitTurnTerminal
+      // below runs, so both must report the same numbers.
+      const settlementTiming = turnExecutionClock.peek(turnId, dispatchAttempt, completedAtMs);
       // A superseded member is durably settled but NEVER delivered: force empty
       // content + suppressDelivery so the daemon persists the FIFO advance without
       // deliverFinalOutput, and tag the disposition so the sink is explicit.
@@ -9608,6 +12902,8 @@ async function handleTrustedCodexAppMarker(
           generation: control.generation,
           seq: control.seq,
           dispatchId: codexAppDispatchId!,
+          ...(settlementTiming ? { completedAtMs: settlementTiming.completedAtMs } : {}),
+          ...(settlementTiming?.durationMs !== undefined ? { durationMs: settlementTiming.durationMs } : {}),
         },
       }));
       if (!persisted || !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
@@ -9631,7 +12927,7 @@ async function handleTrustedCodexAppMarker(
         entry => entry.dispatchId !== codexAppDispatchId,
       );
     } else {
-      if (lastInitConfig?.cliId === 'codex-app'
+      if (isCodexAppCliId(lastInitConfig?.cliId)
           && codexAppDispatchHandle !== undefined
           && !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
         return false;
@@ -9665,7 +12961,7 @@ async function handleTrustedCodexAppMarker(
     }
     // Post-commit liveness (codex-app only; runs only after a successful durable
     // or fallback commit — a failed commit returned above without touching state):
-    if (lastInitConfig?.cliId === 'codex-app') {
+    if (isCodexAppCliId(lastInitConfig?.cliId)) {
       if (isSuperseded) {
         // A superseded member retires exactly ONE extra logical liveness slot
         // (worker flush created N slots for the group; the single native
@@ -9686,7 +12982,10 @@ async function handleTrustedCodexAppMarker(
         codexAppCompletionAwaitingFinal = false;
       }
     }
-    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt);
+    // The app-server runner timestamps its own completion; prefer that instant
+    // over "whenever this worker got around to handling the marker". The clock
+    // clamps it to now, so a skewed runner cannot mint a future completion.
+    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt, undefined, undefined, completedAtMs);
     return true;
   }
   rejectCodexAppControlMarker(`unsupported signed ${kind}`);
@@ -9831,6 +13130,177 @@ let ambiguousSubmissionRecoveryHold: {
   item: PendingCliInput;
 } | null = null;
 
+/** A submit whose adapter receipt stayed unknown may already be parked inside
+ * the TUI. Keep later inputs in BotMux until exact evidence confirms that turn
+ * or a restart replaces this backend generation. Unlike the ZMX recovery hold
+ * above, the ambiguous item itself is retired and is never replayed. */
+interface InputDeliveryQuarantine {
+  backend: SessionBackend;
+  generation: number;
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
+
+/** A terminal is a logical completion, not a PTY write receipt. Install this
+ * synchronously before async screen settlement so type-ahead cannot race the
+ * idle callback. A real composer or a started native successor clears it. */
+let postTerminalInputFence: {
+  backend: SessionBackend;
+  generation: number;
+} | null = null;
+
+function currentPostTerminalInputFence(): typeof postTerminalInputFence {
+  if (postTerminalInputFence
+    && (postTerminalInputFence.backend !== backend
+      || postTerminalInputFence.generation !== cliSpawnGeneration)) {
+    postTerminalInputFence = null;
+  }
+  return postTerminalInputFence;
+}
+
+function armPostTerminalInputFence(): void {
+  if (cliAdapter?.postTerminalPromptFence !== true || !backend
+    || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || currentPostTerminalInputFence()) return;
+  postTerminalInputFence = { backend, generation: cliSpawnGeneration };
+  const revokedPublishedReady = isPromptReady;
+  isPromptReady = false;
+  // The composer can redraw and go quiet BEFORE the terminal reaches the
+  // rollout: screen-idle already published readiness, so the detector is idle
+  // and the transcript's fireIdle() is a no-op, while the bridge poller only
+  // emits while ready. With a static screen nothing would ever re-check the
+  // fence — no terminal, no prompt-ready, every later message stranded.
+  if (revokedPublishedReady) schedulePostTerminalFenceRecheck('terminal after published prompt-ready');
+}
+
+let postTerminalFenceRecheckPending = false;
+
+/** Re-evaluate the post-terminal fence against the current viewport without
+ * waiting for new PTY output. Publishes the structured terminal first (same
+ * order as the external-idle path), then releases prompt-ready only when the
+ * settled screen shows a composer newer than any busy marker. A held fence
+ * keeps the pre-existing contract: the next PTY redraw re-runs idle. */
+function schedulePostTerminalFenceRecheck(reason: string): void {
+  if (postTerminalFenceRecheckPending) return;
+  postTerminalFenceRecheckPending = true;
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  void (async () => {
+    try {
+      try {
+        await renderer?.writeAndFlush('');
+      } catch (err: any) {
+        log(`${cliName()} post-terminal fence recheck renderer settle failed: ${err.message}`);
+        return;
+      }
+      if (!target || backend !== target || generation !== cliSpawnGeneration
+        || cliRestartInProgress || !currentPostTerminalInputFence()) return;
+      if (bridgeJsonlPath) {
+        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      }
+      if (codexBridgeFallbackActive()) {
+        try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+      }
+      if (backend !== target || generation !== cliSpawnGeneration) return;
+      if (postTerminalPromptFenceHolds('external', target)) return;
+      log(`${cliName()} post-terminal composer verified on static screen (${reason})`);
+      // Publish through the detector's idle edge when the fence rejection
+      // reset() it: markIdle re-arms busyTransitionArmed, so a later local
+      // (web-terminal) turn can still flip readiness back to busy. The onIdle
+      // handler re-verifies the composer before marking ready.
+      if (idleDetector && !idleDetector.isIdleNow()) {
+        idleDetector.fireIdle();
+        if (idleDetector.isIdleNow()) return;
+      }
+      markPromptReady();
+    } finally {
+      postTerminalFenceRecheckPending = false;
+    }
+  })();
+}
+
+async function postTerminalInputIsBlocked(target: SessionBackend): Promise<boolean> {
+  if (cliAdapter?.postTerminalPromptFence === true) {
+    // Do not depend on fs.watch ordering: a terminal can already be on disk
+    // when the next message arrives, before the bridge timer has noticed it.
+    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+  }
+  const fence = currentPostTerminalInputFence();
+  if (!fence) return false;
+  try {
+    await renderer?.writeAndFlush('');
+  } catch (err: any) {
+    log(`${cliName()} post-terminal input renderer settle failed: ${err.message}`);
+    return true;
+  }
+  if (backend !== target || fence.generation !== cliSpawnGeneration
+    || cliRestartInProgress) return true;
+  if (!currentPostTerminalInputFence()) return false;
+  return postTerminalPromptFenceHolds('external', target);
+}
+
+function currentInputDeliveryQuarantine(): InputDeliveryQuarantine | null {
+  const quarantine = inputDeliveryQuarantine;
+  if (!quarantine) return null;
+  if (quarantine.backend === backend && quarantine.generation === cliSpawnGeneration) {
+    return quarantine;
+  }
+  inputDeliveryQuarantine = null;
+  log('Cleared stale input-delivery quarantine after backend generation change');
+  return null;
+}
+
+function armInputDeliveryQuarantine(
+  target: SessionBackend,
+  item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+): InputDeliveryQuarantine | null {
+  if (cliAdapter?.quarantineUnconfirmedSubmits !== true || backend !== target) return null;
+  const quarantine: InputDeliveryQuarantine = {
+    backend: target,
+    generation: cliSpawnGeneration,
+    ...(item.turnId ? { turnId: item.turnId } : {}),
+    ...(item.dispatchAttempt !== undefined
+      ? { dispatchAttempt: item.dispatchAttempt }
+      : {}),
+  };
+  inputDeliveryQuarantine = quarantine;
+  log(
+    `Quarantined input delivery for backend generation ${quarantine.generation} `
+    + `after unconfirmed submit turn=${quarantine.turnId ?? '-'} `
+    + `attempt=${quarantine.dispatchAttempt ?? '-'}`,
+  );
+  return quarantine;
+}
+
+function releaseInputDeliveryQuarantine(
+  quarantine: InputDeliveryQuarantine | null | undefined,
+  reason: string,
+  opts: { redriveTerminal?: boolean } = {},
+): boolean {
+  if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
+  inputDeliveryQuarantine = null;
+  log(`Released input-delivery quarantine (${reason})`);
+  if (opts.redriveTerminal) {
+    queueMicrotask(() => idleDetector?.fireIdle());
+  }
+  return true;
+}
+
+function releaseInputDeliveryQuarantineForStructuredTerminal(
+  turnId: string,
+  dispatchAttempt?: number,
+): void {
+  const quarantine = currentInputDeliveryQuarantine();
+  if (!quarantine || quarantine.turnId !== turnId
+    || quarantine.dispatchAttempt !== dispatchAttempt) return;
+  releaseInputDeliveryQuarantine(
+    quarantine,
+    'exact structured terminal',
+    { redriveTerminal: true },
+  );
+}
+
 /** Queue an external control action behind any in-flight ZMX text transaction
  * without opening a new composer journal. This keeps card quick-actions from
  * landing between adapter text chunks and their submit key. */
@@ -9909,6 +13379,7 @@ async function runAmbiguousSubmissionTransaction<T>(
 type VerifiableSubmissionResult = void | {
   submitted: boolean;
   cliSessionId?: string;
+  ownershipProven?: boolean;
   failureReason?: string;
   recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
 };
@@ -9941,6 +13412,11 @@ async function settleVerifiableSubmissionForJournal(
       && typeof recheck.cliSessionId === 'string'
     ) {
       result.cliSessionId = recheck.cliSessionId;
+    }
+    // The positive ownership proof decides whether the later history match may
+    // become a native input consumption receipt; a settled result must keep it.
+    if (typeof recheck === 'object' && recheck && recheck.ownershipProven === true) {
+      result.ownershipProven = true;
     }
     return true;
   } catch (err) {
@@ -10007,7 +13483,44 @@ function cancelAmbiguousSubmissionAfterFailure(
   }
 }
 
-function onPtyData(data: string): void {
+function onPtyData(data: string, isLiveStream = true): void {
+  if (!programStatusStream) {
+    handlePtyDataChunk(data);
+    return;
+  }
+
+  const parts = programStatusStream.feed(data);
+  for (const part of parts) {
+    if (part.type === 'probe') {
+      lastPtyActivityAtMs = Date.now();
+      if (isLiveStream) {
+        log('[program-status] probe received; replying with OSC 7501 handshake');
+        try {
+          backend?.write('\x1b]7501;?\x1b\\');
+        } catch (err: any) {
+          log(`[program-status] probe reply failed: ${err.message}`);
+        }
+      }
+    } else if (part.type === 'status') {
+      lastPtyActivityAtMs = Date.now();
+      if (spawnArgvNeedsWorkingSeed && !spawnArgvTurnStartEvidenceSeen && part.event.state === 'working') {
+        spawnArgvTurnStartEvidenceSeen = true;
+        spawnArgvTurnStartBusyScanTail = '';
+      }
+      const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
+      idleDetector?.observeProgramStatus(part.event);
+      if (!wasAuthoritative && idleDetector?.programStatusActive()) {
+        // The probe log above only proves a probe was seen and answered; an
+        // accepted status report is the evidence the CLI took the handshake.
+        log(`[program-status] status received (state=${part.event.state}); authority engaged`);
+      }
+    } else if (part.type === 'data') {
+      handlePtyDataChunk(part.text);
+    }
+  }
+}
+
+function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   backendScreenRevision += 1;
@@ -10022,7 +13535,7 @@ function onPtyData(data: string): void {
   if (
     spawnArgvNeedsWorkingSeed
     && !spawnArgvTurnStartEvidenceSeen
-    && structuredBridgeIsPi()
+    && structuredBridgeIs('pi')
     && cliAdapter?.busyPattern
   ) {
     spawnArgvTurnStartBusyScanTail = tailChars(
@@ -10088,6 +13601,17 @@ function onPtyData(data: string): void {
     return;
   }
 
+  // `/btw` side answer relay. Armed only by our own `/btw <question>`
+  // passthrough. The keypresses here target the overlay, not the composer.
+  if (btwCaptureGuard.isArmed()) {
+    const action = btwCaptureGuard.inspectData(data);
+    if (action.kind === 'answer') {
+      deliverBtwAnswer(action.question, action.text, 'clipboard');
+    } else if (!btwCaptureGuard.isCopying()) {
+      scheduleBtwScreenCheck();
+    }
+  }
+
   // Track last PTY output time for the ready-gate quiescence settle (see
   // settleThenFlush) and a monotonic generation for rejected-ready evidence.
   // Generation (not timestamp equality) distinguishes two redraw chunks that
@@ -10095,6 +13619,7 @@ function onPtyData(data: string): void {
   lastPtyOutputAtMs = Date.now();
   ptyOutputGeneration.observe();
   idleDetector?.feed(data);
+  observeRestoredStartupHistory();
 }
 
 /**
@@ -10147,12 +13672,19 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
   refreshHookReviewInputHold(visibleSnapshot);
+  if (awaitingFirstPrompt && !idleDetector?.isStartupComplete()) {
+    observeStartupBannerOnScreen();
+    // The async-write/generation fence also protects history startup evidence.
+    observeRestoredStartupHistory();
+  }
 
   // ZMX history does not carry the authoritative current PTY dimensions. A
   // local `zmx attach` can resize the session below our default 120x24 and that
   // size persists after detach, so even the rendered tail may include rows just
-  // above the real viewport. Never synthesize Enter/Down from a full-history
-  // resync. For the same reason, do not feed history into IdleDetector: an old
+  // above the real viewport. Never synthesize dialog-acceptance Enter/Down from
+  // a full-history resync. The startup observation above only releases the
+  // monotonic loading veto for already-permitted type-ahead input, not idle.
+  // Do not feed history into IdleDetector: an old
   // ready/completion marker just above the real viewport could otherwise flush
   // queued input into a CLI that is still busy. Later append-only history deltas
   // still flow through onPtyData; structured transcript completion remains
@@ -10177,8 +13709,27 @@ function releaseRawInputRestartGate(): void {
 }
 
 function readPaneLeafComm(observedBackend: SessionBackend | null = backend): string | undefined {
-  const pid = observedBackend?.getChildPid?.();
-  return pid ? readComm(pid) : undefined;
+  const panePid = observedBackend?.getChildPid?.();
+  if (!panePid) return undefined;
+  let pid = panePid;
+  let comm = readComm(pid);
+  if (isBareShellComm(comm)) {
+    // The owned scope supervisor deliberately remains a shell so tmux cannot
+    // move the payload out of its cgroup. Inspect its actual child; a payload
+    // stuck in an rcfile shell must still trigger the normal input hold.
+    const payloadPid = sessionScopePayloadPid(pid);
+    if (payloadPid !== pid) {
+      pid = payloadPid;
+      comm = readComm(pid) ?? comm;
+    }
+  }
+  if (lastSpawnOuterBwrapActive && process.platform === 'linux' && isBareShellComm(comm)) {
+    try {
+      const commandLine = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+      if (isLinuxIsolationLauncher(commandLine)) return 'bwrap';
+    } catch { /* Unverified shells retain the normal input hold. */ }
+  }
+  return comm;
 }
 
 /** A slow rcfile can outlive the launch detector's settle window, then finish
@@ -10212,7 +13763,7 @@ function markPromptReadyFromPty(observedBackend: SessionBackend): void {
 }
 
 /** Push a coarse screen status without waiting for the periodic sampler. */
-function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean }): void {
+function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean; clearTurnId?: boolean }): void {
   if (!renderer) return;
   const { content } = renderer.snapshot();
   const statusPayload = opts?.force ? { status } : classifyScreenUsageLimit(content, status);
@@ -10220,8 +13771,8 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     type: 'screen_update',
     content,
     ...statusPayload,
-    turnId: currentBotmuxTurnId,
-    dispatchAttempt: currentBotmuxDispatchAttempt,
+    turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
+    dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
   });
 }
 
@@ -10299,7 +13850,7 @@ const SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS = 90_000;
  *  arm, whose first ready is handled by spawnArgvInitialPromptBusy. */
 function spawnArgvTurnStartGateHolds(): boolean {
   if (!spawnArgvNeedsWorkingSeed || spawnArgvInitialPromptBusy) return false;
-  if (!structuredBridgeIsPi()) return false;
+  if (!structuredBridgeIs('pi')) return false;
   if (spawnArgvTurnStartEvidenceSeen) return false;
   return Date.now() < spawnArgvTurnStartEvidenceDeadlineMs;
 }
@@ -10325,8 +13876,8 @@ function noteSpawnArgvTurnStartTranscriptEvidence(events: readonly { kind: strin
   // serves Grok — another argv-baked + structured-bridge + type-ahead CLI —
   // so without this guard the flush side effect below would add a new
   // startup-window write for Grok (whose first ready is owned by the
-  // SessionStart busy arm, not by this gate).
-  if (!structuredBridgeIsPi()) return;
+  // reliable-terminal busy arm, not by this gate).
+  if (!structuredBridgeIs('pi')) return;
   if (spawnArgvTurnStartEvidenceSeen || !spawnArgvNeedsWorkingSeed) return;
   if (!events.some(ev => ev.kind === 'user' || ev.kind === 'assistant_final')) return;
   spawnArgvTurnStartEvidenceSeen = true;
@@ -10398,9 +13949,141 @@ function scheduleSpawnArgvTurnStartFailOpen(): void {
   spawnArgvTurnStartFailOpenTimer.unref?.();
 }
 
+let preserveActiveTurnAuthorityForReady = false;
+
+function markRemoteRunnerStartupReady(): void {
+  preserveActiveTurnAuthorityForReady = true;
+  try {
+    markPromptReady();
+  } finally {
+    preserveActiveTurnAuthorityForReady = false;
+  }
+}
+
+/**
+ * A `restart` landed while a restart window is in flight (owned restart, its
+ * continuation, or a Codex auto-upgrade) and is folded into it — the merge
+ * guard never stacks a second respawn. Its launch settings were already
+ * applied to lastInitConfig. Decide by value who may settle its attempt:
+ *  - the window's replacement, if it runs (or, before the snapshot, will run)
+ *    exactly these settings: adopt the receipt, unless an attempt already
+ *    owns it (never displaced);
+ *  - otherwise only the convergence replacement the window chains afterwards:
+ *    record it as pending (newest id and settings win), so neither the stale
+ *    replacement's ready edge nor the continuation end can settle it.
+ */
+function foldRestartIntoWindow(attemptId: string | undefined): void {
+  const requested = restartLaunchSettings(lastInitConfig);
+  const disposition = classifyMergedRestart({
+    windowLaunch: restartWindowLaunch,
+    requested,
+    convergencePending: !!pendingLaunchConvergence,
+  });
+  if (disposition === 'converge') {
+    pendingLaunchConvergence = { attemptId: attemptId ?? pendingLaunchConvergence?.attemptId, requested };
+    log('Restart folded into in-flight window asks for different launch settings — converging with one more respawn before settling it');
+    return;
+  }
+  activeRestartAttemptId ??= attemptId;
+}
+
+/** The replacement about to be (or just) built satisfies the pending folded
+ *  request: hand its attempt the receipt of this window. */
+function adoptPendingLaunchConvergence(): void {
+  if (!pendingLaunchConvergence) return;
+  if (pendingLaunchConvergence.attemptId) activeRestartAttemptId = pendingLaunchConvergence.attemptId;
+  pendingLaunchConvergence = undefined;
+}
+
+/** Fail a pending folded attempt whose convergence can no longer happen. */
+function failPendingLaunchConvergence(): void {
+  const attemptId = pendingLaunchConvergence?.attemptId;
+  pendingLaunchConvergence = undefined;
+  if (attemptId && attemptId !== activeRestartAttemptId) {
+    send({ type: 'restart_result', attemptId, status: 'failed', category: 'spawn_failed' });
+  }
+}
+
+/**
+ * Settle the correlated restart attempt with success, if the CURRENT replacement
+ * may vouch for it. Called on every prompt-ready edge, and again wherever an
+ * owned replacement finishes with its CLI already at the prompt (restart
+ * continuation end, verified Codex auto-upgrade): the merge guard can adopt an
+ * attempt id AFTER the replacement's ready edge already fired — e.g. a /restart
+ * minted once the previous attempt settled, landing while the continuation
+ * still awaits prepareCodexNativeTitleGeneration(), or a crash auto-restart
+ * folded into a worker-internal respawn. markPromptReady() dedupes repeated
+ * ready, so without these settle points that attempt would wait for an edge
+ * that never comes and time out a healthy session.
+ *
+ * Off the ready edge (`republishPromptReady`), the settle re-sends `prompt_ready`
+ * first: the daemon cleared `ds.cliReady` when it requested the adopted attempt,
+ * and `prompt_ready` is the only edge that sets it again — a receipt alone would
+ * restore `workerReady` but leave the idle CLI looking like it is still spawning
+ * (waitForCliIdle cascades would wait out their timeout). The CLI is genuinely at
+ * its prompt here (isPromptReady, input still fenced by the restart gate), so a
+ * duplicate for an attempt adopted BEFORE the edge is harmless.
+ *
+ * Withheld (attempt kept) when:
+ *  - no replacement backend is installed (a stray late callback must not claim
+ *    success — leave it for the real replacement or the coordinator timeout);
+ *  - a Codex auto-upgrade owns the restart window: it verifies runtime, thread
+ *    and launch settings only after ready, and settles (or fails) the adopted
+ *    attempt itself.
+ */
+function settleRestartAttemptOnReady(
+  trigger: string,
+  opts: { republishPromptReady?: boolean } = {},
+): void {
+  if (!activeRestartAttemptId) return;
+  const receipt = decideRestartReceipt({
+    backendInstalled: !!backend,
+    upgradeInFlight: !!codexAutoUpgrade,
+  });
+  if (receipt === 'emit') {
+    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'succeeded',
+      category: 'prompt_ready',
+    });
+    activeRestartAttemptId = undefined;
+    return;
+  }
+  if (receipt === 'defer_upgrade') {
+    log(`${trigger}: Codex auto-upgrade owns this restart window — deferring restart success receipt until the upgrade is verified`);
+  } else {
+    log(`${trigger} with no backend installed — deferring restart success receipt`);
+  }
+}
+
 function markPromptReady(): void {
+  // Screen probes and timeout fallbacks must honor the same startup evidence
+  // as quiescence; a skeleton composer is not a ready CLI.
+  if (idleDetector?.isStartupPending()) return;
+  if (remoteRunnerRecoveredTurnInFlight) {
+    // A provider `ready`/startup timeout describes transport readiness, not an
+    // idle turn boundary, while an adopted remote turn is still executing.
+    // Preserve its caller authority and withhold prompt_ready until its exact
+    // final/failure releases the recovered-turn fence.
+    log('Ignoring prompt-ready while a recovered remote turn is still active');
+    return;
+  }
   if (bareShellLaunchBlocked) {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
+    return;
+  }
+  if (currentInputDeliveryQuarantine()) {
+    log('Ignoring prompt-ready while input delivery is quarantined');
+    idleDetector?.reset();
+    return;
+  }
+  if (currentPostTerminalInputFence()) {
+    log('Ignoring prompt-ready until the post-terminal PTY composer is verified');
+    idleDetector?.reset();
+    // May be the last PTY edge; a quiet TUI never redraws to re-run idle.
+    schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
   if (isPromptReady) {
@@ -10408,7 +14091,7 @@ function markPromptReady(): void {
     return;  // guard against duplicate calls
   }
   stopStructuredStartGraceRecheck();
-  if (lastInitConfig?.cliId === 'codex-app' && !codexAppControlProven) {
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppControlProven) {
     if (!codexAppUnprovenPromptDeferred) {
       log('Ignoring Codex App prompt until this worker verifies a fresh Ed25519 challenge response');
     }
@@ -10454,11 +14137,11 @@ function markPromptReady(): void {
   // A prompt is authoritative only for the synthetic observation installed
   // after a verified warm reattach; clearing normal queued turns here could
   // lose follow-up inputs written by one flushPending() call.
-  if (lastInitConfig?.cliId === 'codex-app' && !codexAppTurnLiveness.notePrompt()) {
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppTurnLiveness.notePrompt()) {
     log('Ignoring transient Codex App prompt while an explicit runner turn remains queued');
     return;
   }
-  if (lastInitConfig?.cliId === 'codex-app' && !codexAppReadyAuthority.canPublishPromptReady()) {
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppReadyAuthority.canPublishPromptReady()) {
     if (!codexAppReadyAuthority.consumeLatePromptRecovery(!codexAppTurnLiveness.hasActiveTurn())) {
       log('Deferring Codex App terminal prompt until signed runner state confirms busy=false');
       return;
@@ -10506,7 +14189,7 @@ function markPromptReady(): void {
   // fireIdle() can drive the real ready edge.
   if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {
     // Grok is lifecycle-blocking, but its FIRST ready is still a pre-execution
-    // SessionStart / idle-detector edge while the argv-baked prompt is running.
+    // composer / idle-detector edge while the argv-baked prompt is running.
     // The spawnArgvInitialPromptBusy arm below must publish working and consume
     // itself on that first edge. After the arm is gone, later TUI redraws stay
     // blocked until turn_completed so they cannot publish idle mid-turn.
@@ -10519,8 +14202,24 @@ function markPromptReady(): void {
     return;
   }
   structuredRejectedReadyEvidenceGeneration = undefined;
+  // Quiescence is the terminal boundary for PTY adapters that do not emit an
+  // explicit turn_terminal. Durable receivers keep authority until their exact
+  // terminal receipt so an early screen-idle heuristic cannot release it.
+  // A structured remote provider's startup `ready` proves only that its
+  // control channel can accept the opening turn.  It is not an execution
+  // terminal for that already-admitted Lark turn, so keep the exact caller
+  // authority until the provider later emits final/failure.
+  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady) {
+    releaseActiveTurnAuthority('prompt_ready');
+  }
   isPromptReady = true;
+  promptReadyEdges++;
   settleSessionRenameOnPrompt();
+  const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  if (!syncedFromDisk && !queuedTurnAdvanceConsumedForPrompt && queuedTypeAheadTurns.length > 0) {
+    advanceQueuedTypeAheadTurn('prompt_ready');
+  }
+  queuedTurnAdvanceConsumedForPrompt = false;
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
   // slash commands to the replacement generation.
@@ -10549,9 +14248,16 @@ function markPromptReady(): void {
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
+  if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
+  if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
+    // Record the actual running version while its executable is still present.
+    // macOS cannot recover an unlinked old binary after an installer replaces it.
+    codexRuntimeObservedGeneration = cliSpawnGeneration;
+    void observeCodexRuntimeVersionOnReady().catch(error => log(`Codex runtime observation unavailable: ${error.message}`));
+  }
   if (
     persistCodexRunnerBuildOnReady
-    && lastInitConfig?.cliId === 'codex-app'
+    && isCodexAppCliId(lastInitConfig?.cliId)
     && lastInitConfig.runnerBuildId
   ) {
     send({ type: 'runner_build_ready', runnerBuildId: lastInitConfig.runnerBuildId });
@@ -10563,16 +14269,18 @@ function markPromptReady(): void {
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
   //
-  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy):
-  // for these adapters the FIRST ready is a pre-execution SessionStart edge, not a
-  // turn boundary — the argv-baked first prompt is still running. isPromptReady was
-  // just set true above, so this generic snapshot would project 'idle' and reach the
-  // daemon BEFORE the busy arm below re-publishes 'working'. Combined with the
-  // first-turn working already sent by startScreenUpdates, the daemon would then see
-  // working→idle and fire finishTurnReactions() — a premature ✅ DONE mid-turn (and a
+  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy)
+  // or a background sub-agent is still in flight (backgroundTaskTracker.pending()):
+  // for these the FIRST/this ready is not a turn boundary — the argv-baked first
+  // prompt is still running, or the turn is only quiet awaiting a background
+  // <task-notification>. isPromptReady was just set true above, so this generic
+  // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
+  // re-publishes 'working'. Combined with the first-turn working already sent by
+  // startScreenUpdates, the daemon would then see working→idle and fire
+  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
-  // correct 'working' publish for this path, so this idle must not escape first.
-  if (renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  // correct 'working' publish for these paths, so this idle must not escape first.
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -10582,32 +14290,13 @@ function markPromptReady(): void {
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
   }
-  if (activeRestartAttemptId) {
-    // Defense in depth: only report a successful restart when a replacement
-    // backend is actually installed. Every legitimate ready path assigns
-    // `backend` before firing (spawnCli sets it, then idle/PTY callbacks run);
-    // a stray callback that reached here with no backend (e.g. a late stale
-    // generation slipping through a future gate change) must NOT claim success
-    // and consume the attempt id — leave it for the real replacement or the
-    // coordinator timeout.
-    if (backend) {
-      send({
-        type: 'restart_result',
-        attemptId: activeRestartAttemptId,
-        status: 'succeeded',
-        category: 'prompt_ready',
-      });
-      activeRestartAttemptId = undefined;
-    } else {
-      log('prompt-ready with no backend installed — deferring restart success receipt');
-    }
-  }
+  settleRestartAttemptOnReady('prompt-ready');
   // Send an immediate status snapshot so Lark card / card-off reactions track
   // real work. Skip pure idle when:
   //  - messages are pending — flushPending() will immediately make the CLI
   //    busy (avoids a false "就绪" flash on daemon restart);
-  //  - Grok-class argv+SessionStart arming: first ready is pre-execution, so
-  //    park as working until assistant_final/fireIdle;
+  //  - Grok-class argv-baked prompt + reliable turn terminal: first ready is
+  //    pre-execution, so park as working until assistant_final/fireIdle;
   //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
   //    — seed working then idle so card-off gets working→idle (review P2).
   const hasPendingWork =
@@ -10637,6 +14326,18 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
+    } else if (backgroundTaskTracker.pending() > 0) {
+      // The main turn is only quiet because it dispatched background
+      // sub-agents and is awaiting their `<task-notification>`. Report
+      // working (not idle) so the session card is not frozen to 「已完成」
+      // mid-flight and then re-posted as 「进行中」when the notification
+      // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
+      // spawn-argv branch above) so the genuine end-of-turn idle after the
+      // background work settles is still a real, re-fireable edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      publishScreenStatus('working');
+      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }
@@ -10661,6 +14362,16 @@ function markPromptReady(): void {
 function persistCliSessionId(cliSessionId: string): void {
   const published = publishCliSessionIdToDaemon({
     cliSessionId,
+    // Snapshot only worker-owned, durable local Codex roots. Never infer an
+    // archive target from an adopted, remote, wrapper or scratch conversation.
+    ...(lastInitConfig && ['codex', 'codex-app'].includes(lastInitConfig.cliId) && codexCleanupLaunchTarget
+      && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
+      && !lastInitConfig.wrapperCli && lastInitConfig.sandbox !== 'scratch'
+      && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+      ? { codexCleanupTarget: {
+        threadId: cliSessionId,
+        ...codexCleanupLaunchTarget,
+      } } : {}),
     sessionId,
     initConfig: lastInitConfig,
     turnId: currentBotmuxTurnId,
@@ -10668,6 +14379,9 @@ function persistCliSessionId(cliSessionId: string): void {
     send,
   });
   if (published) log(`Published CLI session id for daemon persistence: ${cliSessionId}`);
+  if (lastInitConfig?.cliId === 'antigravity') {
+    ensureAntigravityCotReader(cliSessionId);
+  }
 }
 
 function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
@@ -10704,6 +14418,47 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       }
       persistCliSessionId(chatId);
       log(`Observed Cursor chatId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${chatId}`);
+      // The chat's store exists now: start the session-long thinking reader,
+      // covering the argv-baked first turn (which never enters flushPending).
+      ensureCursorCotReader(chatId);
+      // Bind the zero-prompt transcript bridge the moment the chat is known.
+      // No-op in default mode (bridge inactive for spawned cursor).
+      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(chatId);
+      return;
+    }
+    attempts++;
+    if (attempts < maxAttempts) setTimeout(tick, 500);
+  };
+  setTimeout(tick, 250);
+}
+
+function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+
+  const backendAtSpawn = backend;
+  let attempts = 0;
+  const maxAttempts = 60;
+  const tick = () => {
+    if (!backend || lastInitConfig?.cliId !== 'antigravity') return;
+    if (backend !== backendAtSpawn) return;
+    const currentPid = backend.getChildPid?.();
+    if (currentPid && currentPid !== pid) return;
+
+    const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
+    const cid = findAntigravityConversationIdByPid(realPid);
+    if (cid) {
+      if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
+        log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
+        return;
+      }
+      persistCliSessionId(cid);
+      log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${cid}`);
+      ensureAntigravityCotReader(cid);
+      // Bind the zero-prompt transcript bridge as soon as the conversation is
+      // known (its brain file may not exist yet — notify then leaves the id
+      // pending for the 1s ticker). No-op in default mode (bridge inactive).
+      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid);
       return;
     }
     attempts++;
@@ -10719,6 +14474,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
+/** still_active 只是弱证据（屏幕没有门、但 PTY 刚有活动）：在 20s 弱证据
+ *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
+ *  机制自然终止链，这是保险上限。 */
+const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -10726,6 +14485,9 @@ let unscopedSubmitFailureChainSequence = 0;
  *  instead of stacking a second one, so a logical submission/attempt can never
  *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
 const submitFailureChains = createSubmitFailureChainController();
+// A warning settles its bounded notification chain, but cannot abandon the
+// daemon's durable activation journal. Keep observing only the original receipt.
+const queuedActivationReceipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
 
 /**
  * A recovery fence failure means the prompt may already be running. Keep its
@@ -10788,9 +14550,10 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
-  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle'>,
+  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle' | 'queuedActivationToken'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
+  onConfirmed?: (cliSessionId?: string) => void,
 ): void {
   const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
@@ -10840,6 +14603,7 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   };
   let deferredRecheckAttempts = 0;
+  let activeSilenceExtra = 0;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
@@ -10870,12 +14634,22 @@ function scheduleSubmitFailureNotify(
 
     switch (action.kind) {
       case 'suppress-confirmed':
+        if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
+          acknowledgeTurnInputCommitted(turnIdentity?.turnId);
+        }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         }
+        // A late exact history match is the same owned-log evidence as an
+        // immediate one; other CLIs' rechecks stay on the terminal fallback.
+        if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
+          acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
+            cliSessionId ?? lastInitConfig?.cliSessionId);
+        }
+        onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         redriveRejectedStructuredReady();
         return;
@@ -10891,6 +14665,7 @@ function scheduleSubmitFailureNotify(
         // send marker — proves the turn actually progressed, so the chain is
         // cancelled here and now: no more timers, no unconfirmed warning.
         if (action.evidence === 'structured-transcript' || action.evidence === 'botmux-send') {
+          onConfirmed?.();
           log(`Deferred recheck saw ${action.evidence} success evidence — cancelling chain, no warning. preview="${preview}"`);
           return;
         }
@@ -10909,6 +14684,32 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
+    // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
+    // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
+    let submitDiagnosisScreen = '';
+    if (effectiveBackendType !== 'zmx') {
+      try {
+        submitDiagnosisScreen = backend
+          ? captureBackendScreen(backend)
+          : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+      } catch { submitDiagnosisScreen = ''; }
+    }
+    const submitDiagnosis = diagnoseSubmitFailure({
+      screenText: submitDiagnosisScreen,
+      lastActivityAtMs: lastPtyActivityAtMs,
+    });
+    if (
+      submitDiagnosis.reason === 'still_active'
+      && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
+      && chainIsCurrent()
+    ) {
+      activeSilenceExtra += 1;
+      log(`Deferred recheck still sees fresh CLI activity (${submitDiagnosis.evidence}) — silencing submit card once more. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+    log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
+
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -10920,7 +14721,15 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : 'worker.submit_unconfirmed',
+            : turnIdentity?.queuedActivationToken && recheck
+              ? 'worker.activation_submit_unconfirmed'
+              : submitDiagnosis.reason === 'logged_out'
+                ? 'submitDiag.logged_out'
+                : submitDiagnosis.reason === 'interactive_menu'
+                  ? 'submitDiag.interactive_menu'
+                  : submitDiagnosis.reason === 'draft_parked'
+                    ? 'submitDiag.draft_parked'
+                    : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -11058,14 +14867,75 @@ function requeueUnsubmittedQueuedActivation(item: PendingCliInput): void {
   log(`Retained queued activation ${item.queuedActivationToken.substring(0, 8)} for retry`);
 }
 
+function acknowledgeQueuedActivation(item: PendingCliInput): void {
+  if (!item.queuedActivationToken) return;
+  queuedActivationReceipts.cancel(item.queuedActivationToken);
+  send({
+    type: 'queued_activation_submitted',
+    sessionId,
+    activationToken: item.queuedActivationToken,
+  });
+}
+
+function observeQueuedActivationReceipt(
+  item: PendingCliInput,
+  recheck: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
+): void {
+  if (!item.queuedActivationToken || !backend) return;
+  const generation = cliSpawnGeneration;
+  const receiptBackend = backend;
+  queuedActivationReceipts.watch(item.queuedActivationToken, {
+    recheck,
+    isCurrent: () => cliSpawnGeneration === generation
+      && backend === receiptBackend && !cliRestartInProgress,
+    onConfirmed: result => {
+      if (typeof result === 'object' && result.cliSessionId) {
+        persistCliSessionId(result.cliSessionId);
+        if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        void syncFreshCodexNativeSessionTitle(result.cliSessionId, codexRpcEngine);
+      }
+      queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
+      acknowledgeQueuedActivation(item);
+    },
+  });
+}
+
 function codexAppRuntimeTypeAheadReady(): boolean {
-  return lastInitConfig?.cliId === 'codex-app'
+  return isCodexAppCliId(lastInitConfig?.cliId)
     && codexAppControlProven
     && codexAppSignedStateObserved
     && codexAppInputReady;
 }
 
+function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
+  return resolvePtyInputPolicy(
+    cliAdapter ?? {},
+    backendScreenEvidenceIsAuthoritativeForMutation(),
+    codexAppRuntimeTypeAheadReady(),
+  );
+}
+
+/** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
+ *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
+ *  must stop while the exact native turn is awaiting activation, active, or
+ *  still hydrating its terminal. The queued follow-up is re-driven by the
+ *  normal terminal -> idle path and starts as its own turn afterwards. */
+function directRpcTurnBlocksTypeAhead(): boolean {
+  return codexRpcEngine !== undefined && (
+    rpcTurnsAwaitingActivation.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+  );
+}
+
 async function flushPending(): Promise<void> {
+  // Codex model-migration picker guard (startup only): the single admission
+  // point runs before every other guard, so they are all evaluated after its
+  // renderer drain; concurrent calls still serialize on isFlushing (no other
+  // await before it is set). Nothing below re-reads the screen for the picker.
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
+  if (idleDetector?.isStartupPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
@@ -11083,6 +14953,25 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
+  if (remoteRunnerRecoveredTurnInFlight) {
+    // A resumed provider can report ready while it still owns the recovered
+    // turn. That readiness only completes the transport handshake; it does not
+    // make the provider's serial turn channel available. Keep every successor
+    // queued until emitTurnTerminal() releases this exact recovered-turn fence.
+    log(`Holding ${pendingMessages.length} pending message(s) behind recovered remote turn`);
+    return;
+  }
+  if (currentInputDeliveryQuarantine()) {
+    log(`Holding ${pendingMessages.length} pending message(s) behind unconfirmed input delivery`);
+    return;
+  }
+  if (cliAdapter.postTerminalPromptFence === true) {
+    const target = backend;
+    if (await postTerminalInputIsBlocked(target)) return;
+    // Two input arrivals can both await the same renderer. Only one may own
+    // the drain, and a restart during that await invalidates both arrivals.
+    if (isFlushing || backend !== target || cliRestartInProgress) return;
+  }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -11147,27 +15036,27 @@ async function flushPending(): Promise<void> {
   // so the gate window is correct), Claude bridge can run with type-ahead
   // again.
   //
-  // CoCo (0.120.32+) and Codex (0.134.0+) also tolerate type-ahead, but for a
-  // different reason than Claude: they park a submit-while-busy message in the
-  // TUI's own queue (CoCo: "↑ Press up to edit queued messages"; Codex:
+  // CoCo (0.120.32+) and PTY Codex (0.134.0+) also tolerate type-ahead, but for
+  // a different reason than Claude: they park a submit-while-busy message in
+  // the TUI's own queue (CoCo: "↑ Press up to edit queued messages"; Codex:
   // "Messages to be submitted after next tool call"). CoCo writes the queued
   // user event only at DEQUEUE time, so its transcript stays strictly
-  // interleaved (user1 → asst1 → user2 → asst2). Codex is an active-turn STEER:
-  // a tool-running turn pulls the queued input into the SAME turn and emits one
-  // merged final (user1 → user2 → assistant_final). CodexBridgeQueue copes with
-  // both via HOL-block-drop (see codex-bridge-queue.ts) plus the markTimeMs
-  // dequeue-time override — no queued_command upgrade like Claude's. (The
-  // submit log history.jsonl, which the adapter's writeInput verification
-  // polls, IS written at submit time even for a parked message, so verification
-  // doesn't spuriously fail either.) All behaviours verified empirically —
-  // Codex on codex-cli 0.134.0.
+  // interleaved (user1 → asst1 → user2 → asst2). PTY Codex is an active-turn
+  // STEER: a tool-running turn pulls the queued input into the SAME turn and
+  // emits one merged final (user1 → user2 → assistant_final). CodexBridgeQueue
+  // copes with both via HOL-block-drop (see codex-bridge-queue.ts) plus the
+  // markTimeMs dequeue-time override. Hybrid direct RPC is deliberately
+  // excluded while its current turn is unresolved: it only implements serial
+  // turn/start, not the Codex App runner's ordered turn/steer contract.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
+  const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
+    runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
-  );
+    directRpcTurnBlocksTypeAhead(),
+  ) && !activeTurnBlocks(pendingMessages[0] ?? {});
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
@@ -11175,7 +15064,9 @@ async function flushPending(): Promise<void> {
   const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
-  const renameOnRemoteBackend = effectiveBackendType === 'riff' || effectiveBackendType === 'mojo';
+  const renameOnRemoteBackend = effectiveBackendType === 'riff'
+    || effectiveBackendType === 'mojo'
+    || effectiveBackendType === 'remote-runner';
   if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || renameOnRemoteBackend)) {
     pendingSessionRename = null;
     supportedSessionRenameReady = false;
@@ -11186,6 +15077,8 @@ async function flushPending(): Promise<void> {
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
+  const promptReadyAtFlushStart = isPromptReady;
+  let itemsWrittenInThisFlush = 0;
   const codexAppPromptReplay = new CodexAppFlushPromptReplay();
   // Raw input and native rename own their explicit command-line/session gates;
   // pending adopt writes re-arm inside writeAdoptMessage. Clearing readiness
@@ -11228,6 +15121,7 @@ async function flushPending(): Promise<void> {
     if (!hasRunStartupCommands) {
       hasRunStartupCommands = true;
       await runStartupCommands();
+      await runInitialNativeRename();
     }
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
@@ -11313,6 +15207,17 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      // The entry check protects a new drain. These checks protect subsequent
+      // items when a terminal or late receipt arrives during awaited writes.
+      if (currentInputDeliveryQuarantine()) break;
+      if (cliAdapter.postTerminalPromptFence === true) {
+        const target: SessionBackend = backend;
+        const generation = cliSpawnGeneration;
+        if (await postTerminalInputIsBlocked(target)
+          || backend !== target || generation !== cliSpawnGeneration
+          || cliRestartInProgress) break;
+      }
+      if (activeTurnBlocks(pendingMessages[0]!)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -11343,11 +15248,53 @@ async function flushPending(): Promise<void> {
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
-        renderer?.markNewTurn();
-        currentBotmuxTurnId = item.turnId;
-        currentBotmuxDispatchAttempt = item.dispatchAttempt;
-        currentGatewayTrustedCaller = item.trustedCaller;
-        currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+        syncQueuedTurnsFromMarkerDisk();
+
+        let currentTurnFinalDelivered = Boolean(
+          currentBotmuxTurnId
+            && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+        );
+        if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
+          advanceQueuedTypeAheadTurn('final_delivered');
+          currentTurnFinalDelivered = Boolean(
+            currentBotmuxTurnId
+              && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+          );
+        }
+
+        const isTypeAhead = !!currentBotmuxTurnId
+          && !currentTurnFinalDelivered
+          && !!item.turnId
+          && item.turnId !== currentBotmuxTurnId
+          && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
+
+        if (isTypeAhead && item.turnId) {
+          log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
+          if (!queuedTypeAheadTurns.some(t => t.turnId === item.turnId)) {
+            queuedTypeAheadTurns.push({
+              turnId: item.turnId,
+              dispatchAttempt: item.dispatchAttempt,
+              trustedCaller: item.trustedCaller,
+              trustedController: item.trustedController,
+              vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
+              turnCallerOpenId: item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
+            });
+          }
+        } else {
+          renderer?.markNewTurn();
+          if (currentBotmuxTurnId && currentBotmuxTurnId !== item.turnId) {
+            markTurnRetired(currentBotmuxTurnId);
+          }
+          setCaptureIdentity(
+            item.turnId,
+            item.dispatchAttempt,
+            item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId,
+          );
+          currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+          currentTurnSteerPromoted = false;
+          // Intentionally preserve queuedTypeAheadTurns: earlier type-ahead turns remain in queue.
+          markActiveTurnStarted(item);
+        }
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
         // this input is known not to have started and must not leave a latch
@@ -11364,7 +15311,10 @@ async function flushPending(): Promise<void> {
         }
         writeCliPidMarker();
         publishSandboxRelayCapability();
-        turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        if (!isTypeAhead) {
+          turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        }
+        itemsWrittenInThisFlush++;
         // Anchor the bridge baseline only after this turn owns the ZMX
         // submission lock, immediately before its literal write.
         if (claudeBridgeActive) {
@@ -11379,6 +15329,17 @@ async function flushPending(): Promise<void> {
           if (bridgeTurnId) {
             codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt);
           }
+          // Cursor/antigravity reach this branch only in zero-prompt mode; in
+          // default mode they take their dedicated CoT-only branches below.
+          // Keep arming the session-long thinking reader at every write.
+          if (lastInitConfig?.cliId === 'cursor') armCursorCotForTurn();
+          else if (lastInitConfig?.cliId === 'antigravity') armAntigravityCotForTurn();
+        } else if (lastInitConfig?.cliId === 'cursor' && !writeRpcEngine) {
+          // Reader is session-long; this also covers turns whose chatId the
+          // spawn-time observation has not resolved yet.
+          armCursorCotForTurn();
+        } else if (lastInitConfig?.cliId === 'antigravity' && !writeRpcEngine) {
+          armAntigravityCotForTurn();
         } else {
           // Same anchoring rule as the transcript bridges above: stamp the send
           // window's lower bound at the literal write, not on IPC arrival, so a
@@ -11394,7 +15355,15 @@ async function flushPending(): Promise<void> {
           log('Refused durable Claude submit: transcript terminal bridge is unavailable');
           throw new Error('terminal bridge unavailable before submission');
         }
-        if (lastInitConfig?.cliId === 'codex-app') {
+        // All pre-write guards have passed and the fenced write (the next
+        // operation) is about to hand this turn's input to the CLI. Arm the
+        // execution window HERE, not at the top of the hook: the guard above can
+        // refuse the submission before a single byte is written, and a turn that
+        // never executed must not report a (near-zero) duration — it still gets a
+        // real completedAtMs (the failure instant), just no durationMs. Arming
+        // here also keeps queueing time out of the span.
+        markTurnExecutionStart(item.turnId, item.dispatchAttempt);
+        if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
             + `replyTurn=${shortCorrelationId(item.turnId)} chars=${msg.length}`,
@@ -11410,7 +15379,7 @@ async function flushPending(): Promise<void> {
       // This bookkeeping runs before master's runAmbiguousSubmissionTransaction;
       // prepareNormalWrite (its beforeWrite) still rotates attribution atomically
       // with the fenced write, and it logs the "Writing …" line for both paths.
-      const tracksCodexAppLiveness = lastInitConfig?.cliId === 'codex-app';
+      const tracksCodexAppLiveness = isCodexAppCliId(lastInitConfig?.cliId);
       const codexAppFrozenTurnId = tracksCodexAppLiveness
         ? item.turnId
           || item.codexAppInput?.clientUserMessageId
@@ -11461,6 +15430,7 @@ async function flushPending(): Promise<void> {
       // worker — exactly the failure mode this change is closing. Contain it.
       let submissionBackend: SessionBackend | null = null;
       let recoveryFailureReason: string | undefined;
+      let deliveryQuarantine: InputDeliveryQuarantine | null = null;
       const handleStaleWriteContinuation = (errorCode: string): void => {
         const disposition = settleStaleWriteContinuation(
           item,
@@ -11478,7 +15448,46 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       try {
-        if (writeRpcEngine) {
+        if (item.taskContinuation && !writeRpcEngine) {
+          emitTurnTerminal(
+            item.turnId ?? 'task-continuation-unknown',
+            'failed',
+            'continuation_rpc_unavailable',
+            item.dispatchAttempt,
+          );
+          break;
+        }
+        if (writeBackend.submitTurn) {
+          submissionBackend = writeBackend;
+          if (!item.turnId) {
+            result = {
+              submitted: false,
+              failureReason: 'remote-runner requires an authenticated BotMux turn id',
+            };
+          } else {
+            prepareNormalWrite();
+            result = await writeBackend.submitTurn({
+              content: msg,
+              turnId: item.turnId,
+              ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
+              ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+            });
+          }
+        } else if (writeRpcEngine) {
+          if (item.taskContinuation
+            && (item.turnId?.startsWith('bmx-continuation-') !== true
+              || item.dispatchAttempt === undefined
+              || item.taskContinuation.rpcGeneration !== taskContinuationRpcGeneration
+              || item.taskContinuation.authorizationMode !== 'inherited')) {
+            emitTurnTerminal(
+              item.turnId ?? 'task-continuation-unknown',
+              'failed',
+              'continuation_authority_mismatch',
+              item.dispatchAttempt,
+            );
+            break;
+          }
           rpcTurnIdentity = {
             turnId: item.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
             ...(item.dispatchAttempt !== undefined
@@ -11498,9 +15507,10 @@ async function flushPending(): Promise<void> {
           // renders. No tmux paste → the history.jsonl verify/retry/recover
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
+          let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
             prepareNormalWrite();
-            await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!);
+            rpcNativeTurnId = (await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!)).nativeTurnId;
           });
           // The await may overlap an engine/pane replacement. Fence the captured
           // generation BEFORE touching the global bridge queue; a stale ack must
@@ -11517,6 +15527,10 @@ async function flushPending(): Promise<void> {
             break;
           }
           result = { submitted: true };
+          // The app-server acknowledged turn/start for this exact input on
+          // the engine's active thread, fenced to the current generation.
+          acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
+            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId);
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -11747,6 +15761,10 @@ async function flushPending(): Promise<void> {
           if (recoveryFailureReason) {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
           } else {
+            if (submissionBackend && normalWritePrepared) {
+              deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+              if (deliveryQuarantine) inflightInputs.forget(item);
+            }
             scheduleSubmitFailureNotify(
               logicalMsg,
               undefined,
@@ -11761,10 +15779,21 @@ async function flushPending(): Promise<void> {
         }
         break;
       }
-      if (lastInitConfig?.cliId === 'codex-app'
+      if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId
         && result?.submitted !== false) {
         rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
+      }
+      if (result?.submitted === true
+        && deferTurnInputCommitUntilSubmission(
+          item.dispatchAttempt,
+          item.durablePrimaryInbox,
+        )) {
+        acknowledgeTurnInputCommitted(
+          item.turnId,
+          item.dispatchAttempt,
+          item.durablePrimaryInbox,
+        );
       }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
@@ -11779,6 +15808,15 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
+      // Exact owned history match: the model's own log holds this input.
+      // Sent after any session id persistence so the daemon resolves the
+      // same native conversation that the match was attributed to.
+      // `submitted` keeps its meaning (an exact same-text line appeared); only a
+      // POSITIVELY owned line proves this pane consumed the input.
+      if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
+        acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
+          result.cliSessionId ?? lastInitConfig?.cliSessionId);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -11803,6 +15841,10 @@ async function flushPending(): Promise<void> {
           codexAppReadyAuthority,
           codexAppLivenessHandle,
         );
+        if (!result.failureReason && !recoveryFailureReason && submissionBackend) {
+          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+          if (deliveryQuarantine) inflightInputs.forget(item);
+        }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
           || result.submissionDisposition === 'flushed_invalid';
         if (tracksCodexAppLiveness && !codexAppSafeNonSubmission) {
@@ -11856,6 +15898,10 @@ async function flushPending(): Promise<void> {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
             break;
           }
+          if (result.submissionDisposition === 'dirty_unknown') {
+            inflightInputs.retire(item);
+            break;
+          }
           scheduleSubmitFailureNotify(
             logicalMsg,
             result.recheck,
@@ -11865,32 +15911,57 @@ async function flushPending(): Promise<void> {
             turnSeq,
             item,
             'failed',
+            false,
+            () => {
+              releaseInputDeliveryQuarantine(
+                deliveryQuarantine,
+                'authoritative deferred submit evidence',
+              );
+            },
           );
+          if (!result.failureReason && result.recheck) {
+            observeQueuedActivationReceipt(item, result.recheck);
+          }
         }
-        if (!recoveryFailureReason) requeueUnsubmittedQueuedActivation(item);
+        // A missing history receipt is ambiguous, not proof that the input was
+        // untouched. Replaying on every idle probe duplicates slow submissions
+        // and continually replaces their deferred confirmation timer. Only the
+        // adapter's explicit safe non-submission disposition permits retry.
+        if (!recoveryFailureReason && codexAppSafeNonSubmission) {
+          requeueUnsubmittedQueuedActivation(item);
+        }
+        if (deliveryQuarantine) break;
       } else if (item.queuedActivationToken) {
         // The daemon keeps the exact journal and route reservation until this
         // adapter-level boundary. IPC loss may replay at-least-once; an early
         // worker/daemon crash can never silently consume the opening turn.
-        send({
-          type: 'queued_activation_submitted',
-          sessionId,
-          activationToken: item.queuedActivationToken,
-        });
+        acknowledgeQueuedActivation(item);
       }
       if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
       // identically to `role:user`; CoCo parks queued submits in its TUI queue
       // and writes the user event at dequeue time (transcript stays interleaved);
-      // Codex parks them too but steers them into the active turn (which can
-      // merge into one final), and CodexBridgeQueue's HOL-block-drop attributes
-      // that correctly. Durable receiver attempts are the exception: they and
-      // adjacent IM turns wait for separate idle edges so neither can be
-      // HOL-dropped or steered into the other.
+      // PTY Codex parks them too and steers them into the active turn (which can
+      // merge into one final). Hybrid direct RPC stops here after one accepted
+      // turn/start; its queued successor waits for the native terminal and a new
+      // idle edge. Durable receiver attempts likewise stay on separate edges.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      if (directRpcTurnBlocksTypeAhead()) break;
+      if (item.taskContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
-      if (shouldStopPendingBatch(item, pendingMessages[0])) break;
+      // A type-ahead adapter may accept several queued submits in one flush.
+      // Keep that optimization only within one authenticated principal: a
+      // different sender must wait for this turn's terminal boundary.
+      if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
+      // Fence-enabled adapters can batch healthy type-ahead only after each
+      // write is confirmed. Terminal conflicts and unknown receipts are
+      // checked again before the next item, independently from readiness.
+      if (shouldStopPendingBatch(
+        item,
+        pendingMessages[0],
+        allowBackToBackWrites,
+      )) break;
     }
   } finally {
     isFlushing = false;
@@ -11934,14 +16005,18 @@ function sendToPty(
   content: string,
   turnId?: string,
   opts: {
+    queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
+    durablePrimaryInbox?: true;
     codexAppDispatchId?: string;
     codexAppSteerable?: true;
     queuedActivationToken?: string;
     replyTurnId?: string;
     trustedCaller?: import('./types.js').TrustedCaller;
+    trustedController?: import('./types.js').TrustedCaller;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    turnCallerOpenId?: string;
     nativeSessionTitle?: string;
     nativeSessionTitlePrompt?: string;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
@@ -11952,11 +16027,13 @@ function sendToPty(
      *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
      *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
     atMostOnce?: true;
+    taskContinuation?: import('./types.js').TaskContinuationDispatchMarker;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
     content,
     turnId,
+    ...(opts.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
@@ -11966,11 +16043,15 @@ function sendToPty(
     ...(opts.nativeSessionTitle ? { nativeSessionTitle: opts.nativeSessionTitle } : {}),
     ...(opts.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: opts.nativeSessionTitlePrompt } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
+    ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
+    ...(opts.turnCallerOpenId ? { turnCallerOpenId: opts.turnCallerOpenId } : {}),
   };
   if (!initPromptMaterialized) {
     pendingMessages.push(next);
@@ -11988,16 +16069,18 @@ function sendToPty(
   }
   if (!cliAdapter) return false;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
+    runtimePtyInputPolicy().supportsTypeAhead,
     durableTurnInFlight,
     next,
-  );
+    directRpcTurnBlocksTypeAhead(),
+  ) && !activeTurnBlocks(next);
   const shouldMergeQueued = opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
@@ -12012,7 +16095,7 @@ function sendToPty(
   // wedged blocking flag silently swallows every subsequent message — without
   // this override the user has no way to recover from Lark. Mirrors the
   // web-terminal text-input path (handleTuiTextInput).
-  if (tuiPromptBlocking) {
+  if (tuiPromptBlocking && !opts.queueAfterActiveTurn) {
     log(`User override: incoming Lark message clears tuiPromptBlocking — "${content.substring(0, 80)}"`);
     tuiPromptBlocking = false;
     // Tear down the prompt card so the user doesn't see stale options.
@@ -12025,19 +16108,19 @@ function sendToPty(
   }
   // See flushPending: type-ahead adapters flush even while the CLI is busy.
   // Claude attributes `attachment(queued_command)` identically to `role:user`;
-  // CoCo parks queued submits and writes the user event at dequeue time; Codex
-  // parks them but steers into the active turn — CodexBridgeQueue's
-  // HOL-block-drop attributes the (possibly merged) result correctly.
+  // CoCo parks queued submits and writes the user event at dequeue time; PTY
+  // Codex parks them but steers into the active turn. Hybrid direct RPC is
+  // forced serial by directRpcTurnBlocksTypeAhead() until native terminal.
   // Type-ahead lets the message write while the CLI is BUSY — but only once the
-  // TUI has booted. During startup / tmux re-attach (awaitingFirstPrompt) even a
-  // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
-  // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
-  // brief reaching Codex before its first idle and never landing.
+  // TUI has booted. First-ready or positive initialization evidence proves
+  // this; keep that evidence available to messages arriving after the startup
+  // observer's one-time queue flush, even if resyncs prevent ordinary idle.
   if (!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);
@@ -12065,6 +16148,9 @@ function startScreenUpdates(): void {
   let lastSentStatus: string | undefined;
   let lastTextSnapshotHash = '';
   let lastContent = '';
+  // Last Claude permission dialog already notified (dedup by projection text;
+  // cleared when the dialog leaves the screen so the next one notifies again).
+  let lastClaudeActionPrompt = '';
   // PTY-activity watermark of the last tick that actually captured. The screen
   // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
   // and feeds the renderer in the same place), so when this hasn't advanced the
@@ -12073,8 +16159,10 @@ function startScreenUpdates(): void {
   // web-attach (isScreenSelfDriven) keeps changing without bumping the
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
+  let lastSnapshotGridRevision = observedPaneGridRevision;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) {
+      inspectAidenCodexUpdateDialogOnScreen();
       // First-turn 「工作中」 publisher. The async sampler below is fully gated
       // until the first turn ends (markPromptReady flips awaitingFirstPrompt) or
       // the 15s soft timeout, so an argv-baked first prompt (Pi/Grok/…, delivered
@@ -12130,19 +16218,23 @@ function startScreenUpdates(): void {
         // self-driven screen (observe backend with a live web-attach): the
         // watermark can't be trusted there, so capture every tick.
         const ptyActivity = lastPtyActivityAtMs;
-        if (shouldCaptureScreen({
+        const gridRevision = observedPaneGridRevision;
+        if (gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
           ptyActivity,
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
         })) {
           lastSnapshotPtyActivity = ptyActivity;
+          lastSnapshotGridRevision = gridRevision;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
           const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
           if (pipeText) {
             content = pipeText.content;
-            const hash = pipeText.ansi;
+            // Geometry is part of the frame: the same ANSI re-wrapped on a
+            // resized pane renders different text.
+            const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
             changed = hash !== lastTextSnapshotHash;
             lastTextSnapshotHash = hash;
             // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
@@ -12166,6 +16258,25 @@ function startScreenUpdates(): void {
       if (!snapshot) return;
 
       const usageAware = usageLimitTracker.classify(snapshot.content, status);
+      // Claude Code's permission dialogs — including one raised by a
+      // background fork agent AFTER the main turn already ended — park the
+      // session on a static screen that idle detection reports as "ready for
+      // input", so without this the thread waits silently for as long as the
+      // dialog stands. Deliberately NOT gated on status==='working' nor on an
+      // active turn: the turn-less parked case is exactly the one that must
+      // reach the user. turnId may be undefined once the turn ended; the
+      // daemon's scopedReply falls back to the session anchor. The projection
+      // is narrow: only the bounded title/question/options leave the
+      // terminal, never tool args.
+      if (lastInitConfig?.cliId === 'claude-code') {
+        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        if (prompt && prompt !== lastClaudeActionPrompt) {
+          lastClaudeActionPrompt = prompt;
+          send({type: 'user_notify', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
+        } else if (!prompt) {
+          lastClaudeActionPrompt = '';
+        }
+      }
       if (snapshot.changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
         send({
@@ -12188,7 +16299,50 @@ function stopScreenUpdates(): void {
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
-function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+/** Spawn-time attach for file-backed structured bridges, driven by the adapter's
+ *  `bridgeSpec.spawn`. Pins the transcript when its path is already resolvable
+ *  (resume id / botmux-controlled session id); otherwise arms the 1s poller to
+ *  late-attach once writeInput or the pid probe reports the native session id.
+ *
+ *  Mode uses `resume` = effectiveResume: when the resume probe flipped us to FRESH
+ *  we must NOT baseline against an empty / absent store (it would swallow the
+ *  fresh session's first turn). */
+function attachStructuredBridgeAtSpawn(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  spawn: NonNullable<StructuredBridgeSpec['spawn']>,
+  ids: { resume: boolean; cliSessionId: string | undefined; adapterSessionId: string },
+): void {
+  const sharesAppServer = spawn.appServerShare === true && !!cfg.existingAppServerEndpoint;
+  if (sharesAppServer) {
+    // A shared Codex App thread has two legitimate writers: the App and
+    // BotMux's official `codex --remote` client. Enable local-turn
+    // synthesis only from this share's attach boundary, so older thread
+    // history is absorbed while future App-side turns are mirrored to Lark.
+    codexAdoptStartMs = Date.now();
+    codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);
+    log('Codex bridge enabled App Server shared-turn forwarding');
+  }
+  if (spawn.baseline === 'birth-aware') antigravitySpawnStartMs = Date.now();
+  const sid = spawn.sessionId === 'cli'
+    ? ids.cliSessionId
+    : (ids.cliSessionId ?? ids.adapterSessionId);
+  const path = sid
+    ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir })
+    : undefined;
+  if (path) {
+    const mode = sharesAppServer
+      ? 'split-live'
+      : spawn.baseline === 'birth-aware'
+        ? antigravityLateAttachMode(path)
+        : ids.resume ? 'baseline-existing' : 'fresh-empty';
+    codexBridgeAttach(path, mode);
+  } else {
+    if (sid) codexBridgePendingSessionId = sid;
+    codexBridgeStartTimer();
+  }
+}
+
+async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<void> {
   if (cfg.bridgeJsonlPath) {
     startBridgeWatcher(cfg.bridgeJsonlPath, {
       cliPid: cfg.adoptCliPid,
@@ -12199,7 +16353,13 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     codexAdoptStartMs = adoptStartMs;
     codexBridgeQueue.setLocalTurns(true, adoptStartMs);
     let rolloutPath: string | undefined;
-    if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+    const terminalSession = backend ? await refreshCodexTerminalSession(backend) : undefined;
+    const initialSessionId = terminalSession?.kind === 'terminal' ? terminalSession.sessionId
+      : cfg.cliSessionId;
+    if (initialSessionId) {
+      rolloutPath = findCodexRolloutBySessionId(initialSessionId);
+      persistCliSessionId(initialSessionId);
+    }
     if (!rolloutPath && cfg.adoptCliPid) {
       const probed = findCodexRolloutByPid(cfg.adoptCliPid);
       if (probed) {
@@ -12210,29 +16370,7 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     if (rolloutPath) {
       codexBridgeAttach(rolloutPath, 'split-live');
     } else {
-      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
-      codexAdoptPendingPid = cfg.adoptCliPid;
-      codexBridgeStartTimer();
-    }
-  } else if (cfg.cliId === 'traex') {
-    // TRAE rollout format is byte-identical to Codex; only the directory
-    // layout (and therefore the finder functions) differ.
-    const adoptStartMs = Date.now();
-    codexAdoptStartMs = adoptStartMs;
-    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
-    let rolloutPath: string | undefined;
-    if (cfg.cliSessionId) rolloutPath = findTraexRolloutBySessionId(cfg.cliSessionId);
-    if (!rolloutPath && cfg.adoptCliPid) {
-      const probed = findTraexRolloutByPid(cfg.adoptCliPid);
-      if (probed) {
-        rolloutPath = probed.path;
-        persistCliSessionId(probed.cliSessionId);
-      }
-    }
-    if (rolloutPath) {
-      codexBridgeAttach(rolloutPath, 'split-live');
-    } else {
-      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
+      if (initialSessionId) codexBridgePendingSessionId = initialSessionId;
       codexAdoptPendingPid = cfg.adoptCliPid;
       codexBridgeStartTimer();
     }
@@ -12277,53 +16415,47 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     } else {
       codexBridgeStartTimer();
     }
-  } else if (cfg.cliId === 'cursor') {
-    const adoptStartMs = Date.now();
-    codexAdoptStartMs = adoptStartMs;
-    // Cursor JSONL lacks per-event timestamps, but adopt still needs parity
-    // with other transcript bridges: direct terminal input should be surfaced
-    // as a local-turn card in Lark. Baseline/offset handling above keeps
-    // pre-adopt history out of the queue; worst-case mirror replay is a
-    // duplicate local-turn message rather than lost local input.
-    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
-    // Resolve the transcript: cliSessionId (= Cursor chatId) when discovery
-    // captured it, else the adopt pid via its open store.db fd. Cursor lacks
-    // per-event timestamps, so cursorBridgeAttach baselines by byte offset
-    // rather than the timestamp-cutoff split-live the other CLIs use.
-    let path: string | undefined;
-    if (cfg.cliSessionId) path = findCursorTranscriptByChatId(cfg.cliSessionId);
-    if (!path && cfg.adoptCliPid) {
-      const probed = findCursorTranscriptByPid(cfg.adoptCliPid);
-      if (probed) path = probed.path;
-    }
-    if (path) {
-      cursorBridgeAttach(path);
-    } else {
-      if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
-      codexAdoptPendingPid = cfg.adoptCliPid;
-      codexBridgeStartTimer();
-    }
-  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok') {
-    // File-backed bridges share the same adopt attach skeleton (sid → pid →
-    // split-live | pending). Path lookup is resolveFileBridgePath; pi is
-    // intentionally folded here with grok so the two stay in lockstep.
-    setupAdoptFileBridge(cfg);
+  } else {
+    // Shared skeleton (sid -> pid -> split-live | pending) for every file-backed
+    // CLI whose adapter declares an `adopt` policy: traex / cursor / pi / grok.
+    // codex / coco / mtr keep the dedicated branches above (see StructuredBridgeSpec.adopt).
+    const adopt = bridgeSpecFor(cfg.cliId)?.adopt;
+    if (adopt) setupAdoptFileBridge(cfg, adopt);
   }
 }
 
-/** Adopt attach for file-backed structured bridges (pi/grok today; codex/
- *  traex keep their own branches for rollout-specific probes). */
-function setupAdoptFileBridge(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+/** Adopt attach for file-backed structured bridges that follow the shared
+ *  skeleton, driven by the adapter's `bridgeSpec.adopt` (traex / cursor / pi /
+ *  grok). Order is fixed: native session id, then the adopted pid's open fds,
+ *  then arm the poller with whatever is still pending. */
+function setupAdoptFileBridge(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adopt: NonNullable<StructuredBridgeSpec['adopt']>,
+): void {
   const adoptStartMs = Date.now();
   codexAdoptStartMs = adoptStartMs;
+  // Direct terminal input must surface in Lark as a local-turn card. For
+  // transcripts without per-event timestamps (cursor) the baseline/offset
+  // handling in the attach keeps pre-adopt history out of the queue; the
+  // worst case is a duplicate local-turn message rather than lost local input.
   codexBridgeQueue.setLocalTurns(true, adoptStartMs);
-  const path = resolveFileBridgePath(cfg.cliId, {
-    sessionId: cfg.cliSessionId,
-    cwd: cfg.adoptCwd ?? cfg.workingDir,
-    pid: cfg.adoptCliPid,
-  });
+  let path = cfg.cliSessionId
+    ? resolveFileBridgePath(cfg.cliId, { sessionId: cfg.cliSessionId, cwd: cfg.adoptCwd ?? cfg.workingDir })
+    : undefined;
+  if (!path && cfg.adoptCliPid) {
+    path = resolveFileBridgePath(cfg.cliId, { pid: cfg.adoptCliPid });
+    if (path && adopt.pidProbedSessionId) {
+      // The pid probe also tells us the native session id; the adapter parses
+      // it from its own rollout naming.
+      const probedSessionId = adopt.pidProbedSessionId(path);
+      if (probedSessionId) persistCliSessionId(probedSessionId);
+    }
+  }
   if (path) {
-    codexBridgeAttach(path, 'split-live');
+    // No per-event timestamps -> history is baselined by byte offset (cursor's
+    // attach also starts its CoT reader); everyone else splits at the adopt cutoff.
+    if (adopt.attach === 'baseline-skip-tail') cursorBridgeAttach(path);
+    else codexBridgeAttach(path, 'split-live');
   } else {
     if (cfg.cliSessionId) codexBridgePendingSessionId = cfg.cliSessionId;
     codexAdoptPendingPid = cfg.adoptCliPid;
@@ -12357,11 +16489,38 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
   wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);
-  idleDetector.onIdle(() => {
-    if (backend && deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)) return;
+  idleDetector.onIdle(async (evidenceSource) => {
+    const idleBackend = backend;
+    if ((evidenceSource === 'external' || currentPostTerminalInputFence())
+      && cliAdapter?.postTerminalPromptFence === true
+      && renderer) {
+      try {
+        await renderer.writeAndFlush('');
+      } catch (err: any) {
+        log(`${label} adopt external-idle renderer settle failed: ${err.message}`);
+      }
+      if (backend !== idleBackend) return;
+    }
     log(`Prompt detected (idle) — ${label} adopt mode`);
-    try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-    try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    const drainBridges = (): void => {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    };
+    if ((evidenceSource === 'external' || currentPostTerminalInputFence())
+      && cliAdapter?.postTerminalPromptFence === true) {
+      drainBridges();
+      if (idleBackend && postTerminalPromptFenceHolds(evidenceSource, idleBackend)) return;
+      markPromptReady();
+      return;
+    }
+    if (evidenceSource === 'program-status') {
+      drainBridges();
+      if (idleBackend) markPromptReadyFromPty(idleBackend);
+      else markPromptReady();
+      return;
+    }
+    if (idleBackend && deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)) return;
+    drainBridges();
     markPromptReady();
   });
 }
@@ -12373,7 +16532,7 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
       if (be instanceof ZmxBackend) {
         scheduleBackendScreenResync(initial, source);
       } else {
-        onPtyData(initial);
+        onPtyData(initial, false);
       }
       if (be instanceof HerdrBackend) {
         relayHerdrWebSnapshot(initial);
@@ -12392,15 +16551,62 @@ function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScr
   return !!(be.captureCurrentScreen || be.captureViewport || renderer);
 }
 
-function busyProbeRegion(content: string): string {
-  const lines = content.split(/\r?\n/);
-  const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
-  return lines.slice(-tailLineCount).join('\n');
+/** A transcript terminal closes the logical turn, but selected PTY adapters
+ * require an independently observed composer before they accept successors.
+ * Apply this only to authoritative local viewports; ZMX/history snapshots can
+ * contain stale scrollback and therefore retain the structured-terminal path.
+ *
+ * Compare the last busy and composer markers in the bounded viewport tail so a
+ * fresh composer redraw can retire older spinner text, while a later queue line
+ * still wins over a prompt that belongs to the submitted message above it. */
+function postTerminalPromptFenceHolds(
+  evidenceSource: IdleEvidenceSource,
+  be: SessionBackend,
+): boolean {
+  if ((evidenceSource !== 'external' && !currentPostTerminalInputFence())
+    || cliAdapter?.postTerminalPromptFence !== true
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+    postTerminalInputFence = null;
+    // The predecessor's idle edge must not publish readiness for this active
+    // successor. Input remains allowed because no post-terminal fence is held.
+    idleDetector?.reset();
+    return true;
+  }
+  const composerPattern = cliAdapter.staticBusyClearPattern ?? cliAdapter.readyPattern;
+  if (!composerPattern) return false;
+  try {
+    const { ready, busyAt, composerAt } = inspectPostTerminalComposer(
+      captureBackendScreen(be), cliAdapter.busyPattern, composerPattern,
+    );
+    if (ready) {
+      postTerminalInputFence = null;
+      return false;
+    }
+    armPostTerminalInputFence();
+    log(
+      `${cliName()} external-idle: structured terminal observed without a newer `
+      + `PTY composer (busy=${busyAt >= 0}, composer=${composerAt >= 0}); `
+      + 'holding prompt ready',
+    );
+    idleDetector?.reset();
+    return true;
+  } catch (err: any) {
+    armPostTerminalInputFence();
+    log(`${cliName()} external-idle composer fence capture failed: ${err.message}`);
+    idleDetector?.reset();
+    return true;
+  }
 }
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+    sessionId,
+    cliSessionId: currentCliSid,
+    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
+      ? () => captureBackendScreen(be) : undefined,
+  })) {
     log(`${source}: session state indicates active work (db busy); deferring prompt ready`);
     idleDetector?.reset();
     scheduleBusyPatternIdleProbe(source);
@@ -12425,7 +16631,12 @@ function probeBusyPatternIdle(
   be: SessionBackend,
 ): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+    sessionId,
+    cliSessionId: currentCliSid,
+    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
+      ? () => captureBackendScreen(be) : undefined,
+  })) {
     return false;
   }
   if (cliAdapter?.busyPattern) {
@@ -12540,10 +16751,48 @@ async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
+  if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
+  remoteRunnerRecoveredTurnInFlight = false;
+  if (cfg.adoptMode && cfg.serviceTier) {
+    throw new Error('adopted CLI sessions cannot apply an explicit serviceTier');
+  }
+  if (cfg.envPolicy?.mode === 'strict' && (cfg.adoptMode || cfg.existingAppServerEndpoint || cfg.cliLaunchMode === 'forge-traex')) {
+    throw new Error('envPolicy strict cannot control an adopted process or an external App Server; create a Botmux-owned session');
+  }
+  // These backends currently start user shell processes before our command,
+  // or run tools through a separate local/cloud launcher. Refuse to claim a
+  // boundary until those launch protocols can express an empty initial env.
+  if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff', 'remote-runner'].includes(cfg.backendType)) {
+    throw new Error('envPolicy strict currently supports pty, tmux, zellij and zmx backends');
+  }
+  const networkError = networkPolicySupportError({
+    platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
+    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
+  });
+  if (networkError) throw new Error(networkError);
+  const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
+  if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
+  // Every spawn is a new CLI process that can show the picker again. Not all
+  // respawns pass through killCli() (e.g. the retry after a crash-loop park),
+  // so the per-process picker state must be reset here too.
+  resetCodexModelMigrationState();
+  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
+    ?? join(homedir(), '.botmux', 'data');
+  const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
+  // A worker owns exactly one logical session. Pin its own os.tmpdir() before
+  // constructing any backend so FIFOs, launch configs and CLI descendants all
+  // share the same collectable scratch tree.
+  // The Gateway socket must stay under the inherited, short tmpdir.
+  pinSessionMcpGatewaySocketRoot(tmpdir());
+  applySessionTempEnv(process.env, sessionScratchDir);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
+    TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
+  }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
   submitFailureChains.clear();
+  queuedActivationReceipts.clear();
   // Experimental external App Server attachment: BotMux owns only this TUI
   // client, never the server or its JSON-RPC input stream. Re-establish the
   // remote argv state on EVERY spawn because killCli() deliberately clears the
@@ -12561,6 +16810,9 @@ async function spawnCli(
     if (codexRpcEngine) {
       throw new Error('existing App Server attachment cannot share a BotMux-owned Codex RPC engine');
     }
+    if (cfg.serviceTier !== undefined) {
+      throw new Error('existing App Server attachment cannot apply an explicit serviceTier');
+    }
     remoteWsUrl = normalizeExistingAppServerEndpoint(
       cfg.existingAppServerEndpoint,
       `worker existingAppServerEndpoint for session ${cfg.sessionId}`,
@@ -12570,6 +16822,11 @@ async function spawnCli(
   }
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
+  // Early mount based on cfg.cliId before cliAdapter is instantiated for this generation
+  // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
+  programStatusStream = shouldEnableProgramStatus(cfg.cliId, cliAdapter) ? new ProgramStatusFramingStream() : null;
+  queuedTurnAdvanceConsumedForPrompt = false;
+  retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
   // Enrollment writes the fixed marker before any device credential appears.
   // From that instant onward every NEW local CLI must carry a credential
@@ -12621,7 +16878,6 @@ async function spawnCli(
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
     isPipeMode = true;
-    isZellijMode = false;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const target = cfg.adoptHerdrTarget ?? cfg.adoptHerdrPaneId!;
@@ -12650,9 +16906,10 @@ async function spawnCli(
     });
 
     wireHerdrWebTerminalRelays(herdrBe);
+    herdrBe.onPaneGridChange(() => { observedPaneGridRevision++; });
     seedBackendScreen('herdr adopt', herdrBe);
 
-    setupAdoptTranscriptBridges(cfg);
+    await setupAdoptTranscriptBridges(cfg);
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'herdr');
 
@@ -12675,6 +16932,7 @@ async function spawnCli(
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
+    publishLocalProcessAttestation(cfg.adoptCliPid);
     log(`Adopt mode (herdr): observing ${cfg.adoptHerdrSessionName}:${target} (${cols}x${rows})`);
     return;
   }
@@ -12689,7 +16947,6 @@ async function spawnCli(
     // PTY-per-WS — we don't attach to anything).
     isTmuxMode = true;
     isPipeMode = true;
-    isZellijMode = !!cfg.adoptZellijPaneId;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const observeBe: ObserveBackend = cfg.adoptZellijPaneId
@@ -12715,7 +16972,7 @@ async function spawnCli(
     // immediately, instead of waiting for the next observe tick.
     seedBackendScreen(`${effectiveBackendType} adopt`, observeBe);
 
-    setupAdoptTranscriptBridges(cfg);
+    await setupAdoptTranscriptBridges(cfg);
 
     setupAdoptIdleDetection(cfg, 'pipe');
     setupAdoptInputAdapter(cfg);
@@ -12740,6 +16997,7 @@ async function spawnCli(
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
     const target = cfg.adoptZellijPaneId ? `${cfg.adoptZellijSession}/${cfg.adoptZellijPaneId}` : cfg.adoptTmuxTarget;
+    publishLocalProcessAttestation(cfg.adoptCliPid);
     log(`Adopt mode (${effectiveBackendType}): observing ${target} (${cols}x${rows})`);
     return;
   }
@@ -12750,10 +17008,24 @@ async function spawnCli(
   // so every other dsh-specific branch (OSC decode, turn timeout, etc.) is
   // unaffected — dsh-tui simply doesn't emit OSC frames, making the decoder a
   // no-op for it.
+  validateCliLaunchModeConfig({
+    cliId: cfg.cliId,
+    cliLaunchMode: cfg.cliLaunchMode,
+    wrapperCli: cfg.wrapperCli,
+    cliRuntime: cfg.cliRuntime,
+    cliPathOverride: cfg.cliPathOverride,
+    sandbox: cfg.sandbox,
+    readIsolation: cfg.readIsolation,
+  }, "worker session " + cfg.sessionId);
+
   const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
     ? 'dsh-tui'
     : cfg.cliId as CliId;
-  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
+  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
+  if (cliAdapter.supportsProgramStatus && !programStatusStream) {
+    programStatusStream = new ProgramStatusFramingStream();
+  }
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -12780,23 +17052,41 @@ async function spawnCli(
   }
   let resolvedZmxSessionProbe: SessionProbe | undefined;
   let resolvedZmxSessionPid: number | undefined;
+  let resolvedZmxSocketDir: string | undefined;
   // Frozen zellij existence decision, mirroring resolvedZmxSessionProbe: the
   // gate resolves the tri-state probe ONCE (biasing an indeterminate answer
   // toward reattach) and every teardown below refreshes it to 'missing', so a
   // post-kill re-selection cold-spawns instead of reattaching to the pane it
   // just removed. selectSessionBackend consumes it via hasExistingSession.
   let resolvedZellijSessionProbe: SessionProbe | undefined;
+  // Same frozen tri-state decision for tmux (see resolveTmuxBackendGate): an
+  // indeterminate has-session answer spawns instead of gating AND reattaches
+  // instead of creating, so no pre-spawn fresh-path state is ever built for a
+  // pane that may still be alive. Teardown gates below refresh it to 'missing'.
+  let resolvedTmuxSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
     let hasExistingSession = false;
     let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
-        const probe = probeTmuxFunctionalWithRetry();
-        available = probe.ok;
-        if (!probe.ok) reason = probe.reason;
+      // Tri-state on purpose — `hasSession()` collapses "has-session timed out
+      // under host load" into "no session", which then let the (equally
+      // load-starved) functional probe gate a live pane with the misleading
+      // "tmux 不可用 / install tmux" card. Retry only the indeterminate answer.
+      const tmuxSessionName = TmuxBackend.sessionName(cfg.sessionId);
+      const resolved = resolveTmuxBackendGate({
+        probeSession: () => TmuxBackend.probeSessionWithRetry(tmuxSessionName),
+        binaryOnPath: () => locateExecutable('tmux', tmuxEnv()) !== null,
+        probeFunctional: () => probeTmuxFunctionalWithRetry(),
+      });
+      resolvedTmuxSessionProbe = resolved.probe;
+      available = resolved.available;
+      reason = resolved.reason;
+      hasExistingSession = resolved.hasExistingSession;
+      existingSessionUnknown = resolved.existingSessionUnknown;
+      if (existingSessionUnknown) {
+        log('tmux has-session probe returned no answer but the binary is on PATH (host load); biasing toward reattach instead of gating');
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a
@@ -12840,15 +17130,30 @@ async function spawnCli(
       // The local controller version is a protocol requirement even when the
       // backing session already exists: 0.6 has the old send semantics. Only a
       // transient functional probe may be exempted for a verified live session.
-      const version = probeZmxVersion();
+      const recorded = cfg.persistentBackendTarget?.backendType === 'zmx'
+        ? cfg.persistentBackendTarget : undefined;
+      const version = probeZmxRuntime(zmxEnv(process.env, recorded?.socketDir));
       if (!version.ok) {
         available = false;
         reason = version.reason;
         resolvedZmxSessionProbe = 'unknown';
       } else {
+        resolvedZmxSocketDir = recorded?.socketDir ?? version.socketDir;
+        if (!resolvedZmxSocketDir) {
+          throw new Error('无法解析 zmx version 的 socket_dir，已拒绝创建未固定地址的会话');
+        }
+        // Freeze before the first liveness decision; selection and every later
+        // control command must address the same namespace, even after restart.
+        cfg.persistentBackendTarget = {
+          backendType: 'zmx',
+          sessionName: recorded?.sessionName ?? ZmxBackend.sessionName(cfg.sessionId),
+          socketDir: resolvedZmxSocketDir,
+        };
         const resolved = probeOwnedZmxSession(
-          ZmxBackend.sessionName(cfg.sessionId),
+          cfg.persistentBackendTarget.sessionName,
           cfg.sessionId,
+          undefined,
+          resolvedZmxSocketDir,
         );
         resolvedZmxSessionProbe = resolved.probe;
         resolvedZmxSessionPid = resolved.pid;
@@ -12917,7 +17222,7 @@ async function spawnCli(
       workingDir: cfg.workingDir,
       model: cfg.model,
       disableCliBypass: cfg.disableCliBypass,
-      env: cfg.env ? sanitizePerBotEnv(cfg.env) : undefined,
+      env: cfg.env ? botInjectedEnv(cfg.env, cfg.envPolicy) : undefined,
       // Resume the persisted lineage: daemon restart, /relay and worker rebuilds
       // all arrive with riffParentTaskId set (the shared remote-lineage channel —
       // see the riff_task_id IPC message, emitted by the generic
@@ -12951,6 +17256,7 @@ async function spawnCli(
     (riffBackendConfig as EffectiveMojoConfig).env = {
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
@@ -12973,11 +17279,15 @@ async function spawnCli(
     if (riffCfg.sandboxCluster !== undefined && !isValidRiffSandboxCluster(riffCfg.sandboxCluster)) {
       throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(riffCfg.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
+    if (riffCfg.jwtHome !== undefined && !isValidRiffJwtHome(riffCfg.jwtHome)) {
+      throw new Error(`riff jwtHome 非法（需绝对路径，如 /home/alice，当前: ${JSON.stringify(riffCfg.jwtHome)}）——留空则用 daemon 自身的 HOME`);
+    }
     const sessionEnv: Record<string, string> = {
       BOTMUX_SESSION_ID: cfg.sessionId,
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+      BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
@@ -13020,7 +17330,7 @@ async function spawnCli(
     // explicit riff config.env takes precedence over both. The workflow
     // kill-switch is a host-resolved snapshot and is re-frozen AFTER this merge
     // (see below), so it is intentionally NOT set in sessionEnv here.
-    const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
+    const mergedEnv: Record<string, string> = { ...sessionEnv, ...botInjectedEnv(cfg.env, cfg.envPolicy), ...riffCfg.env };
     // The effective policy is a host-resolved snapshot, not a user-overridable
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
@@ -13030,6 +17340,7 @@ async function spawnCli(
     // it again here to prevent a stale/forged remote value from desynchronising
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
+    mergedEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
     // Public selector metadata is a host-resolved session snapshot. It is only
     // a send-time validation hint (the daemon reauthorizes every callback), but
     // still freeze it after raw riff env merges so stale config cannot desync
@@ -13043,6 +17354,7 @@ async function spawnCli(
     // daemon's authoritative decision. The daemon-side gate is unaffected either
     // way; this keeps the in-pane defense-in-depth honest on the riff path too.
     mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
+    mergedEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -13112,17 +17424,72 @@ async function spawnCli(
       : undefined,
   );
   const riffRemoteBackend = remoteBackendFullyOffBox;
-  if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
-    log(`Sandbox flag set but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
+  // Resolve the tri-state once: 'off' | 'oncall' (fs-policy whitelist) |
+  // 'scratch' (full-root COW, adapters/backend/scratch-sandbox.ts). The env
+  // override is the operator's global force switch; legacy readIsolation
+  // implies oncall.
+  //
+  // Shared with the auto-worktree fail-closed gate (services/default-worktree.ts)
+  // via resolveLocalSandboxMode, so "which local sandbox does this spawn get"
+  // is decided by ONE function on both sides and can never drift again.
+  const sandboxMode = resolveLocalSandboxMode({
+    backendType: effectiveBackendType,
+    mojoConfig: effectiveBackendType === 'mojo'
+      ? (riffBackendConfig as EffectiveMojoConfig | undefined)
+      : undefined,
+    configSandbox: cfg.sandbox,
+    readIsolation: cfg.readIsolation === true,
+    envValue: process.env.BOTMUX_SANDBOX,
+  });
+  if (riffRemoteBackend && sandboxMode !== 'off') {
+    log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
-  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox
-      && (cfg.sandbox === true || cfg.readIsolation === true)) {
+  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox && sandboxMode !== 'off') {
     // Loud on purpose: this is the combination where a mojo bot DOES execute
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const sandboxRequested = !riffRemoteBackend
-    && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
+  if (effectiveNetworkError) throw new Error(effectiveNetworkError);
+  const scratchRequested = sandboxMode === 'scratch';
+  const sandboxRequested = sandboxMode !== 'off';
+  if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('sandbox "scratch" is supported only on Linux (full-root COW overlay) and macOS (APFS clonefile); use "oncall" or turn the sandbox off');
+  }
+  if (scratchRequested && cfg.readIsolation === true) {
+    throw new Error('sandbox "scratch" cannot be combined with the legacy readIsolation flag');
+  }
+  // Authoritative zero-prompt capability gate with the RESOLVED sandbox mode.
+  // The config/command-time supportsZeroPromptInjection call only sees the
+  // CONFIG/session sandbox value; the machine-wide BOTMUX_SANDBOX switch (esp.
+  // =scratch) is resolved into sandboxMode here via resolveSandboxMode but is
+  // never materialised into cfg. Re-check with the resolved mode (and the real
+  // backend) so zero-prompt cursor/antigravity cannot silently drop replies
+  // under the full-root COW overlay (authPaths binds do not apply there) or on a
+  // backend whose final-harvest path is unsupported (antigravity × zmx).
+  if (cfg.promptInjection === 'none' && !supportsZeroPromptInjection(cfg.cliId, {
+    backendType: effectiveBackendType,
+    sandbox: sandboxMode,
+    readIsolation: cfg.readIsolation === true,
+    codexRpcInput: cfg.codexRpcInput === true,
+  })) {
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+  }
+  {
+    // The auto-worktree gate's degrade verdict may only be strengthened here.
+    const fallbackError = autoWorktreeFallbackSandboxError({
+      sandboxMode,
+      workingDir: cfg.workingDir,
+      fallbackDir: cfg.autoWorktreeFallbackDir,
+    });
+    if (fallbackError) throw new Error(fallbackError);
+  }
+  if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
+    throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
+  }
+  if (cfg.cliInstanceBinding?.source !== 'legacy' && cfg.cliInstanceBinding && sandboxRequested) {
+    throw new Error('Codex instance routing does not support sandbox/readIsolation');
+  }
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,
@@ -13167,14 +17534,19 @@ async function spawnCli(
     && credentialIsolationGate.mode !== 'remote-bypass';
   const credentialOnlySeatbelt = credentialIsolationGate.mode === 'seatbelt';
   const credentialOnlyBwrap = credentialIsolationGate.mode === 'bwrap';
+  /** Flavour of the per-session tree this spawn builds (null: none). */
+  const requestedTreeFlavour = requestedSandboxTreeFlavour({
+    platform: process.platform,
+    scratchRequested,
+    sandboxRequested,
+    credentialOnlyBwrap,
+  });
   const appliedIsolationCapabilities: IsolationCapability[] = [];
   if (credentialBoundaryActive || sandboxRequested) {
     appliedIsolationCapabilities.push('credential');
   }
   if (sandboxRequested) appliedIsolationCapabilities.push('read', 'write');
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
-  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
-    ?? join(defaultBotmuxHome, 'data');
   // The unified Darwin sandbox enforces both read and write isolation. Keep
   // the legacy marker fields because a live persistent pane carries the
   // compiled Seatbelt policy in-process and may only be reattached when that
@@ -13185,6 +17557,10 @@ async function spawnCli(
     if (!path) return '';
     try { return realpathSync(path); } catch { return path; }
   };
+  const botmuxInstallRoot = canonicalPolicyPath(dirname(dirname(fileURLToPath(import.meta.url))));
+  const nativeHookProtocolToken = cfg.cliId === 'traex' && !remoteWsUrl
+    ? 'native-subagent-runtime-hook.v1'
+    : '';
   const darwinIsolationPolicyDigest = process.platform === 'darwin'
     ? isolationPanePolicyDigest({
         readIsolation: willReadIsolate,
@@ -13195,9 +17571,7 @@ async function spawnCli(
         ].map(canonicalPolicyPath),
         readOnlyExtraPaths: (cfg.sandboxPaths?.readOnly ?? []).map(canonicalPolicyPath),
         readWriteExtraPaths: (cfg.sandboxPaths?.readWrite ?? []).map(canonicalPolicyPath),
-        writeAllowExtraPaths: process.env.TMPDIR
-          ? [canonicalPolicyPath(process.env.TMPDIR)]
-          : [],
+        writeAllowExtraPaths: [canonicalPolicyPath(sessionScratchDir)],
         workingDir: canonicalPolicyPath(cfg.workingDir),
         homeDir: canonicalPolicyPath(homedir()),
         osUserHomeDir: canonicalPolicyPath(userInfo().homedir),
@@ -13210,15 +17584,18 @@ async function spawnCli(
     : undefined;
   const managedOriginChannelRequired = willReadIsolate
     || credentialOnlySeatbelt
-    || credentialOnlyBwrap;
+    || credentialOnlyBwrap
+    || sandboxRequested;
   const managedOriginChannelPolicyDigest = (willReadIsolate || willWriteSandbox)
     ? darwinIsolationPolicyDigest
     : managedOriginChannelRequired
       ? createHash('sha256').update(JSON.stringify({
-          domain: 'botmux.credential-origin-channel.v1',
+          domain: 'botmux.credential-origin-channel.v2',
           platform: process.platform,
           configuredBotmuxHome: canonicalPolicyPath(configuredBotmuxHome),
           defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
+          botmuxInstallRoot,
+          nativeHookProtocolToken,
         })).digest('hex')
       : undefined;
 
@@ -13243,6 +17620,7 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
@@ -13262,13 +17640,33 @@ async function spawnCli(
       ? resolvedZmxSessionProbe === 'exists'
       : effectiveBackend === 'zellij'
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
-        : undefined,
+        : effectiveBackend === 'tmux'
+          ? persistentReattachBias(resolvedTmuxSessionProbe)
+          : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
+  // Settle a reattach that rests on an indeterminate existence probe with one
+  // more look BEFORE anything consumes the selection (read-isolation /
+  // mcp-gateway / credential gates, then the predicted outcome that freezes
+  // the fresh boot marker + isolation wrapper, credential stamp,
+  // startupCommands and initial-prompt routing). An authoritative 'missing'
+  // turns a doomed reattach into a proper cold spawn WITH the fresh-path setup;
+  // a still-'unknown' answer keeps the reattach bias, so the backend never
+  // creates over a possibly-live pane (no duplicate-session swallowing).
+  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij') {
+    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe : resolvedZellijSessionProbe;
+    const after = reconcileBiasedReattachProbe(before, () => (effectiveBackend === 'tmux'
+      ? TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId))
+      : ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))));
+    if (after !== before) {
+      log(`${effectiveBackend} existence re-probe before spawn: ${before} → ${after}`);
+      if (effectiveBackend === 'tmux') resolvedTmuxSessionProbe = after;
+      else resolvedZellijSessionProbe = after;
+    }
+  }
   let selectedBackend = selectBackend();
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
-  isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
   // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it, plus
   // Codex bots explicitly requesting isolated auth, keep their CLI data
@@ -13279,14 +17677,50 @@ async function spawnCli(
   // sandbox itself still applies). Decided EARLY so every JSONL/bridge/resume
   // path below already targets the right dir. wrapperCli strips spawn args, so
   // the redirect (and its env) can't be guaranteed there → not redirected.
-  const isolatedCodexHomeRequested = cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
-  const willRedirectCliData = shouldRedirectCliData({
+  const legacyHomePolicy = !cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy';
+  const isolatedCodexHomeRequested = legacyHomePolicy && cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
+  // scratch deliberately reads the CLI's NATIVE ~/.claude/~/.codex (zero-config
+  // is the mode's point); the oncall BOT_HOME redirect does not apply there.
+  if (scratchRequested && isolatedCodexHomeRequested) {
+    throw new Error('codexAuthSync "isolated" cannot be combined with sandbox "scratch" (scratch uses the native CLI home)');
+  }
+  const willRedirectCliData = !scratchRequested && legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
     forcePerBotHome: isolatedCodexHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
     wrapperCli: cfg.wrapperCli,
     sessionDataDir: process.env.SESSION_DATA_DIR,
   });
+  // Per-bot credential source: decided before any provisioning so a refused
+  // plan never leaves a half-seeded data root behind. See
+  // services/cli-credential-source.ts for the fail-closed contract.
+  const credentialSourcePlan = planCredentialSource({
+    sourceDir: cfg.credentialsSourceDir,
+    cliId: cfg.cliId,
+    codexAuthSync: cfg.codexAuthSync,
+    sandboxRequested,
+    willRedirectCliData,
+    wrapperCli: cfg.wrapperCli,
+    supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
+    sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,
+    isClaudeFamily: !!claudeDataDir,
+    perBotEnv: cfg.env,
+  });
+  if (credentialSourcePlan.kind === 'ineffective') {
+    log(`[credentials-source] WARN ${credentialSourcePlan.warning}`);
+  } else if (credentialSourcePlan.kind === 'refuse') {
+    throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${credentialSourcePlan.reason}`);
+  }
+  const credentialSourceDir = credentialSourcePlan.kind === 'copy' ? credentialSourcePlan.sourceDir : undefined;
+  const credentialSourceFiles = credentialSourcePlan.kind === 'copy'
+    ? (() => {
+        try {
+          return readCredentialSource(credentialSourcePlan.sourceDir, credentialSourcePlan.family);
+        } catch (e) {
+          throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${(e as Error).message}`);
+        }
+      })()
+    : undefined;
   if (isolatedCodexHomeRequested && !willRedirectCliData) {
     const reason = cfg.wrapperCli
       ? 'wrapperCli cannot guarantee CODEX_HOME propagation'
@@ -13322,33 +17756,87 @@ async function spawnCli(
   if (willRedirectCliData) {
     isolationBotHome = ownBotHome!;
     const isClaudeFam = !!claudeDataDir;
+    // Captured before the redirect below: with a config profile the adapter's
+    // data root IS the (resolved) profile dir, and it becomes the provisioning
+    // source for BOT_HOME instead of the global ~/.claude.
+    const claudeProfileDir = isClaudeFam && cfg.cliConfigDir ? claudeDataDir : undefined;
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(
-      isolationBotHome,
-      cfg.workingDir,
-      isClaudeFam,
-      cfg.cliId,
-      cliAdapter.hookInstall,
-      cfg.codexAuthSync ?? 'shared',
-      log,
-    );
-    if (isClaudeFam && effectiveReadyHookInstall) {
-      effectiveReadyHookInstall = {
-        ...effectiveReadyHookInstall,
-        configPath: join(claudeDataDir!, 'settings.json'),
-      };
-    }
-    if (cliAdapter.mcpGateway) {
-      const isolatedConfigPath = isClaudeFam
-        ? join(claudeDataDir!, '.claude.json')
-        : join(isolationBotHome, 'codex', 'config.toml');
-      const report = ensureGatewayEntry({
-        id: cliAdapter.id,
-        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
-      });
-      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    // Every writer of the per-bot data root runs inside one closure: in
+    // credential-source mode it is serialized per bot (sibling sessions share
+    // <BOT_HOME>/claude), so a concurrent spawn cannot re-install a stale
+    // snapshot (shared oauthAccount / primaryApiKey) after this one's
+    // reconcile, and the post-check below sees the final state.
+    const botHome = isolationBotHome;
+    const adapter = cliAdapter;
+    const provisionBotHome = (): void => {
+      provisionIsolatedBotHome(
+        botHome,
+        cfg.workingDir,
+        isClaudeFam,
+        cfg.cliId,
+        adapter.hookInstall,
+        cfg.codexAuthSync ?? 'shared',
+        log,
+        credentialSourceFiles !== undefined,
+        claudeProfileDir,
+      );
+      if (credentialSourceFiles && claudeDataDir) {
+        // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
+        // failed copy must stop the spawn, not leave an older (possibly shared-
+        // account) credential in place. Atomic 0600 replace: never writes
+        // through a planted leaf symlink, never keeps a loose mode.
+        for (const [name, raw] of Object.entries(credentialSourceFiles)) {
+          writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+        }
+        // The per-bot .claude.json was seeded once from the global state: align
+        // its account identity with the source and drop any API-key login.
+        reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
+      }
+      if (isClaudeFam && effectiveReadyHookInstall) {
+        effectiveReadyHookInstall = {
+          ...effectiveReadyHookInstall,
+          configPath: join(claudeDataDir!, 'settings.json'),
+        };
+      }
+      if (adapter.mcpGateway) {
+        const isolatedConfigPath = isClaudeFam
+          ? join(claudeDataDir!, '.claude.json')
+          : join(botHome, 'codex', 'config.toml');
+        const report = ensureGatewayEntry({
+          id: adapter.id,
+          mcpGateway: { ...adapter.mcpGateway, configPath: isolatedConfigPath },
+        });
+        if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (credentialSourceFiles && claudeDataDir) {
+        // Post-condition, independent of the (best-effort) settings merge: no
+        // auth override may remain where the CLI reads it.
+        const overrides = [
+          ...claudeAuthOverridesInSettingsLayers({
+            userSettingsPath: join(claudeDataDir, 'settings.json'),
+            workingDir: cfg.workingDir,
+          }),
+          ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
+          ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
+        ];
+        if (overrides.length) {
+          throw new Error(
+            `[credentials-source] refusing to start bot ${cfg.larkAppId}: auth overrides would bypass `
+            + `${credentialSourceDir}: ${overrides.join(', ')}`,
+          );
+        }
+        log(`[credentials-source] copied ${Object.keys(credentialSourceFiles).join(', ')} from ${credentialSourceDir}`);
+      }
+    };
+    if (credentialSourceFiles) {
+      // Lock lives in the worker data dir, outside the sandbox's reach.
+      const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);
+      mkdirSync(dirname(provisionLock), { recursive: true, mode: 0o700 });
+      withFileLockSync(provisionLock, provisionBotHome);
+    } else {
+      provisionBotHome();
     }
     if (!isClaudeFam) {
       isolatedCodexHome = join(isolationBotHome, 'codex');
@@ -13430,7 +17918,7 @@ async function spawnCli(
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
-      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, resolvedZmxSocketDir)
       : undefined;
     // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe is not
     // proof of anything. Other persistent backends: their target probe returning
@@ -13438,8 +17926,20 @@ async function spawnCli(
     // (paneProbe) into the state machine, which fail-closes on `unknown` for EVERY
     // backend (refuse-inconclusive-probe) — no longer only ZMX, and no longer
     // collapsed into "dead" (which would clear a still-confined pane's provenance).
-    const paneProbe = zmxOwnedProbe?.probe
+    const rawPaneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
+    // Cold machine (reboot wiped the tmux socket, no tmux process visible): the
+    // pane provably died with the box — let the gate cold-spawn instead of
+    // refusing forever. Scoped to this gate only; see resolveReadIsolationPaneProbe.
+    const resolvedPaneProbe = resolveReadIsolationPaneProbe(
+      rawPaneProbe,
+      effectiveBackendType,
+      () => TmuxBackend.serverAbsentOnColdMachine(),
+    );
+    const paneProbe = resolvedPaneProbe.probe;
+    if (resolvedPaneProbe.coldServerAbsent) {
+      log(`[read-isolation] tmux socket missing and no tmux process visible (cold machine) — treating pane of ${cfg.sessionId} as gone`);
+    }
     if (
       effectiveBackendType === 'zmx'
       && resolvedZmxSessionProbe !== 'exists'
@@ -13456,7 +17956,7 @@ async function spawnCli(
     const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
     // isolatedPaneReattachSafe only means anything under a policy-ON spawn; the
     // state machine consults it only in that arm.
-    const isolationMarkerReattachSafe = appliedIsolationCapabilities.length > 0
+    const isolationMarkerMatches = appliedIsolationCapabilities.length > 0
       && isolatedPaneReattachSafe(marker, {
         requiredCapabilities: appliedIsolationCapabilities,
         exactCapabilities: true,
@@ -13467,6 +17967,36 @@ async function spawnCli(
           policyDigest: managedOriginChannelPolicyDigest,
         } : {}),
       });
+    // Every Linux bwrap pane (oncall / scratch file sandbox, credential-only)
+    // can only send through the relay outbox it bound at spawn (by inode). If
+    // that directory is gone, a successor worker cannot re-serve it —
+    // recreating the path yields an inode the pane never sees — so every send
+    // would time out (and a scratch pane's host-side COW view is gone with it).
+    // Treat it like any other unsafe generation: kill + cold-spawn, which
+    // provisions a fresh tree and bind. The probes below never create anything.
+    const paneRelayBoundByInode = process.platform === 'linux'
+      && (sandboxRequested || credentialOnlyBwrap);
+    // The live pane runs against the tree of the flavour it was spawned with.
+    // A policy flip that keeps the same isolation capabilities (oncall ↔
+    // scratch) must not reattach it under the other flavour's arm.
+    const recordedTreeFlavour = paneRelayBoundByInode
+      ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
+      : null;
+    const paneRelayReattachable = !paneRelayBoundByInode
+      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+        ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
+        : sandboxRequested
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
+          : attachCredentialOnlyRelayOutbox({
+              sessionId: cfg.sessionId,
+              dataDir: isolationRuntimeDataDir,
+            })) !== null);
+    if (paneLive && isolationMarkerMatches && !paneRelayReattachable) {
+      log(recordedTreeFlavour && recordedTreeFlavour !== requestedTreeFlavour
+        ? `[sandbox] persistent pane ${cfg.sessionId} runs a ${recordedTreeFlavour} sandbox tree, not ${requestedTreeFlavour} — killing + cold-spawning instead of reattaching`
+        : `[sandbox] persistent pane ${cfg.sessionId} lost its relay outbox — killing + cold-spawning instead of reattaching`);
+    }
+    const isolationMarkerReattachSafe = isolationMarkerMatches && paneRelayReattachable;
     // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
     // read (real 0600 regular file, right owner) + schema/version validation — a
     // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
@@ -13521,7 +18051,7 @@ async function spawnCli(
           // helper: only this path holds the frozen PID, which makes the
           // ownership check stricter than the name+label check.
           if (effectiveBackendType === 'zmx') {
-            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid);
+            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir));
           } else if (stalePersistentTarget) {
             killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
           } else {
@@ -13533,7 +18063,7 @@ async function spawnCli(
       },
       confirmPaneGone: () => {
         const postKillProbe = effectiveBackendType === 'zmx'
-          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
+          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
           : (stalePersistentTarget
             ? probePersistentBackendTarget(stalePersistentTarget)
             : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
@@ -13564,6 +18094,8 @@ async function spawnCli(
           // mcp-gateway gate is laxer (it only rejects a proven-live pane), so
           // its own reset still has to fail closed on 'unknown' explicitly.
           resolvedZellijSessionProbe = 'missing';
+        } else if (effectiveBackendType === 'tmux') {
+          resolvedTmuxSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -13578,7 +18110,6 @@ async function spawnCli(
         selectedBackend = selectBackend();
         isTmuxMode = selectedBackend.isTmuxMode;
         isPipeMode = selectedBackend.isPipeMode;
-        isZellijMode = selectedBackend.isZellijMode;
         backend = selectedBackend.backend;
         cliLifetimeNonce++;
         persistentSessionName = selectedBackend.persistentSessionName;
@@ -13591,7 +18122,9 @@ async function spawnCli(
         throw new Error(
           `[read-isolation] refusing to start session ${cfg.sessionId}: `
           + `could not verify existing ${effectiveBackendType} pane `
-          + `(liveness probe: ${paneProbe})`,
+          + `(liveness probe: ${paneProbe})\n\n`
+          + `宿主机 tmux server 当前不可达：探测结果不确定时，botmux 会保持现状，不会清理或重建 pane。`
+          + `请不要执行 kill-server；后端恢复后会自动重新探测，也可稍后重发消息重试。`,
         );
       },
     };
@@ -13621,6 +18154,21 @@ async function spawnCli(
     : null;
   if (readIsolationOriginChannelId) {
     persistentPaneOriginChannelId = readIsolationOriginChannelId;
+    ensureManagedOriginCapabilityLeafSafe(managedOriginCapabilityPath(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    ));
+    ensureManagedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
+    sweepManagedOriginAttestationProofs(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
   }
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
@@ -13628,7 +18176,7 @@ async function spawnCli(
     // ZMX ownership is label/PID-sensitive, so only its inconclusive probe
     // fails closed. Other backends keep the pre-ZMX target-probe semantics.
     const paneProbe = effectiveBackendType === 'zmx'
-      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid).probe
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, resolvedZmxSocketDir).probe
       : (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
       effectiveBackendType === 'zmx'
@@ -13653,6 +18201,15 @@ async function spawnCli(
     // proven 'exists'. So an unverifiable zellij pane here must fail closed like
     // zmx rather than silently reattach to a possibly-dead gateway host.
     if (effectiveBackendType === 'zellij' && paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
+    // tmux: same reasoning, but only when the reattach itself rests on an
+    // indeterminate probe (an authoritative 'exists' selection keeps the
+    // pre-existing semantics for a transiently unanswered re-probe here).
+    if (effectiveBackendType === 'tmux' && resolvedTmuxSessionProbe === 'unknown' && paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,
@@ -13697,6 +18254,7 @@ async function spawnCli(
           persistentSessionName,
           cfg.sessionId,
           resolvedZmxSessionPid,
+          zmxEnv(process.env, resolvedZmxSocketDir),
         );
       } else if (persistentTarget) {
         killPersistentBackendTarget(persistentTarget, cfg.sessionId);
@@ -13707,7 +18265,7 @@ async function spawnCli(
       // below decides reattach-vs-fresh from this probe, so an unconfirmed kill
       // would let the new backend reattach to the pane we just tried to remove.
       const postKillProbe = effectiveBackendType === 'zmx'
-        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
         : (persistentTarget
           ? probePersistentBackendTarget(persistentTarget)
           : probePersistentSession(persistentBackendType, persistentSessionName));
@@ -13725,15 +18283,74 @@ async function spawnCli(
         // the re-selection cold-spawns a fresh host instead of reattaching to
         // the pane we just killed. Fail closed to 'missing' unless proven live.
         resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
       isPipeMode = selectedBackend.isPipeMode;
-      isZellijMode = selectedBackend.isZellijMode;
       backend = selectedBackend.backend;
       cliLifetimeNonce++;
       persistentSessionName = selectedBackend.persistentSessionName;
       willReattachPersistent = selectedBackend.isReattach === true;
+    }
+  }
+
+  // Credential-source gate: a surviving persistent pane keeps the login its CLI
+  // started with. Reattach only when that generation's recorded source equals
+  // the configured one (both absent ≡ shared login → historical behaviour).
+  // Otherwise kill + cold-spawn so the freshly copied credential takes effect.
+  if (willReattachPersistent && persistentSessionName && effectiveBackendType !== 'pty') {
+    const launchedWith = readCredentialSourceStamp(config.session.dataDir, cfg.sessionId);
+    const envPolicyChanged = envPolicyRequiresColdStart(readEnvPolicyStamp(config.session.dataDir, cfg.sessionId), cfg.envPolicy);
+    if (launchedWith !== (credentialSourceDir ?? null) || envPolicyChanged) {
+      log(`[credentials-source] persistent pane ${cfg.sessionId} has a different credential source or environment policy — killing + cold-spawning`);
+      const persistentBackendType = effectiveBackendType as PersistentBackendType;
+      const persistentTarget = selectedBackend.persistentBackendTarget;
+      if (effectiveBackendType === 'zmx') {
+        ZmxBackend.killManagedSession(
+          persistentSessionName,
+          cfg.sessionId,
+          resolvedZmxSessionPid,
+          zmxEnv(process.env, resolvedZmxSocketDir),
+        );
+      } else if (persistentTarget) {
+        killPersistentBackendTarget(persistentTarget, cfg.sessionId);
+      } else {
+        killPersistentSession(persistentBackendType, persistentSessionName, cfg.sessionId);
+      }
+      const postKillProbe = effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+        : (persistentTarget
+          ? probePersistentBackendTarget(persistentTarget)
+          : probePersistentSession(persistentBackendType, persistentSessionName));
+      // Only an authoritative `missing` proves the old-account CLI is gone.
+      if (postKillProbe !== 'missing') {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: `
+          + `could not confirm stale ${effectiveBackendType} pane termination (post-kill probe: ${postKillProbe})`,
+        );
+      }
+      if (effectiveBackendType === 'zmx') {
+        resolvedZmxSessionProbe = postKillProbe;
+        resolvedZmxSessionPid = undefined;
+      } else if (effectiveBackendType === 'zellij') {
+        resolvedZellijSessionProbe = 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = 'missing';
+      }
+      selectedBackend = selectBackend();
+      isTmuxMode = selectedBackend.isTmuxMode;
+      isPipeMode = selectedBackend.isPipeMode;
+      backend = selectedBackend.backend;
+      cliLifetimeNonce++;
+      persistentSessionName = selectedBackend.persistentSessionName;
+      willReattachPersistent = selectedBackend.isReattach === true;
+      if (willReattachPersistent) {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: backend still selects reattach after killing the stale pane`,
+        );
+      }
     }
   }
 
@@ -13755,6 +18372,13 @@ async function spawnCli(
     willReattachPersistent = false;
   }
 
+  // Record which credential source this CLI generation launches with, before
+  // spawn, so the next worker's reattach gate above can compare. A reattach
+  // keeps the existing record (it was verified equal).
+  if (!willReattachPersistent) {
+    writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);
+  }
+
   // The worker establishes trust before any runner output can be parsed. A
   // fresh runner gets a new capability; a persistent reattach reloads the
   // capability created by that same runner generation.
@@ -13770,6 +18394,9 @@ async function spawnCli(
   if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
 
   const replacementExpectedFresh = codexRunnerFreshness === 'restarting_fresh';
+  if (codexAutoUpgrade?.stage === 'restoring' && willReattachPersistent) {
+    throw new Error('Automatic Codex upgrade refused to reattach an old persistent process');
+  }
   const freshness = decideCodexRunnerFreshness({
     cliId: cfg.cliId,
     adoptMode: cfg.adoptMode === true,
@@ -13808,7 +18435,8 @@ async function spawnCli(
   // Fresh spawns (incl. resume that starts a new CLI, where hasSession is false)
   // arm it. spawnCli is synchronous up to backend spawn, so this lands before
   // any flushPending consumes the flag.
-  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent });
+  hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })
+    || codexAutoUpgrade?.stage === 'restoring';
   // Re-arm the bare-shell launch detector for this spawn (fresh OR reattach). It
   // runs once on the first flush and only fires when the pane leaf is actually a
   // bare shell, so a healthy reattach (leaf = the live CLI) self-excludes while a
@@ -13890,11 +18518,12 @@ async function spawnCli(
   // adapter probe below queries the exact DB Hermes will `--resume` against.
   const hermesResumeStateDbPath = cfg.cliId === 'hermes'
     ? resolveHermesStateDbPath(
-      { ...process.env, ...sanitizePerBotEnv(cfg.env), BOTMUX_SESSION_ID: cfg.sessionId },
+      { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy), BOTMUX_SESSION_ID: cfg.sessionId },
       { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
     )
     : undefined;
-  const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2;
+  const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2
+    && codexAutoUpgrade?.stage !== 'restoring';
   // Tier 0: see block comment above. The adapter itself drops --resume when
   // the id is missing (its buildArgs starts fresh); demoting HERE keeps
   // effectiveResume honest so the fresh-demotion notice below fires.
@@ -13915,6 +18544,13 @@ async function spawnCli(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
+  if (codexAutoUpgrade?.stage === 'restoring'
+      && (fallBackToFresh || !effectiveResume || effectiveCliSessionId !== codexAutoUpgrade.threadId)) {
+    throw new Error('Automatic Codex upgrade requires the original resume target; fresh fallback is disabled');
+  }
+  if (fallBackToFresh && cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    throw new Error(`Codex instance ${cfg.cliInstanceBinding.instanceId}: exact resume target unavailable; refusing fresh-session fallback`);
+  }
   if (fallBackToFresh) {
     const reason = tier2ForceFresh
       ? `consecutive restart x${consecutiveInWorkerRestarts} — 2nd failed resume attempt`
@@ -13933,15 +18569,24 @@ async function spawnCli(
     }
     // Single human-visible warning. Spam guard: at most once per worker
     // lifecycle (a 4× crash loop otherwise duplicates the notice).
-    if (!resumeFallbackNotified) {
+    // claude-family only: when the transcript bridge never saw the session's
+    // JSONL file, the "history" that would not carry over never existed — the
+    // fallback is recovering a first-turn launch failure, and the pending
+    // first prompt is re-queued, not lost. Notifying the user about context
+    // they never had is a false alarm. Other CLIs (no JSONL bridge) keep the
+    // legacy always-notify behavior.
+    const suppressFallbackNotice =
+      (tier1ProbeFalse || tier2ForceFresh) && claudeDataDir !== undefined && !cliTranscriptEverExisted;
+    if (suppressFallbackNotice) {
+      log(`Resume fallback notice suppressed: no CLI transcript ever existed for this session (first-turn launch recovery); nothing user-visible was lost`);
+    } else if (!resumeFallbackNotified) {
       resumeFallbackNotified = true;
       send({
         type: 'user_notify',
         turnId: currentBotmuxTurnId,
         message:
-          `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
-          `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
-          `之前的上下文不会带到本轮，需要的话请简述背景。`,
+          `⚠️ 会话启动失败，正在尝试以新会话重新启动。\n` +
+          `这次重试不会恢复历史上下文；如需继续之前的任务，请补充背景。`,
       });
     }
     // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
@@ -14009,15 +18654,25 @@ async function spawnCli(
     preparedInitialPrompt = prepared?.initialPrompt ?? cfg.prompt;
     promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;
   }
+  const hasDurableInitialPrompt = cfg.dispatchAttempt !== undefined || !!cfg.queuedActivationToken;
+  const durableInitialPromptArgBaseline = hasDurableInitialPrompt
+    ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
+    : undefined;
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
-    hasStartupCommands: !!cfg.startupCommands?.length,
+    hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || shouldDeferArgsBakedDurablePrompt({
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+    durableInitialPromptViaArgs: cliAdapter.durableInitialPromptViaArgs === true
+      && durableInitialPromptArgBaseline !== null,
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
     queuedActivationToken: cfg.queuedActivationToken,
+  }) || shouldDeferInitialPromptForReattach({
+    willReattachPersistent,
+    adoptMode: cfg.adoptMode === true,
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true)
     || (!promptArgPreparationChanged && shouldDeferInitialPromptForArgLimit({
       passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -14036,7 +18691,7 @@ async function spawnCli(
   // Argv-baked first prompt tracking (PR #633 P2 / second-round review):
   //  - needsWorkingSeed: any argv CLI (Pi/Gemini/MTR/OpenCode/Grok) so card-off
   //    reactions can form working→idle (seeded at first ready or Grok arm).
-  //  - busy arm: only Grok-class SessionStart (first ready ≠ turn end).
+  //  - busy arm: argv-baked prompt + reliable turn terminal (Grok-class; first ready is pre-execution).
   const argvBakedOpts = {
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
     preparedInitialPrompt,
@@ -14045,7 +18700,6 @@ async function spawnCli(
   spawnArgvNeedsWorkingSeed = shouldTrackArgvBakedFirstPrompt(argvBakedOpts);
   spawnArgvInitialPromptBusy = shouldArmSpawnArgvInitialPromptBusy({
     ...argvBakedOpts,
-    injectsReadyHook: cliAdapter.injectsReadyHook === true,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
   // Fresh evidence window for the argv first-turn start gate (Pi): the new
@@ -14061,6 +18715,17 @@ async function spawnCli(
     piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
   }
   lastSpawnDeferInitialPrompt = deferInitialPrompt;
+  lastSpawnArgvDurableInitialPrompt = !deferInitialPrompt
+    && !effectiveResume
+    && !willReattachPersistent
+    && !!preparedInitialPrompt
+    && cliAdapter.durableInitialPromptViaArgs === true
+    && !!cliAdapter.confirmInitialPromptArgSubmission
+    && durableInitialPromptArgBaseline !== null
+    && hasDurableInitialPrompt;
+  lastSpawnArgvDurableInitialPromptSubmission = lastSpawnArgvDurableInitialPrompt
+    ? { baseline: durableInitialPromptArgBaseline!, content: preparedInitialPrompt! }
+    : undefined;
   kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
   kiroSessionIdCaptureBuffer = '';
   // Sandboxed sessions: write this bot's OWN send-credential into its BOT_HOME.
@@ -14090,11 +18755,86 @@ async function spawnCli(
   const buildArgsWorkingDir = sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
+  // Per-bot env 提升通道（claude 家族）：把 bots.json `env` 交给适配器写进进程级
+  // --settings 文件。背景：Claude 会把各 settings 源的 `env` 覆盖到进程 env 之上，
+  // 用户级 ~/.claude/settings.json 的 env（如 ANTHROPIC_BASE_URL/AUTH_TOKEN）会在 CLI
+  // 启动时盖掉 pane 注入的 per-bot 进程 env，bot 自配的第三方供应商被静默改写；
+  // --settings 优先级高于用户/项目 settings 文件，能把 bot env 顶到最上。文件落 CLI
+  // 在各模式下都一定能读的位置：数据重定向/沙盒下放有效 CLI 数据根（bwrap 已 bind
+  // canonical 路径），其余放 per-bot BOT_HOME；密钥走 0600 文件而非 inline argv
+  // （argv 可被 ps 读到）。wrapperCli 会剥 --settings，该场景自然退化为旧行为。
+  let perBotSettingsEnv: Record<string, string> | undefined;
+  let perBotSettingsFilePath: string | undefined;
+  if (cliAdapter.claudeDataDir && cfg.env && process.env.SESSION_DATA_DIR) {
+    const sanitized = botInjectedEnv(cfg.env, cfg.envPolicy);
+    if (Object.keys(sanitized).length > 0) {
+      perBotSettingsEnv = sanitized;
+      const settingsDir = willRedirectCliData && claudeDataDir
+        ? claudeDataDir
+        : join(botHomePath(dirname(process.env.SESSION_DATA_DIR), cfg.larkAppId), 'launch-settings');
+      let canonDir = settingsDir;
+      if (sandboxRequested) {
+        try { canonDir = realpathSync(settingsDir); } catch { /* 目录可能尚未创建，保留 lexical */ }
+      }
+      perBotSettingsFilePath = join(canonDir, 'botmux-launch-settings.json');
+
+    }
+  }
+  const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
+  const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  if (!boundLark && process.env.SESSION_DATA_DIR) {
+    cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
+  }
+  const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
+  const cliExtra = cliAdapter.allowExtraArgs === false
+    ? ''
+    : (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  const cliExtraArgs = cliExtra ? cliExtra.split(/\s+/).filter(Boolean) : [];
+
+  // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
+  // runs. Computed here rather than in the wrapper-install block below because
+  // buildArgs runs first; these are pure path derivations, so naming them early
+  // is safe, and the block below is still what actually writes the files.
+  //
+  // Shim paths and the identity-file locator must reach the tool shell together.
+  // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
+  // identity under the Botmux session id. No credential is passed here.
+  const identityShellEnv: Record<string, string> = {
+    BOTMUX_SESSION_ID: cfg.sessionId,
+    BOTMUX_CHAT_ID: cfg.chatId,
+    BOTMUX_LARK_APP_ID: cfg.larkAppId,
+    BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+  };
+  if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
+  if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
+    const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
+    identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
+    identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
+    identityShellEnv.ZDOTDIR = join(dir, 'shell');
+    identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+    // git runs as a shell subprocess too, so askpass needs the same forwarding
+    // or a push carries the machine's identity. Declared only when bytedcli is
+    // governed — that is the exact condition under which installGitAskpass
+    // writes the file, and pointing GIT_ASKPASS at a missing path would break
+    // git prompts rather than fall back.
+    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
+      identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
+    }
+  }
+  if (boundLark) {
+    identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(identityDataDir!, cfg.sessionId);
+    if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+  }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
     workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
+    quietResume: codexAutoUpgrade?.stage === 'restoring',
+    env: perBotInjectEnv,
+    extraArgs: cliExtraArgs,
     // Native session fork (Claude --fork-session / codex fork): resume the
     // source transcript but branch into a fresh CLI-minted id. Only on the
     // child's first spawn (cfg.forkSession) AND only when we actually resume —
@@ -14102,6 +18842,7 @@ async function spawnCli(
     // fork from, so a fresh session is spawned instead.
     forkSession: cfg.forkSession === true && effectiveResume,
     initialPrompt: preparedInitialPrompt,
+    nativeSessionTitle: cfg.nativeSessionTitle,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
@@ -14110,6 +18851,19 @@ async function spawnCli(
     // adapters (claude-code/genius/grok build it via buildBotmuxSystemPromptText).
     // Reuses the same predicate computed above for the persistent-pane guard.
     noTransport: noTransportSession,
+    // Trigger-user auth on → the system prompt gains the credential-boundary
+    // block. It is a behavioral rule, not a control: nothing in the OS stops the
+    // agent from reading another person's token file today, and the likeliest
+    // way that happens is an agent grepping the data dir to debug an auth error.
+    triggerUserAuth: cfg.triggerUserAuth,
+    larkToolAppId: boundLark ? cfg.larkAppId : undefined,
+    // Codex and TraeX explicitly set these in tool shells instead of depending
+    // on the CLI's default inheritance policy; other adapters inherit normally.
+    ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
+    // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
+    replyDelivery: cfg.replyDelivery,
+    promptInjection: cfg.promptInjection,
+    solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelBackendVariant: cfg.modelBackendVariant,
@@ -14118,12 +18872,16 @@ async function spawnCli(
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
     reasoningEffort: cfg.reasoningEffort,
+    serviceTier: cfg.serviceTier,
     disableCliBypass: cfg.disableCliBypass === true,
+    settingsEnv: perBotSettingsEnv,
+    settingsFilePath: perBotSettingsFilePath,
     codexBrowser: cfg.codexBrowser,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
     // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.
     // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
     bypassHookTrust: config.bypassCodexHookTrust,
+    hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
     skillPluginDir: cfg.skillPluginDir,
     // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
     // needs Codex's read-isolation shell-env behavior.
@@ -14135,6 +18893,11 @@ async function spawnCli(
     // RPC viewer branch actually triggers and never carries the bypass flags.
     remoteWsUrl,
     remoteThreadId,
+    // The remote TUI is only a viewer; its app-server received the same hook in
+    // engageCodexRpc. Plain Trae TUI processes own the model and get it here.
+    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
+      ? nativeSubagentRuntimeHookCommand()
+      : undefined,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -14144,13 +18907,10 @@ async function spawnCli(
   }
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
-  const extra = cliAdapter.allowExtraArgs === false
-    ? ''
-    : (process.env.CLI_EXTRA_ARGS ?? '').trim();
   if (cliAdapter.allowExtraArgs === false && (process.env.CLI_EXTRA_ARGS ?? '').trim()) {
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
-  if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
+  if (cliExtraArgs.length) args.push(...cliExtraArgs);
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
@@ -14178,7 +18938,7 @@ async function spawnCli(
 
   // Reattach vs fresh was predicted above (see willReattachPersistent) so the
   // resume pre-flight could short-circuit on it; reuse it here so the log line
-  // tells the truth. When a bmx-* tmux session is still alive, TmuxBackend.spawn
+  // tells the truth. When a bmx-* tmux session is still alive, the tmux backend
   // ignores the bin/args and just `tmux attach-session`s — logging
   // `Spawning: <new bin>` in that case is misleading and has cost real
   // debugging time. (CliId-mismatch reattach is now blocked upstream in
@@ -14200,6 +18960,7 @@ async function spawnCli(
           cliId: cfg.cliId as CliId,
           cliPathOverride: cfg.cliPathOverride,
           wrapperCli: cfg.wrapperCli,
+          cliLaunchMode: cfg.cliLaunchMode,
         }, cliName());
     if (unavailable) {
       log(`${unavailable} (PATH=${process.env.PATH ?? ''})`);
@@ -14217,7 +18978,10 @@ async function spawnCli(
   // bots.json on disk (im/lark/client.ts), `botmux ask` routes via the
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
-  const childEnv = redactChildEnv(process.env);
+  const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy);
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
+  // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
+  // The worker pin above is the single source for CLI and worker scratch.
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
@@ -14236,6 +19000,37 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  if (!boundLark) {
+    delete childEnv.BOTMUX_LARK_TOOL_BINDING;
+  }
+  const identityPolicy = boundLark && cfg.triggerUserAuth
+    ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+    : cfg.triggerUserAuth;
+  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+  if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
+    // Say plainly how protected the token store actually is. Without the file
+    // sandbox the agent runs as the same OS user as botmux and can read every
+    // person's token file directly; per-person storage fixes attribution and the
+    // overwrite bug, but only the sandbox makes the isolation OS-enforced.
+    // Logged rather than enforced: refusing to run would push operators away
+    // from a change that helps either way, and implying isolation we do not have
+    // would be worse than both.
+    const protection = tokenStoreProtection(sandboxRequested);
+    if (protection.advisory) log(`[trigger-user-auth] NOTE ${protection.advisory}`);
+    // An MCP server with its own app credentials never execs a wrapped CLI, so
+    // this policy does not reach it: the agent can still act under an identity
+    // unrelated to the current sender. Warn rather than block — a self-configured
+    // client has legitimate uses and botmux does not own it — but do not stay
+    // silent, or the operator will believe the boundary is complete.
+    try {
+      const selfCredentialed = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+      if (selfCredentialed) log(`[trigger-user-auth] NOTE ${selfCredentialed}`);
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not scan MCP configs: ${(e as Error).message}`);
+    }
+  }
   // §5 of botmux ask v0.1.7 — `botmux ask buttons` reads these to find the
   // daemon socket, route the card back to this thread, and resolve the
   // approver allowlist against session.owner. Missing env → exit 2.
@@ -14244,6 +19039,10 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+  if (perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT) {
+    childEnv.BOTMUX_APPEND_SYSTEM_PROMPT = perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT;
+  }
   // Pin the EXACT bots.json this daemon loaded so the child's `botmux send`
   // reads the SAME registry. Required when the daemon runs under a non-default
   // HOME (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME,
@@ -14297,6 +19096,9 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
+  // Scope and topic identity come from this Worker, after configurable envs.
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+  // Ask/browser approval require this anchor for both thread and chat sessions.
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
@@ -14310,7 +19112,13 @@ async function spawnCli(
     const bl = resolveBrandLabel(cfg.larkAppId);
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
+  // Machine-wide footer-brand switch (dashboard.cardBrandLabel). The sandboxed
+  // CLI child can't read ~/.botmux/config.json (EPERM), so bridge the resolved
+  // value explicitly: 'false' makes resolveBrandLabel() in the child return ''
+  // for this bot; anything else is 'true' (absent config = default ON).
+  childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  childEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.
@@ -14330,7 +19138,32 @@ async function spawnCli(
   // subcommand agrees with the daemon that spawned it, independent of stale
   // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
   childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
+  childEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
+  // Opt-in structured turn completion (dsh-tui). An inherited copy would point
+  // at another session's IPC route, so it is only ever set from THIS spawn's
+  // adapter flag (and scrubbed at every session boundary, see child-env.ts).
+  if (cliAdapter.injectsTurnIdleHook) childEnv.BOTMUX_TURN_IDLE_COMMAND = turnIdleHookCommand();
+  else delete childEnv.BOTMUX_TURN_IDLE_COMMAND;
+  // Claude Code statusline 链：botmux 的进程级 --settings 会遮蔽用户自己的 statusLine
+  // （单值、不合并），这里按 Claude 的优先级把它找回来，交给 `botmux statusline` 在落盘
+  // 后转发。只对真 claude-code 做（seed / relay 不注入 statusLine）。不按 wrapperCli 分流：
+  // aiden 会剥掉 --settings ⇒ Claude 直接用用户自己的 statusLine、`botmux statusline` 根本
+  // 不会被调用，这个 env 只是闲置；而 cjadk / ccr / ttadk 会透传 --settings、沙盒开启时
+  // wrapperCli 又被整体忽略——这些形态都需要链，按 wrapperCli 跳过会静默吞掉用户的状态栏。
+  // userSettingsPath 用 CLI 实际读的那份：read-isolation 下是 <BOT_HOME>/claude/settings.json
+  // （effectiveReadyHookInstall 已改写）。无用户配置时**显式 delete**，理由同上方
+  // BOTMUX_READ_ISOLATION：rcfile / tmux 里残留的旧值会让别的项目的 statusline 命令在本会话里执行。
+  if (cliAdapter.id === 'claude-code') {
+    const shadowed = resolveShadowedStatusLine({
+      workingDir: cfg.workingDir,
+      userSettingsPath: effectiveReadyHookInstall?.configPath ?? cliAdapter.hookInstall?.configPath,
+    });
+    if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
+    else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  } else {
+    delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  }
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (cfg.dispatchAttempt !== undefined) {
@@ -14372,6 +19205,21 @@ async function spawnCli(
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = canonicalizeForSandbox(claudeDataDir); // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = canonicalizeForSandbox(isolatedCodexHome!);
   }
+  applyCodexInstanceEnv(childEnv, cfg.cliInstanceBinding);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') childEnv.BOTMUX_CODEX_INSTANCE_BINDING = codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime);
+  // Sandboxed Codex cannot discover a trust store inside Seatbelt (see
+  // utils/darwin-ca-bundle for why, and for why realpath matters). `codex-app`
+  // needs this too: its outer child is a Node runner that spawns the same Codex
+  // `app-server` with `env: process.env`, so the variable injected here reaches
+  // the same TLS stack. An explicit value from the operator always wins.
+  if (
+    sandboxRequested
+    && isCodexFamilyCliId(cfg.cliId)
+    && !childEnv.SSL_CERT_FILE
+  ) {
+    const caBundle = resolveDarwinCodexCaBundle({ warn: log });
+    if (caBundle) childEnv.SSL_CERT_FILE = caBundle;
+  }
   if (willReadIsolate) {
     if (!readIsolationOriginChannelId) {
       throw new Error('[read-isolation] origin channel is unavailable');
@@ -14382,10 +19230,11 @@ async function spawnCli(
     childEnv.BOTMUX_ORIGIN_CHANNEL_ID = readIsolationOriginChannelId;
   }
 
-  // Credential-only children have no writable relay outbox. Publish the same
-  // rotating managed-origin claim through a host-owned per-channel directory
-  // before the Seatbelt/bwrap wrapper is compiled, then expose only that
-  // directory read-only below.
+  // Credential-only children also get the rotating managed-origin claim through
+  // a host-owned per-channel directory, published before the Seatbelt/bwrap
+  // wrapper is compiled and exposed read-only below. (Linux bwrap additionally
+  // gets a relay outbox further down; this first publish predates it and the
+  // credential-only arms publish again once the outbox is wired.)
   if (readIsolationOriginChannelId && !sandboxRequested) {
     readIsolationOriginCapabilityFile = managedOriginCapabilityPath(
       isolationRuntimeDataDir,
@@ -14401,9 +19250,21 @@ async function spawnCli(
   // provider, an HTTPS_PROXY, or a CLI feature flag. Passed as injectEnv (NOT
   // merged into childEnv) so the tmux/zellij backends inject it via the per-pane
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
-  // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
-  const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  // keeping it from leaking across bots. Re-sanitized early before buildArgs.
+  if (cliAdapter.id === 'kimi' && cfg.reasoningEffort
+      && cliModelSupportsReasoningEffort('kimi', cfg.model, cfg.reasoningEffort)) {
+    // 复用逐会话 env 注入，避免污染共享 tmux server 或修改 Kimi 全局配置。
+    perBotInjectEnv.KIMI_MODEL_THINKING_EFFORT = cfg.reasoningEffort;
+  }
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
+  if (boundLark) {
+    const dir = childEnv.BOTMUX_IDENTITY_BIN!;
+    perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
+    perBotInjectEnv.BOTMUX_IDENTITY_BIN = dir;
+    perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
+    perBotInjectEnv.ZDOTDIR = join(dir, 'shell');
+    perBotInjectEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+  }
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -14418,7 +19279,18 @@ async function spawnCli(
   // per-session project copy + de-identified config. The agent's `botmux send`
   // routes through a daemon-side outbox watcher (creds never enter the sandbox).
   // PTY backend only for the spike; falls back to direct spawn on any failure.
-  let spawnBin = cliAdapter.resolvedBin;
+  if (!codexRpcEngine) {
+    codexCleanupLaunchTarget = undefined;
+    if (!cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli && cfg.sandbox !== 'scratch'
+        && ['pty', 'tmux'].includes(effectiveBackendType)) {
+      try {
+        codexCleanupLaunchTarget = freezeCodexCleanupLaunch(cfg.cliId, cliAdapter.resolvedBin, args,
+          childEnv.CODEX_HOME ?? join(homedir(), '.codex'));
+      } catch (error) { log(`Codex cleanup launch target unavailable: ${error}`); }
+    }
+  }
+  let spawnBin = cfg.cliId === 'codex' && codexCleanupLaunchTarget
+    ? codexCleanupLaunchTarget.codexBin : cliAdapter.resolvedBin;
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
@@ -14430,11 +19302,39 @@ async function spawnCli(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
+  /** Liveness of this session's persistent pane, by its exact target. Only an
+   *  authoritative `missing` proves it gone (a PTY CLI never outlives its worker). */
+  const probeOwnPersistentPane = (): string => {
+    if (!persistentSessionName || effectiveBackendType === 'pty') return 'missing';
+    try {
+      return effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+        : (selectedBackend.persistentBackendTarget
+          ? probePersistentBackendTarget(selectedBackend.persistentBackendTarget)
+          : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+    } catch (probeErr) {
+      return `unknown (${(probeErr as Error).message})`;
+    }
+  };
+  // A tree of ANOTHER flavour inherited across a restart (sandbox on/off,
+  // oncall ↔ scratch ↔ credential-only) is torn down with its own teardown —
+  // scratch unmounts first — once its pane is proven gone, BEFORE this spawn
+  // prepares its own tree in the same place. Same flavour: reused as before.
+  reconcileSandboxTreeFlavour({
+    sessionId: cfg.sessionId,
+    dataDir: isolationRuntimeDataDir,
+    requested: requestedTreeFlavour,
+    reattach: willReattachPersistent,
+    probePane: probeOwnPersistentPane,
+    log,
+  });
+
   // ── UNIFIED file sandbox (fs-policy): ONE policy source, BOTH platforms. ──
   // Three-tier deny-by-default whitelist compiled to Seatbelt (darwin) or bwrap
   // (linux). Cross-bot read isolation is inherent (siblings' data simply isn't
   // exposed) — no enumeration, no deny-list to keep in sync.
-  if (sandboxRequested) {
+  // SCRATCH (Linux only) branches to its own full-root COW setup BELOW.
+  if (sandboxRequested && !scratchRequested) {
     const dataDir = process.env.SESSION_DATA_DIR;
     // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
     // must be a HARD ERROR, never a silent unconfined run.
@@ -14578,13 +19478,17 @@ async function spawnCli(
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
     // would EPERM/ENOENT writing its <hash>.content into an unbound dir).
     // prepareDirectSandbox re-mkdirs it too; recursive make is idempotent.
-    if (outbox) { try { mkdirSync(outbox, { recursive: true }); } catch { /* best-effort; prepareDirectSandbox retries */ } }
+    // Never on a warm reattach: the live pane bound its outbox by inode, and a
+    // recreated directory is one it can never see (the reattach arm below
+    // re-serves the existing one or refuses).
+    if (outbox && !willReattachPersistent) {
+      try { mkdirSync(outbox, { recursive: true }); } catch { /* best-effort; prepareDirectSandbox retries */ }
+    }
 
     // The botmux install/checkout root (dir containing dist/ + node_modules).
     // This module compiles to <checkout>/dist/worker.js, so `../../` from here is
     // the checkout root. Exposed readOnly so `botmux` + claude hooks can exec
     // `node <checkout>/dist/cli.js`.
-    const botmuxInstallRoot = canonical(dirname(dirname(fileURLToPath(import.meta.url))));
     // A development worktree may share dependencies through a node_modules
     // symlink. Seatbelt resolves that link before matching policy rules, so the
     // checkout grant alone does not cover the canonical dependency tree.
@@ -14607,9 +19511,38 @@ async function spawnCli(
       const tsFile = join(tsDir, `${cfg.sessionId}.jsonl`);
       if (!existsSync(tsFile)) writeFileSync(tsFile, '');
     } catch { /* */ }
+    if (cliAdapter.id === 'cursor') {
+      try { prepareCursorUsageJournal(dataDir, cfg.sessionId); } catch { /* optional telemetry */ }
+    }
+    // dsh-tui ready 通道诊断轨迹：fs-policy 只授本会话的
+    // ready-signal/<sessionId>.log 单个文件（append-only，写满时 in-place 截断保 inode），
+    // 先建好父目录 + 文件本身给 bwrap 当 bind 源；文件不存在时沙盒内的插件写不进去。
+    try {
+      mkdirSync(readySignalLogDir(dataDir), { recursive: true, mode: 0o700 });
+      const rsFile = readySignalLogPath(dataDir, cfg.sessionId);
+      if (!existsSync(rsFile)) writeFileSync(rsFile, '', { mode: 0o600 });
+    } catch { /* */ }
     // UserPromptSubmit sidecar 目录（#794）：daemon 逐 turn 写入，沙盒内 hook 只读。
     try { mkdirSync(join(dataDir, 'prompt-ctx', cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
+    // Claude statusline 快照目录：沙盒内 `botmux statusline` 原子写 latest.json（tmp+rename
+    // 需要目录可写），fs-policy 授的是这个目录；bwrap 不能 bind 不存在的源，先建好。
+    try { mkdirSync(statuslineDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
+    // `botmux send` 的轮次防重登记：fs-policy 只授本会话的 turn-send-ledger/<sessionId>/
+    // 目录（记录是 tmp+rename 原子写，外加同目录的 .lock），先建好给 bwrap 当 bind 源。
+    try { mkdirSync(turnSendLedgerSessionDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
+    // Adapter-declared whole-DIRECTORY state roots that the fs-policy bind-
+    // mounts readWrite (cursor ~/.cursor, antigravity ~/.gemini). bwrap cannot
+    // bind a missing source, and these legitimately do not exist on a fresh
+    // host, so create them here at SPAWN (never at adapter-module load — the
+    // capabilities contract forbids creating runtime state on import). File-
+    // shaped authPaths (oauth token files, identified by an extension) are
+    // skipped: mkdir on them would create a directory in the token's place.
+    for (const authPath of cliAdapter.authPaths ?? []) {
+      const expanded = expandTildeLexical(authPath);
+      if (extname(expanded) !== '') continue;
+      try { mkdirSync(canonical(expanded), { recursive: true }); } catch { /* best effort */ }
+    }
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)
 
@@ -14624,6 +19557,7 @@ async function spawnCli(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
+    const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -14665,16 +19599,6 @@ async function spawnCli(
       if (dataRootProbe !== 'host_accessible') {
         throw new Error('[read-isolation] locator-selected data-root probe is unavailable or unsafe');
       }
-      ensureManagedOriginAttestationDirectory(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
-      sweepManagedOriginAttestationProofs(
-        dataDir,
-        cfg.sessionId,
-        readIsolationOriginChannelId!,
-      );
     }
     readIsolationOriginCapabilityFile = process.platform === 'darwin'
       ? managedOriginCapabilityPath(
@@ -14723,15 +19647,55 @@ async function spawnCli(
         } catch { /* absent authority root */ }
       }
     }
+    if (process.platform === 'linux' && readIsolationOriginChannelId) {
+      // Match the canonical SESSION_DATA_DIR pinned by prepareDirectSandbox;
+      // the host's lexical symlink aliases do not exist in the fresh root.
+      mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(
+        canonical(isolationRuntimeDataDir),
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
+      mandatoryReadOnlyPaths.push(managedOriginAttestationDirectory(
+        canonical(isolationRuntimeDataDir),
+        cfg.sessionId,
+        readIsolationOriginChannelId,
+      ));
+    }
     if (mcpRuntimeManifest) {
       mandatoryDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
         mcpRuntimeManifest,
         config.session.dataDir,
       ).map(canonical));
     }
+    // The sandboxed CLI reads its OWN session's skill manifest via
+    // `botmux skill list/show/read/resources` (manifest-store.ts). Without an
+    // explicit carve-out the deny-by-default policy never exposes it — bwrap
+    // simply doesn't mount it (ENOENT → "skill manifest not found"), Seatbelt
+    // denies it (EPERM). Expose ONLY this session's own manifest file,
+    // read-only: the single `<sessionId>.json`, never the skill-manifests dir,
+    // so a task cannot read other sessions' manifests. Mandatory (not the
+    // session-owned channel): the file name is `<sid>.json`, which that
+    // channel's segment==sessionId containment deliberately rejects, and a
+    // no-transport turn needs it too (no Feishu credential in it). The enabled
+    // skills' BODIES are a per-session SNAPSHOT under runtime-skills/<sid>/
+    // (core/skills/snapshot.ts) that rides sessionOwnedReadonlyRoots via
+    // cfg.skillReadonlyRoots — no host source dir is ever granted.
+    // Path from the store's own helper (same dataDir — SESSION_DATA_DIR is
+    // required above), so the store and the sandbox cannot drift. The leaf must
+    // be a regular file the daemon just (re)wrote in prepareCliPluginGeneration:
+    // a planted symlink would otherwise be followed by canonical() and turn this
+    // MANDATORY read-only grant (beats user/baseline denies by depth) onto an
+    // arbitrary target. Only the parent is canonicalized (symlinked HOME
+    // `/home/u` → `/data00/home/u`). Absent = this session has no user skills.
+    const ownSkillManifest = sessionSkillManifestPath(cfg.sessionId, dataDir);
+    try {
+      if (lstatSync(ownSkillManifest).isFile()) {
+        mandatoryReadOnlyPaths.push(join(canonical(dirname(ownSkillManifest)), basename(ownSkillManifest)));
+      }
+    } catch { /* absent — no user-skill manifest for this session */ }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
-        sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
+        sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : sessionMcpGatewaySocketRoot(),
       );
       mandatoryDenyRegexes.push(sessionMcpGatewayPathRegex(gatewaySocketRoot));
       if (sessionMcpGatewayHost) {
@@ -14862,8 +19826,6 @@ async function spawnCli(
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         botmuxDependencyRoot,
-        ...(cfg.skillReadonlyRoots ?? []),
-        ...piInitialPromptReadonlyRoots,
         // Adapter-declared read-only host paths (e.g. traex/coco first-run
         // migration done-markers at ~/.trae root). Exposed read-only so the CLI
         // sees them without widening the read-WRITE authPaths surface. `~`-expanded
@@ -14873,15 +19835,22 @@ async function spawnCli(
           ...perBotInjectEnv,
         }) ?? [])].map(expandTildeLexical),
       ]),
+      // Daemon-generated per-session roots (skill delivery, Pi initial prompt).
+      // Separate channel so no-transport turns keep them (see fs-policy).
+      sessionOwnedReadonlyRoots: keepExisting([
+        ...(cfg.skillReadonlyRoots ?? []),
+        ...piInitialPromptReadonlyRoots,
+      ]),
       botmuxInstallRoot,
       outbox,
-      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
+      extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
+      hostOnlyDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
-      net: cfg.sandboxNetwork !== false,
+      net: cfg.sandboxNetworkPolicy ? true : cfg.sandboxNetwork !== false,
       // Claude Code saves ~/.claude.json atomically via a PID/random-suffixed
       // sibling — only relevant when the data dir is NOT redirected to BOT_HOME.
       writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
@@ -14910,6 +19879,9 @@ async function spawnCli(
     if (policy.suppressedAuthorityPaths?.length) {
       log(`[file-sandbox] no-transport suppressed ${policy.suppressedAuthorityPaths.length} allow path(s) inside a Feishu-authority root: ${policy.suppressedAuthorityPaths.join(', ')}`);
     }
+    if (policy.suppressedHostOnlyPaths?.length) {
+      log(`[file-sandbox] suppressed ${policy.suppressedHostOnlyPaths.length} allow path(s) inside daemon-owned host-only roots: ${policy.suppressedHostOnlyPaths.join(', ')}`);
+    }
     // Existence-filter only the ALLOW rules (baseline entries are candidates,
     // not guarantees): a non-existent allow path has nothing to expose, and
     // bwrap cannot bind a non-existent SOURCE. DENY rules are kept regardless —
@@ -14933,26 +19905,31 @@ async function spawnCli(
       spawnBin = 'sandbox-exec';
       log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
     } else if (willReattachPersistent) {
-      // Daemon-restart reattach to a live bwrap'd pane: backend.spawn() ignores
-      // bin/args and just re-attaches. Only re-wire the outbox watcher (so the
-      // live CLI's `botmux send` keeps being serviced) + the cleanup ref. The
-      // direct model has NO mounts — cleanup is a plain rm at close/exit.
+      // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
+      // backend.spawn() ignores bin/args and just re-attaches. Only re-wire the
+      // outbox watcher (so the live CLI's `botmux send` keeps being serviced) +
+      // the cleanup ref. The direct model has NO mounts — cleanup is a plain rm
+      // at close/exit. The isolation gate already cold-spawned any pane whose
+      // outbox is gone, so a null here means it vanished in between: fail
+      // closed rather than reattach a pane whose relay nothing serves.
       const att = attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir });
-      if (att) {
-        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        sandboxCleanup = att.cleanup;
-        sandboxRelayOutbox = att.outbox;
-        sandboxStopWatcher = startOutboxWatcher(
-          att.outbox,
-          childEnv,
-          cfg.sessionId,
-          { authorize: authorizeManagedSend },
+      if (!att) {
+        throw new Error(
+          `[file-sandbox] refusing to reattach session ${cfg.sessionId}: `
+          + 'relay outbox disappeared before it could be re-served',
         );
-        publishSandboxRelayCapability();
-        log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
-      } else {
-        log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane as-is`);
       }
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      sandboxCleanup = att.cleanup;
+      sandboxRelayOutbox = att.outbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        att.outbox,
+        childEnv,
+        cfg.sessionId,
+        { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
     } else {
       // Canonical lark-cli data root pinned into the child so the in-sandbox lark-cli
       // resolves the SAME physical keystore the policy denied/carved-out (avoiding a
@@ -14974,6 +19951,7 @@ async function spawnCli(
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
       const sbx = prepareDirectSandbox({
+        networkPolicy: cfg.sandboxNetworkPolicy,
         sessionId: cfg.sessionId,
         dataDir,
         policy,
@@ -14981,9 +19959,14 @@ async function spawnCli(
         home: sandboxHome,
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
+        tempDir: canonical(sessionScratchDir),
+        effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH,
+        identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
+        minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
       });
       if (!sbx) {
         // FAIL-SAFE: never silently run unsandboxed.
@@ -15009,6 +19992,202 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
+
+  // ── SCRATCH sandbox: full-root COW overlay (Linux) ──
+  // The CLI sees the whole real fs; every write copy-ups into a throwaway
+  // upper. No FsPolicy, no BOT_HOME redirect (native CLI data dirs), but the
+  // same outbox relay / seccomp marker / credential masks. Host-side readers of
+  // CLI-written files must go through the scratch path mappings (Linux merged
+  // root, macOS clone trees).
+  let scratchMappings: import('./services/scratch-host-view.js').ScratchPathMapping[] | undefined;
+  /** The clone HOME the worker points its own transcript readers at (both
+   *  platforms; on Linux equals scratchMergedHost + real $HOME). */
+  let scratchHostHome: string | undefined;
+  /** In-sandbox cwd: on macOS the clone path (project key differs from host);
+   *  undefined on Linux where the in-container cwd path == the host path. */
+  let scratchChdirInSandbox: string | undefined;
+  /** NATIVE host codex/trae home for the prepare-time child env force. */
+  let scratchNativeCodexHome: string | undefined;
+  let scratchNativeTraeHome: string | undefined;
+  if (scratchRequested) {
+    const scratchDataDir = process.env.SESSION_DATA_DIR;
+    if (!scratchDataDir) {
+      throw new Error('Sandbox ENABLED (scratch) but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run');
+    }
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
+      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn`;
+      log(msg);
+      throw new Error(msg);
+    }
+    const scratchCanonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+    const scratchHome = scratchCanonical(homedir());
+    // NATIVE host CLI-home values the child must keep seeing (captured before
+    // the worker repoints its own copies at the merged tree below).
+    const nativeCodexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+    const nativeTraeHome = process.env.TRAE_HOME?.trim() || undefined;
+
+    // Fixed transport-credential masks (bots.json + sidecars, dashboard
+    // secret, …) + the per-session sandbox tree itself, plus user denies.
+    const credentialRules = buildCredentialIsolationRules({
+      homeDir: scratchHome,
+      botmuxHome: scratchCanonical(configuredBotmuxHome),
+      defaultBotmuxHome: scratchCanonical(defaultBotmuxHome),
+    });
+    // Complete transport-credential mask. NOT just device files: enumerate
+    // bots.json + sidecars, dashboard secret, per-bot send-cred.json, webhook
+    // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
+    // on-disk layout — a hand-built list once drifted and left bots.json
+    // readable inside scratch (PR #1513 review).
+    const scratchSecrets = enumerateScratchSecretPaths({
+      botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
+      dataDirs: [scratchDataDir].map(scratchCanonical),
+      botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
+      homeDir: scratchHome,
+      sessionId: cfg.sessionId,
+    });
+    const scratchDeny = [...new Set<string>([
+      ...credentialRules.denyPaths.map(scratchCanonical),
+      ...scratchSecrets.denyPaths,
+      join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
+      ...(cfg.scratchDenyPaths ?? [])
+        .filter((p): p is string => typeof p === 'string' && !!p)
+        .map(p => scratchCanonical(p.replace(/^~(?=\/|$)/, scratchHome))),
+    ])];
+    // This session's own trigger-user identity files (under the sealed
+    // cli-identity dir) must stay readable for the governed CLI / relay.
+    const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
+
+    scratchNativeCodexHome = nativeCodexHome;
+    scratchNativeTraeHome = nativeTraeHome;
+
+    if (willReattachPersistent) {
+      // Live pane across a daemon restart: the overlay/clone + pane survive;
+      // only re-wire the outbox watcher. Never remount/re-clone here.
+      if (process.platform === 'darwin') {
+        const att = attachMacScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMappings = att.mappings;
+          scratchHostHome = att.clonedHome;
+          scratchChdirInSandbox = att.chdirInSandbox;
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
+        }
+      } else {
+        // Same contract as the oncall arm: the isolation gate cold-spawned a
+        // pane whose tree is gone, so null here means it vanished in between.
+        const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (!att) {
+          throw new Error(
+            `[scratch-sandbox] refusing to reattach session ${cfg.sessionId}: `
+            + 'scratch tree or relay outbox disappeared before it could be re-served',
+          );
+        }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        sandboxCleanup = att.cleanup;
+        sandboxRelayOutbox = att.outbox;
+        scratchMappings = scratchLinuxMappings(att.mergedHostPath);
+        scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
+        sandboxStopWatcher = startOutboxWatcher(
+          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+        );
+        publishSandboxRelayCapability();
+        log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+      }
+    } else if (process.platform === 'darwin') {
+      // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      const sbx = prepareMacScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        net: cfg.sandboxNetwork !== false,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed; check same-volume and free space) — aborting, never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMappings = sbx.mappings;
+      scratchHostHome = sbx.clonedHome;
+      scratchChdirInSandbox = sbx.chdirInSandbox;
+      spawnCwd = sbx.chdirInSandbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch APFS clone): home=${sbx.clonedHome} outbox=${sbx.outbox}`);
+    } else {
+      // ── Linux: full-root COW overlay ──
+      const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      const sbx = prepareScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        storage,
+        tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
+        net: cfg.sandboxNetwork !== false,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        shimBindTargets: [defaultGatewayEntry().command],
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
+        readOnlyCarvePaths: scratchReadOnlyCarves,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
+      scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
+    }
+    // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
+    // products) resolve through the scratch mappings for this spawn.
+    registerScratchView(cfg.sessionId, scratchMappings);
+    if (scratchMappings && scratchHostHome) {
+      // The worker is a PER-SESSION process, so repointing these env vars here
+      // only affects THIS session's transcript finders (codex/traex honor them
+      // dynamically). The sandboxed child got its OWN values: on Linux the
+      // native homes forced back via childEnvForce; on macOS the prepare module
+      // sets HOME (and we derive the cloned codex/trae homes below).
+      const hostView = (hostPath: string): string => scratchViewPath(scratchMappings, hostPath);
+      process.env.CODEX_HOME = hostView(scratchNativeCodexHome!);
+      process.env.TRAE_HOME = hostView(scratchNativeTraeHome ?? join(homedir(), '.trae'));
+      // CLAUDE_CONFIG_DIR is deliberately NOT set: the claude bridge receives
+      // the remapped data dir explicitly at the bridge site below.
+    }
+  }
+
   // Fresh spawn on a persistent backend: write a PENDING generation proof BEFORE
   // the pane is created, then COMMIT it after spawn only once the fresh generation
   // is attributably established (see the post-spawn commit below). pty needs no
@@ -15106,6 +20285,21 @@ async function spawnCli(
     }
   }
 
+  // Forge x TraeX：Forge 要求把 TraeX argv 合成一个 --agent-args 字符串，不能走普通 wrapperCli。
+  if (cfg.cliLaunchMode === 'forge-traex') {
+    const effectiveChildEnv = buildEffectiveChildEnv({
+      base: childEnv,
+      botEnv: perBotInjectEnv,
+      mojoEnv: effectiveBackendType === 'mojo'
+        ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
+        : undefined,
+    });
+    const launch = buildForgeTraexLaunch(spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b);
+    spawnBin = launch.bin;
+    spawnArgs = launch.args;
+    log("Launch mode forge-traex: spawning " + spawnBin + " " + spawnArgs.slice(0, 4).join(" ") + " …");
+  }
+
   // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
   // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
   // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
@@ -15165,12 +20359,59 @@ async function spawnCli(
           ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
           : undefined,
       });
+      let aidenCodexShimDir: string | undefined;
+      // Session identity has NO channel other than the shim: when trigger-user
+      // auth / Lark tool binding injects the non-prefixed identity keys
+      // (SESSION_DATA_DIR / ZDOTDIR / BASH_ENV / GIT_ASKPASS,
+      // BOTMUX_LARK_TOOL_BINDING), aiden replaces Aiden's env but Codex does not
+      // forward its process env to the shells it spawns. Losing the shim would
+      // silently run tool shells as the machine owner, so fail the launch
+      // explicitly instead of degrading. Plain aiden-codex sessions (BOTMUX_*
+      // collaboration vars only) keep the old best-effort WARN behavior.
+      const aidenCodexIdentityShellEnv = cfg.triggerUserAuth?.enabled || boundLark;
+      if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
+        try {
+          accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
+          if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is unavailable');
+          aidenCodexShimDir = installAidenCodexShim(
+            join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
+          );
+        } catch (e) {
+          if (aidenCodexIdentityShellEnv) {
+            throw new Error(
+              'aiden x codex launch refused: session identity (trigger-user auth / Lark tool '
+              + `binding) requires the PATH shim, but it could not be installed: ${(e as Error).message}`,
+            );
+          }
+          log(`[aiden-codex] WARN reasoning/shell-env shim unavailable; `
+            + `Aiden default effort and machine-owner shell identity: ${(e as Error).message}`);
+        }
+      }
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,
+        childPath: effectiveChildEnv.PATH,
+        aidenCodexRealBin: cliAdapter.resolvedBin,
+        aidenCodexShimDir,
+        // Gate the fail-closed behavior on the SAME condition that adds the
+        // non-prefixed identity keys (see identityShellEnv above): only then is
+        // the shim the sole channel for a credential-boundary value.
+        requireAidenCodexShim: aidenCodexIdentityShellEnv,
+        // Persist the Codex config overrides Aiden rejects from argv
+        // (shell_environment_policy.*, service_tier, tui.auto_recap); the PATH
+        // shim reads them back when Aiden execs the real codex. trigger-user
+        // identity / lark tool binding depend on these reaching codex's tool
+        // shells — stripping silently would run tools under the machine owner's
+        // identity.
+        writeAidenShellConfigs: (configs) => {
+          if (!aidenCodexShimDir) throw new Error('aiden codex shim dir is unavailable');
+          return writeAidenCodexShellConfigs(aidenCodexShimDir, configs);
+        },
+        pathDelimiter: delimiter,
       });
       if (launch.bin) {
         spawnBin = launch.bin;
         spawnArgs = launch.args;
+        if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
         log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
         // ttadk runs its launched agent through a gateway that pops an interactive
         // model-picker unless `-m <model>` is given. buildWrappedLaunch injects
@@ -15197,6 +20438,19 @@ async function spawnCli(
         }
       }
     }
+  }
+
+  // RPC viewer spawns after CodexRpcEngine.start() has validated the owning
+  // app-server; do not probe the catalog twice for the same launch.
+  if (isCodexFamilyCliId(cfg.cliId)
+      && cfg.serviceTier && cfg.serviceTier !== 'default' && !remoteWsUrl) {
+    const tierCheck = await validateCodexServiceTier({
+      cliBin: cfg.cliId === 'codex' ? cliAdapter.resolvedBin : resolveCommandReal(cfg.cliPathOverride ?? 'codex'),
+      env: buildEffectiveChildEnv({ base: childEnv, botEnv: perBotInjectEnv }),
+      model: cfg.model,
+      serviceTier: cfg.serviceTier,
+    });
+    if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
   }
 
   // Publish the exact selected resource BEFORE spawn. This both restores host
@@ -15233,10 +20487,15 @@ async function spawnCli(
       cfg.sessionId,
       readIsolationOriginChannelId!,
     );
+    const attestationDirectory = managedOriginAttestationDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId!,
+    );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
       [...rules.denyPaths.map(canonical), canonical(profileDir)],
-      [canonical(originDirectory)],
+      [canonical(originDirectory), canonical(attestationDirectory)],
       [],
       [canonical(profileDir)],
       rules.denyRegexes,
@@ -15330,17 +20589,45 @@ async function spawnCli(
     }
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    // A credential-only pane has no sound in-pane send authority (see
+    // prepareCredentialOnlyRelayOutbox for the four measured reasons), so give it
+    // the SAME host-side relay the full sandbox uses. Without this the confined
+    // `botmux send` fails closed on the data-root locator gate and the agent
+    // cannot answer the user at all.
+    const credentialRelay = prepareCredentialOnlyRelayOutbox({
+      sessionId: cfg.sessionId,
+      dataDir: isolationRuntimeDataDir,
+    });
+    if (!credentialRelay) {
+      throw new Error(
+        `[device-credential-isolation] refusing to start session ${cfg.sessionId}: `
+        + 'credential-only relay outbox could not be prepared',
+      );
+    }
     const credentialSandbox = prepareCredentialOnlySandbox({
-      hideDirectories: [...hideDirectories],
+      writableOutbox: credentialRelay.outbox,
+      // Hide every session's relay outbox (and its capability leaf); only this
+      // session's outbox is re-bound on top, after all masks.
+      hideDirectories: [...hideDirectories, credentialRelay.sessionsRoot],
       hideFiles: [...hideFiles],
-      privateReadonlyDirectories: [{
-        parent: realpathSync(panePolicyDir),
-        directory: realpathSync(managedOriginCapabilityDirectory(
-          isolationRuntimeDataDir,
-          cfg.sessionId,
-          readIsolationOriginChannelId!,
-        )),
-      }],
+      privateReadonlyDirectories: [
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginCapabilityDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+        {
+          parent: realpathSync(panePolicyDir),
+          directory: realpathSync(managedOriginAttestationDirectory(
+            isolationRuntimeDataDir,
+            cfg.sessionId,
+            readIsolationOriginChannelId!,
+          )),
+        },
+      ],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,
@@ -15353,11 +20640,91 @@ async function spawnCli(
     }
     spawnBin = credentialSandbox.bin;
     spawnArgs = credentialSandbox.args;
+    // Same contract as the full sandbox: the child sees only the outbox path and
+    // never a Feishu credential; the host watcher re-execs the send outside the
+    // pane and performs the authoritative origin check.
+    childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+    sandboxCleanup = credentialRelay.cleanup;
+    sandboxRelayOutbox = credentialRelay.outbox;
+    // session-id is FORCED so a relayed send cannot target another session.
+    sandboxStopWatcher = startOutboxWatcher(
+      credentialRelay.outbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    // Re-publish so the outbox capability leaf exists too: the earlier
+    // credential-only publish ran before an outbox existed and therefore wrote
+    // only the managed-origin copy.
+    publishSandboxRelayCapability({ failClosed: true });
     log(
       `[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only bwrap `
-      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s))`,
+      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s), `
+      + `relay outbox=${credentialRelay.outbox})`,
     );
+  } else if (willReattachPersistent && credentialOnlyBwrap) {
+    // Warm reattach (daemon restart, detach_for_transfer, suspend→resume) of a
+    // live credential-only pane: backend.spawn() ignores bin/args, so nothing
+    // above runs. The pane still has its outbox bind + BOTMUX_SEND_RELAY, but the
+    // previous worker's teardown revoked the capability leaf and its watcher died
+    // with it. Re-serve the SAME outbox (never recreate it — see
+    // attachCredentialOnlyRelayOutbox) exactly like the full-sandbox reattach
+    // arm, or every send from the surviving CLI is refused as stale/missing.
+    // The isolation-marker gate already cold-spawned any pane whose outbox is
+    // gone, so a null here means it vanished in between: fail closed.
+    const credentialRelay = attachCredentialOnlyRelayOutbox({
+      sessionId: cfg.sessionId,
+      dataDir: isolationRuntimeDataDir,
+    });
+    if (!credentialRelay) {
+      throw new Error(
+        `[device-credential-isolation] refusing to reattach session ${cfg.sessionId}: `
+        + 'credential-only relay outbox disappeared before it could be re-served',
+      );
+    }
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    sandboxCleanup = credentialRelay.cleanup;
+    sandboxRelayOutbox = credentialRelay.outbox;
+    sandboxStopWatcher = startOutboxWatcher(
+      credentialRelay.outbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    publishSandboxRelayCapability();
+    log(`[device-credential-isolation] REATTACH (${cfg.cliId}): live pane kept, re-wired relay outbox=${credentialRelay.outbox}`);
   }
+  // One lifecycle rule for every flavour above that established (or re-served)
+  // this generation's per-session tree — oncall, scratch, credential-only;
+  // fresh spawn or warm reattach: a persistent pane outlives this worker, so a
+  // detach-style exit keeps the tree for the successor; a PTY-owned CLI dies
+  // with the worker and its tree goes with it.
+  const sandboxTreeOutlivesPane = sandboxTreeSurvivesWorkerExit({
+    ownsTree: sandboxCleanup !== null,
+    backendType: effectiveBackendType,
+    persistentSessionName,
+  });
+  // It only applies while such a pane exists. A warm reattach (restore /
+  // transfer) runs against one that is already alive; a fresh launch has none
+  // until backend.spawn() below creates it, so a failure before that point
+  // must roll the just-built tree back (deny-mask mountpoints, an unconsumed
+  // bwrap args file, a scratch overlay) — the orphan sweep skips this still-
+  // active session and would never reclaim it.
+  sandboxTreeOutlivesWorker = willReattachPersistent && sandboxTreeOutlivesPane;
+  /** True once a failed fresh launch's pane is proven gone (see the spawn catch). */
+  const retireFailedFreshPersistentPane = (): boolean => {
+    const retired = (backend as { retireSessionCreatedBySpawn?: () => boolean } | null)
+      ?.retireSessionCreatedBySpawn?.() === true;
+    const probe = probeOwnPersistentPane();
+    if (probe === 'missing') {
+      if (retired) log(`Failed fresh launch: retired the ${effectiveBackendType} session it had created; rolling back the sandbox tree`);
+      return true;
+    }
+    log(`Failed fresh launch: ${effectiveBackendType} session not proven gone (probe: ${probe}${retired ? ', after retiring our own' : ''}) — keeping the sandbox tree for the pane that may still run`);
+    return false;
+  };
 
   // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
   // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
@@ -15368,11 +20735,12 @@ async function spawnCli(
       baseBin: reproduceBaseBin,
       baseArgs: reproduceBaseArgs,
       wrapperCli: cfg.wrapperCli,
+      cliLaunchMode: cfg.cliLaunchMode,
       sandboxOn: sandboxRequested,
       binResolver: (b) => locateOnPath(b) ?? b,
       ttadkModel: cfg.model,
     });
-    capturedSpawnCommand = buildReproduceCommand({
+    capturedSpawnCommand = cfg.envPolicy?.mode === 'strict' ? null : buildReproduceCommand({
       backendType: effectiveBackendType,
       bin: reproduceLaunch.bin,
       args: reproduceLaunch.args,
@@ -15390,11 +20758,68 @@ async function spawnCli(
   // launch env and proves the old key, while an actual fresh start consumes
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
+  let programStatusRelayPlanCleanup: (() => void) | undefined;
+  let programStatusRelayLaunched = false;
+  let scopePayloadLauncherActive = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
+    }
+    if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
+      // Wrap the command executed INSIDE the pane, not `tmux new-session`.
+      // The shared tmux server keeps its own cgroup while the owned CLI and all
+      // of its command descendants enter this per-session scope.
+      // If a prior worker crashed after its pane vanished, retire any detached
+      // descendant still held by this exact logical session's old scope before
+      // reusing the deterministic unit name.
+      stopSessionScope(cfg.sessionId);
+      const scoped = wrapCommandInSessionScope(
+        cfg.sessionId,
+        spawnBin,
+        spawnArgs,
+        readGlobalConfig().worker,
+      );
+      spawnBin = scoped.bin;
+      spawnArgs = scoped.args;
+      scopePayloadLauncherActive = !!scoped.unitName;
+      if (scoped.unitName) {
+        log(
+          `Launching owned CLI in ${scoped.unitName}`
+          + (scoped.capabilities.memoryControllerSupported
+            ? ' (memory controller verified)'
+            : ' (scope cleanup only; MemoryMax not enforceable)'),
+        );
+      } else if (scoped.capabilities.reason) {
+        log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
+      }
+    }
+    if (
+      !cfg.adoptMode && !willReattachPersistent && effectiveBackendType === 'tmux'
+      && cliAdapter.id === 'claude-code' && cliAdapter.supportsProgramStatus
+      && process.env.BOTMUX_PROGRAM_STATUS_RELAY !== '0'
+    ) {
+      // tmux answers the CLI's DA1 sentinel itself, before the worker can see
+      // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
+      // status. An in-pane relay answers the probe ahead of the DA1 query
+      // (src/program-status-relay.ts). The pane pid becomes the relay; the
+      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      // Outermost, i.e. OUTSIDE the session scope: the relay's launch shim is a
+      // shell script with `$VAR` references, and systemd-run (258+) expands
+      // environment references in its payload by default. `systemd-run
+      // --scope` execs in place, so the relay's direct child is still exactly
+      // the process the pane pid used to be.
+      const relayed = programStatusRelayLaunch(spawnBin, spawnArgs);
+      if (relayed) {
+        spawnBin = relayed.bin;
+        spawnArgs = relayed.args;
+        programStatusRelayPlanCleanup = relayed.cleanup;
+        programStatusRelayLaunched = true;
+        log('[program-status] launching CLI behind in-pane OSC 7501 relay');
+      } else {
+        log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
+      }
     }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
@@ -15403,15 +20828,42 @@ async function spawnCli(
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
       launchShell: lastInitConfig?.launchShell,
+      strictEnv: cfg.envPolicy?.mode === 'strict',
+      strictEnvReattach: willReattachPersistent,
+      remoteResumeMode: cfg.remoteResumeMode,
+      // spawnBin may now be a launch wrapper (session scope / wrapperCli /
+      // credential sandbox); the Herdr facade still needs the real CLI name.
+      cliBin: cliAdapter.resolvedBin,
+      model: cfg.model,
+      modelBackendVariant: cfg.modelBackendVariant,
+      reasoningEffort: cfg.reasoningEffort,
     });
+    if (!willReattachPersistent) writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
   } catch (err) {
     cleanupCodexAppControlBootstrap();
+    programStatusRelayPlanCleanup?.();
+    if (!willReattachPersistent && sandboxTreeOutlivesPane) {
+      // A fresh persistent launch can fail AFTER it created its pane (tmux:
+      // new-session done, then mkfifo / the FIFO wake fd / pipe-pane failed).
+      // That pane would still run the CLI against this tree, so retire exactly
+      // the session this spawn created, and roll the tree back only once the
+      // name authoritatively resolves to nothing. Otherwise keep the tree.
+      sandboxTreeOutlivesWorker = !retireFailedFreshPersistentPane();
+    }
     throw err;
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
   }
+  // A pane exists now (created by this launch or re-attached), so from here on
+  // its tree outlives this worker. Every post-spawn failure exit below clears
+  // this ONLY after proving the pane gone: an exit that leaves it running (an
+  // unconfirmed kill) must keep the relay tree the live pane is bound to.
+  sandboxTreeOutlivesWorker = sandboxTreeOutlivesPane;
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // A late same-named pane was reused, so the relay never ran to consume its plan.
+  if (actuallyReattachedPersistent) programStatusRelayPlanCleanup?.();
+  if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
   // has returned we know whether a FRESH generation was actually established.
@@ -15451,7 +20903,7 @@ async function spawnCli(
         });
         try {
           if (killKind === 'zmx') {
-            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid);
+            ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir));
           } else if (killKind === 'target') {
             killPersistentBackendTarget(teardownTarget!, cfg.sessionId);
           } else {
@@ -15464,7 +20916,7 @@ async function spawnCli(
           );
         }
         const postKill = killKind === 'zmx'
-          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
           : (killKind === 'target'
             ? probePersistentBackendTarget(teardownTarget!)
             : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
@@ -15474,6 +20926,8 @@ async function spawnCli(
             + `post-kill probe ${postKill} (not missing) — pending proof retained`,
           );
         }
+        // The pane is proven gone: nothing runs against the tree any more.
+        sandboxTreeOutlivesWorker = false;
       }
       throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${why}`);
     };
@@ -15545,6 +20999,8 @@ async function spawnCli(
       } catch (killErr: any) {
         log(`Failed to kill unauthenticated Codex App persistent generation: ${killErr?.message ?? killErr}`);
       }
+      // Roll the tree back only for a pane proven gone (see above).
+      if (probeOwnPersistentPane() === 'missing') sandboxTreeOutlivesWorker = false;
     }
     throw err;
   }
@@ -15574,6 +21030,7 @@ async function spawnCli(
     try {
       mkdirSync(markersDir, { recursive: true });
       cliPidMarker = join(markersDir, String(cliPid));
+      restoreQueuedTurnsFromMarkerDisk(cliPidMarker);
       writeCliPidMarker();
       log(`CLI PID marker written: ${cliPid}`);
     } catch (err: any) {
@@ -15597,52 +21054,160 @@ async function spawnCli(
   // wrapperCli is ignored, so there is no launcher indirection). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const startWrapperRealPidResolve = (launcherPid: number): void => {
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || !claudeDataDir) return;
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+    log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+    // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
+    // module-level bridgeCliPid and re-points to the real CLI's jsonl.
+    bridgeCliPid = realPid;
+    publishLocalProcessAttestation(realPid);
+  };
+  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
+  // reports while this spawn is current (equal to launcherPid unless a relay
+  // sits between the pane and the launcher).
+  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
+    // Codex also needs the real execution root, even without a Claude JSONL bridge.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
+      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  // Continue relay/wrapper resolution from `chainPid` while the backend's
+  // child-pid fence stays pinned to `fencePid` (the pane process; identical to
+  // chainPid except under an owned scope, where the pane is a fixed sh
+  // supervisor and the chain starts at its payload child).
+  const enterPidChain = (chainPid: number, fencePid: number): void => {
+    // The OSC 7501 relay sits between the pane and what used to be the pane
+    // process: its single direct child is exactly the pid the pane reported
+    // before the relay existed (CLI, sandbox wrapper or wrapperCli launcher),
+    // whatever that process's comm. Unwrap that one level, then resolve as
+    // before. A fresh relayed launch is known from this spawn's decision — the
+    // pane may still be the launch shell that has not exec'd the relay yet. A
+    // daemon-restart reattach to an already-relayed pane is recognised from
+    // its cmdline.
+    const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
+      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(chainPid)));
+    if (!viaRelay) { resolveBehindWrapper(chainPid, fencePid); return; }
+    if (!claudeDataDir && cfg.cliId !== 'codex') return;
+    scheduleWrapperRealCliPid(chainPid, {
+      findRealPid: (lp) => {
+        if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
+        // The relay briefly runs `stty` (raw mode) before creating the CLI's
+        // PTY; never bind that helper. Otherwise its only child is the CLI.
+        const children = getChildPids(lp).filter(pid => readComm(pid) !== 'stty');
+        return children.length === 1 ? children[0] : null;
+      },
+      getBackend: () => backend,
+      getChildPid: () => (backend?.getChildPid?.() === fencePid ? chainPid : null),
+      applyRealPid: (childPid) => {
+        applyResolvedCliPid(childPid, 'program-status relay', chainPid);
+        resolveBehindWrapper(childPid, fencePid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  // Owned session scope: the pane pid is a fixed sh supervisor deliberately
+  // kept outside the unit (some tmux versions migrate the pane pid into their
+  // own cgroup after fork). The CLI is its single foreground child — unwrap
+  // that layer first, then continue with relay/wrapper resolution from the
+  // payload. Fail-closed: an unrecognised pane behaves exactly as before.
+  const startWrapperRealPidResolve = (panePid: number): void => {
+    if (!scopePayloadLauncherActive) { enterPidChain(panePid, panePid); return; }
+    const bindScopePayload = (payloadPid: number): void => {
+      // Preserve a deeper wrapper/native CLI resolution that already won.
+      // The pane PID remains a valid marker ancestor, but it cannot identify
+      // the payload's open transcript files or Claude's PID-keyed metadata.
+      const observed = backend as SessionBackend & { cliPid?: number };
+      if (!observed.cliPid || observed.cliPid === panePid || observed.cliPid === payloadPid) {
+        applyResolvedCliPid(payloadPid, 'session scope payload', panePid);
+      } else if (bridgeCliPid === panePid) {
+        bridgeCliPid = payloadPid;
+      }
+      log(`Session scope: resolved payload pid ${payloadPid} under pane ${panePid}`);
+    };
+    const payloadPid = sessionScopePayloadPid(panePid);
+    if (payloadPid !== panePid) {
+      bindScopePayload(payloadPid);
+      enterPidChain(payloadPid, panePid);
+      return;
+    }
+    // Payload not observable yet (slow launch rcfile / systemd startup). Keep
+    // discovering until it appears; the shared stale-backend fence (backend
+    // identity + the pane sh staying the backend child) stops the loop on
+    // close or replacement.
+    scheduleWrapperRealCliPid(panePid, {
+      maxAttempts: Number.POSITIVE_INFINITY,
+      findRealPid: sessionScopePayloadPid,
+      getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
-      applyRealPid: (realPid) => {
-        log(`wrapperCli "${cfg.wrapperCli}": resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-        // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
-        // module-level bridgeCliPid and re-points to the real CLI's jsonl.
-        bridgeCliPid = realPid;
-        publishLocalProcessAttestation(realPid);
+      applyRealPid: (resolvedPid) => {
+        bindScopePayload(resolvedPid);
+        enterPidChain(resolvedPid, panePid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
+  if (cliPid) observeAntigravityCliSessionId(cliPid);
 
   // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
-  // traex`, so the pane leaf (getChildPid) is the bwrap SUPERVISOR — its
-  // /proc/<pid>/fd holds no rollout and the TRAE ownership gate can never admit
-  // a session id (fresh sandbox TRAE then never captures its SID, the bridge
-  // never attaches, and because reliableTurnTerminal disables screen-idle the
-  // durable turn can wedge — it does NOT self-heal). The real traex leaf is
-  // host-visible across the pid ns (ps -A ppid links), so BFS-descend to it and
-  // rewire backend.cliPid. Bounded retry (not one-shot): bwrap may not have
-  // forked traex yet at spawn. Reuses scheduleWrapperRealCliPid's stale-backend
-  // guard so a mid-retry worker restart can't rewire the new session. Gated on
-  // outerBwrapActive — sandboxRequested OR the Linux credential-only bwrap path,
-  // both of which produce an outer supervisor pid. */
+  // traex`; Forge x TraeX launches `forge run --agent traex`. In both shapes the
+  // pane leaf (getChildPid) is a launcher, not the process that holds the TRAE
+  // rollout fd, so the ownership gate cannot admit the id until backend.cliPid is
+  // rewired to the real traex descendant. Bounded retry (not one-shot): the
+  // launcher may not have forked traex yet at spawn. Reuses
+  // scheduleWrapperRealCliPid's stale-backend guard so a mid-retry worker restart
+  // can't rewire the new session.
   const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;
   lastSpawnOuterBwrapActive = outerBwrapActive;
-  const startTraexSandboxPidResolve = (launcherPid: number): void => {
-    if (cfg.cliId !== 'traex' || !outerBwrapActive) return;
+  const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
+  lastSpawnTraexLauncherActive = traexLauncherActive;
+  // A standard npm-installed Codex starts as a Node launcher which then forks
+  // the native `codex` binary.  Treat every managed Codex spawn as potentially
+  // launcher-backed so rollout ownership follows the native child.  Direct
+  // native installs remain unchanged: the candidate's own comm already is the
+  // codex leaf, so both the synchronous resolve and the retry loop early-exit
+  // without scanning descendants.
+  const codexLauncherActive = cfg.cliId === 'codex';
+  lastSpawnCodexLauncherActive = codexLauncherActive;
+  // Only an explicitly configured Codex-compatible runtime narrows the comm
+  // match to a renamed binary; official/legacy shapes keep the static map.
+  const codexFilterExecutable = cfg.cliId === 'codex' && cfg.cliRuntime?.source === 'configured'
+    ? cfg.cliRuntime.executable
+    : undefined;
+  lastSpawnCodexExecutable = codexFilterExecutable;
+  const startTraexLauncherPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, 'traex'),
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
-        log(`TRAE sandbox: resolved real traex leaf pid ${realPid} under bwrap supervisor ${launcherPid}; rewiring ownership pid`);
+        log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-        codexAdoptPendingPid = realPid;
+        publishLocalProcessAttestation(realPid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  const startCodexLauncherPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'codex' || !codexLauncherActive) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex', 6, {}, codexFilterExecutable),
+      isDirectLeaf: (lp) => codexProcessIsNativeLeaf(lp, codexFilterExecutable),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => {
+        log(`Codex launcher: resolved real codex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -15664,18 +21229,28 @@ async function spawnCli(
   //     it fails closed to the launcher pid when no leaf is found yet (the async
   //     retry below re-resolves once bwrap has forked traex).
   //   - reasonix: identify the lease owned by this process tree
+  //   - codex: findCodexRolloutSetByPid → positive ownership proof for the
+  //     paste-mode history match; without it submits are confirmed but never
+  //     proven, so no early native input consumption receipt is emitted.
   // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
   // lookup will surface here, but in-pane `/clear` won't. The pinned
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
-  if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix')) {
-    // TRAE under outer bwrap: best-effort immediate resolve (leaf may already be
-    // forked), then a bounded retry below covers the not-yet-forked case.
-    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
+  if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+    // Under an owned scope the pane pid is the supervisor sh; ownership roots
+    // (traex rollout fd / codex native leaf) live under its payload child.
+    const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(cliPid) : cliPid;
+    // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
+    // already be forked), then a bounded retry below covers the not-yet-forked case.
+    const wiredPid = cfg.cliId === 'traex'
+      ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
+      : cfg.cliId === 'codex'
+        ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+        : ownershipPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-    if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
-    if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(cliPid);
+    if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
+    if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -15697,24 +21272,31 @@ async function spawnCli(
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
             mkdirSync(markersDir, { recursive: true });
             cliPidMarker = join(markersDir, String(pid));
+            restoreQueuedTurnsFromMarkerDisk(cliPidMarker);
             writeCliPidMarker();
             log(`CLI PID marker written (async): ${pid}`);
           } catch (err: any) {
             log(`Failed to write CLI PID marker (async): ${err.message}`);
           }
         }
-        if (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix') {
-          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, outerBwrapActive) : pid;
+        if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+          const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(pid) : pid;
+          const wiredPid = cfg.cliId === 'traex'
+            ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
+            : cfg.cliId === 'codex'
+              ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+              : ownershipPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-          if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
-          if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(pid);
+          if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
+          if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
         // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
         startWrapperRealPidResolve(pid);
         observeCursorCliSessionId(pid, 'async');
+        observeAntigravityCliSessionId(pid, 'async');
         return;
       }
       if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
@@ -15738,12 +21320,23 @@ async function spawnCli(
   // fallbacks that fire for non-Claude CLIs (below).
   if (claudeDataDir && effectiveAdapterSessionId) {
     const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, claudeDataDir);
+    // Scratch: Claude writes into its NATIVE ~/.claude inside the COW view; the
+    // host-side bridge tails the same subtree THROUGH the merged root.
+    const bridgeClaudeDataDir = scratchMappings
+      ? scratchViewPath(scratchMappings, claudeDataDir)
+      : claudeDataDir;
+    // On macOS the clone cwd is a different path and Claude keys its project
+    // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
+    // via the glob-aware helper so a long (>200-char) truncated+hashed project
+    // slug still points at the real jsonl (falls back to the slug path).
+    const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
+    const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
+      ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
-      cliPid: cliPid ?? undefined,
-      cliCwd: cfg.workingDir,
+      cliPid: cliPid ? sessionScopePayloadPid(cliPid) : undefined,
+      cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
-      dataDir: claudeDataDir,
+      dataDir: bridgeClaudeDataDir,
     });
   }
 
@@ -15762,53 +21355,22 @@ async function spawnCli(
   // Mode uses effectiveResume: when the resume probe flipped us to FRESH, we
   // must NOT baseline the "restored" cursor against an empty / absent store
   // (would otherwise swallow the fresh session's first turn).
+  if (zeroPromptTerminalSync()) {
+    codexBridgeQueue.setLocalTurns(true, Date.now());
+  }
+  const spawnBridge = bridgeSpecFor(cfg.cliId)?.spawn;
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
-  } else if (cfg.cliId === 'codex') {
-    if (cfg.existingAppServerEndpoint) {
-      // A shared Codex App thread has two legitimate writers: the App and
-      // BotMux's official `codex --remote` client. Enable local-turn
-      // synthesis only from this share's attach boundary, so older thread
-      // history is absorbed while future App-side turns are mirrored to Lark.
-      codexAdoptStartMs = Date.now();
-      codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);
-      log('Codex bridge enabled App Server shared-turn forwarding');
-    }
-    if (effectiveCliSessionId) {
-      const rolloutPath = findCodexRolloutBySessionId(effectiveCliSessionId);
-      if (rolloutPath) {
-        codexBridgeAttach(
-          rolloutPath,
-          cfg.existingAppServerEndpoint
-            ? 'split-live'
-            : effectiveResume ? 'baseline-existing' : 'fresh-empty',
-        );
-      } else {
-        codexBridgePendingSessionId = effectiveCliSessionId;
-        codexBridgeStartTimer();
-      }
-    } else {
-      codexBridgeStartTimer();
-    }
-  } else if (cfg.cliId === 'traex') {
-    // TRAE: same rollout shape as Codex, different finder path. For a fresh
-    // spawn (no cliSessionId yet) we just arm the poller; writeInput will
-    // surface the cliSessionId on the first successful submit and trigger
-    // codexBridgeNotifyCliSessionId → rollout attach.
-    if (effectiveCliSessionId) {
-      const rolloutPath = findTraexRolloutBySessionId(effectiveCliSessionId);
-      if (rolloutPath) {
-        codexBridgeAttach(
-          rolloutPath,
-          effectiveResume ? 'baseline-existing' : 'fresh-empty',
-        );
-      } else {
-        codexBridgePendingSessionId = effectiveCliSessionId;
-        codexBridgeStartTimer();
-      }
-    } else {
-      codexBridgeStartTimer();
-    }
+  } else if (spawnBridge && (!spawnBridge.zeroPromptOnly || codexBridgeFallbackActive())) {
+    // File-backed CLIs that declare a spawn policy: codex / traex / cursor /
+    // antigravity / pi / oh-my-pi / ebsd / grok. zeroPromptOnly ones (cursor,
+    // antigravity) are NOT bridge-active in default injection mode — they deliver
+    // via `botmux send` — so this is a no-op for them unless promptInjection:'none'.
+    attachStructuredBridgeAtSpawn(cfg, spawnBridge, {
+      resume: effectiveResume,
+      cliSessionId: effectiveCliSessionId,
+      adapterSessionId: effectiveAdapterSessionId,
+    });
   } else if (cfg.cliId === 'coco') {
     const eventsPath = cocoEventsPathForSession(effectiveAdapterSessionId);
     codexBridgeAttach(eventsPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
@@ -15819,23 +21381,6 @@ async function spawnCli(
     const source = findMtrSessionById(mtrSessionId);
     if (source) {
       mtrBridgeAttach(source, effectiveResume ? 'baseline-existing' : 'fresh-empty');
-    } else {
-      codexBridgeStartTimer();
-    }
-  } else if (cfg.cliId === 'pi' || cfg.cliId === 'grok' || cfg.cliId === 'oh-my-pi' || cfg.cliId === 'ebsd') {
-    // File-backed: pin path when known (pi session id / grok --session-id
-    // UUID), else arm the poller. Grok collision-fallback (dir already
-    // exists → no --session-id → grok mints id) is recovered via writeInput
-    // → codexBridgeNotifyCliSessionId.
-    const sid = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    const path = sid
-      ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir })
-      : undefined;
-    if (path) {
-      codexBridgeAttach(path, effectiveResume ? 'baseline-existing' : 'fresh-empty');
-    } else if (sid) {
-      codexBridgePendingSessionId = sid;
-      codexBridgeStartTimer();
     } else {
       codexBridgeStartTimer();
     }
@@ -15870,10 +21415,12 @@ async function spawnCli(
   const readyHookAvailable = effectiveReadyHookInstall
     ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
     : true; // No config-file hook to verify → assume a direct ready-command
-            // integration (env-injected BOTMUX_READY_COMMAND). No current adapter
-            // takes this branch: claude-code and grok both ship a hookInstall
-            // config. (Hermes formerly did, on a BOTMUX_READY_COMMAND contract the
-            // shipped binary never honored — it no longer sets injectsReadyHook.)
+            // integration (env-injected BOTMUX_READY_COMMAND). dsh-tui is the
+            // only adapter on this branch today: it sets injectsReadyHook with
+            // no hookInstall (its wrapper plugin runs the ready command itself).
+            // The Claude family ships a hookInstall config, and Grok still
+            // carries one for historical parity even though it no longer arms
+            // the gate.
   const isolatedReadyTransportRequired = sandboxRequested || credentialBoundaryActive;
   const readyPortAvailable = !isolatedReadyTransportRequired
     || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;
@@ -15907,11 +21454,24 @@ async function spawnCli(
     willReattachPersistent,
   })) {
     readyGate.arm();
-    log('Ready gate armed — holding first prompt until SessionStart ready signal');
+    // A ready-gate fallback may only remove the gate's OWN extra hold. An
+    // adapter that defers the first prompt to a real readyPattern already has
+    // its own deadline (FIRST_PROMPT_HARD_TIMEOUT_MS); releasing the gate
+    // earlier would settle + flush through the type-ahead allowance into a
+    // composer that may not be mounted yet, silently pre-empting the adapter's
+    // cap. Such an adapter opts in explicitly
+    // (`readyGateFallbackAlignedWithHardCap`) — other adapters carrying
+    // defer/readyPattern flags (Hermes, Grok) do not arm the gate at all.
+    const readySignalTimeoutMs = resolveReadySignalTimeoutMs({
+      alignFallbackWithFirstPromptHardCap: cliAdapter.readyGateFallbackAlignedWithHardCap === true,
+      readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
+      firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
+    });
+    log(`Ready gate armed — holding first prompt until ready signal (fallback ${Math.round(readySignalTimeoutMs / 1000)}s)`);
     readySignalTimer = setTimeout(() => {
       readySignalTimer = null;
       releaseReadyGate('signal timeout fallback');
-    }, READY_SIGNAL_TIMEOUT_MS);
+    }, readySignalTimeoutMs);
     readySignalTimer.unref?.();
   }
 
@@ -15920,15 +21480,25 @@ async function spawnCli(
   // advance bridge attribution. Both screen-idle and authoritative Herdr status
   // must preserve this ordering.
   const observedBackend = backend;
-  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+  const drainBridges = (): void => {
     if (bridgeJsonlPath) {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
     }
     if (codexBridgeFallbackActive()) {
       try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
     }
+  };
+  const markReadyFromEvidence = (evidenceSource?: string): void => {
     if (evidenceSource === 'screen') markPromptReadyFromPty(observedBackend);
+    // OSC 7501 done/idle/error is a real prompt edge. It has to take the PTY
+    // path so the post-SessionStart fence accepts it, and it must not fall
+    // through to the footer veto below: Claude's ❯ stays up while busy.
+    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend);
     else markPromptReady();
+  };
+  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+    drainBridges();
+    markReadyFromEvidence(evidenceSource);
   };
 
   // Set up idle detection. Remote backends (riff / mojo) have no PTY output and
@@ -15937,7 +21507,10 @@ async function spawnCli(
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   // (For mojo it is also actively harmful — see MojoBackend.settleTurn.)
   if (!isRemoteBackendType(effectiveBackendType)) {
-    idleDetector = new IdleDetector(cliAdapter);
+    idleDetector = new IdleDetector(cliAdapter, () => {
+      if (backend !== observedBackend || !backendScreenEvidenceIsAuthoritativeForMutation()) return '';
+      return stripAnsiScreenText(captureBackendScreen(observedBackend));
+    });
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
     idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
@@ -15956,18 +21529,39 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
-      // Pi's transcript final (assistant_final) is persisted asynchronously
-      // from the TUI clearing its `Working...` busy marker — either order
-      // occurs. An external idle landing while the authoritative viewport
-      // still shows busy must defer exactly like a screen idle, or the card
-      // flips to 等待输入 mid-turn. Scoped to Pi: Grok/Codex own their idle
-      // via reliableTurnTerminal / lifecycle blocking, and their busy markers
-      // legitimately lag behind the transcript final. deferPromptReadyWhileBusy
-      // itself fail-opens on non-authoritative screens (ZMX), so a stale
-      // `Working...` in ZMX history can never block a structured terminal.
+      // A Codex model-migration picker is not a prompt (see the helper).
+      if (evidenceSource === 'screen' && await codexModelMigrationHoldsIdleInput(idleBackend)) return;
+      // xterm-headless parses renderer.write() asynchronously. A transcript
+      // terminal can arrive in the same tick as the TUI's busy redraw; drain
+      // queued render bytes before the post-terminal composer fence inspects
+      // the viewport, or it can see the stale pre-submit prompt.
+      if ((evidenceSource === 'external' || currentPostTerminalInputFence())
+        && cliAdapter?.postTerminalPromptFence === true
+        && renderer) {
+        try {
+          await renderer.writeAndFlush('');
+        } catch (err: any) {
+          log(`${cliName()} external-idle renderer settle failed: ${err.message}`);
+        }
+      }
+      // Selected PTY adapters (TraeX) split logical terminal from composer
+      // readiness. Their structured terminal must not publish prompt-ready
+      // until the authoritative viewport shows a newer real composer.
+      if ((evidenceSource === 'external' || currentPostTerminalInputFence())
+        && cliAdapter?.postTerminalPromptFence === true) {
+        // Business completion is independent from PTY readiness: publish the
+        // structured final/terminal now, then fence only prompt-ready/input.
+        drainBridges();
+        if (idleBackend && postTerminalPromptFenceHolds(evidenceSource, idleBackend)) return;
+        markReadyFromEvidence(evidenceSource);
+        return;
+      }
+      // Pi/OMP/EBSD transcript finals can also precede clearing their busy
+      // marker. Defer on that explicit marker, while other reliable-terminal
+      // CLIs retain their established immediate terminal behavior.
       const busyGuardedIdle = evidenceSource === 'screen'
         || (evidenceSource === 'external'
-          && (structuredBridgeIsPi() || structuredBridgeIsOmp() || structuredBridgeIsEbsd()));
+          && (structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi') || structuredBridgeIs('ebsd')));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);
@@ -15979,12 +21573,27 @@ async function spawnCli(
     onPtyData(data);
   });
   if (observedBackend instanceof HerdrBackend) {
+    const transcriptSettle = createTranscriptTerminalSettle({ awaitingTerminal: bridgeHeadTurnAwaitingTerminal });
+    const promptReadyEdgesAtSpawn = promptReadyEdges;
     observedBackend.onAgentStatus((status) => {
       if (backend !== observedBackend) return;
       if (status === 'idle' || status === 'done') {
+        // A just-launched CLI may be reported idle while booting (Kimi and
+        // CodeBuddy have no startup guard), so Herdr status is never its first
+        // readiness signal. Re-attached/adopted CLIs were already running.
+        if (observedBackend.launchedNewCli && promptReadyEdges === promptReadyEdgesAtSpawn) {
+          log(`Herdr agent ${status} before this CLI's first confirmed prompt — leaving startup readiness to screen evidence`);
+          return;
+        }
         log(`Herdr agent ${status} — draining bridges before marking prompt ready`);
-        drainBridgesThenMarkReady('structured');
+        // The stop hook behind this status can beat the transcript write of the
+        // turn's final assistant line; settle (bounded) so that answer is not lost.
+        transcriptSettle.request(() => {
+          if (backend !== observedBackend) return;
+          drainBridgesThenMarkReady('structured');
+        });
       } else if (status === 'working') {
+        transcriptSettle.cancel();
         isPromptReady = false;
         idleDetector?.reset();
       }
@@ -15992,7 +21601,11 @@ async function spawnCli(
   }
   backend.onScreenResync?.((snapshot) => {
     if (observedBackend !== backend) return;
-    log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    if (effectiveBackendType === 'remote-runner') {
+      relayRemoteRunnerWebSnapshot(snapshot);
+    } else {
+      log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
   });
   backend.onAccessUrl?.((url) => {
@@ -16021,18 +21634,142 @@ async function spawnCli(
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
-  // Headless final-answer bridge (mojo): deliver the turn's answer to the
+  // Headless final-answer bridge: deliver the turn's answer to the
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text) => {
+  backend.onTurnFinal?.((text, turnId) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
-    try {
-      deliverMojoTurnFinal(text);
-    } catch (err) {
-      log(`Mojo final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
+      return;
     }
+    try {
+      deliverRemoteTurnFinal(text, turnId);
+    } catch (err) {
+      log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const completedTurnId = turnId ?? currentBotmuxTurnId;
+    if (completedTurnId) {
+      emitTurnTerminal(
+        completedTurnId,
+        'completed',
+        undefined,
+        currentBotmuxDispatchAttempt,
+      );
+    }
+  });
+  backend.onOutboundMessage?.(async (message) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) {
+      return {
+        outcome: 'rejected',
+        code: 'outbound_backend_stale',
+        message: 'The backend generation that requested this message is no longer active.',
+      };
+    }
+    return deliverRemoteRunnerOutboundMessage(message);
+  });
+  backend.onSessionTool?.(async (operation) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) {
+      return {
+        outcome: 'rejected',
+        code: 'session_tool_backend_stale',
+        message: 'The backend generation that requested this session tool is no longer active.',
+      };
+    }
+    return deliverRemoteRunnerSessionTool(operation);
+  });
+  backend.onTurnRecovered?.((turn) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    try {
+      if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
+        throw new Error(
+          `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
+        );
+      }
+      setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
+      // Only receiver attempts participate in the durable HOL protocol. An
+      // ordinary primary Lark turn has no dispatchAttempt; its recovered-turn
+      // fence below still blocks startup readiness until the provider settles,
+      // but must not arm a latch that only an attempt-bearing terminal can
+      // release.
+      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
+      remoteRunnerRecoveredTurnInFlight = true;
+      currentTurnSteerPromoted = false;
+      markActiveTurnStarted({
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+        trustedCaller: turn.trustedCaller,
+      });
+      acknowledgeTurnInputCommitted(
+        turn.turnId,
+        turn.dispatchAttempt,
+        turn.dispatchAttempt !== undefined && turn.turnId.startsWith('om_')
+          ? true
+          : undefined,
+      );
+      publishSandboxRelayCapability();
+      log(
+        `Recovered provider-owned remote turn ${turn.turnId.substring(0, 12)} `
+        + `generation=${turn.generation} attempt=${turn.dispatchAttempt ?? '-'}`,
+      );
+    } catch (error) {
+      log(
+        `Refused recovered remote turn ${turn.turnId.substring(0, 12)}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      emitTurnTerminal(
+        turn.turnId,
+        'ambiguous',
+        'remote_turn_recovery_authority_mismatch',
+        turn.dispatchAttempt,
+      );
+      observedBackend.kill();
+    }
+  });
+  backend.onTurnFailure?.((failure) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
+      return;
+    }
+    send({
+      type: 'final_output',
+      content: failure.message,
+      lastUuid: failure.turnId,
+      turnId: failure.turnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      turnFailed: true,
+    });
+    emitTurnTerminal(
+      failure.turnId,
+      failure.status,
+      failure.code,
+      currentBotmuxDispatchAttempt,
+      undefined,
+      failure.retryable,
+    );
+  });
+  backend.onBackendState?.((state) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_backend_state', state });
+  });
+  backend.onUsageSnapshot?.((usage) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_usage', usage });
+  });
+  backend.onReady?.(() => {
+    if (backend !== observedBackend || fatalWorkerErrorPending) return;
+    if (effectiveBackendType === 'remote-runner') {
+      if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
+        log(`Remote runner ready with recovered turn ${currentBotmuxTurnId.substring(0, 12)} still active`);
+        return;
+      }
+      markRemoteRunnerStartupReady();
+      return;
+    }
+    markPromptReady();
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
   backend.onTaskId?.((taskId) => {
@@ -16051,6 +21788,16 @@ async function spawnCli(
     // not clear the replacement backend/durable HOL state or emit claude_exit.
     if (backend !== observedBackend) {
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
+      return;
+    }
+    if (codexAutoUpgrade) {
+      backend = null;
+      isPromptReady = false;
+      if (codexAutoUpgrade.stage === 'restoring') {
+        codexAutoUpgrade.reject?.(new Error(`Replacement Codex exited before readiness (${code ?? signal})`));
+      }
+      // The upgrade owns recovery; a daemon crash-restart could lose the
+      // original thread or replay messages that this worker still owns.
       return;
     }
     const recoveryHeld = ambiguousSubmissionRecoveryHold;
@@ -16074,16 +21821,18 @@ async function spawnCli(
     stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
     const exitedDispatchAttempt = currentBotmuxDispatchAttempt;
-    // Fail closed as soon as this CLI generation ends. The Node worker may
-    // stay alive for auto-restart/crash diagnostics, but an old sandbox relay
-    // token or explicit IM origin must not remain usable in that interval.
+    // Fail closed for the ended backend generation's live-send authority. The
+    // Node worker may stay alive for daemon-driven crash recovery, so its
+    // generation-scoped policy authority remains valid until killCli() performs
+    // an actual worker teardown.
     completeManagedTurnOriginRevocation(
       sandboxRelayCapability,
       exitedTurnId,
       exitedDispatchAttempt,
+      { revokePolicy: false },
     );
     log(`${cliName()} exited (code: ${code}, signal: ${signal})`);
-    if (lastInitConfig?.cliId === 'codex-app' && codexAppControlFatal) {
+    if (isCodexAppCliId(lastInitConfig?.cliId) && codexAppControlFatal) {
       // An earlier control-path failure already made this whole worker
       // generation terminal and scheduled its hard OS exit.  That failure may
       // synchronously kill the backend, invoking this callback after
@@ -16095,7 +21844,7 @@ async function spawnCli(
       return;
     }
     const codexAppPreparedAtExit = !intentionalRestart
-      && lastInitConfig?.cliId === 'codex-app'
+      && isCodexAppCliId(lastInitConfig?.cliId)
       && (codexAppTurnDispatchQueue.size() > 0
         || codexAppRecoveredDispatches.some(entry => entry.state === 'prepared'));
     if (codexAppPreparedAtExit) {
@@ -16109,7 +21858,7 @@ async function spawnCli(
       );
       return;
     }
-    if (cliAdapter?.reliableTurnTerminal === true
+    if ((cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt)
       && exitedTurnId
       && exitedDispatchAttempt !== undefined) {
       // The CLI may have durably appended its terminal record immediately
@@ -16117,14 +21866,17 @@ async function spawnCli(
       // synchronously before claiming `cli_exit`; otherwise ambiguous wins the
       // deduper and needlessly replays a turn that actually completed.
       drainReliableTerminalBeforeInterrupt();
-      // Race-safe with transcript final / submit-failure: the worker-local
-      // terminal deduper lets exactly one status win for this attempt.
-      emitTurnTerminal(
-        exitedTurnId,
-        'ambiguous',
+      if (drainArgvDurableInitialPromptCompletion()) {
+      } else {
+        // Race-safe with transcript final / submit-failure: the worker-local
+        // terminal deduper lets exactly one status win for this attempt.
+        emitTurnTerminal(
+          currentBotmuxTurnId!,
+          'ambiguous',
         'cli_exit',
-        exitedDispatchAttempt,
-      );
+          currentBotmuxDispatchAttempt,
+        );
+      }
     }
     durableTurnInFlight = false;
     // Hybrid RPC mode: the `codex --remote` viewer just died — tear down the
@@ -16143,7 +21895,7 @@ async function spawnCli(
     // onWorkerExit durable-receipt fence. Intentional in-worker teardown has
     // already established its own replay/cancel boundary and may clear here.
     stopCodexAppControlChannel({
-      preserveDispatchRecovery: lastInitConfig?.cliId === 'codex-app' && !intentionalRestart,
+      preserveDispatchRecovery: isCodexAppCliId(lastInitConfig?.cliId) && !intentionalRestart,
     });
     codexAppControlStateValue = undefined;
     codexAppControlProven = false;
@@ -16195,9 +21947,11 @@ async function spawnCli(
     }
     backend = null;
     isPromptReady = false;
-    currentBotmuxTurnId = undefined;
-    currentBotmuxDispatchAttempt = undefined;
-    currentGatewayTrustedCaller = undefined;
+    setCaptureIdentity(undefined, undefined);
+    queuedTypeAheadTurns = [];
+    queuedTurnAdvanceConsumedForPrompt = false;
+    retiredTurnIds.clear();
+    activeTurnAuthority.clear();
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
         type: 'restart_result',
@@ -16211,7 +21965,7 @@ async function spawnCli(
     if (intentionalRestart) {
       log('Suppressed claude_exit for intentional in-worker restart');
     } else {
-      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(lastInitConfig?.cliId === 'codex-app' && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}) });
+      send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}) });
     }
   });
 
@@ -16237,8 +21991,56 @@ async function spawnCli(
   // markNewTurn() sets a clean baseline at the current cursor position so only
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
-  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
+  let requestedAidenResumeRedraw = false;
+  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    // A timeout can recover missing prompt evidence, never contradict explicit
+    // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
+    // normal idle detection and flushes it without replaying a pasted draft.
+    //
+    // "The loaded frame re-drives it" only holds when that frame reaches
+    // feed(). On a snapshot-based backend it never does (see
+    // observeStartupScreen), so pull the authoritative screen here instead of
+    // waiting for a push that cannot come. If the banner still reports loading,
+    // re-check on a bounded schedule: returning without a timer made this
+    // branch terminal, and a hold that nothing can ever release silently
+    // swallows the queued messages for the lifetime of the session.
+    if (idleDetector?.isStartupPending()) {
+      observeStartupBannerOnScreen();
+    }
+    // Banner match above only recognizes a freshly loaded banner. A resumed CLI
+    // can paint straight into a restored composer with no banner repaint (and,
+    // on 0.154, with no restoration marker in the byte stream); the adapter's
+    // guarded history predicate recognizes that layout. ZMX runs it per-chunk
+    // (cheap snapshot cache); byte-stream backends (tmux/PTY) run it here, on
+    // the bounded recheck schedule, against the rendered viewport.
+    if (idleDetector?.isStartupPending()) {
+      observeRestoredStartupHistoryOnScreen();
+    }
+    if (idleDetector?.isStartupPending()) {
+      if (cfg.resume && cfg.cliId === 'codex' && cfg.wrapperCli?.trim() === 'aiden x codex'
+        && !isPersistentBackendReattach && !requestedAidenResumeRedraw && firstPromptBackend
+        && aidenCodexResumeNeedsRedraw(renderer?.rawSnapshot({ preserveFormatting: true }) ?? '')) {
+        requestedAidenResumeRedraw = true;
+        firstPromptBackend.write('\x0c');
+        log('Requested one Aiden Codex resume redraw; startup input remains gated');
+      }
+      log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
+      const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
+        const nextElapsedMs = elapsedMs + waitMs;
+        const startupTimer = setTimeout(
+          () => releaseFirstPromptTimeout(nextElapsedMs, nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS),
+          waitMs,
+        );
+        startupTimer.unref?.();
+      } else {
+        log(`WARN First prompt hard timeout — ${cliName()} startup readiness unconfirmed; keeping ${pendingMessages.length} input(s) queued`);
+        send({ type: 'user_notify', message: `${cliName()} 启动超过 90 秒仍未确认就绪；消息已保留在队列中，尚未提交。请检查终端中的加载状态或待处理对话框。`, turnId: currentBotmuxTurnId });
+      }
+      return;
+    }
     if (!shouldReleaseFirstPromptTimeout({
       deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
       hasReadyPattern: !!cliAdapter?.readyPattern,
@@ -16252,6 +22054,21 @@ async function spawnCli(
       return;
     }
 
+    // Never clear startup state or force a write while Codex's model-migration
+    // picker owns the input surface: the forced flush below would paste into
+    // it and its Enter would accept the new model. Its resolution (automatic,
+    // or by the user in the Web terminal) redraws the composer and re-drives
+    // the normal idle path, which still sees awaitingFirstPrompt.
+    if (!pickerAdmitted && codexModelMigrationCheckNeeded()) {
+      // Decide through the admission point; the re-entry re-validates
+      // everything above against the post-drain state.
+      void codexModelMigrationAdmit('ready', ptyOutputGeneration.snapshot()).then(admission => {
+        if (admission === 'proceed') releaseFirstPromptTimeout(elapsedMs, forced, true);
+        else if (admission === 'held') log(`First prompt timeout — Codex model-migration picker still open; keeping ${pendingMessages.length} input(s) queued`);
+      });
+      return;
+    }
+    const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
     clearPostHookEvidenceFallback();
@@ -16272,16 +22089,46 @@ async function spawnCli(
     // Non-type-ahead adapters (Hermes etc.) flushPending() rejects the held
     // message while isPromptReady is false — it bails on
     // `!isPromptReady && !typeAheadAllowed`. The hard cap means we've waited
-    // long enough. By now the ready gate's 45s fallback has already released
-    // the gate (READY_SIGNAL_TIMEOUT_MS < this 90s hard cap) and the post-
-    // release settle has drained, so markPromptReady() proceeds: it sets
-    // isPromptReady and drains the held first prompt. Without this, a spawn
-    // that never fires the ready signal (and whose readyPattern the idle
-    // detector never matched) would hold the first queued message forever —
-    // the previous code only logged "forcing flush" without actually flushing
-    // for non-type-ahead adapters.
-    if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+    // long enough. The ready gate's fallback has normally released the gate
+    // already (READY_SIGNAL_TIMEOUT_MS < this hard cap for adapters that do not
+    // defer; aligned WITH this cap for those that do), so markPromptReady()
+    // proceeds: it sets isPromptReady and drains the held first prompt. Without
+    // this, a spawn that never fires the ready signal (and whose readyPattern
+    // the idle detector never matched) would hold the first queued message
+    // forever — the previous code only logged "forcing flush" without actually
+    // flushing for non-type-ahead adapters.
+    //
+    // Both branches below are blocked while the gate still holds (flushPending
+    // and markPromptReady both bail on readyGate.shouldHold()), so release it
+    // first — but ONLY at the hard cap (`forced`): that is the adapter's own
+    // deadline, so the gate's extra hold must not outlive it. A SOFT timeout
+    // (15s) leaves the gate armed: for an adapter that does not defer
+    // (claude-code), the gate is the anti-startup-selector hold and its own
+    // release edge is the READY_SIGNAL_TIMEOUT_MS (45s) fallback — opening it
+    // here would write the first message into a selector that has not been
+    // passed yet, exactly what the gate exists to prevent. Falling through
+    // (rather than returning) keeps the settle → mark-ready path intact for
+    // non-type-ahead adapters.
+    if (forced && readyGate.shouldHold()) {
+      log('First prompt hard timeout — releasing ready gate before the hard-cap flush');
+      releaseReadyGate('first-prompt hard timeout');
+    }
+    // …and at the HARD CAP (not at a soft timeout) cancel whatever settle that
+    // release just started — or one a cap-aligned gate fallback started in this
+    // same tick: the cap is the adapter's deadline, so the first write must not
+    // land up to READY_FLUSH_SETTLE_CAP_MS later. Without this, the "90s hard
+    // cap" actually held the queued first input for 90–96s. A soft-timeout
+    // release keeps its settle: that is the pre-existing behavior for legacy
+    // adapters, whose own cap is far away.
+    if (forced) cancelFirstFlushSettle();
+    if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
+      const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
+        wasAwaitingPostHookPrompt,
+        hasPendingInput: hasPendingInputForFlush(),
+        webInputSinceBoundary: webTerminalInputGeneration !== webTerminalInputGenerationAtBoundary,
+      });
       flushPending();
+      if (armPromptSeed && backend) armFirstPromptTimeoutPromptSeed(backend);
       return;
     }
     markPromptReady();
@@ -16293,7 +22140,8 @@ async function spawnCli(
   // PTY output), and the first-prompt timeout only flushes for type-ahead
   // adapters, so isPromptReady would otherwise stay false until the ~15s
   // fallback and every first message would be needlessly delayed.
-  if (isRemoteBackendType(effectiveBackendType)) {
+  if (isRemoteBackendType(effectiveBackendType)
+    && effectiveBackendType !== 'remote-runner') {
     // BEFORE markPromptReady, which can flush a queued turn: a replacement
     // backend is built from the original init config, so a rotated — or cleared —
     // credential must be re-applied first or the queued turn runs against the
@@ -16363,6 +22211,10 @@ function restoreMojoLivePatchAfterRespawn(): void {
 
 function killCli(opts: {
   preservePending?: boolean;
+  preserveInjections?: boolean;
+  /** An intentional in-worker CLI restart replaces only the live backend. The
+   * surviving Node worker keeps its generation-scoped policy authority. */
+  preservePolicyCapability?: boolean;
   /** The replacement worker reuses this logical session's sandbox tree. Stop
    * this worker's watcher but leave the tree/mountpoints for that replacement. */
   preserveSandbox?: boolean;
@@ -16371,6 +22223,8 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  inputDeliveryQuarantine = null;
+  postTerminalInputFence = null;
   currentCliCredentialIsolated = false;
   stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();
@@ -16386,6 +22240,8 @@ function killCli(opts: {
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
+  programStatusStream?.reset();
+  programStatusStream = null;
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();
@@ -16420,6 +22276,7 @@ function killCli(opts: {
     sandboxRelayCapability,
     currentBotmuxTurnId,
     currentBotmuxDispatchAttempt,
+    { revokePolicy: !opts.preservePolicyCapability },
   );
   // Stop the sandbox outbox watcher, then reclaim the deny-mask mountpoints +
   // remove the per-session sandbox tree. In the fs-policy model the CLI writes
@@ -16432,9 +22289,11 @@ function killCli(opts: {
   sandboxRelayOutbox = null;
   readIsolationOriginCapabilityFile = null;
   readIsolationOriginChannelId = null;
-  currentBotmuxTurnId = undefined;
-  currentBotmuxDispatchAttempt = undefined;
-  currentGatewayTrustedCaller = undefined;
+  setCaptureIdentity(undefined, undefined);
+  queuedTypeAheadTurns = [];
+  queuedTurnAdvanceConsumedForPrompt = false;
+  retiredTurnIds.clear();
+  activeTurnAuthority.clear();
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
@@ -16450,6 +22309,7 @@ function killCli(opts: {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
   }
+  sandboxTreeOutlivesWorker = false;
   isPromptReady = false;
   forceClearSessionRenameInFlight();
   if (!opts.preservePending) {
@@ -16460,11 +22320,11 @@ function killCli(opts: {
   // because /rename owned the TUI or an owned CLI restart was already fenced.
   // Preserve them across restart; unlike an in-flight raw command, replaying
   // these cannot duplicate a side effect.
-  // pendingInjections 则无条件清空（不随 preservePending 保留）：barrier /cd 的
+  // 普通重启清空 pendingInjections（不随 preservePending 保留）：barrier /cd 的
   // 目录变更已固化进 lastInitConfig.workingDir 与 daemon 记录，respawn 本身就落在
   // 新目录，重放 /cd 反而多余；非 barrier 注入（如 /compact）是 best-effort，
-  // 不跨进程重放。
-  pendingInjections.length = 0;
+  // 不跨进程重放。自动升级保留换代窗口内尚未写入的注入。
+  if (!opts.preserveInjections) pendingInjections.length = 0;
   scrollback = '';
   herdrWebHistory = null;
   herdrWebScrollDirection = null;
@@ -16472,14 +22332,36 @@ function killCli(opts: {
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
+  aidenCodexUpdateLastActionAt = 0;
+  aidenCodexUpdateAttempts = 0;
+  aidenCodexUpdateLimitNotified = false;
+  resetCodexModelMigrationState();
   disarmEffortConfirm();
+  disarmBtwCapture();
   appRunnerControlDecoder.reset();
+}
+
+function stopOwnedSessionScope(reason: string): void {
+  const cfg = lastInitConfig;
+  if (!cfg || cfg.adoptMode || isRemoteBackendType(effectiveBackendType)) return;
+  try {
+    const stopped = stopSessionScope(cfg.sessionId);
+    log(stopped
+      ? `Stopped owned session scope (${reason})`
+      : `Owned session scope was absent or could not be stopped (${reason})`);
+  } catch (error) {
+    log(`Failed to stop owned session scope (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
+  if (codexAutoUpgrade) {
+    codexAutoUpgrade.reject?.(new Error(reason));
+    return;
+  }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
     log(`Restart ignored in shared-adopt mode (${reason})`);
     return;
@@ -16491,12 +22373,14 @@ async function restartCliProcess(
   // Old-generation deferred submit rechecks are stale by definition: cancel
   // them now so no lingering timer warns or mutates the replacement attempt.
   submitFailureChains.clear();
+  queuedActivationReceipts.clear();
   // Set before touching destroySession(): remote teardown can await for many
   // seconds while the old backend object is still non-null and still capable
   // of firing idle/task-done callbacks. Inputs accepted in that interval must
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
   replacementSpawnInProgress = false;
+  restartWindowLaunch = undefined;
   rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
@@ -16565,16 +22449,27 @@ async function restartCliProcess(
         ));
         return;
       }
-      killCli({ preservePending: opts.preservePending });
+      stopOwnedSessionScope('restart');
+      killCli({
+        preservePending: opts.preservePending,
+        preservePolicyCapability: true,
+      });
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
+        let spawnedLaunch: RestartLaunchSettings | undefined;
         if (lastInitConfig) {
           startScreenUpdates();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
             spawnedWorkingDir = restartCfg.workingDir;
+            // Launch snapshot of this window. A folded request still pending
+            // from before it is satisfied by this replacement (built from the
+            // latest settings): it owns this window's receipt now.
+            restartWindowLaunch = restartLaunchSettings(restartCfg);
+            spawnedLaunch = restartWindowLaunch;
+            adoptPendingLaunchConvergence();
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
@@ -16615,18 +22510,42 @@ async function restartCliProcess(
         //    second restart). Recover now or the session strands at
         //    backend=null needing a manual /restart. Genuine crash recovery →
         //    COUNTS toward tier-2 FRESH.
+        //  - launch-config: a correlated restart folded in AFTER restartCfg was
+        //    captured asked (by value) for different cwd / env / model /
+        //    larkToolBinding (foldRestartIntoWindow). Same convergence respawn
+        //    as cwd-move; that request's attempt rides into it and is settled
+        //    only by the converged replacement.
         const followup = decideRestartFollowup({
           spawnedWorkingDir,
           currentWorkingDir: lastInitConfig?.workingDir,
           backendAlive: !!backend,
+          spawnedLaunch,
+          requestedLaunch: pendingLaunchConvergence?.requested,
         });
         if (followup.kind !== 'none') {
           const reason = followup.kind === 'cwd-move'
             ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
-            : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
+            : followup.kind === 'launch-config'
+              ? 'launch-config follow-up respawn (a restart folded into this window asked for different env/model/tool binding)'
+              : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
           log(reason);
+          // The follow-up builds from the latest settings: the pending folded
+          // request owns its receipt (the stale replacement never settles it).
+          adoptPendingLaunchConvergence();
           void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
           return;
+        }
+        // A request folded in after the snapshot whose settings this
+        // replacement already runs (by value) needs no respawn: it settles here.
+        adoptPendingLaunchConvergence();
+        // The replacement may already have reached its prompt while this
+        // continuation was still awaiting (spawnCli / Codex title prep). Its
+        // ready edge settled whatever attempt existed then; an attempt the
+        // merge guard adopted afterwards would otherwise never see another
+        // edge (markPromptReady dedupes). killCli reset isPromptReady before
+        // the spawn, so a true value here is THIS replacement's prompt.
+        if (isPromptReady) {
+          settleRestartAttemptOnReady('restart continuation finished at the prompt', { republishPromptReady: true });
         }
         // Remote backends mark themselves prompt-ready inside spawnCli(); that
         // early flush is intentionally held by the restart gate above. Release
@@ -16670,11 +22589,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       }
       const { hasRead, hasWrite, platformReadonly } = resolveTerminalAccessForReq(req, url);
       if (!hasRead) {
+        const body = terminalStatusHtml('forbidden');
         res.writeHead(403, {
-          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Type': 'text/html; charset=utf-8',
           'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
         });
-        res.end('Forbidden');
+        res.end(body);
         return;
       }
       // #933 回归修复：平台注入的 Cookie/Role 会被中央前门剥掉（P1-6 / 内部 grant），
@@ -16722,7 +22643,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
       res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
@@ -16732,6 +22657,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // `connection` callback is too late: an unauthenticated localhost scanner
       // briefly becomes a client and races the terminal history seed.
       verifyClient: ({ req }, done) => {
+        if (codexAutoUpgrade) {
+          done(false, 503, 'Codex session is restarting');
+          return;
+        }
         const url = parseWorkerRequestUrl(req);
         if (!url) {
           done(false, 400, 'Bad Request');
@@ -16746,6 +22675,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
     });
 
     wss.on('connection', (ws, req: IncomingMessage) => {
+      if (codexAutoUpgrade) {
+        ws.close(1013, 'Codex session is restarting');
+        return;
+      }
       // P1-3 — the pre-handshake verdict is a SNAPSHOT, and this callback runs
       // strictly after it: ws only completes the upgrade once verifyClient
       // called back, and re-resolving access here re-reads `.dashboard-secret`
@@ -16797,6 +22730,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // frame #1 of a connection as control, so PTY output can never be mistaken
       // for it. Nothing awaits between `wsClients.add` above and this send.
       try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
+      const currentInputMode = getWebTerminalInputMode(sessionId);
+      if (hasWrite) {
+        // 带内 OSC 1989 序列：仅下发移动端输入模式 UI 呈现（缓冲上屏 vs 实时输入）。
+        // 安全边界说明：
+        // ① 该帧仅控制客户端工具栏/输入框交互逻辑，不携带或授予任何服务端写权限；
+        // ② 服务端终端输入转发严格受 authedClients 门禁保护；终端内进程若伪造该字节流，
+        //    最多改变前端输入面板交互形态，无法越权写入或绕过授权检查；
+        // ③ 模式帧格式与现有 _hh/_hf/_ho/_fs 同族，遵循相同 OSC 1989 设计规范。
+        try { ws.send(formatMobileInputModeOsc(currentInputMode)); } catch { /* already closing */ }
+      }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
       // delayed or bypassed, the worker independently removes any granted
@@ -16996,6 +22939,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ));
         herdrWebBindings.set(ws, herdrWebBinding);
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
+        // A view capability is observational: it must not resize a shared
+        // terminal. Remote Runner already follows the provider grid; owned
+        // tmux pipe sessions need the same rule because their live pane also
+        // drives the Lark screenshot. Letting a narrow read-only browser resize
+        // that pane leaves later screenshots permanently wrapped at its width.
+        const readOnlyFollowsBackendGrid = !hasWrite
+          && (effectiveBackendType === 'remote-runner'
+            || (effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode));
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -17013,7 +22964,18 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // (sent BEFORE the seed so the client resizes before rendering it).
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
-          if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+          if (sz && sz.cols > 0 && sz.rows > 0) {
+            const pin = `\x1b]1989;${sz.cols};${sz.rows}\x07`;
+            ws.send(pin);
+            adoptWebGridPins.set(ws, pin);
+          }
+        }
+        // Pin a read-only viewer to the authoritative grid before sending the
+        // seed. Its FitAddon may still report the browser viewport below, but
+        // that resize stays display-local and is not forwarded to the backend.
+        if (readOnlyFollowsBackendGrid) {
+          const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
+          ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
         const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
           ? scrollback
@@ -17042,14 +23004,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               const result = herdrWebBinding.resize(msg.cols, msg.rows);
               applyHerdrWebBindingResult(ws, result);
-              if (!result.backend) {
+              if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
+                broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
               auditTerminalInput(auditUser, msg.data);
+              lastWebTerminalInputAtMs = Date.now();
+              webTerminalInputGeneration++;
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -17062,12 +23027,21 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
               if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
               backend?.write(msg.data);
+            } else if (msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')) {
+              if (!authedClients.has(ws)) return;
+              setWebTerminalInputMode(msg.mode, sessionId);
+              for (const client of wsClients) {
+                if (client !== ws && authedClients.has(client) && client.readyState === WebSocket.OPEN) {
+                  try { client.send(formatMobileInputModeOsc(msg.mode)); } catch { /* ignore */ }
+                }
+              }
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
 
         ws.on('close', () => {
           wsClients.delete(ws);
+          authedClients.delete(ws);
           herdrWebBindings.delete(ws);
           const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
@@ -17094,6 +23068,7 @@ function getTerminalHtml(
   forceRemoteScroll = false,
   localTerminalBackend = false,
   allowReadOnlyRemoteScroll = false,
+  initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(sessionId),
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -17101,9 +23076,11 @@ function getTerminalHtml(
 <head>
 <meta charset="utf-8">
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="lk-config" content="{&quot;showBottomNavBar&quot;:false}">
+<meta name="format-detection" content="telephone=no">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
@@ -17164,10 +23141,31 @@ body{display:flex;flex-direction:column;height:100vh;height:100dvh}
 @media(prefers-reduced-motion:reduce){#toolbar,#toolbar.collapsed{transition:opacity .12s linear}}
 #terminal{flex:1;min-width:0;min-height:0;width:100%;height:100%}
 #terminal .xterm{height:100%}
+/* Fixed remote grids need canvas scrolling in addition to xterm history.
+   Reserve the same 15px scrollbar allowance as FitAddon beside the last column. */
+#terminal.fixed-grid{overflow:auto}
+#terminal.fixed-grid .xterm{height:auto;width:max-content;padding-right:15px}
+/* Hidden input helpers can retain old cursor coordinates after a font resize.
+   They must not extend the outer scroll range past the rendered final row. */
+#terminal.fixed-grid .xterm-screen{overflow:clip}
 /* Real scroll container is xterm's own viewport — kill iOS rubber-band bounce
    and momentum here (not just on body), and reserve gestures for pinch-zoom so
    single-finger drag is driven manually by the touch handler below. */
 #terminal .xterm-viewport{overscroll-behavior:none;-webkit-overflow-scrolling:auto;touch-action:pinch-zoom}
+/* Scrollbar: Feishu's embedded webview (and any desktop with classic, non-overlay
+   scrollbars) paints the viewport's native bar as a wide light track that glares
+   against the dark terminal. Thin translucent thumb on a transparent track instead,
+   darker on hover. Standard scrollbar-* covers Firefox and Chromium 121+ (where
+   they take precedence); ::-webkit-scrollbar covers older Chromium and WebKit. The
+   viewport is xterm's real scroll container, so this is the only bar to style.
+   Neutral gray so it reads on both dark and light terminal themes. */
+#terminal .xterm-viewport{scrollbar-width:thin;scrollbar-color:rgba(140,148,170,.38) transparent}
+#terminal .xterm-viewport::-webkit-scrollbar{width:8px;height:8px}
+#terminal .xterm-viewport::-webkit-scrollbar-track{background:transparent}
+#terminal .xterm-viewport::-webkit-scrollbar-thumb{min-height:36px;border:2px solid transparent;border-radius:8px;
+  background:rgba(140,148,170,.38);background-clip:padding-box}
+#terminal .xterm-viewport::-webkit-scrollbar-thumb:hover{background:rgba(140,148,170,.6);background-clip:padding-box}
+#terminal .xterm-viewport::-webkit-scrollbar-corner{background:transparent}
 /* On touch, glyph cells are selectable text — a finger-drag over text starts
    native text selection (and the long-press callout) instead of scrolling,
    which is why blank areas scroll fine but text areas stall/won't move.
@@ -17190,6 +23188,64 @@ body.touch #terminal .xterm-screen *{
   background:rgba(224,175,104,0.12);border:1px solid rgba(224,175,104,0.35);border-radius:4px;
   backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
 #login-banner.show{display:inline-block}
+/* ── Mobile input bar (ported from woof's #mobile-input-form) ──
+   On touch devices the floating right-edge toolbar is hidden and this bar
+   replaces it: a scrollable row of shortcut/navigation keys
+   plus a persistent input row with two modes:
+     • live   : keystrokes are diff'd to ANSI sequences and sent as you type
+     • buffer : text accumulates, sent wholesale on 发送/Enter
+   Lives at the bottom; the terminal resizes above it via --mobile-bar-h. */
+body.touch #toolbar-shell{display:none!important}
+#mobile-input-bar{display:none}
+body.touch.has-token #mobile-input-bar{
+  display:flex;flex-direction:column;position:fixed;left:0;right:0;bottom:0;z-index:60;
+  padding:6px max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));
+  border-top:1px solid #2a2b3d;background:#0f0f14;
+  transform:translateY(calc(0px - var(--keyboard-inset,0px)));transition:transform .12s ease}
+body.touch.has-token #terminal .xterm{
+  padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
+#mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#mobile-bar-keys::-webkit-scrollbar{display:none}
+/* A long press on a bar key must repeat that key (see the repeat handler below),
+   never raise the iOS selection handles / callout menu. user-select alone is not
+   enough in a WKWebView — the -webkit- pair is what suppresses both, same as the
+   xterm content area above. */
+#mobile-bar-keys button{
+  flex:none;min-width:44px;height:34px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;white-space:nowrap}
+#mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-bar-row{display:flex;align-items:flex-end;gap:8px}
+#mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
+/* 16px is a hard floor, not a taste call: iOS Safari / WKWebView auto-zooms the
+   page whenever a focused form control renders below 16px, and it never zooms
+   back out — the terminal is left scaled up with its right-hand columns off
+   screen. -webkit-text-size-adjust does NOT prevent that (it only stops the
+   text-inflation algorithm), so the size itself has to be 16px. */
+#mobile-input{
+  flex:1;min-width:0;min-height:42px;max-height:120px;resize:none;overflow-y:auto;
+  padding:10px 12px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  -webkit-text-size-adjust:100%;text-size-adjust:100%}
+#mobile-input::placeholder{color:#565f89}
+#mobile-bar-row button{
+  flex:none;width:42px;min-height:42px;height:42px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
+  background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-input-bar button:disabled,#mobile-input-bar textarea:disabled{opacity:.45;cursor:not-allowed}
+#mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
+#mobile-mode{min-width:48px;border-radius:8px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
+/* live mode: the textarea holds the IME draft but the typed text is already in
+   the terminal, so render the textarea transparent to avoid double-vision. */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:transparent;caret-color:transparent}
+#mobile-live-hint{display:none;position:absolute;inset:0;pointer-events:none;align-items:center;
+  padding:0 56px 0 14px;color:#565f89;font:12px -apple-system,sans-serif;white-space:nowrap;overflow:hidden}
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-live-hint{display:flex}
+/* live mode: the hint replaces the placeholder — hide both to avoid overlap */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input::placeholder{color:transparent}
 </style>
 </head>
 <body>
@@ -17218,13 +23274,36 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     </div>
   </div>
 </div>
+<form id="mobile-input-bar" autocomplete="off" data-mode="${initialMobileInputMode}" aria-label="手机输入">
+  <div id="mobile-bar-keys">
+    <button type="button" data-sk="paste">Paste</button>
+    <button type="button" data-sk="ctrlc">Ctrl+C</button>
+    <button type="button" data-sk="esc">Esc</button>
+    <button type="button" data-sk="tab">Tab</button>
+    <button type="button" data-sk="left" title="左移" aria-label="左移">←</button>
+    <button type="button" data-sk="right" title="右移" aria-label="右移">→</button>
+    <button id="mobile-up" type="button" data-sk="up" title="上移" aria-label="上移">↑</button>
+    <button id="mobile-down" type="button" data-sk="down" title="下移" aria-label="下移">↓</button>
+    <button id="mobile-bs" type="button" data-sk="bs" title="删除终端字符" aria-label="删除终端字符">⌫</button>
+    <button type="button" data-sk="enter">Enter</button>
+    <button type="button" data-sk="stab">Shift+Tab</button>
+  </div>
+  <div id="mobile-bar-row">
+    <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
+    <div id="mobile-input-wrap">
+      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="输入命令…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
+      <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
+    </div>
+    <button id="mobile-send" type="submit">上屏</button>
+  </div>
+</form>
 <div id="status" class="err">connecting...</div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0.7.0/lib/addon-canvas.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
@@ -17245,6 +23324,10 @@ var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
 var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
+var _wbInitialMobileInputMode=${JSON.stringify(initialMobileInputMode)};
+var _wbSetMobileInputMode=null;
+var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});
+var _wbSyncMobileInputMode=function(m){try{if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'mobile_input_mode',mode:m}));}}catch(_e){}};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -17312,10 +23395,101 @@ try{
 // 首帧字号已经在 new Terminal 里按容器宽度定好了；这个函数负责后续尺寸变化
 // （转屏、iframe 改宽、分屏、地址栏收放）时复算。返回 true 表示字号真的换了档。
 function _wbApplyAutoFontSize(){
+  var before=term.options.fontSize;
   var next=_wbAutoFontSize(_wbTerminalWidth());
-  if(term.options.fontSize===next)return false;
-  term.options.fontSize=next;
-  return true;
+  // 固定网格撑开过的行距、字间距先复位到基准：字号按基准间距重新适配；离开固定网格
+  // 也靠这一步还原。
+  _wbResetGridSpacing();
+  if(fixedSize)next=_wbFixedGridFontSize(next);
+  if(next!==before)term.options.fontSize=next;
+  if(fixedSize){_wbSettleFixedGridFont();_wbStretchFixedGrid();}
+  return term.options.fontSize!==before;
+}
+// 固定网格（adopt 的 pane、托管 Herdr 的 follower 等）的行列数由远端决定。按容器宽度
+// 算出的字号要么放不下（出横向滚动条），要么放得下却铺不满（四周留白）。这里照远程桌面
+// 「适应窗口」的做法：取宽、高都放得下整张网格的最大字号，等比缩放，只在一个方向上留下
+// 不到一档的空隙。下限 _WB_FONT_MIN（再小就读不了，宁可滚动）；上限 _WB_FIXED_FONT_MAX
+// （防止很小的远端网格在大屏上被放成巨字）。
+// 单元格尺寸用 xterm 实测值（FitAddon 读的也是它）。可用空间要扣掉 .xterm 自身的
+// padding：fixed-grid 给滚动条预留的右边距，以及触屏可写时给底部输入栏和软键盘留的
+// 下边距（--mobile-bar-h / --keyboard-inset，两者变化时都会触发 onViewportResize 重新适配）。
+var _WB_FIXED_FONT_MAX=24;
+// 外观设置给的基准行距（经典 1 / 阅读风 1.15，见外观消息处理）。固定网格的撑开以它为底。
+var _wbLineHeightBase=1;
+function _wbFixedGridMetrics(){
+  var host=document.getElementById('terminal');
+  var dims=term._core&&term._core._renderService&&term._core._renderService.dimensions;
+  var cell=dims&&dims.css&&dims.css.cell;
+  var cs=term.element&&window.getComputedStyle?window.getComputedStyle(term.element):null;
+  var px=function(v){var n=parseFloat(v);return n>0?n:0;};
+  var padX=cs?px(cs.paddingLeft)+px(cs.paddingRight):15;
+  var padY=cs?px(cs.paddingTop)+px(cs.paddingBottom):0;
+  var m={
+    cellW:cell?cell.width:0,cellH:cell?cell.height:0,
+    availW:(host?host.clientWidth:0)-padX,availH:(host?host.clientHeight:0)-padY
+  };
+  m.ok=m.cellW>0&&m.cellH>0&&m.availW>0&&m.availH>0&&term.cols>0&&term.rows>0;
+  return m;
+}
+function _wbFixedGridFits(m){
+  return m.cellW*term.cols<=m.availW&&m.cellH*term.rows<=m.availH;
+}
+function _wbFixedGridFontSize(base){
+  var m=_wbFixedGridMetrics(),f=term.options.fontSize;
+  if(!m.ok)return base;
+  var fitted=Math.floor(Math.min(m.availW*f/(m.cellW*term.cols),m.availH*f/(m.cellH*term.rows))*2)/2;
+  if(fitted>_WB_FIXED_FONT_MAX)return _WB_FIXED_FONT_MAX;
+  return fitted<_WB_FONT_MIN?_WB_FONT_MIN:fitted;
+}
+// 单元格尺寸按设备像素取整，与字号并不严格成正比（实测字宽 / 字号在 0.556~0.6 之间浮动），
+// 所以估算落档后要按实测尺寸校正：放不下就逐半档下调，放得下再逐半档试着上调，直到刚好
+// 放得下为止。下限也放不下时停在下限，保留滚动。
+function _wbSettleFixedGridFont(){
+  var m=_wbFixedGridMetrics();
+  if(!m.ok)return;
+  while(term.options.fontSize>_WB_FONT_MIN&&!_wbFixedGridFits(m)){
+    term.options.fontSize=term.options.fontSize-.5;
+    m=_wbFixedGridMetrics();
+  }
+  while(term.options.fontSize<_WB_FIXED_FONT_MAX&&_wbFixedGridFits(m)){
+    var at=term.options.fontSize;
+    term.options.fontSize=at+.5;
+    m=_wbFixedGridMetrics();
+    if(!_wbFixedGridFits(m)){term.options.fontSize=at;break;}
+  }
+}
+// 字号只能按档变化，浏览器和远端网格的宽高比也未必一致，等比缩放之后总有一边留白。
+// 字形不动：剩余高度用行距撑满，剩余宽度用字间距撑满。xterm 把单元格按物理像素取整，
+// 所以宽度最多还差「列数 x 1 个物理像素」，高度最多差「行数 x 1 个物理像素」。两者都
+// 设上限，避免宽高比相差悬殊时排得过散。
+var _WB_FIXED_LINE_STRETCH=1.5,_WB_FIXED_LETTER_STRETCH=.2;
+function _wbResetGridSpacing(){
+  if(term.options.lineHeight!==_wbLineHeightBase)term.options.lineHeight=_wbLineHeightBase;
+  if(term.options.letterSpacing)term.options.letterSpacing=0;
+}
+function _wbStretchFixedGrid(){
+  var m=_wbFixedGridMetrics();
+  if(!m.ok||!_wbFixedGridFits(m))return;
+  var lh=Math.min(_wbLineHeightBase*_WB_FIXED_LINE_STRETCH,
+    _wbLineHeightBase*m.availH/(m.cellH*term.rows));
+  // 行高按物理像素向下取整，估算偶尔会多出一个像素：放不下就一点点往回收。
+  for(var i=0;i<40&&lh>_wbLineHeightBase;i++){
+    term.options.lineHeight=lh;
+    m=_wbFixedGridMetrics();
+    if(_wbFixedGridFits(m))break;
+    lh=Math.max(_wbLineHeightBase,lh-.005);
+  }
+  if(!_wbFixedGridFits(m)){term.options.lineHeight=_wbLineHeightBase;m=_wbFixedGridMetrics();}
+  // 字间距的单位因渲染器而异（WebGL / Canvas 按物理像素取整，DOM 按 CSS 像素），按
+  // 物理像素估算，放不下就逐个往回收。
+  var dpr=window.devicePixelRatio||1;
+  var ls=Math.min(Math.floor(m.cellW*_WB_FIXED_LETTER_STRETCH*dpr),
+    Math.floor((m.availW/term.cols-m.cellW)*dpr));
+  for(;ls>0;ls--){
+    term.options.letterSpacing=ls;
+    if(_wbFixedGridFits(_wbFixedGridMetrics()))return;
+  }
+  if(term.options.letterSpacing)term.options.letterSpacing=0;
 }
 fit.fit();
 // 这条通道到底能不能写，以**已经建立的 WS** 为准（见页面顶部 wsHasWrite 那段注释）。
@@ -17337,6 +23511,7 @@ function _wbPostWrite(){
   // 发），嵌入方据此把上一条连接的结论清掉，而不是继续显示一个过期的判定。
   try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
 }
+var _wbMobileWriteState=null;
 function _wbSetWsWrite(v){
   var changed=wsHasWrite!==v;
   wsHasWrite=v;
@@ -17349,6 +23524,7 @@ function _wbSetWsWrite(v){
       else if(v===true)_wb.classList.remove('show');
     }
   }
+  if(_wbMobileWriteState)_wbMobileWriteState(v);
   _wbPostWrite();
 }
 // 工作台下发的终端外观（消息类型 botmux:wb-appearance）。终端画布住在这个跨文档
@@ -17390,8 +23566,11 @@ window.addEventListener('message',function(_ev){
     // 1.3 对中文密集的 TUI 内容还是偏松：汉字撑满 em 框，行间空隙观感接近隔行，于是
     // 再收一档到 1.15（单元格高约 18.2px），比经典松一成半，读起来才连成一段。
     term.options.lineHeight=_d.termStyle==='reader'?1.15:1;
-    // 行距变了可视行数就变，必须复算一次。几何契约不动：只有画布内重绘。
-    fit.fit();
+    _wbLineHeightBase=term.options.lineHeight;
+    // Refit only an owned grid; followers must preserve the remote row/column count
+    // and re-fit their font instead, since the line height changes the grid height.
+    if(!fixedSize)fit.fit();
+    else _wbApplyAutoFontSize();
   }catch(_e){}
 });
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
@@ -17407,11 +23586,11 @@ function _cancelInitialFollow(){
 }
 function _settleInitialBottom(){
   if(!_initialFollow)return;
-  try{term.scrollToBottom()}catch(_e){}
+  try{term.scrollToBottom();_followFixedGridBottom()}catch(_e){}
   clearTimeout(_initialFollowT);
   _initialFollowT=setTimeout(function(){
     if(!_initialFollow)return;
-    try{term.scrollToBottom()}catch(_e){}
+    try{term.scrollToBottom();_followFixedGridBottom()}catch(_e){}
     _initialFollow=false;
   },500);
 }
@@ -17603,6 +23782,52 @@ term.onData(function(d){
   _sendInput(d);
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
+function _setFixedGrid(enabled){
+  fixedSize=enabled;
+  var host=document.getElementById('terminal');
+  host.classList.toggle('fixed-grid',enabled);
+  if(!enabled){host.scrollTop=0;host.scrollLeft=0;}
+}
+function _followFixedGridBottom(){
+  if(fixedSize){var host=document.getElementById('terminal');host.scrollTop=host.scrollHeight;}
+}
+function _scrollFixedGrid(dx,dy){
+  if(!fixedSize)return false;
+  var host=document.getElementById('terminal'),x=host.scrollLeft,y=host.scrollTop;
+  // Consume only the dominant axis: minor cross-axis drift must not swallow
+  // a gesture that should reach terminal history at the canvas boundary.
+  if(Math.abs(dy)>=Math.abs(dx)){
+    host.scrollTop+=dy;
+    return host.scrollTop!==y;
+  }
+  host.scrollLeft+=dx;
+  return host.scrollLeft!==x;
+}
+// Reveal the canvas before xterm or the remote-wheel handler consumes gestures.
+// At the canvas edge, normal terminal history scrolling resumes.
+var _fixedHost=document.getElementById('terminal'),_fixedTouch=null;
+_fixedHost.addEventListener('wheel',function(e){
+  if(e.ctrlKey)return;
+  var unit=e.deltaMode===1?16:e.deltaMode===2?_fixedHost.clientHeight:1;
+  if(_scrollFixedGrid(e.deltaX*unit,e.deltaY*unit)){
+    e.preventDefault();e.stopImmediatePropagation();
+  }
+},{capture:true,passive:false});
+_fixedHost.addEventListener('touchstart',function(e){
+  _fixedTouch=e.touches.length===1?{x:e.touches[0].clientX,y:e.touches[0].clientY}:null;
+},{capture:true,passive:true});
+_fixedHost.addEventListener('touchmove',function(e){
+  if(!_fixedTouch||e.touches.length!==1){_fixedTouch=null;return;}
+  var touch=e.touches[0],dx=_fixedTouch.x-touch.clientX,dy=_fixedTouch.y-touch.clientY;
+  _fixedTouch={x:touch.clientX,y:touch.clientY};
+  if(_scrollFixedGrid(dx,dy)){
+    // Keep the downstream touch handler's anchor current when it resumes.
+    _tLastY=touch.clientY;
+    e.preventDefault();e.stopImmediatePropagation();
+  }
+},{capture:true,passive:false});
+_fixedHost.addEventListener('touchend',function(){_fixedTouch=null;},{passive:true});
+_fixedHost.addEventListener('touchcancel',function(){_fixedTouch=null;},{passive:true});
 function sendResize(){
   if(!ws_||ws_.readyState!==1)return;
   // Dedup: a fit that lands on the same grid must NOT re-emit a resize — for a
@@ -17646,6 +23871,10 @@ if(typeof ResizeObserver!=='undefined'){
   var proto=location.protocol==='https:'?'wss':'ws';
   var ws=new WebSocket(proto+'://'+location.host+base+'/'+location.search);
   ws_=ws;ws.binaryType='arraybuffer';
+  // Guard against a hung CONNECTING state (proxy/network black hole): if the
+  // socket never opens, close it so onclose retries instead of leaving the
+  // user staring at "connecting" forever.
+  var openTimer=setTimeout(function(){try{ws.close()}catch(e){}},10000);
   // 新连接 = 新的一次鉴权。上一条连接拿到的权限说明不了这一条，先退回未知（并把这
   // 个「未知」上抛给嵌入方），等这条连接自己的首帧说话。
   _wbFirstFrame=true;
@@ -17657,7 +23886,7 @@ if(typeof ResizeObserver!=='undefined'){
   // restart). If we never re-send our real grid, the PTY stays 160 while this
   // xterm renders narrower, and Claude's height-relative redraws drift a row
   // (status-line update bleeds into the line below). Always re-assert size.
-  ws.onopen=function(){el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
+  ws.onopen=function(){clearTimeout(openTimer);el.textContent='connected';el.className='ok';_lastC=_lastR=0;sendResize()};
   ws.onmessage=function(e){
     // 带外控制帧只可能是**本连接的第一帧**，而且必须整帧精确匹配（见页面顶部
     // _wbDecodeWriteFrame 那段注释）。首帧一旦消费掉，这条连接上之后的每一个字节
@@ -17688,20 +23917,27 @@ if(typeof ResizeObserver!=='undefined'){
     // own viewport and reports the new size back to the worker.
     var _hf=data.match(/\\x1b\\]1989;follower;(\\d+);(\\d+)\\x07/);
     if(_hf){
-      fixedSize=true;var _hc=+_hf[1],_hr=+_hf[2];
+      _setFixedGrid(true);var _hc=+_hf[1],_hr=+_hf[2];
       if(_hc>0&&_hr>0){try{term.resize(_hc,_hr)}catch(ex){}_lastC=_hc;_lastR=_hr}
+      try{_wbApplyAutoFontSize()}catch(ex){}
       data=data.replace(_hf[0],'');
     }
     var _ho=data.match(/\\x1b\\]1989;owner\\x07/);
     if(_ho){
-      fixedSize=false;data=data.replace(_ho[0],'');
+      _setFixedGrid(false);data=data.replace(_ho[0],'');
+      // 离开固定网格：字号回到按容器宽度自适应的那一档，再 fit 回自己的视口。
+      try{_wbApplyAutoFontSize()}catch(ex){}
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
-    if(_fs){fixedSize=true;var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}try{_wbApplyAutoFontSize()}catch(ex){}data=data.replace(_fs[0],'')}
+    // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
+    // 纯显示/交互态控制帧，不改变服务端权限门禁。使用服务端共享正则编译实例。
+    var _mim=data.match(_wbMimRegex);
+    if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
@@ -18160,6 +24396,263 @@ if(!${isTmuxMode && !isPipeMode}){
   _tTerm.addEventListener('touchend',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
   _tTerm.addEventListener('touchcancel',function(){_tLastY=null;_endScrollBurst()},{capture:true,passive:true});
 }
+
+// ── Mobile input bar (ported from woof mobile_live_input + #mobile-input-form) ──
+// Two modes drive the SAME ws {type:'input'} channel the shortcut toolbar uses:
+//   • buffer : textarea text is sent wholesale on 发送/Enter (default, safest)
+//   • live   : each keystroke is diff'd to ANSI cursor/backspace/insert sequences
+//              via a grapheme-aware mirror, so Chinese IME and fast typing work.
+// Read-only sessions never show it (no token ⇒ no body.has-token).
+if(isTouch&&hasToken){(function(){
+  document.body.classList.add('has-token');
+  var bar=document.getElementById('mobile-input-bar');
+  var ta=document.getElementById('mobile-input');
+  var modeBtn=document.getElementById('mobile-mode');
+  var sendBtn=document.getElementById('mobile-send');
+  var hint=document.getElementById('mobile-live-hint');
+  var LIVE='live',BUFFER='buffer';
+  var mode=(typeof _wbInitialMobileInputMode==='string'&&_wbInitialMobileInputMode===LIVE)?LIVE:BUFFER;
+  var controls=bar.querySelectorAll('button,textarea');
+
+  function _syncMode(m){try{if(typeof _wbSyncMobileInputMode==='function')_wbSyncMobileInputMode(m);}catch(_e){}}
+  function setExternalMode(m){
+    if(m!==LIVE&&m!==BUFFER)return;
+    if(m===mode)return;
+    if(mode===LIVE&&!sendLiveKey(''))return;
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();
+    }
+    setMode(m);
+    if(m===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  }
+  _wbSetMobileInputMode=setExternalMode;
+
+  function setWriteState(v){
+    var disabled=v!==true;
+    for(var ci=0;ci<controls.length;ci++)controls[ci].disabled=disabled;
+    bar.setAttribute('aria-disabled',disabled?'true':'false');
+  }
+  _wbMobileWriteState=setWriteState;
+
+  // ── grapheme-aware edit-sequence mirror (from woof mobile_live_input.js) ──
+  var CL='\\x1b[D',CR='\\x1b[C',BS='\\x7f';
+  function graphs(s){s=String(s||'');
+    if(typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'){
+      return Array.from(new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(s),function(p){return p.segment});}
+    return Array.from(s);}
+  function editSeq(prev,next){
+    var b=graphs(prev),a=graphs(next),pre=0;
+    while(pre<b.length&&pre<a.length&&b[pre]===a[pre])pre++;
+    var suf=0;
+    while(suf<b.length-pre&&suf<a.length-pre&&b[b.length-1-suf]===a[a.length-1-suf])suf++;
+    var rem=b.length-pre-suf,ins=a.slice(pre,a.length-suf).join('');
+    return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
+  var mirror={sent:'',held:'',composing:false};
+  function sendInput(seq){if(!seq||wsHasWrite!==true||!ws_||ws_.readyState!==1)return false;
+    try{ws_.send(JSON.stringify({type:'input',data:seq}));return true;}catch(e){return false;}}
+  function syncMirror(v){mirror.held=String(v||'');
+    if(mirror.composing||mirror.held===mirror.sent)return true;
+    var seq=editSeq(mirror.sent,mirror.held);
+    if(!sendInput(seq))return false;
+    mirror.sent=mirror.held;return true;}
+  function sendLiveKey(key){
+    mirror.held=String(ta.value||'');
+    if(mirror.composing||wsHasWrite!==true)return false;
+    var payload=editSeq(mirror.sent,mirror.held)+(key||'');
+    if(payload&&!sendInput(payload))return false;
+    mirror.sent=mirror.held='';ta.value='';resizeTa();return true;}
+
+  // Buffer mode types the text into the CLI's own input box WITHOUT submitting
+  // (it sends the text and nothing else — no trailing newline, which a TUI would
+  // insert as a literal line break rather than run), so the button is labelled
+  // 上屏 there and the user presses the Enter key once the text looks right. Live
+  // mode's button really does submit (it appends a carriage return), so it keeps
+  // 发送 — same reason the mode button spells out the extra Enter step.
+  function setMode(m){mode=m;bar.setAttribute('data-mode',m);
+    modeBtn.textContent=m===LIVE?'实时':'缓冲';
+    sendBtn.textContent=m===LIVE?'发送':'上屏';
+    sendBtn.setAttribute('aria-label',m===LIVE?'发送并执行':'把文本送上终端，随后按 Enter 执行');
+    modeBtn.setAttribute('aria-label',m===LIVE?'当前为实时输入，点击切换为缓冲':'当前为缓冲输入（上屏后需按 Enter 提交），点击切换为实时');}
+  var measuredBarHeight=-1;
+  function measureBar(){
+    var rect=bar.getBoundingClientRect?bar.getBoundingClientRect():null;
+    var height=Math.ceil((rect&&rect.height)||bar.offsetHeight||0);
+    if(height===measuredBarHeight)return;
+    measuredBarHeight=height;
+    document.documentElement.style.setProperty('--mobile-bar-h',height+'px');
+    onViewportResize();}
+  function resizeTa(){ta.style.height='42px';
+    if(ta.value)ta.style.height=Math.min(Math.max(ta.scrollHeight,42),120)+'px';
+    measureBar();}
+  function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
+
+  // 上屏 puts the text into the CLI's own input box and stops there — the user
+  // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
+  // lands inside that box as a literal line break (a TUI reads it as "insert"),
+  // so the text showed up with a stray empty line after it. Only the Enter key
+  // (or live mode's own commit) sends the \\r that actually runs the command.
+  function sendBuffered(){
+    var text=ta.value;
+    if(!text)return;
+    if(!sendInput(text.replace(/\\x1b/g,'')))return;
+    ta.value='';resizeTa();
+    if(mode===LIVE){mirror.sent=mirror.held='';}
+    showKeyboard();}
+  function sendLiveCommit(appendEnter){
+    if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
+  // An EMPTY box in buffer mode still has to submit: after 上屏 the text is on the
+  // terminal and the box was cleared, and pressing Enter is literally step 3 of
+  // the 上屏 → 检查 → Enter flow this bar is built around. sendBuffered() bails on
+  // empty text, and the keydown handler has already called preventDefault(), so
+  // routing there would make the key vanish entirely. Send the \\r the key-row ⏎
+  // button already sends in this exact state — same reasoning as the empty-box
+  // Backspace below: an empty box has no draft, so the key belongs to the terminal.
+  function submit(){if(mode===LIVE)sendLiveCommit(true);else if(ta.value)sendBuffered();else sendInput('\\r');}
+
+  // shortcut keys row
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',left:'\\x1b[D',right:'\\x1b[C',up:'\\x1b[A',down:'\\x1b[B',bs:'\\x7f',enter:'\\r',stab:'\\x1b[Z'};
+  // Keys whose effect is safe to apply repeatedly while the finger stays down.
+  var REPEATABLE={bs:1,left:1,right:1,up:1,down:1};
+  var REPEAT_DELAY=450,REPEAT_EVERY=60;
+  var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
+  for(var i=0;i<keyBtns.length;i++){(function(btn){
+    // Set once a repeat tick has actually fired, so the click the browser sends
+    // when the finger lifts can be swallowed instead of adding one more hit.
+    var suppressTrailingClick=false;
+    btn.addEventListener('click',function(){btn.blur();
+      if(suppressTrailingClick){suppressTrailingClick=false;return;}
+      var act=btn.getAttribute('data-sk');
+      if(act==='paste'){
+        // Commit pending live text before the async clipboard result lands.
+        if(mode===LIVE&&!sendLiveKey(''))return;
+        // Read the clipboard and send as terminal input. Async API; fall back
+        // to focusing the textarea so the user can long-press paste.
+        if(navigator.clipboard&&navigator.clipboard.readText){
+          navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
+        }else{showKeyboard();}
+        return;}
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});
+    // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
+    // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
+    // repeating Enter would fire the command several times, repeating Ctrl-C
+    // would spray interrupts. A plain tap is still served by the click handler
+    // above (mouse included); this adds the follow-up ticks once the finger has
+    // stayed down past REPEAT_DELAY. Note a click event fires when the finger
+    // LIFTS, so on a long press it lands AFTER the ticks — it is swallowed above
+    // so a 1.2s hold deletes exactly as many characters as it showed ticks.
+    if(REPEATABLE[btn.getAttribute('data-sk')]){
+      var holdT=null,holdIv=null;
+      var stopHold=function(){if(holdT)clearTimeout(holdT);if(holdIv)clearInterval(holdIv);holdT=holdIv=null;};
+      btn.addEventListener('pointerdown',function(){
+        suppressTrailingClick=false;
+        stopHold();
+        holdT=setTimeout(function(){
+          holdIv=setInterval(function(){
+            // Stop as soon as this key can no longer be pressed — either the bar
+            // was disabled (write permission lost / socket dropped mid-hold) or
+            // the send itself was refused — instead of spinning until release.
+            if(btn.disabled){stopHold();return;}
+            var seq=sk[btn.getAttribute('data-sk')];
+            var ok=mode===LIVE?sendLiveKey(seq):sendInput(seq);
+            if(!ok){stopHold();return;}
+            suppressTrailingClick=true;
+          },REPEAT_EVERY);
+        },REPEAT_DELAY);
+      });
+      // pointerup fires on release, pointercancel when the gesture is stolen
+      // (scroll/system), pointerleave when the finger slides off the button.
+      ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
+        btn.addEventListener(ev,stopHold);
+      });
+    }
+  })(keyBtns[i]);}
+
+  // Tapping ANY bar button must not blur the textarea. iOS retracts the
+  // software keyboard the moment the focused element loses focus, and this bar
+  // rides above the keyboard (transform: -var(--keyboard-inset)) — so the
+  // keyboard closing yanks the whole bar down by ~300px while the finger is
+  // still on the glass. The button the user aims at next has moved, which is
+  // exactly the mis-tap being reported. Cancelling pointerdown suppresses the
+  // pointer-initiated focus transfer; click, form submit, :active feedback and
+  // the key row's horizontal scroll all still work (verified in a real
+  // browser — Backspace/Ctrl-C/mode/上屏 all kept focus on #mobile-input).
+  // Buttons only: the textarea itself must keep focusing and placing its caret,
+  // and Tab focus is unaffected because only pointer-driven focus is cancelled.
+  // Static NodeList, captured once: the bar's buttons must stay in the initial
+  // markup. A button added later would miss this handler AND the disable pass
+  // over 'controls' below, so both regress together rather than silently apart.
+  var barBtns=bar.querySelectorAll('button');
+  for(var bbi=0;bbi<barBtns.length;bbi++){
+    barBtns[bbi].addEventListener('pointerdown',function(e){e.preventDefault();});
+  }
+
+  modeBtn.addEventListener('click',function(){modeBtn.blur();
+    // switching away from live flushes pending held text
+    if(mode===LIVE&&!sendLiveKey(''))return;
+    // Entering live must flush the staged buffer text too, for the same reason:
+    // live means "what the box holds is already in the terminal", and the mirror
+    // is reset to empty just below. Leaving text in the textarea breaks that
+    // invariant AND is invisible (live renders the textarea transparent), so the
+    // next keystroke would diff '' → 'hello…' and INSERT the stale text into the
+    // terminal instead of editing it. Flush it the way 上屏 does — insert without
+    // submitting — rather than silently discarding what the user typed.
+    if(mode!==LIVE&&ta.value){
+      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      ta.value='';resizeTa();}
+    var nextMode=mode===LIVE?BUFFER:LIVE;
+    setMode(nextMode);
+    if(nextMode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+    showKeyboard();
+    _syncMode(nextMode);});
+
+  bar.addEventListener('submit',function(e){e.preventDefault();submit();});
+
+  ta.addEventListener('compositionstart',function(){mirror.composing=true;},{capture:true,passive:true});
+  ta.addEventListener('compositionend',function(){mirror.composing=false;
+    if(mode===LIVE)syncMirror(ta.value);},{capture:true,passive:true});
+  ta.addEventListener('input',function(){
+    resizeTa();
+    if(mode===LIVE&&!mirror.composing)syncMirror(ta.value);});
+  ta.addEventListener('keydown',function(e){
+    // live mode intercepts nav keys so they go to the terminal, not the textarea
+    if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].indexOf(e.key)>=0){
+      e.preventDefault();
+      sendLiveKey({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowLeft:'\\x1b[D',ArrowRight:'\\x1b[C'}[e.key]);return;}
+    // Backspace on an EMPTY textarea has to be forwarded by hand, in BOTH modes.
+    // Live mode otherwise only ever sends what the 'input' listener diffs, and
+    // buffer mode does not send keystrokes at all — but deleting from an empty
+    // box changes nothing, so the browser fires beforeinput and NO input event
+    // (verified in a real browser). Either way the keystroke evaporates.
+    // An empty box has no draft to edit, so the only thing Backspace can
+    // sensibly mean there is "delete on the terminal" — which is exactly what
+    // the bottom bar's ⌫ (aria-label 删除终端字符) already does in both modes.
+    // Leaving it mode-gated made the two disagree in the same visible state:
+    // after 上屏 the box is empty and the text is on the terminal, yet the
+    // system keyboard could not erase it while ⌫ could.
+    // Non-empty is still left alone so a pending IME draft edits locally
+    // instead of eating terminal characters.
+    if(!mirror.composing&&!e.isComposing&&e.key==='Backspace'&&!ta.value){
+      e.preventDefault();
+      sendInput('\\x7f');return;}
+    if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
+
+  setMode(mode);
+  if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
+  resizeTa();setWriteState(wsHasWrite);
+  if(typeof ResizeObserver!=='undefined'){
+    try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
+  }
+  // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
+  document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
+  // keep the bar above the software keyboard using visualViewport when available
+  if(window.visualViewport){
+    var vkT=0;
+    window.visualViewport.addEventListener('resize',function(){clearTimeout(vkT);vkT=setTimeout(function(){
+      var vv=window.visualViewport;var inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);
+      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');onViewportResize();},120);});
+  }
+})();}
 </script>
 </body>
 </html>`;
@@ -18169,6 +24662,18 @@ if(!${isTmuxMode && !isPipeMode}){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+/** Opens at each turn's literal CLI write, closes at its terminal. See
+ *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
+const turnExecutionClock = new TurnExecutionClock();
+
+/** Arm the execution window for the turn whose input is being written right
+ *  now. Called from every literal-write site (flush, adopt, passthrough, init)
+ *  so `durationMs` measures the CLI, not the daemon's backlog. */
+function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: number): void {
+  const startedAtMs = Date.now();
+  turnExecutionClock.start(turnId, dispatchAttempt, startedAtMs);
+  if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
+}
 
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
@@ -18180,6 +24685,9 @@ function emitTurnTerminal(
   dispatchAttempt?: number,
   outputDisposition?: 'nothing_to_send',
   retryable?: boolean,
+  /** Backend-supplied completion instant (codex-app's runner timestamps its own
+   *  finals). Clamped to now by the clock; absent means "use this instant". */
+  completedAtMs?: number,
 ): void {
   if (!sessionId || !turnId) return;
   cancelSubmitFailureChainForTerminal(
@@ -18187,16 +24695,26 @@ function emitTurnTerminal(
     { turnId, dispatchAttempt },
     cliSpawnGeneration,
   );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
+  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) {
+    // A duplicate terminal must not leave the start armed: the first emission
+    // already published this turn's timing and consumed the entry, but a
+    // *replay* whose first emission never ran through this path could.
+    turnExecutionClock.forget(turnId, dispatchAttempt);
+    return;
+  }
+  const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
   if (status !== 'completed') {
     const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
     if (dropped) {
       log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
     }
   }
-  // Revoke before publishing terminal. The daemon receives same-worker IPC in
-  // order, and the worker-side relay becomes unusable synchronously.
-  revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);
+  // Revoke before publishing terminal. A stale terminal from a superseded
+  // same-principal steer must not clear the newer turn's authority.
+  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
+    flushThinkingUpdate();
+  }
   send({
     type: 'turn_terminal',
     sessionId,
@@ -18206,7 +24724,10 @@ function emitTurnTerminal(
     ...(errorCode ? { errorCode } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
+    ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
+    ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
   });
+  let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
     { turnId, dispatchAttempt },
@@ -18216,6 +24737,19 @@ function emitTurnTerminal(
     // fresh process behind the receiver's newer dispatch attempt.
     inflightInputs.onTurnComplete();
     durableTurnInFlight = false;
+    wakePending = true;
+  }
+  if (remoteRunnerRecoveredTurnInFlight
+    && currentBotmuxTurnId === turnId
+    && currentBotmuxDispatchAttempt === dispatchAttempt) {
+    // Recovered ordinary turns intentionally have no dispatch attempt, so the
+    // durable-attempt predicate above cannot release this independent startup
+    // fence. Exact turn identity is sufficient: a later/stale terminal cannot
+    // match after capture attribution advances.
+    remoteRunnerRecoveredTurnInFlight = false;
+    wakePending = true;
+  }
+  if (wakePending) {
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
@@ -18224,9 +24758,20 @@ function emitTurnTerminal(
 }
 
 function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
-  return msg.type === 'final_output' && sessionId
-    ? { ...msg, sessionId }
-    : msg;
+  if (msg.type !== 'final_output') return msg;
+  // Signed Codex finals already freeze the native completion instant. Other
+  // bridges sample their exact turn before emitTurnTerminal consumes the clock.
+  const timing = msg.codexAppSettlement
+    ?? turnExecutionClock.peek(msg.turnId, msg.dispatchAttempt);
+  const durationMs = timing?.durationMs;
+  const executionStartedAtMs = durationMs !== undefined && timing?.completedAtMs !== undefined
+    ? timing.completedAtMs - durationMs : undefined;
+  return {
+    ...msg,
+    ...(sessionId ? { sessionId } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(executionStartedAtMs !== undefined ? { executionStartedAtMs } : {}),
+  };
 }
 
 function send(msg: WorkerToDaemon): void {
@@ -18241,14 +24786,62 @@ function send(msg: WorkerToDaemon): void {
   process.send?.(payload);
 }
 
-function acknowledgeTurnInputCommitted(turnId?: string): void {
+function deferNativeCodexInputCommit(dispatchAttempt?: number): boolean {
+  return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode
+    && !codexRpcEngine && dispatchAttempt === undefined;
+}
+
+function deferTurnInputCommitUntilSubmission(
+  dispatchAttempt: number | undefined,
+  durablePrimaryInbox: true | undefined,
+): boolean {
+  return deferNativeCodexInputCommit(dispatchAttempt)
+    || (durablePrimaryInbox === true
+      && dispatchAttempt !== undefined);
+}
+
+function acknowledgeTurnInputCommitted(
+  turnId?: string,
+  dispatchAttempt?: number,
+  durablePrimaryInbox?: true,
+): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
-  send({ type: 'turn_input_committed', turnId });
+  send({
+    type: 'turn_input_committed',
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+  });
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
   if (turnId) send({ type: 'turn_input_received', turnId });
+}
+
+/** Native acceptance proof for shared group background coverage. Emitted only
+ * from boundaries where the CLI itself evidenced this exact input: Codex's
+ * exact owned history line, a Codex RPC turn/start acknowledgement, or a
+ * Claude transcript user record whose full normalised content matched. Never
+ * from IPC arrival, queue ownership or a generic adapter `submitted` flag. */
+function acknowledgeNativeInputConsumed(
+  turnId: string | undefined,
+  proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
+  nativeSessionId?: string,
+  nativeTurnId?: string,
+): void {
+  if (!turnId) return;
+  send({
+    type: 'native_input_consumed', turnId, proofKind,
+    ...(nativeSessionId ? { nativeSessionId } : {}),
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+  });
+}
+
+/** Codex tmux/paste mode proves acceptance by matching the exact submitted
+ * text in the owned history.jsonl. RPC and adopted panes have other owners. */
+function codexHistoryMatchProvesConsumption(): boolean {
+  return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode && !codexRpcEngine;
 }
 
 function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed' {
@@ -18257,19 +24850,38 @@ function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed'
   return state;
 }
 
-function rejectOrdinaryImTurn(turnId: string, reason: string): void {
+function rejectOrdinaryImTurn(
+  turnId: string,
+  reason: string,
+  opts: { rejectedBeforeAdmission?: true } = {},
+): void {
+  const active = activeTurnAuthority.snapshot();
   ordinaryImTurnDedupe.release(turnId);
-  send({ type: 'turn_input_rejected', turnId, reason });
+  send({
+    type: 'turn_input_rejected',
+    turnId,
+    reason,
+    ...opts,
+    ...(active?.turnId ? { activeTurnId: active.turnId } : {}),
+    ...(active?.caller ? { activeCaller: active.caller } : {}),
+    ...(active?.controller ? { activeController: active.controller } : {}),
+  });
 }
 
-function publishLocalProcessAttestation(cliPid?: number): void {
+function publishLocalProcessAttestation(
+  cliPid?: number,
+  enginePid = codexRpcEngine?.appServerPid,
+): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(enginePid ? { enginePid } : {}),
+    ...(engineProcStart ? { engineProcStart } : {}),
   });
   // IPC preserves order: the daemon records this exact CLI pid/generation
   // before it snapshots the current turn's pre-existing descendants. This is
@@ -18343,6 +24955,16 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  const pendingAttemptId = pendingLaunchConvergence?.attemptId;
+  pendingLaunchConvergence = undefined;
+  if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
+    await sendAndFlush({
+      type: 'restart_result',
+      attemptId: pendingAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+  }
   if (activeRestartAttemptId) {
     await sendAndFlush({
       type: 'restart_result',
@@ -18387,6 +25009,14 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'plugin_result_delivery_result': {
+      const pending = pendingPluginResultDeliveries.get(msg.requestId);
+      if (!pending) break;
+      pendingPluginResultDeliveries.delete(msg.requestId);
+      if (msg.ok) pending.resolve({ messageIds: msg.messageIds ?? [] });
+      else pending.reject(new Error(msg.error ?? 'plugin_result_delivery_failed'));
+      break;
+    }
     case 'init': {
       const initStartedAtMs = Date.now();
       const ordinaryImTurnId = !msg.adoptMode
@@ -18425,12 +25055,29 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
+        // Per-bot liveness window override (#1162). The value is normalized at
+        // the registry layer, so retimeout's positive-finite guard is purely
+        // defensive here. In-flight turns keep their activity clocks; only the
+        // window computation changes.
+        codexAppTurnLiveness.retimeout(msg.noProgressNotify.timeoutMs);
+      }
+      if (msg.cliInstanceBinding && (msg.cliId !== 'codex' || msg.adoptMode || msg.existingAppServerEndpoint)) {
+        throw new Error('Codex instance binding is incompatible with this worker init');
+      }
+      applyCodexInstanceEnv(process.env, msg.cliInstanceBinding);
+      if (!codexUpgradeTimer && isCodexFamilyCliId(msg.cliId)
+          && !msg.adoptMode && !msg.existingAppServerEndpoint) {
+        codexUpgradeTimer = setInterval(() => { void codexUpgradeMonitor.tick(); }, 60 * 60_000);
+        codexUpgradeTimer.unref();
+      }
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
-      // The view token intentionally stays per-boot random (no refresh): a
-      // worker restart must invalidate every previously issued read link.
+      // Dashboard grants stay per-boot, while the Lark-card capability is
+      // revocable at the logical Session lifecycle boundary.
       refreshTerminalWriteToken();
+      refreshTerminalCardViewToken(msg.terminalCardEpoch);
       applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
@@ -18448,11 +25095,11 @@ process.on('message', async (raw: unknown) => {
       // must not be appended to the bot's chat-session registry.  The
       // workflow's own event log is the source of truth for run state.
       if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
-        // owner:false —— worker 可能由仍在跑旧代码的 daemon 从新 dist spawn 出来，
-        // 不许它首启导入/建 .db（引擎切换只能由 daemon 自己做），只按 db-else-json 读。
+        // owner:false —— worker 不得首启导入/建 .db（引擎切换只能由 daemon 自己做）。
+        // 无 .db 而有 leftover JSON 时 load() 记为 unmigrated，getSession 抛错。
         sessionStore.init(msg.larkAppId, { owner: false });
       }
-      if (msg.cliId === 'codex-app') {
+      if (isCodexAppCliId(msg.cliId)) {
         codexAppRecoveredDispatches = (msg.codexAppRecoveredDispatches ?? []).map(entry => ({
           ...entry,
           codexAppInput: entry.codexAppInput ? { ...entry.codexAppInput } : undefined,
@@ -18503,11 +25150,24 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
+        // Initial capture-identity snapshot (sent even for an idle/restored
+        // (undefined, undefined) tuple) before any frame can be captured.
+        setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined, msg.turnCallerOpenId);
         if (msg.turnId) {
-          currentBotmuxTurnId = msg.turnId;
-          currentBotmuxDispatchAttempt = msg.dispatchAttempt;
-          currentGatewayTrustedCaller = msg.trustedCaller;
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
+          if (msg.prompt) {
+            reserveActiveTurn({
+              turnId: msg.turnId,
+              dispatchAttempt: msg.dispatchAttempt,
+              trustedCaller: msg.trustedCaller,
+              trustedController: msg.trustedController,
+            });
+          }
+          // Opening/argv turns start with the session (their prompt rides the
+          // spawn). Arm the window at init; a later literal write re-arms with
+          // the true write instant, so argv-only turns measure spawn→terminal
+          // and written turns measure write→terminal.
+          markTurnExecutionStart(msg.turnId, msg.dispatchAttempt);
           writeCliPidMarker();
           publishSandboxRelayCapability();
         }
@@ -18543,9 +25203,11 @@ process.on('message', async (raw: unknown) => {
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        const rpcPersistentTarget = rpcBackendType === 'zmx' && msg.persistentBackendTarget?.backendType === 'zmx'
+          ? msg.persistentBackendTarget : undefined;
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
-          paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
+          paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid, rpcPersistentTarget),
           paneIsRemote: (name) => paneRunsRemoteTui(name, {}, msg.cliRuntime?.executable),
           prepare: async () => {
             const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
@@ -18557,6 +25219,7 @@ process.on('message', async (raw: unknown) => {
             rpcBackendType as PersistentBackendType,
             name,
             msg.sessionId,
+            rpcPersistentTarget,
           ),
           teardownEngine: () => stopCodexRpcEngine(),
           log: (m) => log(m),
@@ -18629,10 +25292,12 @@ process.on('message', async (raw: unknown) => {
             codexAppInput: entry.codexAppInput,
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
+            trustedController: msg.trustedController,
           }));
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         let initialInputCommitted = false;
+        let initialInputQueued = false;
         if (shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
@@ -18655,10 +25320,12 @@ process.on('message', async (raw: unknown) => {
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
+            durablePrimaryInbox: msg.durablePrimaryInbox,
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
+            trustedController: msg.trustedController,
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
             // fold follow-ups into THIS turn (the runner's canSteer requires the
@@ -18674,18 +25341,123 @@ process.on('message', async (raw: unknown) => {
             ...(msg.atMostOnce ? { noReplay: true } : {}),
           });
           initialInputCommitted = true;
-        } else if (msg.cliId === 'codex-app') {
+          initialInputQueued = true;
+        } else if (isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
         } else if (msg.prompt) {
           // A successful spawn with a non-queued prompt means the adapter baked
           // it into argv or the RPC engine already accepted it.
           initialInputCommitted = true;
+          if (lastSpawnArgvDurableInitialPrompt) {
+            if (msg.dispatchAttempt !== undefined) durableTurnInFlight = true;
+            const submission = lastSpawnArgvDurableInitialPromptSubmission;
+            const confirm = cliAdapter?.confirmInitialPromptArgSubmission;
+            if (submission
+              && submission.baseline !== null
+              && msg.turnId
+              && msg.dispatchAttempt !== undefined
+              && cliAdapter) {
+              argvDurableInitialPromptCompletion = {
+                baseline: submission.baseline,
+                content: submission.content,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+            }
+            const argvGeneration = cliSpawnGeneration;
+            const argvBackend = backend;
+            const finalizeArgvSubmission = (cliSessionId?: string) => {
+              if (!cliSessionId) return;
+              if (msg.queuedActivationToken) {
+                send({
+                  type: 'queued_activation_submitted',
+                  sessionId,
+                  activationToken: msg.queuedActivationToken,
+                });
+              }
+              if (!submission
+                || submission.baseline === null
+                || !msg.turnId
+                || msg.dispatchAttempt === undefined
+                || !cliAdapter?.isInitialPromptComplete
+                || !argvBackend) return;
+              const completion = {
+                baseline: submission.baseline,
+                content: submission.content,
+                cliSessionId,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+              argvDurableInitialPromptCompletion = completion;
+              watchArgvDurableInitialPromptCompletion({
+                ...completion,
+                backend: argvBackend,
+                generation: argvGeneration,
+              });
+            };
+            if (submission && confirm && argvBackend) {
+              try {
+                const result = await confirm(submission.baseline, submission.content);
+                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
+                  if (result.cliSessionId) persistCliSessionId(result.cliSessionId);
+                  if (result.submitted) {
+                    finalizeArgvSubmission(result.cliSessionId);
+                  } else {
+                    scheduleSubmitFailureNotify(
+                      submission.content,
+                      result.recheck,
+                      t('worker.transcriptLabel'),
+                      undefined,
+                      undefined,
+                      usageLimitTracker.currentTurn(),
+                      { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
+                      'failed',
+                      false,
+                      cliSessionId => finalizeArgvSubmission(cliSessionId),
+                    );
+                  }
+                }
+              } catch {
+                if (cliSpawnGeneration === argvGeneration && backend === argvBackend) {
+                  scheduleSubmitFailureNotify(
+                    submission.content,
+                    undefined,
+                    t('worker.transcriptLabel'),
+                    undefined,
+                    undefined,
+                    usageLimitTracker.currentTurn(),
+                    { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
+                    'failed',
+                  );
+                }
+              }
+            }
+          }
         }
         // The first turn is now either at queue head or already owned by the
         // argv/RPC startup path. Only now may an early idle edge drain
         // follow-ups that arrived while init was awaiting slow startup work.
         initialInputOwnershipPending = false;
-        if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
+        if (initialInputCommitted && !initialInputQueued) {
+          markActiveTurnStarted({
+            turnId: msg.turnId,
+            dispatchAttempt: msg.dispatchAttempt,
+            trustedCaller: msg.trustedCaller,
+            trustedController: msg.trustedController,
+          });
+        }
+        if (initialInputCommitted && !deferTurnInputCommitUntilSubmission(
+          msg.dispatchAttempt,
+          msg.durablePrimaryInbox,
+        )) {
+          acknowledgeTurnInputCommitted(
+            msg.turnId,
+            msg.dispatchAttempt,
+            msg.durablePrimaryInbox,
+          );
+        }
         initPromptMaterialized = true;
 
         // A backend may become prompt-ready before spawnCli() returns. The
@@ -18703,6 +25475,7 @@ process.on('message', async (raw: unknown) => {
           port,
           token: writeToken,
           viewToken,
+          cardViewToken,
           ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
           // A fast initial turn can complete via `botmux send` before Herdr
           // reports idle and this ready IPC is emitted. Tell the daemon not to
@@ -18741,6 +25514,9 @@ process.on('message', async (raw: unknown) => {
       if (msg.model !== undefined && lastInitConfig) {
         lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
+      if (msg.larkToolBinding !== undefined && lastInitConfig) {
+        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
       // to the backend (see flushPending) — applying at receive time made two
@@ -18765,14 +25541,42 @@ process.on('message', async (raw: unknown) => {
           break;
         }
       }
+      // Cross-principal turns are rejected at this worker boundary. The daemon
+      // normally isolates them before worker IPC; this closes races/restarts so
+      // another human can never steer the active turn directly.
+      if (!msg.queueAfterActiveTurn && activeTurnBlocks({
+        turnId: msg.turnId,
+        dispatchAttempt: msg.dispatchAttempt,
+        trustedCaller: msg.trustedCaller,
+        trustedController: msg.trustedController,
+      })) {
+        if (ordinaryImTurnId) {
+          rejectOrdinaryImTurn(
+            ordinaryImTurnId,
+            'cross_principal_requires_owner_confirmation',
+            { rejectedBeforeAdmission: true },
+          );
+        } else if (msg.turnId) {
+          const active = activeTurnAuthority.snapshot();
+          send({
+            type: 'turn_input_rejected',
+            turnId: msg.turnId,
+            reason: 'cross_principal_requires_owner_confirmation',
+            rejectedBeforeAdmission: true,
+            ...(active?.turnId ? { activeTurnId: active.turnId } : {}),
+            ...(active?.caller ? { activeCaller: active.caller } : {}),
+            ...(active?.controller ? { activeController: active.controller } : {}),
+          });
+        }
+        break;
+      }
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution
       // from the write/verification already in flight.
-      let turnSeq = usageLimitTracker.currentTurn();
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.
-      if (!lastInitConfig?.adoptMode) {
+      if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       }
@@ -18843,6 +25647,7 @@ process.on('message', async (raw: unknown) => {
           queuedActivationToken: msg.queuedActivationToken,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
           trustedCaller: msg.trustedCaller,
+          trustedController: msg.trustedController,
           codexAppInput,
           nativeSessionTitle: postSubmitNativeSessionTitle,
         };
@@ -18865,8 +25670,10 @@ process.on('message', async (raw: unknown) => {
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
         const inputCommitted = sendToPty(content, msg.turnId, {
+          ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
+          durablePrimaryInbox: msg.durablePrimaryInbox,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
@@ -18874,13 +25681,48 @@ process.on('message', async (raw: unknown) => {
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
           trustedCaller: msg.trustedCaller,
+          trustedController: msg.trustedController,
           // Applied when THIS item is written, not on receipt.
           ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          ...(msg.taskContinuation ? { taskContinuation: msg.taskContinuation } : {}),
           ...(postSubmitNativeSessionTitle ? { nativeSessionTitle: postSubmitNativeSessionTitle } : {}),
           ...(msg.nativeSessionTitlePrompt ? { nativeSessionTitlePrompt: msg.nativeSessionTitlePrompt } : {}),
+          ...(msg.turnCallerOpenId ? { turnCallerOpenId: msg.turnCallerOpenId } : {}),
         });
-        if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
-        else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+        if (inputCommitted) {
+          if (!deferTurnInputCommitUntilSubmission(
+            msg.dispatchAttempt,
+            msg.durablePrimaryInbox,
+          )) {
+            acknowledgeTurnInputCommitted(
+              msg.turnId,
+              msg.dispatchAttempt,
+              msg.durablePrimaryInbox,
+            );
+          }
+        } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+      }
+      break;
+    }
+
+    case 'codex_app_effort': {
+      // One short, atomic frame; never splice into a chunked business input or
+      // rotate currentBotmuxTurnId, readiness, the dispatch ledger, or the card.
+      if (!isCodexAppCliId(lastInitConfig?.cliId) || !backend || !codexAppControlProven
+        || isFlushing || commandLineWritesPending > 0 || cliRestartInProgress
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness) || lastInitConfig.adoptMode) {
+        send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'unavailable' });
+        break;
+      }
+      const frame = Buffer.from(JSON.stringify({
+        type: 'effort', requestId: msg.requestId, effort: msg.effort,
+      })).toString('base64');
+      try {
+        if (!backend.write(`::botmux-codex-app:${frame}\n`)) {
+          send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
+        }
+      } catch {
+        send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
       }
       break;
     }
@@ -18910,7 +25752,7 @@ process.on('message', async (raw: unknown) => {
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
-        || hookReviewInputHold) {
+        || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
           notifyHookReviewInputHold();
@@ -18953,6 +25795,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (codexAutoUpgrade?.stage === 'failed') {
+        codexAutoUpgrade = undefined;
+        cliRestartInProgress = false;
+      }
       if (effectiveBackendType === 'riff') {
         log('Refused Riff generation restart; the existing lineage-owning worker is retained');
         break;
@@ -18974,7 +25820,7 @@ process.on('message', async (raw: unknown) => {
       }
       // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
       // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
-      // 全量覆盖 lastInitConfig.env —— spawnCli 的 sanitizePerBotEnv(cfg.env)
+      // 全量覆盖 lastInitConfig.env —— spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy)
       // 每次 spawn 都重跑，覆盖即在重启出的 CLI 上生效。undefined=不携带（旧
       // daemon / 兜底）保持快照；null=dashboard 已清空 → 移除快照。与上面的
       // cwd merge 一样放在合并守卫之前：被合并的重复 restart 也应带走 env
@@ -18990,6 +25836,9 @@ process.on('message', async (raw: unknown) => {
       if (msg.model !== undefined && lastInitConfig) {
         lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
+      if (msg.larkToolBinding !== undefined && lastInitConfig) {
+        lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;
+      }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
       // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
@@ -19002,9 +25851,21 @@ process.on('message', async (raw: unknown) => {
       // 补 recovery（见 decideRestartFollowup）；健康的重复 restart 就该被合并掉，
       // 记 flag 反而会逼健康进程再重启一轮、烧预算丢 --resume（正是合并要防的）。
       if (cliRestartInProgress || tmuxRestartTimer) {
+        // 回执归属（不是 flag，不会触发任何额外重启）：被合并的 restart 带了 attemptId、
+        // 而在飞这一轮还没有 attempt 认领回执时——worker 自发的重启（如 durable 租约
+        // 到期），或上一个 attempt 已因 replacement 退出被判 failed、daemon 随即为
+        // claude_exit 铸了新 attempt——由它认领：在飞 respawn 的 prompt_ready（或续体
+        // 结束时已就绪的 replacement，见 settleRestartAttemptOnReady）就是它的成功回执。
+        // 否则 daemon 侧这个 attempt 永远等不到 restart_result，workerReady 栅栏放不开，
+        // fork/relay 永久 worker_busy（#1863）。已有 attempt 认领时绝不替换，不抢它的回执。
+        foldRestartIntoWindow(msg.attemptId);
         log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
         break;
       }
+      // A fresh restart opens a new window built from the latest settings; any
+      // folded request left over from a superseded window is moot (the daemon
+      // mints a new attempt only after the previous one settled or timed out).
+      pendingLaunchConvergence = undefined;
       activeRestartAttemptId = msg.attemptId;
       codexRunnerFreshness = 'restarting_fresh';
       // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
@@ -19025,7 +25886,10 @@ process.on('message', async (raw: unknown) => {
       settleDurableTurnForRestart({
         hasInFlightTurn: durableTurnInFlight,
         hasCurrentTurnId: !!currentBotmuxTurnId,
-        drain: () => drainReliableTerminalBeforeInterrupt(),
+        drain: () => {
+          drainReliableTerminalBeforeInterrupt();
+          drainArgvDurableInitialPromptCompletion();
+        },
         isStillInFlight: () => durableTurnInFlight,
         emitAmbiguous: () => emitTurnTerminal(currentBotmuxTurnId!, 'ambiguous', undefined, currentBotmuxDispatchAttempt),
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
@@ -19316,6 +26180,7 @@ process.on('message', async (raw: unknown) => {
         readyPatternSeenDuringHold = false;
         idleDetector?.resetReadyEvidence();
         lastPtyOutputAtMs = Date.now();
+        webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;
         log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
         if (armPostHookFallback) armPostHookPromptEvidenceFallback();
       }
@@ -19347,6 +26212,48 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'turn_idle': {
+      // Structured end-of-turn signal from INSIDE the CLI (currently only
+      // dsh-tui's cordis wrapper plugin, on `agent/status === 'idle'`), instead
+      // of PTY quiescence — a TUI that repaints while idle can never satisfy
+      // IdleDetector Strategy 2, so without this channel it has no idle edge at
+      // all after the first prompt.
+      //
+      // FENCE (conservative, never early): a report may only settle the turn
+      // THIS worker believes is in flight. `turnId` is a fresh random id per
+      // turn and the reporter reads it from the worker-published active-turn
+      // marker, so a mismatch means this worker moved on (a newer turn was
+      // written) after the report was produced. Dropping is the safe side:
+      // dsh-tui delivers queued input through the type-ahead path, so the newer
+      // turn is written regardless and its own idle edge settles it.
+      const decision = decideTurnIdleReport({
+        reportedTurnId: msg.turnId,
+        reportedDispatchAttempt: msg.dispatchAttempt,
+        activeTurnId: currentBotmuxTurnId,
+        activeDispatchAttempt: currentBotmuxDispatchAttempt,
+        promptReady: isPromptReady,
+      });
+      if (!decision.accept) {
+        log(`Ignoring turn-idle report (${decision.reason}) turn=${msg.turnId ?? '?'} seq=${msg.seq ?? '?'} pid=${msg.pid ?? '?'}`);
+        break;
+      }
+      log(`Turn-idle report accepted (turn=${msg.turnId} seq=${msg.seq ?? '?'} pid=${msg.pid ?? '?'}) — firing structured idle`);
+      idleDetector?.fireIdle();
+      break;
+    }
+
+    case 'prompt_submitted': {
+      if (isPromptReady) {
+        isPromptReady = false;
+        idleDetector?.reset();
+        log('User prompt submitted via hook — publishing working state');
+        // Web 终端/沙箱 hook 直提路径无 managed turn；显式 clearTurnId 避免携带
+        // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。
+        publishScreenStatus('working', { force: true, clearTurnId: true });
+      }
+      break;
+    }
+
     case 'set_display_mode': {
       log(`Display mode → ${msg.mode}`);
       applyDisplayMode(msg.mode);
@@ -19364,6 +26271,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'term_action': {
       await handleTermAction(msg.key);
+      break;
+    }
+
+    case 'interrupt_turn': {
+      await handleExactTurnInterrupt(msg.requestId, msg.turnId);
       break;
     }
 
@@ -19477,6 +26389,18 @@ process.on('message', async (raw: unknown) => {
       }
 
       closeRequested = true;
+      const cleanupRequest = msg.codexCleanupRelease;
+      let nativeSnapshot: ReturnType<typeof captureCodexNativeProcesses> | undefined;
+      const cleanupIdentityMatches = !!cleanupRequest && cleanupRequest.sessionId === sessionId
+        && cleanupRequest.threadId === lastInitConfig?.cliSessionId;
+      if (cleanupIdentityMatches) {
+        try {
+          const roots = [backend?.getChildPid?.(), codexRpcEngine?.appServerPid]
+            .filter((pid): pid is number => typeof pid === 'number' && pid > 1);
+          nativeSnapshot = captureCodexNativeProcesses([...new Set(roots)]);
+        } catch { /* absent evidence must never authorize archive */ }
+      }
+      const nativeRpcRelease = cleanupRequest && codexRpcEngine ? codexRpcEngine.stopAndWait() : undefined;
       // This ACK is what resolves the daemon's close fence (worker-pool
       // resolveCloseFence) so `/close` can return. It MUST be flushed: a plain
       // send() only queues on process.send's async IPC buffer, and the fully
@@ -19500,7 +26424,14 @@ process.on('message', async (raw: unknown) => {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
+      stopOwnedSessionScope('close');
       killCli();
+      if (cleanupRequest) {
+        const rpcReleased = nativeRpcRelease ? await nativeRpcRelease : true;
+        const released = cleanupIdentityMatches && rpcReleased && !!nativeSnapshot
+          && await waitForCodexNativeRelease(nativeSnapshot);
+        await sendAndFlush({ type: 'codex_cleanup_released', ...cleanupRequest, released });
+      }
       // Bridge marker + turn-journal files outlive a single CLI process (kept
       // across restarts so a mid-flight send is still credited and an
       // interrupted turn can be restored), but a real close tears down the
@@ -19577,7 +26508,7 @@ process.on('message', async (raw: unknown) => {
         shutdownDetachRequestId = msg.requestId;
         shutdownDetachPhase = 'preparing';
         try {
-          result = await backend?.prepareShutdownDetach?.()
+          result = await backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)
             ?? { ok: false, taskId: null, error: 'shutdown_detach_unsupported' };
         } catch (err) {
           result = {
@@ -19773,6 +26704,7 @@ process.on('message', async (raw: unknown) => {
         if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      stopOwnedSessionScope('suspend');
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
@@ -19798,6 +26730,8 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
+  codexUpgradeTimer = undefined;
   stopNativeSessionTitleSync();
   cleanupPiInitialPromptFiles();
   stopSessionMcpGatewayHost();
@@ -19835,11 +26769,31 @@ function shutdownWorkerForParentExit(reason: string): void {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
+    // The remote TUI keeps running in its credential-only pane too, still bound
+    // to its relay outbox by inode. This branch never runs killCli, so drop
+    // only the tree-removal reference: the exit hook still stops the watcher
+    // and revokes this generation's capability leaf (the successor republishes
+    // it), but must not delete the outbox the live TUI sends through.
+    if (sandboxTreeOutlivesWorker) {
+      log(`Preserving the sandbox relay outbox for the surviving remote TUI during ${reason}`);
+      sandboxCleanup = null;
+    }
     cleanup();
     process.exit(0);
     return;
   }
-  killCli();
+  // A persistent sandboxed pane (oncall / scratch / credential-only) survives
+  // this exit (backend.kill() only detaches) and still runs against its
+  // per-session tree: the relay outbox is bound into it by inode, and a scratch
+  // CLI's COW root lives there. Deleting the tree here would leave the
+  // successor nothing to re-serve — every later `botmux send` would go
+  // unanswered (or the reattach gate would kill + cold-spawn the pane),
+  // interrupting in-flight work on every daemon restart. Keep it, exactly like
+  // detach_for_transfer / suspend; a real close still removes it, and a
+  // PTY-owned CLI (which dies with this worker) still cleans up here.
+  const preserveSandbox = sandboxTreeOutlivesWorker;
+  if (preserveSandbox) log(`Preserving the sandbox tree of the surviving persistent pane during ${reason}`);
+  killCli({ preserveSandbox });
   cleanup();
   process.exit(0);
 }
@@ -19885,10 +26839,16 @@ function teardownSandboxBestEffort(): void {
   sandboxTeardownDone = true;
   try { sandboxStopWatcher?.(); } catch { /* */ }
   sandboxStopWatcher = null;
-  try { sandboxCleanup?.(); } catch { /* */ }
+  // A crashed worker's persistent pane keeps running exactly as on a daemon
+  // restart, and the next worker reattaches it: keep the tree it runs against
+  // (the daemon sweep reclaims it once the session is no longer active).
+  if (!sandboxTreeOutlivesWorker) {
+    try { sandboxCleanup?.(); } catch { /* */ }
+  }
   sandboxCleanup = null;
   unlinkManagedOriginCapabilityFiles();
   sandboxRelayCapability = null;
+  sandboxPolicyCapability = null;
   if (seatbeltProfilePath) { try { unlinkSync(seatbeltProfilePath); } catch { /* */ } seatbeltProfilePath = null; }
 }
 // Under pm2 the worker's stdout/stderr are pipes; a broken pipe (e.g. log
@@ -19907,21 +26867,43 @@ process.on('exit', () => {
   teardownSandboxBestEffort();
   stopCodexRpcEngine();
 });
+let workerFatalReported = false;
+/** Best-effort one-shot terminal crash report. The 1s flush timeout means a
+ *  daemon that stopped draining can never delay the fail-closed exit; delivery
+ *  failure is swallowed. Both fatal handlers share this so a rejection that
+ *  immediately causes an exception (or vice versa) reports only once. */
+async function reportWorkerFatal(prefix: string, err: unknown): Promise<void> {
+  if (workerFatalReported) return;
+  workerFatalReported = true;
+  const detail = typeof err === 'object' && err !== null && 'stack' in err && (err as any).stack
+    ? String((err as any).stack)
+    : String(err);
+  const message = `${prefix}: ${detail}`.slice(0, 4096);
+  try {
+    await sendAndFlush({ type: 'worker_fatal', message });
+  } catch { /* best-effort — never delay exit */ }
+}
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.
   if (isIgnorableStreamError(err)) return;
-  try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
+    await reportWorkerFatal('Uncaught exception', err);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 process.on('unhandledRejection', (reason: any) => {
   if (isIgnorableStreamError(reason)) return;
-  try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
+    await reportWorkerFatal('Unhandled rejection', reason);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 
 log('Worker started, waiting for init...');

@@ -13,10 +13,7 @@ const STORE_SCHEMA_VERSION = 2;
 export const DEFAULT_MAX_CODEX_NOTIFIER_EVENTS = 1000;
 export const DEFAULT_MAX_CODEX_NOTIFIER_RECEIPTS = 10_000;
 
-interface StoreFileV1 {
-  schemaVersion: 1;
-  records: CodexNotifierEventRecord[];
-}
+// 旧版 v1 文件形状为 { schemaVersion: 1; records: CodexNotifierEventRecord[] }，读取时按结构识别并迁移到 v2（见下方 load）。
 
 interface StoreFileV2 {
   schemaVersion: 2;

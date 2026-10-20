@@ -1,6 +1,6 @@
 # Botmux 反馈能力：现阶段实现说明
 
-> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa` 与 schema v7 整理
+> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa`、schema v7 与 Completion Proposal v1 整理
 >
 > 对照基线：Botmux 作者反馈能力技术方案 review 稿（revision 7）
 >
@@ -20,8 +20,9 @@
 - Core 统一持久化具备真实 worker terminal 信号且关联到 canonical Lark delivery 的 `turn.completed`；同一 turn 的多条 canonical delivery 通过 correlation discriminator 区分，并分别生成 completion event。
 - 主动 `botmux send --response-kind final` 在真实 worker turn 内关联该 turn 并参与 completion reconcile；脱离 worker turn 的主动发送只有 delivery，没有 terminal/completion event。
 - 已实现强关联 delivery、durable outbox/webhook 和 Dashboard 分析 API/基础页面。
+- 已实现 Completion Proposal v1：Agent 可在标准 final 卡附一个受约束、requester-only、非阻塞的二选一后续；它与反馈独立，不开放任意 card-action。
 
-当前实现已覆盖原方案 M1、M2 和 M3 的主体。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
+当前实现已覆盖原方案 M1、M2 和 M3 的主体，并完成路线中的“Agent 受约束建议”。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
 
 ## 2. 与作者 review 文档的逐项对照
 
@@ -44,6 +45,7 @@
 | nativeMessageId P1 | 未实现 | 当前使用 turnId + nativeSessionId + dispatchAttempt + contentHash/ref + platformMessageId；没有原生 assistant row ID |
 | 通用 card-action 注册表 | 未实现 | 反馈 handler 已在 core 接入，但分发仍非面向第三方插件的公开注册表 |
 | Agent 动态反馈建议 | 未实现 | 反馈选项来自 team/bot/chat 配置快照，Agent 不能逐回答提交动态模板建议 |
+| Agent 受约束后续建议 | 已实现 | 标准 final 卡可附一个 Core 校验的二选一 Completion Proposal；接受后新建 continuation turn，拒绝不启动 Agent |
 | 本地订阅 API | 部分实现 | 本地事实表和事件表已存在；尚无通用、稳定、面向插件的事件订阅/游标读取协议 |
 
 ## 3. 产品语义与默认配置
@@ -224,6 +226,22 @@ botmux send --response-kind final ...
 - 自由文本写入本地事实表，但不会回显到群卡。
 - 原因/说明更新形成新 revision，并通过 `supersedes_feedback_id` 连接上一版。
 
+### 5.4 Completion Proposal v1
+
+Completion Proposal 是完成后的**可选后续授权**，不是评价。卡片顺序固定为“结果 → Proposal → Feedback → footer”；两者状态互不影响：反馈不会启动新任务，Proposal 的接受才会启动独立 continuation turn。
+
+- 调用方通过 `--completion-proposal-file` 提交 `title`、`body`、`acceptLabel`、`dismissLabel` 四个可见字段；Core 拒绝额外字段、敏感内容、绝对路径和隐藏 payload。
+- 只允许标准当前会话 final 卡。精确 requester、origin turn 或可跨重启恢复的 backend 不可证明时，自动降级为正文静态提示。
+- Core 固定 24 小时 TTL；proposal 记录冻结 requester、app、session、chat、anchor、origin turn、可见快照和 hash。
+- 记录复用 Ask 泛化后的 Human Decision 文件存储，不依赖 feedback SQLite；原子写入和单记录锁保证跨进程 first-decision-wins，终态审计保留 7 天后清理。
+- callback 只带固定 action、proposal ID、nonce 和决定；自定义卡片的 reserved discriminator denylist 禁止伪造该 callback。
+- 回调先原子落盘，按 requester-only、nonce、message/app 绑定和 first-decision-wins 校验后同步 ACK；卡片 patch 和 continuation dispatch 在 ACK 后异步执行。
+- dispatch 结果不明时记录 `dispatch_unknown` 且不自动重放，避免有副作用任务重复执行；用户可在话题里明确再次发起。
+- daemon 重启会恢复“已接受但尚未开始 dispatch”的安全窗口；已经进入 `dispatching` 的记录只能收敛为 `dispatch_unknown`，不能猜测重放。
+- continuation envelope 只回放用户看见并接受的快照，把它声明为数据而非指令。Agent 必须重新执行适用 Skill、目标归属、权限和审批检查；Core 不执行 MR、发布或 merge。
+
+该能力是本文路线中的“Agent 受约束建议”，不是“通用 card-action 注册表”。它只能表达一次二选一、接受后开启新 turn 的形状；阻塞问答仍用 Ask，需要源字节重校验或多阶段确认的领域流程仍由专用 handler 负责。
+
 ## 6. SQLite v7 数据模型
 
 数据文件：`botmux-feedback.sqlite`。SQLite 开启 WAL、foreign keys 和 busy timeout，并支持 v1/v2 事务迁移到 v7。
@@ -401,8 +419,8 @@ API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、mod
 
 ### 11.2 尚未实现的初稿增强
 
-1. **通用 card-action 注册表**：当前反馈是 core handler，但还未把所有 action 分发抽成公开插件注册机制。
-2. **Agent 动态反馈建议**：尚不支持逐回答由 Agent 建议一套受约束按钮；当前只读 team/bot/chat 配置。
+1. **通用 card-action 注册表**：当前反馈和 Completion Proposal 是 core handler，但还未把所有 action 分发抽成公开插件注册机制。
+2. **Agent 动态反馈建议**：尚不支持逐回答由 Agent 改写评价选项；Completion Proposal 只承载与评价独立的单个可选后续。
 3. **nativeMessageId**：没有原生 assistant message row ID；仍采用 review 认可的 P0 组合锚点。
 4. **Webhook 管理 UI**：没有完整的 destination + write-only secret 管理面。
 5. **本地事件订阅 API**：事实表存在，但没有稳定订阅协议。

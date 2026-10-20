@@ -20,6 +20,18 @@ Adopt uses a **zero-touch bridge**: botmux only observes the pane out of band (`
 
 > ⚠️ The old "🔄 Adopt Over" button on the card is **retired**: it's no longer rendered in bridge mode, and clicking it on a historical card is a no-op. Full rebuild into a standard botmux session via `--resume` (`/adopt --takeover`) is still on the roadmap and not yet shipped. Today, adopt is always the "shared bridge" form.
 
+## Codex shared background server compatibility
+
+When Codex uses a shared background server, BotMux still sends input to the original tmux pane. On adoption and before each message, if the foreground process does not own a rollout file, BotMux reads the current thread ID from the live status line for submission confirmation and reply observation. Enable `thread-id` (legacy name `session-id`) in Codex's `/statusline` at the end of the list by default. Keep the full ID visible by widening the pane or reducing other display items if necessary. When no complete ID is visible, BotMux tries to locate the config using the original Codex process environment (`CODEX_HOME` or that process’s `HOME/.codex`) and places the ID last in `tui.status_line` (preserving an existing ID alias and removing duplicates). Existing items, comments, and other settings are preserved; when no custom list exists, the built-in default items are retained. Before the first edit, the original file is backed up with the suffix `.botmux-statusline.bak`. If the directory cannot be identified, the layout cannot be edited safely, or writing fails, BotMux preserves the original file and provides manual instructions.
+
+BotMux reports whether the config was updated, already configured, or could not be changed. Saving the file does not mean the running Codex TUI has applied it: future launches using that config will read the setting; for the current session, enable the ID in `/statusline` and save, widening the pane if necessary. No new session is needed, and BotMux does not restart the original Codex process.
+
+BotMux never automatically types `/status`. Even after saving the config, it stops before writing the message until the live status line exposes a complete ID. This does not require `existingAppServer`; older or embedded runtimes retain process-owned rollout discovery without a version setting.
+
+If the composer has a draft, a dialog or loading state is present, or the terminal layout cannot be recognized reliably, BotMux also stops before writing the message. Resolve the state in the original Terminal before retrying. After a local `/new` or `/resume`, the next Lark input reads the ID again and switches the reply observer.
+
+If foreground rollout enumeration is unavailable (for example, macOS without `lsof`), BotMux preserves the legacy discovery path. Live status-line identity is required only when enumeration confirms that the foreground owns no rollout files. Both the inline layout and the separate status/hints rows are supported, including busy spinners; UUIDs embedded in working-directory paths are not treated as thread IDs.
+
 ## Boundaries and caveats
 
 An adopted session's lifecycle lives **on your machine**, outside botmux's control, so a few hard boundaries apply:

@@ -772,28 +772,6 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('deny401');
   });
 
-  it('GET /game/index.html — HD2D office shell allow without any token', () => {
-    const d = decideDashboardAuth({
-      method: 'GET',
-      pathname: '/game/index.html',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('allow');
-  });
-
-  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
-    const d = decideDashboardAuth({
-      method: 'POST',
-      pathname: '/api/game/download',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('deny401');
-  });
-
   // ─── P2-1：/workbench-ticket/<ticket> 兑换端点 ─────────────────────────
   // 飞书卡片的工作台入口改带短时票据；票据本身就是凭证，处理器自行验票，所以
   // 这条 GET 必须在 token 门禁之外可达。其它方法与残缺路径保持 fail closed。
@@ -872,6 +850,14 @@ describe('decideDashboardAuth — protected surface', () => {
       activeToken: TOK,
     });
     expect(d.kind).toBe('deny401');
+  });
+
+  it('GET /api/schedules/:id/logs without token → deny401', () => {
+    for (const pathname of ['/api/schedules/sched-1/logs', '/api/schedules/calendars']) {
+      const d = decideDashboardAuth({ method: 'GET', pathname, hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK });
+      expect(d.kind).toBe('deny401');
+    }
   });
 
   it('GET /api/v3 run list/detail without token → deny401', () => {
@@ -961,6 +947,33 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
     });
   });
 
+  it('?t=<correct> on the fragment-free Workbench entries → set-cookie + one-hop redirect into the immersive workbench', () => {
+    // `/workbench` 与 `/workbench/dock` 自己就是跳板，登录跳转直接落到真实目的地；
+    // 直达入口落沉浸式壳（hash 带 botmuxWorkbenchShell=immersive），不带侧栏。
+    expect(decideDashboardAuth({
+      method: 'GET',
+      pathname: '/workbench',
+      hasTokenParam: true,
+      presentedToken: TOK,
+      activeToken: TOK,
+    })).toEqual({
+      kind: 'allow+set-cookie',
+      token: TOK,
+      redirectTo: '/#/agent-workbench?botmuxWorkbenchShell=immersive',
+    });
+    expect(decideDashboardAuth({
+      method: 'GET',
+      pathname: '/workbench/dock',
+      hasTokenParam: true,
+      presentedToken: TOK,
+      activeToken: TOK,
+    })).toEqual({
+      kind: 'allow+set-cookie',
+      token: TOK,
+      redirectTo: '/#/agent-workbench-dock?botmuxWorkbenchShell=immersive',
+    });
+  });
+
   it('?t=<wrong> on protected route → deny401 (no cookie minted)', () => {
     const d = decideDashboardAuth({
       method: 'GET',
@@ -1037,6 +1050,25 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('tokenless schedule precondition writes stay management-only', () => {
+    for (const [method, pathname] of [
+      ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
+      ['PATCH', '/api/schedules/sched-1'],
+      ['DELETE', '/api/schedules/sched-1'],
+    ] as const) {
+      const d = decideDashboardAuth({
+        method,
+        pathname,
+        hasTokenParam: false,
+        presentedToken: undefined,
+        activeToken: TOK,
+        publicReadOnly: true,
+      });
+      expect(d.kind, `${method} ${pathname}`).toBe('deny401');
+    }
+  });
+
   it('tokenless GET raw PTY log → still deny401 (sensitive carve-out)', () => {
     const d = decideDashboardAuth({
       method: 'GET', pathname: '/api/workflows/run-1/nodes/n1/terminal-log/raw', hasTokenParam: false,
@@ -1088,6 +1120,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/bots',
       '/api/skills',
       '/api/cli-options',
+      '/api/schedules/sched-1/logs',
       // Workflow projections contain user-authored goals and identifiers.
       '/api/v3/runs',
       '/api/v3/runs/project-review-1',
@@ -1149,6 +1182,9 @@ describe('Workbench H5 capability boundary', () => {
       ['PUT', '/api/bots/app/env'],
       ['PUT', '/api/settings'],
       ['POST', '/api/schedules'],
+      ['POST', '/api/schedules/precondition/test'],
+      ['PATCH', '/api/schedules/sched-1'],
+      ['DELETE', '/api/schedules/sched-1'],
       ['DELETE', '/api/skills/tool'],
       ['POST', '/api/sessions/s1/close'],
       ['GET', '/api/sessions/s1/write-link'],
@@ -1251,8 +1287,8 @@ describe('Workbench H5 capability boundary', () => {
 //      dashboard.ts 的真实组合复算：路由级 decide*（workbench-only 走
 //      decideWorkbenchH5Auth，legacy 走 decideDashboardAuth）+ 处理器级
 //      `terminalCapability === 'readonly'` / `previewCapability === 'readonly'`
-//      403 判据（agent-workbench-route.test.ts 以源码断言钉住 dashboard.ts 里
-//      的这两行）；
+//      403 判据（终端那条由 test/terminal-control-route.test.ts 按行为验证；预览写
+//      门禁先于 unlock / activity / lock 由 agent-workbench-route.test.ts 的结构护栏钉住）；
 //   3) 各身份在三条真实路由上的 401/403 行为与改动前逐条一致——隐藏按钮的同时
 //      API 权限既没放大也没缩小。
 describe('P1-4 workbench operation-capability projection', () => {
@@ -1444,6 +1480,8 @@ describe('P1-7 dual-cookie identity (real requests)', () => {
         legacyCookie: parseCookie(req.headers.cookie),
         activeToken: ACTIVE,
         roleHeader: req.headers['x-botmux-role'],
+        actorHeader: req.headers['x-botmux-actor'],
+        scopesHeader: req.headers['x-botmux-scopes'],
         platformMachineId: opts.platformMachineId ?? null,
         platformActorScope: (machineId: string) => `scope-${machineId}`,
         legacyAuthSessionId: (token: string) => `legacy-${token}`,

@@ -6,11 +6,39 @@ import {
   type TurnCompletionEventPayload,
 } from './skill-feedback-store.js';
 
+/** The terminal facts the persistence layer needs. Timing is carried end-to-end
+ *  (worker → daemon → queue → store) so `completed_at` is the turn's REAL
+ *  completion instant rather than the row's write time, and `duration_ms` is the
+ *  CLI's own execution span. Both stay optional: an emitter that cannot vouch
+ *  for a real instant sends neither, and the store falls back honestly. */
+export type PersistedTurnTerminal = Pick<
+  Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+  'turnId' | 'dispatchAttempt' | 'status' | 'completedAtMs' | 'durationMs'
+>;
+
+/** Normalize the wire's epoch-ms timing into the store's column shape. Rejects
+ *  non-finite / negative values instead of writing a nonsense timestamp. */
+export function turnTerminalTiming(terminal: PersistedTurnTerminal): {
+  completedAt?: string;
+  durationMs?: number;
+} {
+  const completedAtMs = terminal.completedAtMs;
+  const durationMs = terminal.durationMs;
+  return {
+    ...(typeof completedAtMs === 'number' && Number.isFinite(completedAtMs) && completedAtMs > 0
+      ? { completedAt: new Date(completedAtMs).toISOString() }
+      : {}),
+    ...(typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0
+      ? { durationMs: Math.round(durationMs) }
+      : {}),
+  };
+}
+
 export async function persistTurnTerminal(input: {
   dataDir: string;
   botAppId: string;
   session: Pick<Session, 'sessionId'>;
-  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'dispatchAttempt' | 'status'>;
+  terminal: PersistedTurnTerminal;
   store?: SkillFeedbackStore;
 }): Promise<TurnCompletionEventPayload | undefined> {
   const store = input.store ?? await getSkillFeedbackStore(input.dataDir);
@@ -20,6 +48,7 @@ export async function persistTurnTerminal(input: {
     turnId: input.terminal.turnId,
     dispatchAttempt: input.terminal.dispatchAttempt,
     status: input.terminal.status,
+    ...turnTerminalTiming(input.terminal),
   });
 }
 
@@ -40,7 +69,7 @@ export interface EnqueueTurnTerminalInput {
   dataDir: string;
   botAppId: string;
   sessionId: string;
-  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'dispatchAttempt' | 'status'>;
+  terminal: PersistedTurnTerminal;
   onError?: (error: unknown) => void;
   /** Test/tuning knobs. */
   retryBaseMs?: number;
@@ -136,6 +165,7 @@ async function attempt(key: string): Promise<void> {
       turnId: input.terminal.turnId,
       dispatchAttempt: input.terminal.dispatchAttempt,
       status: input.terminal.status,
+      ...turnTerminalTiming(input.terminal),
     });
     if (result.done) { finish(key); return; }
     // Write lock busy: reschedule with capped backoff, yielding the loop.

@@ -30,11 +30,18 @@
  * collapsing it would be the bug.
  */
 
+import { spawnSync } from 'node:child_process';
 import { describe, it, expect, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  cursorUsageHookCommand,
   hookCommandParts,
   hookCommandFor,
+  nativeSubagentRuntimeHookCommand,
   sessionReadyHookCommand,
+  statuslineHookCommand,
   userPromptHookCommand,
 } from '../src/adapters/hook-command.js';
 
@@ -54,6 +61,9 @@ describe('hook-command — compiled binary form', () => {
       hookCommandFor('claude-code'),
       sessionReadyHookCommand(),
       userPromptHookCommand(),
+      statuslineHookCommand(),
+      cursorUsageHookCommand(),
+      nativeSubagentRuntimeHookCommand(),
       ...hookCommandParts('claude-code').args,
       hookCommandParts('claude-code').cmd,
     ];
@@ -72,6 +82,29 @@ describe('hook-command — compiled binary form', () => {
     expect(hookCommandFor('claude-code')).toBe(`"${process.execPath}" hook claude-code`);
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" user-prompt-hook`);
+    // statusLine.command 走进程级 --settings，同样由 Claude 经 shell 执行。
+    expect(statuslineHookCommand()).toBe(`"${process.execPath}" statusline`);
+    expect(cursorUsageHookCommand()).toContain(`"${process.execPath}" __cursor-usage-v1`);
+    expect(nativeSubagentRuntimeHookCommand()).toMatch(
+      /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
+    );
+  });
+
+  it('keeps the native runtime hook on the canonical stable wrapper path under a symlinked HOME', () => {
+    if (process.platform === 'win32') return;
+    asCompiledBinary();
+    const root = mkdtempSync(join(tmpdir(), 'botmux-hook-compiled-home-'));
+    const realHome = join(root, 'real-home');
+    const aliasHome = join(root, 'alias-home');
+    mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
+    symlinkSync(realHome, aliasHome, 'dir');
+    try {
+      expect(nativeSubagentRuntimeHookCommand({ HOME: aliasHome }, 'linux'))
+        .toBe(`"${join(realpathSync(join(realHome, '.botmux', 'bin')), 'botmux-native-subagent-runtime-hook')}"`);
+      expect(nativeSubagentRuntimeHookCommand({ HOME: aliasHome }, 'linux')).not.toContain(aliasHome);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('survives a shell round-trip with the subcommand intact', () => {
@@ -106,10 +139,15 @@ describe('hook-command — Node form stays byte-identical', () => {
     expect(s.endsWith(' hook claude-code')).toBe(true);
   });
 
-  it('session-ready and user-prompt-hook carry the script path too', () => {
+  it('session-ready, user-prompt-hook, and native runtime hook carry the script path too', () => {
     const script = hookCommandParts('x').args[0];
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" "${script}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" "${script}" user-prompt-hook`);
+    expect(statuslineHookCommand()).toBe(`"${process.execPath}" "${script}" statusline`);
+    expect(nativeSubagentRuntimeHookCommand()).toMatch(
+      /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
+    );
+    expect(nativeSubagentRuntimeHookCommand()).not.toContain(script);
   });
 
   it('the two forms differ exactly by the script argument', () => {
@@ -120,5 +158,23 @@ describe('hook-command — Node form stays byte-identical', () => {
     // a future edit to either branch alone breaks it.
     expect(nodeForm.args).toHaveLength(binForm.args.length + 1);
     expect(nodeForm.args.slice(1)).toEqual(binForm.args);
+  });
+});
+
+
+describe('Cursor user-hook environment guard', () => {
+  it('skips the executable entirely when either managed-session variable is absent', () => {
+    if (process.platform === 'win32') return;
+    // In this source test the generated cli.js path is intentionally absent.
+    // Successful silent execution proves the shell never tries to launch it.
+    for (const missing of ['BOTMUX_SESSION_ID', 'SESSION_DATA_DIR']) {
+      const result = spawnSync('/bin/sh', ['-c', cursorUsageHookCommand('linux')], {
+        env: { ...process.env, BOTMUX_SESSION_ID: 'own', SESSION_DATA_DIR: '/tmp/data', [missing]: '' }, encoding: 'utf8',
+      });
+      expect(result.status).toBe(0); expect(result.stdout).toBe(''); expect(result.stderr).toBe('');
+    }
+  });
+  it('uses cmd guards for Windows rather than POSIX test syntax', () => {
+    expect(cursorUsageHookCommand('win32')).toMatch(/^if defined BOTMUX_SESSION_ID if defined SESSION_DATA_DIR /);
   });
 });

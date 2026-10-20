@@ -6,10 +6,12 @@
  * Generated once and persisted to `{dataDir}/deployment-identity.json`; the name
  * defaults to the machine hostname and can be renamed by the owner.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readJsonFileSoft } from '../utils/json-file.js';
 
 export interface DeploymentIdentity {
   deploymentId: string;
@@ -27,27 +29,26 @@ function filePath(dataDir: string): string {
 
 function write(dataDir: string, id: DeploymentIdentity): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(id, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(id, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** Load (creating + persisting on first call) this deployment's identity. */
 export function getDeploymentIdentity(dataDir: string): DeploymentIdentity {
-  const fp = filePath(dataDir);
-  if (existsSync(fp)) {
-    try {
-      const p = JSON.parse(readFileSync(fp, 'utf-8'));
-      if (p && typeof p.deploymentId === 'string' && p.deploymentId) {
-        return {
-          deploymentId: p.deploymentId,
-          name: typeof p.name === 'string' && p.name ? p.name : 'botmux',
-          ownerUnionId: typeof p.ownerUnionId === 'string' ? p.ownerUnionId : undefined,
-          ownerName: typeof p.ownerName === 'string' ? p.ownerName : undefined,
-        };
-      }
-    } catch { /* corrupt — regenerate */ }
+  // 损坏 / 缺 deploymentId 的文件被隔离为 .corrupt-*（而不是被新生成的身份覆盖，
+  // 连同 deploymentId 与已绑定的 owner 一并丢失），见 utils/json-file.ts。
+  const p = readJsonFileSoft<Record<string, any> | null>(filePath(dataDir), {
+    fallback: () => null,
+    validate: (v): v is Record<string, any> =>
+      !!v && typeof (v as Record<string, unknown>).deploymentId === 'string' && !!(v as Record<string, unknown>).deploymentId,
+    label: 'deployment-identity',
+  });
+  if (p) {
+    return {
+      deploymentId: p.deploymentId,
+      name: typeof p.name === 'string' && p.name ? p.name : 'botmux',
+      ownerUnionId: typeof p.ownerUnionId === 'string' ? p.ownerUnionId : undefined,
+      ownerName: typeof p.ownerName === 'string' ? p.ownerName : undefined,
+    };
   }
   const id: DeploymentIdentity = { deploymentId: `dep_${randomUUID().slice(0, 12)}`, name: hostname() || 'botmux' };
   write(dataDir, id);

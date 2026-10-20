@@ -1,12 +1,26 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as childProcess from 'node:child_process';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import {
   checkCliAvailability,
   cliUnavailableMessage,
   hasAgentLaunchConfigChanged,
 } from '../src/setup/cli-availability.js';
+
+// Pass-through spies: every process the availability check could start (the
+// login-shell `command -v` probe, `forge doctor`) goes through these.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawnSync: vi.fn(actual.spawnSync),
+    execFileSync: vi.fn(actual.execFileSync),
+    execSync: vi.fn(actual.execSync),
+  };
+});
 
 const originalPath = process.env.PATH;
 const originalMircli = process.env.MIRCLI_BIN;
@@ -36,17 +50,36 @@ describe('CLI launch availability', () => {
     expect(hasAgentLaunchConfigChanged(current, { ...current, cliId: 'claude-code' })).toBe(true);
     expect(hasAgentLaunchConfigChanged(current, { ...current, cliPathOverride: '/usr/bin/codex' })).toBe(true);
     expect(hasAgentLaunchConfigChanged(current, { ...current, wrapperCli: 'ttadk codex' })).toBe(true);
+    expect(hasAgentLaunchConfigChanged(current, { ...current, cliLaunchMode: 'forge-traex' })).toBe(true);
   });
 
-  it('keeps PATH-only checks shell-free by avoiding adapter resolvedBin getters', () => {
-    const source = readFileSync(new URL('../src/setup/cli-availability.ts', import.meta.url), 'utf8');
-    expect(source).not.toContain('createCliAdapterSync');
-
+  it('never starts a process for a PATH-only check, for any CLI', () => {
     process.env.PATH = '';
+    vi.mocked(childProcess.spawnSync).mockClear();
+    vi.mocked(childProcess.execFileSync).mockClear();
+    vi.mocked(childProcess.execSync).mockClear();
+
     expect(checkCliAvailability({ cliId: 'pi' }, { shellFallback: false })).toMatchObject({
       available: false,
       command: 'pi',
     });
+    for (const cliId of ALL_CLI_IDS) checkCliAvailability({ cliId }, { shellFallback: false });
+
+    // A resolvable Forge x TraeX pair must not run `forge doctor` either.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      executable(dir, 'forge');
+      process.env.PATH = dir;
+      expect(checkCliAvailability({ cliId: 'traex', cliLaunchMode: 'forge-traex' }, { shellFallback: false }))
+        .toMatchObject({ available: true, command: 'forge' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(childProcess.spawnSync).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+    expect(childProcess.execSync).not.toHaveBeenCalled();
   });
 
   it('checks the wrapper binary instead of the replaced adapter binary', () => {
@@ -95,6 +128,53 @@ describe('CLI launch availability', () => {
       available: false,
       command: '/definitely/missing/mircli',
     });
+  });
+
+  it('requires both traex and forge for Forge x TraeX launch mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      const forge = executable(dir, 'forge');
+      executable(dir, 'traex');
+      process.env.PATH = dir;
+
+      expect(checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      }, { shellFallback: false })).toMatchObject({
+        available: true,
+        command: 'forge',
+        resolvedPath: forge,
+      });
+
+      rmSync(forge);
+      const missingForge = checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      }, { shellFallback: false });
+      expect(missingForge).toMatchObject({ available: false, command: 'forge' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs forge doctor when shell fallback checks are enabled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      const forge = join(dir, 'forge');
+      writeFileSync(forge, '#!/bin/sh\nif [ "$1" = doctor ]; then exit 7; fi\nexit 0\n');
+      chmodSync(forge, 0o755);
+      process.env.PATH = dir;
+
+      const result = checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      });
+      expect(result.available).toBe(false);
+      expect(result.reason).toContain('forge doctor 检查失败');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('does not require a local executable for API-backed agents', () => {

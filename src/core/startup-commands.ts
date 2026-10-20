@@ -86,3 +86,19 @@ export function shouldDeferInitialPromptForStartup(opts: {
 }): boolean {
   return opts.hasStartupCommands && !opts.adoptMode && opts.passesInitialPromptViaArgs;
 }
+
+/**
+ * Whether an args-baked initial prompt must be routed through the input queue
+ * because this spawn is predicted to REATTACH a live persistent pane. A reattach
+ * never executes the launch argv (tmux pipe-pane / zellij attach just rejoin the
+ * running CLI), so a prompt baked only into argv would be silently dropped while
+ * init still counts it as delivered. Queueing it instead types it into the live
+ * CLI once it is idle — and, if the reattach fails, init fails before any ACK.
+ */
+export function shouldDeferInitialPromptForReattach(opts: {
+  willReattachPersistent: boolean;
+  adoptMode: boolean;
+  passesInitialPromptViaArgs: boolean;
+}): boolean {
+  return opts.willReattachPersistent && !opts.adoptMode && opts.passesInitialPromptViaArgs;
+}

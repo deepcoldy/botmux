@@ -46,24 +46,27 @@ describe('maintenance global config', () => {
     expect(readGlobalConfig().maintenance).toBeUndefined();
   });
 
-  it('autoUpdate keeps {enabled,time}; autoRestart is a toggle (time ignored)', () => {
+  it('reads autoUpdate, autoRestart, and notifyOnRestart', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: {
         autoUpdate: { enabled: true, time: '04:00' },
         autoRestart: { enabled: true, time: '4:30' }, // time on autoRestart is meaningless now
+        notifyOnRestart: false,
       },
     }));
     expect(readGlobalConfig().maintenance).toEqual({
       autoUpdate: { enabled: true, time: '04:00' },
       autoRestart: { enabled: true },
+      notifyOnRestart: false,
     });
   });
 
-  it('drops invalid autoUpdate time / non-boolean enabled, keeps the rest', () => {
+  it('drops invalid task fields and non-boolean notifyOnRestart, keeps the rest', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: {
         autoUpdate: { enabled: 'yes', time: '99:99' }, // both invalid → dropped
         autoRestart: { enabled: false },
+        notifyOnRestart: 'no',
       },
     }));
     expect(readGlobalConfig().maintenance).toEqual({
@@ -84,14 +87,15 @@ describe('maintenance global config', () => {
     expect(raw.maintenance.autoUpdate).toEqual({ enabled: true, time: '03:00' });
   });
 
-  it('mergeMaintenanceConfig merges into existing maintenance without dropping the other key', () => {
+  it('mergeMaintenanceConfig merges into existing maintenance without dropping sibling keys', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
-      maintenance: { autoUpdate: { enabled: true, time: '05:00' } },
+      maintenance: { autoUpdate: { enabled: true, time: '05:00' }, notifyOnRestart: false },
     }));
     mergeMaintenanceConfig({ autoRestart: { enabled: true } });
     const m = readGlobalConfig().maintenance;
     expect(m?.autoUpdate).toEqual({ enabled: true, time: '05:00' });
     expect(m?.autoRestart).toEqual({ enabled: true });
+    expect(m?.notifyOnRestart).toBe(false);
   });
 
   it('read-after-merge sees fresh value immediately (cache invalidation)', () => {
@@ -120,12 +124,20 @@ describe('parseMaintenancePatch (dashboard PUT validation)', () => {
       autoRestart: { enabled: false },
     } });
   });
+  it('accepts notifyOnRestart as a boolean', () => {
+    expect(parseMaintenancePatch({ notifyOnRestart: false }))
+      .toEqual({ ok: true, patch: { notifyOnRestart: false } });
+  });
   it('rejects an invalid autoUpdate time', () => {
     expect(parseMaintenancePatch({ autoUpdate: { time: '99:99' } })).toEqual({ ok: false, error: 'invalid_time' });
   });
   it('rejects a non-boolean enabled on either key', () => {
     expect(parseMaintenancePatch({ autoUpdate: { enabled: 'yes' } })).toEqual({ ok: false, error: 'invalid_enabled' });
     expect(parseMaintenancePatch({ autoRestart: { enabled: 1 } })).toEqual({ ok: false, error: 'invalid_enabled' });
+  });
+  it('rejects a non-boolean notifyOnRestart', () => {
+    expect(parseMaintenancePatch({ notifyOnRestart: 'no' }))
+      .toEqual({ ok: false, error: 'invalid_notify_on_restart' });
   });
   it('rejects a non-object task', () => {
     expect(parseMaintenancePatch({ autoRestart: 'x' })).toEqual({ ok: false, error: 'invalid_task' });

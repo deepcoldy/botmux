@@ -10,12 +10,20 @@
  * The one-shot command is a small per-cliId argv template (print/exec modes
  * of the CLIs botmux already drives). CLIs without a known print mode
  * degrade to the placeholder silently.
+ *
+ * `generateOneShotTitle` is also the title source for unnamed `/g` groups
+ * (see group-auto-title.ts), which keep their own registry and gating.
  */
 import { execFile } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { lstatSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { getBot } from '../bot-registry.js';
-import { redactChildEnv } from '../utils/child-env.js';
-import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { credentialIsolationRequired, deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE } from '../platform/device-paths.js';
+import { cliConfigDirEnvKey } from '../core/cli-config-dir.js';
+import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../core/env-policy.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
 import { renameChat } from './groups-store.js';
 import {
@@ -32,18 +40,25 @@ import { logger } from '../utils/logger.js';
 // Generous: one-shot CLIs pay cold-start + API latency (codex regularly
 // exceeds 15s); the rename is async so a slow title costs nothing visible.
 const TITLE_TIMEOUT_MS = 45_000;
-const DEFAULT_MAX_LEN = 12;
+export const DEFAULT_TITLE_MAX_LEN = 12;
 export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
  *  `cliPathOverride` when configured. Prompt is appended as the last arg. */
-const ONE_SHOT_ARGV: Record<string, string[]> = {
-  'claude-code': ['claude', '-p'],
+export const ONE_SHOT_ARGV: Record<string, string[]> = {
+  // Pin the permission mode: the bot's profile (oneShotProfileEnv →
+  // CLAUDE_CONFIG_DIR) may set `permissions.defaultMode: "bypassPermissions"`,
+  // which Claude Code refuses under root without IS_SANDBOX ("--dangerously-
+  // skip-permissions cannot be used with root/sudo privileges"), failing every
+  // title. A title call needs no tools, so never inherit bypass either way.
+  'claude-code': ['claude', '-p', '--permission-mode', 'dontAsk'],
   codex: ['codex', 'exec', '--skip-git-repo-check'],
   // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
   traex: ['traex', 'exec', '--skip-git-repo-check'],
   opencode: ['opencode', 'run'],
   gemini: ['gemini', '-p'],
+  antigravity: ['agy', '-p'],
+  grok: ['grok', '-p'],
 };
 
 /** One in-flight title job per chat — birth and the heal-on-activity path
@@ -86,10 +101,10 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(botEnv: unknown): NodeJS.ProcessEnv {
+export function buildOneShotEnv(botEnv: unknown, envPolicy?: EnvPolicy): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...redactChildEnv(process.env),
-    ...sanitizePerBotEnv(botEnv),
+    ...buildSessionChildEnv(process.env, envPolicy),
+    ...botInjectedEnv(botEnv, envPolicy),
   };
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
@@ -146,6 +161,143 @@ export function sanitizeTitleOutput(stdout: string, maxLen: number): string | nu
   return capped || null;
 }
 
+/** Whether this CLI has a one-shot print mode the title generator can drive. */
+export function supportsOneShotTitle(cliId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(ONE_SHOT_ARGV, cliId);
+}
+
+/** Mandatory device-credential isolation on this host — the same marker /
+ *  device-credential probe worker.ts runs before every local spawn. */
+function hostRequiresCredentialIsolation(): boolean {
+  const home = homedir();
+  const exists = (path: string): boolean => {
+    try { lstatSync(path); return true; } catch { return false; }
+  };
+  const roots = new Set([join(home, '.botmux')]);
+  if (process.env.SESSION_DATA_DIR) roots.add(dirname(process.env.SESSION_DATA_DIR));
+  return credentialIsolationRequired({
+    markerExists: exists(deviceCredentialIsolationMarkerPath(home)),
+    deviceCredentialExists: [...roots].some(root => exists(join(root, DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE))
+      || exists(join(root, DEVICE_CREDENTIAL_FILE))),
+  });
+}
+
+/**
+ * Whether `/g` may run a one-shot title call for this bot. The call is a bare
+ * CLI process on the daemon host — no file sandbox or credential confinement,
+ * tools and hooks left on, only the env / wrapper / profile this module
+ * reproduces — so it is allowed only for a plain local launch it provably
+ * matches. Anything else keeps the placeholder name: a sandboxed bot or an
+ * enrolled host (mandatory credential isolation), the Forge launch mode, and a
+ * private or pooled CODEX_HOME. Remote CLIs have no one-shot template at all.
+ * Fails closed on an unresolvable sandbox mode.
+ */
+export function oneShotTitleAllowed(cfg: {
+  cliId: string;
+  sandbox?: unknown;
+  readIsolation?: boolean;
+  cliLaunchMode?: string;
+  codexAuthSync?: string;
+  codexInstancePool?: unknown;
+}): boolean {
+  if (!supportsOneShotTitle(cfg.cliId)) return false;
+  if (cfg.cliLaunchMode || cfg.codexAuthSync === 'isolated' || cfg.codexInstancePool) return false;
+  try {
+    if (resolveSandboxMode({
+      configSandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    }) !== 'off') return false;
+    return !hostRequiresCredentialIsolation();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The bot's CLI config profile (`cliConfigDir`) for the one-shot launch: the
+ * same CLAUDE_CONFIG_DIR the worker spawns with (see claudeConfigProfileVariant).
+ * Daemon boot scrubs inherited CLI-home pointers, so without it the call would
+ * use the host's default settings and login instead of the bot's account.
+ */
+export function oneShotProfileEnv(cfg: { cliId: string; cliConfigDir?: string }): Record<string, string> {
+  const key = cliConfigDirEnvKey(cfg.cliId);
+  const dir = cfg.cliConfigDir?.trim();
+  if (!key || !dir) return {};
+  const expanded = dir === '~' ? homedir() : dir.startsWith('~/') ? join(homedir(), dir.slice(2)) : dir;
+  return { [key]: resolve(expanded) };
+}
+
+/**
+ * Run ONE headless call through the bot's own CLI and extract a short title.
+ * Shared by session groups and unnamed `/g` groups so both use the same
+ * launcher, env boundary and output sanitizer.
+ *
+ * Resolves null when the CLI has no one-shot template or its output carried
+ * no usable title; rejects when the CLI call failed twice (one spaced in-call
+ * retry). `logTag` / `chatId` only label the log lines.
+ */
+export async function generateOneShotTitle(opts: {
+  larkAppId: string;
+  chatId: string;
+  userText: string;
+  maxLen: number;
+  logTag: string;
+}): Promise<string | null> {
+  const { larkAppId, chatId, userText, maxLen, logTag } = opts;
+  const cfg = getBot(larkAppId).config;
+  const template = ONE_SHOT_ARGV[cfg.cliId];
+  if (!template) {
+    logger.info(`[${logTag}] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
+    return null;
+  }
+  const { argv, env: wrapperEnv } = resolveOneShotCommand(cfg, template);
+  const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
+
+  const runOnce = () => new Promise<string>((resolve, reject) => {
+    const env = { ...buildOneShotEnv(cfg.env, cfg.envPolicy), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
+    const child = execFile(argv[0], [...argv.slice(1), prompt], {
+      timeout: TITLE_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      cwd: tmpdir(),
+      env,
+    }, (err, out, errOut) => {
+      if (err && !out) {
+        // Surface stderr — execFile's bare "Command failed: …" hides the
+        // actual CLI error (API failures, auth, rate limits).
+        const detail = String(errOut ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 200);
+        return reject(new Error(`${err.message.split('\n')[0]}${detail ? ` | stderr: ${detail}` : ''}`));
+      }
+      resolve(String(out ?? ''));
+    });
+    // CRITICAL: close stdin. codex-family CLIs (codex/traex) treat a piped
+    // stdin as "additional input" and BLOCK reading it until EOF — with
+    // execFile's default open pipe they hang to the timeout and get killed
+    // ("Reading additional input from stdin..."). A TTY stdin (manual
+    // testing) skips that path, which is why this only bites under the
+    // daemon. Closing stdin is a no-op for CLIs that never read it.
+    child.stdin?.end();
+  });
+  // One-shot CLI calls fail transiently (API hiccups, cold start races) —
+  // a single spaced retry recovers most of them without delaying much.
+  let stdout: string;
+  try {
+    stdout = await runOnce();
+  } catch (firstErr) {
+    logger.info(`[${logTag}] AI title attempt 1 failed for chat=${chatId.substring(0, 12)} (retrying): ${firstErr}`);
+    await new Promise(r => setTimeout(r, 3000));
+    stdout = await runOnce();
+  }
+
+  const title = sanitizeTitleOutput(stdout, maxLen);
+  if (!title) {
+    // Log the raw head — an unpredicted output shape is invisible otherwise.
+    const rawHead = stdout.replace(/\s+/g, ' ').trim().slice(0, 200);
+    logger.info(`[${logTag}] AI title empty for chat=${chatId.substring(0, 12)}; keeping placeholder (raw: "${rawHead}")`);
+  }
+  return title;
+}
+
 /** Fire-and-forget: generate an AI title for a freshly-born session group and
  *  rename the chat (+ session record) when it lands. */
 export function scheduleSessionGroupTitle(opts: {
@@ -170,58 +322,10 @@ export function scheduleSessionGroupTitle(opts: {
       const sg = cfg.sessionGroup ?? {};
       if ((sg.naming?.mode ?? 'ai-summary') !== 'ai-summary') return;
       if (!userText.trim()) return;
-      const maxLen = sg.naming?.maxLen && sg.naming.maxLen > 0 ? sg.naming.maxLen : DEFAULT_MAX_LEN;
+      const maxLen = sg.naming?.maxLen && sg.naming.maxLen > 0 ? sg.naming.maxLen : DEFAULT_TITLE_MAX_LEN;
 
-      const template = ONE_SHOT_ARGV[cfg.cliId];
-      if (!template) {
-        logger.info(`[session-group] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
-        return;
-      }
-      const { argv, env: wrapperEnv } = resolveOneShotCommand(cfg, template);
-      const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
-
-      const runOnce = () => new Promise<string>((resolve, reject) => {
-        const env = { ...buildOneShotEnv(cfg.env), ...wrapperEnv };
-        const child = execFile(argv[0], [...argv.slice(1), prompt], {
-          timeout: TITLE_TIMEOUT_MS,
-          maxBuffer: 1024 * 1024,
-          cwd: tmpdir(),
-          env,
-        }, (err, out, errOut) => {
-          if (err && !out) {
-            // Surface stderr — execFile's bare "Command failed: …" hides the
-            // actual CLI error (API failures, auth, rate limits).
-            const detail = String(errOut ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 200);
-            return reject(new Error(`${err.message.split('\n')[0]}${detail ? ` | stderr: ${detail}` : ''}`));
-          }
-          resolve(String(out ?? ''));
-        });
-        // CRITICAL: close stdin. codex-family CLIs (codex/traex) treat a piped
-        // stdin as "additional input" and BLOCK reading it until EOF — with
-        // execFile's default open pipe they hang to the timeout and get killed
-        // ("Reading additional input from stdin..."). A TTY stdin (manual
-        // testing) skips that path, which is why this only bites under the
-        // daemon. Closing stdin is a no-op for CLIs that never read it.
-        child.stdin?.end();
-      });
-      // One-shot CLI calls fail transiently (API hiccups, cold start races) —
-      // a single spaced retry recovers most of them without delaying much.
-      let stdout: string;
-      try {
-        stdout = await runOnce();
-      } catch (firstErr) {
-        logger.info(`[session-group] AI title attempt 1 failed for chat=${chatId.substring(0, 12)} (retrying): ${firstErr}`);
-        await new Promise(r => setTimeout(r, 3000));
-        stdout = await runOnce();
-      }
-
-      const title = sanitizeTitleOutput(stdout, maxLen);
-      if (!title) {
-        // Log the raw head — an unpredicted output shape is invisible otherwise.
-        const rawHead = stdout.replace(/\s+/g, ' ').trim().slice(0, 200);
-        logger.info(`[session-group] AI title empty for chat=${chatId.substring(0, 12)}; keeping placeholder (raw: "${rawHead}")`);
-        return;
-      }
+      const title = await generateOneShotTitle({ larkAppId, chatId, userText, maxLen, logTag: 'session-group' });
+      if (!title) return;
       const prefix = sg.namePrefix ?? '';
       const finalName = `${prefix}${title}`;
       // Reuse the shared renameChat wrapper (membership precheck + error

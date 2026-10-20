@@ -7,11 +7,14 @@
  * Async (execFile) on purpose: a `git fetch` can take many seconds and this
  * runs inside the daemon's event loop.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readlinkSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
+import { withFileLock } from '../utils/file-lock.js';
 
 const execFileP = promisify(execFile);
 
@@ -32,6 +35,11 @@ export interface CreateRepoWorktreeOptions {
   slug?: string;
   /** Explicit target directory. Used by multi-repo worktree groups. */
   worktreePath?: string;
+  /** Reuse an existing linked worktree at `worktreePath` instead of failing. */
+  reuseExisting?: boolean;
+  /** Keep an explicit deterministic branch local even if a same-named remote
+   * ref exists. Used for host-owned isolation identities, not user branches. */
+  ignoreRemoteBranch?: boolean;
 }
 
 async function git(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
@@ -49,6 +57,16 @@ async function tryGit(args: string[], cwd: string, timeoutMs = 10_000): Promise<
     return await git(args, cwd, timeoutMs);
   } catch {
     return null;
+  }
+}
+
+async function gitRaw(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
+  try {
+    const { stdout } = await execFileP('git', args, { cwd, timeout: timeoutMs, encoding: 'utf-8' });
+    return stdout.replace(/\r?\n$/, '');
+  } catch (e: any) {
+    const stderr = typeof e?.stderr === 'string' ? e.stderr.trim() : '';
+    throw new Error(stderr || e?.message || String(e));
   }
 }
 
@@ -116,6 +134,45 @@ async function resolveMainWorktree(dir: string): Promise<string> {
   return first ? first.slice('worktree '.length) : dir;
 }
 
+async function reuseCompatibleWorktree(
+  repo: string,
+  worktreePath: string,
+  branch: string,
+): Promise<WorktreeCreation | null> {
+  if (!existsSync(worktreePath)) return null;
+  const sameRepo = await isGitWorkTree(worktreePath)
+    && resolve(await resolveMainWorktree(worktreePath)) === resolve(repo);
+  const actualBranch = sameRepo
+    ? await tryGit(['branch', '--show-current'], worktreePath, 5_000)
+    : null;
+  if (!sameRepo || actualBranch !== branch) {
+    throw new Error(
+      `worktree target exists but is not ${branch} in the expected repository: ${worktreePath}`,
+    );
+  }
+  logger.info(`[git-worktree] reusing existing worktree ${worktreePath} on branch ${branch}`);
+  return { path: worktreePath, branch, baseRef: branch };
+}
+
+async function addWorktreeOrReuseAfterRace(
+  repo: string,
+  worktreePath: string,
+  branch: string,
+  args: string[],
+  reuseExisting: boolean,
+): Promise<WorktreeCreation | null> {
+  try {
+    await git(args, repo, 60_000);
+    return null;
+  } catch (error) {
+    if (reuseExisting) {
+      const reused = await reuseCompatibleWorktree(repo, worktreePath, branch);
+      if (reused) return reused;
+    }
+    throw error;
+  }
+}
+
 /**
  * Create a linked worktree for `repoPath`, as a sibling of the repo's MAIN
  * checkout (a linked-worktree input is resolved back to the main one first).
@@ -131,7 +188,7 @@ async function resolveMainWorktree(dir: string): Promise<string> {
  * The base ref is fetched first so the worktree starts from the remote's
  * latest state; fetch failure degrades to the local (possibly stale) ref.
  */
-export async function createRepoWorktree(
+async function createRepoWorktreeUnlocked(
   repoPath: string,
   opts: CreateRepoWorktreeOptions = {},
 ): Promise<WorktreeCreation> {
@@ -161,7 +218,7 @@ export async function createRepoWorktree(
   const slug = branch ? undefined : slugFromWorktreeText(opts.slug);
   if (branch) {
     wtPath = explicitPath ?? join(parent, `${repoBase}-${dirSuffixForBranch(branch)}`);
-    if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
+    if (existsSync(wtPath) && !opts.reuseExisting) throw new Error(`worktree target already exists: ${wtPath}`);
   } else if (slug) {
     if (explicitPath) {
       for (let n = 1;; n++) {
@@ -174,7 +231,7 @@ export async function createRepoWorktree(
         wtPath = explicitPath;
         break;
       }
-      if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
+      if (existsSync(wtPath) && !opts.reuseExisting) throw new Error(`worktree target already exists: ${wtPath}`);
     } else {
       for (let n = 1;; n++) {
         if (n > 1000) throw new Error(`no free wt/${slug} slot under 1000`);
@@ -199,7 +256,7 @@ export async function createRepoWorktree(
         wtPath = explicitPath;
         break;
       }
-      if (existsSync(wtPath)) throw new Error(`worktree target already exists: ${wtPath}`);
+      if (existsSync(wtPath) && !opts.reuseExisting) throw new Error(`worktree target already exists: ${wtPath}`);
     } else {
       let n = 1;
       for (;; n++) {
@@ -213,17 +270,25 @@ export async function createRepoWorktree(
     }
   }
 
+  if (opts.reuseExisting) {
+    const reused = await reuseCompatibleWorktree(repo, wtPath, branch);
+    if (reused) return reused;
+  }
+
   mkdirSync(dirname(wtPath), { recursive: true });
 
   if (await localBranchExists(repo, branch)) {
     // Existing branch: check it out as-is (git rejects it if the branch is
     // already checked out in another worktree — surface that error verbatim).
-    await git(['worktree', 'add', wtPath, branch], repo, 60_000);
+    const reused = await addWorktreeOrReuseAfterRace(
+      repo, wtPath, branch, ['worktree', 'add', wtPath, branch], !!opts.reuseExisting,
+    );
+    if (reused) return reused;
     logger.info(`[git-worktree] created ${wtPath} on existing branch ${branch}`);
     return { path: wtPath, branch, baseRef: branch };
   }
 
-  if (opts.branch?.trim()) {
+  if (opts.branch?.trim() && !opts.ignoreRemoteBranch) {
     try {
       await git(['fetch', 'origin', branch], repo, 30_000);
     } catch (e) {
@@ -232,16 +297,74 @@ export async function createRepoWorktree(
 
     const remoteRef = `origin/${branch}`;
     if (await remoteBranchExists(repo, branch)) {
-      await git(['worktree', 'add', '-b', branch, '--track', wtPath, remoteRef], repo, 60_000);
+      const reused = await addWorktreeOrReuseAfterRace(
+        repo,
+        wtPath,
+        branch,
+        ['worktree', 'add', '-b', branch, '--track', wtPath, remoteRef],
+        !!opts.reuseExisting,
+      );
+      if (reused) return reused;
       logger.info(`[git-worktree] created ${wtPath} tracking ${remoteRef}`);
       return { path: wtPath, branch, baseRef: remoteRef };
     }
   }
 
-  await git(['worktree', 'add', '-b', branch, wtPath, baseRef], repo, 60_000);
+  const reused = await addWorktreeOrReuseAfterRace(
+    repo,
+    wtPath,
+    branch,
+    ['worktree', 'add', '-b', branch, wtPath, baseRef],
+    !!opts.reuseExisting,
+  );
+  if (reused) return reused;
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
 }
+
+
+export function withWorktreeTargetLock<T>(
+  worktreePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const target = resolve(worktreePath);
+  mkdirSync(dirname(target), { recursive: true });
+  return withFileLock(target, fn, { maxWaitMs: 180_000 });
+}
+
+export async function createRepoWorktreeAndCommit<T>(
+  repoPath: string,
+  opts: CreateRepoWorktreeOptions,
+  commit: (creation: WorktreeCreation) => Promise<T>,
+): Promise<{ creation: WorktreeCreation; result: T }> {
+  const run = async () => {
+    const creation = await createRepoWorktreeUnlocked(repoPath, opts);
+    if (opts.ignoreRemoteBranch) {
+      await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
+    }
+    return { creation, result: await commit(creation) };
+  };
+  return opts.reuseExisting && opts.worktreePath
+    ? withWorktreeTargetLock(opts.worktreePath, run)
+    : run();
+}
+
+export async function createRepoWorktree(
+  repoPath: string,
+  opts: CreateRepoWorktreeOptions = {},
+): Promise<WorktreeCreation> {
+  const run = async () => {
+    const creation = await createRepoWorktreeUnlocked(repoPath, opts);
+    if (opts.ignoreRemoteBranch) {
+      await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
+    }
+    return creation;
+  };
+  return !opts.reuseExisting || !opts.worktreePath
+    ? run()
+    : withWorktreeTargetLock(opts.worktreePath, run);
+}
+
 
 /**
  * Push a freshly created worktree branch to origin (`push -u`). Used by the
@@ -255,6 +378,331 @@ export async function pushWorktreeBranch(worktreePath: string, branch: string): 
   logger.info(`[git-worktree] pushed branch ${branch} to origin (${worktreePath})`);
 }
 
+
+
+export interface WorktreeSafetyStatus {
+  /** True when either ordinary Git changes or ignored local content exists. */
+  dirty: boolean;
+  /** Aggregate count/list retained for deletion gates and existing callers. */
+  dirtyCount: number;
+  dirtyFiles: string[];
+  uncommittedCount: number;
+  uncommittedFiles: string[];
+  ignoredCount: number;
+  ignoredFiles: string[];
+  ahead: number;
+  unpushedCommits: string[];
+  /** Stable snapshot used to reject stale destructive confirmation cards. */
+  fingerprint: string;
+}
+
+interface SafetyStatusEntry {
+  status: string;
+  /** Path shown to the caller, relative to the top-level worktree. */
+  path: string;
+  /** Repository whose porcelain output produced this entry. */
+  repoDir: string;
+  /** Path relative to repoDir, used for content hashing. */
+  localPath: string;
+}
+
+/** Stream porcelain v1's NUL form so a large ignored directory cannot exceed
+ * execFile's 1 MiB stdout buffer. Paths are never C-quoted in this form. */
+function gitPorcelainZ(
+  args: string[],
+  repoDir: string,
+  prefix = '',
+  timeoutMs = 10_000,
+): Promise<SafetyStatusEntry[]> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('git', args, { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    const entries: SafetyStatusEntry[] = [];
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderr = '';
+    let skipRenameSource = false;
+    let settled = false;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise(entries);
+    };
+    const consume = (record: string) => {
+      if (skipRenameSource) {
+        skipRenameSource = false;
+        return;
+      }
+      if (record.length < 4) return;
+      const status = record.slice(0, 2);
+      const localPath = record.slice(3);
+      entries.push({ status, localPath, repoDir, path: prefix ? `${prefix}/${localPath}` : localPath });
+      // Rename/copy destinations are followed by the source path as a second
+      // NUL record. Only the destination above exists in the worktree.
+      skipRenameSource = /[RC]/.test(status);
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      let nul = pending.indexOf(0);
+      while (nul >= 0) {
+        consume(pending.subarray(0, nul).toString('utf8'));
+        pending = pending.subarray(nul + 1);
+        nul = pending.indexOf(0);
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (stderr.length < 65_536) stderr += chunk.toString('utf8');
+    });
+    child.on('error', error => finish(error));
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (settled) return;
+      if (pending.length) consume(pending.toString('utf8'));
+      if (timedOut) {
+        finish(new Error(`git status timed out after ${timeoutMs}ms`));
+      } else if (code !== 0) {
+        finish(new Error(stderr.trim() || `git status exited with code ${code ?? signal ?? 'unknown'}`));
+      } else {
+        finish();
+      }
+    });
+    timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+  });
+}
+
+async function safetyStatusEntries(dir: string): Promise<SafetyStatusEntry[]> {
+  const entries = await gitPorcelainZ([
+    'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
+  ], dir, '', 10_000);
+  const submodules = await gitRaw([
+    'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
+  ], dir, 10_000);
+  for (const path of submodules.split('\0').filter(Boolean)) {
+    const submoduleDir = join(dir, path);
+    entries.push(...await gitPorcelainZ([
+      'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
+    ], submoduleDir, path, 10_000));
+  }
+  return entries;
+}
+
+interface SafetyContentEntry {
+  path: string;
+  repoDir: string;
+  localPath: string;
+}
+
+const SAFETY_HASH_BATCH_PATHS = 500;
+const SAFETY_HASH_BATCH_BYTES = 64 * 1024;
+
+function safetyHashBatches<T extends { localPath: string }>(entries: T[]): T[][] {
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const entryBytes = Buffer.byteLength(entry.localPath) + 1;
+    if (batch.length && (batch.length >= SAFETY_HASH_BATCH_PATHS || bytes + entryBytes > SAFETY_HASH_BATCH_BYTES)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(entry);
+    bytes += entryBytes;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+async function safetyContentRows(entries: SafetyContentEntry[]): Promise<string[]> {
+  const rows = new Array<string>(entries.length);
+  const regularByRepo = new Map<string, Array<SafetyContentEntry & { index: number }>>();
+  for (const [index, entry] of entries.entries()) {
+    const absolute = join(entry.repoDir, entry.localPath.replace(/\/$/, ''));
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        rows[index] = `${entry.path}\0<missing>`;
+        continue;
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      // Hash the link itself. Never let an ignored dependency link pull an
+      // external/shared directory into this worktree's confirmation snapshot.
+      const digest = createHash('sha256')
+        .update('symlink\0')
+        .update(readlinkSync(absolute))
+        .digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    if (stat.isDirectory()) {
+      // Expanded porcelain records carry descendant content separately; the
+      // path/status row already fingerprints the directory marker itself.
+      const digest = createHash('sha256').update('directory\0').digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    if (!stat.isFile()) {
+      const digest = createHash('sha256')
+        .update(`special\0${stat.mode}\0${stat.size}\0${stat.mtimeMs}`)
+        .digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    const group = regularByRepo.get(entry.repoDir) ?? [];
+    group.push({ ...entry, index });
+    regularByRepo.set(entry.repoDir, group);
+  }
+
+  // Batch ordinary files to avoid one git process per ignored dependency.
+  // argv preserves every filename (including newlines) and `--` protects paths
+  // beginning with a dash; output order matches input order.
+  for (const [repoDir, regularEntries] of regularByRepo) {
+    for (const batch of safetyHashBatches(regularEntries)) {
+      const output = await gitRaw([
+        'hash-object', '--no-filters', '--', ...batch.map(entry => entry.localPath),
+      ], repoDir, 30_000);
+      const hashes = output ? output.split('\n') : [];
+      if (hashes.length !== batch.length) {
+        throw new Error(`git hash-object returned ${hashes.length} hashes for ${batch.length} paths`);
+      }
+      for (let i = 0; i < batch.length; i++) {
+        rows[batch[i].index] = `${batch[i].path}\0${hashes[i]}`;
+      }
+    }
+  }
+  return rows;
+}
+
+export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
+  const dir = resolve(worktreePath);
+  const statusEntries = await safetyStatusEntries(dir);
+  const status = statusEntries.map(entry => `${entry.status} ${entry.path}`).join('\n');
+  const allDirtyFiles = statusEntries.map(entry => entry.path);
+  const dirtyFiles = allDirtyFiles.slice(0, 20);
+  const uncommittedEntries = statusEntries.filter(entry => entry.status !== '!!');
+  const ignoredEntries = statusEntries.filter(entry => entry.status === '!!');
+  const uncommittedFiles = uncommittedEntries.map(entry => entry.path).slice(0, 20);
+  const ignoredFiles = ignoredEntries.map(entry => entry.path).slice(0, 20);
+  let ahead = 0;
+  let unpushedCommits: string[] = [];
+  const head = await tryGit(['rev-parse', '--verify', 'HEAD'], dir, 5_000) ?? '';
+  const upstream = await tryGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], dir, 5_000);
+  if (upstream) {
+    const count = await tryGit(['rev-list', '--count', `${upstream}..HEAD`], dir, 10_000);
+    ahead = Number.parseInt(count ?? '0', 10) || 0;
+    if (ahead > 0) {
+      const commits = await tryGit(['log', '--oneline', '--max-count=10', `${upstream}..HEAD`], dir, 10_000);
+      unpushedCommits = commits?.split('\n').map(line => line.trim()).filter(Boolean) ?? [];
+    }
+  } else {
+    const base = await tryGit(['merge-base', 'HEAD', 'origin/HEAD'], dir, 5_000)
+      ?? await tryGit(['merge-base', 'HEAD', 'origin/main'], dir, 5_000)
+      ?? await tryGit(['merge-base', 'HEAD', 'origin/master'], dir, 5_000);
+    if (head && base && head !== base) {
+      const count = await tryGit(['rev-list', '--count', `${base}..HEAD`], dir, 10_000);
+      ahead = Number.parseInt(count ?? '0', 10) || 0;
+      if (ahead > 0) {
+        const commits = await tryGit(['log', '--oneline', '--max-count=10', `${base}..HEAD`], dir, 10_000);
+        unpushedCommits = commits?.split('\n').map(line => line.trim()).filter(Boolean) ?? [];
+      }
+    }
+  }
+  // `git status` records paths and states, not bytes. Hash the current worktree
+  // content for every dirty entry so an already-dirty file changing between the
+  // confirmation card and deletion invalidates the confirmation. Regular files
+  // use `git hash-object`; symlinks hash their link text without dereferencing;
+  // a directory marker is expanded with the traditional ignored view so ignored
+  // directory contents participate without changing the compact display list.
+  const contentEntries: SafetyContentEntry[] = [];
+  const expandedByRepo = new Map<string, Promise<SafetyStatusEntry[]>>();
+  for (const entry of statusEntries) {
+    const path = entry.path;
+    const localPath = entry.localPath;
+    if (localPath.endsWith('/')) {
+      let expanded = expandedByRepo.get(entry.repoDir);
+      if (!expanded) {
+        expanded = gitPorcelainZ([
+          'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
+        ], entry.repoDir, '', 10_000);
+        expandedByRepo.set(entry.repoDir, expanded);
+      }
+      for (const nestedEntry of await expanded) {
+        if (!nestedEntry.localPath.startsWith(localPath)) continue;
+        const displayPath = path.slice(0, path.length - localPath.length) + nestedEntry.localPath;
+        contentEntries.push({
+          path: displayPath,
+          repoDir: entry.repoDir,
+          localPath: nestedEntry.localPath,
+        });
+      }
+      continue;
+    }
+    contentEntries.push({ path, repoDir: entry.repoDir, localPath });
+  }
+  const contentRows = await safetyContentRows(contentEntries);
+  // `write-tree` rejects unresolved conflicts. `ls-files --stage` serializes
+  // every index entry (including stages 1/2/3), so it remains content-sensitive
+  // for both ordinary staged changes and conflicted indexes.
+  const indexTree = await gitRaw(['ls-files', '--stage', '-z'], dir, 10_000);
+  const submodulePaths = (await gitRaw([
+    'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
+  ], dir, 10_000)).split('\0').filter(Boolean);
+  const submoduleIndexes: { path: string; head: string; index: string }[] = [];
+  for (const path of submodulePaths) {
+    const submoduleDir = join(dir, path);
+    submoduleIndexes.push({
+      path,
+      head: await gitRaw(['rev-parse', '--verify', 'HEAD'], submoduleDir, 5_000),
+      index: await gitRaw(['ls-files', '--stage', '-z'], submoduleDir, 10_000),
+    });
+  }
+  const fingerprint = createHash('sha256')
+    .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, submoduleIndexes, status, contentRows, ahead, unpushedCommits }))
+    .digest('hex');
+  return {
+    dirty: statusEntries.length > 0,
+    dirtyCount: allDirtyFiles.length,
+    dirtyFiles,
+    uncommittedCount: uncommittedEntries.length,
+    uncommittedFiles,
+    ignoredCount: ignoredEntries.length,
+    ignoredFiles,
+    ahead,
+    unpushedCommits,
+    fingerprint,
+  };
+}
+
+export async function mainWorktreeFor(dir: string): Promise<string> {
+  return resolveMainWorktree(resolve(dir));
+}
+
+/** Root of the specific worktree containing `dir`, not the main checkout. */
+export async function worktreeRootFor(dir: string): Promise<string | null> {
+  const root = await tryGit(['rev-parse', '--show-toplevel'], resolve(dir), 5_000);
+  return root ? resolve(root) : null;
+}
+
+export async function isLinkedWorktree(dir: string): Promise<boolean> {
+  const resolved = resolve(dir);
+  try {
+    return resolve(await resolveMainWorktree(resolved)) !== resolved;
+  } catch {
+    return false;
+  }
+}
+
 /** Remove a worktree created by {@link createRepoWorktree}. Used to roll back the
  *  worktrees already built when a later repo in a multi-repo batch fails — leaves
  *  the branch in place (it may be a pre-existing branch we only checked out, and a
@@ -263,4 +711,34 @@ export async function pushWorktreeBranch(worktreePath: string, branch: string): 
 export async function removeRepoWorktree(repo: string, worktreePath: string): Promise<void> {
   await git(['worktree', 'remove', '--force', worktreePath], repo, 30_000);
   logger.info(`[git-worktree] removed worktree ${worktreePath}`);
+}
+
+/**
+ * `git check-ref-format --branch` — the ONLY branch-name validity check in the
+ * repo. `createRepoWorktree` itself never validates: an illegal name only fails
+ * later inside `git worktree add -b` (60s window, after the topic exists). The
+ * topic header's `/repo wt <目标> [分支]` runs this BEFORE opening the topic so a
+ * typo fails closed with zero side effects. Needs no repository (any cwd works);
+ * a leading `-` is rejected up front because git would parse it as an option.
+ */
+export async function isValidBranchName(name: string): Promise<boolean> {
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.startsWith('-')) return false;
+  // cwd 用 tmpdir：check-ref-format 不需要仓库，而 daemon 的 cwd 可能已被删除（ENOENT）。
+  return (await tryGit(['check-ref-format', '--branch', trimmed], tmpdir())) !== null;
+}
+
+/**
+ * The directory {@link createRepoWorktree} WILL use for an explicit `branch` —
+ * `<main checkout's parent>/<repo>-<dirSuffixForBranch(branch)>` (no `wt-`
+ * prefix; that is reserved for auto-named worktrees). Exposed so a caller can
+ * fail closed on "target already exists" before doing anything else; keep it in
+ * lockstep with the explicit-branch arm of `createRepoWorktree`. Throws when
+ * `repoPath` is not inside a git work tree.
+ */
+export async function resolveWorktreePathForBranch(repoPath: string, branch: string): Promise<string> {
+  const startDir = resolve(repoPath);
+  await git(['rev-parse', '--git-dir'], startDir);
+  const repo = await resolveMainWorktree(startDir);
+  return join(dirname(repo), `${basename(repo)}-${dirSuffixForBranch(branch)}`);
 }

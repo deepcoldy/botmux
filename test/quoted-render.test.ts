@@ -63,6 +63,26 @@ describe('renderQuotedMessage: post', () => {
       { type: 'file', key: 'file_bbb', name: 'spec.pdf' },
     ]);
   });
+
+  it('exposes a rich-text upload carried by the post top-level files array', async () => {
+    const post = {
+      title: '',
+      content: [[{ tag: 'text', text: '请看附件' }]],
+      content_v2: [[{ tag: 'text', text: '请看附件' }]],
+      files: [{
+        file_key: 'file_v3_quoted',
+        file_name: 'brief.md',
+        is_folder: false,
+      }],
+    };
+    const out = await renderQuotedMessage('app_x', rawMessage('post', post), noExpand);
+    expect(out.content).toBe('请看附件');
+    expect(out.resources).toEqual([{
+      type: 'file',
+      key: 'file_v3_quoted',
+      name: 'brief.md',
+    }]);
+  });
 });
 
 describe('renderQuotedMessage: interactive', () => {

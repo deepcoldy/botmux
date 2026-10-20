@@ -20,6 +20,7 @@ import {
   renderConnectorTopicTemplate,
   type ResolveConnectorMentionIdentities,
 } from '../services/connector-topic-template.js';
+import { renderConnectorLifecycleGroupName } from '../services/connector-lifecycle-group-name.js';
 import {
   webhookAuditRequest,
   webhookAuditResponse,
@@ -52,7 +53,7 @@ function pruneExpiredWebhookLogs(): void {
 export type WebhookRouteDeps = TriggerApiDeps & {
   createLifecycleGroup?: (
     connector: ConnectorDefinition,
-    args: { dedupKey: string },
+    args: { dedupKey: string; groupName: string },
   ) => Promise<{ chatId: string; creatorLarkAppId?: string }>;
   resolveMentionIdentities?: ResolveConnectorMentionIdentities;
 };
@@ -905,7 +906,13 @@ async function handleWebhookRouteImpl(
         }
         let created: { chatId: string; creatorLarkAppId?: string };
         try {
-          created = await deps.createLifecycleGroup(connector, { dedupKey: lifecycleDedupKey });
+          created = await deps.createLifecycleGroup(connector, {
+            dedupKey: lifecycleDedupKey,
+            groupName: renderConnectorLifecycleGroupName(connector, parsed.payload, {
+              dedupKey: lifecycleDedupKey,
+              requestId,
+            }),
+          });
         } catch (e: any) {
           await failWebhookLifecycleGroup(connector.id, lifecycleDedupKey, begun.record.lifecycleId);
           fail(502, 'group_create_failed', e?.message ?? String(e));
@@ -932,7 +939,14 @@ async function handleWebhookRouteImpl(
         return true;
       }
       try {
-        const created = await deps.createLifecycleGroup(connector, { dedupKey: requestId.slice(0, 16) });
+        const lifecycleDedupKey = requestId.slice(0, 16);
+        const created = await deps.createLifecycleGroup(connector, {
+          dedupKey: lifecycleDedupKey,
+          groupName: renderConnectorLifecycleGroupName(connector, parsed.payload, {
+            dedupKey: lifecycleDedupKey,
+            requestId,
+          }),
+        });
         chatId = created.chatId;
       } catch (e: any) {
         fail(502, 'group_create_failed', e?.message ?? String(e));

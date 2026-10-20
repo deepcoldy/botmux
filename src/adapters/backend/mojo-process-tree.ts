@@ -35,10 +35,12 @@
  *
  * Fail-closed
  * -----------
- * Only ENOENT means "this pid exited between readdir and read", which is a
- * genuine non-member and safe to skip. EVERY other read or parse error means the
- * table we built is incomplete, and an incomplete table can hide a survivor, so
- * it fails the WHOLE scan instead of silently shrinking the result. The one
+ * Only a vanished pid (ENOENT, or ESRCH) means "this pid exited between readdir
+ * and read", which is a genuine non-member and safe to skip. Node reports that
+ * race as ENOENT; Bun 1.4 on Linux reports the same /proc/<pid> disappearance
+ * as ESRCH ("no such process"). EVERY other read or parse error means the table
+ * we built is incomplete, and an incomplete table can hide a survivor, so it
+ * fails the WHOLE scan instead of silently shrinking the result. The one
  * documented exception is EACCES/EPERM on `environ` (see readEnviron).
  */
 import { readFileSync, readdirSync } from 'node:fs';
@@ -298,6 +300,22 @@ function messageOf(err: unknown): string {
 }
 
 /**
+ * `/proc/<pid>` disappeared mid-scan. Safe to skip: the process is gone, so it
+ * cannot be a survivor we failed to account for.
+ *
+ * Exported so the Bun-vs-Node errno split is pinned in unit tests rather than
+ * only showing up as an unscannable restart abort on CI.
+ */
+export function isVanishedProcError(err: unknown): boolean {
+  const code = errnoOf(err);
+  return code === 'ENOENT' || code === 'ESRCH';
+}
+
+function isVanishedProcReason(reason: string): boolean {
+  return /ENOENT|ESRCH|no such file|no such process/i.test(reason);
+}
+
+/**
  * `/proc/<pid>/stat`: field 2 (comm) is parenthesised and may itself contain
  * spaces or ')', so the numeric tail must be cut at the LAST ')' rather than
  * split naively. After that cut, rest[0] is field 3 (state), so field N is
@@ -384,7 +402,7 @@ function unsupportedScan(platform: string): MojoTreeScan & { ok: false } {
 }
 
 /**
- * `environ` is the one place a non-ENOENT error is tolerated.
+ * `environ` is the one place a non-vanished-pid error is tolerated.
  *
  * Scanning all of `/proc` necessarily touches OTHER users' processes, whose
  * environ is 0400 root-or-owner; EACCES there is the normal case, not a fault,
@@ -401,7 +419,7 @@ function readEnviron(
     return { state: 'read', text: readFileSync(`${procRoot}/${name}/environ`, 'utf-8') };
   } catch (err) {
     const code = errnoOf(err);
-    if (code === 'ENOENT') return { state: 'gone' };
+    if (isVanishedProcError(err)) return { state: 'gone' };
     if (code === 'EACCES' || code === 'EPERM') return { state: 'blind' };
     return { state: 'error', detail: messageOf(err) };
   }
@@ -437,9 +455,10 @@ function readProcTable(
     try {
       parsed = parseStat(readFileSync(`${procRoot}/${name}/stat`, 'utf-8'));
     } catch (err) {
-      // ENOENT: exited between readdir and read. A vanished process is genuinely
-      // not a member, so skipping it is correct and is not a scan failure.
-      if (errnoOf(err) === 'ENOENT') continue;
+      // Vanished between readdir and read (Node: ENOENT; Bun on Linux: ESRCH).
+      // A gone process is genuinely not a member, so skipping it is correct
+      // and is not a scan failure.
+      if (isVanishedProcError(err)) continue;
       // Anything else (EACCES, EIO, ...) means we cannot account for this pid.
       // An unaccounted pid could be the survivor we are looking for, so the whole
       // scan fails rather than quietly omitting it.
@@ -668,7 +687,7 @@ export function signalTurnTreeGroup(
       return { kind: 'unsupported-platform', platform: read.failure.platform };
     }
     // A vanished root is the expected happy path late in teardown.
-    if (read.failure.kind === 'proc-entry-unreadable' && /ENOENT|no such file/i.test(read.reason)) {
+    if (read.failure.kind === 'proc-entry-unreadable' && isVanishedProcReason(read.reason)) {
       return { kind: 'gone' };
     }
     return { kind: 'unverifiable', reason: read.reason };

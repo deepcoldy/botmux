@@ -74,6 +74,12 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotBrand: vi.fn(() => 'feishu'),
 }));
 
+const sessionGroups = vi.hoisted(() => ({ groups: new Set<string>(), touch: vi.fn() }));
+vi.mock('../src/services/session-groups-store.js', () => ({
+  isSessionGroup: (chatId: string) => sessionGroups.groups.has(chatId),
+  touchSessionGroup: (...args: unknown[]) => sessionGroups.touch(...args),
+}));
+
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
 }));
@@ -82,6 +88,8 @@ const forkWorkerSpy = vi.fn();
 
 import {
   forkSession,
+  forkClosedSession,
+  withActiveSessionKeyLock,
   isForkCapableSession,
   forkWorker,
   setActiveSessionsRegistry,
@@ -154,8 +162,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
+  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -177,6 +185,15 @@ describe('isForkCapableSession', () => {
       botName: 'TestBot',
     } as any);
     const ds = makeSourceDs({ cliId: 'codex' });
+    expect(isForkCapableSession(ds)).toBe(false);
+  });
+
+  it('refuses a traex session running under Hybrid RPC input', () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'traex', larkAppId: 'cli_app_test', codexRpcInput: true },
+      botName: 'TestBot',
+    } as any);
+    const ds = makeSourceDs({ cliId: 'traex' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
@@ -247,6 +264,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
       sandboxHidePaths: ['/hide/me'],
       sandboxReadonlyPaths: ['/ro/here'],
       sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] } },
     });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
 
@@ -259,6 +277,48 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandboxHidePaths).toEqual(['/hide/me']);
     expect(child.sandboxReadonlyPaths).toEqual(['/ro/here']);
     expect(child.sandboxNetwork).toBe(false);
+    expect(child.sandboxNetworkPolicy).toEqual(src.session.sandboxNetworkPolicy);
+    expect(child.sandboxNetworkPolicy).not.toBe(src.session.sandboxNetworkPolicy);
+  });
+
+  // ── childOwnerOpenId: an admin forking someone else's session is stamped as
+  //    the CHILD owner instead of inheriting the source owner. The stamp has to
+  //    land on BOTH the persisted row and the runtime childDs (the latter feeds
+  //    BOTMUX_OWNER_OPEN_ID into the CLI subprocess via applySessionOwnerEnv).
+  //    Dropping the option on either copy must flip these red. ──
+  it('childOwnerOpenId overrides owner on BOTH the persisted row and runtime childDs', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'oc_child', 'group', 'chat',
+      { forkWorkerImpl: forkWorkerSpy as any, childOwnerOpenId: 'ou_admin' },
+    );
+    expect(r.ok).toBe(true);
+
+    // Persisted row (worker-pool.ts childSession.ownerOpenId).
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_admin');
+
+    // Runtime DaemonSession handed to forkWorker (feeds the worker owner env).
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_admin');
+  });
+
+  it('without childOwnerOpenId the child inherits the SOURCE owner (persisted + runtime)', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'om_child_root', 'group', 'thread',
+      { forkWorkerImpl: forkWorkerSpy as any },
+    );
+    expect(r.ok).toBe(true);
+
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_owner');
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_owner');
   });
 
   it('P1: a fork of an explicitly UN-sandboxed source stays un-sandboxed (false travels, not just true)', async () => {
@@ -271,10 +331,27 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe(false);
   });
 
+  it('preserves service tier, scratch storage, denied paths and the worktree admission decision without shared objects', async () => {
+    const src = makeSourceDs({ sandbox: 'scratch',
+      serviceTier: 'priority',
+      sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 192, denyPaths: ['/private'], network: false },
+      autoWorktreeFallbackDir: '/tmp/project' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    expect((await callFork(src)).ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.sandbox).toBe('scratch');
+    expect(child.sandboxScratch).toEqual(src.session.sandboxScratch);
+    expect(child.sandboxScratch).not.toBe(src.session.sandboxScratch);
+    expect(child.serviceTier).toBe(src.session.serviceTier);
+    expect(child.autoWorktreeFallbackDir).toBe('/tmp/project');
+    child.sandboxScratch!.denyPaths!.push('/child-only');
+    expect(src.session.sandboxScratch!.denyPaths).toEqual(['/private']);
+  });
+
   // ── P2: the per-session reasoningEffort override + the agentFrozen marker
   //    must ride along, else sessionAgentConfig re-freezes from the live bot
   //    config and the clone silently drops the source's launch identity. ──
-  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / cliConfigDir / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
       reasoningEffort: 'xhigh',
       modelBackendVariant: 'max',
@@ -286,6 +363,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
         update: { provider: 'self' },
       },
       cliPathOverride: '/opt/custom/claude',
+      cliConfigDir: '~/.claude-api',
       wrapperCli: 'ttadk',
       agentFrozen: true,
     });
@@ -299,6 +377,8 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.cliRuntime).toEqual(src.session.cliRuntime);
     expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
+    // The fork resumes the source transcript, which lives under the source profile.
+    expect(child.cliConfigDir).toBe('~/.claude-api');
     expect(child.wrapperCli).toBe('ttadk');
     expect(child.agentFrozen).toBe(true);
   });
@@ -559,6 +639,24 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     expect(cfg.model).toBe('gpt-5.6');          // same CLI → live bot model applies (== /restart)
   });
 
+  it('clears a Codex service tier only when a cross-CLI selection resolves', () => {
+    const ds = selectedDs('claude-code', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.cliId).toBe('claude-code');
+    expect(cfg.serviceTier).toBeUndefined();
+    expect(ds.session.serviceTier).toBe('inherit');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('keeps a Codex service tier for a same-CLI selection', () => {
+    const ds = selectedDs('codex', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.serviceTier).toBe('priority');
+    expect(ds.session.serviceTier).toBe('priority');
+  });
+
   it('honors a per-trigger spawnModelOverride on a /cli session', () => {
     const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
     const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
@@ -579,5 +677,304 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
     const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
     expect(cfg.modelBackendVariant).toBeUndefined();
+  });
+
+  it('freezes Forge x TraeX launch mode from bot config', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('repairs a stale backend variant from a frozen non-TraeX session', () => {
+    const ds = makeSourceDs({
+      cliId: 'codex',
+      agentFrozen: true,
+      modelBackendVariant: 'max',
+    });
+
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+
+    expect(cfg.modelBackendVariant).toBeUndefined();
+    expect(ds.session.modelBackendVariant).toBeUndefined();
+  });
+});
+
+
+describe('sessionAgentConfig — service tier without /cli selection', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['default', 'priority', 'ultrafast'] as const)(
+    'clears %s when the Bot switches CLI before the first fork', (serviceTier) => {
+      const ds = makeSourceDs({ cliId: undefined, agentFrozen: false, serviceTier });
+      const cfg = sessionAgentConfig(ds, { cliId: 'claude-code' });
+      expect(cfg.cliId).toBe('claude-code');
+      expect(cfg.serviceTier).toBeUndefined();
+      expect(ds.session.serviceTier).toBe('inherit');
+      expect(sessionStore.updateSession).toHaveBeenLastCalledWith(expect.objectContaining({
+        cliId: 'claude-code', agentFrozen: true, serviceTier: 'inherit',
+      }));
+      expect(sessionAgentConfig(ds, { cliId: 'codex' }).serviceTier).toBeUndefined();
+    },
+  );
+
+  it('preserves the tier when the session already froze a Codex CLI', () => {
+    const ds = makeSourceDs({ cliId: 'codex', agentFrozen: true, serviceTier: 'priority' });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code' });
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.serviceTier).toBe('priority');
+    expect(ds.session.serviceTier).toBe('priority');
+  });
+
+  it.each(['codex', 'claude-code'] as const)('resolves the tier after the store restores a stale %s row', (cliId) => {
+    const ds = makeSourceDs({ cliId: undefined, agentFrozen: false, serviceTier: undefined });
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(session => {
+      session.serviceTier = 'priority';
+    });
+    const cfg = sessionAgentConfig(ds, { cliId });
+    expect(cfg.serviceTier).toBe(cliId === 'codex' ? 'priority' : undefined);
+    expect(ds.session.serviceTier).toBe(cliId === 'codex' ? 'priority' : 'inherit');
+  });
+});
+
+
+describe('sessionAgentConfig — group defaults', () => {
+  const topic = (overrides: Partial<Session> = {}) => makeSourceDs({
+    cliId: 'codex', cliSessionId: undefined, agentFrozen: false,
+    groupDefaultModels: { codex: { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' } },
+    ...overrides,
+  });
+  const bot = { cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'medium' } as const;
+
+  it.each([false, true])('applies group effort with agentFrozen=%s without changing CLI', (agentFrozen) => {
+    const ds = topic({ agentFrozen });
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBe('gpt-5.6-sol');
+    expect(cfg.reasoningEffort).toBe('ultra');
+  });
+
+  it('preserves explicit session effort', () => {
+    expect(sessionAgentConfig(topic({ reasoningEffort: 'high' }), bot).reasoningEffort).toBe('high');
+  });
+
+  it('ignores captured group settings when session becomes chat scope', () => {
+    const ds = topic();
+    ds.session.scope = 'chat';
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.model).toBe('gpt-5.5');
+    expect(cfg.reasoningEffort).toBe('medium');
+  });
+});
+
+describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+    setActiveSessionsRegistry(new Map());
+  });
+
+  const closedRow = (overrides: Partial<Session> = {}): Session => ({
+    ...makeSourceDs({ status: 'closed', closedAt: new Date().toISOString(), sandbox: true, reasoningEffort: 'high', ...overrides }).session,
+  });
+  const callClosedFork = (row: Session) => {
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    return forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+      childOwnerOpenId: 'ou_resumer',
+    });
+  };
+
+  it('在目标锚点铸出带完整上下文的子会话，原关闭记录不动', async () => {
+    const row = closedRow();
+    const before = structuredClone(row);
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const res = await callClosedFork(row);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const child = vi.mocked(sessionStore.updateSession).mock.calls.map(c => c[0]).find(s => s.sessionId === res.childSessionId)!;
+    expect(child).toMatchObject({
+      chatId: 'oc_here', rootMessageId: 'om_here_root', scope: 'thread',
+      forkedFrom: row.sessionId, pendingForkSession: true, cliSessionId: 'cli-native-src-abc',
+      sandbox: true, reasoningEffort: 'high', larkAppId: 'cli_app_test', ownerOpenId: 'ou_resumer',
+    });
+    expect(registry.get(sessionKey('om_here_root', 'cli_app_test'))?.session.sessionId).toBe(res.childSessionId);
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(row).toEqual(before);
+  });
+
+  it('两个复制请求并发打到同一个空锚点：先注册者胜出，后到者不会把它替换/关掉', async () => {
+    const row = closedRow();
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const go = () => forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+    });
+    const [a, b] = await Promise.all([go(), go()]);
+    const oks = [a, b].filter(r => r.ok);
+    expect(oks).toHaveLength(1);
+    expect([a, b].find(r => !r.ok)).toEqual({ ok: false, error: 'target_chat_has_session' });
+    const winner = registry.get(sessionKey('om_here_root', 'cli_app_test'));
+    expect(winner?.session.sessionId).toBe((oks[0] as { childSessionId: string }).childSessionId);
+    expect(winner?.session.status).toBe('active');
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('排队等目标锁期间源会话被回收：进锁后复查源，拒绝 workspace_retired 且不铸子会话', async () => {
+    const row = closedRow();
+    const retired = { ...row, workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/project' } as any };
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(row).mockReturnValue(retired);
+    vi.mocked(sessionStore.createSession).mockClear();
+    const res = await forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+    });
+    expect(res).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('已关闭的 Codex/TraeX 会话无法确认是否以 RPC 启动：fail closed', async () => {
+    for (const cliId of ['codex', 'traex'] as const) {
+      expect(await callClosedFork(closedRow({ cliId }))).toEqual({ ok: false, error: 'fork_unsupported_backend' });
+    }
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('会话群顶层（chat-scope）复制成功后把子会话登记为常驻；子话题与非会话群不登记', async () => {
+    const row = closedRow();
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    sessionGroups.groups = new Set(['oc_group']);
+    sessionGroups.touch.mockClear();
+    setActiveSessionsRegistry(new Map());
+    const chat = await forkClosedSession(row.sessionId, 'oc_group', 'oc_group', 'group', 'chat', { forkWorkerImpl: forkWorkerSpy as any });
+    expect(chat.ok).toBe(true);
+    expect(sessionGroups.touch).toHaveBeenCalledWith('oc_group', (chat as { childSessionId: string }).childSessionId);
+    sessionGroups.touch.mockClear();
+    setActiveSessionsRegistry(new Map());
+    expect((await forkClosedSession(row.sessionId, 'oc_group', 'om_sub_root', 'group', 'thread', { forkWorkerImpl: forkWorkerSpy as any })).ok).toBe(true);
+    setActiveSessionsRegistry(new Map());
+    expect((await forkClosedSession(row.sessionId, 'oc_plain', 'oc_plain', 'group', 'chat', { forkWorkerImpl: forkWorkerSpy as any })).ok).toBe(true);
+    expect(sessionGroups.touch).not.toHaveBeenCalled();
+    sessionGroups.groups = new Set();
+  });
+
+  it('关闭行缺少 larkAppId：拒绝而不是回退到其它 bot 的身份', async () => {
+    expect(await callClosedFork(closedRow({ larkAppId: undefined }))).toEqual({ ok: false, error: 'not_found' });
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('只接受已关闭、未回收、可 fork 的记录', async () => {
+    expect(await callClosedFork(closedRow({ status: 'active' }))).toEqual({ ok: false, error: 'not_closed' });
+    expect(await callClosedFork(closedRow({ workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/p' } as any })))
+      .toEqual({ ok: false, error: 'workspace_retired' });
+    expect(await callClosedFork(closedRow({ cliId: 'codex-app' }))).toEqual({ ok: false, error: 'fork_unsupported_backend' });
+    expect(await callClosedFork(closedRow({ cliSessionId: undefined }))).toEqual({ ok: false, error: 'not_started_yet' });
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
+    expect(await forkClosedSession('missing', 'oc_here', 'om_here_root', 'group', 'thread')).toEqual({ ok: false, error: 'not_found' });
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('forkSession：等目标锁期间源会话变化', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+  });
+
+  const forkWhileTargetLocked = async (mutate: (src: DaemonSession, registry: Map<string, DaemonSession>) => void) => {
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const src = makeSourceDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    vi.mocked(sessionStore.createSession).mockClear();
+    let release: (() => void) | undefined;
+    const held = withActiveSessionKeyLock(registry, sessionKey('oc_child', 'cli_app_test'), () => new Promise<void>(r => { release = r; }));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    // Source guards pass now; the fork then queues behind the held target lock.
+    const pending = callFork(src);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    mutate(src, registry);
+    release!();
+    await held;
+    return pending;
+  };
+
+  it('源会话开始新一轮：拒绝 worker_busy，不铸子会话', async () => {
+    const res = await forkWhileTargetLocked(src => {
+      src.worker = { killed: false } as any;
+      src.lastScreenStatus = 'working' as any;
+    });
+    expect(res).toEqual({ ok: false, error: 'worker_busy' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('源会话被关闭：拒绝 session_not_active，不铸子会话', async () => {
+    const res = await forkWhileTargetLocked((src, registry) => {
+      src.session.status = 'closed';
+      registry.clear();
+    });
+    expect(res).toEqual({ ok: false, error: 'session_not_active' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('sessionAgentConfig — cliConfigDir (Claude config profile) is frozen per session', () => {
+  it('freezes the bot profile on first fork and ignores later bot edits', () => {
+    const ds = makeSourceDs({ agentFrozen: false, cliConfigDir: undefined });
+    const first = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(first.cliConfigDir).toBe('~/.claude-api');
+    expect(ds.session.cliConfigDir).toBe('~/.claude-api');
+    // The transcript lives in the frozen profile: a resume must not follow the bot.
+    const again = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-other' });
+    expect(again.cliConfigDir).toBe('~/.claude-api');
+  });
+
+  it('never back-fills a profile into a session frozen by an older build', () => {
+    const ds = makeSourceDs({ agentFrozen: true, cliConfigDir: undefined });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+    expect(ds.session.cliConfigDir).toBeUndefined();
+  });
+
+  it('never hands a profile to an adopted session (it wraps an external CLI on the default root)', () => {
+    const adoptedFrom = { source: 'tmux' as const, tmuxTarget: 'ext-pane', cwd: '/repo' };
+    const fresh = makeSourceDs({ agentFrozen: false, cliConfigDir: undefined, adoptedFrom });
+    expect(sessionAgentConfig(fresh, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' }).cliConfigDir).toBeUndefined();
+    expect(fresh.session.cliConfigDir).toBeUndefined();
+    // a row an older build froze with the bot profile must not reach the spawn either
+    const legacy = makeSourceDs({ agentFrozen: true, cliConfigDir: '~/.claude-api', adoptedFrom });
+    expect(sessionAgentConfig(legacy, { cliId: 'claude-code' }).cliConfigDir).toBeUndefined();
+  });
+
+  it('drops the profile for a CLI that does not support it', () => {
+    const ds = makeSourceDs({ cliId: 'codex', agentFrozen: false, cliConfigDir: undefined });
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+  });
+
+  it('does not hand the bot profile to a per-session /cli selection', () => {
+    const ds = makeSourceDs({
+      cliId: undefined,
+      cliSessionId: undefined,
+      agentFrozen: false,
+      model: undefined,
+      cliLaunchSnapshot: {
+        version: 1, state: 'pending', entryId: 'claude-code', cliId: 'claude-code', cliRuntime: null,
+        cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      } as any,
+    });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+    expect(ds.session.cliConfigDir).toBeUndefined();
   });
 });

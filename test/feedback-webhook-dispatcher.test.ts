@@ -92,6 +92,27 @@ describe('feedback webhook attempt contract', () => {
     await dispatcher.stop(); db.close();
   });
 
+  it('does not block the daemon event loop when another process holds the feedback DB write lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-busy-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    const blocker = await SkillFeedbackStore.open(dir);
+    (blocker as any).db.exec('BEGIN IMMEDIATE;');
+
+    const started = Date.now();
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db,
+      readSecret: () => 'secret',
+      intervalMs: 100_000,
+    });
+    await dispatcher.ready;
+    expect(Date.now() - started).toBeLessThan(500);
+
+    (blocker as any).db.exec('COMMIT;');
+    await dispatcher.stop();
+    blocker.close();
+    db.close();
+  });
+
   it('stop(0) returns immediately without waiting the internal default window', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-stop0-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);

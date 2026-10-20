@@ -110,9 +110,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ──────────────────────────────────────────────────────
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
+import { initWorkerPool, __testOnly_setupWorkerHandlers, __testOnly_resetRestartCoordinator, restartCounts, sendWorkerInput } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
+import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -168,6 +169,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
   beforeEach(() => {
     vi.clearAllMocks();
     restartCounts.clear();
+    __testOnly_resetRestartCoordinator();
     initWorkerPool({
       sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',
@@ -193,7 +195,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
       'text',
       'app_test',
       undefined,
-      undefined,
+      { sourceSessionId: 'sid-riff-no-restart' },
     );
   });
 
@@ -225,10 +227,11 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    // auto-restart 捎带最新 per-bot env + 最新模型（本 fixture 的 mock getBot
-    // 两者都没配 → 均为 null，即「明确清空快照」），并标记 reason: 'cli_crash'
-    // 区分 operator 主动 restart。
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash', env: null, model: null });
+    // auto-restart 捎带最新 per-bot env + 最新模型 + larkToolBinding（本 fixture 的 mock getBot
+    // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持），
+    // 并标记 reason: 'cli_crash' 区分 operator 主动 restart；经 restart coordinator 发出，
+    // 必带 attemptId（#1863：只有关联回执能放开 workerReady 栅栏）。
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'cli_crash', env: null, model: null, larkToolBinding: true });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.
@@ -294,6 +297,67 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
     expect(ds.session.suspendedColdResume).toBeFalsy();
+  });
+
+  it('crash card falls back to the per-worker stderr ring when logTail is missing', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-diag-ring', worker);
+    const ring = createWorkerStderrRing();
+    // Banner/progress noise, then a real fault line pinned by the marker.
+    ring.push('worker banner line one');
+    ring.push(`${WORKER_ERROR_MARKER} RING_ROOT_CAUSE fatal`);
+    for (let i = 0; i < 12; i++) ring.push(`noise-after-${i}`);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, undefined, ring);
+
+    await crashTimes(worker, 4, undefined);
+
+    const cardText = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(cardText).toContain('最近的 worker 输出（可能含死因）：');
+    // The pinned marker survives even though 12 newer normal lines followed.
+    expect(cardText).toContain('RING_ROOT_CAUSE');
+    expect(cardText).toContain('noise-after-11');
+  });
+
+  it('crash card keeps a worker-provided logTail and does not duplicate the ring', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-diag-logtail', worker);
+    const ring = createWorkerStderrRing();
+    ring.push(`${WORKER_ERROR_MARKER} RING_MUST_NOT_APPEAR`);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, undefined, ring);
+
+    for (let i = 0; i < 3; i++) {
+      worker.emit('message', { type: 'claude_exit', code: 1, signal: null });
+    }
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+      logTail: 'WORKER_LOGTAIL_PAYLOAD',
+    });
+    await flush();
+
+    const cardText = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(cardText).toContain('WORKER_LOGTAIL_PAYLOAD');
+    expect(cardText).toContain('最近终端输出：');
+    expect(cardText).not.toContain('RING_MUST_NOT_APPEAR');
+    expect(cardText).not.toContain('最近的 worker 输出（可能含死因）：');
+  });
+
+  it('pre-ready exit notice appends the per-worker stderr ring tail', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-preready-ring', worker);
+    const ring = createWorkerStderrRing();
+    ring.push(`${WORKER_ERROR_MARKER} EARLY_FATAL_LINE boom`);
+    ring.push('early-noise-line');
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, undefined, ring);
+
+    worker.emit('exit', 1, null);
+    await flush();
+
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('exit code: 1');
+    expect(notice).toContain('EARLY_FATAL_LINE');
+    expect(notice).toContain('最近的 worker 输出（可能含死因）：');
   });
 
 });

@@ -1,13 +1,28 @@
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
+import { resolvePiModel } from './pi-model.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { delay } from '../../utils/timing.js';
+import { logger } from '../../utils/logger.js';
+import { drainPiTranscript, findPiTranscriptBySessionId, findPiTranscriptByPid } from '../../services/pi-transcript.js';
+
+/** botmux ships its built-in skills for Pi here and injects it per-session via
+ *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
+ *  standalone `pi` never surfaces (and mis-fires) them. Single source of truth
+ *  for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
+export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
 
 /** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
  *  or `undefined` when no readable copy exists on disk.
@@ -19,22 +34,50 @@ import { delay } from '../../utils/timing.js';
  *  caller therefore omits the flag entirely in that case and the reader falls
  *  back to its timeout backstop — degraded, not broken.
  *
- *  The case is real, not theoretical: inside a `bun build --compile` binary the
- *  module graph lives in the virtual `/$bunfs/` root, so both `__dirname`-derived
- *  candidates resolve to paths that exist only inside this process — measured
- *  `/$bunfs/root/pi-turn-boundary-extension.{js,ts}`, neither present on disk.
- *  See CLAUDE.md on why a `__dirname` path must never be handed to another
- *  process. Resolved lazily at spawn time so constructing the adapter never
- *  touches the filesystem. */
+ *  Inside a `bun build --compile` binary the module graph lives in the virtual
+ *  `/$bunfs/` root, so `__dirname`-derived candidates resolve to paths that exist
+ *  only inside this process. To ensure external `pi` processes and sandboxes can
+ *  load the extension in compiled form, we materialize the embedded JS source to
+ *  a real path on disk inside `PI_PLUGIN_DIR/extensions/` (which is whitelisted
+ *  as read-only in fs-policy). */
 export function piTurnBoundaryExtensionPath(): string | undefined {
   const here = dirname(fileURLToPath(import.meta.url));
   for (const candidate of [
     resolve(here, 'pi-turn-boundary-extension.js'),
+    resolve(here, 'pi-turn-boundary-extension.mjs'),
     resolve(here, 'pi-turn-boundary-extension.ts'),
   ]) {
     if (existsSync(candidate)) return candidate;
   }
-  return undefined;
+
+  // Inside a compiled binary, materialize the embedded extension source
+  // to a real path on disk that the child process can load and the file-sandbox permits.
+  return materializePiTurnBoundaryExtension();
+}
+
+/** Materializes the embedded turn-boundary extension JS file into
+ *  `PI_PLUGIN_DIR/extensions/pi-turn-boundary-extension.js`. */
+export function materializePiTurnBoundaryExtension(): string | undefined {
+  const extDir = join(PI_PLUGIN_DIR, 'extensions');
+  const extPath = join(extDir, 'pi-turn-boundary-extension.js');
+  try {
+    if (!existsSync(extPath) || readFileSync(extPath, 'utf8') !== PI_TURN_BOUNDARY_EXTENSION_SOURCE) {
+      mkdirSync(extDir, { recursive: true, mode: 0o755 });
+      writeFileSync(extPath, PI_TURN_BOUNDARY_EXTENSION_SOURCE, { encoding: 'utf8', mode: 0o644 });
+    }
+    return extPath;
+  } catch {
+    // If writing fails (e.g. read-only mount) but a readable copy is already present on disk, use it
+    if (existsSync(extPath)) {
+      try {
+        readFileSync(extPath, 'utf8');
+        return extPath;
+      } catch {
+        // unreadable
+      }
+    }
+    return undefined;
+  }
 }
 
 /** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
@@ -44,9 +87,13 @@ export function piTurnBoundaryExtensionPath(): string | undefined {
  *  BOTH sides without stubbing the filesystem. */
 export function buildPiArgs(opts: {
   sessionId: string;
+  resume?: boolean;
   initialPrompt?: string;
+  nativeSessionTitle?: string;
   model?: string;
   turnBoundaryExtension: string | undefined;
+  builtinSkillsDir?: string;
+  skillPluginDir?: string;
 }): string[] {
   const args: string[] = [];
   // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
@@ -57,11 +104,58 @@ export function buildPiArgs(opts: {
   // only in the argv we build). See pi-turn-boundary-extension.ts.
   if (opts.turnBoundaryExtension) args.push('--extension', opts.turnBoundaryExtension);
   args.push('--session-id', opts.sessionId);
+  // Resume opens the existing session file and then appends session_info.
+  // Pi takes the name from the last record, so `--name` on resume overwrites a
+  // title the user changed inside the CLI. Fresh spawns are the only ones that
+  // should stamp the Botmux title.
+  if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
+  if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
   // Pi's interactive mode processes positional initial messages after TUI
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
   return args;
+}
+
+/**
+ * Resolve BotConfig.model to pi's --model flag against the ENV the pi process
+ * will actually be spawned with, and log every implicit decision. The rewrite
+ * crosses a config boundary (bots.json slug → pi-side settings.defaultProvider),
+ * so silence would make "configured X but argv says Y" unauditable; the bare
+ * passthrough additionally warns how pi itself fails on a cross-provider id.
+ */
+export function resolvePiModelForSpawn(
+  model: string | undefined,
+  childEnv: NodeJS.ProcessEnv,
+): string | undefined {
+  const resolution = resolvePiModel(model, { env: childEnv });
+  switch (resolution.kind) {
+    case 'none':
+      return undefined;
+    case 'qualified':
+      logger.debug(`pi: --model "${resolution.flag}" already provider-qualified; passed as-is`);
+      return resolution.flag;
+    case 'prefixed':
+      logger.info(
+        `pi: --model "${model!.trim()}" → "${resolution.flag}" ` +
+          `(qualified with settings.defaultProvider="${resolution.provider}" from ${resolution.settingsPath})`,
+      );
+      return resolution.flag;
+    case 'bare': {
+      const ambiguityHint = 'pi exits when this id is ambiguous across authenticated providers (use provider/id)';
+      if (resolution.state === 'invalid') {
+        logger.warn(
+          `pi: --model "${resolution.flag}" left unqualified: settings file ${resolution.settingsPath} is unreadable; ${ambiguityHint}`,
+        );
+      } else {
+        logger.info(
+          `pi: --model "${resolution.flag}" left unqualified (no defaultProvider in ${resolution.settingsPath}); ${ambiguityHint}`,
+        );
+      }
+      return resolution.flag;
+    }
+  }
 }
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
@@ -133,21 +227,103 @@ export function buildPiArgs(opts: {
  *       custom-tool `terminate:true` gap).
  *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
  *       working when `Working...` reappears. */
-export function createPiAdapter(pathOverride?: string): CliAdapter {
+/** Pi session JSONL. botmux passes `--session-id`, so the adapter session id is a valid
+ *  first lookup key even before the native id is known. */
+export const piBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainPiTranscript(path, offset),
+  locate: {
+    bySessionId: (sessionId, cwd) => findPiTranscriptBySessionId(sessionId, cwd),
+    byPid: pid => findPiTranscriptByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+  adopt: { attach: 'split-live' },
+};
+
+export function createPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
+    bridgeSpec: piBridgeSpec,
     authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
-    buildArgs({ sessionId, initialPrompt, model }) {
+    buildArgs({
+      sessionId,
+      resume,
+      initialPrompt,
+      nativeSessionTitle,
+      model,
+      botName,
+      botOpenId,
+      locale,
+      noTransport,
+      triggerUserAuth,
+      larkToolAppId,
+      replyDelivery,
+      solo,
+      skillPluginDir,
+      workingDir,
+      env,
+      extraArgs,
+      trustOverride,
+      projectTrusted,
+      promptInjection,
+    }) {
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        larkToolAppId,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // pi-turn-boundary-extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: Pi's CLI
+      // disables native automatic discovery of project/user APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict runtime project trust decisions. Appending via the extension
+      // after native discovery completes preserves 100% faithful native project trust
+      // resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
+
+      // Resolve against the child env (per-bot env wins over daemon env), the
+      // same env pi sees, so an agent-dir overlay / HOME redirect is honored.
+      const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env });
+
       return buildPiArgs({
         sessionId,
+        resume,
         initialPrompt,
-        model,
-        turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+        nativeSessionTitle,
+        model: resolvedModel,
+        turnBoundaryExtension: turnBoundaryExt,
+        builtinSkillsDir: promptInjection === 'none' ? undefined : PI_BUILTIN_SKILLS_DIR,
+        skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
       });
     },
+
+    injectsSessionContext: true,
+    pluginDir: PI_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'skill-root', supportsScopedSession: true, supportsExclusive: false },
 
     buildResumeCommand({ sessionId }) {
       return `pi --session-id ${sessionId}`;
@@ -162,12 +338,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       return {
         initialPrompt: prepared.initialPromptArg,
         readonlyRoots: prepared.readonlyRoot ? [prepared.readonlyRoot] : undefined,
-        cleanupPaths: prepared.filePath ? [prepared.filePath] : undefined,
+        cleanupPaths: prepared.filePath ? [prepared.filePath, prepared.extensionPath!] : undefined,
         cleanupDirs: prepared.cleanupDir ? [prepared.cleanupDir] : undefined,
         deferredInput: prepared.deferredInput,
       };
     },
 
+    buildSessionRenameCommand: (title) => `/name ${title}`,
     passesInitialPromptViaArgs: true,
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -176,7 +353,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(`\x1b[200~${content}\x1b[201~`);
+        pty.write(wrapBracketedPaste(content));
         await delay(1000);
         pty.write('\r');
       }
@@ -199,10 +376,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     // custom-terminate turn has no on-disk boundary — see the header for why
     // that stronger promise is unsafe (and why type-ahead does not need it).
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    supportsProgramStatus: true,
+    systemHints: [],
     altScreen: true,
+    // Pi >= 1.0 defaults to fullscreen mode, where Pi owns the transcript and
+    // xterm/tmux have no usable scrollback. Let read-only Web Terminal viewers
+    // use the worker's validated, rate-limited SGR wheel-only path.
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.pi/agent/skills',
   };
 }
-
-export const create = createPiAdapter;

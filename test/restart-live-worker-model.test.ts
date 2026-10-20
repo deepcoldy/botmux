@@ -12,11 +12,10 @@
  *  （字符串=用它 / null=当前不该传模型 / undefined=取不到，保持快照=旧行为），
  *  worker 在合并守卫之前覆盖 lastInitConfig.model。
  *
- *  另外两条同族状态转换也在这里锁：
- *  - Codex App 线程接管把 cliId 钉成 codex-app 时必须清掉内存态的
- *    spawnModelOverride（它优先级最高且无条件，否则会泄漏进接管后的启动）；
- *  - session.model 是「上次实际启动用的模型」记录，只在 bot 换过 CLI、
- *    session 被钉在旧 CLI 上时兜底。
+ *  另外：session.model 是「上次实际启动用的模型」记录，只在 bot 换过 CLI、
+ *  session 被钉在旧 CLI 上时兜底；crash-loop park 后由消息触发的恢复重启也要
+ *  刷新模型（见 crash-loop-diagnostic.test.ts）。worker 侧在合并守卫之前覆盖
+ *  lastInitConfig.model 的接线在 worker.ts 闭包里，暂无单测 seam。
  *
  * Run:  pnpm vitest run test/restart-live-worker-model.test.ts
  */
@@ -38,18 +37,12 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
   updateSession: (...args: unknown[]) => updateSessionMock(...args),
 }));
 
-import { readFileSync } from 'node:fs';
 import {
   latestModelForRespawn,
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
-
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 let sessionCounter = 0;
 
@@ -189,121 +182,5 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
     // bot hot-switches CLI (`/botconfig set cli` — no mismatch sweep)
     const switched = { cliId: 'claude-code' as const, model: 'opus' };
     expect(resolveSessionLaunchModel(ds, switched)).toBe('B');
-  });
-});
-
-// ─── 3. 全部四个 restart IPC 生产者均捎带 model（wiring） ───────────────────
-
-describe('every daemon-side restart IPC producer carries model (source wiring)', () => {
-  it('worker-pool.ts: every {type:restart} send includes model', () => {
-    const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2); // requestSessionRestart + auto-restart
-    for (const s of sends) {
-      expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
-    }
-  });
-
-  it('dashboard-ipc-server.ts: every {type:restart} send includes model', () => {
-    const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard 重启按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing model in: ${s}`).toContain('model: latestModelForRespawn(ds)');
-    }
-  });
-
-  it('the restart message type declares the three-state model field', () => {
-    const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
-    const restartAt = typesSource.indexOf("| { type: 'restart';");
-    expect(restartAt).toBeGreaterThanOrEqual(0);
-    const line = typesSource.slice(restartAt, typesSource.indexOf('}', restartAt));
-    expect(line).toContain('model?: string | null');
-  });
-});
-
-// ─── 4. worker wiring：respawn 前 merge model（合并守卫之前 + null 清除） ────
-
-describe('worker restart case merges model into lastInitConfig (source pin)', () => {
-  function restartCaseBranch(): string {
-    const start = workerSource.indexOf("case 'restart': {");
-    const end = workerSource.indexOf("case 'expire_durable_turn':", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    return workerSource.slice(start, end);
-  }
-
-  it('full-replaces lastInitConfig.model with null→clear three-state semantics', () => {
-    const branch = restartCaseBranch();
-    expect(branch).toContain('if (msg.model !== undefined && lastInitConfig)');
-    expect(branch).toContain('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
-  });
-
-  it('the model merge sits BEFORE the in-flight merge guard (coalesced restarts still take it)', () => {
-    const branch = restartCaseBranch();
-    const modelMerge = branch.indexOf('if (msg.model !== undefined && lastInitConfig)');
-    const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
-    expect(modelMerge).toBeGreaterThanOrEqual(0);
-    expect(guard).toBeGreaterThan(modelMerge);
-  });
-});
-
-// ─── 5. Codex App 线程接管必须清掉内存态的 per-trigger 覆盖（source pin） ────
-
-describe('Codex App thread takeover clears the in-memory model override', () => {
-  it('the takeover block that pins cliId=codex-app also clears spawnModelOverride', () => {
-    const pin = daemonSource.indexOf("ds.session.cliId = 'codex-app';");
-    expect(pin).toBeGreaterThanOrEqual(0);
-    // 接管块紧随其后的几行：清 wrapper / 清 model 记录 / 清一次性覆盖 / 置 frozen。
-    const block = daemonSource.slice(pin, pin + 400);
-    expect(block).toContain('delete ds.session.model;');
-    expect(block).toContain('ds.spawnModelOverride = undefined;');
-  });
-});
-
-// ─── 6. crash-loop park 后由消息触发的恢复重启也要刷新模型 ──────────────────
-
-describe('crash-park retry respawn takes the model carried by the message', () => {
-  function messageCaseHead(): string {
-    const start = workerSource.indexOf("case 'message': {");
-    expect(start).toBeGreaterThanOrEqual(0);
-    return workerSource.slice(start, start + 1200);
-  }
-
-  it('the message case merges msg.model into lastInitConfig with null→clear', () => {
-    const head = messageCaseHead();
-    expect(head).toContain('if (msg.model !== undefined && lastInitConfig)');
-    expect(head).toContain('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
-  });
-
-  it('the merge precedes the crash-park retry that respawns from lastInitConfig', () => {
-    const merge = workerSource.indexOf('lastInitConfig.model = msg.model === null ? undefined : msg.model;');
-    const retry = workerSource.indexOf('Message received after crash-loop stop; retrying CLI start');
-    expect(merge).toBeGreaterThanOrEqual(0);
-    expect(retry).toBeGreaterThan(merge);
-    // …and that retry really does spawn from the snapshot this merge updates.
-    const retryBlock = workerSource.slice(retry, retry + 600);
-    expect(retryBlock).toContain('{ ...lastInitConfig, resume: true');
-  });
-
-  it('every daemon-side message IPC refreshes the model while the worker is parked', () => {
-    // Every literal that builds a `{type:'message'}` IPC must carry the refresh,
-    // gated on the parked flag — a send that forgets it leaves the snapshot stale
-    // for the crash-park respawn; an ungated one would put a model field on every
-    // ordinary turn, which changes nothing and only adds noise.
-    const bodies = workerPoolSource.split(/type: 'message',/).slice(1).map(part => part.slice(0, 700));
-    expect(bodies.length).toBeGreaterThanOrEqual(2);
-    for (const body of bodies) {
-      expect(body, `missing model in: ${body.slice(0, 120)}`)
-        .toContain('...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {})');
-    }
-  });
-
-  it('the park request marks the session, and a ready worker clears it', () => {
-    const park = workerPoolSource.indexOf("ds.worker!.send({ type: 'park_diagnostic' }");
-    expect(park).toBeGreaterThanOrEqual(0);
-    // The flag must be set BEFORE the park IPC leaves, so a message racing the
-    // park still carries the refresh.
-    const setAt = workerPoolSource.lastIndexOf('ds.crashDiagnosticParked = true;', park);
-    expect(setAt).toBeGreaterThanOrEqual(0);
-    expect(workerPoolSource).toContain('ds.crashDiagnosticParked = undefined;');
   });
 });

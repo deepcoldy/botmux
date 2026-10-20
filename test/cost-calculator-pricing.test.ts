@@ -104,6 +104,12 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
   createCliAdapterSync: vi.fn(() => ({ claudeDataDir: '/fake/pkg/.claude-runtime' })),
 }));
 
+// resolveSessionTranscriptPath() 的 codex 分支会查会话库里的实例绑定。
+// 本套件整体 mock 了 node:fs，真实 store 会读到合成文件系统；stub 掉它需要的这一个入口。
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
+}));
+
 import { existsSync, readFileSync } from 'node:fs';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
 import { getSessionUsageSnapshot, __resetSessionUsageCachesForTest } from '../src/core/cost-calculator.js';

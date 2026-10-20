@@ -4,7 +4,7 @@
  * 三个适配器的 detectModels 都复用它，过滤/容错行为在这里统一覆盖。
  */
 import { describe, it, expect } from 'vitest';
-import { parseDebugModelsJson } from '../src/adapters/cli/model-catalog-json.js';
+import { parseDebugModelCapabilitiesJson, parseDebugModelsJson } from '../src/adapters/cli/model-catalog-json.js';
 
 const REAL_SHAPE = (models: unknown[]) => JSON.stringify({ models });
 const modelEntry = (slug: string, visibility: string = 'list') => ({
@@ -12,6 +12,17 @@ const modelEntry = (slug: string, visibility: string = 'list') => ({
   description: `model ${slug}`,
   visibility,
   supported_in_api: true,
+});
+
+const capabilityEntry = (slug: string, tiers: string[]) => ({
+  ...modelEntry(slug),
+  service_tiers: tiers.map(id => ({ id, name: id })),
+});
+
+const reasoningEntry = (slug: string, levels: string[], defaultLevel: string) => ({
+  ...modelEntry(slug),
+  supported_reasoning_levels: levels.map(effort => ({ effort })),
+  default_reasoning_level: defaultLevel,
 });
 
 describe('parseDebugModelsJson', () => {
@@ -65,5 +76,32 @@ describe('parseDebugModelsJson', () => {
       ]),
     );
     expect(out).toEqual(['good-1', 'good-2']);
+  });
+});
+
+describe('parseDebugModelCapabilitiesJson', () => {
+  it('保留 visibility=list 模型的 service_tiers id', () => {
+    const out = parseDebugModelCapabilitiesJson(REAL_SHAPE([
+      capabilityEntry('gpt-6.1-sol', ['priority']),
+      capabilityEntry('gpt-6-astra', ['priority', 'ultrafast']),
+      { ...capabilityEntry('secret', ['priority']), visibility: 'hidden' },
+      { ...modelEntry('legacy'), service_tiers: [{ name: 'bad' }, null, { id: '' }] },
+    ]));
+    expect(out).toEqual([
+      { slug: 'gpt-6.1-sol', serviceTiers: ['priority'] },
+      { slug: 'gpt-6-astra', serviceTiers: ['priority', 'ultrafast'] },
+      { slug: 'legacy', serviceTiers: [] },
+    ]);
+  });
+
+  it('同一次解析保留 reasoning levels，并过滤未知档位', () => {
+    expect(parseDebugModelCapabilitiesJson(REAL_SHAPE([
+      reasoningEntry('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'future'], 'medium'),
+    ]))).toEqual([{
+      slug: 'gpt-6.1-sol',
+      serviceTiers: [],
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      defaultReasoningEffort: 'medium',
+    }]);
   });
 });

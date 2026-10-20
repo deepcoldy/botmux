@@ -7,6 +7,7 @@ type ProtectedSessionMutationState = Pick<
   | 'queued'
   | 'queuedActivationPending'
   | 'queuedActivationTail'
+  | 'principalLaneQueuedTurns'
   | 'pendingRepoSetup'
 >;
 
@@ -20,6 +21,7 @@ export type ProtectedSessionMutationReason =
   | 'queued_todo'
   | 'activation_head'
   | 'activation_tail'
+  | 'principal_lane_tail'
   | 'repository_setup'
   | 'initial_start';
 
@@ -37,6 +39,7 @@ export function protectedSessionMutationReasons(
   if (session.queued === true) reasons.push('queued_todo');
   if (session.queuedActivationPending === true) reasons.push('activation_head');
   if ((session.queuedActivationTail?.length ?? 0) > 0) reasons.push('activation_tail');
+  if ((session.principalLaneQueuedTurns?.length ?? 0) > 0) reasons.push('principal_lane_tail');
   if (session.pendingRepoSetup !== undefined) reasons.push('repository_setup');
   if (ds?.initialStartPending === true) reasons.push('initial_start');
   return reasons;

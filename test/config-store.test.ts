@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, statSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, statSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readRawConfig, writeRawConfigAtomic, findEntryIndex } from '../src/services/config-store.js';
@@ -10,7 +10,10 @@ beforeEach(() => {
   cfg = join(dir, 'bots.json');
   writeFileSync(cfg, JSON.stringify([{ larkAppId: 'a1', allowedUsers: ['ou_x'] }], null, 2), { mode: 0o600 });
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe('config-store', () => {
   it('writeRawConfigAtomic keeps file 0o600', async () => {
@@ -21,8 +24,33 @@ describe('config-store', () => {
     expect((await readRawConfig(cfg))[0].allowedUsers).toEqual(['ou_x', 'ou_y']);
   });
 
+  it('rejects an uncoordinated bots.json write in primary mode', async () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', allowedUsers: ['ou_y'] }]))
+      .rejects.toThrow('durable_config_coordinator_required');
+    expect((await readRawConfig(cfg))[0].allowedUsers).toEqual(['ou_x']);
+  });
+
+  it('rejects network policy combinations before changing durable configuration', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const before = readFileSync(cfg, 'utf8');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', sandboxNetworkPolicy: policy, sandbox: false }])).rejects.toThrow('sandbox_network_policy_requires_local_pty_oncall');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', sandboxNetworkPolicy: { ...policy, proxy: 'http://example.org' }, sandbox: true }])).rejects.toThrow('invalid_sandbox_network_policy');
+    expect(readFileSync(cfg, 'utf8')).toBe(before);
+  });
+
   it('findEntryIndex matches by larkAppId', async () => {
     expect(findEntryIndex(await readRawConfig(cfg), 'a1')).toBe(0);
     expect(findEntryIndex(await readRawConfig(cfg), 'nope')).toBe(-1);
+  });
+
+  it('rejects an impending quota fallback cycle before replacing the file', async () => {
+    const before = readFileSync(cfg, 'utf8');
+    const cyclic = [
+      { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
+      { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
+    ];
+    await expect(writeRawConfigAtomic(cfg, cyclic)).rejects.toThrow('cli_a -> cli_b -> cli_a');
+    expect(readFileSync(cfg, 'utf8')).toBe(before);
   });
 });

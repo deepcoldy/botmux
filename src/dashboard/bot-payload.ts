@@ -1,9 +1,25 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
-import { normalizeUsageDisplay } from '../bot-registry.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
+import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
+import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import type { CodexServiceTier } from '../services/codex-service-tier.js';
+import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
+import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
+
+/** Shared parser so a malformed payload can't reach the selector half-shaped;
+ *  anything invalid degrades to the registry default (`inherit`). */
+function envPolicyForClient(raw: unknown): EnvPolicy {
+  try { return normalizeEnvPolicy(raw) ?? { mode: 'inherit' }; }
+  catch { return { mode: 'inherit' }; }
+}
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -17,14 +33,20 @@ export interface DashboardBotDescriptor {
   /** Legacy executable override. Private Bot Defaults payload only. */
   cliPathOverride?: string;
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
   dshRuntime?: 'official' | 'tui' | null;
   /** dsh profile name; dashboard exposes it for the dsh CLI only. */
   dshProfile?: string | null;
+  /** CLI config profile dir (claude-code: CLAUDE_CONFIG_DIR). */
+  cliConfigDir?: string | null;
 }
 
 /**
@@ -46,6 +68,19 @@ export function brandMapByAppId(
   }
 }
 
+/**
+ * Trigger-user CLI auth policy for the private Bot Defaults payload.
+ *
+ * A daemon that predates the field simply omits it, and an unregistered bot
+ * reports null — both mean "off", which is what the dashboard toggle renders as
+ * unchecked. A malformed value (hand-edited bots.json reaching an older daemon
+ * that echoed it verbatim) degrades to off rather than throwing: this aggregate
+ * builds every bot row, so one bad policy must not take the whole page down.
+ */
+function normalizeTriggerUserAuthForClient(raw: unknown): TriggerUserAuthConfig | null {
+  try { return parseTriggerUserAuthConfig(raw); } catch { return null; }
+}
+
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
   return {
     larkAppId: bot.larkAppId,
@@ -65,15 +100,20 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
+    ...(bot.cliLaunchMode ? { cliLaunchMode: bot.cliLaunchMode } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
+    ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     ...(bot.dshProfile ? { dshProfile: bot.dshProfile } : {}),
+    ...(bot.cliConfigDir ? { cliConfigDir: bot.cliConfigDir } : {}),
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
     // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
     // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。
-    ...(bot.cliId ? { agentSelectionKey: selectionKeyForBot(bot.cliId, bot.wrapperCli) } : {}),
+    ...(bot.cliId ? { agentSelectionKey: selectionKeyForBot(bot.cliId, bot.wrapperCli, bot.cliLaunchMode) } : {}),
     online: true,
   };
   if (error) return { ...base, error };
@@ -84,6 +124,13 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     displayName: typeof j?.displayName === 'string' ? j.displayName : null,
     larkBotName: typeof j?.larkBotName === 'string' ? j.larkBotName : null,
     defaultOncall: j?.defaultOncall,
+    scheduleWorkingDir: typeof j?.scheduleWorkingDir === 'string' && j.scheduleWorkingDir.trim()
+      ? j.scheduleWorkingDir
+      : null,
+    schedulePreconditionFileRoot: typeof j?.schedulePreconditionFileRoot === 'string'
+      && j.schedulePreconditionFileRoot.trim()
+      ? j.schedulePreconditionFileRoot
+      : null,
     defaultWorkingDir: typeof j?.defaultWorkingDir === 'string' ? j.defaultWorkingDir : null,
     // 「仓库选择卡片」形态的工作目录。与 defaultWorkingDir 互斥（见 BotConfig）。
     // 克隆弹窗要用它判断源 Bot 是哪种目录形态，才能预填出与克隆结果一致的表单。
@@ -94,7 +141,22 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
     replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
-    sandbox: j?.sandbox === true,
+    // 同上：非法手改值 fail-soft 丢掉，缺省（compact）以 null 表达。
+    askOptionLayout: normalizeAskOptionLayout(j?.askOptionLayout).layout ?? null,
+    sandbox: j?.sandbox === true || j?.sandbox === 'oncall' || j?.sandbox === 'scratch',
+    sandboxMode: j?.sandboxMode === 'off' || j?.sandboxMode === 'oncall' || j?.sandboxMode === 'scratch'
+      ? j.sandboxMode
+      : (j?.sandbox === 'scratch' ? 'scratch' : j?.sandbox === true || j?.sandbox === 'oncall' ? 'oncall' : 'off'),
+    scratchStorage: j?.scratchStorage === 'disk' || j?.scratchStorage === 'tmpfs' ? j.scratchStorage : null,
+    // tmpfs-vs-disk selection exists only on Linux (full-root overlay). On
+    // macOS scratch is always APFS clonefile COW (disk-backed, swap-backed);
+    // the UI hides the storage segmented control there.
+    scratchStorageSelectable: process.platform === 'linux',
+    scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
+    scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
+    scratchSupported: j?.scratchSupported === true,
+    sandboxNetworkPolicy: j?.sandboxNetworkPolicy ?? null,
+    sandboxNetworkPolicyPlatform: j?.sandboxNetworkPolicyPlatform ?? null,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
@@ -104,23 +166,36 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : null,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
+    ...normalizeReplyFooter(j),
+    showReplyTiming: j?.showReplyTiming === true,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
-    disableStreamingCard: j?.disableStreamingCard === true,
+    disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
+    replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
+    hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
+    codexBrowser: j?.codexBrowser === true
+      || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
-    thinkingCard: j?.thinkingCard !== false,
+    cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
+    senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
+    quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
+    autoInviteOwnerOnGroupAdd: j?.autoInviteOwnerOnGroupAdd !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
     autoStartOnGroupJoinSeed: typeof j?.autoStartOnGroupJoinSeed === 'string' ? j.autoStartOnGroupJoinSeed : '',
     autoStartOnGroupJoinSeedDefault: typeof j?.autoStartOnGroupJoinSeedDefault === 'string' ? j.autoStartOnGroupJoinSeedDefault : '',
+    groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
+    groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),
@@ -135,9 +210,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     docSubscribeDefaultMode: j?.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
+    oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
+    noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
+    grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
       && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
       ? j.grantDefaultDurationMs
@@ -145,11 +223,24 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
+    topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
+    replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
+    promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
+    replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
+    replyDeliverySupported: j?.replyDeliverySupported === true,
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Trigger-user CLI auth policy. No secrets in it — just which tools it
+    // covers and what to do when the sender has not authorized. Run through the
+    // SHARED parser so this door cannot drift from bots.json / /botconfig: a
+    // malformed hand edit degrades to null (feature off) instead of reaching
+    // form state as a half-shaped policy the toggle would misrender.
+    triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
+    larkToolBinding: j?.larkToolBinding !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
     maxLiveWorkers: typeof j?.maxLiveWorkers === 'number' ? j.maxLiveWorkers : null,
+    idleSuspendMinutes: typeof j?.idleSuspendMinutes === 'number' ? j.idleSuspendMinutes : null,
     logicalSessionCount: typeof j?.logicalSessionCount === 'number' ? j.logicalSessionCount : 0,
     residentSessionCount: typeof j?.residentSessionCount === 'number' ? j.residentSessionCount : 0,
     dormantSessionCount: typeof j?.dormantSessionCount === 'number' ? j.dormantSessionCount : 0,
@@ -161,7 +252,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
+    // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
+    // 页面刷新即显示 ∅，看起来像没存上（而空白再保存会真的清掉）。
+    envKeys: Array.isArray(j?.envKeys) ? j.envKeys.filter((k: unknown): k is string => typeof k === 'string') : [],
+    envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
+    remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

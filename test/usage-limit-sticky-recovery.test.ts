@@ -33,6 +33,7 @@ vi.mock('node-pty', () => ({
 
 import { registerBot } from '../src/bot-registry.js';
 import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -75,6 +76,7 @@ describe('usage-limit sticky state self-heal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-limit-'));
+    sessionStore.init(APP);
     registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -171,5 +173,26 @@ describe('usage-limit sticky state self-heal', () => {
 
     expect(ds.usageLimit).toBeDefined();
     expect(ds.lastScreenStatus).toBe('limited');
+  });
+
+  it('publishes every accepted screen status to the external runtime-card sink even when default cards are off', async () => {
+    const onScreenStatus = vi.fn(async () => undefined);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onScreenStatus,
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'screen_update', content: 'busy', status: 'working' });
+    worker.emit('message', { type: 'screen_update', content: 'still busy', status: 'working' });
+    worker.emit('message', { type: 'screen_update', content: 'stuck', status: 'stalled' });
+    await flush();
+
+    expect(onScreenStatus.mock.calls.map(call => call[1].status)).toEqual(['working', 'working', 'stalled']);
   });
 });

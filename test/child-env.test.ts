@@ -1,13 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import {
   applySessionOwnerEnv,
   scrubExternalMemberEnv,
   BOTMUX_INJECTED_ENV_KEYS,
+  CA_BUNDLE_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
+  COMPANION_STARTUP_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
   INVOKER_TERMINAL_ENV_KEYS,
+  PROXY_ENV_KEYS,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
@@ -17,12 +21,14 @@ import {
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
   SESSION_TURN_MARKER_ENV_KEYS,
+  stripCompanionStartupEnv,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
-import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
+import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
 
 describe('applySessionOwnerEnv()', () => {
   it('injects both the public contract and legacy owner names', () => {
@@ -50,9 +56,13 @@ describe('redactChildEnv()', () => {
     const out = redactChildEnv({
       LARK_APP_ID: 'cli_bot',
       LARK_APP_SECRET: 'secret',
+      ONCALL_SERVICE_SECRET: 'oncall-secret',
+      NODE_CHANNEL_FD: '3',
+      NODE_CHANNEL_SERIALIZATION_MODE: 'json',
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
+      GOFLAGS: '-p=4',
     });
     // The bug this guards: `{ ...env, LARK_APP_ID: undefined }` leaves the key
     // PRESENT (`'LARK_APP_ID' in obj === true`), and node-pty then stringifies
@@ -60,10 +70,16 @@ describe('redactChildEnv()', () => {
     // just falsy value.
     expect('LARK_APP_ID' in out).toBe(false);
     expect('LARK_APP_SECRET' in out).toBe(false);
+    expect('ONCALL_SERVICE_SECRET' in out).toBe(false);
+    expect('NODE_CHANNEL_FD' in out).toBe(false);
+    expect('NODE_CHANNEL_SERIALIZATION_MODE' in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain('ONCALL_SERVICE_SECRET');
     expect('CLAUDECODE' in out).toBe(false);
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
     expect(out.PATH).toBe('/usr/bin');
+    // Host-scoped build policy reaches the CLI through the ordinary child env.
+    expect(out.GOFLAGS).toBe('-p=4');
   });
 
   it('does not mutate the input env', () => {
@@ -86,6 +102,25 @@ describe('redactChildEnv()', () => {
     }
     // Behavior knob, not an identity marker — must survive.
     expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('removes companion authority from non-serving process environments', () => {
+    const env = Object.fromEntries(COMPANION_STARTUP_ENV_KEYS.map(key => [key, 'private']));
+    stripCompanionStartupEnv(env);
+    for (const key of COMPANION_STARTUP_ENV_KEYS) expect(key in env, key).toBe(false);
+  });
+
+  it('removes the companion secret-file path from child env', () => {
+    const out = redactChildEnv({
+      [COMPANION_SECRET_FILE_ENV]: '/run/secrets/botmux/companion',
+      [COMPANION_BOT_APP_ID_ENV]: 'local_test_bot',
+      KEEP: 'v',
+    });
+    expect(COMPANION_SECRET_FILE_ENV in out).toBe(false);
+    expect(COMPANION_BOT_APP_ID_ENV in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_SECRET_FILE_ENV);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(COMPANION_BOT_APP_ID_ENV);
     expect(out.KEEP).toBe('v');
   });
 
@@ -136,15 +171,19 @@ describe('redactChildEnv()', () => {
     }
   });
 
-  it('covers every H5 var the dashboard actually reads (drift guard)', () => {
-    // resolveDashboardH5AuthConfig is the single consumer; scrape its source so
-    // adding a knob there without extending the deny list fails here.
-    const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
-    const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
-    expect(read.size).toBeGreaterThan(0);
-    for (const key of read) {
+  it('covers every H5 var the dashboard actually reads', () => {
+    // resolveDashboardH5AuthConfig is the single consumer; record the keys it
+    // really reads so adding a knob there without extending the named deny
+    // list (which the tmux pane unset clause needs) fails here.
+    const read = new Set<string>();
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, key) => { if (typeof key === 'string') read.add(key); return undefined; },
+    });
+    resolveDashboardH5AuthConfig(env);
+    const h5Reads = [...read].filter(key => key.startsWith(DASHBOARD_H5_ENV_PREFIX));
+    expect(h5Reads.length).toBeGreaterThanOrEqual(DASHBOARD_H5_ENV_KEYS.length);
+    for (const key of h5Reads) {
       expect(DASHBOARD_H5_ENV_KEYS as readonly string[], key).toContain(key);
-      expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(true);
     }
   });
 
@@ -178,12 +217,37 @@ describe('redactChildEnv()', () => {
     expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
   });
 
-  it('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
-    // End-to-end guard for the actual leak vector Codex found: a spawned child
-    // must see the redacted var as genuinely UNSET. `${VAR+x}` expands to empty
-    // only when VAR is unset, distinguishing "unset" from "set to the string
-    // 'undefined'". Run against the real bundled node-pty + /bin/sh.
-    const pty = await import('node-pty');
+  // Two REAL-CHILD guards for the same leak vector, split by transport.
+  //
+  // The plain-spawn one runs everywhere. The node-pty one is Node-only, because
+  // node-pty's fork/exec is broken under Bun when cores are scarce — MEASURED
+  // here with `taskset` (node-pty 1.1.0, bun 1.4.2, `/bin/sh -c`):
+  //
+  //     node, 1 core .......... 25/25 child ran
+  //     bun,  1 core ..........  1/25
+  //     bun,  2 cores .........  24/25   <- the ~4% red on the 2-core CI runner
+  //
+  // It is NOT a lost read, which is what this test used to claim. Point the child
+  // at a file instead of the pty stream and it still fails 1/25 under bun; have
+  // the shell announce itself first (`exec >>log; echo ENTERED`) and a failing run
+  // leaves exitCode 1 with no log file at all — /bin/sh never starts. So no
+  // amount of draining, waiting or retrying on the JS side can fix it: retrying
+  // four times inside one process recovered 0/20 on one core, because the failure
+  // is per-process, not per-attempt. A retry loop would look like a fix and only
+  // be one on a fast runner.
+  //
+  // Skipping under Bun keeps the pty leg honest on Node instead of trading a real
+  // guard for a flaky one. `redactChildEnv` is transport-agnostic, and the
+  // plain-spawn case below exercises the same env marshalling on BOTH runtimes,
+  // so nothing about the leak vector goes unguarded here.
+  const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+
+  const leakProbeScript = (sentinel: string) =>
+    'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; '
+    + `if [ -z "\${${sentinel}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${sentinel}]"; fi`;
+
+  /** Set the two vars, hand `redactChildEnv`'s output to `run`, always restore. */
+  const withLeakyParentEnv = async (run: (env: NodeJS.ProcessEnv) => Promise<string>) => {
     const prev = process.env.LARK_APP_ID;
     const prevSentinel = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
     process.env.LARK_APP_ID = 'cli_parent_must_not_leak';
@@ -191,27 +255,81 @@ describe('redactChildEnv()', () => {
     // which must not survive into the forked CLI child.
     process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
     try {
-      const env = redactChildEnv(process.env) as { [k: string]: string };
-      const script =
-        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
-        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
-      const out: string = await new Promise((resolve) => {
-        const p = pty.spawn('/bin/sh', ['-c', script], {
-          name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
-        });
-        let buf = '';
-        p.onData((d) => { buf += d; });
-        p.onExit(() => resolve(buf));
-      });
-      expect(out).toContain('R=UNSET');
-      expect(out).toContain('S=UNSET');
-      expect(out).not.toContain('undefined');
+      return await run(redactChildEnv(process.env) as { [k: string]: string });
     } finally {
       if (prev === undefined) delete process.env.LARK_APP_ID;
       else process.env.LARK_APP_ID = prev;
       if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
       else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
+  };
+
+  /** Both answers present — the only shape that proves the child actually ran. */
+  const expectNoLeak = (out: string) => {
+    expect(out).toContain('R=UNSET');
+    expect(out).toContain('S=UNSET');
+    expect(out).not.toContain('undefined');
+  };
+
+  it('real spawned child does NOT inherit a redacted var (not the string "undefined")', async () => {
+    // End-to-end guard for the actual leak vector: a spawned child must see the
+    // redacted var as genuinely UNSET. `${VAR+x}` expands to empty only when VAR
+    // is unset, distinguishing "unset" from "set to the string 'undefined'".
+    // Plain spawn, so this leg runs on Node AND Bun (measured 25/25 on both at
+    // one core).
+    const out = await withLeakyParentEnv((env) => new Promise<string>((resolve, reject) => {
+      const child = spawn('/bin/sh', ['-c', leakProbeScript(PM2_GRACEFUL_EXIT_CODE_ENV)], {
+        cwd: '/tmp', env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let buf = '';
+      child.stdout.on('data', (d) => { buf += String(d); });
+      child.on('error', reject);
+      // `close` (not `exit`) fires only after both stdio streams are drained, so
+      // the buffer is complete by definition — no grace period to tune.
+      child.on('close', () => resolve(buf));
+    }));
+    expectNoLeak(out);
+  });
+
+  it.skipIf(isBun)('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
+    // Same guard across the PTY transport, which marshals env into raw K=V pairs
+    // in native code rather than reusing libuv's spawn path — a distinct code
+    // path worth covering. Node-only for the reason documented above.
+    const pty = await import('node-pty');
+    const out = await withLeakyParentEnv((env) => new Promise<string>((resolve, reject) => {
+      const p = pty.spawn('/bin/sh', ['-c', leakProbeScript(PM2_GRACEFUL_EXIT_CODE_ENV)], {
+        name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env: env as { [k: string]: string },
+      });
+      let buf = '';
+      let settled = false;
+      // node-pty delivers onData and onExit on independent paths: the child can be
+      // reaped before the pty's pending output has been drained, so resolving
+      // straight from onExit can hand back an empty string. Settle on having BOTH
+      // answers, and let exit only START a short grace period rather than decide.
+      // If the grace period expires with the output still incomplete, REJECT with
+      // the raw buffer: a lost read must never be reported as a leak-shaped
+      // assertion failure ("Expected to contain R=UNSET / Received: ''").
+      const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
+      const finish = (settle: () => void) => { if (settled) return; settled = true; settle(); };
+      const fail = () => finish(() => reject(new Error(
+        'pty output incomplete — a lost read, not an env leak. '
+        + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+      )));
+      const guard = setTimeout(fail, 10_000);
+      guard.unref?.();
+      p.onData((d) => {
+        buf += d;
+        if (hasBothAnswers()) { clearTimeout(guard); finish(() => resolve(buf)); }
+      });
+      p.onExit(() => {
+        setTimeout(() => {
+          clearTimeout(guard);
+          if (hasBothAnswers()) finish(() => resolve(buf));
+          else fail();
+        }, 250);
+      });
+    }));
+    expectNoLeak(out);
   });
 });
 
@@ -246,35 +364,6 @@ describe('stripDashboardH5Env()', () => {
     const env: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_PORT: '7991' };
     stripDashboardH5Env(env);
     expect(env.BOTMUX_DASHBOARD_PORT).toBe('7991');
-  });
-
-  it('is called by index-daemon.ts after dotenv (source pin)', () => {
-    // The unit test above proves the function; this pins the boundary that
-    // makes it matter: the daemon strips the family it just dotenv-loaded
-    // BEFORE any daemon code (or the session-var scrubs below it) can run.
-    const src = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
-    const dotenvAt = src.indexOf('dotenvConfig(');
-    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
-    expect(dotenvAt).toBeGreaterThan(-1);
-    expect(stripAt).toBeGreaterThan(dotenvAt);
-  });
-
-  it('is also called by index-supervisor.ts after its own wholesale dotenv (source pin)', () => {
-    // index-supervisor.ts dotenv-loads the same ~/.botmux/.env wholesale as
-    // index-daemon.ts, and resolveFleetDaemonEnv() spreads this process's env
-    // into every supervised member — an unstripped secret would sit in this
-    // long-lived process and ride into every bot daemon and the dashboard.
-    const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
-    const dotenvAt = src.indexOf('dotenvConfig(');
-    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
-    expect(dotenvAt).toBeGreaterThan(-1);
-    expect(stripAt).toBeGreaterThan(dotenvAt);
-  });
-
-  it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
-    const src = readFileSync(new URL('../src/core/maintenance.ts', import.meta.url), 'utf-8');
-    const fn = src.slice(src.indexOf('export function detachedRestartEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('stripDashboardH5Env(');
   });
 });
 
@@ -445,6 +534,8 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       'BOTMUX_LARK_APP_ID',
       'BOTMUX_SESSION_SCOPE',
       'BOTMUX_SEND_RELAY',
+      // per-session shadowed user statusLine command (worker-computed from cwd)
+      'BOTMUX_STATUSLINE_CHAIN',
     ]) {
       expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
     }
@@ -514,125 +605,61 @@ describe('scrubSessionTurnMarkerEnv()', () => {
   });
 });
 
-describe('session CLI home scrub call sites', () => {
-  // The scrub only works if every process boundary actually invokes it. These
-  // source-level pins keep a refactor from silently dropping a boundary:
-  // the fleet supervisor boot (index-supervisor.ts — it spawns every daemon
-  // child from process.env, replacing the old pm2Env boundary), daemon boot
-  // (workers fork from it), worker boot (worker-side dynamic resolvers +
-  // childEnv seeding).
+describe('process-boundary env scrub call sites', () => {
+  // Each scrub/strip helper is behavior-tested above; these pins keep a refactor
+  // from silently dropping the boundary that makes it matter. The entry modules
+  // run their scrubs at import time (importing them boots the process), so the
+  // call sites can only be checked in the source.
   const read = (rel: string) =>
     readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
+  const callsOnProcessEnv = (src: string, fn: string) =>
+    new RegExp(`\\b${fn}\\(\\s*process\\.env\\s*\\)`).test(src);
 
-  it('index-supervisor.ts scrubs process.env before spawning any daemon (replaces pm2Env boundary)', () => {
-    // The supervisor forks each daemon inheriting its (scrubbed) process.env via
-    // resolveFleetDaemonEnv, so scrubbing at supervisor boot is the boundary that
-    // pm2Env used to be — a leaked marker here would ride into every daemon.
-    expect(read('index-supervisor.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('index-daemon.ts scrubs process.env at boot', () => {
-    expect(read('index-daemon.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('worker.ts scrubs process.env at boot', () => {
-    expect(read('worker.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('all three boundaries also scrub Claude session markers', () => {
-    // Same rationale, same boundaries: a marker that survives into the supervisor
-    // reaches the daemon → the tmux server it forks → every pane on the machine.
-    expect(read('index-supervisor.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-    expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-  });
-
-  it('injects the canonical session owner at every worker execution boundary', () => {
-    const worker = read('worker.ts');
-    expect(worker).toContain('applySessionOwnerEnv(process.env, msg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(childEnv, cfg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
-  });
-
-  it('supervisor, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
-    expect(read('index-supervisor.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
-    const dashboard = read('dashboard.ts');
-    const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
-    expect(scrubAt).toBeGreaterThan(-1);
-    // Must land before anything that can fork a host child — the onboarding
-    // manager is wired to the start/stop-bot spawns (dashboard/managed-spawn.ts).
-    expect(scrubAt).toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
-    expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
-  });
-
-  it('every CLI-child spawn boundary builds its env from redactChildEnv (source pin)', () => {
-    // The H5 secret leak was a missing KEY, not a missing call — but the deny
-    // list only protects boundaries that actually route through it. Pin the
-    // non-obvious ones: the daemon-side one-shot that titles a session group,
-    // and worker.ts's own child/engine envs.
-    const oneShot = read('services/session-group-title.ts');
-    const fn = oneShot.slice(oneShot.indexOf('export function buildOneShotEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('redactChildEnv(process.env)');
-    const worker = read('worker.ts');
-    expect(worker).toContain('const childEnv = redactChildEnv(process.env)');
-    // The zellij web-terminal viewer used the raw process.env (zellijEnv only
-    // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
-    // REDACTED_CHILD_ENV_KEYS.
-    expect(worker).toContain('zellijEnv(redactChildEnv(process.env))');
-  });
-
-  it('pm2 boundaries and daemon boot scrub invoker-terminal fingerprints and turn markers', () => {
-    // Same persistence vector as the scrubs above, fourth and fifth key
-    // families: agent-shell fingerprints (NO_COLOR/CODEX_CI/PAGER — colorless
-    // fleet TUIs) and turn-scoped session identity. The plugin pm2 client
-    // boundary (core/plugins/pm2.ts, which shares the God's PM2_HOME and routes
-    // through scrubPm2CallerEnv) must bake clean env; daemon boot additionally
-    // heals a fleet already poisoned by an earlier restart or a stale dump.pm2.
-    const pm2EnvSrc = read('cli/pm2-env.ts');
-    const fn = pm2EnvSrc.slice(pm2EnvSrc.indexOf('export function scrubPm2CallerEnv('));
-    const fnBody = fn.slice(0, fn.indexOf('\n}'));
-    expect(fnBody).toContain('scrubInvokerTerminalEnv(');
-    expect(fnBody).toContain('scrubSessionTurnMarkerEnv(');
-    // TERM is re-pinned (not left absent) inside the shared scrub so pm2
-    // CLIENT output on a real TTY keeps supports-color detection.
-    expect(fnBody).toContain("env.TERM = 'xterm-256color'");
-    const pluginPm2 = read('core/plugins/pm2.ts');
-    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
-    expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
-    // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked
-    // its snapshot, so without this the daemon (and every forked worker) runs
-    // TERM-less — the zmx backend's sessions inherit that env verbatim (no
-    // node-pty `name` to force TERM) and their CLIs render colorless.
-    expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
-  });
-
-  it('the fleet supervisor and dashboard entry also scrub invoker-terminal fingerprints and turn markers', () => {
-    // Same two key families as the daemon-boot pin above, at the two other
-    // long-lived boundaries: resolveFleetDaemonEnv() bakes the supervisor's
-    // own (post-scrub) process.env into every daemon child + the dashboard,
-    // and the dashboard entry forks debug terminals / start-stop-bot CLI runs
-    // straight from its own process.env. Both used to scrub only a hand-picked
-    // 7-key subset of session identity and never touched invoker-terminal
-    // fingerprints at all — the gap this test closes.
-    for (const rel of ['index-supervisor.ts', 'index-dashboard.ts']) {
+  // 源码结构护栏(K2)：入口模块在 import 时即执行 boot 清洗，没有可调用的 seam；守的是长寿进程不把
+  // 凭证/会话身份带进它 fork 的整个 fleet —— Dashboard H5 APP_SECRET 与 companion 凭证、兄弟 bot 的
+  // CLAUDE_CONFIG_DIR/CODEX_HOME（385d189d6c）、owner/turn 标记（#877、#1207）、workflow 身份（#809）、
+  // Claude 会话标记（b7a123c19e：实机事故，fleet 转写静默停写、--resume 全部失效）。
+  it('every long-lived entry scrubs inherited credentials and session identity at boot', () => {
+    const required: Record<string, string[]> = {
+      'index-supervisor.ts': ['stripDashboardH5Env', 'scrubSessionTurnMarkerEnv', 'scrubSessionCliHomeEnv',
+        'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
+      'index-daemon.ts': ['stripDashboardH5Env', 'stripCompanionStartupEnv', 'scrubSessionTurnMarkerEnv',
+        'scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
+      'index-dashboard.ts': ['scrubSessionTurnMarkerEnv'],
+      'dashboard.ts': ['scrubWorkflowWorkerEnv'],
+      'worker.ts': ['scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv'],
+      'index-plugin-supervisor.ts': ['scrubExternalMemberEnv'],
+    };
+    for (const [rel, fns] of Object.entries(required)) {
       const src = read(rel);
-      expect(src, rel).toContain('scrubInvokerTerminalEnv(process.env)');
-      expect(src, rel).toContain('scrubSessionTurnMarkerEnv(process.env)');
-      expect(src, rel).toContain("process.env.TERM = 'xterm-256color'");
+      for (const fn of fns) expect(callsOnProcessEnv(src, fn), `${rel}: ${fn}(process.env)`).toBe(true);
     }
+    // The daemon strips the H5 family only AFTER dotenv loaded it; the supervisor
+    // never wholesale-loads ~/.botmux/.env into the long-lived parent of every bot.
+    const daemon = read('index-daemon.ts');
+    expect(daemon.indexOf('dotenvConfig(')).toBeGreaterThan(-1);
+    expect(daemon.search(/stripDashboardH5Env\(\s*process\.env/)).toBeGreaterThan(daemon.indexOf('dotenvConfig('));
+    expect(read('index-supervisor.ts')).not.toContain('dotenvConfig(');
+    // The dashboard scrubs before it can fork start/stop-bot children.
+    const dashboard = read('dashboard.ts');
+    expect(dashboard.search(/scrubWorkflowWorkerEnv\(\s*process\.env/))
+      .toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
+    // A real workflow worker receives its identity explicitly; worker boot must keep it.
+    expect(callsOnProcessEnv(read('worker.ts'), 'scrubWorkflowWorkerEnv')).toBe(false);
+    // The external-member launcher scrubs the env it hands the plugin supervisor.
+    expect(read('core/plugins/supervisor-client.ts')).toMatch(/\bscrubExternalMemberEnv\(/);
   });
 
-  it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
-    // WORKER_REDACTED_ENV_KEYS is a private const in worker-pool.ts (worker fork
-    // boundary, not importable without side effects), so pin at the source that
-    // the sentinel is in the strip list. redactChildEnv covers the CLI child;
-    // this covers the worker process itself so it also never exits 90.
-    const src = read('core/worker-pool.ts');
-    const decl = src.slice(src.indexOf('const WORKER_REDACTED_ENV_KEYS'));
-    expect(decl.slice(0, decl.indexOf('\n'))).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  // 源码结构护栏(K2)：worker 的 CLI child / engine / runner env 都在 worker.ts 巨型闭包里拼装，没有
+  // 行为 seam；守的是凭证脱敏（H5 secret 曾经漏进 CLI child 与 zellij 终端 viewer）和 CLAUDE.md
+  // 「飞书 owner 身份边界」要求的 applySessionOwnerEnv 在每个执行边界注入并冻结。
+  it('worker routes child envs through the shared redaction builder and freezes the session owner', () => {
+    const worker = read('worker.ts');
+    expect(worker).toMatch(/\bchildEnv\s*=\s*buildSessionChildEnv\(\s*process\.env\b/);
+    expect(worker).toMatch(/\bzellijEnv\(\s*redactChildEnv\(\s*process\.env\s*\)/);
+    for (const target of ['process\\.env', 'childEnv', 'engineEnv', 'mergedEnv']) {
+      expect(worker, target).toMatch(new RegExp(`\\bapplySessionOwnerEnv\\(\\s*${target}\\s*,`));
+    }
   });
 });
 
@@ -653,84 +680,31 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
-  });
-});
-
-/**
- * pm2 invocation boundary — the plugin pm2 client (core/plugins/pm2.ts →
- * cli/pm2-env.ts). (Core fleet supervision no longer uses pm2 after the
- * pm2→supervisor migration; plugin services remain pm2-managed and share the
- * God's PM2_HOME.)
- *
- * pm2 copies the CALLER's environment into every managed app and into
- * dump.pm2, which `pm2 resurrect` replays after a reboot — so whatever survives
- * this scrub is handed to the whole fleet AND written to disk under
- * ~/.botmux/pm2, readable via `pm2 describe`/`jlist` for as long as that dump
- * lives. `botmux restart` is routinely issued from the dashboard process
- * (update/restart button), which legitimately holds the Feishu H5 login family.
- */
-describe('pm2CallerEnv()', () => {
-  it('never carries the Dashboard H5 login family into pm2 metadata/dump', () => {
-    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
-    const base: NodeJS.ProcessEnv = {
-      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'h5-secret'])),
-      [future]: 'h5-secret',
-      PATH: '/usr/bin',
-    };
-
-    const env = pm2CallerEnv(base, '/tmp/pm2-home');
-
-    for (const key of [...DASHBOARD_H5_ENV_KEYS, future]) {
-      expect(key in env, key).toBe(false);
-    }
-    expect(Object.values(env)).not.toContain('h5-secret');
-    expect(env.PATH).toBe('/usr/bin');
-    expect(env.PM2_HOME).toBe('/tmp/pm2-home');
+    // `botmux statusline` runs inside the pane and needs the worker-computed chain
+    // command; without transport it would silently drop the user's own statusLine.
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
   });
 
-  it('keeps stripping session CLI homes, Claude markers and workflow identity', () => {
-    const base: NodeJS.ProcessEnv = {
-      CLAUDE_CONFIG_DIR: '/home/bot-a/.botmux/claude',
-      CODEX_HOME: '/home/bot-a/.botmux/codex',
-      CLAUDECODE: '1',
-      CLAUDE_CODE_CHILD_SESSION: '1',
-      BOTMUX_WORKFLOW: '1',
-      BOTMUX_WORKFLOW_RUN_ID: 'run_1',
-      BOTMUX_DASHBOARD_PORT: '7891',
-    };
-
-    const env = pm2CallerEnv(base, '/tmp/pm2-home');
-
-    for (const key of [...SESSION_CLI_HOME_ENV_KEYS, ...CLAUDE_SESSION_MARKER_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS]) {
-      expect(key in env, key).toBe(false);
-    }
-    // Non-secret operator settings still ride through — they are the point of
-    // the baked env block.
-    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7891');
-  });
-
-  it('does not mutate the caller env', () => {
-    const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
-    pm2CallerEnv(base, '/tmp/pm2-home');
-    expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
+  it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {
+    // BOTMUX_INJECTED_ENV_KEYS also drives the pane `unset` clause and
+    // scrubTmuxServerGlobalEnv(), so a standard, user-ownable variable listed
+    // there would delete the CA bundle a user configured for their own tmux
+    // server — for every CLI, on every platform. Same reason PROXY_ENV_KEYS is
+    // kept out. Per-pane forwarding happens in buildBotmuxEnvAssignments.
+    expect(BOTMUX_INJECTED_ENV_KEYS).not.toContain('SSL_CERT_FILE');
+    expect(CA_BUNDLE_ENV_KEYS).toContain('SSL_CERT_FILE');
+    expect(PROXY_ENV_KEYS as readonly string[]).not.toContain('SSL_CERT_FILE');
   });
 });
 
 describe('scrubExternalMemberEnv (external fleet members)', () => {
-  // Parity with the pm2 path is the whole contract: this replaces the plugin pm2
-  // boundary, and a migration must not quietly reduce protection. Asserting the
-  // RESULT against that boundary's real composition (rather than re-listing keys
-  // here) means the two cannot drift.
-  //
-  // The reference MUST be the whole old boundary, not scrubPm2CallerEnv alone:
-  // pm2Env() ran stripPm2GracefulExitMarker FIRST and then scrubbed. Comparing
-  // against the scrub in isolation is what let the graceful-exit sentinel leak
-  // into external members unnoticed — the fixture carries it now so this spec
-  // fails if that strip is ever dropped again.
-  it('strips exactly what the whole pm2 plugin boundary stripped', async () => {
-    const { scrubPm2CallerEnv } = await import('../src/cli/pm2-env.js');
-    const { stripPm2GracefulExitMarker } = await import('../src/pm2-graceful-exit.js');
-    const poisoned = (): NodeJS.ProcessEnv => ({
+  // The fixture carries every key family the old pm2 plugin boundary stripped
+  // (pm2Env(): stripPm2GracefulExitMarker(...) then scrubPm2CallerEnv(...)), so
+  // this spec fails if any of those strips is ever dropped — including the
+  // graceful-exit sentinel, which once leaked into external members unnoticed.
+  it('strips every key family the old pm2 plugin boundary stripped', () => {
+    const env: NodeJS.ProcessEnv = {
       CODEX_HOME: '/bot/a/codex',
       CLAUDE_CONFIG_DIR: '/bot/a/claude',
       CLAUDECODE: '1',
@@ -748,13 +722,32 @@ describe('scrubExternalMemberEnv (external fleet members)', () => {
       PATH: '/usr/bin',
       HOME: '/root',
       UNRELATED: 'keep',
+    };
+    scrubExternalMemberEnv(env);
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      HOME: '/root',
+      UNRELATED: 'keep',
+      TERM: 'xterm-256color',
     });
-    const viaExternal = poisoned();
-    // pm2Env(): stripPm2GracefulExitMarker(...) then scrubPm2CallerEnv(...).
-    const viaPm2 = stripPm2GracefulExitMarker(poisoned());
-    scrubExternalMemberEnv(viaExternal);
-    scrubPm2CallerEnv(viaPm2);
-    expect(viaExternal).toEqual(viaPm2);
+  });
+
+  it('never carries the Dashboard H5 login family (incl. future prefixed knobs) into external members', () => {
+    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'h5-secret'])),
+      [future]: 'h5-secret',
+      PATH: '/usr/bin',
+      BOTMUX_DASHBOARD_PORT: '7891',
+    };
+    scrubExternalMemberEnv(env);
+    for (const key of [...DASHBOARD_H5_ENV_KEYS, future]) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(Object.values(env)).not.toContain('h5-secret');
+    // Non-secret operator settings still ride through.
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7891');
   });
 
   it('strips the graceful-exit sentinel (drift guard on the key name)', () => {

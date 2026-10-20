@@ -93,6 +93,32 @@ describe('grant-store', () => {
     expect(bot.resolvedAllowedUsers).toEqual(['ou_owner']);
   });
 
+  it('revokeGrant prunes only the revoked allowed key, never blockedUsers keys in shared sidecar (P1c)', async () => {
+    writeConfig({ allowedUsers: ['owner@x.com', 'guest@x.com'], blockedUsers: ['banned@x.com'] });
+    const { registry, store } = await freshModules();
+    const bot = registry.getBot('a1');
+    bot.resolvedAllowedUsers = ['ou_owner', 'ou_guest'];
+    bot.rawAllowedUserResolution = new Map([['owner@x.com', 'ou_owner'], ['guest@x.com', 'ou_guest']]);
+    bot.resolvedBlockedUsers = ['ou_banned'];
+    // Seed the shared sidecar with BOTH legs' raw→ou_ cache (as a healthy prior
+    // resolve would leave it).
+    const dataDir = process.env.SESSION_DATA_DIR!;
+    const { writeAllowedUsersResolveCache, readAllowedUsersResolveCache } = await import('../src/utils/allowed-users-cache.js');
+    writeAllowedUsersResolveCache(dataDir, 'a1', {
+      map: { 'owner@x.com': 'ou_owner', 'guest@x.com': 'ou_guest', 'banned@x.com': 'ou_banned' },
+    });
+
+    const r = await store.revokeGrant('a1', 'oc_1', 'ou_guest');
+    expect(r.ok).toBe(true);
+
+    const cacheAfter = readAllowedUsersResolveCache(dataDir, 'a1');
+    // revoked allowed key is pruned …
+    expect(cacheAfter['guest@x.com']).toBeUndefined();
+    // … but the blockedUsers key (shared sidecar) must survive the /revoke write.
+    expect(cacheAfter['banned@x.com']).toBe('ou_banned');
+    expect(cacheAfter['owner@x.com']).toBe('ou_owner');
+  });
+
   it('addGlobalGrant persists & syncs in-memory; idempotent; never touches allowedUsers', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();
@@ -152,6 +178,71 @@ describe('grant-store', () => {
 });
 
 describe('grant-store message quota', () => {
+  it('charges a dispatch launch receipt exactly once across repeated calls', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 3, used: 0 } },
+    });
+    const { registry, store } = await freshModules();
+    const input = {
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'1'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    };
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: true });
+    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 3, used: 1 });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'1'.repeat(32)}`]).toMatchObject({ allow: true });
+    expect(registry.getBot('a1').config.quotaState?.[quotaKey]).toEqual({ limit: 3, used: 1 });
+  });
+
+  it('persists a denied dispatch receipt without changing exhausted quota', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g'] },
+      quotaState: { [quotaKey]: { limit: 2, used: 2 } },
+    });
+    const { store } = await freshModules();
+    const input = {
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'2'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    };
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
+    expect(await store.consumeDispatchLaunchQuotaOnce(input)).toEqual({ allow: false });
+    expect(readConfig().quotaState[quotaKey]).toEqual({ limit: 2, used: 2 });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'2'.repeat(32)}`]).toMatchObject({ allow: false });
+  });
+
+  it('fails closed when the frozen dispatch quota key no longer has its grant', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { store } = await freshModules();
+    expect(await store.consumeDispatchLaunchQuotaOnce({
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'4'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    })).toEqual({ allow: false });
+    expect(readConfig().dispatchLaunchQuotaReceipts[`quota_${'4'.repeat(32)}`]).toMatchObject({ allow: false });
+    expect(readConfig().quotaState).toBeUndefined();
+  });
+
+  it('atomically exhausts finite dispatch quota and revokes the matching chat grant', async () => {
+    const quotaKey = 'chat:oc_1:ou_g';
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { oc_1: ['ou_g', 'ou_other'] },
+      quotaState: { [quotaKey]: { limit: 1, used: 0 } },
+      grantExpiryState: { [quotaKey]: { expiresAt: Date.now() + 60_000 } },
+    });
+    const { registry, store } = await freshModules();
+    expect(await store.consumeDispatchLaunchQuotaOnce({
+      larkAppId: 'a1', quotaKey, receiptId: `quota_${'3'.repeat(32)}`, sourceOpenId: 'ou_g', grantChatId: 'oc_1',
+    })).toEqual({ allow: true });
+    expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_other'] });
+    expect(readConfig().quotaState).toBeUndefined();
+    expect(readConfig().grantExpiryState).toBeUndefined();
+    expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_other'] });
+    expect(registry.getBot('a1').config.dispatchLaunchQuotaReceipts?.[`quota_${'3'.repeat(32)}`]).toMatchObject({ allow: true });
+  });
+
   it('persists expiry and re-granting as permanent clears only the expiry record', async () => {
     writeConfig({ allowedUsers: ['ou_owner'] });
     const { registry, store } = await freshModules();

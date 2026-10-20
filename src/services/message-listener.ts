@@ -1,7 +1,8 @@
 import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
-import { extractCardContent, unwrapUserDslContent } from '../im/lark/message-parser.js';
+import { extractCardContent, extractPostListenerText, unwrapUserDslContent } from '../im/lark/message-parser.js';
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { resolveListenerDocumentTitles } from './message-listener-document-titles.js';
 
 export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 
@@ -12,6 +13,7 @@ export interface MessageListenerMatch {
   replyCardTitle?: string;
   prompt: string;
   workingDir?: string;
+  replyMode: 'thread' | 'chat';
   messageText: string;
   messageTitle?: string;
   msgType: string;
@@ -93,7 +95,7 @@ export function extractListenerMessageText(message: any): string {
   const content = listenerMessageContent(message);
   if (!content) return '';
   const msgType = messageTypeOf(message);
-  if (msgType === 'interactive') return extractCardContent(content);
+  if (msgType === 'interactive') return extractCardContent(content, undefined, message?.mentions ?? []);
   if (msgType === 'image') {
     try {
       const obj = JSON.parse(content);
@@ -106,17 +108,7 @@ export function extractListenerMessageText(message: any): string {
   try {
     const obj = JSON.parse(content);
     if (typeof obj?.text === 'string') return obj.text.trim();
-    const inner = obj?.zh_cn ?? obj?.en_us ?? obj;
-    if (Array.isArray(inner?.content)) {
-      const parts: string[] = [];
-      for (const para of inner.content) {
-        if (!Array.isArray(para)) continue;
-        for (const node of para) {
-          if (node?.tag === 'text' && typeof node.text === 'string') parts.push(node.text);
-        }
-      }
-      return parts.join('').trim();
-    }
+    if (msgType === 'post') return extractPostListenerText(obj);
   } catch {
     return '';
   }
@@ -252,10 +244,22 @@ export function matchesContentPolicy(text: string, policy: MessageListenerConten
 }
 
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
-  const listener = bot.config.messageListeners?.[chatId];
+  const listener = resolveEffectiveMessageListener(bot, chatId);
   if (!listener?.enabled) return undefined;
   if (!listener.prompt?.trim()) return undefined;
   return listener;
+}
+
+/** Resolve the one listener policy that applies to a bot in a chat.
+ * Absence deliberately means inherit, so newly joined chats adopt the global
+ * policy without requiring a persisted record. */
+export function resolveEffectiveMessageListener(bot: BotState, chatId: string): MessageListenerConfig | undefined {
+  const override = bot.config.groupMessageListenerOverrides?.[chatId];
+  if (override?.mode === 'disabled') return undefined;
+  if (override?.mode === 'custom') return override.listener;
+  // Keep this fallback for unit callers and rolling deployments that still
+  // construct the legacy shape before bot-registry has normalized it.
+  return bot.config.globalMessageListener ?? bot.config.messageListeners?.[chatId];
 }
 
 export function evaluateMessageListener(input: {
@@ -274,6 +278,7 @@ export function evaluateMessageListener(input: {
    */
   senderIdentityUnverified?: boolean;
   explicitlyMentionedThisBot: boolean;
+  messageTextOverride?: string;
 }): MessageListenerMatch | undefined {
   if (input.explicitlyMentionedThisBot) return undefined;
   const messageId = String(input.message?.message_id ?? '');
@@ -305,7 +310,7 @@ export function evaluateMessageListener(input: {
   const msgType = messageTypeOf(input.message);
   if (!msgTypeAllowed(listener, msgType)) return undefined;
 
-  const messageText = extractListenerMessageText(input.message);
+  const messageText = input.messageTextOverride ?? extractListenerMessageText(input.message);
   if (!messageText && (msgType === 'text' || msgType === 'post')) return undefined;
   const messageTitle = extractListenerMessageTitle(input.message);
 
@@ -319,6 +324,7 @@ export function evaluateMessageListener(input: {
     replyCardTitle: listener.replyCardTitle,
     prompt: listener.prompt,
     workingDir: listener.workingDir,
+    replyMode: listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread',
     messageText,
     messageTitle,
     msgType,
@@ -326,6 +332,46 @@ export function evaluateMessageListener(input: {
     senderName: input.senderName,
     senderType,
   };
+}
+
+export async function evaluateMessageListenerWithDocumentTitles(
+  input: Parameters<typeof evaluateMessageListener>[0],
+  deps: { resolveDocumentTitles?: (larkAppId: string, text: string) => Promise<string[]> } = {},
+): Promise<MessageListenerMatch | undefined> {
+  const listener = findMessageListenerForChat(input.bot, input.chatId);
+  const policy = listener?.contentPolicy;
+  const localText = input.messageTextOverride ?? extractListenerMessageText(input.message);
+  if (policy?.resolveDocumentTitles !== true || !policy.includeKeywords?.some(keyword => keyword.trim()) || matchesContentPolicy(localText, policy)) {
+    return evaluateMessageListener(input);
+  }
+  const msgType = messageTypeOf(input.message);
+  if (msgType !== 'text' && msgType !== 'post') return evaluateMessageListener(input);
+  const candidateBot: BotState = {
+    ...input.bot,
+    config: {
+      ...input.bot.config,
+      groupMessageListenerOverrides: {
+        ...(input.bot.config.groupMessageListenerOverrides ?? {}),
+        [input.chatId]: { mode: 'custom', listener: { ...listener!, contentPolicy: undefined } },
+      },
+    },
+  };
+  if (!evaluateMessageListener({ ...input, bot: candidateBot, messageTextOverride: localText })) return undefined;
+  let titles: string[];
+  try {
+    titles = await (deps.resolveDocumentTitles ?? resolveListenerDocumentTitles)(input.bot.config.larkAppId, localText);
+  } catch {
+    // The production resolver already degrades per-link, but retain this
+    // boundary so an adapter failure cannot escape the daemon event path.
+    return evaluateMessageListener(input);
+  }
+  // Prefixes help the Agent explain why it woke, but they are not source text
+  // and must never themselves satisfy a user keyword such as “文档” or “标题”.
+  const matchingText = [...new Set([localText, ...titles])].filter(Boolean).join('\n');
+  const match = evaluateMessageListener({ ...input, messageTextOverride: matchingText });
+  if (!match) return undefined;
+  match.messageText = [...new Set([localText, ...titles.map(title => `文档标题：${title}`)])].filter(Boolean).join('\n');
+  return match;
 }
 
 /** Raw sender fields as parsed from a message (realtime event or REST history). */

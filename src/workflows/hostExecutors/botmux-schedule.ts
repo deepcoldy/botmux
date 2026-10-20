@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { computeNextRun, parseSchedule } from '../../core/scheduler.js';
+import { computeNextRun, normalizeTopicTitle, parseSchedule } from '../../core/scheduler.js';
 import {
   canonicalScheduleInput,
   createTask,
@@ -27,8 +27,15 @@ export type ScheduleInput = {
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
+  /** First-message template for non-silent new-topic/task runs. Supports
+   * `{{date}}`, signed day offsets, and `{{owner}}`. */
   topicTitle?: string;
   larkAppId?: string;
+  /** Run initiator's open_id, only materializable as the exact
+   *  `{ "$ref": "context.initiatorOpenId" }` binding (template-bindings
+   *  policy). Stamped onto the task so scheduled turns authenticate as the
+   *  workflow initiator; omitted for ownerless templates. */
+  ownerOpenId?: string;
   /** `repeat.completed` is intentionally absent — it's a runtime counter
    *  and must not be part of canonical input.  See schedule-store
    *  canonicalScheduleInput. */
@@ -37,6 +44,9 @@ export type ScheduleInput = {
   /** Silent fires: no "task started" banner; the spawned turn suppresses
    *  daemon-initiated group output and the model decides whether to send. */
   silent?: boolean;
+  /** `--follow-active`: re-resolve the landing topic at every fire (see
+   *  ScheduledTask.followActive). Requires executionPosition 'topic'. */
+  followActive?: boolean;
 };
 
 export type ScheduleOutput = {
@@ -63,12 +73,14 @@ const ScheduleInputSchema = z.object({
   chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
-  executionPosition: z.enum(['top-level', 'topic', 'new-topic']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic', 'task']).optional(),
   topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
+  ownerOpenId: z.string().optional(),
   repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
   deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
   silent: z.boolean().optional(),
+  followActive: z.boolean().optional(),
 });
 
 export function parseScheduleInput(input: unknown): ScheduleInput {
@@ -142,6 +154,34 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         message: 'topic execution requires rootMessageId',
       };
     }
+    if (input.executionPosition === 'task' && input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+        message: 'task execution runs in its own session and must not carry rootMessageId',
+      };
+    }
+    if (input.followActive === true && input.executionPosition !== 'topic') {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_FOLLOW_ACTIVE_REQUIRES_TOPIC',
+        message: 'followActive requires executionPosition topic',
+      };
+    }
+    try {
+      normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (input.parsed.kind !== 'once') return { ok: true };
     const runAtMs = input.parsed.runAt ? Date.parse(input.parsed.runAt) : Number.NaN;
     // Keep exactly the scheduler's two-minute one-shot catch-up window. Once
@@ -170,11 +210,18 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       rootMessageId: input.rootMessageId,
       scope: input.scope,
       executionPosition: input.executionPosition,
-      topicTitle: input.topicTitle?.trim() || undefined,
+      topicTitle: normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      }),
       larkAppId: input.larkAppId,
+      ownerOpenId: input.ownerOpenId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
       silent: input.silent,
+      followActive: input.followActive === true ? true : undefined,
     });
     return {
       output: { taskId: task.id },

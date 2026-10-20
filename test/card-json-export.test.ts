@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   parseApiMessage,
   createImgNumberer,
+  extractResources,
   resolveMergedCardContent,
 } from '../src/im/lark/message-parser.js';
 import { renderQuotedMessage } from '../src/cli/quoted-render.js';
@@ -201,6 +202,33 @@ describe('resolveMergedCardContent: returns resources aligned with [图片 N]', 
     expect(merged!.resources).toEqual([{ type: 'image', key: 'img_curve', name: 'img_curve.jpg' }]);
     // Resources were numbered BEFORE text extraction → placeholder is [图片 1].
     expect(merged!.text).toContain('[图片 1: 同比曲线]');
+  });
+
+  it('surfaces Markdown image tokens as resources while ignoring code examples', async () => {
+    const markdownCard = JSON.stringify({
+      config: {},
+      elements: [{
+        tag: 'markdown',
+        content: [
+          '测试图片：',
+          '![E2E attachment](img_v3_real_key)',
+          '`![inline example](img_v3_inline_fake)`',
+          '```md',
+          '![fenced example](img_v3_fenced_fake)',
+          '```',
+        ].join('\n'),
+      }],
+    });
+    vi.mocked(getMessageDetail).mockImplementation(async () => ({
+      items: [{ body: { content: markdownCard } }],
+    }));
+
+    const merged = await resolveMergedCardContent('app', 'om_card');
+    expect(merged).not.toBeNull();
+    expect(merged!.resources).toEqual([
+      { type: 'image', key: 'img_v3_real_key', name: 'img_v3_real_key.jpg' },
+    ]);
+    expect(extractResources('interactive', markdownCard)).toEqual(merged!.resources);
   });
 
   it('returns null when both representations fail', async () => {

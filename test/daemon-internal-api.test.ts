@@ -175,6 +175,19 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(ids).not.toContain('sB');
   });
 
+  it('sessions-list ?fresh=1 reads the authenticated caller daemon instead of the aggregator cache', async () => {
+    const proxyToDaemon = vi.fn(async () => makeUpstream(200, {
+      sessions: [{ ...cliA, status: 'working' }, cliB],
+    }));
+    const api = createDaemonInternalApi(makeDeps({
+      getSessions: () => [{ ...cliA, status: 'idle' }],
+      proxyToDaemon,
+    }));
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list?fresh=1'), '', 'cli_a');
+    expect(r).toEqual({ status: 200, body: { sessions: [{ ...cliA, status: 'working' }] } });
+    expect(proxyToDaemon).toHaveBeenCalledWith('cli_a', '/api/sessions', { method: 'GET' });
+  });
+
   it('sessions-list with callerAppId=cli_a AND ?scope=global → ALL rows cross-bot', async () => {
     const api = createDaemonInternalApi(mixedDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/sessions-list?scope=global'), '', 'cli_a');
@@ -253,6 +266,108 @@ describe('per-bot read scoping: callerAppId filters aggregator rows', () => {
     expect(sessIds).toEqual(['sA', 'sB', 'sLegacy']);
     const schedIds = (body.schedules as Array<{ id: string }>).map(s => s.id).sort();
     expect(schedIds).toEqual(['schA', 'schB', 'schLegacy']);
+  });
+});
+
+describe('bot-facing schedule reads strip all precondition material', () => {
+  const sensitiveFields = [
+    'preconditionSource',
+    'preconditionScript',
+    'preconditionFilePath',
+    'preconditionFile',
+    'preconditionPath',
+    'preconditionDefinition',
+    'preconditionRef',
+    'preconditionHash',
+    'precondition',
+  ] as const;
+
+  function schedule(id: string, larkAppId?: string): Record<string, unknown> {
+    return {
+      id,
+      ...(larkAppId ? { larkAppId } : {}),
+      prompt: `prompt-${id}`,
+      workingDir: `/repos/${id}`,
+      hasPrecondition: true,
+      preconditionEnabled: true,
+      preconditionSource: 'inline',
+      preconditionScript: `echo ${id}`,
+      preconditionFilePath: `/private/${id}.sh`,
+      preconditionFile: `/legacy/${id}.sh`,
+      preconditionPath: `/legacy-path/${id}.sh`,
+      preconditionDefinition: { source: { kind: 'inline', script: `echo ${id}` } },
+      preconditionRef: `ref-${id}`,
+      preconditionHash: `hash-${id}`,
+      precondition: { script: `echo ${id}` },
+    };
+  }
+
+  function assertSafeSchedules(
+    rows: unknown[],
+    expectedIds: string[],
+  ): void {
+    expect(rows.map(row => (row as { id: string }).id).sort()).toEqual(expectedIds.slice().sort());
+    for (const row of rows as Array<Record<string, unknown>>) {
+      for (const field of sensitiveFields) expect(row).not.toHaveProperty(field);
+      expect(row.prompt).toBe(`prompt-${row.id}`);
+      expect(row.workingDir).toBe(`/repos/${row.id}`);
+      expect(row.hasPrecondition).toBe(true);
+      expect(row.preconditionEnabled).toBe(true);
+    }
+  }
+
+  function sensitiveDeps(): {
+    deps: DaemonInternalApiDeps;
+    source: Array<Record<string, unknown>>;
+    before: Array<Record<string, unknown>>;
+  } {
+    const source = [schedule('schA', 'cli_a'), schedule('schB', 'cli_b'), schedule('legacy')];
+    const before = structuredClone(source);
+    return {
+      deps: makeDeps({ getSchedules: () => source }),
+      source,
+      before,
+    };
+  }
+
+  it('schedules-list strips material after per-bot scoping without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list'), '', 'cli_a');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('schedules-list strips material from every global row without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/schedules-list?scope=global'), '', 'cli_a');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'schB', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('overview-snapshot strips material after per-bot scoping without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot'), '', 'cli_b');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schB', 'legacy']);
+    expect(source).toEqual(before);
+  });
+
+  it('overview-snapshot strips material from every global row without mutating aggregator rows', async () => {
+    const { deps, source, before } = sensitiveDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest('GET', url('/__daemon/overview-snapshot?scope=global'), '', 'cli_b');
+
+    expect(r.status).toBe(200);
+    assertSafeSchedules((r.body as { schedules: unknown[] }).schedules, ['schA', 'schB', 'legacy']);
+    expect(source).toEqual(before);
   });
 });
 

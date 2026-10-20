@@ -1,6 +1,7 @@
 import type React from 'react';
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -15,24 +16,26 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type CSSProperties,
-  type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../../utils/daemon-version-display.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
   parseIdleCleanupHours,
-  selectIdleCleanupCandidates,
+  selectCleanupCandidates,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { ModalDialog } from './modal-dialog.js';
+import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
-  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredCreateKeepOpen,
@@ -68,6 +71,7 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
   sessionLocationTitle,
@@ -113,12 +117,13 @@ import {
 import type { SessionKanbanColumn } from './kanban-model.js';
 import {
   SessionsKanbanView,
+  type SessionsKanbanIcons,
   type SessionsKanbanMove,
   type SessionsKanbanTeam,
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
-import { confirm, promptText } from './confirm-modal.js';
+import { confirm } from './confirm-modal.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
@@ -151,7 +156,7 @@ type HistoryState = {
   messages: any[];
   ownerOpenId?: string;
   error?: string;
-  stale?: boolean;
+  staleHint?: { running: string; disk: string };
 };
 
 type TerminalState = {
@@ -191,19 +196,17 @@ function imageFileDataUrl(file: File): Promise<string> {
   });
 }
 
+type IdleCleanupCounts = { idle: number; dormant: number };
+
 type IdleCleanupBarProps = {
   busy: boolean;
   hours: IdleCleanupHours;
   status: string;
-  countForHours: (hours: IdleCleanupHours) => number;
+  countForHours: (hours: IdleCleanupHours) => IdleCleanupCounts;
   onRun: (hours: IdleCleanupHours) => Promise<void>;
 };
 
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
-
-function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
-  return hours === 168 ? '7d' : `${hours}H`;
-}
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
   value: String(hours) as IdleCleanupHoursValue,
@@ -513,28 +516,14 @@ function insightDur(ms?: number): string {
   return `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s`;
 }
 
-function useDialogVisibility(ref: React.RefObject<HTMLDialogElement | null>, open: boolean): void {
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* already opening/unsupported */ }
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [open, ref]);
-}
-
 function CopyButton(props: { value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
       data-copy={props.value}
-      onClick={() => {
-        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+      onClick={(event) => {
+        void copyText(props.value, t('sessions.copy'), event.currentTarget).then(didCopy => {
           if (!didCopy) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 800);
@@ -673,8 +662,13 @@ export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: s
 }
 
 /** 排序下拉：表格列排序之外的统一入口（看板/状态板/话题视图没有表头可点）。
- *  只写既有 sortKey/sortDir，不引入新数据流。 */
-function SortMenu(props: {
+ *  只写既有 sortKey/sortDir，不引入新数据流。
+ *
+ *  刻意不并入 dashboard-components 的 SortMenu/DropdownMenu：那是「选值」语义
+ *  （再选当前值是 no-op、选后收起、自带外点/Esc 关闭与上下翻转定位），而这里
+ *  是「点同一项 = 翻转升降序」，选中项还要带 ↑/↓ 后缀，菜单项走 menu/menuitem
+ *  role，且选后保持展开。强行并入要给共享版加 4 个互斥开关，且会改变现有行为。 */
+function SessionsSortMenu(props: {
   sortKey: string;
   sortDir: 'asc' | 'desc';
   onSort: (key: string) => void;
@@ -721,8 +715,6 @@ function SessionsFilterDrawer(props: {
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
   onClose: () => void;
 }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, props.open);
   const [cliQuery, setCliQuery] = useState('');
   const statusOptions = [
     { value: '', label: t('sessions.anyStatus') },
@@ -756,11 +748,10 @@ function SessionsFilterDrawer(props: {
     }));
   };
   return (
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={props.open}
       className="sessions-filter-drawer"
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       <header>
         <h3>{t('sessions.filters.title')}</h3>
@@ -913,7 +904,7 @@ function SessionsFilterDrawer(props: {
           {t('sessions.filters.done')}
         </button>
       </footer>
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -981,7 +972,7 @@ function SessionsFilters(props: {
         {t('sessions.filters.title')}
         {activeFilterCount > 0 ? <span className="sessions-filter-count">{activeFilterCount}</span> : null}
       </button>
-      <SortMenu sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
+      <SessionsSortMenu sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
       <IdleCleanupBar {...props.idleCleanup} />
       <SessionsFilterDrawer
         open={drawerOpen}
@@ -1035,7 +1026,8 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const count = props.countForHours(draftHours);
+  const counts = props.countForHours(draftHours);
+  const count = counts.idle + counts.dormant;
 
   useEffect(() => {
     if (open) setDraftHours(props.hours);
@@ -1129,9 +1121,14 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
             <span className="idle-cleanup-pop-title">{t('sessions.idleCleanupRun')}</span>
             <span id="idle-cleanup-count" className="idle-cleanup-count">
               <span className="idle-cleanup-dot" aria-hidden="true" />
-              {t('sessions.idleCleanupCount', { count })}
+              {t('cleanupDormant.countIdle', { count: counts.idle })}
+              {' · '}
+              {t('cleanupDormant.countDormant', { count: counts.dormant })}
             </span>
           </div>
+          <p style={{ margin: 0, color: 'var(--muted)', fontSize: 12, lineHeight: 1.5 }}>
+            {t('cleanupDormant.semanticsHint')}
+          </p>
           <div className="idle-cleanup-pop-field">
             <span className="idle-cleanup-label">{t('sessions.idleCleanupOlderThan')}</span>
             <div
@@ -1182,7 +1179,12 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   );
 }
 
-function SessionsTable(props: {
+// 列表三视图（表格 / 状态板 / 话题）统一 memo 化。它们此前每次页面渲染都全量重绘，
+// 于是「打开/关闭详情」这种只动抽屉状态的操作也要重排上千行 DOM。memo 生效的前提是
+// 下面传进来的 props 引用稳定——页面侧的 list* 回调就是为此存在的。
+// 注意：memo 会挡住父组件触发的重渲染，而这些视图内部直接调 t()。所以每个视图都要
+// useT() 自己订阅 locale，否则切语言时文案会停在旧语言上。
+function SessionsTableBase(props: {
   rows: any[];
   selected: Set<string>;
   hidden: boolean;
@@ -1199,6 +1201,7 @@ function SessionsTable(props: {
   onSelectAll: (selected: boolean) => void;
   onSort: (key: string) => void;
 }): React.JSX.Element {
+  useT();
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   useLayoutEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
@@ -1340,6 +1343,8 @@ function SessionsTable(props: {
     </table>
   );
 }
+
+const SessionsTable = memo(SessionsTableBase);
 
 type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 
@@ -1637,7 +1642,7 @@ function BoardCard(props: {
   );
 }
 
-function BoardView(props: {
+function BoardViewBase(props: {
   rows: any[];
   selected: Set<string>;
   hidden: boolean;
@@ -1658,6 +1663,7 @@ function BoardView(props: {
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
 }): React.JSX.Element {
+  useT();
   useEffect(() => {
     if (!props.hidden && !props.animated) props.onAnimated();
   }, [props.animated, props.hidden, props.onAnimated]);
@@ -1756,6 +1762,23 @@ function BoardView(props: {
   );
 }
 
+const BoardView = memo(BoardViewBase);
+
+// 看板卡片的图标集。以前是渲染体里的对象字面量：每次渲染都换一个新引用，
+// 于是每张卡片的 callbacks 都"变了"，React.memo 全部失效。图标本身是常量，
+// 提到模块级即可让 memo 真正命中。
+const KANBAN_ICONS: SessionsKanbanIcons = {
+  details: ICON.details,
+  feishu: ICON.feishu,
+  history: ICON.history,
+  key: ICON.key,
+  lock: ICON.lock,
+  restart: ICON.restart,
+  close: ICON.close,
+  terminal: ICON.terminal,
+  unlock: ICON.unlock,
+};
+
 type TopicGroupsViewProps = {
   rows: SessionRow[];
   relationRows?: SessionRow[];
@@ -1777,7 +1800,8 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
 
-export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element {
+function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
+  useT();
   const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
@@ -1854,6 +1878,8 @@ export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element 
   );
 }
 
+export const TopicGroupsView = memo(TopicGroupsViewBase);
+
 function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
   const human = m.senderType === 'user';
@@ -1878,8 +1904,6 @@ function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: 
 }
 
 function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loaded = !!props.state && !props.state.loading && !props.state.error && props.state.messages.length > 0;
@@ -1890,12 +1914,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
     if (el) el.scrollTop = el.scrollHeight;
   }, [loaded, props.state?.sessionId, props.state?.messages.length]);
   return (
-    <dialog
+    <ModalDialog
       id="history-modal"
       className="history-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -1914,7 +1937,9 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             {!props.state.loading && props.state.error ? (
               <div className="history-error">
                 {t('sessions.history.fail')}: {props.state.error}
-                {props.state.stale ? <><br /><span>{t('sessions.history.staleHint')}</span></> : null}
+                {props.state.staleHint ? (
+                  <><br /><span>{t('sessions.history.staleHint', props.state.staleHint)}</span></>
+                ) : null}
               </div>
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length === 0 ? (
@@ -1935,11 +1960,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
+export function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1950,6 +1975,11 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
     const input = inputRef.current;
     input.focus();
     input.select();
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    if (!editing || !inputRef.current) return;
+    const input = inputRef.current;
     const fit = () => {
       const cs = getComputedStyle(input);
       const span = document.createElement('span');
@@ -2008,20 +2038,17 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
 }
 
 function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const readonlyUrl = row ? terminalHref(row) : null;
   const url = props.state?.url ?? readonlyUrl ?? '';
   const rowCli = row ? sessionCliDisplayName(row) : '';
   const rowRepo = row ? repoBasename(row.workingDir) : '';
   return (
-    <dialog
+    <ModalDialog
       id="term-modal"
       className="term-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -2074,7 +2101,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -2192,18 +2219,15 @@ function Drawer(props: {
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   onTakeover: (row: any, button?: HTMLButtonElement) => void;
 }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.row);
   const row = props.row;
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
   const canTakeover = !!row && !closed && !!terminal;
   return (
-    <dialog
+    <ModalDialog
       id="drawer"
-      ref={dialogRef}
+      open={!!props.row}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {row ? (
         <article>
@@ -2330,7 +2354,7 @@ function Drawer(props: {
           </footer>
         </article>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -2384,15 +2408,11 @@ function CreateSessionDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
-  const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
-  const [feedGroupAppId, setFeedGroupAppId] = useState('');
-  const [feedGroupId, setFeedGroupId] = useState('');
-  const [newFeedGroupName, setNewFeedGroupName] = useState('');
-  const [feedGroupError, setFeedGroupError] = useState('');
-  const [feedGroupLoading, setFeedGroupLoading] = useState(false);
-  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
-  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
-  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
+  const feed = useFeedGroups({
+    enabled: !!state && !state.loading && !state.success,
+    reloadKey: state,
+    onAuthError: (_kind, reason) => toast(reason, { kind: 'error' }),
+  });
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -2411,89 +2431,11 @@ function CreateSessionDialog(props: {
     setAdvancedOpen(false);
     setSubmitting(false);
     setKeptSuccess(null);
-    setFeedGroupId('');
-    setNewFeedGroupName('');
-    setFeedGroupError('');
-    setFeedGroupAuthUrl('');
-    setFeedGroupCallbackUrl('');
+    feed.reset();
     setMentionTrigger(null);
     setMentionIndex(0);
     nextImageOrdinalRef.current = 1;
   }, [state]);
-
-  useEffect(() => {
-    if (!feedGroupAuthUrl) return;
-    let alive = true;
-    const timer = window.setInterval(() => {
-      void fetch('/api/feed-groups')
-        .then(async response => {
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok || !body.ok || !alive) return;
-          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-          setFeedGroupError('');
-          setFeedGroupAuthUrl('');
-          setFeedGroupCallbackUrl('');
-        })
-        .catch(() => { /* remote/manual fallback remains visible */ });
-    }, 1_000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [feedGroupAuthUrl]);
-
-  useEffect(() => {
-    if (!state || state.loading || state.success) return;
-    let alive = true;
-    setFeedGroupLoading(true);
-    void fetch('/api/feed-groups')
-      .then(async response => {
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-        if (!alive) return;
-        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-        setFeedGroupError('');
-      })
-      .catch(error => { if (alive) setFeedGroupError(error instanceof Error ? error.message : String(error)); })
-      .finally(() => { if (alive) setFeedGroupLoading(false); });
-    return () => { alive = false; };
-  }, [state]);
-
-  const openFeedGroupLogin = async (): Promise<void> => {
-    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
-    const response = await fetch(`/api/feed-groups/auth-url${query}`);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.authUrl) {
-      toast(body.error ?? `HTTP ${response.status}`, { kind: 'error' });
-      return;
-    }
-    setFeedGroupAuthUrl(String(body.authUrl));
-    setFeedGroupCallbackUrl('');
-  };
-
-  const completeFeedGroupLogin = async (callbackUrl: string): Promise<void> => {
-    setFeedGroupAuthSubmitting(true);
-    try {
-      const response = await fetch('/api/feed-groups/oauth-callback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-      const groupsResponse = await fetch('/api/feed-groups');
-      const groupsBody = await groupsResponse.json().catch(() => ({}));
-      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
-      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
-      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
-      setFeedGroupError('');
-      setFeedGroupAuthUrl('');
-      setFeedGroupCallbackUrl('');
-    } catch (error) {
-      toast(error instanceof Error ? error.message : String(error), { kind: 'error' });
-    } finally {
-      setFeedGroupAuthSubmitting(false);
-    }
-  };
 
   if (!state) return null;
   if (state.success) {
@@ -2649,9 +2591,9 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
-          feedGroupId: feedGroupId || undefined,
-          newFeedGroupName: newFeedGroupName.trim() || undefined,
-          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
+          feedGroupId: feed.selectedId || undefined,
+          newFeedGroupName: feed.newName.trim() || undefined,
+          feedGroupAppId: (feed.selectedId || feed.newName.trim()) ? feed.appId : undefined,
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2792,25 +2734,7 @@ function CreateSessionDialog(props: {
           <label><input type="radio" name="mode" value="all" checked={mode === 'all'} onChange={() => setMode('all')} /> {t('sessions.create.modeAll')}</label>
           <small>{t('sessions.create.modeHelp')}</small>
         </fieldset>
-        {feedGroupAuthUrl ? (
-          <div className="feed-group-auth-overlay">
-            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="session-feed-group-auth-title">
-              <h3 id="session-feed-group-auth-title">授权飞书标签</h3>
-              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
-              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
-              <label>
-                <span>请把点击授权后的完整链接粘贴在这里</span>
-                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
-              </label>
-              <div className="actions">
-                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
-                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
-                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
+        <FeedGroupAuthOverlay feed={feed} titleId="session-feed-group-auth-title" />
         <fieldset className="cs-lead-row" hidden={mode !== 'lead'}>
           <legend>{t('sessions.create.lead')}</legend>
           <select name="lead" disabled={leadOptions.length === 0} value={leadOptions.includes(lead) ? lead : ''} onChange={event => setLead(event.currentTarget.value)}>
@@ -2848,23 +2772,15 @@ function CreateSessionDialog(props: {
             <fieldset className="cs-feed-group">
               <legend>飞书标签（可选）</legend>
               <FeedGroupPicker
-                groups={feedGroups}
-                selectedId={feedGroupId}
-                newName={newFeedGroupName}
-                disabled={feedGroupLoading || !!feedGroupError}
-                onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+                groups={feed.groups}
+                selectedId={feed.selectedId}
+                newName={feed.newName}
+                disabled={feed.loading || !!feed.error}
+                onChange={feed.select}
               />
               <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
-              {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
-              {feedGroupError ? (
-                <div className="cs-warn">
-                  <small>{feedGroupError}</small>{' '}
-                  <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
-                    {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
-                  </button>
-                  <small> 授权后会弹窗提示你粘贴回调地址。</small>
-                </div>
-              ) : null}
+              {feed.loading ? <small>正在读取飞书标签…</small> : null}
+              <FeedGroupAuthPrompt feed={feed} className="cs-warn" />
             </fieldset>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.workingDir')}</span>
@@ -2955,7 +2871,7 @@ function SessionsPage(): React.JSX.Element {
   const [kanbanGroupBy, setKanbanGroupBy] = useState<KanbanGroupBy>(() => readStoredKanbanGroupBy(windowStorage()));
   const viewStageSignature = `${viewMode}:${viewMode === 'kanban' ? kanbanGroupBy : '-'}`;
   const viewStageInitialRef = useRef(true);
-  const [viewStageAnimKey, setViewStageAnimKey] = useState(0);
+  const viewStageRef = useRef<HTMLDivElement | null>(null);
   const [kanbanTeams, setKanbanTeams] = useState<SessionsKanbanTeam[]>([]);
   const [kanbanChatBots, setKanbanChatBots] = useState<ChatBotsMap | null>(null);
   const [kanbanTeamsLoaded, setKanbanTeamsLoaded] = useState(false);
@@ -2982,12 +2898,24 @@ function SessionsPage(): React.JSX.Element {
   const [createLoading, setCreateLoading] = useState(false);
   const createRequestRef = useRef(0);
 
+  // 视图切换的入场动画。以前靠 `key={viewStageAnimKey}` 换 key 强制 remount 整个
+  // 舞台来重放 CSS animation——那等于每次点「看板/状态板/话题/表格」都把当前视图
+  // 连同全部卡片从零重建一遍，5000+ 会话下单次点击主线程阻塞 4~6.6s。
+  // 现在改成就地重启动画：摘掉 class、读一次 offsetWidth 触发 reflow、再加回去，
+  // DOM 不动，React 也不用重建子树。
+  // 入场 class 只由这里加，JSX 上的 className 保持静态——这正是本做法成立的前提：
+  // React 只在 className 的计算值变化时才写 DOM，值恒为 "sessions-view-stage"，
+  // 所以它不会把我们加上的 class 冲掉，也就不需要再拿一个 state 去驱动它。
   useLayoutEffect(() => {
     if (viewStageInitialRef.current) {
       viewStageInitialRef.current = false;
       return;
     }
-    setViewStageAnimKey(value => value + 1);
+    const stage = viewStageRef.current;
+    if (!stage) return;
+    stage.classList.remove('sessions-view-stage-enter');
+    void stage.offsetWidth;
+    stage.classList.add('sessions-view-stage-enter');
   }, [viewStageSignature]);
 
   useEffect(() => {
@@ -3048,13 +2976,29 @@ function SessionsPage(): React.JSX.Element {
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
   const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
+  // 下面这几个派生集合原来都是裸表达式，每次渲染（含每条 SSE session.update）都要
+  // 在数千行上重跑一遍 filter/every/some。全部收进 useMemo：只有真正的输入变了才重算。
   const visibleRows = viewMode === 'table' || viewMode === 'topics' ? rows : boardRows;
-  const selectableRows = visibleRows.filter(row => row.status !== 'closed');
-  const selectedRows = [...selected]
-    .map(id => rowsById.get(id))
-    .filter((row): row is SessionRow => !!row && row.status !== 'closed');
-  const selectAllChecked = selectableRows.length > 0 && selectableRows.every(row => selected.has(row.sessionId));
-  const selectAllIndeterminate = selectableRows.some(row => selected.has(row.sessionId)) && !selectAllChecked;
+  const selectableRows = useMemo(
+    () => visibleRows.filter(row => row.status !== 'closed'),
+    [visibleRows],
+  );
+  const selectedRows = useMemo(
+    () => [...selected]
+      .map(id => rowsById.get(id))
+      .filter((row): row is SessionRow => !!row && row.status !== 'closed'),
+    [rowsById, selected],
+  );
+  const { selectAllChecked, selectAllIndeterminate } = useMemo(() => {
+    let anySelected = false;
+    let allSelected = selectableRows.length > 0;
+    for (const row of selectableRows) {
+      if (selected.has(row.sessionId)) anySelected = true;
+      else allSelected = false;
+      if (anySelected && !allSelected) break;
+    }
+    return { selectAllChecked: allSelected, selectAllIndeterminate: anySelected && !allSelected };
+  }, [selectableRows, selected]);
 
   useEffect(() => {
     setSelected(prev => {
@@ -3098,7 +3042,7 @@ function SessionsPage(): React.JSX.Element {
     return rows;
   }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, rows, teamChatIdsFor, viewMode]);
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectIdleCleanupCandidates(currentCleanupVisibleRows, hours),
+    (hours: IdleCleanupHours) => selectCleanupCandidates(currentCleanupVisibleRows, hours),
     [currentCleanupVisibleRows],
   );
 
@@ -3352,6 +3296,12 @@ function SessionsPage(): React.JSX.Element {
         if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
+      if (body?.archiveError) {
+        const detail = body.archiveError === 'codex_archive_target_unverified'
+          ? t('sessions.codexArchiveTargetUnverified') : body.archiveError === 'codex_archive_target_invalid'
+            ? t('sessions.codexArchiveTargetInvalid') : body.archiveError;
+        toast(t('sessions.codexArchiveFailed', { count: 1, detail }), { kind: 'warning' });
+      }
       // Closed locally, but a remote session was left running (its control plane
       // could not be verified). The drawer is about to close, so this is the only
       // moment the operator can be told.
@@ -3438,7 +3388,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        toast(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
+        toast(resumeErrorMessage(body?.error ?? r.status, t), { kind: 'error' });
         return false;
       }
       return true;
@@ -3476,8 +3426,25 @@ function SessionsPage(): React.JSX.Element {
         const body = await r.json().catch(() => ({}));
         if (!r.ok || body?.ok === false) {
           const errCode = String(body?.error ?? r.status);
-          const stale = errCode === 'not_found_yet' || errCode === 'not_found';
-          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, stale } : prev);
+          let staleHint: HistoryState['staleHint'];
+          if ((errCode === 'not_found_yet' || errCode === 'not_found') && row.larkAppId) {
+            try {
+              // `diskVersion` is absent when the server cannot tell what is on
+              // disk (compiled binary): then no stale hint, never an inverted one.
+              const status = await fetch('/api/update/status', { cache: 'no-store' }).then(res => res.json()) as {
+                diskVersion?: string;
+                runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+              };
+              const running = status.runningDaemons?.find(d => d.larkAppId === row.larkAppId)?.version;
+              if (daemonVersionDiffersFromDisk(running, status.diskVersion)) {
+                staleHint = {
+                  running: stripBotmuxVersionPrefix(running!),
+                  disk: stripBotmuxVersionPrefix(status.diskVersion!),
+                };
+              }
+            } catch { /* raw not_found only */ }
+          }
+          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, staleHint } : prev);
           return;
         }
         const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -3521,6 +3488,7 @@ function SessionsPage(): React.JSX.Element {
     // Counted separately: a residual is NOT a failure (the row closed) but must
     // never be folded into the silent success total.
     const residualIds: string[] = [];
+    const archiveErrors: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -3531,6 +3499,7 @@ function SessionsPage(): React.JSX.Element {
           if (!r.ok || body?.ok === false) {
             failed += 1;
           } else {
+            if (body?.archiveError) archiveErrors.push(String(body.archiveError));
             const residual = parseCloseResidual(body);
             if (residual) residualIds.push(describeCloseResidual(residual));
           }
@@ -3547,6 +3516,7 @@ function SessionsPage(): React.JSX.Element {
     setSelected(new Set());
     refresh();
     if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
+    if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.join(', ') }), { kind: 'warning' });
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is
       // entirely silent and the operator believes everything is gone. Kind-neutral
@@ -3609,7 +3579,8 @@ function SessionsPage(): React.JSX.Element {
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
     if (!nextHours) return;
-    const candidates = idleCleanupCandidatesFor(nextHours);
+    const groups = idleCleanupCandidatesFor(nextHours);
+    const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
     setIdleCleanupHours(nextHours);
     setIdleCleanupBusy(true);
@@ -3637,6 +3608,10 @@ function SessionsPage(): React.JSX.Element {
         closed: Number(body?.closed ?? 0),
         failed: Number(body?.failed ?? 0),
       }));
+      const archiveErrors = (body?.results ?? []).filter((item: any) => item?.archiveError);
+      if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.map((item: any) => item.archiveError === 'codex_archive_target_unverified'
+        ? t('sessions.codexArchiveTargetUnverified') : item.archiveError === 'codex_archive_target_invalid'
+          ? t('sessions.codexArchiveTargetInvalid') : item.archiveError).join(', ') }), { kind: 'warning' });
       const idleResiduals = (body?.results ?? [])
         .filter((item: any) => item?.ok && item?.residual)
         .map((item: any) => describeCloseResidual(item.residual));
@@ -3671,7 +3646,7 @@ function SessionsPage(): React.JSX.Element {
       setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
     }
   }, [sortKey]);
-  const moveColumn = (id: string, delta: number): void => {
+  const moveColumn = useCallback((id: string, delta: number): void => {
     setBoardOrder(prev => {
       const from = prev.indexOf(id);
       const to = from + delta;
@@ -3682,8 +3657,8 @@ function SessionsPage(): React.JSX.Element {
       writeStoredBoardOrder(windowStorage(), next);
       return next;
     });
-  };
-  const moveColumnTo = (id: string, targetId: string): void => {
+  }, []);
+  const moveColumnTo = useCallback((id: string, targetId: string): void => {
     if (id === targetId) return;
     setBoardOrder(prev => {
       const from = prev.indexOf(id);
@@ -3695,7 +3670,7 @@ function SessionsPage(): React.JSX.Element {
       writeStoredBoardOrder(windowStorage(), next);
       return next;
     });
-  };
+  }, []);
 
   const kanbanState = useMemo(() => ({
     rows,
@@ -3706,6 +3681,98 @@ function SessionsPage(): React.JSX.Element {
     teamBoardData: teamBoard.data,
     teamBoardKey: teamBoard.key,
   }), [kanbanGroupBy, kanbanTeamKey, kanbanTeams, kanbanTeamsLoaded, rows, teamBoard.data, teamBoard.key]);
+
+  // 看板回调必须是稳定引用。以前这十个回调都是 <SessionsKanbanView> 上的内联箭头，
+  // 于是每次页面渲染（含每条 SSE）都生成一整套新函数 → 看板内部 props/display 换新
+  // 引用 → 每张卡片的 memo 全部失效。底层 helper 本身早就是 useCallback 了，这里只是
+  // 把「取 store 里的会话再转调」那层薄包装也固定下来。
+  const kanbanOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void closeSession(s, button);
+  }, [closeSession]);
+  const kanbanOnDetails = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const kanbanOnNeedTeamBoard = useCallback((team: SessionsKanbanTeam) => { void ensureTeamBoard(team); }, [ensureTeamBoard]);
+  const kanbanOnNeedTeams = useCallback(() => { void loadKanbanTeams(); }, [loadKanbanTeams]);
+  const kanbanOnRename = useCallback((row: any, title: string) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void persistRename(s, title);
+  }, [persistRename]);
+  const kanbanOnRestart = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void restartSession(s, button);
+  }, [restartSession]);
+  const kanbanOnTeamScope = useCallback((scope: { chats: number; sessions: number } | null) => {
+    setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '');
+  }, []);
+  const kanbanOnToggleLock = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void setSessionLocked(s, !s.locked, button);
+  }, [setSessionLocked]);
+  const kanbanOnToggleSelect = useCallback((row: any) => setSelected(prev => {
+    const id = String(row.sessionId);
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  // 表格 / 状态板 / 话题三视图的回调同样必须是稳定引用。它们过去都是 JSX 上的内联
+  // 箭头，于是每次页面渲染（含每条 SSE session.update、以及「打开/关闭详情」这种
+  // 只改抽屉状态的操作）都换一套新函数 → 视图 memo 全部失效 → 数千行整体重排。
+  // 这里只包一层薄转调，真正的实现仍是上面那些 useCallback helper。
+  const listOnOpen = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const listOnToggleSelect = useCallback((row: any) => setSelected(prev => {
+    const id = String(row.sessionId);
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  const listOnSelect = useCallback((id: string, checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    if (checked) next.add(id); else next.delete(id);
+    return next;
+  }), []);
+  const listOnLocate = useCallback((row: any) => locateSession(row), [locateSession]);
+  const listOnRestart = useCallback((row: any, button?: HTMLButtonElement) => {
+    void restartSession(row, button);
+  }, [restartSession]);
+  const listOnLock = useCallback((row: any, locked: boolean, button?: HTMLButtonElement) => {
+    void setSessionLocked(row, locked, button);
+  }, [setSessionLocked]);
+  const listOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
+    void closeSession(row, button);
+  }, [closeSession]);
+  const boardOnAnimated = useCallback(() => setBoardAnimated(true), []);
+  const tableOnSelectAll = useCallback((checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    for (const row of selectableRows) {
+      if (checked) next.add(row.sessionId);
+      else next.delete(row.sessionId);
+    }
+    return next;
+  }), [selectableRows]);
+  const tableOnResetColumns = useCallback(() => {
+    setHiddenColumns(new Set());
+    writeStoredHiddenTableColumns(windowStorage(), []);
+  }, []);
+  const tableOnToggleColumn = useCallback((colId: string) => {
+    const willHide = !hiddenColumns.has(colId);
+    const next = new Set(hiddenColumns);
+    if (willHide) next.add(colId);
+    else next.delete(colId);
+    // 落盘放在 updater 外：updater 必须是纯函数（StrictMode 下会跑两次）。
+    writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
+    setHiddenColumns(next);
+    // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
+    if (willHide && colId === sortKey) {
+      setSortKey('lastMessageAt');
+      setSortDir('desc');
+    }
+  }, [hiddenColumns, sortKey]);
+
+  // 这两个开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
+  const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined;
+  const kanbanOnOpenWritableTerminal = dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal()
+    ? openWritableTerminal
+    : undefined;
 
   const drawerRow = drawerSessionId ? rowsById.get(drawerSessionId) ?? null : null;
   const kanbanTeamOptions = useMemo(() => {
@@ -3737,34 +3804,6 @@ function SessionsPage(): React.JSX.Element {
       setCreateState({ bots });
     } finally {
       if (createRequestRef.current === requestId) setCreateLoading(false);
-    }
-  }, []);
-
-  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
-  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
-  const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = await promptText({ title: t('sessions.debugTerminal'), message: t('sessions.debugTerminalPrompt') });
-    if (input === null) return; // 用户取消
-    const workingDir = input.trim();
-    const tab = window.open('about:blank', '_blank');
-    if (tab) tab.opener = null;
-    try {
-      const r = await fetch('/api/debug-terminal', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(workingDir ? { workingDir } : {}),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false || !body?.url) {
-        tab?.close();
-        if (r.status !== 401) toast(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
-        return;
-      }
-      if (tab) tab.location.href = body.url;
-      else window.open(body.url, '_blank', 'noopener');
-    } catch (e) {
-      tab?.close();
-      toast(`${t('sessions.debugTerminalFail')}: ${e}`, { kind: 'error' });
     }
   }, []);
 
@@ -3859,16 +3898,6 @@ function SessionsPage(): React.JSX.Element {
             </button>
           ) : null}
           {ui.authed ? (
-            <button
-              type="button"
-              className="debug-terminal-btn"
-              title={t('sessions.debugTerminalHint')}
-              onClick={() => void openDebugTerminal()}
-            >
-              {t('sessions.debugTerminal')}
-            </button>
-          ) : null}
-          {ui.authed ? (
             <CreateActionButton
               className="page-primary-action create-session-btn"
               disabled={createLoading}
@@ -3897,7 +3926,10 @@ function SessionsPage(): React.JSX.Element {
           busy: idleCleanupBusy,
           hours: idleCleanupHours,
           status: idleCleanupStatus,
-          countForHours: hours => idleCleanupCandidatesFor(hours).length,
+          countForHours: (hours) => {
+            const groups = idleCleanupCandidatesFor(hours);
+            return { idle: groups.idle.length, dormant: groups.dormant.length };
+          },
           onRun: runIdleCleanup,
         }}
       />
@@ -3915,153 +3947,104 @@ function SessionsPage(): React.JSX.Element {
       />
 
       <div
-        key={viewStageAnimKey}
-        className={`sessions-view-stage${viewStageAnimKey > 0 ? ' sessions-view-stage-enter' : ''}`}
+        ref={viewStageRef}
+        className="sessions-view-stage"
         data-view={viewMode}
         data-kanban-group={kanbanGroupBy}
       >
         {!bootstrapped ? <SessionsSkeleton /> : null}
+        {bootstrapped && viewMode === 'table' ? (
         <SessionsTable
           rows={rows}
           selected={selected}
-          hidden={viewMode !== 'table' || !bootstrapped}
+          hidden={false}
           sortKey={sortKey}
           sortDir={sortDir}
           selectAllChecked={selectAllChecked}
           selectAllIndeterminate={selectAllIndeterminate}
           selectAllDisabled={selectableRows.length === 0}
           hiddenColumns={hiddenColumns}
-          onToggleColumn={(colId) => {
-            const willHide = !hiddenColumns.has(colId);
-            const next = new Set(hiddenColumns);
-            if (willHide) next.add(colId);
-            else next.delete(colId);
-            writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
-            setHiddenColumns(next);
-            // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
-            if (willHide && colId === sortKey) {
-              setSortKey('lastMessageAt');
-              setSortDir('desc');
-            }
-          }}
-          onResetColumns={() => {
-            setHiddenColumns(new Set());
-            writeStoredHiddenTableColumns(windowStorage(), []);
-          }}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
-          onSelect={(id, checked) => setSelected(prev => {
-            const next = new Set(prev);
-            if (checked) next.add(id);
-            else next.delete(id);
-            return next;
-          })}
-          onSelectAll={checked => setSelected(prev => {
-            const next = new Set(prev);
-            for (const row of selectableRows) {
-              if (checked) next.add(row.sessionId);
-              else next.delete(row.sessionId);
-            }
-            return next;
-          })}
+          onToggleColumn={tableOnToggleColumn}
+          onResetColumns={tableOnResetColumns}
+          onOpen={listOnOpen}
+          onSelect={listOnSelect}
+          onSelectAll={tableOnSelectAll}
           onSort={handleSort}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'board' ? (
         <BoardView
           rows={boardRows}
           selected={selected}
-          hidden={viewMode !== 'board' || !bootstrapped}
+          hidden={false}
           order={boardOrder}
           animated={boardAnimated}
           dragColId={dragColId}
           dragOverCol={dragOverCol}
-          onAnimated={() => setBoardAnimated(true)}
+          onAnimated={boardOnAnimated}
           onMoveColumn={moveColumn}
           onMoveColumnTo={moveColumnTo}
           onDragCol={setDragColId}
           onDragOverCol={setDragOverCol}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
+          onToggleSelect={listOnToggleSelect}
+          onOpen={listOnOpen}
           onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
+          onLocate={listOnLocate}
+          onRestart={listOnRestart}
+          onLock={listOnLock}
+          onClose={listOnClose}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'topics' ? (
         <TopicGroupsView
           rows={rows}
           relationRows={storeRows}
           selected={selected}
-          hidden={viewMode !== 'topics' || !bootstrapped}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
+          hidden={false}
+          onToggleSelect={listOnToggleSelect}
+          onOpen={listOnOpen}
           onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
+          onLocate={listOnLocate}
+          onRestart={listOnRestart}
+          onLock={listOnLock}
+          onClose={listOnClose}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'kanban' ? (
         <div
           id="sessions-kanban"
           ref={setKanbanHost}
           className={`sessions-kanban${kanbanGroupBy === 'bot' ? ' kanban-mode-bot' : ''}`}
-          hidden={viewMode !== 'kanban' || !bootstrapped}
         >
-          {viewMode === 'kanban' ? (
-            <SessionsKanbanView
-              host={kanbanHost}
-              {...kanbanState}
-              canRestartSession={canRestartSession}
-              getTeamChatIds={teamChatIdsFor}
-              icons={{
-                details: ICON.details,
-                feishu: ICON.feishu,
-                history: ICON.history,
-                key: ICON.key,
-                lock: ICON.lock,
-                restart: ICON.restart,
-                close: ICON.close,
-                terminal: ICON.terminal,
-                unlock: ICON.unlock,
-              }}
-              lockActionLabel={lockActionLabel}
-              sessionStatusText={sessionStatusText}
-              onClose={(row, button) => {
-                const s = store.sessions.get(String(row.sessionId));
-                if (s) void closeSession(s, button);
-              }}
-              onDetails={row => setDrawerSessionId(String(row.sessionId))}
-              onHistory={openHistoryModal}
-              onMoveRows={handleKanbanMoves}
-              onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
-              onNeedTeams={() => { void loadKanbanTeams(); }}
-              onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
-              onOpenWritableTerminal={dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal() ? openWritableTerminal : undefined}
-              onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
-              onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
-              onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}
-              onToggleLock={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void setSessionLocked(s, !s.locked, button); }}
-              onToggleSelect={row => setSelected(prev => {
-                const id = String(row.sessionId);
-                const next = new Set(prev);
-                if (next.has(id)) next.delete(id); else next.add(id);
-                return next;
-              })}
-              selectedSessionIds={selected}
-            />
-          ) : null}
+          <SessionsKanbanView
+            host={kanbanHost}
+            {...kanbanState}
+            canRestartSession={canRestartSession}
+            getTeamChatIds={teamChatIdsFor}
+            icons={KANBAN_ICONS}
+            lockActionLabel={lockActionLabel}
+            sessionStatusText={sessionStatusText}
+            onClose={kanbanOnClose}
+            onDetails={kanbanOnDetails}
+            onHistory={openHistoryModal}
+            onMoveRows={handleKanbanMoves}
+            onNeedTeamBoard={kanbanOnNeedTeamBoard}
+            onNeedTeams={kanbanOnNeedTeams}
+            onOpenTerminal={kanbanOnOpenTerminal}
+            onOpenWritableTerminal={kanbanOnOpenWritableTerminal}
+            onRename={kanbanOnRename}
+            onRestart={kanbanOnRestart}
+            onTeamScope={kanbanOnTeamScope}
+            onToggleLock={kanbanOnToggleLock}
+            onToggleSelect={kanbanOnToggleSelect}
+            selectedSessionIds={selected}
+            namesVersion={revision}
+          />
         </div>
+        ) : null}
       </div>
 
       <Drawer

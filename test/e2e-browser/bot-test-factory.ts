@@ -4,13 +4,17 @@
  *
  * Test flow per bot:
  *  1. Navigate to messenger → click bot's private chat
- *  2. Send "hello" → bot creates topic and replies
- *  3. Verify streaming card appears
- *  4. Wait for card to reach "等待输入", or for Codex to return a quota/rate-limit response
- *  5. Verify bot sent an actual text reply message, or that Codex reached Codex-side response handling
- *  6. Close session and verify "会话已关闭"
+ *  2. Send a tagged prompt → bot creates a topic
+ *  3. Non-Codex: streaming card, then the model reply bubble (ACK-e2e-…).
+ *     That bubble is the success gate. Do not hard-wait for the card title
+ *     「等待输入」 first — the ACK can already be on screen while the card
+ *     body still reads 「回复 — 工作中」.
+ *  4. Codex: open the thread and click 「直接开启会话」 before any streaming
+ *     wait, same order as Codex prompt submission, then accept a Codex-side
+ *     response (marker, or a usage/rate-limit notice).
+ *  5. Close session and verify 「会话已关闭」
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';
@@ -25,9 +29,8 @@ import {
   sendMessage,
   navigateToMessenger,
   openChat,
+  openThreadForMessage,
   waitForStreamingCard,
-  waitForCardStatus,
-  waitForIdleOrCodexUsageLimit,
   waitForCodexSideResponse,
   clickDirectStartIfPresent,
   showStreamingOutput,
@@ -36,6 +39,7 @@ import {
   closeSession,
   type BotName,
 } from './helpers.js';
+import { publishLabeledPageVideo } from './e2e-video.js';
 
 type BotTestOptions = {
   allowCodexUsageLimitResponse?: boolean;
@@ -64,6 +68,11 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       await closeSession(agent, page);
       await agent?.destroy();
       await context?.close();
+      try {
+        await publishLabeledPageVideo(page);
+      } catch (error) {
+        console.error('Feishu video publish failed:', error);
+      }
       await browser?.close();
     });
 
@@ -76,37 +85,30 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       await navigateToMessenger(page);
       await openChat(page, agent, botName);
 
-      const msg = testMessage(botName.toLowerCase());
-      await sendMessage(agent, msg);
+      if (opts?.allowCodexUsageLimitResponse) {
+        // Match the passing Codex prompt submission case: open the thread
+        // and click 「直接开启会话」 before any streaming-card wait.
+        const marker = `CODEX_E2E_MARKER_${Date.now()}`;
+        const msg = `${testMessage('codex-marker', { plain: true })} 请在最终回复中原样包含 ${marker}`;
+        await sendMessage(agent, msg, page);
+        await openThreadForMessage(agent, { timeoutMs: 120_000, msgHint: msg, page });
+        await clickDirectStartIfPresent(agent, page, { expectMs: 90_000 });
+        await scrollThreadToBottom(agent);
+        await waitForCodexSideResponse(agent, { marker, timeoutMs: 180_000 });
+        return;
+      }
 
-      // Wait for streaming card in thread panel
+      const msg = testMessage(botName.toLowerCase());
+      await sendMessage(agent, msg, page);
+
+      // Session started. Title 「等待输入」 is not the success gate: Claude
+      // can send ACK-e2e-… while the card body still reads 「回复 — 工作中」.
       await waitForStreamingCard(agent, {
         timeoutMs: 90_000,
         msgHint: msg,
         page,
       });
-      if (opts?.allowCodexUsageLimitResponse) {
-        await clickDirectStartIfPresent(agent, page);
-      }
 
-      // Wait for card to reach idle, or for Codex to return a quota/rate-limit response.
-      await scrollThreadToBottom(agent);
-      const outcome = opts?.allowCodexUsageLimitResponse
-        ? await waitForIdleOrCodexUsageLimit(agent, { timeoutMs: 180_000 })
-        : 'idle';
-      if (outcome === 'idle') {
-        await waitForCardStatus(agent, '等待输入', { timeoutMs: 120_000 });
-      }
-
-      if (outcome === 'codex-usage-limit') {
-        await scrollThreadToBottom(agent);
-        await waitForCodexSideResponse(agent, { timeoutMs: 60_000 });
-        return;
-      }
-
-      // --- Step A: Wait for the model's actual text reply. This is the
-      //      real "task succeeded" gate — card status "等待输入" only
-      //      proves the CLI went idle, not that the model answered. ---
       await scrollThreadToBottom(agent);
       await waitForModelTextReply(agent, {
         botName,
@@ -114,11 +116,9 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
         timeoutMs: 180_000,
       });
 
-      // --- Step B: Verify the streaming card's display-toggle still works
-      //      (i.e. the Feishu card feature is healthy). Running this AFTER
-      //      the text reply is in place means the card has a real screenshot
-      //      to show and the toggle isn't fighting a mid-flight re-render. ---
-      await scrollThreadToBottom(agent);
+      // The ACK bubble is now the last item. showStreamingOutput scrolls the
+      // streaming card itself into view; scrolling to the thread bottom
+      // hides that card behind the bubble.
       await showStreamingOutput(agent, page);
     }, timeoutMs);
   });

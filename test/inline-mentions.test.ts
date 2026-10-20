@@ -11,7 +11,7 @@
  * Run: pnpm vitest run test/inline-mentions.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { applyInlineMentions } from '../src/im/lark/inline-mentions.js';
+import { applyInlineMentions, applyInlineMentionsToCard } from '../src/im/lark/inline-mentions.js';
 
 const zhang = { open_id: 'ou_zhangsan', name: '张三' };
 const li = { open_id: 'ou_lisi', name: '李四' };
@@ -94,5 +94,73 @@ describe('applyInlineMentions', () => {
     const r = applyInlineMentions('@张三 hi', [{ open_id: 'ou_x', name: '' }]);
     expect(r.text).toBe('@张三 hi');
     expect(r.usedIds.size).toBe(0);
+  });
+});
+
+describe('applyInlineMentionsToCard', () => {
+  it('inlines a responsible owner in Card 2.0 markdown without changing the source card', () => {
+    const card = {
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**修复负责人：** 建议 @张三（高置信度）' },
+          { tag: 'button', text: { tag: 'plain_text', content: '@张三' } },
+        ],
+      },
+    };
+    const result = applyInlineMentionsToCard(card, [zhang]);
+
+    expect((result.card.body as any).elements[0].content)
+      .toBe('**修复负责人：** 建议 <at id=ou_zhangsan></at>（高置信度）');
+    expect((result.card.body as any).elements[1].text.content).toBe('@张三');
+    expect((card.body.elements[0] as any).content).toContain('@张三');
+    expect(result.usedIds).toEqual(new Set(['ou_zhangsan']));
+  });
+
+  it('supports legacy lark_md nodes', () => {
+    const result = applyInlineMentionsToCard({
+      elements: [{ tag: 'div', text: { tag: 'lark_md', content: '负责人 @Owner' } }],
+    }, [owner]);
+    expect(((result.card.elements as any[])[0].text as any).content)
+      .toBe('负责人 <at id=ou_owner></at>');
+  });
+});
+
+describe('applyInlineMentions — Markdown code stays literal (#1744)', () => {
+  const botB = { open_id: 'ou_botb', name: 'BotB' };
+
+  it('rewrites prose but leaves inline code and fenced blocks verbatim', () => {
+    const text = '这里只汇报 @BotB 的结果。\n\n行内示例：`@BotB`\n\n```text\n@BotB\n```';
+    const r = applyInlineMentions(text, [botB]);
+    expect(r.text).toBe('这里只汇报 <at id=ou_botb></at> 的结果。\n\n行内示例：`@BotB`\n\n```text\n@BotB\n```');
+    expect([...r.usedIds]).toEqual(['ou_botb']);
+  });
+
+  it('does not count a code-only mention as inlined (so it stays on the footer)', () => {
+    const r = applyInlineMentions('示例：`botmux send --mention @BotB`\n~~~\n@BotB\n~~~', [botB]);
+    expect(r.text).toBe('示例：`botmux send --mention @BotB`\n~~~\n@BotB\n~~~');
+    expect(r.usedIds.size).toBe(0);
+  });
+
+  it('rewrites mentions directly adjacent to code and between multiple spans', () => {
+    const r = applyInlineMentions('`a`@BotB ``@BotB`` @BotB`b`', [botB]);
+    expect(r.text).toBe('`a`<at id=ou_botb></at> ``@BotB`` <at id=ou_botb></at>`b`');
+  });
+
+  it('does not rewrite a match whose name runs into code (name with a tilde)', () => {
+    const tilde = { open_id: 'ou_t', name: 'B~' };
+    expect(applyInlineMentions('@B~~~\nx\n~~~', [tilde]).text).toBe('@B~~~\nx\n~~~');
+    expect(applyInlineMentions('@B~ ok', [tilde]).text).toBe('<at id=ou_t></at> ok');
+  });
+
+  it('treats an unbalanced stray backtick as a literal', () => {
+    const r = applyInlineMentions('it`s @BotB', [botB]);
+    expect(r.text).toBe('it`s <at id=ou_botb></at>');
+  });
+
+  it('keeps code literal inside custom-card markdown too', () => {
+    const card = { elements: [{ tag: 'markdown', content: '@BotB 看 `@BotB`' }] };
+    const r = applyInlineMentionsToCard(card, [botB]);
+    expect((r.card.elements as Array<{ content: string }>)[0].content).toBe('<at id=ou_botb></at> 看 `@BotB`');
   });
 });

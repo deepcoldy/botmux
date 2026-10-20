@@ -6,7 +6,16 @@
 
 `.github/workflows/release.yml` 在 macOS runner 上完成 Universal 构建、Developer ID 签名、Apple 公证和 stapling，再把 DMG/ZIP 作为附件加入同一个 GitHub Release。签名 job 只接受 `deepcoldy` 发起或重新运行，并且必须通过受保护的 `macos-signing` Environment 审批。以下凭据配置为该 Environment 的 Secrets，不应配置成仓库级 Secrets：
 
-其他 contributor 从分支推送 canary、beta、rc 或其它 prerelease tag 时，仍会发布对应的 npm dist-tag 和 GitHub prerelease，但签名 job 会被跳过，因此不会读取签名凭据，也不会生成 macOS 附件。正式版缺少成功的签名产物时会直接拒绝发布。
+同一个 Environment 也为 `botmux-darwin-x64` 和 `botmux-darwin-arm64`
+standalone CLI 提供 Developer ID 签名。正式版会等 CLI 签名审批通过后再发布 npm
+平台包和 GitHub Release，确保 macOS TCC 权限绑定稳定的 designated requirement，
+不会因升级替换二进制而退化为新程序。Desktop DMG/ZIP 仍异步构建和挂载。
+CLI 签名使用 `build/entitlements.mac.plist`：Bun 单文件运行时会把 `pty.node` 等
+原生载荷释放后动态加载，必须保留 `disable-library-validation`；Desktop 内的
+原生文件会被 electron-builder 逐个同身份签名，仍使用更严格的
+`entitlements.mac.release.plist`。
+
+其他 contributor 从分支推送 canary、beta、rc 或其它 prerelease tag 时，仍会发布对应的 npm dist-tag 和 GitHub prerelease，但签名 job 会被跳过，因此不会读取签名凭据，也不会生成 macOS 附件。预览版 CLI 仍使用 ad-hoc 签名；正式版缺少成功的 CLI 签名产物时会直接拒绝发布。
 
 需要为已有版本重新生成桌面附件时，可以手动运行 `Release` workflow 并填写 `release_tag`。该模式只覆盖对应 Release 的 macOS 附件并校验上传内容，不会再次发布 npm、修改 tag 或改写 Release 正文。
 
@@ -48,9 +57,9 @@ bash src/desktop/install-local.sh
 7. 使用本机 ad-hoc 签名并移除 quarantine。
 8. 默认打开 App。
 
-脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 自带版本匹配的 Node、botmux 和 PM2，不依赖用户的 PATH、fnm、nvm 或 Homebrew Node。
+脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 自带版本匹配的 Node 和 botmux，不依赖用户的 PATH、fnm、nvm 或 Homebrew Node。
 
-App 与命令行继续共用 `~/.botmux` 中的机器人配置、会话、日志和专用 PM2_HOME。启动时若检测到全局 CLI 留下的 botmux fleet，会先优雅停止旧 core 进程，再使用内置 runtime 重建；不会删除用户配置，也不会操作默认 `~/.pm2` 中的无关应用。
+App 与命令行继续共用 `~/.botmux` 中的机器人配置、会话、日志和 fleet 状态（`~/.botmux/fleet-state.json`）。启动时若检测到全局 CLI 留下的 botmux fleet，会先优雅停止旧 core 进程，再使用内置 runtime 重建；不会删除用户配置。
 
 常用参数：
 

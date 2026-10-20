@@ -26,6 +26,7 @@ function makeCli(opts: {
   staticBusyPattern?: RegExp;
   staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
+  firstPromptQuiescenceMs?: number;
 } = {}): CliAdapter {
   return {
     id: 'test-cli',
@@ -38,6 +39,7 @@ function makeCli(opts: {
     staticBusyPattern: opts.staticBusyPattern,
     staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
+    firstPromptQuiescenceMs: opts.firstPromptQuiescenceMs,
     systemHints: [],
     altScreen: false,
   };
@@ -223,8 +225,8 @@ describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
   //   queue strings:   "Queued for capacity",
   //                    "Too many requests right now. You're in the queue."
   //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
-  // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
-  // (0 hits across all releases + the 94MB TUI logs).
+  // Live 0.201.6 captures verified seven activity glyphs and hook-runner rows
+  // using the same elapsed-time / `esc to interrupt` footer.
   const traexAdapter = createTraexAdapter('/bin/true');
 
   it('flips a queued session back to busy when the capacity-queue string renders after a false idle', () => {
@@ -279,6 +281,64 @@ describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
     detector.fireIdle();
     detector.feed('\x1b[2K⠹ Pondering…');
     expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('flips busy on live hook-runner and activity rows across rotating glyphs', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K\x1b[38;5;2m⋄\x1b[0m Running 4 PreToolUse hooks (7s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K❖ Running 2 PostToolUse hooks (13s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('flips busy on TraeX 0.209.1 working and glyph-queue rows after a false idle', () => {
+    // Live 0.209.1 tmux captures: trailing shell-status segments follow the
+    // footer, and the capacity queue renders as a glyph activity row.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K✦ Working… (3s • esc to interrupt) · 1 shell running… · /ps to manage');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    detector.fireIdle();
+    detector.feed("\x1b[2K◆ Queued for capacity (1s • esc to interrupt)\n  └ Too many requests right now. You're in the queue at position 432.");
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('does not promote a completed TraeX 0.209.1 reply or turn summary', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('◆ Ran sleep 12\n  └ (no output)\n◆ OK\n  Worked for 17s • 12:03 PM\n❯ Improve documentation in @filename');
+    expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('does not promote transcript prose, commands, or diff history quoting activity text', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('The previous status was ✦ Running 2 PreToolUse hooks');
+    detector.feed('\n◆ Ran rg for esc to interrupt');
+    detector.feed('\n◆ Ran echo "(36m 20s • ↑ 68.7K tokens • esc to interrupt)"');
+    detector.feed('\n◆ Ran grep (2m 3s) for "esc to interrupt" in logs');
+    detector.feed('\n◇ diff (12s): -◈ old (1m 1s • esc to interrupt)');
+    expect(cb).not.toHaveBeenCalled();
     detector.dispose();
   });
 
@@ -380,6 +440,21 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     expect(idleCb).not.toHaveBeenCalled();
 
     detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('holds the TraeX 0.207 queued-next-turn screen until the composer redraws', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2K⠋ Any second now…\nQueued for next turn\nesc to interrupt\nContext 65% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 65% left');
     vi.advanceTimersByTime(2_500);
     expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
@@ -777,6 +852,22 @@ describe('IdleDetector: quiescence detection', () => {
     expect(cb).not.toHaveBeenCalled();
 
     // Advance past spinner guard (3000ms) + buffer (200ms)
+    vi.advanceTimersByTime(3500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('delays idle for 8-dot braille spinner frames (Ink / Antigravity ⣷)', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Feed 8-dot braille spinner character (⣷ = U+28F7)
+    detector.feed('⣷ Running command...');
+
+    vi.advanceTimersByTime(2000);
+    expect(cb).not.toHaveBeenCalled();
+
     vi.advanceTimersByTime(3500);
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
@@ -1405,6 +1496,94 @@ describe('IdleDetector: CoCo readyPattern compatibility', () => {
     detector.feed('█ ◆ ◆ █  Try Codebase Copilot');
     vi.advanceTimersByTime(2500);
     expect(cb).toHaveBeenCalledTimes(0);
+    detector.dispose();
+  });
+});
+
+// ─── first-prompt extended quiescence (OpenCode-style adapters) ───────────
+
+describe('IdleDetector: first-prompt extended quiescence', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('uses the longer window only before this process has ever gone idle', () => {
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: 4_000 }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Later cycles use the normal 2s quiescence. reset() synthesizes a recent
+    // spinner timestamp, so the spinner guard adds 1.2s on top; idle landing at
+    // 3.2s (< the 4s extended window) proves the long window did not recur.
+    detector.reset();
+    detector.feed('second output');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1_200);
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('defaults to the normal 2s window when the field is absent', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('does not change adapters that define readyPattern', () => {
+    const detector = new IdleDetector(makeCli({
+      readyPattern: /READY>/,
+      firstPromptQuiescenceMs: 4_000,
+    }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Strategy 2 still early-returns until readyPattern is seen.
+    detector.feed('still booting...');
+    vi.advanceTimersByTime(10_000);
+    expect(cb).not.toHaveBeenCalled();
+
+    detector.feed('READY>');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it.each([1_000, 2_000])('falls back to 2s when the field is %s (not greater than the default)', (value) => {
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: value }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('still honors the spinner guard inside the extended first window', () => {
+    // 2.5s is long enough to select the extended window but short enough that
+    // the 3s spinner guard is still live when the quiescence check runs.
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: 2_500 }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('loading ⠋');
+    vi.advanceTimersByTime(2_500);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(699);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
 });

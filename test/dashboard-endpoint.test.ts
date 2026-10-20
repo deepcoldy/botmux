@@ -12,7 +12,7 @@
  *
  * Run: pnpm vitest run test/dashboard-endpoint.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -131,7 +131,9 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: false } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7891/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
   });
 
   it.each([
@@ -143,7 +145,30 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/ensure',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken } }),
     });
-    expect(r).toEqual({ ok: true, url: `http://host:7891/?t=${token}` });
+    expect(r).toEqual({
+      ok: true, url: `http://host:7891/?t=${token}`, localUrl: undefined, platformHosted: false,
+    });
+  });
+
+  // ─── platformHosted 是「能不能摘 token」的唯一判据，只认严格 true ────────────
+  // 它由生成 URL 的 dashboard 进程如实标注：那是唯一知道自己用了哪条基址的进程。
+  // 调用方自己推断出过真缺陷（bind.ts 硬编码 true ⟹ 反代场景摘成死链），所以判据
+  // 收归协议层。fail-safe 方向：非严格 true 一律当 false（= 保留 token）。
+  it.each([
+    { name: 'strict true', body: { platformHosted: true }, expected: true },
+    { name: 'strict false', body: { platformHosted: false }, expected: false },
+    { name: 'absent (older dashboard)', body: {}, expected: false },
+    { name: 'string "true" (not a boolean)', body: { platformHosted: 'true' }, expected: false },
+    { name: 'number 1', body: { platformHosted: 1 }, expected: false },
+    { name: 'null', body: { platformHosted: null }, expected: false },
+  ])('parses platformHosted: $name -> $expected', async ({ body, expected }) => {
+    setPort(7891);
+    const fetchImpl = (async () => new Response(
+      JSON.stringify({ url: 'https://m-x.example/?t=fresh', ...body }),
+      { status: 200 },
+    )) as unknown as typeof fetch;
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/current', fetchImpl });
+    expect(r.ok && r.platformHosted).toBe(expected);
   });
 
   it('surfaces the dashboard-provided localUrl fallback (platform link case)', async () => {
@@ -154,7 +179,13 @@ describe('callDashboard', () => {
       { status: 200 },
     )) as unknown as typeof fetch;
     const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl });
-    expect(r).toEqual({ ok: true, url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' });
+    expect(r).toEqual({
+      ok: true,
+      url: 'https://m-x.example/?t=fresh',
+      localUrl: 'http://10.0.0.1:7891/?t=fresh',
+      // 响应体没带 platformHosted（模拟旧版 dashboard）⟹ 必须解析成 false = 保留 token。
+      platformHosted: false,
+    });
   });
 
   it('does NOT mislabel a daemon-IPC 404 as no-active-token; self-heals to the real dashboard', async () => {
@@ -167,7 +198,9 @@ describe('callDashboard', () => {
         7901: { kind: 'dashboard', hasToken: true },
       }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7901/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7901/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
     // Port file healed to the discovered dashboard port.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7901');
   });
@@ -181,7 +214,9 @@ describe('callDashboard', () => {
         7897: { kind: 'dashboard', hasToken: true },
       }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7897/?t=fresh' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7897/?t=fresh', localUrl: undefined, platformHosted: false,
+    });
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7897');
   });
 
@@ -219,7 +254,9 @@ describe('callDashboard', () => {
       rescanWhenUnreachable: true,
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: true } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=current' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7891/?t=current', localUrl: undefined, platformHosted: false,
+    });
     // ...and the dead recorded port is healed, so the next call needs no rescan.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7891');
   });
@@ -244,7 +281,9 @@ describe('callDashboard', () => {
       configDir: dir, defaultPort: 7891, path: '/__cli/current',
       fetchImpl: makeFetch({ 7893: { kind: 'ipc' }, 7901: { kind: 'dashboard', hasToken: true } }),
     });
-    expect(r).toEqual({ ok: true, url: 'http://host:7901/?t=current' });
+    expect(r).toEqual({
+      ok: true, url: 'http://host:7901/?t=current', localUrl: undefined, platformHosted: false,
+    });
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7901');
   });
 
@@ -364,9 +403,11 @@ void existsSync;
  * assertion can reach.
  *
  * Hence two guards that CAN bite:
- *  1. A shape guard on the source — no runtime needed, so it holds in CI.
- *  2. A real Bun child process (skipped when no bun binary is around), which is
- *     the only way to observe the actual proxying behaviour.
+ *  1. A global-fetch tripwire: the wrapper must reach a real loopback server
+ *     while the global `fetch` is stubbed to throw. It does not depend on proxy
+ *     semantics, so it bites under Node too.
+ *  2. A real Bun child process (required in CI), which is the only way to
+ *     observe the actual proxying behaviour of callDashboard's default client.
  */
 describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
   /**
@@ -384,31 +425,33 @@ describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
     return undefined;
   }
 
-  const ENDPOINT_SRC = join(__dirname, '..', 'src', 'cli', 'dashboard-endpoint.ts');
-
-  it('never falls back to the global fetch for the default client (shape guard)', () => {
-    const src = readFileSync(ENDPOINT_SRC, 'utf8');
-    // Both defaulting sites (requestDashboardAt + callDashboard) must resolve to
-    // the node:http client. `?? fetch` is exactly the regression: on Bun that
-    // routes a 127.0.0.1 request through $http_proxy when no_proxy is a CIDR.
-    const globalFetchFallbacks = src.match(/fetchImpl\s*\?\?\s*fetch\b/g) ?? [];
-    expect(globalFetchFallbacks).toEqual([]);
-    const loopbackDefaults = src.match(/fetchImpl\s*\?\?\s*loopbackFetchImpl\b/g) ?? [];
-    expect(loopbackDefaults).toHaveLength(2);
-    // …and the client it defaults to must itself be built on node:http.
-    const client = readFileSync(join(__dirname, '..', 'src', 'core', 'loopback-fetch.ts'), 'utf8');
-    expect(client).toMatch(/from 'node:buffer'|requestLiteralLoopback/);
-    expect(client).not.toMatch(/\bawait fetch\(|=\s*fetch\(/);
-  });
-
-  it('the daemon-IPC wrapper does not use the global fetch either', () => {
+  it('the daemon-IPC wrapper reaches the loopback server without touching the global fetch', async () => {
     // Same defect, different wrapper: fetchDaemonIpc is the loopback client for
     // 30+ call sites (resume/suspend/lang/term-link/dashboard→daemon). Verified
     // with a real Bun process against a stand-in proxy: the global fetch returned
     // the proxy's 403, loopbackFetch reached the daemon.
-    const ipc = readFileSync(join(__dirname, '..', 'src', 'core', 'daemon-ipc-auth.ts'), 'utf8');
-    expect(ipc).toContain('loopbackFetch(');
-    expect(ipc).not.toMatch(/return fetch\(|await fetch\(/);
+    const { fetchDaemonIpc } = await import('../src/core/daemon-ipc-auth.js');
+    const { createServer } = await import('node:http');
+    const seen: string[] = [];
+    const server = createServer((req, res) => {
+      seen.push(`${req.method} ${req.url}`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
+    const globalFetch = vi.fn(async () => { throw new Error('daemon IPC must not use the global fetch'); });
+    vi.stubGlobal('fetch', globalFetch);
+    try {
+      const res = await fetchDaemonIpc(port, '/api/ping?x=1', { method: 'POST', body: '{}' }, SECRET);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      expect(seen).toEqual(['POST /api/ping?x=1']);
+      expect(globalFetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      await new Promise<void>(r => server.close(() => r()));
+    }
   });
 
   it('a real Bun process reaches the dashboard directly with a CIDR no_proxy', async () => {
@@ -486,7 +529,9 @@ describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
       expect(parsed.runtime).toBe('bun');
       expect(proxyHits).toBe(0);
       expect(directHits).toBe(1);
-      expect(parsed.r).toEqual({ ok: true, url: 'http://dash.local/?t=direct' });
+      expect(parsed.r).toEqual({
+        ok: true, url: 'http://dash.local/?t=direct', platformHosted: false,
+      });
     } finally {
       await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
     }
@@ -532,7 +577,9 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     const execution = await executeDashboardCommand([], cliCaller);
     expect(execution.kind).toBe('endpoint');
     if (execution.kind === 'endpoint') {
-      expect(execution.result).toEqual({ ok: true, url: 'http://host:7891/?t=current' });
+      expect(execution.result).toEqual({
+        ok: true, url: 'http://host:7891/?t=current', localUrl: undefined, platformHosted: false,
+      });
     }
     // The dead port is healed, so subsequent calls need no scan at all.
     expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe('7891');
@@ -576,56 +623,34 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     expect(paths).toContain('/__cli/ensure');
   });
 
-  it('cmdDashboard goes through the wrapper (minimal source pin, no nested parsing)', () => {
-    // The behavioural tests above prove the WRAPPER opts in; they cannot see
-    // cli.ts choosing the raw helper instead (VERIFIED: that swap left them all
-    // green). cli.ts exports no cmdDashboard, so pin exactly one fact — which
-    // function it calls — rather than parsing a nested callback's options object.
-    // That earlier, more ambitious regex was wrong twice; this asserts one name.
-    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
-    const start = src.indexOf('async function cmdDashboard(');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}', start);
-    const body = src.slice(start, end)
-      .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');   // strip comments: they name both fns
-    expect(body).toContain('executeDashboardCliCommand(');
-    // ...and must NOT reach past the wrapper to the un-opted-in helper.
-    expect(body).not.toMatch(/[^i]executeDashboardCommand\(/);
+  it('the wrapper exports only after the dashboard answered, and opts in on the re-read too', async () => {
+    // cmdDashboard passes the Devbox export through the wrapper. The export must
+    // wait for the first call (callDashboard may heal `.dashboard-port` there),
+    // and the post-export `/__cli/current` re-read is an endpoint call like any
+    // other — it needs the same dead-port opt-in.
+    const events: string[] = [];
+    const execution = await executeDashboardCliCommand(['current'], async (path, opts) => {
+      events.push(`${path} ${JSON.stringify(opts)}`);
+      return { ok: true, url: `http://host:7891/?t=current&n=${events.length}` };
+    }, async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+    expect(events).toEqual([
+      '/__cli/current {"rescanWhenUnreachable":true}',
+      'export',
+      '/__cli/current {"rescanWhenUnreachable":true}',
+    ]);
+    expect(execution).toMatchObject({ kind: 'endpoint', result: { ok: true, url: 'http://host:7891/?t=current&n=3' } });
   });
 
-  it('printDashboardHintWithRetry bounds its request (its own budget cannot interrupt a hung await)', () => {
-    // Its 90s budget is only consulted AFTER `await callDashboardEndpoint(...)`
-    // returns, so a recorded port that accepts and never answers hangs the first
-    // iteration forever — the outer budget and the retry loop are both unreachable.
-    // Bounding the request is the ONLY thing that can interrupt it. Source-pinned
-    // because cli.ts exports nothing here; the value itself is checked behaviourally
-    // by `requestTimeoutMs` tests above.
-    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
-    const start = src.indexOf('async function printDashboardHintWithRetry(');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}', start);
-    const body = src.slice(start, end)
-      .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
-    expect(body).toMatch(/callDashboardEndpoint\([^)]*\{[^}]*requestTimeoutMs/);
-  });
-
-  it('printDashboardHintWithRetry does NOT opt in (minimal source pin)', () => {
-    // The behavioural tests below only show that the RAW helper passes one
-    // argument; they cannot see the production poll adding the flag itself
-    // (VERIFIED: adding `{ rescanWhenUnreachable: true }` to the poll's own call
-    // left all 179 tests green). A 500ms poll that scanned the probe range every
-    // tick would turn every boot into repeated port scans, so pin it directly.
-    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
-    const start = src.indexOf('async function printDashboardHintWithRetry(');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}', start);
-    expect(end).toBeGreaterThan(start);
-    const body = src.slice(start, end)
-      .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');   // its comments name the flag
-    expect(body).toContain('callDashboardEndpoint(');
-    expect(body).not.toContain('rescanWhenUnreachable');
-    // ...and it must not route through the CLI wrapper, which always opts in.
-    expect(body).not.toContain('executeDashboardCliCommand');
+  it.each([[['help']], [['wat']], [['current']]])('the wrapper never exports for %j without a live answer', async (args) => {
+    let exports = 0;
+    await executeDashboardCliCommand(args, async () => ({ ok: false, reason: 'unreachable' }), async () => {
+      exports++;
+      return 'https://devbox.example.com';
+    });
+    expect(exports).toBe(0);
   });
 
   it('the raw command helper does NOT opt in (the readiness poll shape)', async () => {

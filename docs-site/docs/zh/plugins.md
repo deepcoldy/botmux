@@ -238,7 +238,30 @@ export default function PluginDashboard({ pluginId, api }) {
 - `getServiceStatus()`；
 - `startService()`；
 - `stopService()`；
-- `restartService()`。
+- `restartService()`；
+
+- `react`：宿主 React 实例，插件应复用它，避免打包另一份 React；
+- `getSettings()`：读取适配器允许在浏览器展示的配置；
+- `saveSettings(value)`：通过适配器保存 JSON 值；
+- `listBots()`：列出可管理的 Bot。
+
+配置功能需要显式提供 `dist/server/settings.js` ES 模块，并同时导出：
+
+```ts
+export function getSettings(api: { config: PluginConfigApi }): unknown | Promise<unknown>;
+export function saveSettings(api: { config: PluginConfigApi }, value: unknown): unknown | Promise<unknown>;
+```
+
+注入的 `api` **只有 `config`**，提供 `get(key?)`、`set(key, value)`、
+`replace(object)` 和 `path`。它不是 `baseApi`，不包含 `runtime`、`logger`、
+`resolve` 或 `settingsPath`。使用受控 config API，明确挑选可展示的字段，
+不要直接回传原始 `config.json` 或敏感信息。
+两个方法允许返回可 JSON 序列化的值或 void；null/undefined 会归一化为
+`{ ok: true }`。请求 JSON 非法返回 400，插件或适配器不存在返回 404，
+不支持的方法返回 405。适配器内部异常、导出错误及不可序列化结果返回完整的
+500 JSON 响应，错误码统一为 `plugin_settings_failed`，不暴露原始异常。
+适配器导出在请求时检查，convention scanner 不执行插件代码。
+
 
 Dashboard 代码在安装 Botmux 的系统用户权限边界内运行。不要把敏感配置渲染进页面或浏览器日志。
 

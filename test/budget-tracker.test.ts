@@ -222,6 +222,22 @@ describe('isBudgetHardStopped', () => {
     expect(isBudgetHardStopped('cli_a', { now: AUG, ledgerDir: dir, budget: cfg })).toBe(false);
   });
 
+  it('quarantines a corrupt state file and rebuilds the spend from the ledger', () => {
+    // Regression: a corrupt state file used to read as a zero-spend month and
+    // be overwritten by the next save, silently re-opening the hard stop.
+    const cfg = budget({ monthlyCny: 100, hardStop: true });
+    writeFileSync(join(dir, 'usage-2026-08-10.jsonl'), JSON.stringify({ larkAppId: 'cli_a', costCny: 150 }) + '\n');
+    trackBudgetSpend('cli_a', 150, { now: AUG, ledgerDir: dir, budget: cfg });
+    writeFileSync(stateFile(dir), '{not json');
+    _resetBudgetTrackerForTest();
+
+    expect(isBudgetHardStopped('cli_a', { now: AUG, ledgerDir: dir, budget: cfg })).toBe(true);
+    const quarantined = readdirSync(dir).filter(f => f.startsWith('budget-state-cli_a.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dir, quarantined[0]!), 'utf8')).toBe('{not json');
+    expect(JSON.parse(readFileSync(stateFile(dir), 'utf8')).spentCny).toBe(150);
+  });
+
   it('is false after the month rolls over', () => {
     const cfg = budget({ monthlyCny: 100, hardStop: true });
     trackBudgetSpend('cli_a', 150, { now: AUG, ledgerDir: dir, budget: cfg });

@@ -105,6 +105,8 @@ export function authorizeV3SessionRunMutationRequest(input: {
    * module free of the daemon's bot-registry dependency.
    */
   isScheduleOwnerAllowed?: (larkAppId: string, ownerOpenId: string) => boolean;
+  /** Exact daemon-owned in-flight registry check for auto-disabled one-shots. */
+  isScheduledTurnLive?: (turnId: string) => boolean;
 }): V3SessionRelayDecision {
   if (!isV3SessionRunMutation(input.mutation)) {
     return { ok: false, status: 404, error: 'unknown_mutation' };
@@ -186,6 +188,9 @@ export function authorizeV3SessionRunMutationRequest(input: {
       sessionLarkAppId: current.larkAppId,
       sessionChatId: current.chatId,
       isOwnerAllowed: gate,
+      ...(input.isScheduledTurnLive
+        ? { isScheduledTurnLive: input.isScheduledTurnLive }
+        : {}),
     });
     if ('error' in auth) {
       return {

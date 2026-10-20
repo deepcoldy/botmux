@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
 import { detectGlobalInstallManager } from '../src/utils/global-install.js';
+import { parseNpmPackJson } from '../scripts/parse-npm-pack-json.mjs';
 
 const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
 
@@ -19,8 +20,9 @@ const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
  * probe means the same thing on every npm major that ships it.
  */
 function parseNpmPackReport(stdout: string, packageName: string): { files: Array<{ path: string }> } {
-  const parsed = JSON.parse(stdout);
-  return Array.isArray(parsed) ? parsed[0] : parsed[packageName];
+  const rows = parseNpmPackJson(stdout) as Array<{ name?: string; files: Array<{ path: string }> }>;
+  const named = rows.find(row => row?.name === packageName);
+  return named ?? rows[0];
 }
 
 function runNodeScript(script: string, env: NodeJS.ProcessEnv) {
@@ -133,6 +135,8 @@ describe('package.json — lockfile safety and packaging', () => {
       expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
     }
     expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
+    expect(paths.filter(p => p.startsWith('public-api/'))).toEqual([]);
+    expect(manifest.exports).toBeUndefined();
     // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.
@@ -145,6 +149,15 @@ describe('package.json — lockfile safety and packaging', () => {
     expect(parseNpmPackReport(JSON.stringify([{ name: 'botmux', files }]), 'botmux').files).toEqual(files);
     // Object-keyed-by-name shape: npm 12+ — MEASURED on npm 12.0.1.
     expect(parseNpmPackReport(JSON.stringify({ botmux: { name: 'botmux', files } }), 'botmux').files).toEqual(files);
+    // Banner before the object (workflow-core scripts used to scan only for `^[`).
+    expect(parseNpmPackReport('notice\n{ "botmux": { "name": "botmux", "files": [] } }\n', 'botmux').files).toEqual([]);
+    // CI leftover: `prepare` reprints `[workflow-core] built …` into pack stdout.
+    // The opener `[` must NOT be taken as the JSON array (this is what broke the
+    // build job after the first dual-shape helper).
+    expect(parseNpmPackReport(
+      '[workflow-core] built 9 exports in /tmp/dist\n[\n  {"name":"botmux","filename":"x.tgz","files":[]}\n]\n',
+      'botmux',
+    )).toEqual({ name: 'botmux', filename: 'x.tgz', files: [] });
   });
 
   it('declares no entry point that the tarball does not contain', () => {
@@ -152,8 +165,24 @@ describe('package.json — lockfile safety and packaging', () => {
     // that lies about itself: `require('botmux')` would resolve and then fail on a
     // missing file. The package is a CLI delivered as a compiled binary, so it has
     // no library entry point at all.
-    expect(manifest.bin).toBeUndefined();
+    //
+    // `bin` IS set again (it was undefined between #1047 and the sh-launcher
+    // change), but only to a launcher this package actually ships. That is exactly
+    // the invariant this test is named after, so assert the invariant rather than
+    // the absence: every `bin` target must be a file inside `files`, and must not
+    // point into `dist/`. See the node-pty pin below for the shape that must NOT
+    // come back (`bin` → dist/cli.js, which needed a Node runtime + node-pty).
     expect(manifest.main).toBeUndefined();
+    const binTargets = Object.values((manifest.bin ?? {}) as Record<string, string>);
+    expect(binTargets).toEqual(['scripts/botmux-launcher.sh']);
+    for (const target of binTargets) {
+      expect(target.startsWith('dist/'), `${target} must not point into dist/`).toBe(false);
+      expect(
+        manifest.files.some((f: string) => f === target || f === 'scripts/' || f === 'scripts'),
+        `${target} is declared in bin but not shipped in files`,
+      ).toBe(true);
+      expect(existsSync(resolve(import.meta.dirname, '..', target)), `${target} missing on disk`).toBe(true);
+    }
   });
 
   it('ships the postinstall script in `files` (otherwise npm i -g fails hard)', () => {
@@ -576,13 +605,20 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     // pre-#1047 install reached the same unrunnable CLI with no `bin` involved —
     // that is the crash users hit on 3.18.7/3.18.8. `dist/` is out of `files` now
     // (asserted against real `npm pack` output above); keep BOTH pins.
+    //
+    // `bin` itself is back (sh launcher), so the pin can no longer be "bin is
+    // undefined". What must never come back is a `bin` that needs a NODE RUNTIME:
+    // the sh launcher `exec`s the platform binary directly and imports nothing.
     const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf-8')) as {
-      bin?: unknown;
+      bin?: Record<string, string>;
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
       optionalDependencies?: Record<string, string>;
     };
-    expect(manifest.bin).toBeUndefined();
+    for (const target of Object.values(manifest.bin ?? {})) {
+      expect(target.endsWith('.sh'), `bin ${target} must be the sh launcher, not a Node entry point`).toBe(true);
+      expect(target.startsWith('dist/'), `bin ${target} must not resolve into dist/`).toBe(false);
+    }
     // node-pty must be a devDependency and NOTHING else. It has an `install` script
     // and ships no linux prebuild, so ANY placement an end user's install would honor
     // (`dependencies` OR `optionalDependencies`) makes npm run node-gyp — measured:

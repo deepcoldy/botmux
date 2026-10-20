@@ -34,7 +34,7 @@ Compared to approaches like OpenClaw that are "rebuilt on top of an Agent SDK":
 - **Multi-bot collaboration** — Put multiple bots with different CLIs in one group, @ whoever you want to work, and have Claude Code and Codex review code together
 - **Persistent tmux sessions** — Restarting the daemon doesn't interrupt CLI processes
 - **Session adopt** — Adopt a CLI running in a local tmux into Lark with one click, and continue on another device
-- **Scheduled tasks** — Configure recurring tasks in natural language; they resume in the original topic when due
+- **Scheduled tasks** — Configure recurring tasks in natural language; group tasks default to chat top level, with explicit `--topic` support to continue in the original topic
 - **On-Call Mode** — Anchor a group to a project so anyone in the on-call group can @ for instant answers
 
 ➡️ Next: [5-minute quick setup](/en/quickstart)

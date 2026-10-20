@@ -196,6 +196,30 @@ export async function bindOncall(
 }
 
 /**
+ * PUT /api/groups/:chatId/name/:appId — rename a group through one explicit
+ * bot identity. The selected daemon validates membership and the Lark name.
+ */
+export async function renameGroup(
+  chatId: string,
+  appId: string,
+  bodyRaw: string,
+  deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(
+    appId,
+    `/api/groups/${encodeURIComponent(chatId)}/name`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: bodyRaw || '{}',
+    },
+  );
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/**
  * DELETE /api/groups/:chatId/oncall/:appId — unbind the per-(chat × bot)
  * oncall. Internal proxy path is `/api/oncall/:chatId` DELETE.
  */
@@ -207,6 +231,78 @@ export async function unbindOncall(
   const upstream = await deps.proxyToDaemon(
     appId, `/api/oncall/${encodeURIComponent(chatId)}`, { method: 'DELETE' },
   );
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Read-only single-chat topology probe through the named member bot's daemon. */
+export async function getChatModeForGroup(
+  chatId: string, appId: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-chat-mode/${encodeURIComponent(chatId)}`, { method: 'GET' });
+  const { text, json } = await parseUpstream(upstream);
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist (or clear with mode=inherit) the regular-group reply mode on the named group member bot. */
+export async function setReplyModeForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-reply-mode/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok === true) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist the inactivity policy on the named group member bot. */
+export async function setIdleCloseForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-idle-close/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok === true) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/**
+ * Persist the run-process card switch (same `noCardChats` state as the in-chat
+ * `/card off|on`) on the named group member bot. Silent: nothing is posted.
+ */
+export async function setCardModeForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-card-mode/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok === true) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist the FIFO switch on the named group member bot. */
+export async function setSerialInputForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-serial-input/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist the new-topic defaults on the named group member bot. */
+export async function setDefaultModelsForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-default-models/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
   const { text, json } = await parseUpstream(upstream);
   if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
   return { status: upstream.status, body: json ?? text };

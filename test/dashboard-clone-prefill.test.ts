@@ -106,3 +106,44 @@ describe('clone 目录形态：源目录不能被目标的默认值遮蔽', () =
     expect(effectiveDir(bot)).toBe('~');
   });
 });
+
+describe('clone native subagent runtime policy', () => {
+  it('copies the policy as behavior configuration', () => {
+    const nativeSubagentRuntime = {
+      model: { mode: 'custom', value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom', value: 'high' },
+    };
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', nativeSubagentRuntime },
+      { larkAppId: 'cli_target', larkAppSecret: 'target-secret' },
+    );
+    expect(cloned.nativeSubagentRuntime).toEqual(nativeSubagentRuntime);
+  });
+});
+
+describe('clone launch-mode fields', () => {
+  it('does not retain a target Forge launch mode when the source bot is plain CLI', () => {
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', cliId: 'codex' },
+      {
+        larkAppId: 'cli_target',
+        larkAppSecret: 'target-secret',
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      },
+    );
+
+    expect(cloned.cliId).toBe('codex');
+    expect(cloned.cliLaunchMode).toBeUndefined();
+  });
+
+  it('copies Forge x TraeX launch mode only when the source bot owns it', () => {
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', cliId: 'traex', cliLaunchMode: 'forge-traex' },
+      { larkAppId: 'cli_target', larkAppSecret: 'target-secret', cliId: 'codex' },
+    );
+
+    expect(cloned.cliId).toBe('traex');
+    expect(cloned.cliLaunchMode).toBe('forge-traex');
+  });
+});

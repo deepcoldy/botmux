@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildGrantCard, buildGrantResultCard, buildGrantNotifyCard } from '../src/im/lark/card-builder.js';
+import { buildGrantCard, buildGrantResultCard, buildGrantRequesterNoticeCard, buildQuotaExhaustedCard } from '../src/im/lark/card-builder.js';
 import { normalizeGrantQuotaOption } from '../src/services/grant-policy.js';
 
 function deepFind(node: any, predicate: (value: any) => boolean): any[] {
@@ -117,30 +117,9 @@ describe('buildGrantCard', () => {
     expect(normalizeGrantQuotaOption(quota.default_value)).toBe(1000);
   });
 
-  it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', ['ou_a', 'ou_b'], 'zh'));
-    const flat = JSON.stringify(card);
-    expect(flat).toContain('<at id=ou_a></at>');
-    expect(flat).toContain('<at id=ou_b></at>');
-  });
-
-  // 混合规则：bot grantee 有名字 → 纯文本（不 <at>，避免唤醒对方 bot 的 daemon 误拉空会话）；
-  // 真人 grantee → @ 点名（真人被 @ 不会自动开会话）。
-  it('buildGrantNotifyCard renders known-name bot grantees as PLAIN name (no <at>), humans as @', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', [
-      { openId: 'ou_human', name: '张三', isBot: false },
-      { openId: 'ou_codex', name: 'Codex', isBot: true },
-    ], 'zh'));
-    const flat = JSON.stringify(card);
-    expect(flat).toContain('<at id=ou_human></at>');   // 真人 → @
-    expect(flat).not.toContain('<at id=ou_codex');     // 有名字的 bot → 无 <at>
-    expect(flat).toContain('Codex');                   // 有名字的 bot → 纯文本名字
-  });
-
   // 名字缺失才退回 @ 兜底：飞书据 open_id 展示身份（远比裸 open_id 可读），代价=可能偶尔一次空会话（可接受）。
-  it('buildGrantNotifyCard bot grantee WITHOUT name falls back to @mention (no bare open_id)', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', [{ openId: 'ou_codex', isBot: true }], 'zh'));
-    const flat = JSON.stringify(card);
+  it('buildGrantResultCard bot grantee WITHOUT name falls back to @mention (no bare open_id)', () => {
+    const flat = buildGrantResultCard('chat', 'zh', undefined, undefined, [{ openId: 'ou_codex', isBot: true }]);
     expect(flat).toContain('<at id=ou_codex></at>');   // 无名字 → @ 兜底
   });
 
@@ -167,5 +146,104 @@ describe('buildGrantCard', () => {
     expect(buildGrantResultCard('deny', 'zh', undefined, undefined, [{ openId: 'ou_g', name: '张三' }]))
       .not.toContain('<at id=ou_g');  // deny 不 @
     expect(buildGrantResultCard('chat', 'zh')).not.toContain('<at');  // 无 targets 不 @
+  });
+});
+
+describe('grant request card forwarded to the approver DM', () => {
+  function byAction(json: string): Record<string, any> {
+    const actions = deepFind(JSON.parse(json), value => value?.tag === 'button');
+    return Object.fromEntries(actions.map((a: any) => [callbackValue(a).action, callbackValue(a)]));
+  }
+
+  it('dm_p2p: body names the requester without @owner, button says DM, value carries delivery', () => {
+    const json = buildGrantCard(
+      { ownerOpenId: 'ou_owner', targets: [{ openId: 'ou_g', name: '张三' }], chatId: 'oc_p2p', nonce: 'n1', mode: 'request', delivery: 'dm_p2p' },
+      'zh',
+    );
+    expect(json).toContain('张三');
+    expect(json).toContain('私聊中申请');
+    expect(json).not.toContain('<at id=ou_owner>');
+    expect(json).toContain('授权私聊对话');
+    const actions = byAction(json);
+    expect(actions.grant_chat).toMatchObject({ chat_id: 'oc_p2p', nonce: 'n1', delivery: 'dm_p2p' });
+    expect(actions.grant_deny).toMatchObject({ delivery: 'dm_p2p' });
+    expect(actions.grant_chat.chat_name).toBeUndefined();
+    // 自助申请仍然只给本会话授权，不提供全局授权
+    expect(actions.grant_global).toBeUndefined();
+  });
+
+  it('dm_group: body names the origin chat, value carries delivery + chat_name', () => {
+    const json = buildGrantCard(
+      { ownerOpenId: 'ou_owner', targets: [{ openId: 'ou_g', name: '张三' }], chatId: 'oc_g', nonce: 'n2', mode: 'request', delivery: 'dm_group', chatName: '值班群' },
+      'zh',
+    );
+    expect(json).toContain('值班群');
+    expect(json).toContain('授权该群对话');
+    expect(json).not.toContain('<at id=ou_owner>');
+    const actions = byAction(json);
+    expect(actions.grant_chat).toMatchObject({ chat_id: 'oc_g', delivery: 'dm_group', chat_name: '值班群' });
+    expect(actions.grant_global).toBeUndefined();
+  });
+
+  it('in-chat request card is unchanged: no delivery / chat_name in callback value', () => {
+    const json = buildGrantCard(
+      { ownerOpenId: 'ou_owner', targets: [{ openId: 'ou_g', name: '张三' }], chatId: 'oc_1', nonce: 'n3', mode: 'request' },
+      'zh',
+    );
+    const actions = byAction(json);
+    expect(actions.grant_chat.delivery).toBeUndefined();
+    expect(actions.grant_chat.chat_name).toBeUndefined();
+    expect(json).toContain('授权本群对话');
+  });
+
+  it('result card in the approver DM names the scope instead of "this chat"', () => {
+    const target = [{ openId: 'ou_g', name: '张三', isBot: false }];
+    const p2p = buildGrantResultCard('chat', 'zh', 3, undefined, target, { delivery: 'dm_p2p' });
+    expect(p2p).toContain('私聊');
+    expect(p2p).not.toContain('在本群');
+    const group = buildGrantResultCard('chat', 'zh', 3, undefined, target, { delivery: 'dm_group', chatName: '值班群' });
+    expect(group).toContain('值班群');
+    expect(group).not.toContain('在本群');
+    // global 与原文案一致
+    expect(buildGrantResultCard('global', 'zh', 3, undefined, target, { delivery: 'dm_p2p' })).toContain('全局授权');
+  });
+
+  it('requester notice: p2p has no @, group @s the human requester, deny carries no quota suffix', () => {
+    const human = [{ openId: 'ou_g', name: '张三', isBot: false }];
+    const grantedP2p = buildGrantRequesterNoticeCard('chat', 'dm_p2p', human, 'zh', 5);
+    expect(grantedP2p).not.toContain('<at');
+    expect(grantedP2p).toContain('5');
+    const deniedP2p = buildGrantRequesterNoticeCard('deny', 'dm_p2p', human, 'zh', 5);
+    expect(deniedP2p).toContain('未通过');
+    expect(deniedP2p).not.toContain('5 条');
+    const grantedGroup = buildGrantRequesterNoticeCard('chat', 'dm_group', human, 'zh');
+    expect(grantedGroup).toContain('<at id=ou_g></at>');
+    const deniedGroupBot = buildGrantRequesterNoticeCard('deny', 'dm_group', [{ openId: 'ou_bot', name: 'Codex', isBot: true }], 'zh');
+    expect(deniedGroupBot).not.toContain('<at id=ou_bot');
+    expect(deniedGroupBot).toContain('Codex');
+  });
+
+  it('en locale has every new key (no raw key leaks)', () => {
+    const jsons = [
+      buildGrantCard({ ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'A' }], chatId: 'oc', nonce: 'n', mode: 'request', delivery: 'dm_p2p' }, 'en'),
+      buildGrantCard({ ownerOpenId: 'ou_o', targets: [{ openId: 'ou_g', name: 'A' }], chatId: 'oc', nonce: 'n', mode: 'request', delivery: 'dm_group', chatName: 'G' }, 'en'),
+      buildGrantResultCard('chat', 'en', 1, undefined, [{ openId: 'ou_g', name: 'A' }], { delivery: 'dm_p2p' }),
+      buildGrantResultCard('chat', 'en', 1, undefined, [{ openId: 'ou_g', name: 'A' }], { delivery: 'dm_group', chatName: 'G' }),
+      buildGrantRequesterNoticeCard('chat', 'dm_p2p', [{ openId: 'ou_g' }], 'en'),
+      buildGrantRequesterNoticeCard('deny', 'dm_p2p', [{ openId: 'ou_g' }], 'en'),
+      buildGrantRequesterNoticeCard('deny', 'dm_group', [{ openId: 'ou_g' }], 'en'),
+    ];
+    for (const j of jsons) expect(j).not.toMatch(/card\.grant\./);
+  });
+});
+
+describe('buildQuotaExhaustedCard — auto re-apply wording', () => {
+  it('default keeps "ask the owner to /grant"; autoReapply says the next message re-applies automatically', () => {
+    const legacy = buildQuotaExhaustedCard('ou_g', 3, 'zh');
+    expect(legacy).toContain('/grant');
+    const reapply = buildQuotaExhaustedCard('ou_g', 3, 'zh', true);
+    expect(reapply).toContain('自动向 Bot 管理员申请');
+    expect(reapply).not.toContain('/grant');
+    expect(buildQuotaExhaustedCard('ou_g', 3, 'en', true)).not.toMatch(/quota\.exhausted/);
   });
 });

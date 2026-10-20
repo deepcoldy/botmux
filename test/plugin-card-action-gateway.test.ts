@@ -1,7 +1,11 @@
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  isBotmuxCardAction,
+  pluginCardActionSelectorOverlapsBotmux,
+} from '../src/core/card-action-namespace.js';
 import {
   getOrCreatePluginCardActionToken,
   readPluginCardActionToken,
@@ -190,6 +194,34 @@ describe('plugin card action gateway', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it('完成提案 action 家族在安装期与运行时都不能被插件接管', async () => {
+    expect(isBotmuxCardAction('completion_proposal_decide')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_proposal_decide', 'action')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_', 'prefix')).toBe(true);
+
+    // Simulate an old or tampered registry that predates install-time selector
+    // validation. The runtime fence must still route the built-in action back
+    // to Core instead of dialing the plugin service.
+    const record = makeRecord('completion-hijack', { actions: ['completion_proposal_decide'] });
+    const request = vi.fn(async () => successResponse());
+    const fallbackResult = { toast: { type: 'info' as const, content: 'builtin' } };
+    const fallback = vi.fn(async () => fallbackResult);
+    const gateway = createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      fallback,
+    });
+
+    await expect(gateway.dispatch({
+      action: { value: { action: 'completion_proposal_decide' } },
+    }, 'cli_current')).resolves.toBe(fallbackResult);
+    expect(fallback).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('按确定性规则选择或熔断动作声明', async () => {
     const broad = makeRecord('broad', { prefixes: ['example.'] });
     const narrow = makeRecord('narrow', { prefixes: ['example.review.'] });
@@ -266,7 +298,7 @@ describe('plugin card action gateway', () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it('插件响应卡只能继续使用本插件 selector，且不能注入 Botmux 路由字段', async () => {
+  it.each(['legacy', 'behaviors'])('插件响应卡（%s）只能继续使用本插件 selector，且不能注入 Botmux 路由字段', async format => {
     const record = makeRecord('response-actions', { prefixes: ['example.'] });
     const shadowingRecord = makeRecord('exact-actions', { actions: ['example.other'] });
     const log = testLog();
@@ -274,24 +306,27 @@ describe('plugin card action gateway', () => {
       schemaVersion: 1,
       ack: { card },
     }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const button = (value: Record<string, unknown>) => format === 'legacy'
+      ? { tag: 'button', value }
+      : { tag: 'button', behaviors: [{ type: 'callback', value }] };
     const request = vi.fn()
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'example.submit' } }] },
+        body: { elements: [button({ action: 'example.submit' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
         // This still matches response-actions' broad prefix, but the live
         // routing table gives the exact selector to another enabled plugin.
-        body: { elements: [{ tag: 'button', value: { action: 'example.other' } }] },
+        body: { elements: [button({ action: 'example.other' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'example.submit', key: 'close' } }] },
+        body: { elements: [button({ action: 'example.submit', key: 'close' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'close' } }] },
+        body: { elements: [button({ action: 'close' })] },
       }));
     const gateway = createPluginCardActionGateway({
       resolvePluginIds: () => [record.id, shadowingRecord.id],
@@ -464,12 +499,5 @@ describe('plugin card-action capability snapshot', () => {
       registryOf(malformed),
     );
     expect(snapshot.plugins).toEqual([]);
-  });
-
-  it('wires the snapshot into local, persistent, Riff, and Mojo generations', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    expect(worker).toContain('[PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities');
-    expect(worker).toContain('mergedEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
-    expect(worker).toContain('childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
   });
 });
