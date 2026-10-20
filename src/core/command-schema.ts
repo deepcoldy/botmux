@@ -206,6 +206,18 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
+/** 一条命令的 **CLI 限定值** 是否匹配当前会话 CLI：字符串精确相等，数组命中其一。
+ *  调用方负责先判空——`cliId === undefined` 是全局命令（不排除任何 CLI），
+ *  语义不是「匹配某 CLI」。路由闸与原生 slash 面板目录共用这一个口径。 */
+export function commandCliIdMatches(
+  specCliId: string | readonly string[],
+  cliId: string | undefined,
+): boolean {
+  return typeof specCliId === 'string'
+    ? specCliId === cliId
+    : specCliId.includes(cliId ?? '');
+}
+
 const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId && !s.claimWithoutSessionOnly);
 
 /** 所有 CLI 都由 botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
