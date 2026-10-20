@@ -123,9 +123,8 @@ describe('index-dashboard.ts — Dashboard PM2 entry', () => {
  * 扩散»). ~/.botmux/.env is a general operator file: it commonly holds the
  * legacy single-bot LARK_APP_SECRET, GitHub tokens, model API keys and
  * whatever else the host needs. The dashboard used to dotenv the whole thing
- * into process.env — and it forks debug-terminal shells, `botmux
- * start-bot/stop-bot`, a global npm/pnpm/bun install (arbitrary lifecycle
- * scripts!), herdr plugin installs and plugin PM2 services, all of which
+ * into process.env — and it forks `botmux start-bot/stop-bot`, a global
+ * npm/pnpm/bun install (arbitrary lifecycle scripts!), herdr plugin installs and plugin PM2 services, all of which
  * inherit that environment. Only keys with a named dashboard consumer may
  * cross into the process.
  */
@@ -152,6 +151,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     'BOTMUX_PUBLIC_URL=https://botmux.example.com',
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH=/var/lib/botmux/audit.ndjson',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS=300000',
+    'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+    'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED=true',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID=cli_h5app',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET=h5-app-secret',
@@ -176,6 +177,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     expect(env.BOTMUX_PUBLIC_URL).toBe('https://botmux.example.com');
     expect(env.BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH).toBe('/var/lib/botmux/audit.ndjson');
     expect(env.BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS).toBe('300000');
+    expect(env.BOTMUX_GLOBAL_CONFIG_FILE).toBe('/mnt/shared/global-config.json');
+    expect(env.BOTMUX_GROUP_CONTEXT_SETTINGS_FILE).toBe('/mnt/shared/group-context-settings.json');
     // The dashboard IS the H5 family's only legitimate consumer — this entry
     // point exists to deliver it (resolveDashboardH5AuthConfig reads it).
     expect(env.BOTMUX_DASHBOARD_FEISHU_H5_ENABLED).toBe('true');

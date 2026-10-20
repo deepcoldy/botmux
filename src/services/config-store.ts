@@ -11,6 +11,10 @@ import {
   assertChangedBotConfigInvariants,
   botConfigInvariantError,
 } from './bot-config-invariants.js';
+import {
+  assertDurableConfigMutationAllowed,
+  runDurableConfigMutation,
+} from './durable-config-mutation.js';
 export { botConfigInvariantError } from './bot-config-invariants.js';
 export type { BotConfigInvariantError } from './bot-config-invariants.js';
 
@@ -21,6 +25,7 @@ export async function readRawConfig(path: string): Promise<any[]> {
 }
 
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
+  assertDurableConfigMutationAllowed('bots');
   let previous: any[] = [];
   try { previous = await readRawConfig(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   assertCodexInstanceConfigWrite(previous, raw);
@@ -50,27 +55,31 @@ export function requireConfigPath(): string {
  */
 export async function rmwBotEntry<T>(
   larkAppId: string,
-  mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T,
+  mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T | Promise<{ write: boolean; result: T } | T>,
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
   const path = requireConfigPath();
-  return withFileLock(path, async () => {
-    const raw = await readRawConfig(path);
-    const idx = findEntryIndex(raw, larkAppId);
-    if (idx < 0) return { ok: false, reason: 'bot_not_in_config' };
-    const entry = raw[idx];
-    const out = mutate(entry, raw);
-    if (out && typeof out === 'object' && 'write' in (out as any)) {
-      const wrap = out as { write: boolean; result: T };
-      if (wrap.write) {
-        const invariantError = botConfigInvariantError(entry);
-        if (invariantError) return { ok: false, reason: invariantError };
-        await writeRawConfigAtomic(path, raw);
+  return runDurableConfigMutation({
+    scope: 'bots',
+    path,
+    mutation: () => withFileLock(path, async () => {
+      const raw = await readRawConfig(path);
+      const idx = findEntryIndex(raw, larkAppId);
+      if (idx < 0) return { ok: false as const, reason: 'bot_not_in_config' };
+      const entry = raw[idx];
+      const out = await mutate(entry, raw);
+      if (out && typeof out === 'object' && 'write' in (out as any)) {
+        const wrap = out as { write: boolean; result: T };
+        if (wrap.write) {
+          const invariantError = botConfigInvariantError(entry);
+          if (invariantError) return { ok: false as const, reason: invariantError };
+          await writeRawConfigAtomic(path, raw);
+        }
+        return { ok: true as const, result: wrap.result };
       }
-      return { ok: true, result: wrap.result };
-    }
-    const invariantError = botConfigInvariantError(entry);
-    if (invariantError) return { ok: false, reason: invariantError };
-    await writeRawConfigAtomic(path, raw);
-    return { ok: true, result: out as T };
+      const invariantError = botConfigInvariantError(entry);
+      if (invariantError) return { ok: false as const, reason: invariantError };
+      await writeRawConfigAtomic(path, raw);
+      return { ok: true as const, result: out as T };
+    }),
   });
 }

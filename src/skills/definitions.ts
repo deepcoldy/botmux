@@ -564,6 +564,8 @@ EOF
 
 \`--card-file <path>\` 或 \`--card-json '<json>'\` 直接发送 interactive card JSON。输入既可以是直接卡片对象（如 \`{"schema":"2.0",...}\`），也可以是 webhook/openapi 形态 \`{"msg_type":"interactive","card":{...}}\` 或 \`{"msg_type":"interactive","content":"{...}"}\`。
 
+**自定义卡片作为最终答复**：当前会话内用 \`botmux send --card-file "$TMPDIR/card.json" --response-kind final --mention-back\`。必须是 schema 2.0、包含 body.elements；保留原卡头、多列、折叠区等排版，宿主在**同一张卡**上添加最终签名及已配置的反馈控件，复用本轮回复卡和最终交付记录。不要再补一条普通 final 收尾消息。卡片不能占用 \`botmux_\` 前缀元素 ID；不支持与跨群/顶层发送或 \`--completion-proposal-file\` 混用。普通进度卡仍不加最终签名/反馈；宿主托管的 final 卡不要用 \`card patch\` 覆盖，以免破坏反馈与轮次状态。
+
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash

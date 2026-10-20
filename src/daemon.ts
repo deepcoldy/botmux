@@ -26,6 +26,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import {
+  globalConfigPath,
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
@@ -125,11 +126,26 @@ import {
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
   claimDurableLarkActiveSession,
+  listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { requestDurableSessionControl } from './services/durable-session-control-request.js';
+import {
+  createDurableGroupContextRecallFacade,
+  readDurableGroupContextRecalls,
+  recordDurableGroupContextRecall,
+} from './services/durable-group-context-recall.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
-import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
+import {
+  durableDirectSessionControlEvent,
+  durableLarkSessionControlPartitionPrefix,
+} from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -193,11 +209,13 @@ import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
-import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
   setDurableSessionSendHandler(null);
+  setDurableSessionLifecycleHandler(null);
+  setDurableSessionListHandler(null);
 }
 
 interface ScheduleRunLogErrorDetails {
@@ -360,7 +378,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -438,6 +456,10 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
+import {
+  appendDurablePrimaryInputCommit,
+  durablePrimaryExistingTurnDisposition,
+} from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
@@ -687,7 +709,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -737,6 +759,8 @@ import {
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
+  listPendingAsksByAnchor,
+  askAnswerActorFor,
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
@@ -747,6 +771,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -7705,6 +7730,17 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   let body: any;
   try { body = await readJsonBody(req, 32 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' }); }
+  const remoteRunnerSessionTool = body?.remoteRunnerSessionTool === true;
+  if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  const remoteRunnerControllerOpenId = body?.remoteRunnerControllerOpenId;
+  if (remoteRunnerControllerOpenId !== undefined
+      && (!remoteRunnerSessionTool
+        || typeof remoteRunnerControllerOpenId !== 'string'
+        || !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
@@ -7723,6 +7759,13 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && caller.requestLarkAppId === ds.larkAppId
     && !!caller.requestUserOpenId
     && getDashboardAdminOpenIds(ds.larkAppId).includes(caller.requestUserOpenId);
+  const providerActor = !!ds && trustedHost && remoteRunnerSessionTool
+    && caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId
+    && typeof remoteRunnerControllerOpenId === 'string';
+  if (remoteRunnerControllerOpenId && !providerActor) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
+  }
   const action = body.action;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
@@ -7738,12 +7781,44 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   const appId = ds?.larkAppId ?? selfDaemonLarkAppId;
   if (!appId) return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_daemon_unbound' });
+  const authority = scheduleAuthorityStore.getRecord(appId, id);
+  let providerActorAdmin = false;
+  if (providerActor) {
+    const providerTurnId = ds!.managedTurnOrigin?.turnId;
+    const providerGeneration = ds!.workerGeneration;
+    const providerCapability = ds!.managedTurnOrigin?.capability;
+    if (!providerTurnId || providerGeneration === undefined || !providerCapability
+      || !authority || authority.kind !== 'direct'
+      || authority.task.chatId !== ds!.chatId
+      || authority.controlOpenId !== remoteRunnerControllerOpenId
+      || !getDashboardAdminOpenIds(ds!.larkAppId).includes(remoteRunnerControllerOpenId)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_operator_denied' });
+    }
+    const controlUnionId = await resolveUnionIdFromOpenId(
+      ds!.larkAppId,
+      remoteRunnerControllerOpenId,
+    ) ?? undefined;
+    if (!controlUnionId || authority.controlUnionId !== controlUnionId
+      || (ds!.chatType === 'group'
+        && !(await listChatMemberOpenIds(ds!.larkAppId, ds!.chatId))
+          .includes(remoteRunnerControllerOpenId))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_operator_denied' });
+    }
+    const currentCaller = scheduleCallerForTurn(ds!, providerTurnId);
+    if (ds!.managedTurnOrigin?.turnId !== providerTurnId
+      || ds!.managedTurnOrigin?.capability !== providerCapability
+      || ds!.workerGeneration !== providerGeneration
+      || currentCaller?.senderType !== 'bot'
+      || currentCaller.requestLarkAppId !== ds!.larkAppId) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_mutation_turn_changed' });
+    }
+    providerActorAdmin = true;
+  }
   const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
     && (action === 'pause' || action === 'remove');
-  if (!hostAdmin && !currentHumanAdmin && !potentialScheduledSelfManager) {
+  if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
-  const authority = scheduleAuthorityStore?.getRecord(appId, id);
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
   if (potentialScheduledSelfManager && action === 'remove' && authority.state === 'revoked') {
     return jsonRes(res, 200, { ok: true, replay: true });
@@ -8038,6 +8113,10 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+export function __testOnly_setScheduleAuthorityStore(store: ScheduleAuthorityStore | null): ScheduleAuthorityStore | null {
+  const previous = scheduleAuthorityStore; scheduleAuthorityStore = store; return previous;
+}
+
 const explicitAskContinuation = createExplicitAskContinuation({
   dir: join(config.session.dataDir, 'explicit-ask-receipts'),
   get appId() { return selfDaemonLarkAppId ?? ''; },
@@ -8061,6 +8140,44 @@ const explicitAskContinuation = createExplicitAskContinuation({
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
+
+/** Resolve once at registration; delivery must not consult evictable replyTargets
+ * or mutable lastCallerOpenId. Autonomous asks use the existing canTalk policy. */
+function asyncAskAudience(ds: DaemonSession, originTurnId: string | undefined):
+  { kind: 'human'; answererOpenId: string } | { kind: 'shared' } | { kind: 'silent' } | { kind: 'unavailable' } {
+  const taskId = originTurnId ? parseScheduledTurnId(originTurnId) : null;
+  if (taskId) {
+    const task = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId)?.task;
+    if (!task || (task.larkAppId && task.larkAppId !== ds.larkAppId)
+      || !scheduleStore.effectiveScheduleChatIds(task).includes(ds.chatId)) return { kind: 'unavailable' };
+    // silent means no IM side effects, including unsolicited interactive cards.
+    if (task.silent) return { kind: 'silent' };
+    const owner = task.ownerOpenId ?? ds.session.ownerOpenId;
+    return owner && canOperate(ds.larkAppId, ds.chatId, owner)
+      ? { kind: 'shared' } : { kind: 'unavailable' };
+  }
+  const frozen = originTurnId ? pickTurnReplyTarget(ds.session, originTurnId) : undefined;
+  const sender = frozen?.senderOpenId;
+  const botSender = sender && (ds.session.turnReplyContexts?.[originTurnId ?? '']?.replyTargetSenderIsBot
+    || (ds.session.quoteTargetId === originTurnId && ds.session.quoteTargetSenderIsBot) || frozen?.participants?.some(p => p.openId === sender && p.isBot)
+    || isKnownPeerBot(config.session.dataDir, ds.larkAppId, sender));
+  // Human-origin cards use the same talk policy as ordinary input and Ask clicks.
+  // This only admits registration; the answerer remains frozen to this sender.
+  if (sender && !botSender) return evaluateAskAnswerTalk(ds.larkAppId, ds.chatId, sender, ds.chatType)
+    ? { kind: 'human', answererOpenId: sender } : { kind: 'unavailable' };
+  // A missing human turn's exact identity must not be reassigned to its owner.
+  if (originTurnId?.startsWith('om_') && !sender) return { kind: 'unavailable' };
+  return ds.session.ownerOpenId && canOperate(ds.larkAppId, ds.chatId, ds.session.ownerOpenId)
+    ? { kind: 'shared' } : { kind: 'unavailable' };
+}
+
+async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: string | undefined, text: string): Promise<void> {
+  try {
+    await sessionReply(sessionAnchorId(ds), [...text].slice(0, 6000).join(''), 'text', ds.larkAppId, turnId, {
+      replyTarget: root ? { mode: 'thread', rootMessageId: root } : { mode: 'plain', chatId: ds.chatId },
+    });
+  } catch (error) { logger.warn(`[ask:${ds.session.sessionId}] could not show async question notice: ${String(error)}`); }
+}
 
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
@@ -8160,11 +8277,9 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   // 是 p2p（否则 checker 只有 chatId，p2pOpen 腿 fail-closed，对方点不动按钮）。
   // 必须从 capability 已认证的 session 取，不能信任请求体里的 larkAppId/chatId。
   const askChatType = askSession?.chatType;
-  if (!askChatType) {
-    // 查不到会话 → chatType 缺省 → p2pOpen 腿 fail-closed（答复权退回原语义）。不致命，但
-    // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
-    logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
-  }
+  const documentSource = typeof body.originTurnId === 'string'
+    ? askSession?.session.docCommentTargets?.[body.originTurnId] : undefined;
+  const asyncDocumentTarget = documentSource ? { ...documentSource } : undefined;
   let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
   const askGeneration = askSession && captureRoutingGeneration(askSession);
   const askWorker = askSession?.worker;
@@ -8186,20 +8301,57 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
     });
   }
+  const asyncInput = boundAsk.asyncUserInput;
+  const asyncWorker = askSession?.worker;
+  const asyncGeneration = askSession?.session.workerGeneration;
+  const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  const audience = asyncInput && askSession
+    ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
+      : asyncAskAudience(askSession, asyncOriginTurn)
+    : undefined;
+  const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
+  const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
+    ? body.originTurnId : askSession?.session.rootMessageId;
+  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed
+    || !isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
+    || askSession.session.cliSessionId !== asyncInput.threadId)) {
+    if (askSession && audience?.kind !== 'silent') await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+      tr('card.ask.async_unavailable', undefined, localeForBot(askSession.larkAppId)));
+    return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+  }
+  if (asyncInput && askSession) {
+    if (audience?.kind === 'silent') return jsonRes(res, 200, { kind: 'invalidated', reason: 'silent_schedule', selected: null, by: null, comment: null, timedOut: false });
+    if (audience?.kind === 'unavailable' || boundAsk.asyncFailure) {
+      await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+        tr(boundAsk.asyncFailure === 'limit' ? 'card.ask.async_limit'
+          : boundAsk.asyncFailure === 'invalid_questions' ? 'card.ask.async_invalid' : 'card.ask.async_unavailable',
+          undefined, localeForBot(askSession.larkAppId))
+        + (boundAsk.asyncFailure === 'invalid_questions' ? '' : '\n' + boundAsk.questions.map(q => q.prompt).join('\n')));
+      return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+    }
+  }
+  if (!askChatType) {
+    // 查不到会话 → chatType 缺省 → p2pOpen 腿 fail-closed（答复权退回原语义）。不致命，但
+    // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
+    logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
+  }
   const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    replyCardTarget: documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
+    // Async asks outlive their originating reply card; document asks are delivered privately.
+    replyCardTarget: asyncInput || documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
     deliveryTarget: documentDelivery,
-    ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
+    ...((documentDelivery?.openId ?? asyncCaller)
+      ? { answererOpenId: documentDelivery?.openId ?? asyncCaller } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -8218,6 +8370,74 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     ? await explicitAskContinuation.wait(explicitInput)
     : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
+
+  if (asyncInput && askSession && result.kind === 'answered') {
+    const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession
+      && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
+      && askSession.session.workerGeneration === asyncGeneration
+      && askSession.session.cliSessionId === asyncInput.threadId;
+    const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
+      isCurrent,
+      deliver: async (text, by) => {
+        const actor = askAnswerActorFor(result);
+        const byIsBot = actor?.botSender === true || isKnownPeerBot(config.session.dataDir, askSession.larkAppId, by);
+        const byType = byIsBot ? true : actor ? (actor.senderType === 'user' ? false : undefined) : false;
+        const sender = await resolveSender(askSession.larkAppId, by, byIsBot ? 'bot' : 'user');
+        // Never send an old card's answer into a replacement runner, another
+        // native thread or another principal's active session after this await.
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
+        const turnId = `codex-async-answer-${randomUUID()}`;
+        const bot = getBot(askSession.larkAppId);
+        askSession.session.quoteTargetId = asyncOriginMessageId;
+        askSession.session.quoteTargetSenderOpenId = by;
+        askSession.session.quoteTargetSenderIsBot = byIsBot;
+        beginReplyTargetTurn(askSession, boundAsk.rootMessageId ?? undefined, turnId, new Date().toISOString(), {
+          senderOpenId: by, participants: [{ openId: by, isBot: byIsBot }], inThread: !!boundAsk.rootMessageId,
+        });
+        const input = buildFollowUpCliInput(text, boundAsk.sessionId, {
+          cliId: 'codex-app', sender, codexAppText: text,
+          larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
+          selfMention: { name: bot.botName, openId: bot.botOpenId },
+          sessionBackendType: askSession.session.backendType,
+          promptInjection: sessionPromptInjection(askSession), turnId,
+        });
+        if (documentDelivery && asyncDocumentTarget) {
+          // The originating turn can finish and consume its comment route while
+          // this card is pending. The answer's new turn must retain that route,
+          // never inherit a later comment's recipient or reaction cleanup.
+          (askSession.session.docCommentTargets ??= {})[turnId] = {
+            fileToken: asyncDocumentTarget.fileToken, fileType: asyncDocumentTarget.fileType,
+            commentId: asyncDocumentTarget.commentId, replyToOpenId: documentDelivery.openId,
+            replyToName: asyncDocumentTarget.replyToName, turnId,
+          };
+        }
+        // Use the same accepted-input ledger and serial FIFO as human messages.
+        // A live turn is allowed to finish; its answer then starts a new turn in
+        // the SAME native thread, with its own Botmux delivery identity.
+        await noteTurnReceived(askSession, turnId, text, sender, turnId);
+        if (!isCurrent()) return false;
+        if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, actor?.memberUnionId, byType) })) return false;
+        beginNewTurn(askSession, '异步提问答复', turnId);
+        rememberLastCliInput(askSession, text, input);
+        markSessionActivity(askSession);
+        sessionStore.updateSession(askSession.session);
+        logger.info(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer admitted as ${turnId}`);
+        return true;
+      },
+    });
+    if (!delivered) {
+      logger.warn(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer not delivered: session changed`);
+      await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+        tr('card.ask.async_not_delivered', undefined, localeForBot(askSession.larkAppId)));
+      return jsonRes(res, 409, { ok: false, error: 'async_answer_not_delivered' });
+    }
+  }
+
+  if (asyncInput && askSession && (result.kind === 'timedOut' || result.kind === 'invalidated')) {
+    await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+      tr('card.ask.async_ended', undefined, localeForBot(askSession.larkAppId)));
+  }
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
@@ -18966,7 +19186,12 @@ function scheduleQueuedActivationTailReleaseRetry(
 async function admitFollowerBehindOpening(
   ds: DaemonSession,
   reservation: QueuedActivationTailReservation,
-  follower: { userPrompt: string; turnId: string; build: () => Promise<CliTurnPayload> },
+  follower: {
+    userPrompt: string;
+    turnId: string;
+    dispatchAttempt?: number;
+    build: () => Promise<CliTurnPayload>;
+  },
 ): Promise<void> {
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
@@ -18974,6 +19199,9 @@ async function admitFollowerBehindOpening(
       userPrompt: follower.userPrompt,
       cliInput,
       turnId: follower.turnId,
+      ...(follower.dispatchAttempt !== undefined
+        ? { dispatchAttempt: follower.dispatchAttempt }
+        : {}),
     }, reservation);
     if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
       scheduleQueuedActivationTailReleaseRetry(ds);
@@ -22690,6 +22918,107 @@ function markIngressAdmitted(ctx: RoutingContext): void {
   else ctx.ingressAdmission = { admitted: true };
 }
 
+const DURABLE_PRIMARY_INPUT_COMMIT_LIMIT = 64;
+const DURABLE_PRIMARY_INPUT_COMMIT_TIMEOUT_MS = 60_000;
+type DurablePrimaryInputCommitWaiter = {
+  resolve(): void;
+  reject(error: Error): void;
+  timer: NodeJS.Timeout;
+  signal: AbortSignal;
+  onAbort(): void;
+};
+const durablePrimaryInputCommitWaiters = new Map<
+  string,
+  Set<DurablePrimaryInputCommitWaiter>
+>();
+
+function durablePrimaryInputCommitKey(sessionId: string, turnId: string): string {
+  return `${sessionId}:${turnId}`;
+}
+
+function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolean {
+  return ds.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId) === true;
+}
+
+function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
+  if (!ctx.durablePrimaryDispatch) return false;
+  ctx.ingressAdmission ??= { admitted: false };
+  ctx.ingressAdmission.retryReason = reason;
+  return true;
+}
+
+function recordDurablePrimaryInputCommit(
+  ds: DaemonSession,
+  receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+  workerGeneration: number,
+): void {
+  if (!receipt.durablePrimaryInbox) return;
+  const previous = ds.session.durablePrimaryInputCommits ?? [];
+  const appended = appendDurablePrimaryInputCommit(previous, {
+    turnId: receipt.turnId,
+    workerGeneration,
+    committedAt: new Date().toISOString(),
+    ...(receipt.dispatchAttempt !== undefined
+      ? { dispatchAttempt: receipt.dispatchAttempt }
+      : {}),
+  }, DURABLE_PRIMARY_INPUT_COMMIT_LIMIT);
+  if (appended.added) {
+    ds.session.durablePrimaryInputCommits = appended.history;
+    sessionStore.updateSession(ds.session);
+  }
+  const key = durablePrimaryInputCommitKey(ds.session.sessionId, receipt.turnId);
+  const waiters = durablePrimaryInputCommitWaiters.get(key);
+  if (!waiters) return;
+  durablePrimaryInputCommitWaiters.delete(key);
+  for (const waiter of waiters) {
+    clearTimeout(waiter.timer);
+    waiter.signal.removeEventListener('abort', waiter.onAbort);
+    waiter.resolve();
+  }
+}
+
+export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
+
+function waitForDurablePrimaryInputCommit(
+  ds: DaemonSession,
+  turnId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (hasDurablePrimaryInputCommit(ds, turnId)) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const key = durablePrimaryInputCommitKey(ds.session.sessionId, turnId);
+    const settle = (): void => {
+      const waiters = durablePrimaryInputCommitWaiters.get(key);
+      waiters?.delete(waiter);
+      if (waiters?.size === 0) durablePrimaryInputCommitWaiters.delete(key);
+      clearTimeout(waiter.timer);
+      signal.removeEventListener('abort', waiter.onAbort);
+    };
+    const waiter: DurablePrimaryInputCommitWaiter = {
+      resolve() { settle(); resolve(); },
+      reject(error) { settle(); reject(error); },
+      timer: setTimeout(() => {
+        waiter.reject(new Error(`durable primary provider submit receipt timed out for ${turnId}`));
+      }, DURABLE_PRIMARY_INPUT_COMMIT_TIMEOUT_MS),
+      signal,
+      onAbort() {
+        waiter.reject(signal.reason instanceof Error
+          ? signal.reason
+          : new Error('durable primary Inbox claim was aborted'));
+      },
+    };
+    waiter.timer.unref?.();
+    const waiters = durablePrimaryInputCommitWaiters.get(key) ?? new Set();
+    waiters.add(waiter);
+    durablePrimaryInputCommitWaiters.set(key, waiters);
+    if (signal.aborted) waiter.onAbort();
+    else signal.addEventListener('abort', waiter.onAbort, { once: true });
+    // An IPC callback may have persisted the marker between the first check
+    // and waiter registration. Re-check after publication to close that race.
+    if (hasDurablePrimaryInputCommit(ds, turnId)) waiter.resolve();
+  });
+}
+
 function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableLarkOutboxTarget {
   const target = frozenReplyContextForTurn(ds, turnId).target;
   return target.mode === 'plain'
@@ -25653,7 +25982,13 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
+    const ambiguous = candidates.length > 1 && candidates.some(ask => ask.originKind === CODEX_ASYNC_ASK_ORIGIN);
+    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
+    if (ambiguous && !quoted) {
+      await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    }
     if (pendingAsk) {
       const hostChoiceText = askCandidate.text.trim();
       const hostChoiceAllowsText = pendingAsk.originKind === 'host_cross_principal_classification'
@@ -25680,6 +26015,8 @@ async function handleThreadReplyAdmitted(
         // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
         // to the plain evaluateTalk(openId, chatType).
         actor: {
+          senderType: senderIsBotTriState(parsed.senderType, isForeignBot) === true ? 'bot'
+            : parsed.senderType === 'user' ? 'user' : undefined,
           botSender: isBotSenderType || isForeignBot,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId,
@@ -25704,6 +26041,84 @@ async function handleThreadReplyAdmitted(
     && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
+  }
+  // Durable-primary rows remain the authoritative FIFO while another turn is
+  // active. Do this before native-topic mutation, quota/resource awaits,
+  // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
+  // retry must be a pure claim-state transition.
+  if (ds && ctx.durablePrimaryDispatch) {
+    const disposition = durablePrimaryExistingTurnDisposition({
+      session: ds.session,
+      worker: ds.worker,
+      cliReady: ds.cliReady,
+      activeInteractiveTurn: ds.activeInteractiveTurn,
+      // Durable queued-activation state is recovery INPUT, not proof that a
+      // live handler already owns this dead worker's generation. Let the cold
+      // path below replay that exact journal. Only a pending repository choice
+      // or another handler's live claim token blocks this refork boundary.
+      workerStartBlocker: ds.pendingRepo === true
+        ? 'pending-repo'
+        : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
+          ? 'in-flight-claim'
+          : undefined,
+    }, parsed.messageId);
+    if (disposition === 'committed') {
+      const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+      markSessionActivity(ds, Date.now(), {
+        human: parsed.senderType === 'user' && !isForeignBot,
+      });
+      const nativeTopicChanged = fillNativeTopicId(ds.session, scope, parsed.threadId);
+      if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
+      ds.session.quoteTargetSenderOpenId = callerOpenId;
+      ds.session.quoteTargetSenderIsBot = isForeignBot;
+      const substituteReplyMode = substituteTrigger
+        ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+        : 'thread';
+      const postAt = prepared?.postParticipantMentions
+        ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+      const window = buildTurnParticipants(
+        larkAppId,
+        callerOpenId,
+        senderIsBotTriState(parsed.senderType, isForeignBot),
+        parsed.mentions,
+        undefined,
+        postAt,
+      );
+      beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+        quoteOnly: substituteReplyMode === 'quote',
+        substitute: !!substituteTrigger,
+        senderOpenId: callerOpenId,
+        participants: window.participants,
+        participantsIncomplete: window.incomplete,
+        inThread: !!parsed.threadId,
+        foldedRootId: ctx.foldedRootId,
+        sourceMessageId: parsed.messageId,
+      });
+      if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
+      publishLastInputFromBotPatch(ds);
+      if (ds.session.vcMeetingReceiver) {
+        ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
+        if (ctx.vcMeetingImTurnOrigin) {
+          rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
+        }
+      }
+      sessionStore.updateSession(ds.session);
+      if (nativeTopicChanged) publishNativeTopicLinkPatch(ds);
+      markIngressAdmitted(ctx);
+      logger.info(
+        `[${tag(ds)}] Reused durable-primary provider submit proof for `
+        + `${parsed.messageId.slice(0, 12)}`,
+      );
+      return;
+    }
+    if (disposition === 'retry') {
+      retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
+      logger.info(
+        `[${tag(ds)}] Requeued durable-primary turn ${parsed.messageId.slice(0, 12)} `
+        + 'behind the active session turn',
+      );
+      return;
+    }
   }
   if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
     sessionStore.updateSession(ds.session);
@@ -26661,6 +27076,12 @@ async function handleThreadReplyAdmitted(
       }
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
         {
+          ...(ctx.durablePrimaryDispatch
+            ? {
+                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
+                durablePrimaryInbox: true as const,
+              }
+            : {}),
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
           ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
@@ -26684,6 +27105,24 @@ async function handleThreadReplyAdmitted(
           );
         }
         rememberLastCliInput(ds, promptContent, cliInput);
+        if (ctx.durablePrimaryDispatch) {
+          try {
+            await waitForDurablePrimaryInputCommit(
+              ds,
+              parsed.messageId,
+              ctx.durablePrimaryDispatch.signal,
+            );
+          } catch (error) {
+            if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
+            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
+            logger.warn(
+              `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
+              + `will retry after provider submit receipt wait failed: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+            return;
+          }
+        }
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {
@@ -26752,6 +27191,9 @@ async function handleThreadReplyAdmitted(
       await admitFollowerBehindOpening(ds, tailReservation, {
         userPrompt: promptContent,
         turnId: parsed.messageId,
+        ...(ctx.durablePrimaryDispatch
+          ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt }
+          : {}),
         build: async () => {
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
@@ -27067,6 +27509,12 @@ async function handleThreadReplyAdmitted(
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
+          ...(!queuedHasDurableTail && ctx.durablePrimaryDispatch
+            ? {
+                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
+                durablePrimaryInbox: true as const,
+              }
+            : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true } : {}),
           ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId
@@ -27127,6 +27575,24 @@ async function handleThreadReplyAdmitted(
         threadTrustedCaller,
         queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
+    }
+    if (ctx.durablePrimaryDispatch && !queuedHasDurableTail) {
+      try {
+        await waitForDurablePrimaryInputCommit(
+          ds,
+          parsed.messageId,
+          ctx.durablePrimaryDispatch.signal,
+        );
+      } catch (error) {
+        if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
+        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork');
+        logger.warn(
+          `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
+          + `will retry after provider submit receipt wait failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
     }
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
@@ -27480,6 +27946,30 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
       if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType)) {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      // durable-primary 下，精确的文字 `/close` 本身也是一条持久化 ingress 事件。
+      // 此处不改副本本地 Session：先提交本消息的 active 快照，再追加独立的
+      // owner-routed control；provider 回收与 canonical closed 提交都由该 control
+      // 负责，当前副本消失后仍可恢复。`/close wt` 暂时保留原确认流程，等待
+      // worktree retirement 接入同一套分布式协议。
+      if (cmd === '/close'
+          && commandContent.trim().toLowerCase() === '/close'
+          && existingDs
+          && senderOpenId
+          && ctx.queuePostAdmissionControl) {
+        const sessionId = existingDs.session.sessionId;
+        ctx.queuePostAdmissionControl(durableDirectSessionControlEvent({
+          source: 'lark-command',
+          larkAppId,
+          operationId: `lark-command.session-control:${larkAppId}:${parsed.messageId}`,
+          action: 'close',
+          sessionId,
+          rootId: storedSessionAnchorId(existingDs.session),
+          operatorOpenId: senderOpenId,
+          cardMessageId: existingDs.streamCardId ?? existingDs.session.streamCardId,
+        }));
+        markIngressAdmitted(ctx);
         return true;
       }
       // First message of a fresh thread carrying a session-needing daemon command
@@ -28591,10 +29081,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     { allowPrimary: true },
   );
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
+  const durablePrimaryEventRuntimes: LarkEventDispatcherRuntime[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
     : undefined;
+  const durableGroupContextRecallFacade = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableGroupContextRecallFacade({
+        store: durableCoordinationRuntime.store,
+        ownerId: `group-context-recall:${getDaemonBootId()}`,
+      })
+    : undefined;
+  const durableConfigCoordinator = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableConfigCoordinator({
+        store: durableCoordinationRuntime.store,
+        ownerId: `config-daemon:${getDaemonBootId()}`,
+      })
+    : undefined;
+  setDurableConfigCoordinator(durableConfigCoordinator);
   durableSessionShadowFacade = durableSessionFacade;
   const durableInboxShadowConsumer = durableCoordinationRuntime?.mode === 'shadow'
     ? startDurableInboxShadowConsumer({
@@ -28895,7 +29399,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduleAuthorityStore = null;
     scheduler.setScheduleAuthorityUnavailable(error);
   }
-  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
+  void runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: () => migrateOverloadAlertAtStartup(
+      botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })),
+    ),
+  }).catch(error => logger.warn(
+    `[durable-config] overload alert migration skipped: ${error instanceof Error ? error.message : String(error)}`,
+  ));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -29224,6 +29736,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         proposer,
         message: envelope,
       });
+    },
+    onTurnInputCommitted(ds, receipt, context) {
+      // A recovered Remote Runner turn can conservatively classify an
+      // attempt-bearing Lark message as durable-primary. Keep that recovery
+      // hint entirely inert for disabled/shadow/default deployments.
+      if (durableCoordinationRuntime?.mode !== 'primary'
+          || !durablePrimaryRuntimeByApp.has(ds.larkAppId)) return;
+      if (ds.session.workerGeneration !== context.workerGeneration) return;
+      recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
     },
     onNativeInputConsumed(ds, receipt, context) {
       // The worker proved this exact input entered its native conversation.
@@ -30202,6 +30723,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         let primaryControlRuntime: ReturnType<
           typeof createDurableLarkSessionControlRuntime
         > | undefined;
+        const takeOverPrimarySession = async (
+          stableKey: string,
+          canonical: Session,
+        ): Promise<Session | { kind: 'retry'; reason: string } | undefined> => {
+          if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+          try {
+            const claimed = await claimDurableLarkActiveSession({
+              facade: primaryRuntime.session,
+              sessionKey: stableKey,
+              expectedSessionId: canonical.sessionId,
+              expectedLarkAppId: cfg.larkAppId,
+            });
+            if (claimed.kind !== 'claimed') {
+              return {
+                kind: 'retry',
+                reason: claimed.kind === 'occupied'
+                  ? `active Session lease is still owned by ${claimed.ownerId}`
+                  : `active Session takeover is not ready: ${claimed.kind}`,
+              };
+            }
+            const local = activeSessions.get(stableKey);
+            if (local?.session.sessionId === claimed.session.sessionId
+                && local.session.status === 'active') {
+              return local.session;
+            }
+            const takeover = await takeOverDurableActiveRemoteSession(
+              claimed.session,
+              activeSessions,
+            );
+            if (!takeover.ok) {
+              throw new Error(
+                `durable active takeover failed: ${takeover.error}`
+                + (takeover.detail ? ` (${takeover.detail})` : ''),
+              );
+            }
+            return takeover.ds.session;
+          } catch (error) {
+            await primaryRuntime.session.releaseLease(stableKey);
+            throw error;
+          }
+        };
         const eventRuntime = createLarkEventDispatcherRuntime(
           cfg.larkAppId,
           cfg.larkAppSecret,
@@ -30211,55 +30773,36 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           {
             enqueuePrimary: input => {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              return primaryRuntime.ingress.enqueueClusterBeforeAck(input);
+            },
+            enqueuePrimaryRecovery: input => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueBeforeAck(input);
             },
             enqueuePrimaryControl: input => {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
-              return primaryRuntime.ingress.enqueueControlBeforeAck(input);
+              return primaryRuntime.ingress.enqueueClusterControlBeforeAck(input);
             },
+            persistPrimaryGroupContextRecall: async input => {
+              if (!primaryRuntime || !durableGroupContextRecallFacade) {
+                throw new Error('durable primary recall runtime is not ready');
+              }
+              await recordDurableGroupContextRecall({
+                facade: durableGroupContextRecallFacade,
+                ...input,
+              });
+            },
+            readPrimaryGroupContextRecalls: input => readDurableGroupContextRecalls({
+              store: durableCoordinationRuntime.store,
+              ...input,
+            }),
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             readPrimarySession: async stableKey => {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
-            takeOverPrimarySession: async (stableKey, canonical) => {
-              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
-              try {
-                const claimed = await claimDurableLarkActiveSession({
-                  facade: primaryRuntime.session,
-                  sessionKey: stableKey,
-                  expectedSessionId: canonical.sessionId,
-                  expectedLarkAppId: cfg.larkAppId,
-                });
-                if (claimed.kind !== 'claimed') {
-                  throw new Error(
-                    claimed.kind === 'occupied'
-                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
-                      : `durable active takeover claim failed: ${claimed.kind}`,
-                  );
-                }
-                const local = activeSessions.get(stableKey);
-                if (local?.session.sessionId === claimed.session.sessionId
-                    && local.session.status === 'active') {
-                  return local.session;
-                }
-                const takeover = await takeOverDurableActiveRemoteSession(
-                  claimed.session,
-                  activeSessions,
-                );
-                if (!takeover.ok) {
-                  throw new Error(
-                    `durable active takeover failed: ${takeover.error}`
-                    + (takeover.detail ? ` (${takeover.detail})` : ''),
-                  );
-                }
-                return takeover.ds.session;
-              } catch (error) {
-                await primaryRuntime.session.releaseLease(stableKey);
-                throw error;
-              }
-            },
+            takeOverPrimarySession,
           },
         );
         startEventDispatchers.push(() => {
@@ -30292,6 +30835,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 throw new Error('canonical closed Session materialization did not persist');
               }
               return materialized;
+            },
+            takeOverActiveSession: async (stableKey, canonical) => {
+              const takeover = await takeOverPrimarySession(stableKey, canonical);
+              return takeover && 'kind' in takeover ? undefined : takeover;
             },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
@@ -30378,7 +30925,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 );
               });
             },
-            onLeadershipLost: () => { eventRuntime.close(); },
+            // Leadership fences only REST history recovery. Every replica keeps
+            // an active SDK client because Feishu distributes one event to one
+            // random connection; closing standby sockets recreates the p2p and
+            // WS-only no-owner window that history APIs cannot repair.
             onSessionLeaseLost: stableKey => {
               const ds = activeSessions.get(stableKey);
               if (!ds || ds.larkAppId !== cfg.larkAppId) return;
@@ -30398,7 +30948,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
           });
           durablePrimaryRuntimes.push(primaryRuntime);
+          durablePrimaryEventRuntimes.push(eventRuntime);
           durablePrimaryRuntimeByApp.set(cfg.larkAppId, primaryRuntime);
+          eventRuntime.connect();
           void primaryRuntime.ready.then(() => {
             logger.info(`[durable-primary:${cfg.larkAppId}] runtime ready`);
           });
@@ -30581,6 +31133,56 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
+    const quarantinedDashboardSessionKeys = new Set<string>();
+    setDurableSessionListHandler(async () => {
+      const listSessions = durableCoordinationRuntime.store.listSessions;
+      if (!listSessions) throw new Error('durable_primary_session_listing_unavailable');
+      const sessions = new Map<string, Session>();
+      let afterSessionKey: string | undefined;
+      for (let page = 0; page < 40; page += 1) {
+        const listed = await listSessions.call(durableCoordinationRuntime.store, {
+          ...(afterSessionKey ? { afterSessionKey } : {}),
+          limit: 256,
+        });
+        for (const session of listValidDurablePrimarySessions(
+          listed.records,
+          cfg.larkAppId,
+          (record, error) => {
+            if (quarantinedDashboardSessionKeys.has(record.sessionKey)) return;
+            quarantinedDashboardSessionKeys.add(record.sessionKey);
+            while (quarantinedDashboardSessionKeys.size > 1_024) {
+              quarantinedDashboardSessionKeys.delete(quarantinedDashboardSessionKeys.values().next().value!);
+            }
+            logger.warn(
+              `[dashboard] quarantined invalid canonical Session ${record.sessionKey}: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          },
+        )) {
+          sessions.set(session.sessionId, session);
+        }
+        if (!listed.nextSessionKey) return [...sessions.values()];
+        afterSessionKey = listed.nextSessionKey;
+      }
+      throw new Error('durable_primary_session_listing_limit_exceeded');
+    });
+    setDurableSessionLifecycleHandler(async request => {
+      const local = findActiveBySessionId(request.sessionId)?.session
+        ?? sessionStore.getOwnedSession(request.sessionId);
+      const larkAppId = local?.larkAppId || cfg.larkAppId;
+      const rootId = request.rootId ?? (local ? storedSessionAnchorId(local) : undefined);
+      const runtime = durablePrimaryRuntimeByApp.get(larkAppId);
+      if (!runtime) return { ok: false, error: 'durable_primary_unavailable' };
+      return requestDurableSessionControl({
+        store: durableCoordinationRuntime.store,
+        request: {
+          larkAppId,
+          ...(rootId ? { sessionKey: sessionKey(rootId, larkAppId) } : {}),
+          sessionId: request.sessionId,
+          action: request.action,
+        },
+      });
+    });
   } else {
     useOrdinaryOutputDelivery();
   }
@@ -31434,6 +32036,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
     setTurnResultRuntime(undefined);
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) {
       const stopped = await runtime.stop(remainingBudget());
       if (stopped.kind === 'timed_out') {
@@ -31442,6 +32045,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31453,6 +32059,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
+    }
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    if (durableRecallStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-recall] facade stop timed out `
+        + `(pending=${durableRecallStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableRecallStop.unreleasedSessionKeys.length})`,
+      );
     }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
@@ -31513,9 +32127,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
+    durableGroupContextRecallFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }

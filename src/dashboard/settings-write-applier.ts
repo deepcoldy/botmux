@@ -142,6 +142,8 @@ export type ParseMaintenanceResult =
 
 /** All IO this helper needs — injected so tests use mocks, production wires real impls. */
 export interface SettingsWriteApplierDeps {
+  /** Optional outer transaction used by durable multi-replica deployments. */
+  runConfigMutation?: <T>(mutation: () => Promise<T>) => Promise<T>;
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields. */
@@ -379,6 +381,10 @@ export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
 ): Promise<ApplySettingsWriteResult> {
+  if (deps.runConfigMutation) {
+    const { runConfigMutation, ...innerDeps } = deps;
+    return runConfigMutation(() => applySettingsWrite(body, innerDeps));
+  }
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};

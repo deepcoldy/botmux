@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, statSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,10 @@ beforeEach(() => {
   cfg = join(dir, 'bots.json');
   writeFileSync(cfg, JSON.stringify([{ larkAppId: 'a1', allowedUsers: ['ou_x'] }], null, 2), { mode: 0o600 });
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe('config-store', () => {
   it('writeRawConfigAtomic keeps file 0o600', async () => {
@@ -19,6 +22,13 @@ describe('config-store', () => {
     await writeRawConfigAtomic(cfg, raw);
     expect(statSync(cfg).mode & 0o777).toBe(0o600);
     expect((await readRawConfig(cfg))[0].allowedUsers).toEqual(['ou_x', 'ou_y']);
+  });
+
+  it('rejects an uncoordinated bots.json write in primary mode', async () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', allowedUsers: ['ou_y'] }]))
+      .rejects.toThrow('durable_config_coordinator_required');
+    expect((await readRawConfig(cfg))[0].allowedUsers).toEqual(['ou_x']);
   });
 
   it('rejects network policy combinations before changing durable configuration', async () => {

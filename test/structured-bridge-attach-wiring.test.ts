@@ -126,3 +126,33 @@ describe('adopt attach', () => {
     expect(shared).toContain("codexBridgeAttach(path, 'split-live')");
   });
 });
+
+describe('cursor attach baseline is footer-aware (codexBridgeAttach)', () => {
+  // cursor-agent truncates its trailing `turn_ended` footer and rewrites the
+  // next turn from the footer's start, so an EOF baseline sits past the next
+  // user line. Both cursor baseline routes must take baselineCursorTranscript
+  // (one raw-byte snapshot) instead of a plain stat size / baselineJsonlCursor.
+  const attach = slice('function codexBridgeAttach(', 'type CursorAttachMode');
+
+  it('adopt: cursorBridgeAttach maps baseline-existing to the skip-tail mode', () => {
+    const fn = slice('function cursorBridgeAttach(', 'function codexBridgeDetachFile(');
+    expect(fn).toContain("codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode)");
+  });
+
+  it('adopt skip-tail branch takes its offset from the footer-aware snapshot', () => {
+    const start = attach.indexOf("} else if (mode === 'baseline-existing-skip-tail'");
+    const branch = attach.slice(start, attach.indexOf('} else if (existsSync(rolloutPath)) {', start));
+    expect(branch).toContain("structuredBridgeIs('cursor')");
+    expect(branch).toContain('baselineCursorTranscript(rolloutPath, { skipTail: true })?.newOffset');
+    expect(branch).toContain('codexBridgeOffset = offset;');
+    // The stat size is only the non-cursor / unreadable fallback.
+    expect(branch.indexOf('baselineCursorTranscript(')).toBeLessThan(branch.indexOf('statSync(rolloutPath).size'));
+  });
+
+  it('zero-prompt resume (baseline-existing) uses the footer-aware cursor baseline', () => {
+    const start = attach.indexOf('Structured bridge baseline-existing recovered:');
+    const branch = attach.slice(start, attach.indexOf('Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`', start));
+    expect(branch).toContain("(structuredBridgeIs('cursor') ? baselineCursorTranscript(rolloutPath) : undefined)");
+    expect(branch).toContain('?? baselineJsonlCursor(rolloutPath)');
+  });
+});

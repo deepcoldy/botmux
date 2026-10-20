@@ -43,8 +43,11 @@ describe('worker structured-turn status wiring', () => {
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
     const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
     expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
+    // Bounded by the function's end rather than a fixed character window.
     const attachStart = source.indexOf('function codexBridgeAttach(');
-    const attach = source.slice(attachStart, source.indexOf('type CursorAttachMode', attachStart));
+    const attachEnd = source.indexOf('\ntype CursorAttachMode', attachStart);
+    expect(attachEnd).toBeGreaterThan(attachStart);
+    const attach = source.slice(attachStart, attachEnd);
     expect(attach).toContain('!structuredBridgeRecoveryAttempted');
     expect(attach).toContain("!structuredBridgeIs('cursor')");
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
@@ -759,5 +762,18 @@ describe('worker structured-turn status wiring', () => {
     expect(adopt).toContain('scheduleSubmitFailureNotify(');
     expect(adopt).toContain("t('worker.transcriptLabel')");
     expect(adopt).toContain('dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt)');
+  });
+});
+
+describe('delivered-final failure-notice opt-in worker wiring', () => {
+  it('reads only an explicit init true and passes it to both structured fallback gates', () => {
+    const reader = functionSlice('deliveredFinalFailureNoticeSuppressed', 'zeroPromptTerminalSync');
+    expect(reader).toContain('lastInitConfig?.suppressDeliveredFinalFailureNotice === true');
+    const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
+    const calls = emit.split('shouldSuppressStructuredFallback(').slice(1);
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.split('\n')[0]).toContain('replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())');
+    }
   });
 });

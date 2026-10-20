@@ -97,6 +97,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS=5000',
       'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS=30000',
       'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=0',
+      'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+      'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     ].join('\n'))).toMatchObject({
       BOTMUX_COORDINATION_MODE: 'primary',
       BOTMUX_COORDINATION_PROVIDER_BIN: '/opt/botmux/provider',
@@ -104,6 +106,8 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS: '5000',
       BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS: '30000',
       BOTMUX_FORWARD_FOLLOWUP_WAIT_MS: '0',
+      BOTMUX_GLOBAL_CONFIG_FILE: '/mnt/shared/global-config.json',
+      BOTMUX_GROUP_CONTEXT_SETTINGS_FILE: '/mnt/shared/group-context-settings.json',
     });
   });
 

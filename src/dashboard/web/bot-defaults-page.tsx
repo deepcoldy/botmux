@@ -2491,6 +2491,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
@@ -2574,6 +2575,7 @@ export function BotAgentSection(props: {
         setTurnTimeoutError(null);
         setDshRuntimeTouched(false);
         setRuntimeTouched(false);
+        setCliSelectionTouched(false);
         setNativePolicyTouched(false);
         const savedNativePolicy = res.body.nativeSubagentRuntime;
         setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
@@ -2805,6 +2807,7 @@ export function BotAgentSection(props: {
             options={cliOptions}
             searchable
             onChange={updateCli}
+            notifyOnReselect
           />
           {option?.available === false && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">

@@ -831,6 +831,30 @@ describe('host memory pressure worker admission', () => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
+  it('propagates durable-primary attribution through the actual fork init message', () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'durable opening', {
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    })).toBe(true);
+
+    expect(ds.initConfig).toMatchObject({
+      type: 'init',
+      prompt: 'durable opening',
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    });
+  });
+
   it('starts standalone init delivery only after the Worker IPC bootstrap is ready', async () => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);
@@ -4099,6 +4123,28 @@ describe('CLI runtime session freeze', () => {
     expect(resumedInit.cliRuntime).toEqual(firstInit.cliRuntime);
     expect(resumedInit.cliPathOverride).toBe('/opt/vendor-codex');
     expect(ds.session.cliRuntime).toEqual(firstInit.cliRuntime);
+  });
+});
+
+describe('delivered-final failure-notice opt-in init wiring', () => {
+  it.each([undefined, false, 'true'])('does not send the experimental field when the bot value is %s', value => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: value }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_default' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.type).toBe('init');
+    expect(init).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it('freezes an explicit opt-in on the worker init', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: true }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_opt_in' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(ds.initConfig?.suppressDeliveredFinalFailureNotice).toBe(true);
   });
 });
 

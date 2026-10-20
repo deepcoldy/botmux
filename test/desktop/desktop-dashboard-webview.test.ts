@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { isWebTerminalDashboardHash } from '../../src/dashboard/web/client-shell.js';
 
 describe('desktop dashboard embed', () => {
   function sidebarRoutes(html: string): string[] {
@@ -46,7 +47,12 @@ describe('desktop dashboard embed', () => {
       'utf-8',
     );
 
-    expect(sidebarRoutes(desktopHtml)).toEqual(dashboardNavRoutes(dashboardSource));
+    // Web-terminal surfaces (the host Terminal page) belong to the native client:
+    // the embedded dashboard redirects them to #/sessions, so the desktop sidebar
+    // deliberately leaves them out.
+    expect(sidebarRoutes(desktopHtml)).toEqual(
+      dashboardNavRoutes(dashboardSource).filter(id => !isWebTerminalDashboardHash(`#/${id}`)),
+    );
   });
 
   it('provides localized desktop labels for the mirrored message-listener route', () => {

@@ -790,3 +790,45 @@ describe('frozen reply context', () => {
     });
   });
 });
+
+// A chat-scope card button carries the CHAT id as its `root_id`. Passing that
+// through as a reply root used to freeze `{ mode: 'thread', rootMessageId: oc_… }`,
+// after which every rootless daemon post (worker-ready card, static fallback)
+// replied to a chat id and failed with Lark 230001 until a new IM turn arrived.
+describe('chat id is never a reply root', () => {
+  it('resolveInboundReplyTarget keeps a chat-scope turn flat when the "reply root" is the chat id', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat', chatId: 'oc_chat', threadRootId: 'oc_chat', replyRootId: 'oc_chat',
+    })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('beginReplyTargetTurn does not record a chat id as the turn root, alias or current target', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'oc_chat', 'om_card', NOW, { senderOpenId: 'ou_user' });
+    expect(ds.session.turnReplyContexts?.om_card?.target).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+    expect(ds.session.replyTargets?.om_card?.rootMessageId).toBeUndefined();
+    expect(ds.session.replyThreadAliases?.oc_chat).toBeUndefined();
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(resolveSessionReplyTarget(ds, fallbackTurnId(ds))).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('heals a session that already persisted a chat id as its thread root', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'oc_chat', turnId: 'om_card', updatedAt: NOW },
+    }) as DaemonSession;
+    ds.session.currentReplyTarget = { rootMessageId: 'oc_chat', turnId: 'om_card', updatedAt: NOW };
+    ds.session.replyTargets = { om_card: { rootMessageId: 'oc_chat', updatedAt: NOW } };
+    ds.session.turnReplyContexts = { om_card: { target: { mode: 'thread', rootMessageId: 'oc_chat' } } };
+
+    const turnId = fallbackTurnId(ds);
+    expect(turnId).toBe('om_card');
+    expect(frozenReplyContextForTurn(ds, turnId).target).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+    expect(resolveSessionReplyTarget(ds, turnId)).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('still honours a real topic root in chat scope', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat', chatId: 'oc_chat', threadRootId: 'oc_chat', replyRootId: 'om_topic',
+    })).toEqual({ mode: 'thread', rootMessageId: 'om_topic' });
+  });
+});

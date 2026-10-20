@@ -380,8 +380,10 @@ function buildCloseWorktreeConfirmCard(args: {
   worktreeDir: string;
   sessions: import('../types.js').Session[];
   dirty: boolean;
-  dirtyCount: number;
-  dirtyFiles: string[];
+  uncommittedCount: number;
+  uncommittedFiles: string[];
+  ignoredCount: number;
+  ignoredFiles: string[];
   ahead: number;
   unpushedCommits: string[];
   invokerOpenId: string;
@@ -396,11 +398,17 @@ function buildCloseWorktreeConfirmCard(args: {
   // Safety checks: one compact line each; a detail line follows only when the
   // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
   const checkLines: string[] = [
-    args.dirty
-      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyCount) }, loc)
-      : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
+    args.uncommittedCount > 0
+      ? t('cmd.close.worktree_check_uncommitted_warn', { n: String(args.uncommittedCount) }, loc)
+      : t('cmd.close.worktree_check_uncommitted_ok', undefined, loc),
   ];
-  if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
+  if (args.uncommittedFiles.length) checkLines.push(closeWorktreeInlineDetail(args.uncommittedFiles));
+  checkLines.push(
+    args.ignoredCount > 0
+      ? t('cmd.close.worktree_check_ignored_warn', { n: String(args.ignoredCount) }, loc)
+      : t('cmd.close.worktree_check_ignored_ok', undefined, loc),
+  );
+  if (args.ignoredFiles.length) checkLines.push(closeWorktreeInlineDetail(args.ignoredFiles));
   checkLines.push(
     args.ahead > 0
       ? t('cmd.close.worktree_check_ahead_warn', { n: String(args.ahead) }, loc)
@@ -437,18 +445,28 @@ function buildCloseWorktreeConfirmCard(args: {
       content: `<font color='grey'>${t(hasRisk ? 'cmd.close.worktree_confirm_effect' : 'cmd.close.worktree_effect_safe', undefined, loc)}</font>`,
     },
     {
-      tag: 'action',
-      actions: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
-        type: 'danger',
-        value: {
-          action: 'close_worktree_confirm',
-          root_id: args.rootId,
-          session_id: args.sessionId,
-          invoker_open_id: args.invokerOpenId,
-          confirmation_state: args.confirmationState,
-        },
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
+          type: 'danger',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'close_worktree_confirm',
+              root_id: args.rootId,
+              session_id: args.sessionId,
+              invoker_open_id: args.invokerOpenId,
+              confirmation_state: args.confirmationState,
+            },
+          }],
+        }],
       }],
     },
   ];
@@ -2246,6 +2264,13 @@ export async function handleCommand(
       }
 
       case '/dismiss': {
+        // durable primary 下，解散会话组必须由跨副本一致的控制面提交。
+        // 这里仍是本地 session-store 路径；在接入 canonical control 前先 fail closed，
+        // 避免任一副本单独删除会话或群组状态。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.dismiss.primary_unsupported', undefined, loc));
+          break;
+        }
         const appId = larkAppId ?? ds?.larkAppId;
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
@@ -2276,6 +2301,13 @@ export async function handleCommand(
       }
 
       case '/close': {
+        // primary 的无参数 /close 会在 daemon 入口转交 durable control。
+        // 能落到这里的请求（含 /close wt 和卡片确认）都不能再执行本地关闭、
+        // sibling 回收或 worktree 删除；否则其它副本仍会保留旧的权威状态。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.close.primary_unsupported', undefined, loc));
+          break;
+        }
         const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
         const closeTokens = closeArg.split(/\s+/).filter(Boolean);
         const removeWorktree = /^(wt|worktree)$/i.test(closeTokens[0] ?? '');
@@ -2383,8 +2415,10 @@ export async function handleCommand(
                 worktreeDir,
                 sessions: [ds.session, ...siblingSessions],
                 dirty: safety.dirty,
-                dirtyCount: safety.dirtyCount,
-                dirtyFiles: safety.dirtyFiles,
+                uncommittedCount: safety.uncommittedCount,
+                uncommittedFiles: safety.uncommittedFiles,
+                ignoredCount: safety.ignoredCount,
+                ignoredFiles: safety.ignoredFiles,
                 ahead: safety.ahead,
                 unpushedCommits: safety.unpushedCommits,
                 invokerOpenId: message.senderId,
@@ -2669,6 +2703,12 @@ export async function handleCommand(
 
       case '/detach':
       case '/disconnect': {
+        // detach/disconnect 仍直接关闭本副本的 worker。primary 模式下必须等
+        // canonical control 接线后才能开放，否则会制造跨副本可见性分叉。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.detach.primary_unsupported', undefined, loc));
+          break;
+        }
         // 文字版的"⏏ 断开"按钮：共享接入会话适用。
         //   - tmux adopt：BotMux 停止观察外部终端，不结束原 CLI；
         //   - existing App Server adopt：BotMux 停止自己的 `codex --remote`

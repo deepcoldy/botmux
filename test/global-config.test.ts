@@ -53,6 +53,27 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
+  });
+
   it('drops invalid dashboard.localCliOpenMode values', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: {

@@ -436,6 +436,8 @@ type DropdownMenuProps<T extends string> = {
   value: T;
   options: DropdownOption<T>[];
   onChange: (value: T) => void;
+  /** Manual-save selectors may need to distinguish an explicit same-value choice. */
+  notifyOnReselect?: boolean;
   /** Filter box at the top of the popup, for long option lists (e.g. 20+ CLIs). */
   searchable?: boolean;
   searchPlaceholder?: string;
@@ -592,7 +594,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     setOpen(false);
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
-    if (next === props.value) return;
+    if (next === props.value && !props.notifyOnReselect) return;
     props.onChange(next);
   };
   const queryNorm = query.trim().toLowerCase();

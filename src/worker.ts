@@ -119,7 +119,14 @@ import {
   type WebTerminalInputMode,
 } from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
+import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
+import {
+  ClaudeBtwCaptureGuard,
+  claudeBtwOverlayVisible,
+  claudeBtwQuestion,
+  parseClaudeBtwOverlay,
+} from './utils/claude-btw-overlay.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
@@ -287,7 +294,7 @@ import {
   isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
-import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
+import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
@@ -477,7 +484,6 @@ import {
 } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
-import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
 import {
@@ -2552,6 +2558,13 @@ function replyDeliveryMode(): 'send' | 'transcript' {
   return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
 }
 
+/** 实验性、默认关闭：daemon 在 init 上冻结 per-bot 开关。只有显式 true 时，
+ *  失败兜底才信任本轮本次尝试已带回执的显式 final 而不再补发；读不到一律
+ *  false——等于历史行为。 */
+function deliveredFinalFailureNoticeSuppressed(): boolean {
+  return lastInitConfig?.suppressDeliveredFinalFailureNotice === true;
+}
+
 function zeroPromptTerminalSync(): boolean {
   return lastInitConfig?.promptInjection === 'none' && !lastInitConfig.adoptMode
     && !lastInitConfig.apiOnly;
@@ -3356,6 +3369,10 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // a dialog that renders during the acceptance wait is not missed. Bare
         // `/effort` opens a level picker (unknown target) and is left alone.
         if (isEffortLevelCommand(msg.content)) armEffortConfirm();
+        // `/btw <question>` answers in an overlay that never reaches the
+        // transcript; arm the capture before the bytes land.
+        const btwQuestion = claudeBtwQuestion(msg.content);
+        if (btwQuestion) armBtwCapture(btwQuestion, msg.turnId);
       });
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
@@ -3370,6 +3387,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         ? err.recoveryFailureReason
         : undefined;
       disarmEffortConfirm();
+      disarmBtwCapture();
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
@@ -6015,6 +6033,8 @@ function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
   const adoptMode = lastInitConfig?.adoptMode === true;
   const markers = adoptMode ? [] : readSendMarkers();
   const gateInput = {
+    turnId,
+    dispatchAttempt,
     markTimeMs: mark?.markTimeMs,
     isLocal: false,
     finalText: text,
@@ -8158,9 +8178,18 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (mode === 'baseline-existing-skip-tail' && existsSync(rolloutPath)) {
-    let size = 0;
-    try { size = statSync(rolloutPath).size; } catch { /* degrade below */ }
-    codexBridgeOffset = size;
+    // Cursor (the only skip-tail caller) parks the baseline at a trailing
+    // `turn_ended` footer: the next turn truncates the footer and rewrites
+    // from its start, which a plain EOF baseline would sit past. One snapshot
+    // decides the offset — no separate stat a concurrent rewrite could skew.
+    let offset = structuredBridgeIs('cursor')
+      ? baselineCursorTranscript(rolloutPath, { skipTail: true })?.newOffset
+      : undefined;
+    if (offset === undefined) {
+      offset = 0;
+      try { offset = statSync(rolloutPath).size; } catch { /* degrade below */ }
+    }
+    codexBridgeOffset = offset;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     structuredBridgeRecoveryAttempted = true;
@@ -8233,7 +8262,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         }
       }
     } else {
-      const cursor = baselineJsonlCursor(rolloutPath);
+      // Cursor (zero-prompt resume) needs the footer-aware baseline for the
+      // same reason as the skip-tail branch above.
+      const cursor = (structuredBridgeIs('cursor') ? baselineCursorTranscript(rolloutPath) : undefined)
+        ?? baselineJsonlCursor(rolloutPath);
       codexBridgeOffset = cursor.newOffset;
       codexBridgePendingTail = cursor.pendingTail;
       codexBridgeBaselineDone = true;
@@ -9596,6 +9628,8 @@ function emitReadyCodexTurns(): void {
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       forwardLocalFinal: zeroPromptTerminalSync(),
@@ -9640,12 +9674,13 @@ function emitReadyCodexTurns(): void {
         turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
       ),
     );
-    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
-      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
+      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
+        + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
       // turn, local-typed). Only the former is positive evidence that the model
@@ -10098,12 +10133,46 @@ function observeStartupBannerOnScreen(): boolean {
 
 /** ZMX's complete cached history can carry a restoration header that no
  * synthetic renderer viewport retains. Both resync and append-only captures
- * update this cache before notifying us; neither path may strand startup. */
+ * update this cache before notifying us; neither path may strand startup.
+ *
+ * ZMX-only: its `captureCurrentScreen()` returns a cheap in-memory snapshot
+ * cache, so calling it on every PTY chunk is free. Byte-stream backends
+ * (tmux/PTY) whose `captureCurrentScreen()` shells out must NOT be polled
+ * per-chunk here — they run the same history predicate on the bounded
+ * first-prompt recheck schedule via observeRestoredStartupHistoryOnScreen(). */
 function observeRestoredStartupHistory(): void {
   if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
   if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
   log(`${cliName()} restored history observed; releasing the startup hold`);
   if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
+/** Backend-agnostic restore-history compensation for the first-prompt recheck
+ * loop. A resumed CLI (e.g. Codex 0.154 `resume`) can paint straight into a
+ * restored composer without ever repainting the loaded banner AND without the
+ * "Earlier messages" restoration marker reaching the byte stream. In that
+ * layout neither feed()'s banner match, observeStartupScreen(), nor the
+ * startupHistorySeen-gated quiescence capture can lift the startup veto — only
+ * the adapter's own startupReadyFromHistory() predicate recognizes the
+ * restored composer (it accepts the `· Context N% left/used` footer as
+ * positive initialization evidence, guarded against loading/busy/queued/
+ * draft/picker screens). The ZMX path above runs it for snapshot backends;
+ * run it here for byte-stream backends (tmux/PTY) as well.
+ *
+ * Reads the renderer, NOT backend.captureCurrentScreen(): the rendered snapshot
+ * is the same viewport the banner path already trusts, avoids a per-recheck
+ * tmux capture-pane shell-out, and — critically — excludes scrollback, so a
+ * stale `esc to interrupt` / restoration marker far above the composer cannot
+ * be misread as current readiness. No-op for adapters without the predicate
+ * (only the Codex family declares startupReadyFromHistory). */
+function observeRestoredStartupHistoryOnScreen(): boolean {
+  if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
+  log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -10832,6 +10901,36 @@ function scheduleOneShotAfterAction(): void {
   }, POST_ACTION_DELAY_MS);
 }
 
+/**
+ * Lazily-backed, injectable indirection to @napi-rs/canvas's PNG renderer.
+ *
+ * WHY a module-scope wrapper instead of a `const { captureToPng } = await
+ * import(...)` inside captureAndUpload(): @napi-rs/canvas is a native addon a
+ * compiled binary may lack, so the import MUST stay lazy (a static import would
+ * fail the worker at module init, not just a screenshot). But declaring the
+ * binding inside captureAndUpload broke the capture path's dependency-injection
+ * seam: test/worker-screenshot-upload-hardening.test.ts slices this function's
+ * body into `new Function('deps', …)` and injects `captureToPng` as a FREE
+ * variable — a block-scoped `const` shadows it, and the extra `await import`
+ * also pushed the render past the harness's two-tick flush.
+ *
+ * Keeping the import inside a module-scope function named `captureToPng` puts
+ * the lazy load back behind the SAME free identifier the harness injects, so
+ * the seam is intact while worker init still never touches the native addon.
+ * The dynamic `import()` is cached by the module system, so repeat calls are
+ * cheap. NOTE: no explicit "stale after import" checkpoint is needed here —
+ * the import performs no rendering, and captureAndUpload's existing
+ * `if (frameIsStale()) cancelStale('render')` right after the awaited render is
+ * what actually prevents a stale frame from uploading.
+ */
+async function captureToPng(
+  terminal: Parameters<typeof import('./utils/screenshot-renderer.js')['captureToPng']>[0],
+  opts: Parameters<typeof import('./utils/screenshot-renderer.js')['captureToPng']>[1],
+): Promise<Buffer> {
+  const { captureToPng: renderPng } = await import('./utils/screenshot-renderer.js');
+  return renderPng(terminal, opts);
+}
+
 async function captureAndUpload(): Promise<void> {
   // displayMode mismatch should be impossible during a running loop (start/stop
   // gate on it). Logging here exists to surface the unexpected case — e.g. a
@@ -10907,6 +11006,8 @@ async function captureAndUpload(): Promise<void> {
         usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        // `captureToPng` is the module-scope lazy wrapper above: the canvas native
+        // is still only loaded on first use, never at worker init.
         png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
         if (frameIsStale()) { cancelStale('render'); return; }
       }
@@ -11235,6 +11336,7 @@ let injectionFlushing = false;
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
@@ -11549,6 +11651,133 @@ function armEffortConfirm(): void {
     effortConfirmTimer = null;
     effortConfirmGuard.disarm();
   }, EFFORT_CONFIRM_WINDOW_MS);
+  effortConfirmTimer.unref?.();
+}
+
+// Relay Claude Code's `/btw` side answer to the IM thread: watch the screen
+// for our overlay to finish, press `c`, forward the OSC 52 payload. Armed
+// only by botmux's own `/btw <question>` passthrough; see claude-btw-overlay.ts.
+const btwCaptureGuard = new ClaudeBtwCaptureGuard();
+let btwCaptureTurnId: string | undefined;
+let btwCaptureTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyTimer: ReturnType<typeof setTimeout> | null = null;
+let btwScreenCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyAttempts = 0;
+let btwCaptureGeneration = 0;
+// A side question is answered without tools; give slow models room but never
+// leave the guard armed indefinitely.
+const BTW_ANSWER_WINDOW_MS = 180_000;
+// The OSC 52 payload follows the `c` keypress almost immediately.
+const BTW_COPY_WINDOW_MS = 3_000;
+// Screen reads are throttled, not debounced: a busy main turn repaints its
+// spinner continuously, so a quiet window may never come.
+const BTW_SCREEN_CHECK_MS = 150;
+const BTW_MAX_COPY_ATTEMPTS = 3;
+
+function disarmBtwCapture(): void {
+  if (btwCaptureTimer) clearTimeout(btwCaptureTimer);
+  if (btwCopyTimer) clearTimeout(btwCopyTimer);
+  if (btwScreenCheckTimer) clearTimeout(btwScreenCheckTimer);
+  btwCaptureTimer = btwCopyTimer = btwScreenCheckTimer = null;
+  btwCopyAttempts = 0;
+  btwCaptureGuard.disarm();
+  btwCaptureTurnId = undefined;
+}
+
+function armBtwCapture(question: string, turnId: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  // Remote runners deliver screens, not a byte stream with OSC 52.
+  if (isRemoteBackendType(effectiveBackendType)) return;
+  disarmBtwCapture();
+  btwCaptureGeneration += 1;
+  btwCaptureGuard.arm(question);
+  btwCaptureTurnId = turnId;
+  btwCaptureTimer = setTimeout(() => {
+    btwCaptureTimer = null;
+    log('/btw answer not captured within the answer window; giving up');
+    giveUpBtwCapture();
+  }, BTW_ANSWER_WINDOW_MS);
+  btwCaptureTimer.unref?.();
+}
+
+/** The live renderer (fed every PTY chunk) rather than lastAnalyzerSnapshot,
+ *  which refreshes at most every 2s; with preserveFormatting so indentation
+ *  (question vs. answer, nested lists) survives. */
+function btwOverlayScreen(): string {
+  return renderer?.rawSnapshot({ preserveFormatting: true }) || lastAnalyzerSnapshot || '';
+}
+
+/** Close the overlay, which otherwise swallows the next keystrokes botmux
+ *  types (`f` forks, `x` clears history). Only while the freshest screen
+ *  shows it: with the overlay gone, Esc would interrupt the running turn.
+ *  The headless renderer parses asynchronously, so the repaint that came
+ *  with the triggering chunk (e.g. "Copied to clipboard") may be half
+ *  applied right now; look again a few times before concluding it is gone. */
+const BTW_CLOSE_CHECKS_MS = [100, 300, 700];
+
+function closeBtwOverlayIfVisible(attempt = 0, generation = btwCaptureGeneration): void {
+  const timer = setTimeout(() => {
+    // A newer `/btw` owns whatever overlay is on screen now.
+    if (!backend || generation !== btwCaptureGeneration) return;
+    if (claudeBtwOverlayVisible(btwOverlayScreen())) {
+      log('/btw overlay still open; closing it');
+      sendTermActionOnce(backend, 'esc');
+    } else if (attempt + 1 < BTW_CLOSE_CHECKS_MS.length) {
+      closeBtwOverlayIfVisible(attempt + 1, generation);
+    }
+  }, BTW_CLOSE_CHECKS_MS[attempt] - (BTW_CLOSE_CHECKS_MS[attempt - 1] ?? 0));
+  timer.unref?.();
+}
+
+function giveUpBtwCapture(): void {
+  closeBtwOverlayIfVisible();
+  disarmBtwCapture();
+}
+
+function deliverBtwAnswer(question: string, answer: string, source: 'clipboard' | 'screen'): void {
+  const turnId = btwCaptureTurnId;
+  disarmBtwCapture();
+  log(`/btw answer captured from ${source} (${answer.length} chars)`);
+  send({ type: 'btw_answer', question, answer, source, ...(turnId ? { turnId } : {}) });
+  closeBtwOverlayIfVisible();
+}
+
+function scheduleBtwScreenCheck(): void {
+  if (btwScreenCheckTimer) return;
+  btwScreenCheckTimer = setTimeout(checkBtwOverlayScreen, BTW_SCREEN_CHECK_MS);
+  btwScreenCheckTimer.unref?.();
+}
+
+function checkBtwOverlayScreen(): void {
+  btwScreenCheckTimer = null;
+  if (!backend || btwCaptureGuard.inspectScreen(btwOverlayScreen()).kind !== 'copy') return;
+  btwCopyAttempts += 1;
+  btwCaptureGuard.markCopyRequested();
+  backend.write('c');
+  btwCopyTimer = setTimeout(finishBtwCaptureFromScreen, BTW_COPY_WINDOW_MS);
+  btwCopyTimer.unref?.();
+}
+
+/** No OSC 52 arrived after `c`: read the answer from the rendered overlay
+ *  (viewport only, so the daemon marks it as possibly partial). If the
+ *  overlay is still answering, wait for the finished footer again. */
+function finishBtwCaptureFromScreen(): void {
+  btwCopyTimer = null;
+  if (!btwCaptureGuard.isCopying()) return;
+  const overlay = parseClaudeBtwOverlay(btwOverlayScreen());
+  const next = btwCaptureGuard.copyFallback(overlay, btwCopyAttempts, BTW_MAX_COPY_ATTEMPTS);
+  if (next.kind === 'deliver') {
+    deliverBtwAnswer(btwCaptureGuard.question, next.answer, 'screen');
+    return;
+  }
+  if (next.kind === 'wait') {
+    log('/btw overlay still answering after the copy request; waiting for it to finish');
+    btwCaptureGuard.revertToAnswering();
+    scheduleBtwScreenCheck();
+    return;
+  }
+  log('/btw answer finished but neither the clipboard nor the screen yielded it');
+  giveUpBtwCapture();
 }
 
 /**
@@ -11633,6 +11862,373 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
   return screen.length > 0 && dismissAidenCodexUpdateDialog(screen, 'screen');
 }
 
+// ─── Codex model-migration picker ────────────────────────────────────────────
+
+// Codex 0.162 paints a skeleton composer before initialization and then, once
+// per CODEX_HOME whenever the configured model has an unacknowledged upgrade,
+// replaces it with a modal "Meet <model>: 1. Try new model / 2. Use existing
+// model" picker. The idle detector had already latched ready evidence from the
+// skeleton, so two quiet seconds on the picker flushed the first queued message
+// into it: the paste was dropped and its submit Enter confirmed "Try new model"
+// (silently switching the user's global model), leaving the turn
+// submit_unconfirmed. There is no process-level opt-out (see
+// codex-model-migration-dialog.ts), so resolve it on screen with "Use existing
+// model" and keep every input path held until the normal composer returns.
+const codexModelMigrationGuard = new CodexModelMigrationDialogGuard();
+// The picker's key handler is not ready the instant it paints — the same
+// warm-up race as the trust dialog (openai/codex#39487).
+const CODEX_MODEL_MIGRATION_SETTLE_MS = 400;
+const CODEX_MODEL_MIGRATION_RETRY_MS = 1_000;
+const CODEX_MODEL_MIGRATION_POLL_MS = 2_000;
+const CODEX_MODEL_MIGRATION_MAX_ATTEMPTS = 3;
+/** Input is held for the picker (seen, or an unreadable capture while held). */
+let codexModelMigrationPending = false;
+/** The authoritative screen was verified picker-free after startup. The picker
+ *  only precedes the first prompt of a CLI process, so later input skips the
+ *  screen capture until the next spawn. */
+let codexModelMigrationCleared = false;
+/** PTY output generation at the latest rejected ready edge (screen idle or
+ *  first-prompt timeout). If nothing was output since, that edge cannot recur
+ *  on its own and the release must re-drive it. */
+let codexModelMigrationHeldReadyGeneration: number | undefined;
+/** A queued writer (flush, injection, raw passthrough) returned early. */
+let codexModelMigrationHeldWrite = false;
+/** Own retry loop, independent of the chat screen-update timer (which v3
+ *  workflow workers never start). */
+let codexModelMigrationRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+let codexModelMigrationUnreadableLogged = false;
+let codexModelMigrationLastActionAt = 0;
+let codexModelMigrationAttempts = 0;
+let codexModelMigrationLimitNotified = false;
+/** Startup readiness re-seed after a release (see the release function). */
+let codexModelMigrationReseedTimer: ReturnType<typeof setTimeout> | null = null;
+const CODEX_MODEL_MIGRATION_RESEED_QUIET_MS = 2_000;
+const CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES = 15;
+
+/** All picker state is per CLI process: called on every spawn and kill. */
+function resetCodexModelMigrationState(): void {
+  codexModelMigrationGuard.reset();
+  if (codexModelMigrationRecheckTimer) {
+    clearTimeout(codexModelMigrationRecheckTimer);
+    codexModelMigrationRecheckTimer = null;
+  }
+  if (codexModelMigrationReseedTimer) {
+    clearTimeout(codexModelMigrationReseedTimer);
+    codexModelMigrationReseedTimer = null;
+  }
+  codexModelMigrationPending = false;
+  codexModelMigrationCleared = false;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  codexModelMigrationUnreadableLogged = false;
+  codexModelMigrationLastActionAt = 0;
+  codexModelMigrationAttempts = 0;
+  codexModelMigrationLimitNotified = false;
+}
+
+/** Owned Codex TUI whose screen may drive synthesized keys. ZMX snapshots are
+ *  not authoritative for that (see onBackendScreenResync). */
+function codexModelMigrationInScope(): boolean {
+  return lastInitConfig?.cliId === 'codex'
+    && !lastInitConfig.adoptMode
+    && !lastInitConfig.existingAppServerEndpoint
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+}
+
+function codexModelMigrationCheckNeeded(): boolean {
+  return codexModelMigrationInScope() && !!backend && !codexModelMigrationCleared;
+}
+
+/** Drain the PTY renderer before the screen is judged. On the renderer
+ *  screen path (PTY: no native capture) xterm parses renderer.write()
+ *  asynchronously, so a picker repaint that has just arrived can still be
+ *  invisible to a synchronous capture. Returns false when output kept
+ *  arriving through every round: the frame is then UNVERIFIED and callers
+ *  must hold, never proceed. tmux/herdr captures come from the multiplexer
+ *  and need no drain. */
+async function settleCodexModelMigrationRenderer(): Promise<boolean> {
+  if (!renderer || !backend || backend.captureViewport || backend.captureCurrentScreen) return true;
+  for (let round = 0; round < 3; round++) {
+    const target: TerminalRenderer | null = renderer;
+    if (!target) return true;
+    const revision = backendScreenRevision;
+    try { await target.writeAndFlush(''); } catch { return false; }
+    if (renderer !== target) return false;
+    if (backendScreenRevision === revision) return true;
+  }
+  return false;
+}
+
+type CodexModelMigrationObservation =
+  | { state: 'picker'; screen: string }
+  | { state: 'clear' }
+  /** The capture threw or came back blank (TmuxPipeBackend returns '' on a
+   *  capture timeout): proves nothing about the picker. */
+  | { state: 'unreadable' }
+  /** No screen source at all (e.g. a PTY backend in a workflow worker, which
+   *  has no renderer): nothing can be resolved, keep the previous behaviour. */
+  | { state: 'unobservable' };
+
+function observeCodexModelMigrationScreen(): CodexModelMigrationObservation {
+  if (!backend || !canCaptureBusyPatternScreen(backend)) return { state: 'unobservable' };
+  let screen = '';
+  try {
+    screen = captureBackendScreen(backend);
+  } catch { return { state: 'unreadable' }; }
+  if (!stripAnsiScreenText(screen).trim()) return { state: 'unreadable' };
+  return isCodexModelMigrationScreen(screen) ? { state: 'picker', screen } : { state: 'clear' };
+}
+
+/** Stream side: chunks place the picker's words with cursor addressing, so the
+ *  selected row is only knowable from the rendered screen. Schedule a screen
+ *  check once the picker's key handler is live; do NOT consume the chunk. One
+ *  coalesced read can carry the picker repaint AND the composer that replaced
+ *  it, and that composer evidence must still reach the idle detector. Holding
+ *  input is decided only by the authoritative screen, so a stream match alone
+ *  can never strand startup. */
+function noticeCodexModelMigrationDialog(data: string): void {
+  if (!awaitingFirstPrompt || !codexModelMigrationCheckNeeded() || !codexModelMigrationGuard.inspect(data)) return;
+  scheduleCodexModelMigrationRecheck(CODEX_MODEL_MIGRATION_SETTLE_MS);
+}
+
+function scheduleCodexModelMigrationRecheck(delayMs: number): void {
+  if (codexModelMigrationRecheckTimer) return;
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationRecheckTimer = setTimeout(() => {
+    codexModelMigrationRecheckTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void recheckCodexModelMigration(backendAtSchedule, generationAtSchedule);
+  }, delayMs);
+}
+
+/** Timer-driven re-check: retries the picker while it stays open and releases
+ *  held input once a readable screen shows it gone. */
+async function recheckCodexModelMigration(expectedBackend: typeof backend, expectedGeneration: number): Promise<void> {
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  // Still open (or unverified): the gate re-armed this loop. Gone: it
+  // scheduled the release.
+  await codexModelMigrationAdmit('recheck');
+}
+
+function holdCodexModelMigrationInput(): void {
+  codexModelMigrationPending = true;
+  scheduleCodexModelMigrationRecheck(codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS
+    ? CODEX_MODEL_MIGRATION_POLL_MS
+    : CODEX_MODEL_MIGRATION_RETRY_MS);
+}
+
+/** Runs the release outside the observing caller: a writer that just saw the
+ *  picker gone must not re-enter flushPending from inside itself. */
+function scheduleCodexModelMigrationRelease(): void {
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  setTimeout(() => {
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    releaseCodexModelMigrationHold();
+  }, 0);
+}
+
+/** The picker is gone: re-drive whatever it held. Checks never reset idle
+ *  evidence, so a composer redraw fed after a rejected ready edge already runs
+ *  its own quiescence cycle; only a rejected edge with no output since needs
+ *  re-firing (same rule as the structured pre-start gate). */
+function releaseCodexModelMigrationHold(): void {
+  const heldReady = codexModelMigrationHeldReadyGeneration;
+  const heldWrite = codexModelMigrationHeldWrite;
+  codexModelMigrationHeldReadyGeneration = undefined;
+  codexModelMigrationHeldWrite = false;
+  log('Codex model-migration picker cleared; releasing held input');
+  if (heldReady !== undefined && ptyOutputGeneration.isCurrent(heldReady)) {
+    idleDetector?.reset();
+    idleDetector?.fireIdle();
+  }
+  // Newer output does not guarantee another idle edge: after the rejected
+  // idle, feed() dropped readySeen, and cursor/footer-only redraws carry no
+  // prompt marker to re-arm quiescence. Once the PTY is quiet, verify the
+  // prompt on screen and re-seed it (a no-op if the detector re-armed).
+  if (awaitingFirstPrompt) scheduleCodexModelMigrationReseed(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS, CODEX_MODEL_MIGRATION_RESEED_MAX_TRIES);
+  // During startup the idle path (re-driven above, or the composer redraw's
+  // own cycle) owns the first flush: kicking flushPending here would bypass the
+  // startup readiness gate that sendToPty applies (shouldWriteNow).
+  if (!heldWrite || awaitingFirstPrompt) return;
+  if (pendingInjections.length > 0) void flushPendingInjections();
+  if (hasPendingInputForFlush()) void flushPending();
+}
+
+function scheduleCodexModelMigrationReseed(delayMs: number, triesLeft: number): void {
+  if (codexModelMigrationReseedTimer) clearTimeout(codexModelMigrationReseedTimer);
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  codexModelMigrationReseedTimer = setTimeout(() => {
+    codexModelMigrationReseedTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    void reseedCodexModelMigrationReadiness(backendAtSchedule, generationAtSchedule, triesLeft);
+  }, Math.max(0, delayMs));
+}
+
+/** Same rule as the post-SessionStart evidence fallback: a quiet PTY plus a
+ *  prompt on the authoritative screen re-seeds readySeen; IdleDetector still
+ *  runs its full quiescence check, and the screen-idle gate still applies. */
+async function reseedCodexModelMigrationReadiness(
+  expectedBackend: typeof backend,
+  expectedGeneration: number,
+  triesLeft: number,
+): Promise<void> {
+  // Ready already published, or the picker is back (its gate owns startup).
+  if (!awaitingFirstPrompt || codexModelMigrationPending || !expectedBackend) return;
+  const retry = (delayMs: number) => {
+    if (triesLeft > 1) scheduleCodexModelMigrationReseed(delayMs, triesLeft - 1);
+  };
+  const quietMs = Date.now() - lastPtyOutputAtMs;
+  if (quietMs < CODEX_MODEL_MIGRATION_RESEED_QUIET_MS) {
+    retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS - quietMs);
+    return;
+  }
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return;
+  if (!awaitingFirstPrompt || codexModelMigrationPending) return;
+  if (!settled) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  let screen = '';
+  try {
+    screen = captureBackendScreen(expectedBackend);
+  } catch { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  const text = stripAnsiScreenText(screen);
+  if (!text.trim()) { retry(CODEX_MODEL_MIGRATION_RESEED_QUIET_MS); return; }
+  if (isCodexModelMigrationScreen(screen) || !cliAdapter?.readyPattern?.test(text)) return;
+  if (idleDetector?.seedReadyEvidence()) {
+    log(`Codex model-migration picker cleared: screen quiet ${quietMs}ms with a prompt; re-seeding readiness`);
+  }
+}
+
+/**
+ * Synchronous picker gate on the current screen; reached only through
+ * codexModelMigrationAdmit(), which drains the renderer first. Returns true
+ * while input must stay queued: the authoritative screen shows the picker as
+ * the active input surface, or the frame is unreadable/unverified while a hold
+ * is in force (or during startup). It then selects "Use existing model"
+ * (bounded retries, then one user notice). It never resets idle evidence: a
+ * stale observation must not erase a composer redraw.
+ */
+function codexModelMigrationBlocksInput(override?: CodexModelMigrationObservation): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  const observed = override ?? observeCodexModelMigrationScreen();
+  if (observed.state === 'unobservable') return false;
+  if (observed.state === 'unreadable') {
+    // Not evidence that the picker closed: keep an existing hold (and stay
+    // held during startup), never cache it as cleared. A readable recheck
+    // decides.
+    if (!codexModelMigrationPending && !awaitingFirstPrompt) return false;
+    if (!codexModelMigrationUnreadableLogged) {
+      codexModelMigrationUnreadableLogged = true;
+      log('Codex screen capture unreadable while checking the model-migration picker; holding input until a readable capture');
+    }
+    holdCodexModelMigrationInput();
+    return true;
+  }
+  codexModelMigrationUnreadableLogged = false;
+  if (observed.state === 'clear') {
+    const wasPending = codexModelMigrationPending;
+    codexModelMigrationPending = false;
+    if (!awaitingFirstPrompt) codexModelMigrationCleared = true;
+    if (wasPending) scheduleCodexModelMigrationRelease();
+    return false;
+  }
+  holdCodexModelMigrationInput();
+  if (codexModelMigrationAttempts >= CODEX_MODEL_MIGRATION_MAX_ATTEMPTS) {
+    if (!codexModelMigrationLimitNotified) {
+      codexModelMigrationLimitNotified = true;
+      log(`Codex model-migration picker remained after ${codexModelMigrationAttempts} automatic attempts; input stays held`);
+      send({
+        type: 'user_notify',
+        message: t('worker.codex_model_migration_unresolved', { cliName: cliName(), attempts: codexModelMigrationAttempts }),
+        turnId: currentBotmuxTurnId,
+      });
+    }
+    return true;
+  }
+  if (Date.now() - codexModelMigrationLastActionAt < CODEX_MODEL_MIGRATION_RETRY_MS) return true;
+  codexModelMigrationLastActionAt = Date.now();
+  // Every throttled attempt spends the bounded budget, including one where the
+  // highlighted row is unreadable or the keys were refused: a persistent
+  // failure must surface to the user instead of holding the turn silently.
+  codexModelMigrationAttempts += 1;
+  const attempt = `attempt ${codexModelMigrationAttempts}/${CODEX_MODEL_MIGRATION_MAX_ATTEMPTS}`;
+  const keys = codexModelMigrationSafeKeys(observed.screen);
+  if (!keys) {
+    log(`Codex model-migration picker visible but its selected row is unreadable; holding input (${attempt})`);
+    return true;
+  }
+  let delivered = false;
+  try {
+    if ('sendSpecialKeys' in backend!) {
+      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
+    } else {
+      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      delivered = backend!.write(input) === true;
+    }
+  } catch (error) {
+    log(`Codex model-migration picker navigation failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  log(delivered
+    ? `Codex model-migration picker detected, keeping the configured model (${keys.join('+')}, ${attempt})`
+    : `Codex model-migration picker keys were not delivered (${attempt})`);
+  return true;
+}
+
+/**
+ * THE admission point for the picker guard. Every Codex PTY writer
+ * (flushPending — queued and type-ahead messages, raw passthrough deferred by
+ * codexModelMigrationHoldsRawInput, startup commands, rename — and
+ * flushPendingInjections), every startup ready edge (screen idle, first-prompt
+ * timeout) and the retry timer pass through here, and only here:
+ * renderer drain first, then the synchronous gate on a verified frame. An
+ * unverified frame takes the same hold + retry path as an unreadable capture.
+ * `superseded` means the CLI generation changed during the drain.
+ */
+async function codexModelMigrationAdmit(
+  kind: 'write' | 'ready' | 'recheck',
+  readyGeneration?: number,
+): Promise<'proceed' | 'held' | 'superseded'> {
+  if (!codexModelMigrationCheckNeeded()) return 'proceed';
+  const expectedBackend = backend;
+  const expectedGeneration = cliSpawnGeneration;
+  const settled = await settleCodexModelMigrationRenderer();
+  if (backend !== expectedBackend || cliSpawnGeneration !== expectedGeneration) return 'superseded';
+  if (!codexModelMigrationBlocksInput(settled ? undefined : { state: 'unreadable' })) return 'proceed';
+  // Remember what was held so the release can re-drive it.
+  if (kind === 'write') codexModelMigrationHeldWrite = true;
+  if (kind === 'ready' && readyGeneration !== undefined) codexModelMigrationHeldReadyGeneration = readyGeneration;
+  return 'held';
+}
+
+/** Raw passthrough normally writes literally, even while busy. While the
+ *  picker guard is live (startup, or a hold in force) it is queued instead —
+ *  synchronously, in arrival order — so flushPending, the single admission
+ *  point serialized by isFlushing, delivers it after the gate and never
+ *  interleaved with a normal message's paste/Enter. The picker only precedes
+ *  a CLI process's first prompt, so afterwards raw keeps its legacy path. */
+function codexModelMigrationHoldsRawInput(): boolean {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  if (!awaitingFirstPrompt && !codexModelMigrationPending) return false;
+  codexModelMigrationHeldWrite = true;
+  return true;
+}
+
+/** Screen-idle gate: a picker that replaced Codex's composer is not a prompt,
+ *  even when the stream chunk that painted it was missed. */
+async function codexModelMigrationHoldsIdleInput(idleBackend: typeof backend): Promise<boolean> {
+  if (!codexModelMigrationCheckNeeded()) return false;
+  // Evidence generation of THIS idle edge, before any await.
+  const readyGeneration = ptyOutputGeneration.snapshot();
+  const admission = await codexModelMigrationAdmit('ready', readyGeneration);
+  // Superseded generation: never mark ready from it.
+  if (admission === 'superseded' || backend !== idleBackend) return true;
+  if (admission === 'proceed') return false;
+  log('Codex model-migration picker owns the input surface; holding queued input');
+  return true;
+}
+
 /**
  * Handle startup-only interactions discovered in visible terminal text.
  * Both incremental PTY chunks and authoritative observer snapshots pass
@@ -11651,6 +12247,10 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // "Continue without trusting" through the Web Terminal when Codex presents
   // its Hooks review menu.
   if (lastInitConfig?.existingAppServerEndpoint) return false;
+
+  // Checked before the trust latch: the migration picker follows the trust
+  // dialog on a first launch. Observation only — the chunk is not consumed.
+  noticeCodexModelMigrationDialog(data);
 
   if (trustHandled) return false;
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -12891,6 +13491,17 @@ function handlePtyDataChunk(data: string): void {
     return;
   }
 
+  // `/btw` side answer relay. Armed only by our own `/btw <question>`
+  // passthrough. The keypresses here target the overlay, not the composer.
+  if (btwCaptureGuard.isArmed()) {
+    const action = btwCaptureGuard.inspectData(data);
+    if (action.kind === 'answer') {
+      deliverBtwAnswer(action.question, action.text, 'clipboard');
+    } else if (!btwCaptureGuard.isCopying()) {
+      scheduleBtwScreenCheck();
+    }
+  }
+
   // Track last PTY output time for the ready-gate quiescence settle (see
   // settleThenFlush) and a monotonic generation for rejected-ready evidence.
   // Generation (not timestamp equality) distinguishes two redraw chunks that
@@ -14119,6 +14730,11 @@ function directRpcTurnBlocksTypeAhead(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  // Codex model-migration picker guard (startup only): the single admission
+  // point runs before every other guard, so they are all evaluated after its
+  // renderer drain; concurrent calls still serialize on isFlushing (no other
+  // await before it is set). Nothing below re-reads the screen for the picker.
+  if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (idleDetector?.isStartupPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
   // old CLI. Never let a new flush (including one triggered by the old
@@ -14968,8 +15584,16 @@ async function flushPending(): Promise<void> {
         && result?.submitted !== false) {
         rememberBounded(submittedCodexAppReplyTurnIds, item.turnId);
       }
-      if (result?.submitted === true && deferNativeCodexInputCommit(item.dispatchAttempt)) {
-        acknowledgeTurnInputCommitted(item.turnId);
+      if (result?.submitted === true
+        && deferTurnInputCommitUntilSubmission(
+          item.dispatchAttempt,
+          item.durablePrimaryInbox,
+        )) {
+        acknowledgeTurnInputCommitted(
+          item.turnId,
+          item.dispatchAttempt,
+          item.durablePrimaryInbox,
+        );
       }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
@@ -15184,6 +15808,7 @@ function sendToPty(
     queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
+    durablePrimaryInbox?: true;
     codexAppDispatchId?: string;
     codexAppSteerable?: true;
     queuedActivationToken?: string;
@@ -15220,6 +15845,7 @@ function sendToPty(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(opts.trustedController ? { trustedController: opts.trustedController } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.taskContinuation ? { taskContinuation: opts.taskContinuation } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -15947,6 +16573,10 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
+  // Every spawn is a new CLI process that can show the picker again. Not all
+  // respawns pass through killCli() (e.g. the retry after a crash-loop park),
+  // so the per-process picker state must be reset here too.
+  resetCodexModelMigrationState();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
@@ -20514,6 +21144,8 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
+      // A Codex model-migration picker is not a prompt (see the helper).
+      if (evidenceSource === 'screen' && await codexModelMigrationHoldsIdleInput(idleBackend)) return;
       // xterm-headless parses renderer.write() asynchronously. A transcript
       // terminal can arrive in the same tick as the TUI's busy redraw; drain
       // queued render bytes before the post-terminal composer fence inspects
@@ -20685,6 +21317,13 @@ async function spawnCli(
         dispatchAttempt: turn.dispatchAttempt,
         trustedCaller: turn.trustedCaller,
       });
+      acknowledgeTurnInputCommitted(
+        turn.turnId,
+        turn.dispatchAttempt,
+        turn.dispatchAttempt !== undefined && turn.turnId.startsWith('om_')
+          ? true
+          : undefined,
+      );
       publishSandboxRelayCapability();
       log(
         `Recovered provider-owned remote turn ${turn.turnId.substring(0, 12)} `
@@ -20968,7 +21607,7 @@ async function spawnCli(
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
   let requestedAidenResumeRedraw = false;
-  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
+  const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
@@ -20983,6 +21622,15 @@ async function spawnCli(
     // swallows the queued messages for the lifetime of the session.
     if (idleDetector?.isStartupPending()) {
       observeStartupBannerOnScreen();
+    }
+    // Banner match above only recognizes a freshly loaded banner. A resumed CLI
+    // can paint straight into a restored composer with no banner repaint (and,
+    // on 0.154, with no restoration marker in the byte stream); the adapter's
+    // guarded history predicate recognizes that layout. ZMX runs it per-chunk
+    // (cheap snapshot cache); byte-stream backends (tmux/PTY) run it here, on
+    // the bounded recheck schedule, against the rendered viewport.
+    if (idleDetector?.isStartupPending()) {
+      observeRestoredStartupHistoryOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
       if (cfg.resume && cfg.cliId === 'codex' && cfg.wrapperCli?.trim() === 'aiden x codex'
@@ -21021,6 +21669,20 @@ async function spawnCli(
       return;
     }
 
+    // Never clear startup state or force a write while Codex's model-migration
+    // picker owns the input surface: the forced flush below would paste into
+    // it and its Enter would accept the new model. Its resolution (automatic,
+    // or by the user in the Web terminal) redraws the composer and re-drives
+    // the normal idle path, which still sees awaitingFirstPrompt.
+    if (!pickerAdmitted && codexModelMigrationCheckNeeded()) {
+      // Decide through the admission point; the re-entry re-validates
+      // everything above against the post-drain state.
+      void codexModelMigrationAdmit('ready', ptyOutputGeneration.snapshot()).then(admission => {
+        if (admission === 'proceed') releaseFirstPromptTimeout(elapsedMs, forced, true);
+        else if (admission === 'held') log(`First prompt timeout — Codex model-migration picker still open; keeping ${pendingMessages.length} input(s) queued`);
+      });
+      return;
+    }
     const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
@@ -21288,7 +21950,9 @@ function killCli(opts: {
   aidenCodexUpdateLastActionAt = 0;
   aidenCodexUpdateAttempts = 0;
   aidenCodexUpdateLimitNotified = false;
+  resetCodexModelMigrationState();
   disarmEffortConfirm();
+  disarmBtwCapture();
   appRunnerControlDecoder.reset();
 }
 
@@ -23710,10 +24374,28 @@ function deferNativeCodexInputCommit(dispatchAttempt?: number): boolean {
     && !codexRpcEngine && dispatchAttempt === undefined;
 }
 
-function acknowledgeTurnInputCommitted(turnId?: string): void {
+function deferTurnInputCommitUntilSubmission(
+  dispatchAttempt: number | undefined,
+  durablePrimaryInbox: true | undefined,
+): boolean {
+  return deferNativeCodexInputCommit(dispatchAttempt)
+    || (durablePrimaryInbox === true
+      && dispatchAttempt !== undefined);
+}
+
+function acknowledgeTurnInputCommitted(
+  turnId?: string,
+  dispatchAttempt?: number,
+  durablePrimaryInbox?: true,
+): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
-  send({ type: 'turn_input_committed', turnId });
+  send({
+    type: 'turn_input_committed',
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+  });
 }
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
@@ -24211,6 +24893,7 @@ process.on('message', async (raw: unknown) => {
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
+            durablePrimaryInbox: msg.durablePrimaryInbox,
             codexAppDispatchId: msg.codexAppDispatchId,
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -24338,7 +25021,16 @@ process.on('message', async (raw: unknown) => {
             trustedController: msg.trustedController,
           });
         }
-        if (initialInputCommitted && !deferNativeCodexInputCommit(msg.dispatchAttempt)) acknowledgeTurnInputCommitted(msg.turnId);
+        if (initialInputCommitted && !deferTurnInputCommitUntilSubmission(
+          msg.dispatchAttempt,
+          msg.durablePrimaryInbox,
+        )) {
+          acknowledgeTurnInputCommitted(
+            msg.turnId,
+            msg.dispatchAttempt,
+            msg.durablePrimaryInbox,
+          );
+        }
         initPromptMaterialized = true;
 
         // A backend may become prompt-ready before spawnCli() returns. The
@@ -24554,6 +25246,7 @@ process.on('message', async (raw: unknown) => {
           ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
+          durablePrimaryInbox: msg.durablePrimaryInbox,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
@@ -24570,7 +25263,16 @@ process.on('message', async (raw: unknown) => {
           ...(msg.turnCallerOpenId ? { turnCallerOpenId: msg.turnCallerOpenId } : {}),
         });
         if (inputCommitted) {
-          if (!deferNativeCodexInputCommit(msg.dispatchAttempt)) acknowledgeTurnInputCommitted(msg.turnId);
+          if (!deferTurnInputCommitUntilSubmission(
+            msg.dispatchAttempt,
+            msg.durablePrimaryInbox,
+          )) {
+            acknowledgeTurnInputCommitted(
+              msg.turnId,
+              msg.dispatchAttempt,
+              msg.durablePrimaryInbox,
+            );
+          }
         } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
       }
       break;
@@ -24623,7 +25325,7 @@ process.on('message', async (raw: unknown) => {
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
-        || hookReviewInputHold) {
+        || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
           notifyHookReviewInputHold();

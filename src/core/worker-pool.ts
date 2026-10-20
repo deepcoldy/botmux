@@ -152,7 +152,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
@@ -746,6 +746,7 @@ import {
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
+import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { clearAllSessionIdentities } from './cli-identity.js';
@@ -759,6 +760,7 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
+import { truncateUtf16WellFormed } from '../utils/unicode.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -791,6 +793,8 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 // the leader already reported failure (split-brain; see the busy-refuse comment
 // in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// Claude Code `/btw` answers are capped before rendering (see 'btw_answer').
+const BTW_ANSWER_MAX_CHARS = 6_000;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -910,6 +914,12 @@ export interface WorkerPoolCallbacks {
   onNativeInputConsumed?: (
     ds: DaemonSession,
     receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
+    context: { workerGeneration: number },
+  ) => void;
+  /** Provider submission proof for one durable-primary Lark Inbox turn. */
+  onTurnInputCommitted?: (
+    ds: DaemonSession,
+    receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
     context: { workerGeneration: number },
   ) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
@@ -1240,7 +1250,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1296,7 +1306,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1485,7 +1495,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1561,7 +1571,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1651,7 +1661,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -2896,6 +2906,23 @@ function isRunnerDeliveryCli(cliId?: string): boolean {
   return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
+/** A topic opened by `botmux dispatch` carries a verified report binding: its
+ *  brief asks the worker to `botmux report --dispatch-root`, which reaches the
+ *  dispatcher's own session outside this topic. Addressing the dispatcher in
+ *  this topic instead starts a fresh dispatcher session with no context (#1887). */
+function topicReportsToDispatcher(ds: DaemonSession, dispatchRoot: string | undefined = ds.session.rootMessageId): boolean {
+  if (!dispatchRoot) return false;
+  try {
+    const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
+    return resolveVerifiedDispatchReportTarget({
+      registry, dispatchRoot,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    }).ok;
+  } catch {
+    return false;
+  }
+}
+
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
   if (!owner) {
@@ -2903,7 +2930,8 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
     // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
     // the daemon fallback card back to the original dispatcher so orchestration
     // resumes (the card's real <at> is what re-wakes the dispatching bot).
-    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId
+      && !topicReportsToDispatcher(ds)) {
       return ds.session.creatorOpenId;
     }
     return undefined;
@@ -2915,7 +2943,7 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
       // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
       // daemon fallback card is their only @-trigger channel, so address the
       // dispatcher bot here too.
-      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
+      return isRunnerDeliveryCli(effectiveCliId) && !topicReportsToDispatcher(ds) ? owner : undefined;
     }
     return owner;
   } catch {
@@ -3041,7 +3069,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -3664,6 +3692,7 @@ export function bindStreamCardDisplayTarget(
   newTurnId?: string,
 ): void {
   if (!isRealStreamingCardId(messageId) || ds.streamCardId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   const publication = ++streamCardPublicationSeq;
   const identity = currentCaptureIdentity(ds);
   ds.streamCardDisplayTarget = newTurnId === undefined || identity?.turnId === newTurnId
@@ -3702,13 +3731,18 @@ function promoteWaitingStreamCardTarget(ds: DaemonSession): void {
   if (!identity || identity.turnId !== target.turnId) return;
   // CAS on the exact publication: never upgrade a replaced target.
   if (ds.streamCardDisplayTarget !== target) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = { ...target, mode: 'follow-live' };
 }
 
 /** Drop the display target (optionally only when it names `messageId`). */
 export function forgetStreamCardDisplayTarget(ds: DaemonSession, messageId?: string): void {
-  if (!ds.streamCardDisplayTarget) return;
+  if (!ds.streamCardDisplayTarget) {
+    ds.waitingTurnPreview = undefined;
+    return;
+  }
   if (messageId !== undefined && ds.streamCardDisplayTarget.messageId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = undefined;
 }
 
@@ -3731,6 +3765,30 @@ export function currentStreamCardDisplayTarget(
   return { messageId: ds.streamCardId, publication: 0, mode: 'follow-live' };
 }
 
+/** True when the visible card belongs to a turn that the terminal has not
+ * started producing yet. `turnId` covers the short POST window before the
+ * card's display target is bound; afterwards the persisted target is the
+ * authority. A missing capture identity is inconclusive, so fresh-session
+ * startup keeps its normal `starting` presentation. */
+export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boolean {
+  if (currentStreamCardDisplayTarget(ds)?.mode === 'waiting-exact-turn') return true;
+  if (!turnId) return false;
+  const identity = currentCaptureIdentity(ds);
+  return identity?.turnId !== undefined && identity.turnId !== turnId;
+}
+
+/** Image for the card's presentation layer. A waiting card may show the live
+ * predecessor frame only through the explicit in-memory preview slot; it is
+ * never promoted into this turn's currentImageKey. */
+export function streamingCardPresentationImageKey(ds: DaemonSession): string | undefined {
+  if (!streamingCardTurnQueued(ds)) return ds.currentImageKey;
+  const preview = ds.waitingTurnPreview;
+  if (!preview) return undefined;
+  if (screenshotSourceSuppressed(ds, preview.turnId, preview.dispatchAttempt)) return undefined;
+  if (currentCaptureSourcesSuppressed(ds)) return undefined;
+  return preview.imageKey;
+}
+
 /** May a cached image with this source be rendered for the current target? A
  * waiting-exact-turn(T) target accepts only a frame positively from T — never
  * a predecessor's frame and never a source-less cache. */
@@ -3742,9 +3800,10 @@ function cachedImageAllowedByDisplayTarget(ds: DaemonSession, source: CaptureTup
 
 export type ScreenshotFrameVerdict =
   | { ok: true; source: CaptureTuple }
+  | { ok: false; reason: 'target-waiting'; source: CaptureTuple }
   | { ok: false; reason:
       | 'invalid-revision' | 'unknown-revision' | 'superseded-revision' | 'tuple-mismatch'
-      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' | 'target-waiting' };
+      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' };
 
 /** Producer (source) and display-target verdict for one worker frame. Both
  * must pass before the frame may enter the cache or be PATCHed.
@@ -3799,7 +3858,10 @@ export function evaluateScreenshotFrame(
   if (anyCaptureSourceSuppressed(ds, tuples)) return { ok: false, reason: 'source-suppressed' };
   const target = currentStreamCardDisplayTarget(ds);
   if (target?.mode === 'waiting-exact-turn' && source.turnId !== target.turnId) {
-    return { ok: false, reason: 'target-waiting' };
+    // Source/auth/suppression checks already passed. The frame still cannot
+    // enter this turn's durable image cache, but callers may show it through
+    // the isolated, in-memory preview slot to preserve legacy card behavior.
+    return { ok: false, reason: 'target-waiting', source };
   }
   return { ok: true, source };
 }
@@ -3840,6 +3902,7 @@ function currentCaptureSourcesSuppressed(ds: DaemonSession): boolean {
  * provenance (legacy/disk-restored cache) the frame is only shown while no
  * known current source is suppressed. */
 export function displayableStreamingCardImageKey(ds: DaemonSession): string | undefined {
+  if (streamingCardTurnQueued(ds)) return streamingCardPresentationImageKey(ds);
   const key = ds.currentImageKey;
   if (!key) return undefined;
   const source = ds.currentImageSource?.imageKey === key ? ds.currentImageSource : undefined;
@@ -4550,12 +4613,18 @@ function bumpStreamCardStatusRevision(ds: DaemonSession): void {
 /** Re-render a just-created starting card when a newer worker status arrived
  * during its POST. The turn id is forwarded to scheduleCardPatch so a late
  * patch from turn N cannot overwrite turn N+1's card. */
-function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefined, revisionAtPost: number): void {
+function reconcilePostedStartingCard(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  revisionAtPost: number,
+  statusOverride?: StreamStatus,
+): void {
   if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId));
+  const status = statusOverride
+    ?? (ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId)));
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
@@ -4566,7 +4635,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -4836,7 +4905,7 @@ export async function postFreshStreamingCard(
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -7097,7 +7166,9 @@ async function prepareLiveRemoteWorkerClose(
       ok: false,
       error: backendType === 'riff'
         ? 'riff_worker_close_failed'
-        : 'remote_runner_close_reconciliation_required',
+        : result.recovery === 'retryable'
+          ? 'remote_runner_worker_close_failed'
+          : 'remote_runner_close_reconciliation_required',
       retryable: backendType === 'riff' || mayRestore,
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
@@ -7137,7 +7208,26 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
-  if (ds.worker && !ds.worker.killed) return true;
+  if (ds.worker && !ds.worker.killed) {
+    // Active-session takeover publishes the local DaemonSession immediately
+    // after fork admission, before the replacement worker has necessarily
+    // completed its provider handshake. Sending `close` in that gap races the
+    // worker's async init and can make it exit without a close_result. Wait for
+    // the exact admitted generation instead of treating mere process existence
+    // as control readiness.
+    const worker = ds.worker;
+    const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (findActiveBySessionId(ds.session.sessionId) !== ds
+          || ds.session.status !== 'active'
+          || ds.worker !== worker
+          || worker.killed) return false;
+      if (ds.workerReady === true) return true;
+      await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
+    }
+    logger.warn(`[${tag(ds)}] Timed out waiting for existing takeover worker readiness`);
+    return false;
+  }
   if (findActiveBySessionId(ds.session.sessionId) !== ds) return false;
   if (!normalizeRemoteRunnerBackendState(ds.session.remoteBackendState)) return false;
   if (isSessionTransferring(ds)
@@ -7250,7 +7340,7 @@ async function prepareRemoteRunnerExplicitClose(
       retryable: true,
     };
   }
-  if (!ds?.worker || ds.worker.killed) {
+  if (!ds?.worker || ds.worker.killed || ds.workerReady !== true) {
     if (!ds) {
       return {
         ok: false,
@@ -7263,7 +7353,8 @@ async function prepareRemoteRunnerExplicitClose(
     // A worker-less wake has no such runtime authority, so it must start only
     // from a valid opaque durable state and must never create a new provider
     // session merely to close it.
-    if (!normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
+    if ((!ds.worker || ds.worker.killed)
+        && !normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
       return {
         ok: false,
         error: 'remote_runner_row_inconsistent',
@@ -8458,7 +8549,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -11738,6 +11829,7 @@ export function sendWorkerInput(
   turnId?: string,
   opts: {
     dispatchAttempt?: number;
+    durablePrimaryInbox?: true;
     /** A command handler may own its single rejection reply. */
     notifyRejection?: false;
     /** Explicit positive steer authorization (plain-human-interactive only).
@@ -11898,6 +11990,7 @@ export function sendWorkerInput(
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
@@ -12421,6 +12514,9 @@ export type ForkResumeOrTurnId = boolean | string | {
   remoteResumeMode?: 'reattach' | 'rebuild';
   turnId?: string;
   dispatchAttempt?: number;
+  /** The opening prompt is a claimed durable-primary Inbox row and must ACK
+   * only after the adapter/provider proves submission. */
+  durablePrimaryInbox?: true;
   /** The payload is an exact retained activation journal. Do not re-read the
    * live clean-input feature flag on retry/replay. */
   codexAppInputGateFrozen?: boolean;
@@ -12678,10 +12774,14 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         ...(gatedPrompt.codexAppSteerable === true
           ? { codexAppSteerable: true as const }
           : {}),
@@ -12706,6 +12806,9 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.atMostOnce
         : undefined;
@@ -12717,6 +12820,7 @@ export function forkWorker(
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         // R6-B3 (transfer-gate sibling): sendWorkerInput reads steer
         // authorization from OPTS, not the payload. A steerable opening/refork
         // rerouted through the transfer gate must carry the flag here too, or it
@@ -12802,6 +12906,7 @@ export function forkWorker(
   let remoteResumeMode: 'reattach' | 'rebuild' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let initDurablePrimaryInbox: true | undefined;
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   let initAtMostOnce: boolean | undefined;
@@ -12814,6 +12919,7 @@ export function forkWorker(
     remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    initDurablePrimaryInbox = resumeOrTurnId.durablePrimaryInbox;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
     initAtMostOnce = resumeOrTurnId.atMostOnce;
@@ -12885,6 +12991,7 @@ export function forkWorker(
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
       // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
       // payload), so the direct-route double-fork (protected ownership, no
       // activation gate — e.g. only an unsettled ledger) must pass it through
@@ -13001,6 +13108,7 @@ export function forkWorker(
           if (prompt.length > 0) {
             const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
               ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+              ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
               ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
               ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
               ...(initAtMostOnce ? { atMostOnce: true as const } : {}),
@@ -13754,6 +13862,9 @@ export function forkWorker(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    // 实验性、默认关闭：只有显式 true 才下发，worker 读不到即保持旧的失败通知。
+    // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
+    ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
     promptInjection: sessionPromptInjection(ds),
     solo: ds.soloSession === true,
     feedback: feedbackPolicy,
@@ -13778,6 +13889,7 @@ export function forkWorker(
     turnId: initAttributionTurnId,
     ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
+    ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     // R4-B1: COPY the frozen steer authorization onto the first-turn init so the
     // worker can fold follow-ups into this opening turn (canSteer requires the
@@ -14436,11 +14548,18 @@ function setupWorkerHandlers(
         // Committed synchronously (no await before this point) so no later
         // frame of this worker can be judged against an older identity.
         if (ds.workerGeneration !== workerGeneration) break;
+        const cardWasWaiting = streamingCardTurnQueued(ds);
         if (!commitCaptureIdentity(ds, workerGeneration, msg)) {
           logger.debug(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
+        } else if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
+          // The waiting turn has become the terminal producer. Repaint even
+          // when the worker remains working→working and no status edge would
+          // otherwise wake the card: this immediately removes the predecessor
+          // preview, before the first screenshot from the new turn arrives.
+          reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
         }
         break;
       }
@@ -14545,6 +14664,16 @@ function setupWorkerHandlers(
         ) {
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
+        }
+        if (msg.durablePrimaryInbox) {
+          try {
+            cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });
+          } catch (err) {
+            logger.warn(
+              `[${t}] durable-primary input commit handler failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
@@ -14862,7 +14991,7 @@ function setupWorkerHandlers(
               effectiveCliId,
               ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
-              ds.currentImageKey,
+              streamingCardPresentationImageKey(ds),
               isAdopt,
               showTakeover,
               loc,
@@ -14988,7 +15117,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15136,7 +15265,10 @@ function setupWorkerHandlers(
               await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
-            throw fallbackErr;
+            // This handler is fire-and-forget (worker IPC), so a rethrow only
+            // surfaces as a daemon-level unhandled rejection. Log and leave
+            // streamCardId cleared so a later screen_update can retry the card.
+            logger.warn(`[${t}] Failed to send static fallback card: ${fallbackErr}`);
           }
         }
 
@@ -15705,7 +15837,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15831,7 +15963,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15869,8 +16001,31 @@ function setupWorkerHandlers(
         // target must accept it (a new-turn card waits for its exact turn).
         const frameVerdict = evaluateScreenshotFrame(ds, workerGeneration, msg);
         if (!frameVerdict.ok) {
+          let shownAsWaitingPreview = false;
+          if (frameVerdict.reason === 'target-waiting'
+            && frameVerdict.source.turnId !== undefined) {
+            const target = currentStreamCardDisplayTarget(ds);
+            if (target?.mode === 'waiting-exact-turn') {
+              // Keep predecessor pixels observable without laundering them into
+              // the waiting turn's durable cache. This slot is in-memory only,
+              // preserves the legacy card presentation, and is cleared on
+              // target activation/publication or worker replacement.
+              ds.waitingTurnPreview = {
+                imageKey: msg.imageKey,
+                ...frameVerdict.source,
+              };
+              shownAsWaitingPreview = true;
+              if ((ds.displayMode ?? 'hidden') === 'screenshot'
+                && ds.streamCardId
+                && ds.streamCardId !== CARD_POSTING_SENTINEL
+                && workerHasInitialized(ds)) {
+                scheduleCardPatch(ds, buildStreamingCardJson(ds), target.turnId);
+              }
+            }
+          }
           logger.debug(
-            `[${t}] Dropped screenshot (${frameVerdict.reason}) turn=${msg.turnId?.substring(0, 12) ?? '-'} `
+            `[${t}] ${shownAsWaitingPreview ? 'Previewed' : 'Dropped'} screenshot (${frameVerdict.reason}) `
+            + `turn=${msg.turnId?.substring(0, 12) ?? '-'} `
             + `attempt=${msg.dispatchAttempt ?? '-'} rev=${msg.captureRevision ?? '-'}`,
           );
           break;
@@ -15937,7 +16092,7 @@ function setupWorkerHandlers(
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isAdopt,
           showTakeover,
           loc,
@@ -16891,7 +17046,11 @@ function setupWorkerHandlers(
           }
           const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
           if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
-          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const card = buildTrustedResultDeliveryCard({
+            accessUrl,
+            expiresAt: msg.expiresAt,
+            brand: getBotBrand(ds.larkAppId),
+          });
           const messageId = await scopedReply(card, 'interactive', msg.turnId, {
             uuid: deliveryUuid('entry'),
             replyTarget: frozen.target,
@@ -18073,6 +18232,36 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'btw_answer': {
+        // Claude Code `/btw` side answer captured from its overlay. Rendered
+        // like the adopt preamble (question + Markdown answer) and replied
+        // under the `/btw` turn.
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        if (!msg.answer.trim()) break;
+        const loc = localeForBot(ds.larkAppId);
+        // Feishu cards cap at ~30KB; a side answer is short, so a plain
+        // character cap (CJK is 3 bytes) is enough instead of a file fallback.
+        let btwAnswer = msg.answer.length > BTW_ANSWER_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+          : msg.answer;
+        if (msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        const cardJson = buildContextualReplyCard({
+          title: tr('card.btw_answer', undefined, loc),
+          userText: msg.question,
+          assistantText: repairReplyMarkdown(btwAnswer),
+          assistantLabel: sessionCliDisplayName(ds, botCfg),
+          recipientOpenId,
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          locale: loc,
+          workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+        });
+        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: unknown) => {
+          logger.error(`[${t}] Failed to deliver /btw answer: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        break;
+      }
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
         // from the adopted CLI session so the Lark thread has context to
@@ -19178,10 +19367,19 @@ function deliverFinalOutput(
         : msg.userText;
       const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
       if (!isStillOwned()) { onComplete?.(false); return; }
+      const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
+        : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
+          : ds.session.rootMessageId;
+      // In a dispatched topic a bot initiator is the dispatcher: the automatic
+      // report below returns the result to its own session, so no @ here.
+      const reportInsteadOfAt = zeroPromptReply && initiator?.isBot === true
+        && topicReportsToDispatcher(ds, zeroPromptDispatchRoot);
       const recipientOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
-          ?? (zeroPromptReply ? initiator?.openId : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+          ?? (zeroPromptReply
+            ? (reportInsteadOfAt ? undefined : initiator?.openId)
+            : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
       // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
       // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
       // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
@@ -19489,17 +19687,15 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge')
-        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit)) {
+        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit && !reportInsteadOfAt)) {
         // A real @ already returns this result to the initiating bot. Do not
         // also inject an HTTP report and make it process the same result twice.
+        // In a dispatched topic that @ was dropped above, so the report is the path.
         // Reporting is a separate sink. Its bounded retries must not resend
         // the already-delivered card or delay this sub-session's settlement.
         const report = cb.onZeroPromptFinal;
         const input = {
-          turnId: msg.turnId, content: safeAssistantText,
-          dispatchRoot: frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
-            : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
-              : ds.session.rootMessageId,
+          turnId: msg.turnId, content: safeAssistantText, dispatchRoot: zeroPromptDispatchRoot,
         };
         if (report) void Promise.resolve().then(() => report(ds, input)).catch(error => {
           logger.warn(`[${t}] Automatic dispatch report failed (turn ${msg.turnId}): ${error}`);
@@ -19707,6 +19903,7 @@ export function reserveWorkerGeneration(ds: DaemonSession): number {
   ) + 1;
   ds.workerGeneration = workerGeneration;
   ds.session.workerGeneration = workerGeneration;
+  ds.waitingTurnPreview = undefined;
   // P1-13：换代边界统一清 previewTarget。fork / refork / 切 CLI / adopt 全部经由这里
   // 预留代次，所以这一处就是「上一代 CLI 起的 dev server 已经失去权威」的唯一判据。
   // 并进同一次 updateSession，代次推进与预览清空要么一起落盘、要么一起回滚——否则

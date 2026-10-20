@@ -676,10 +676,13 @@ describe('session CLI home scrub call sites', () => {
     expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     const dashboard = read('dashboard.ts');
     const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
+    const coordinatorAt = dashboard.indexOf('setDurableConfigCoordinator(dashboardConfigCoordinator)');
     expect(scrubAt).toBeGreaterThan(-1);
     // Must land before anything that can fork a host child — the onboarding
     // manager is wired to the start/stop-bot spawns (dashboard/managed-spawn.ts).
     expect(scrubAt).toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
+    expect(coordinatorAt).toBeGreaterThan(scrubAt);
+    expect(coordinatorAt).toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
     expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
   });
 
