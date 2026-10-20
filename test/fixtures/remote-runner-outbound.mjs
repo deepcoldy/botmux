@@ -14,15 +14,23 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
 }
 
-function outbound(operationId, turnId, content) {
+function outbound(
+  operationId,
+  turnId,
+  content,
+  mention = 'none',
+  mentions = undefined,
+  responseKind = 'progress',
+) {
   emit({
     type: 'outbound_message',
     operationId,
     turnId,
     generation: 1,
     content,
-    responseKind: 'progress',
-    mention: 'none',
+    responseKind,
+    mention,
+    ...(mentions ? { mentions } : {}),
   });
 }
 
@@ -31,7 +39,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   if (command.type === 'hello') {
     emit({
       type: 'hello', requestId: command.requestId, provider: 'outbound-test',
-      capabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'outbound_message'],
+      capabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'outbound_message', 'outbound_message_explicit_mention', 'outbound_message_final',
+      ],
     });
     return;
   }
@@ -53,11 +64,21 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       expectedResults = 2;
       outbound('same-operation', command.turnId, 'first payload');
       outbound('same-operation', command.turnId, 'changed payload');
+    } else if (command.content === 'mention-conflict') {
+      expectedResults = 2;
+      outbound('same-operation', command.turnId, 'same payload', 'explicit', ['ou_first:First']);
+      outbound('same-operation', command.turnId, 'same payload', 'explicit', ['ou_second:Second']);
     } else if (command.content === 'rate') {
       expectedResults = 11;
       for (let index = 0; index < expectedResults; index++) {
         outbound(`operation-${index}`, command.turnId, `payload ${index}`);
       }
+    } else if (command.content === 'final-outbound') {
+      expectedResults = 1;
+      outbound(
+        'final-operation', command.turnId, 'final payload',
+        'explicit', ['ou_target:Target'], 'final',
+      );
     }
     return;
   }

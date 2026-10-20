@@ -35,6 +35,13 @@ const [planDigestArg, planPathArg] = process.argv.slice(isStandaloneBinary() ? 3
 const plan = consumeProgramStatusRelayPlan(planDigestArg, planPathArg);
 const stdin = process.stdin;
 const stdout = process.stdout;
+// Create the stderr stream NOW, while the pane is alive. It is lazy, and once
+// the pane is killed node's stdin teardown (net Socket._destroy) touches it for
+// the first time; creating a TTY stream re-opens the pane tty, and on macOS
+// open() of a hung-up pty blocks forever. That froze the event loop before the
+// SIGHUP handler's escalation could run, leaking the relay, the CLI and their
+// three ptys per closed session until tmux could no longer fork a pane.
+void process.stderr;
 // The launch shim parked interpreter loader options and moved us to `/` so no
 // bot- or workdir-configured preload runs in this unconfined process; the CLI
 // gets its options and working directory back.

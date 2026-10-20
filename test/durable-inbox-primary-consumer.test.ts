@@ -200,6 +200,65 @@ describe('durable inbox primary consumer', () => {
     await consumer.stop();
   });
 
+  it('requeues an explicit busy result without reporting a dispatch error', async () => {
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    // Explicit retry is a wait-state, not a failing attempt. Even an already
+    // high attempt count must not hit the generic poison-row completion path.
+    const busy = { ...claim('om_busy'), attempts: 999 };
+    const store = inboxStore({ claims: [busy], retried });
+    const errors: unknown[] = [];
+    const commits: DurableInboxPrimaryDispatchResult[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      retryDelayMs: 750,
+      maxAttempts: 1,
+      now: () => 9_000,
+      dispatch: async () => ({ kind: 'retry', reason: 'session has an unfinished turn' }),
+      onCommitted: ({ result }) => commits.push(result),
+      onError: error => errors.push(error),
+    });
+    await consumer.ready;
+
+    expect(store.completeInboxClaim).not.toHaveBeenCalled();
+    expect(retried).toHaveLength(1);
+    expect(retried[0].visibleAt).toBe(9_750);
+    expect(commits).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+    await consumer.stop();
+  });
+
+  it('lets another consumer slot commit while one partition head is explicitly busy', async () => {
+    const completed: InboxClaim[] = [];
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const busy = claim('om_busy_partition');
+    busy.event.partitionKey = 'lark-message-routing:cli_test:oc_busy';
+    const independent = claim('om_independent_partition');
+    independent.event.partitionKey = 'lark-message-routing:cli_test:oc_independent';
+    const store = inboxStore({ claims: [busy, independent], completed, retried });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 2,
+      intervalMs: 60_000,
+      now: () => 2_000,
+      dispatch: async message => message.messageId === 'om_busy_partition'
+        ? { kind: 'retry', reason: 'session has an unfinished turn' }
+        : committed(message),
+    });
+    await consumer.ready;
+
+    expect(retried.map(item => item.claim.event.partitionKey)).toEqual([
+      'lark-message-routing:cli_test:oc_busy',
+    ]);
+    expect(completed.map(item => item.event.partitionKey)).toEqual([
+      'lark-message-routing:cli_test:oc_independent',
+    ]);
+    await consumer.stop();
+  });
+
   it('requeues a transient failure in SQLite with an incremented attempt', async () => {
     let now = 100;
     const store = sqliteStore(() => now);

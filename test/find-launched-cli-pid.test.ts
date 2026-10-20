@@ -74,8 +74,13 @@ function runWorkerWiring(late: boolean, options: {
   relayLaunched?: boolean;
   reattached?: boolean;
   cliRuntime?: { source: string; executable: string };
+  /** The pane pid is the owned-scope supervisor; resolve to this payload pid. */
+  scopePayloadPid?: number;
+  /** Payload becomes observable only after this many sessionScopePayloadPid reads. */
+  scopePayloadAfterProbe?: number;
 } = {}) {
   const scheduler = makeScheduler();
+  let scopeProbes = 0;
   const backend = { cliPid: 100, getChildPid: () => 100 };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
@@ -95,6 +100,7 @@ function runWorkerWiring(late: boolean, options: {
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    scopePayloadLauncherActive: options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
@@ -102,6 +108,14 @@ function runWorkerWiring(late: boolean, options: {
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
+    sessionScopePayloadPid: vi.fn((pid: number) => {
+      scopeProbes++;
+      return options.scopePayloadPid !== undefined
+        && pid === 100
+        && scopeProbes >= (options.scopePayloadAfterProbe ?? 1)
+        ? options.scopePayloadPid
+        : pid;
+    }),
     readCmdline: (() => {
       let reads = 0;
       return (pid: number) => {
@@ -127,6 +141,70 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('binds and attests an owned-scope payload rather than its pane supervisor (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('follows a scope payload that appears after the initial PID wiring (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 2,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
+  it.each([false, true])('keeps resolving the wrapperCli native leaf underneath a scope payload (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', claudeDataDir: '/claude',
+      scopePayloadPid: 150,
+    });
+    // Scope unwraps to 150 first; the wrapper BFS then descends to native 200.
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it('keeps scope PID discovery alive while a slow launch shell is still starting', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 40,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
+  it.each([false, true])('roots Codex launcher ownership discovery at the scope payload, not the sh (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { scopePayloadPid: 150 });
+    // The pane sh (100) is never searched for the codex native leaf; BFS starts
+    // at the payload (150) and descends to 200.
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'codex');
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(200);
+  });
+
+  it('roots Codex ownership at the scope payload in the synchronous ownership block', () => {
+    // An adopt/reuse codex launch (no Claude data dir, no wrapper CLI) skips
+    // every async resolver, so only the immediate synchronous ownership block
+    // can unscope the root; with no resolve helpers it must bind the payload.
+    const result = runWorkerWiring(false, {
+      cliId: 'codex', wrapperCli: '', claudeDataDir: undefined, scopePayloadPid: 150,
+      launchedCliPid: null,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
   it.each([false, true])('attests the Codex child without a Claude data dir (late PID=%s)', late => {
     const result = runWorkerWiring(late);
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');

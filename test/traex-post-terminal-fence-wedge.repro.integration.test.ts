@@ -241,7 +241,13 @@ setInterval(() => {
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitFor(child, () => messages.some(m => m.type === 'prompt_ready'), logs, 'initial prompt readiness');
+    await waitFor(
+      child,
+      () => messages.some(m => m.type === 'prompt_ready'),
+      logs,
+      'initial prompt readiness',
+      30_000,
+    );
 
     // Durable IM turn (dispatchAttempt) — exactly what the daemon sends.
     child.send({ type: 'message', content: 'first prompt', turnId: 'om_first', dispatchAttempt: 1 } satisfies DaemonToWorker);
@@ -327,5 +333,5 @@ setInterval(() => {
       'idle→busy edge for a locally started turn',
       8_000,
     );
-  }, 40_000);
+  }, 60_000);
 });

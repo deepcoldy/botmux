@@ -818,6 +818,12 @@ export async function handleSessionsCardAction(
         ),
       });
     }
+    if (body.archiveError) {
+      const elements = Array.isArray((card as { elements?: unknown }).elements)
+        ? (card as { elements: unknown[] }).elements : undefined;
+      elements?.unshift({ tag: 'markdown', content: t('card.dashboard.sessions.codex_archive_failed',
+        { detail: String(body.archiveError) }, locale) });
+    }
     return { card: { type: 'raw', data: card } };
   }
 

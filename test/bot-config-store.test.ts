@@ -140,6 +140,50 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
   });
 
+  it('judges zero injection on the effective backend (daemon default when not overridden)', async () => {
+    process.env.BACKEND_TYPE = 'zmx';
+    try {
+      // antigravity zero injection cannot run on zmx; with no override the session uses it.
+      const { store } = await loaded({ cliId: 'antigravity' });
+      const zero = store.findConfigField('promptInjection')!;
+      expect(await store.applyConfigField('app_default', zero, 'none'))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      const backend = store.findConfigField('backendType')!;
+      expect((await store.applyConfigField('app_default', backend, 'tmux')).ok).toBe(true);
+      expect((await store.applyConfigField('app_default', zero, 'none')).ok).toBe(true);
+      // Clearing the override falls back to zmx: refused while zero injection is on.
+      expect(await store.applyConfigField('app_default', backend, null))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      expect(readConfig().backendType).toBe('tmux');
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
+    process.env.BACKEND_TYPE = 'riff';
+    try {
+      // claude-code never spawns on riff: the pairing resolves it to pty, which supports zero injection.
+      const { store } = await loaded({ cliId: 'claude-code' });
+      expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+      // Runtime prompt construction agrees with the accepted write.
+      const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+      expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('treats a stale remote backend override on a local CLI the way spawning does', async () => {
+    // e.g. left over after switching away from a remote CLI: spawn pairs it back to local.
+    const { store } = await loaded({ cliId: 'claude-code', backendType: 'riff', replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+    expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'claude-code')).toBe('transcript');
+  });
+
   it('rejects zero injection without automatic reply support', async () => {
     const { store } = await loaded({ cliId: 'gemini' });
     expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
@@ -192,6 +236,52 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    const spec = store.findConfigField('codexCapacityRecovery')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate', clearable: true });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect(store.coerceConfigValue(spec, 'sometimes').ok).toBe(false);
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).not.toBe(true);
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBeUndefined();
+  });
+
+  it('defaults the delivered-final failure-notice opt-in off and round-trips only an explicit true', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    const spec = store.findConfigField('suppressDeliveredFinalFailureNotice')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'next-session', clearable: true });
+    expect(spec.defaultOn).toBeUndefined();
+    expect(spec.hint).toContain('实验性');
+    expect(spec.hint).toContain('默认 off');
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.loadBotConfigs()[0].suppressDeliveredFinalFailureNotice).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it.each(['true', 1, 'on'])('does not enable the delivered-final opt-in from a non-boolean bots.json value (%s)', async raw => {
+    const { registry } = await loaded({ cliId: 'codex', suppressDeliveredFinalFailureNotice: raw });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
   });
 
   it('normalizes noProgressNotify JSON and rejects out-of-range or unknown fields', async () => {
@@ -628,6 +718,45 @@ describe('bot-config store', () => {
     expect(registry.loadBotConfigs()[0].showReplyTiming).toBe(true);
     await store.applyConfigField('app_default', timing, false);
     expect(readConfig().showReplyTiming).toBeUndefined();
+  });
+
+  it('larkToolBinding is a next-session clearable boolean with defaultOn, aliases bindlarkapp / larkappbinding, and cleans bots.json when true', async () => {
+    const { registry, store } = await loaded();
+    expect(store.findConfigField('larkToolBinding')?.configKey).toBe('larkToolBinding');
+    expect(store.findConfigField('bindLarkApp')?.configKey).toBe('larkToolBinding');
+    expect(store.findConfigField('larkAppBinding')?.configKey).toBe('larkToolBinding');
+
+    const spec = store.findConfigField('larkToolBinding')!;
+    expect(spec.effect).toBe('next-session');
+    expect(spec.clearable).toBe(true);
+    expect(spec.defaultOn).toBe(true);
+
+    // Initial state: undefined (renders 'on' because defaultOn: true)
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
+    expect(readConfig().larkToolBinding).toBeUndefined();
+
+    // Disable (false) -> writes false on disk and in memory
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().larkToolBinding).toBe(false);
+    expect(registry.getBot('app_default').config.larkToolBinding).toBe(false);
+
+    // Enable (true) -> deletes key (back to default), in-memory undefined (= on)
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().larkToolBinding).toBeUndefined();
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
+
+    // Unset (null) from an explicit-false state also restores the default
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().larkToolBinding).toBe(false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().larkToolBinding).toBeUndefined();
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
   });
 
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {

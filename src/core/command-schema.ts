@@ -39,6 +39,16 @@ export interface CommandSpec {
   readonly aliases?: readonly string[];
   /** 仅指定 CLI 由 daemon 处理；不加入全局命令集合，保留其它 CLI 的透传行为。 */
   readonly cliId?: string | readonly string[];
+  /**
+   * 仅在**无会话**时由 botmux 认领；话题/群里已有会话时按未知命令原样转发给 CLI（保留 CLI
+   * 自带同名命令）。同 `cliId` 命令一样不进全局集合：不遮蔽自定义透传、不进 canTalk 名单。
+   */
+  readonly claimWithoutSessionOnly?: boolean;
+  /**
+   * 权限门槛。缺省 = 需要 canOperate（可被 bot 的 canTalkDaemonCommands 逐条降到 canTalk）；
+   * `'talk'` = 有对话权限即可执行（`canRunDaemonCommand` 直接按 canTalk 判）。
+   */
+  readonly permission?: 'talk';
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -170,6 +180,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
   { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  {
+    name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
+    notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
+      + '有对话权限即可用；带别处 id 时凭会话 id 复制（信任模型同 /fork：id 只在原聊天可见、不可猜）',
+  },
 ];
 
 /** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。
@@ -191,7 +206,7 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
-const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId);
+const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId && !s.claimWithoutSessionOnly);
 
 /** 所有 CLI 都由 botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
 export const DAEMON_COMMANDS: Set<string> = new Set(GLOBAL_COMMANDS.flatMap(namesOf));

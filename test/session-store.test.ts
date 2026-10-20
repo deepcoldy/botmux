@@ -1306,6 +1306,7 @@ describe('principal lane durable store', () => {
     source.backendType = 'tmux';
     source.model = 'gpt-5';
     source.reasoningEffort = 'high';
+    source.cliConfigDir = '~/.claude-api';
     source.sandbox = true;
     source.sandboxPaths = { readWrite: [tempDir], readOnly: ['/tmp/read-only'] };
     source.mojoIdentity = { controlPlane: 'host', endpoint: 'https://runtime.example' } as any;
@@ -1361,6 +1362,7 @@ describe('principal lane durable store', () => {
         backendType: 'tmux',
         model: 'gpt-5',
         reasoningEffort: 'high',
+        cliConfigDir: '~/.claude-api',
         sandbox: true,
         mojoIdentity: { controlPlane: 'host', endpoint: 'https://runtime.example' },
       },

@@ -14,7 +14,7 @@ import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
-import { replyMessage, sendMessage, updateMessage, uploadFile } from './client.js';
+import { replyMessage, sendMessage, sendUserMessage, updateMessage, uploadFile } from './client.js';
 import { TRANSIENT_LARK_CODES } from './api-gate.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { larkCodeFromMessage, structuredLarkCode } from './lark-errors.js';
@@ -49,6 +49,7 @@ export interface AskCardActionData {
 
 export interface AskCardDispatcherDeps {
   sendMessage?: typeof sendMessage;
+  sendUserMessage?: typeof sendUserMessage;
   replyMessage?: typeof replyMessage;
   updateMessage?: typeof updateMessage;
   uploadFile?: typeof uploadFile;
@@ -64,6 +65,7 @@ export function createLarkAskCardDispatcher(
   deps: AskCardDispatcherDeps = {},
 ): AskCardDispatcher {
   const send = deps.sendMessage ?? sendMessage;
+  const sendUser = deps.sendUserMessage ?? sendUserMessage;
   const reply = deps.replyMessage ?? replyMessage;
   const update = deps.updateMessage ?? updateMessage;
   // 惰性取用：只有超预算的卡才需要上传附件。
@@ -71,6 +73,13 @@ export function createLarkAskCardDispatcher(
 
   return {
     async send(ask) {
+      if (ask.chatId.startsWith('doc:') && !ask.deliveryTarget) {
+        throw new AskDispatchError('Confirmation card cannot be delivered: document session has no verified recipient', false);
+      }
+      if (ask.deliveryTarget && (!ask.deliveryTarget.openId.startsWith('ou_')
+        || ask.deliveryTarget.openId !== ask.answererOpenId)) {
+        throw new AskDispatchError('Confirmation card cannot be delivered: invalid document author', false);
+      }
       if (ask.replyCardTarget) {
         try { return { messageId: await publishReplyCardAsk(ask) }; }
         catch (err) {
@@ -83,8 +92,11 @@ export function createLarkAskCardDispatcher(
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
       // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
       // 所以这里要按前缀判断是否真的能 reply.
-      const canReplyToRoot =
+      const canReplyToRoot = !ask.deliveryTarget &&
         typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
+      const sendToRecipient = (content: string, type: string, uuid?: string) => ask.deliveryTarget
+        ? sendUser(ask.larkAppId, ask.deliveryTarget.openId, content, type, uuid)
+        : send(ask.larkAppId, ask.chatId, content, type, uuid);
       // Pass the ask's stable dispatchUuid as the Feishu message uuid so a
       // re-send after a daemon restart (restart-resume) dedupes server-side and
       // returns the ORIGINAL message_id instead of posting a second card.
@@ -99,7 +111,7 @@ export function createLarkAskCardDispatcher(
           try {
             await sendPromptAttachment(ask, upload, (content, fileUuid) => canReplyToRoot
               ? reply(ask.larkAppId, ask.rootMessageId!, content, 'file', true, fileUuid)
-              : send(ask.larkAppId, ask.chatId, content, 'file', fileUuid));
+              : sendToRecipient(content, 'file', fileUuid));
           } catch (err) {
             if (classifyAskDispatchError(err).retryable) throw err;
             logger.warn(`[ask:${ask.askId}] failed to send full-question attachment; sending truncated card only: ${
@@ -108,7 +120,7 @@ export function createLarkAskCardDispatcher(
         }
         const messageId = canReplyToRoot
           ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
-          : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
+          : await sendToRecipient(cardJson, 'interactive', uuid);
         return { messageId };
       } catch (err) {
         // Re-throw as a typed AskDispatchError so the broker's bounded retry can
@@ -370,8 +382,9 @@ export function renderAskCard(
   opts?: { confirmEmptyArmed?: boolean },
 ): { json: string; promptTruncated: boolean } {
   const measureUuid = ask.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE;
+  const receiveId = ask.deliveryTarget?.openId ?? ask.chatId;
   const full = renderAskCardWithCap(ask, result, opts, Infinity);
-  if (turnReplyCardRequestBytes(full, ask.chatId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
+  if (turnReplyCardRequestBytes(full, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
     return { json: full, promptTruncated: false };
   }
   const longest = Math.max(0, ...ask.questions.map((_, i) => questionPrompt(ask, i).length));
@@ -382,7 +395,7 @@ export function renderAskCard(
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
     const json = renderAskCardWithCap(ask, result, opts, mid);
-    if (turnReplyCardRequestBytes(json, ask.chatId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
+    if (turnReplyCardRequestBytes(json, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
       best = json;
       lo = mid + 1;
     } else {
@@ -455,11 +468,18 @@ function renderAskCardWithCap(
     tag: 'div',
     fields: [
       { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
     ],
   };
 
   const elements: Array<Record<string, unknown>> = [metaDiv];
+  if (ask.deliveryTarget) {
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text',
+      content: t('card.ask.document_origin', {
+        document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
+      }, locale),
+    }] });
+  }
 
   if (status) {
     // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
@@ -573,7 +593,9 @@ function renderAskCardWithCap(
     elements.push({
       tag: 'note',
       elements: [
-        { tag: 'plain_text', content: t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
+        { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
+          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
   }
@@ -662,6 +684,11 @@ function escalateUnauthorized(
 ): { toast: { type: string; content: string } } {
   const ask = getAskSnapshot(askId);
   if (!ask || ask.settled || ask.nonce !== nonce) return staleToast(locale);
+  // A responder lock is not a missing group grant. Never ask the owner to
+  // grant a forwarded-card clicker access to the document author's decision.
+  if (ask.deliveryTarget) {
+    return { toast: { type: 'warning', content: t('card.ask.toast.unauthorized', undefined, locale) } };
+  }
   const requestGrant = deps.requestGrant ?? requestGrantForAskClicker;
   const outcome = requestGrant(
     {

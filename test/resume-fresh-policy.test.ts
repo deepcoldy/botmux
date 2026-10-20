@@ -9,18 +9,23 @@
  *   1. `resumeStartsFresh` — the shared predicate upper layers (closed card,
  *      resume receipt) use to distinguish "route reactivated" from "CLI
  *      history restored".
- *   2. Worker source-lock — resume-without-id is routed through the existing
- *      fresh-demotion branch (effectiveResume=false + user_notify), so the
- *      cold-recovery path is observable instead of silently launching a blank
- *      session while the UI claims history is back.
- *   3. Card-handler source-lock — the resume receipt picks the fresh variant.
+ *   2. The closed-session card built for such a session warns that resume
+ *      starts fresh instead of implying the CLI history is back. (The resume
+ *      receipt variant is covered in card-handler-resume-receipt.test.ts; the
+ *      worker's fresh-demotion wiring lives in spawnCli and has no unit seam.)
  *
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
  */
-import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { describe, it, expect, vi } from 'vitest';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
+import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
+import { getCliDisplayName } from '../src/im/lark/card-builder.js';
+import { t } from '../src/i18n/index.js';
+import type { Session } from '../src/types.js';
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex' } })),
+}));
 
 describe('resumeStartsFresh', () => {
   it('copilot / kimi / cursor without a persisted cliSessionId start fresh', () => {
@@ -51,117 +56,26 @@ describe('resumeStartsFresh', () => {
   });
 });
 
-// ─── Worker wiring (source lock) ────────────────────────────────────────────
-//
-// spawnCli is not exported for unit testing; the repo convention for its
-// internal wiring is source-lock tests (see config-dir.test.ts). These assert
-// the missing-exact-id case is routed through the EXISTING fresh-demotion
-// branch — the one that flips effectiveResume=false and emits the
-// fresh-start attempt user_notify — instead of leaving
-// effectiveResume=true while the adapter silently launches a blank session.
-describe('worker spawnCli resume demotion (source lock)', () => {
-  const workerSource = readFileSync(resolvePath('src/worker.ts'), 'utf8');
+// ─── Closed-session card ────────────────────────────────────────────────────
+describe('closed-session card for a precise-id-only CLI', () => {
+  const session = (cliSessionId?: string) => ({
+    sessionId: 'botmux-session', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group',
+    title: 'Topic', status: 'closed', createdAt: '2026-08-03T00:00:00.000Z', workingDir: '/repo',
+    cliId: 'cursor', agentFrozen: true, larkAppId: 'app_test',
+    ...(cliSessionId ? { cliSessionId } : {}),
+  }) as unknown as Session;
+  const markdown = (cardJson: string): string =>
+    (JSON.parse(cardJson) as { elements: Array<{ tag: string; content?: string }> })
+      .elements.find(e => e.tag === 'markdown')?.content ?? '';
+  const freshNote = t('card.body.resume_starts_fresh', { cliName: getCliDisplayName('cursor') }, 'zh');
 
-  it('declares the missing-exact-id tier from the adapter capability flag', () => {
-    expect(workerSource).toContain('cliAdapter.resumeRequiresCliSessionId === true');
-    expect(workerSource).toContain('const missingExactResumeId');
+  it('warns that resume starts fresh when no cliSessionId was persisted', () => {
+    expect(markdown(buildClosedSessionCard(session(), 'zh'))).toContain(freshNote);
   });
 
-  it('feeds the tier into fallBackToFresh (not a standalone side branch)', () => {
-    const start = workerSource.indexOf('const fallBackToFresh =');
-    expect(start).toBeGreaterThan(-1);
-    const block = workerSource.slice(start, start + 400);
-    expect(block).toContain('missingExactResumeId');
-  });
-
-  it('demotes effectiveResume + emits the existing fresh-demotion user_notify', () => {
-    // The tier must land inside the `if (fallBackToFresh)` block that already
-    // drops resume and notifies — not a parallel silent path.
-    const fbStart = workerSource.indexOf('if (fallBackToFresh) {');
-    expect(fbStart).toBeGreaterThan(-1);
-    const block = workerSource.slice(fbStart, fbStart + 2200);
-    expect(block).toContain('effectiveResume = false;');
-    expect(block).toContain('effectiveCliSessionId = undefined;');
-    expect(block).toContain('resumeFallbackNotified');
-    expect(block).toContain('user_notify');
-    expect(block).toContain('正在尝试以新会话重新启动');
-    expect(block).toContain('不会恢复历史上下文');
-    expect(block).not.toContain('已为你**新起一个干净会话**');
-    expect(block).not.toContain('历史会话（');
-  });
-
-  it('keeps the missing-id diagnostic reason in the worker', () => {
-    expect(workerSource).toContain('no persisted CLI session id');
-  });
-
-  it('never demotes when reattaching to a live persistent pane (no context is lost)', () => {
-    const start = workerSource.indexOf('const missingExactResumeId');
-    expect(start).toBeGreaterThan(-1);
-    const block = workerSource.slice(start, start + 400);
-    expect(block).toContain('!willReattachPersistent');
-  });
-
-  it('suppresses the fresh-demotion notice when no CLI transcript ever existed (first-turn launch recovery)', () => {
-    // A first-turn launch that dies before the CLI writes its session file has
-    // no user-visible history; the fallback is recovery, not context loss, and
-    // the user-facing notice is a false alarm.
-    const fbStart = workerSource.indexOf('if (fallBackToFresh) {');
-    expect(fbStart).toBeGreaterThan(-1);
-    const block = workerSource.slice(fbStart, fbStart + 2400);
-    expect(block).toContain('suppressFallbackNotice');
-    expect(block).toContain('!cliTranscriptEverExisted');
-    expect(block).toContain('resumeFallbackNotified');
-  });
-
-  it('marks the transcript as existing when the bridge baselines against the JSONL file', () => {
-    const fnStart = workerSource.indexOf('function bridgeAbsorbBaseline(): void {');
-    expect(fnStart).toBeGreaterThan(-1);
-    const block = workerSource.slice(fnStart, fnStart + 800);
-    expect(block).toContain('cliTranscriptEverExisted = true');
-  });
-
-  it('also arms the transcript flag on the fresh-empty first drain (not only at baseline)', () => {
-    // fresh-empty mode never runs bridgeAbsorbBaseline — it declares
-    // baseline-done up front so first-turn events stay attributable. Without
-    // the drain-side setter, a fresh session that ran real turns would keep
-    // the flag false and a later resume fallback would silently drop its
-    // context without the user-facing notice.
-    const drainStart = workerSource.indexOf('const result = drainTranscript(bridgeJsonlPath, bridgeOffset);');
-    expect(drainStart).toBeGreaterThan(-1);
-    const block = workerSource.slice(drainStart, drainStart + 1100);
-    expect(block).toContain('cliTranscriptEverExisted = true');
-  });
-
-  it('documents the cross-process (worker-restart) reset trade-off at the flag declaration', () => {
-    // Not persisting the flag across worker restarts is deliberate: a stale
-    // persisted `true` could suppress the notice for a session whose
-    // transcript is actually gone, while the reset only risks missing one
-    // reminder (the resume path re-arms the flag by baselining the
-    // still-existing transcript).
-    const declStart = workerSource.indexOf('let cliTranscriptEverExisted = false;');
-    expect(declStart).toBeGreaterThan(-1);
-    const comment = workerSource.slice(Math.max(0, declStart - 2000), declStart);
-    expect(comment).toContain('NOT persisted');
-    expect(comment).toContain('worker restart');
-  });
-});
-
-// ─── Card copy wiring (source lock) ─────────────────────────────────────────
-describe('resume copy distinction (source lock)', () => {
-  it('card-handler picks the fresh receipt variant via resumeStartsFresh', () => {
-    const source = readFileSync(resolvePath('src/im/lark/card-handler.ts'), 'utf8');
-    expect(source).toContain("t('card.action.resume_success_fresh'");
-    expect(source).toContain('resumeStartsFresh(result.ds.session)');
-  });
-
-  it('closed-session-card passes the fresh flag into the card builder', () => {
-    const source = readFileSync(resolvePath('src/core/closed-session-card.ts'), 'utf8');
-    expect(source).toContain('resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId })');
-  });
-
-  it('card-builder renders the fresh note instead of the generic resume note', () => {
-    const source = readFileSync(resolvePath('src/im/lark/card-builder.ts'), 'utf8');
-    expect(source).toContain('resumeStartsFresh?: boolean');
-    expect(source).toContain("t('card.body.resume_starts_fresh'");
+  it('prints the precise resume command instead when a cliSessionId exists', () => {
+    const md = markdown(buildClosedSessionCard(session('chat-1'), 'zh'));
+    expect(md).toContain('cursor-agent --resume chat-1');
+    expect(md).not.toContain(freshNote);
   });
 });

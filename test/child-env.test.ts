@@ -28,6 +28,7 @@ import {
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
+import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
 
 describe('applySessionOwnerEnv()', () => {
   it('injects both the public contract and legacy owner names', () => {
@@ -108,8 +109,6 @@ describe('redactChildEnv()', () => {
     const env = Object.fromEntries(COMPANION_STARTUP_ENV_KEYS.map(key => [key, 'private']));
     stripCompanionStartupEnv(env);
     for (const key of COMPANION_STARTUP_ENV_KEYS) expect(key in env, key).toBe(false);
-    const daemonEntry = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
-    expect(daemonEntry).toContain('stripCompanionStartupEnv(process.env)');
   });
 
   it('removes the companion secret-file path from child env', () => {
@@ -172,15 +171,19 @@ describe('redactChildEnv()', () => {
     }
   });
 
-  it('covers every H5 var the dashboard actually reads (drift guard)', () => {
-    // resolveDashboardH5AuthConfig is the single consumer; scrape its source so
-    // adding a knob there without extending the deny list fails here.
-    const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
-    const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
-    expect(read.size).toBeGreaterThan(0);
-    for (const key of read) {
+  it('covers every H5 var the dashboard actually reads', () => {
+    // resolveDashboardH5AuthConfig is the single consumer; record the keys it
+    // really reads so adding a knob there without extending the named deny
+    // list (which the tmux pane unset clause needs) fails here.
+    const read = new Set<string>();
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, key) => { if (typeof key === 'string') read.add(key); return undefined; },
+    });
+    resolveDashboardH5AuthConfig(env);
+    const h5Reads = [...read].filter(key => key.startsWith(DASHBOARD_H5_ENV_PREFIX));
+    expect(h5Reads.length).toBeGreaterThanOrEqual(DASHBOARD_H5_ENV_KEYS.length);
+    for (const key of h5Reads) {
       expect(DASHBOARD_H5_ENV_KEYS as readonly string[], key).toContain(key);
-      expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(true);
     }
   });
 
@@ -361,34 +364,6 @@ describe('stripDashboardH5Env()', () => {
     const env: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_PORT: '7991' };
     stripDashboardH5Env(env);
     expect(env.BOTMUX_DASHBOARD_PORT).toBe('7991');
-  });
-
-  it('is called by index-daemon.ts after dotenv (source pin)', () => {
-    // The unit test above proves the function; this pins the boundary that
-    // makes it matter: the daemon strips the family it just dotenv-loaded
-    // BEFORE any daemon code (or the session-var scrubs below it) can run.
-    const src = readFileSync(new URL('../src/index-daemon.ts', import.meta.url), 'utf-8');
-    const dotenvAt = src.indexOf('dotenvConfig(');
-    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
-    expect(dotenvAt).toBeGreaterThan(-1);
-    expect(stripAt).toBeGreaterThan(dotenvAt);
-  });
-
-  it('is called by index-supervisor.ts without wholesale dotenv loading (source pin)', () => {
-    // The supervisor scrubs any inherited H5 credentials before it seeds the
-    // fleet, but deliberately does NOT wholesale-load ~/.botmux/.env: doing so
-    // would place dashboard-only secrets in a long-lived parent of every bot.
-    // The dashboard remains the only entry that loads those settings from disk.
-    const src = readFileSync(new URL('../src/index-supervisor.ts', import.meta.url), 'utf-8');
-    const stripAt = src.indexOf('stripDashboardH5Env(process.env)');
-    expect(stripAt).toBeGreaterThan(-1);
-    expect(src).not.toContain('dotenvConfig(');
-  });
-
-  it('is called by detachedRestartEnv so a dashboard-spawned restart drops the family (source pin)', () => {
-    const src = readFileSync(new URL('../src/core/maintenance.ts', import.meta.url), 'utf-8');
-    const fn = src.slice(src.indexOf('export function detachedRestartEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('stripDashboardH5Env(');
   });
 });
 
@@ -630,118 +605,61 @@ describe('scrubSessionTurnMarkerEnv()', () => {
   });
 });
 
-describe('session CLI home scrub call sites', () => {
-  // The scrub only works if every process boundary actually invokes it. These
-  // source-level pins keep a refactor from silently dropping a boundary:
-  // the fleet supervisor boot (index-supervisor.ts — it spawns every daemon
-  // child from process.env, replacing the old pm2Env boundary), daemon boot
-  // (workers fork from it), worker boot (worker-side dynamic resolvers +
-  // childEnv seeding).
+describe('process-boundary env scrub call sites', () => {
+  // Each scrub/strip helper is behavior-tested above; these pins keep a refactor
+  // from silently dropping the boundary that makes it matter. The entry modules
+  // run their scrubs at import time (importing them boots the process), so the
+  // call sites can only be checked in the source.
   const read = (rel: string) =>
     readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
+  const callsOnProcessEnv = (src: string, fn: string) =>
+    new RegExp(`\\b${fn}\\(\\s*process\\.env\\s*\\)`).test(src);
 
-  it('index-supervisor.ts scrubs process.env before spawning any daemon (replaces pm2Env boundary)', () => {
-    // The supervisor forks each daemon inheriting its (scrubbed) process.env via
-    // resolveFleetDaemonEnv, so scrubbing at supervisor boot is the boundary that
-    // pm2Env used to be — a leaked marker here would ride into every daemon.
-    expect(read('index-supervisor.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('index-daemon.ts scrubs process.env at boot', () => {
-    expect(read('index-daemon.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('worker.ts scrubs process.env at boot', () => {
-    expect(read('worker.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
-  });
-
-  it('all three boundaries also scrub Claude session markers', () => {
-    // Same rationale, same boundaries: a marker that survives into the supervisor
-    // reaches the daemon → the tmux server it forks → every pane on the machine.
-    expect(read('index-supervisor.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-    expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
-  });
-
-  it('injects the canonical session owner at every worker execution boundary', () => {
-    const worker = read('worker.ts');
-    expect(worker).toContain('applySessionOwnerEnv(process.env, msg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(childEnv, cfg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId)');
-    expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
-  });
-
-  it('supervisor, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
-    expect(read('index-supervisor.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
-    const dashboard = read('dashboard.ts');
-    const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
-    expect(scrubAt).toBeGreaterThan(-1);
-    // Must land before anything that can fork a host child — the onboarding
-    // manager is wired to the start/stop-bot spawns (dashboard/managed-spawn.ts).
-    expect(scrubAt).toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
-    expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
-  });
-
-  it('every CLI-child spawn boundary uses the shared inheritance and redaction builder (source pin)', () => {
-    // The H5 secret leak was a missing KEY, not a missing call — but the deny
-    // list only protects boundaries that actually route through it. Pin the
-    // non-obvious ones: the daemon-side one-shot that titles a session group,
-    // and worker.ts's own child/engine envs.
-    const oneShot = read('services/session-group-title.ts');
-    const fn = oneShot.slice(oneShot.indexOf('export function buildOneShotEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('buildSessionChildEnv(process.env, envPolicy)');
-    const worker = read('worker.ts');
-    expect(worker).toContain('const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy)');
-    // The zellij web-terminal viewer used the raw process.env (zellijEnv only
-    // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
-    // REDACTED_CHILD_ENV_KEYS.
-    expect(worker).toContain('zellijEnv(redactChildEnv(process.env))');
-  });
-
-  it('external-member boundary and daemon boot scrub invoker-terminal fingerprints and turn markers', () => {
-    // Same persistence vector as the scrubs above, fourth and fifth key
-    // families: agent-shell fingerprints (NO_COLOR/CODEX_CI/PAGER — colorless
-    // fleet TUIs) and turn-scoped session identity. The external-member
-    // boundary (core/plugins/supervisor-client.ts → scrubExternalMemberEnv) must
-    // bake clean env; daemon boot additionally heals a fleet already poisoned by
-    // an earlier restart or a stale dump.pm2.
-    const pluginSupervisor = read('core/plugins/supervisor-client.ts');
-    expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
-    expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
-    expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
-    // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked
-    // its snapshot, so without this the daemon (and every forked worker) runs
-    // TERM-less — the zmx backend's sessions inherit that env verbatim (no
-    // node-pty `name` to force TERM) and their CLIs render colorless.
-    expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
-  });
-
-  it('the fleet supervisor and dashboard entry also scrub invoker-terminal fingerprints and turn markers', () => {
-    // Same two key families as the daemon-boot pin above, at the two other
-    // long-lived boundaries: resolveFleetDaemonEnv() bakes the supervisor's
-    // own (post-scrub) process.env into every daemon child + the dashboard,
-    // and the dashboard entry forks debug terminals / start-stop-bot CLI runs
-    // straight from its own process.env. Both used to scrub only a hand-picked
-    // 7-key subset of session identity and never touched invoker-terminal
-    // fingerprints at all — the gap this test closes.
-    for (const rel of ['index-supervisor.ts', 'index-dashboard.ts']) {
+  // 源码结构护栏(K2)：入口模块在 import 时即执行 boot 清洗，没有可调用的 seam；守的是长寿进程不把
+  // 凭证/会话身份带进它 fork 的整个 fleet —— Dashboard H5 APP_SECRET 与 companion 凭证、兄弟 bot 的
+  // CLAUDE_CONFIG_DIR/CODEX_HOME（385d189d6c）、owner/turn 标记（#877、#1207）、workflow 身份（#809）、
+  // Claude 会话标记（b7a123c19e：实机事故，fleet 转写静默停写、--resume 全部失效）。
+  it('every long-lived entry scrubs inherited credentials and session identity at boot', () => {
+    const required: Record<string, string[]> = {
+      'index-supervisor.ts': ['stripDashboardH5Env', 'scrubSessionTurnMarkerEnv', 'scrubSessionCliHomeEnv',
+        'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
+      'index-daemon.ts': ['stripDashboardH5Env', 'stripCompanionStartupEnv', 'scrubSessionTurnMarkerEnv',
+        'scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv', 'scrubWorkflowWorkerEnv'],
+      'index-dashboard.ts': ['scrubSessionTurnMarkerEnv'],
+      'dashboard.ts': ['scrubWorkflowWorkerEnv'],
+      'worker.ts': ['scrubSessionCliHomeEnv', 'scrubClaudeSessionMarkerEnv'],
+      'index-plugin-supervisor.ts': ['scrubExternalMemberEnv'],
+    };
+    for (const [rel, fns] of Object.entries(required)) {
       const src = read(rel);
-      expect(src, rel).toContain('scrubInvokerTerminalEnv(process.env)');
-      expect(src, rel).toContain('scrubSessionTurnMarkerEnv(process.env)');
-      expect(src, rel).toContain("process.env.TERM = 'xterm-256color'");
+      for (const fn of fns) expect(callsOnProcessEnv(src, fn), `${rel}: ${fn}(process.env)`).toBe(true);
     }
+    // The daemon strips the H5 family only AFTER dotenv loaded it; the supervisor
+    // never wholesale-loads ~/.botmux/.env into the long-lived parent of every bot.
+    const daemon = read('index-daemon.ts');
+    expect(daemon.indexOf('dotenvConfig(')).toBeGreaterThan(-1);
+    expect(daemon.search(/stripDashboardH5Env\(\s*process\.env/)).toBeGreaterThan(daemon.indexOf('dotenvConfig('));
+    expect(read('index-supervisor.ts')).not.toContain('dotenvConfig(');
+    // The dashboard scrubs before it can fork start/stop-bot children.
+    const dashboard = read('dashboard.ts');
+    expect(dashboard.search(/scrubWorkflowWorkerEnv\(\s*process\.env/))
+      .toBeLessThan(dashboard.indexOf('new BotOnboardingManager('));
+    // A real workflow worker receives its identity explicitly; worker boot must keep it.
+    expect(callsOnProcessEnv(read('worker.ts'), 'scrubWorkflowWorkerEnv')).toBe(false);
+    // The external-member launcher scrubs the env it hands the plugin supervisor.
+    expect(read('core/plugins/supervisor-client.ts')).toMatch(/\bscrubExternalMemberEnv\(/);
   });
 
-  it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
-    // WORKER_REDACTED_ENV_KEYS is a private const in worker-pool.ts (worker fork
-    // boundary, not importable without side effects), so pin at the source that
-    // the sentinel is in the strip list. redactChildEnv covers the CLI child;
-    // this covers the worker process itself so it also never exits 90.
-    const src = read('core/worker-pool.ts');
-    const decl = src.slice(src.indexOf('const WORKER_REDACTED_ENV_KEYS'));
-    expect(decl.slice(0, decl.indexOf('\n'))).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  // 源码结构护栏(K2)：worker 的 CLI child / engine / runner env 都在 worker.ts 巨型闭包里拼装，没有
+  // 行为 seam；守的是凭证脱敏（H5 secret 曾经漏进 CLI child 与 zellij 终端 viewer）和 CLAUDE.md
+  // 「飞书 owner 身份边界」要求的 applySessionOwnerEnv 在每个执行边界注入并冻结。
+  it('worker routes child envs through the shared redaction builder and freezes the session owner', () => {
+    const worker = read('worker.ts');
+    expect(worker).toMatch(/\bchildEnv\s*=\s*buildSessionChildEnv\(\s*process\.env\b/);
+    expect(worker).toMatch(/\bzellijEnv\(\s*redactChildEnv\(\s*process\.env\s*\)/);
+    for (const target of ['process\\.env', 'childEnv', 'engineEnv', 'mergedEnv']) {
+      expect(worker, target).toMatch(new RegExp(`\\bapplySessionOwnerEnv\\(\\s*${target}\\s*,`));
+    }
   });
 });
 

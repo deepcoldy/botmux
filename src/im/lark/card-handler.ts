@@ -81,7 +81,7 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -2499,6 +2499,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         botCfg.cliRuntime?.executable,
       );
       cacheAdoptCandidates(rootId, candidates, Date.now());
+    } else if (value.action === 'adopt_pick') {
+      // A pick usually precedes confirm, and the resume confirm reads this
+      // snapshot: renew it so a pick just before the TTL still reaches confirm.
+      cacheAdoptCandidates(rootId, candidates, Date.now());
     }
     const { buildAdoptSelectCard } = await import('./card-builder.js');
     const cardJson = buildAdoptSelectCard(
@@ -2566,13 +2570,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     const botCfg = getBot(ds.larkAppId).config;
-    const { clearAdoptCandidates } = await import('../../services/adopt-picker.js');
+    const { clearAdoptCandidates, getCachedAdoptCandidates } = await import('../../services/adopt-picker.js');
 
     // ── Resume-import path (key = "resume:<cliSessionId>") ──────────────
     if (entryKey.startsWith('resume:')) {
       const cliSessionId = entryKey.slice('resume:'.length);
       const { discoverResumableSessionsForBot, startResumeImportSession, ADOPT_RESUME_LIMIT } = await import('../../core/command-handler.js');
-      const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions, ADOPT_RESUME_LIMIT);
+      // Re-query with the same live-session exclusion the card was rendered
+      // with, or entries that filled the cap in place of live duplicates would
+      // be cut off. Panes are not re-scanned here (3s callback budget); an
+      // expired snapshot falls back to the query without live ids.
+      const snapshot = getCachedAdoptCandidates(rootId, Date.now());
+      const liveSessionIds = snapshot
+        ? new Set(snapshot.sessions.flatMap(s => s.sessionId ? [s.sessionId] : []))
+        : undefined;
+      const resumable = await discoverResumableSessionsForBot(
+        botCfg.cliId, botCfg.cliPathOverride, activeSessions, ADOPT_RESUME_LIMIT, liveSessionIds,
+      );
       if (
         ds.session !== sourceSession || ds.session.status !== 'active'
         || activeSessions.get(sKey) !== ds || isSessionTransferring(ds)
@@ -3000,6 +3014,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           closeResult = await closeWorkerPoolSession(targetSessionId, {
             awaitWorkerExit: false,
             cardVisibility: value?.visibility === 'private' ? 'private' : 'public',
+            explicitClose: true,
+            onArchiveError: error => sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${error}`),
           });
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
@@ -3176,6 +3192,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
         } else if (result.error === 'workspace_retired') {
           await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, locDsResume));
+        } else if (result.error === 'codex_unarchive_failed') {
+          await sessionReply(rootId, t('card.action.resume_codex_unarchive_failed', undefined, locDsResume));
         } else if (result.error === 'resume_start_failed') {
           await sessionReply(rootId, t('card.action.resume_start_failed', undefined, locDsResume));
         } else if (result.error === 'resume_reconciliation_required') {
@@ -3286,7 +3304,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionCliId(ds),
           ds.displayMode ?? 'hidden',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isSharedAdoptSession(ds),
           false,
           locDs,
@@ -4081,7 +4099,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
@@ -4215,7 +4233,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         senderOpenId: operatorOpenId,
         senderIsBot: false,
         messageId: cardMessageId ?? `compact-${Date.now()}`,
-        replyRootId: rootId,
+        // A chat-scope card's root_id is the chat id, not a message: passing it
+        // on would freeze an unreplyable thread target for this turn.
+        replyRootId: ds.scope === 'chat' ? undefined : rootId,
       });
       logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
       return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
@@ -4251,7 +4271,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),

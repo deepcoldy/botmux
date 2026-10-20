@@ -17,7 +17,8 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/queue <text>` | Codex App live sessions: submit a separate turn after the active task, or start immediately when idle. Multiline plain text supported; rich text and attachments are not supported yet. Requires command permission (canTalkDaemonCommands may grant access). Missing/unready sessions and other CLIs are explicitly rejected Trigger-user identity is refreshed before admission; later messages may overwrite the single credential slot, so a waiting turn may still see bytedcli/lark-cli turn-mismatch rejection and require retry. |
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
-| `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
+| `/close` | Close the session and send a recoverable card (including the CLI's own resume command). A later message starts a new session |
+| `/resume [session id]` | When this topic/chat has **no session**, resume a closed one: no argument resumes the latest one closed here; an id from elsewhere is copied here like `/fork` (full context, original untouched; fork-capable CLIs only; closed Codex / TraeX sessions must be resumed where they were). **With a session**, it goes to the CLI's own `/resume` unchanged. Anyone who can talk to the bot may use it; cross-location copies are keyed by the session id (visible only in the original chat, not guessable), the same trust level as `/fork` |
 | `/dismiss` | Top level of a dedicated session group only: after confirmation, closes the session and disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
 | `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
@@ -83,6 +84,8 @@ A few boundaries:
 - The header's `/repo wt` does not accept the numeric form (numbers only mean something on the picker card); the in-session `/repo wt <N|project name> [branch]` still does.
 - A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
+Codex capacity recovery is **off by default**. Administrators can enable it with `/botconfig set codexCapacityRecovery on` and disable it with `/botconfig set codexCapacityRecovery off`. When enabled, managed Codex Lark sessions automatically continue explicit model-capacity failures (`server_overloaded`) after 15 seconds and, if needed, another 45 seconds. Each continuation appends a recovery input to the native session (at most two per task); these inputs may remain in model context, and disabling recovery does not delete history. An opted-out pending recovery is saved as cancelled with one notice, so re-enabling recovery or restarting does not revive that old task. Detection is not specific to modelhub and does not guarantee a quick recovery. Continuations resume existing progress instead of replaying the original task. New input, `/stop`, or closing the session cancels the previous recovery. After a process restart, pending or unconfirmed recovery stops and requires manual continuation. Already running work can still deliver a successful result, but a late capacity failure will not trigger another automatic continuation, avoiding replay of a cancellation that could not be saved. After two unsuccessful continuations, the failure card offers a manual retry. Generic 503, stream, authentication and rate-limit errors retain their existing behavior, as do adopted, HTTP and meeting-receiver sessions.
+
 ## 💬 Reply Mode (`/reply-mode`)
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.
@@ -94,7 +97,7 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 | `/reply-mode` `/reply-mode status` | Show the current DM session mode |
 | `/reply-mode chat` | Each 1:1 DM is one flat continuous session — all messages in that DM share one session (**default**) |
 | `/reply-mode topic` `/reply-mode new-topic` | Each **top-level** DM opens its own session/thread; replies inside an existing thread continue that thread's session |
-| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; returning to the group resumes the session — see `p2pMode=group`) |
+| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; after the session closes a new message starts a fresh one — use the close card's "Resume session" or `/resume` to continue; see `p2pMode=group`) |
 
 `shared` / `chat-topic` rely on native group topics and are rejected in DMs.
 
@@ -193,6 +196,10 @@ Rules: only a leading run of passthrough lines forms a cascade (a botmux command
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
+Dashboard's **Bot Defaults → Security → Slash Commands** section also has an optional **native Lark command panel**. It lists botmux's own commands (including aliases, derived directly from the command registry) as candidates and marks each entry as synced, missing, or outdated on Lark; users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** is an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. CLI passthrough commands (`/compact`, `/model`, …) are not candidates yet, because support differs across CLIs and input backends.
+
+The panel needs the optional scopes `application:app_slash_command:read` / `application:app_slash_command:write`. They are **not** part of the default scope manifest and the startup self-check never tops them up automatically; when they are missing, or the tenant is not in Lark's gated rollout (desktop 7.70+ and the FG allowlist), the panel only shows "unavailable" plus grant links, and every other bot feature keeps working. The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
+
 ## 📡 Session Onboarding
 
 | Command | Description |
@@ -206,7 +213,7 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 | Command | Description |
 |------|------|
 | `/login` | Basic Lark user authorization: read messages, access resources, and renew authorization; does not request docs, contacts, or calendar permissions by default |
-| `/login --scope <scope> [more scopes]` | Add only the requested permissions to the basic scopes, e.g. `/login --scope docx:document:readonly` |
+| `/login --scope <scope>... [--force]` | Add requested permissions to basic scopes, e.g. `/login --scope docx:document:readonly`; add `--force` to bypass local catalog validation for uncataloged new scopes |
 | `/login status` | View authorization status |
 | `/login tags` | Session-group tag authorization (feed-group scopes); once granted, new session groups auto-join your sidebar feed group (for p2pMode=group with the feed-group tag mode — the default) |
 | `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
@@ -266,6 +273,8 @@ Written and hot-applied — no restart needed.
 ## 🆕 One-Click New Session Group
 
 `/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
+
+Like session groups, the new group gets a gradient logo avatar by default, and without a name it is renamed from its first message.
 
 Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
 

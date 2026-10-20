@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mockCleanupRelease } from './helpers/codex-cleanup-release.js';
+import { freezeCodexCleanupLaunch } from '../src/core/codex-cleanup-launch.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync, realpathSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -493,5 +495,92 @@ describe('setCodexAppThreadName', () => {
       }
     }
     throw new Error(`force-closed fake Codex app-server ${pid} was not reaped`);
+  });
+});
+
+describe('Codex archive lifecycle RPC', () => {
+  async function probe(archived: boolean, storedArchived: boolean, behavior = 'success', outside = false) {
+    const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-archive-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+    const env = fakeCodexEnv(dir, { FAKE_CODEX_LOG: logPath, FAKE_CODEX_BEHAVIOR: behavior,
+      FAKE_CODEX_THREAD_PATH: outside ? join(dir, 'foreign', 'rollout.jsonl')
+        : join(dir, 'source-codex-home', storedArchived ? 'archived_sessions' : 'sessions', 'rollout.jsonl') });
+    mkdirSync(join(env.FAKE_CODEX_THREAD_PATH!, '..'), { recursive: true });
+    writeFileSync(env.FAKE_CODEX_THREAD_PATH!, '{}');
+    const promise = setCodexAppThreadArchived({ threadId: 'native-thread', archived,
+      codexHome: env.CODEX_HOME!, codexBin: FAKE_CODEX, env, timeoutMs: 500 });
+    return { promise, requests: () => readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
+  }
+  it.each([[true, false, 'thread/archive'], [false, true, 'thread/unarchive']] as const)(
+    'uses official RPC for archived=%s', async (archived, previous, method) => {
+      const p = await probe(archived, previous); await p.promise;
+      expect(p.requests().find(r => r.method === method)?.params).toEqual({ threadId: 'native-thread' });
+      expect(p.requests().some(r => r.method === 'thread/resume' || r.method === 'turn/start')).toBe(false);
+    });
+  it.each([true, false])('already in desired state is a no-op (%s)', async state => {
+    const p = await probe(state, state); await p.promise;
+    expect(p.requests().some(r => r.method === 'thread/archive' || r.method === 'thread/unarchive')).toBe(false);
+  });
+  it('rejects a foreign storage path before mutation', async () => {
+    const p = await probe(true, false, 'success', true);
+    await expect(p.promise).rejects.toThrow('outside the frozen session home');
+    expect(p.requests().some(r => r.method === 'thread/archive')).toBe(false);
+  });
+  it.each([true, false])('accepts a symlinked home for archive/recovery (%s)', async archived => {
+    const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-home-alias-')); tempDirs.push(dir);
+    const env = fakeCodexEnv(dir); const realHome = realpathSync(env.CODEX_HOME!);
+    const alias = join(dir, 'home-alias'); symlinkSync(realHome, alias, 'dir');
+    const rollout = join(realHome, archived ? 'sessions' : 'archived_sessions', 'rollout.jsonl');
+    mkdirSync(join(rollout, '..'), { recursive: true }); writeFileSync(rollout, '{}');
+    await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived, codexHome: alias,
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: 1000 })).resolves.toBeUndefined();
+  });
+  it('restores with the frozen executable after its temporary symlink disappears', async () => {
+    const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-bin-alias-')); tempDirs.push(dir);
+    const alias = join(dir, 'codex'); symlinkSync(FAKE_CODEX, alias);
+    const frozenBin = freezeCodexCleanupLaunch('codex-app', process.execPath, ['--codex-bin', alias],
+      join(dir, 'source-codex-home'))!.codexBin;
+    const env = fakeCodexEnv(dir);
+    for (const folder of ['sessions', 'archived_sessions']) {
+      mkdirSync(join(env.CODEX_HOME!, folder), { recursive: true });
+      writeFileSync(join(env.CODEX_HOME!, folder, 'rollout.jsonl'), '{}');
+    }
+    const opts = { threadId: 'native-thread', codexHome: env.CODEX_HOME!, codexBin: frozenBin, env, timeoutMs: 1000 };
+    const { archiveCodexForCleanup, restoreCodexCleanupArchive } = await import('../src/services/codex-cleanup-archive.js');
+    const row = { sessionId: 'mock-bin-recovery', status: 'closed', cliId: 'codex-app', backendType: 'tmux',
+      cliSessionId: opts.threadId, codexCleanupTarget: { threadId: opts.threadId, codexHome: opts.codexHome, codexBin: frozenBin } } as import('../src/types.js').Session;
+    const rpc: typeof setCodexAppThreadArchived = request => setCodexAppThreadArchived({ ...request,
+      env: { ...request.env, ...env, FAKE_CODEX_THREAD_PATH: join(env.CODEX_HOME!, request.archived ? 'sessions' : 'archived_sessions', 'rollout.jsonl') } });
+    expect(await archiveCodexForCleanup(row, true, () => {}, rpc, async () => mockCleanupRelease(row))).toBeUndefined();
+    expect(row.codexCleanupArchive?.state).toBe('archived');
+    unlinkSync(alias);
+    await expect(restoreCodexCleanupArchive(row, () => {}, rpc)).resolves.toBeUndefined();
+    expect(row.codexCleanupArchive).toBeUndefined();
+  });
+  it('rejects a rollout symlink escaping the canonical home before mutation', async () => {
+    const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rollout-escape-')); tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl'); const env = fakeCodexEnv(dir, { FAKE_CODEX_LOG: logPath });
+    mkdirSync(join(env.CODEX_HOME!, 'sessions')); const outside = join(dir, 'outside.jsonl'); writeFileSync(outside, '{}');
+    const rollout = join(env.CODEX_HOME!, 'sessions', 'rollout.jsonl'); symlinkSync(outside, rollout);
+    await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived: true, codexHome: env.CODEX_HOME!,
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: 1000 })).rejects.toThrow('outside the frozen session home');
+    expect(readFileSync(logPath, 'utf8')).not.toContain('thread/archive');
+  });
+  it('rejects a sessions-directory symlink escaping the canonical home', async () => {
+    const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-directory-escape-')); tempDirs.push(dir);
+    const env = fakeCodexEnv(dir); const outside = join(dir, 'foreign'); mkdirSync(outside); writeFileSync(join(outside, 'rollout.jsonl'), '{}');
+    symlinkSync(outside, join(env.CODEX_HOME!, 'sessions'), 'dir');
+    await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived: true, codexHome: env.CODEX_HOME!,
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: join(env.CODEX_HOME!, 'sessions', 'rollout.jsonl') }, timeoutMs: 1000 })).rejects.toThrow('outside the frozen session home');
+  });
+  it.each(['archive-error', 'hang-archive'])('propagates bounded RPC failure (%s)', async behavior => {
+    const p = await probe(true, false, behavior);
+    await expect(p.promise).rejects.toThrow();
   });
 });

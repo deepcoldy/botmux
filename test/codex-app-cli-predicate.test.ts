@@ -40,10 +40,18 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
     // worker 侧：worker 当前 init 的 cliId 与会话库里的 cliId 任一为 Codex App 即按 ledger 精确校验。
     const worker = read('src/worker.ts');
     expect(worker).toMatch(/isCodexAppCliId\(lastInitConfig\?\.cliId\)\s*\|\|\s*isCodexAppCliId\(session\?\.cliId\)/);
-    // daemon 侧两处（/api/send 与 hook 路径）：initConfig.cliId 与 session.cliId 同理。
+    // daemon 侧两处内联（/api/send、hook 路径）：initConfig.cliId 与 session.cliId 同理。
     const daemon = read('src/daemon.ts');
     const hits = daemon.match(/isCodexAppCliId\(ds!?\.initConfig\?\.cliId\) \|\| isCodexAppCliId\(ds!?\.session\.cliId\)/g) ?? [];
     expect(hits).toHaveLength(2);
+    // capability 直连 dispatch 的判定集中在 core/dispatch-output-sink.ts 一处（同样的 OR），
+    // 由种子注册 / 投递路由的入口与写飞书栅栏、以及 dispatch-policy 路由共用。
+    const sink = read('src/core/dispatch-output-sink.ts');
+    expect(sink.match(/isCodexAppCliId\(ds\.initConfig\?\.cliId\) \|\| isCodexAppCliId\(ds\.session\.cliId\)/g) ?? [])
+      .toHaveLength(1);
+    expect(daemon.match(/isolatedDispatchOutputSinkAllowed\(ds\)/g) ?? []).toHaveLength(2);
+    expect(daemon.match(/withIsolatedDispatchSinkFence\(/g) ?? []).toHaveLength(2);
+    expect(read('src/core/dashboard-ipc-server.ts')).toContain('isolatedDispatchOutputSinkAllowed(ds)');
   });
 
   it('every session-level codex-app gate resolves the CLI snapshot-first (same priority as sessionCliId)', () => {

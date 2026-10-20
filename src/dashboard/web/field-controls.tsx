@@ -21,6 +21,7 @@ export function DropdownField<T extends string>(props: {
   ariaLabel?: string;
   className?: string;
   searchable?: boolean;
+  notifyOnReselect?: boolean;
   onChange(value: T): void;
 }) {
   const tr = useT();
@@ -38,6 +39,7 @@ export function DropdownField<T extends string>(props: {
         searchPlaceholder={props.searchable ? tr('common.dropdownSearch') : undefined}
         searchEmptyLabel={props.searchable ? tr('common.dropdownSearchEmpty') : undefined}
         onChange={props.onChange}
+        notifyOnReselect={props.notifyOnReselect}
       />
       <input type="hidden" data-input={props.dataInput} value={props.value} readOnly />
     </>

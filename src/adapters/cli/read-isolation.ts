@@ -382,7 +382,17 @@ export function buildSeatbeltProfile(
 // would be masked to /dev/null by this flavour's own `.dashboard-secret.*`
 // enumeration. A v15 pane carries neither the mount nor the env, so a warm
 // reattach would keep failing every send; it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 16;
+// 17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only pane's wrapper env
+// (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
+// reattach would keep refusing the legacy --bot / --repo / --standby dispatch
+// forms; it must cold-spawn once.
+// 18 binds a sandboxed pane's OWN skill manifest (`skill-manifests/<sid>.json`)
+// and its per-session skill SNAPSHOT dir (`runtime-skills/<sid>/snapshot`),
+// read-only, at spawn time (`botmux skill show/read/resources` under
+// sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
+// its ORIGINAL mount set and skips skill generation, so such a pane could never
+// read either — it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 18;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

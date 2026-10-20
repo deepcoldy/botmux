@@ -18,11 +18,10 @@
  *  1. latestPerBotEnvForRestart 纯函数三分态（最新 / 清空 / 取不到兜底）。
  *  2. daemon behavioral：requestSessionRestart live-worker 分支把 env 放进
  *     发给 worker 的 restart 消息体（含 attemptId）。
- *  3. 其余三个 restart IPC 生产者（dashboard 重启按钮 / dashboard cwd-move /
- *     崩溃 auto-restart）同样捎带 env——respawn 即该用最新 env，语义一致。
- *  4. worker wiring（source pin，worker.ts 是进程入口不可 import，同
- *     restart-worker-null-reattach.test.ts 的做法）：env merge 在合并守卫
- *     之前（被合并的重复 restart 也要带走 env 更新）且含 null→清除语义。
+ *  3. requestSessionRestart 是唯一的 restart IPC 发送方（dashboard 重启按钮 /
+ *     cwd-move / 崩溃 auto-restart 都经它走），单发送方约束见
+ *     restart-live-worker-lark-tool-binding.test.ts 的 restart IPC choke point。
+ *     worker 侧「合并守卫之前覆盖 lastInitConfig.env」在 worker.ts 闭包里，暂无单测 seam。
  *
  * Run:  pnpm vitest run test/restart-live-worker-env.test.ts
  */
@@ -38,7 +37,7 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
 }));
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -46,10 +45,6 @@ import {
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
-
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
 let sessionCounter = 0;
 
@@ -206,64 +201,5 @@ describe('requestSessionRestart live-worker branch carries env (behavioral)', ()
     expect(second.joined).toBe(true);
     expect(second.attemptId).toBe(first.attemptId);
     expect(send).toHaveBeenCalledTimes(1);
-  });
-});
-
-// ─── 3. 全部四个 restart IPC 生产者均捎带 env（wiring） ─────────────────────
-
-describe('every daemon-side restart IPC producer carries env (source wiring)', () => {
-  it('worker-pool.ts: every {type:restart} send includes env', () => {
-    const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2); // requestSessionRestart + auto-restart
-    for (const s of sends) {
-      expect(s, `missing env in: ${s}`).toContain('env: latestPerBotEnvForRestart(ds)');
-    }
-  });
-
-  it('dashboard-ipc-server.ts: every {type:restart} send includes env', () => {
-    const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard restart 按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing env in: ${s}`).toContain('env: latestPerBotEnvForRestart(ds)');
-    }
-  });
-
-  it('the restart message type declares the three-state env field', () => {
-    const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
-    const restartLine = typesSource.indexOf("| { type: 'restart';");
-    expect(restartLine).toBeGreaterThanOrEqual(0);
-    const line = typesSource.slice(restartLine, typesSource.indexOf('}', restartLine));
-    expect(line).toContain('env?: Record<string, string> | null');
-  });
-});
-
-// ─── 4. worker wiring：respawn 前 merge env（合并守卫之前 + null 清除语义） ──
-
-describe('worker restart case merges env into lastInitConfig (source pin)', () => {
-  function restartCaseBranch(): string {
-    const start = workerSource.indexOf("case 'restart': {");
-    const end = workerSource.indexOf("case 'expire_durable_turn':", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    return workerSource.slice(start, end);
-  }
-
-  it('full-replaces lastInitConfig.env with null→clear three-state semantics', () => {
-    const branch = restartCaseBranch();
-    expect(branch).toContain('if (msg.env !== undefined && lastInitConfig)');
-    expect(branch).toContain('lastInitConfig.env = msg.env === null ? undefined : msg.env;');
-  });
-
-  it('the env merge sits BEFORE the in-flight merge guard (coalesced restarts still take the update)', () => {
-    const branch = restartCaseBranch();
-    const envMerge = branch.indexOf('if (msg.env !== undefined && lastInitConfig)');
-    const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
-    expect(envMerge).toBeGreaterThanOrEqual(0);
-    expect(guard).toBeGreaterThan(envMerge);
-  });
-
-  it('spawnCli re-derives the inject set from cfg.env on every spawn (no cached copy)', () => {
-    const spawnCfg = workerSource.indexOf('const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);');
-    expect(spawnCfg).toBeGreaterThanOrEqual(0);
   });
 });

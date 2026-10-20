@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from './reply-footer.js';
 /**
  * Per-bot card-behaviour preferences. Mirrors the brand-store / oncall-store
  * pattern: cross-process file lock + atomic write of bots.json, plus an
@@ -51,7 +52,8 @@ import {
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 
-export interface BotCardPrefs {
+export interface BotCardPrefs extends ReplyFooterPreferences {
+  showReplyTiming: boolean;
   /** Where to show native Context / Token usage:
    *  'streaming' (default) = live streaming card body, 'footer' = ordinary
    *  reply-card footer, 'off' = nowhere. */
@@ -122,6 +124,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
     return {
+      ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, c[key] !== false])),
+      showReplyTiming: c.showReplyTiming === true,
       usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
@@ -154,6 +158,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     };
   } catch {
     return {
+      ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, true])),
+      showReplyTiming: false,
       usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
       replyCardMode: 'legacy',
@@ -270,6 +276,8 @@ async function updateBotCardPrefsInternal(
       entry.replyCardMode = 'unified';
       entry.disableStreamingCard = true;
     }
+    for (const key of REPLY_FOOTER_KEYS) applyDefaultTrue(entry, key, patch[key]);
+    apply(entry, 'showReplyTiming', patch.showReplyTiming);
     applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     if (patch.replyCardMode !== undefined) {
@@ -309,6 +317,8 @@ async function updateBotCardPrefsInternal(
     return {
       write: true,
       result: {
+        ...normalizeReplyFooter(entry),
+        showReplyTiming: entry.showReplyTiming === true,
         usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
@@ -348,6 +358,10 @@ async function updateBotCardPrefsInternal(
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config so live card builders / routing react without a restart.
+  for (const key of REPLY_FOOTER_KEYS) {
+    if (patch[key] !== undefined) bot.config[key] = patch[key] === false ? false : undefined;
+  }
+  if (patch.showReplyTiming !== undefined) bot.config.showReplyTiming = patch.showReplyTiming || undefined;
   if (patch.usageDisplay !== undefined) {
     // Store only a non-default mode; 'streaming' (default) clears the key.
     bot.config.usageDisplay = (patch.usageDisplay && patch.usageDisplay !== DEFAULT_USAGE_DISPLAY)

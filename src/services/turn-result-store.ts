@@ -99,7 +99,7 @@ export class TurnResultStore {
 
   recordDelivery(binding: TurnResultBinding, output: TurnResult['output'], receipt: TurnDeliveryReceipt): void {
     const entry = this.matching(binding);
-    if (!entry || entry.result || entry.receipt) return;
+    if (!entry || entry.result) return;
     if (!['available', 'empty', 'unavailable'].includes(output.status)
       || (output.status === 'available' && typeof output.content !== 'string')
       || (output.format !== undefined && !['text', 'markdown'].includes(output.format))
@@ -109,6 +109,13 @@ export class TurnResultStore {
       || !Array.isArray(receipt.messages) || receipt.messages.length > 256
       || receipt.messages.some(message => !validText(message.messageId) || !['primary', 'attachment'].includes(message.kind))) {
       throw new Error('invalid_turn_result_delivery');
+    }
+    // A failed/partial plugin attempt is provisional until the native terminal
+    // arrives. If the model recovers and publishes a fully acknowledged final,
+    // that user-visible success is authoritative. Never replace an already
+    // delivered receipt, and never mutate a settled result.
+    if (entry.receipt) {
+      if (entry.receipt.status === 'delivered' || receipt.status !== 'delivered') return;
     }
     entry.output = {
       status: output.status,

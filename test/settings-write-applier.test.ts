@@ -123,6 +123,16 @@ describe('resolveCodexNotifierRecipientView', () => {
 });
 
 describe('applySettingsWrite happy paths', () => {
+  it('runs the complete settings write inside one injected config transaction', async () => {
+    const runConfigMutation = vi.fn(async <T>(mutation: () => Promise<T>) => mutation());
+    const deps = makeDeps({ runConfigMutation });
+    const result = await applySettingsWrite({ publicReadOnly: true, repoPickerMode: 'repos' }, deps);
+    expect(result.ok).toBe(true);
+    expect(runConfigMutation).toHaveBeenCalledOnce();
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ publicReadOnly: true });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ repoPickerMode: 'repos' });
+  });
+
   it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
@@ -1268,5 +1278,20 @@ describe('applySettingsWrite sessionCleanup', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
       sessionCleanup: { intervalMinutes: 90 },
     });
+  });
+});
+
+
+describe('Codex idle cleanup setting', () => {
+  it('accepts a standalone opt-in patch and preserves scheduled cleanup fields', async () => {
+    const deps = makeDeps({ readGlobalConfig: () => ({ sessionCleanup: { enabled: true, olderThanHours: 72 } }) });
+    const r = await applySettingsWrite({ sessionCleanup: { archiveCodex: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ sessionCleanup: { enabled: true, olderThanHours: 72, archiveCodex: true } });
+  });
+  it('rejects nonboolean values', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });

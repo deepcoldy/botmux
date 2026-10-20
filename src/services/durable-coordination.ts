@@ -8,7 +8,7 @@
  * 使用注入时钟，远程数据库实现应在事务内使用数据库时间，不能信任不同 worker 的墙钟。
  */
 
-export const DURABLE_COORDINATION_CONTRACT_VERSION = 3 as const;
+export const DURABLE_COORDINATION_CONTRACT_VERSION = 5 as const;
 export const DURABLE_INBOX_LANE_LARK_MESSAGE = 'lark-message' as const;
 export const DURABLE_INBOX_LANE_SESSION_CONTROL = 'session-control' as const;
 
@@ -72,8 +72,35 @@ export type WriteSessionResult =
   | { kind: 'conflict'; current?: DurableSessionRecord }
   | { kind: 'stale_lease' };
 
+/**
+ * 与 canonical Session 分表保存的内部共享状态。
+ *
+ * 这类状态同样使用 SessionLease 做 fencing，但不能出现在 Session 列表、Dashboard
+ * 或 session_count 指标里。典型用途是按 chat 维护的 recall tombstone、无 Session 的
+ * 控制游标等。
+ */
+export interface DurableAuxiliaryStateRecord {
+  stateKey: string;
+  revision: number;
+  value: DurableJson;
+  updatedAt: number;
+}
+
+export interface WriteAuxiliaryStateInput {
+  /** lease.sessionKey 必须与目标 state key 相同。 */
+  lease: SessionLease;
+  expectedRevision: number | null;
+  value: DurableJson;
+}
+
+export type WriteAuxiliaryStateResult =
+  | { kind: 'written'; record: DurableAuxiliaryStateRecord }
+  | { kind: 'conflict'; current?: DurableAuxiliaryStateRecord }
+  | { kind: 'stale_lease' };
+
 export interface DurableInboxEvent {
-  /** 平台稳定事件键；同键不同 payload 必须返回 conflict。 */
+  /** 平台稳定事件键。默认同键不同 payload 返回 conflict；Lark receive 事件允许
+   *  WS/REST 两种权威快照按 app/message/partition 语义等价，保留 first writer。 */
   eventId: string;
   /** 隔离不同消费者；同一 lane 内才参与 claim 和 partition FIFO。 */
   lane?: string;
@@ -322,7 +349,20 @@ export interface DurableSessionLeaseStore {
 
 export interface DurableSessionStateStore {
   readSession(sessionKey: string): Promise<DurableSessionRecord | undefined>;
+  /** 按稳定键分页读取 canonical 状态；可选以兼容旧 provider。 */
+  listSessions?(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{
+    records: DurableSessionRecord[];
+    nextSessionKey?: string;
+  }>;
   writeSession(input: WriteSessionInput): Promise<WriteSessionResult>;
+}
+
+export interface DurableAuxiliaryStateStore {
+  readAuxiliaryState(stateKey: string): Promise<DurableAuxiliaryStateRecord | undefined>;
+  writeAuxiliaryState(input: WriteAuxiliaryStateInput): Promise<WriteAuxiliaryStateResult>;
 }
 
 export interface DurableInboxStore {
@@ -331,6 +371,14 @@ export interface DurableInboxStore {
   renewInboxClaim(input: RenewInboxClaimInput): Promise<InboxClaimMutationResult>;
   completeInboxClaim(claim: InboxClaim): Promise<InboxClaimMutationResult>;
   retryInboxClaim(input: RetryInboxClaimInput): Promise<InboxClaimMutationResult>;
+}
+
+export interface DurableFencedInboxStore extends DurableInboxStore {
+  /** Atomically validate the ingress lease and insert the event. */
+  enqueueInboxWithLease(input: {
+    lease: SessionLease;
+    event: DurableInboxEvent;
+  }): Promise<DurableInsertResult | { kind: 'stale_lease' }>;
 }
 
 export interface DurableOutboxStore {
@@ -377,7 +425,8 @@ export interface DurableControlOperationStore {
 export interface DurableCoordinationStore
   extends DurableSessionLeaseStore,
     DurableSessionStateStore,
-    DurableInboxStore,
+    DurableAuxiliaryStateStore,
+    DurableFencedInboxStore,
     DurableOutboxStore,
     DurableControlOperationStore {
   close(): Promise<void>;

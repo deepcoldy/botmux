@@ -82,7 +82,201 @@ function final(target?: FrozenSessionReplyTarget, owns: () => boolean = () => tr
   }, 'fixture', 0, (owned, messageId) => resolve({ owned, messageId }), owns, target));
 }
 
+async function waitFor(check: () => boolean): Promise<void> {
+  for (let index = 0; index < 100; index += 1) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error('timed out waiting for worker result delivery');
+}
+
 describe('worker final-output topic transport', () => {
+  it.each([
+    ['stale_worker', 'stale'],
+    ['delivery_suppressed_for_turn', 'suppressed'],
+    ['trusted_caller_mismatch', 'caller'],
+  ] as const)('rejects trusted delivery with %s before any Lark side effect', async (expected, mode) => {
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    if (mode === 'suppressed') {
+      ds.suppressedFinalOutputTurns = new Map([['om_turn_old', 1]]);
+    }
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: `req_${mode}`,
+      sessionId: mode === 'stale' ? 'sid_stale' : ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', dispatchAttempt: 1,
+      callerOpenId: mode === 'caller' ? 'ou_other' : 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: `delivery_${mode}_20261015`, viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'plugin_result_delivery_result', ok: false, error: expected,
+    }));
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['sentinel terminal', 'nothing_to_send' as const],
+    ['ordinary terminal', undefined],
+  ])('records trusted plugin delivery before the %s result terminal', async (_label, outputDisposition) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', brand: 'lark',
+      turnResults: { enabled: true }, replyCardMode: 'legacy' });
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    mocks.upload.mockReset().mockResolvedValue({ file_key: 'file_trusted' });
+    mocks.reply.mockImplementation(async input => ({ code: 0, data: {
+      message_id: input.data.msg_type === 'file' ? 'om_attachment' : 'om_primary',
+    } }));
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'req_trusted', sessionId: ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261014', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+    const entryReply = mocks.reply.mock.calls.find(([input]) => input.data.msg_type === 'interactive');
+    const entryCard = JSON.parse(entryReply?.[0].data.content ?? '{}');
+    const entryLinks = entryCard.elements?.[1]?.actions?.[0]?.multi_url;
+    expect(entryLinks?.url).toMatch(/^https:\/\/applink\.larksuite\.com\/client\/web_url\/open\?/);
+    expect(entryLinks?.pc_url).toBe(entryLinks?.url);
+    expect(entryLinks?.android_url).toContain('/plugin-result-access/view_token_abcdefghijklmnopqrstuvwxyz');
+    expect(entryLinks?.ios_url).toBe(entryLinks?.android_url);
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', status: 'completed', ...(outputDisposition ? { outputDisposition } : {}) });
+    await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');
+    const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+    expect(lookup?.status).toBe('ready');
+    if (lookup?.status !== 'ready') throw new Error('Expected trusted delivery result');
+    expect(lookup.result.output).toEqual({ status: 'unavailable', reason: 'trusted_plugin_delivery' });
+    expect(lookup.result.deliveries).toEqual([{
+      channel: 'im', status: 'delivered', platform: 'lark', chatId: 'oc_source', parentMessageId: 'om_source',
+      messages: [{ kind: 'primary', messageId: 'om_primary' }],
+    }]);
+    expect(JSON.stringify(lookup)).not.toContain('CONFIDENTIAL_BUSINESS_SENTINEL');
+    expect(JSON.stringify(lookup)).not.toContain('result.xlsx');
+  });
+
+  it.each([
+    ['delivered', true],
+    ['failed', false],
+  ])('records a non-leaking %s trusted plugin delivery terminal', async (expectedStatus, primarySucceeds) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      turnResults: { enabled: true }, replyCardMode: 'legacy' });
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    mocks.reply.mockImplementation(async () => {
+      if (!primarySucceeds) throw new Error('CONFIDENTIAL_PROVIDER_SENTINEL');
+      return { code: 0, data: { message_id: 'om_primary' } };
+    });
+    mocks.upload.mockReset().mockRejectedValue(new Error('/private/CONFIDENTIAL_FILE_SENTINEL.xlsx'));
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'req_failed', sessionId: ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261015', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', status: 'failed' });
+    await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');
+    const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+    expect(lookup?.status).toBe('ready');
+    if (lookup?.status !== 'ready') throw new Error('Expected failed trusted delivery result');
+    expect(lookup.result.output.status).toBe('unavailable');
+    expect(lookup.result.deliveries[0]).toEqual({
+      channel: 'im', status: expectedStatus, platform: 'lark', chatId: 'oc_source', parentMessageId: 'om_source',
+      messages: primarySucceeds ? [{ kind: 'primary', messageId: 'om_primary' }] : [],
+      ...(!primarySucceeds ? { reason: 'trusted_plugin_delivery_failed' } : {}),
+    });
+    expect(JSON.stringify(lookup)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private/);
+    expect(JSON.stringify(sent)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private/);
+  });
+
+  it.each([
+    ['failed', false],
+  ])('lets a normal successful final replace a %s trusted plugin attempt', async (_status, primarySucceeds) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      turnResults: { enabled: true }, replyCardMode: 'legacy' });
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    mocks.reply.mockImplementation(async () => {
+      if (!primarySucceeds) throw new Error('CONFIDENTIAL_PROVIDER_SENTINEL');
+      return { code: 0, data: { message_id: 'om_plugin_partial' } };
+    });
+    mocks.upload.mockReset().mockRejectedValue(new Error('/private/CONFIDENTIAL_FILE_SENTINEL.xlsx'));
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'req_recover', sessionId: ds.session.sessionId,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261016', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+
+    mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_fallback_final' } });
+    mocks.upload.mockReset().mockResolvedValue({ file_key: 'unused' });
+    await final({ mode: 'thread', rootMessageId: 'om_source' }, () => true, 'safe fallback answer');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', status: 'completed' });
+    await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');
+    const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+    expect(lookup).toMatchObject({
+      status: 'ready',
+      result: {
+        execution: { status: 'completed' },
+        output: { status: 'available', content: 'safe fallback answer', source: 'transcript' },
+        deliveries: [{ status: 'delivered', messages: [{ kind: 'primary', messageId: 'om_fallback_final' }] }],
+      },
+    });
+    expect(JSON.stringify(lookup)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private|om_plugin_partial/);
+  });
+
   it('keeps ordinary result collection alive when durable delivery is disabled', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', turnResults: { enabled: true } });
     useOrdinaryOutputDelivery();

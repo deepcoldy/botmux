@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { renderSummary } from '../scripts/render-midscene-summary.mjs';
+import { failureReason } from '../scripts/midscene-report-evidence.mjs';
 
 describe('Midscene CI summary', () => {
   it('does not report success when a successful Feishu step has no summary', () => {
@@ -60,6 +61,46 @@ describe('Midscene CI summary', () => {
     );
   });
 
+  it('shows why a failed case failed, even without a screenshot', () => {
+    expect(failureReason({
+      error: { message: 'Node "feishu.openAndSend" failed: Messenger did not load\n    at stack' },
+    })).toBe('Messenger did not load');
+    expect(failureReason({ status: 'failed' })).toBeNull();
+
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'failure',
+      feishuOutcome: 'failure',
+      evidenceCases: [{
+        name: 'Claude basic bot flow',
+        project: 'feishu-core-claude',
+        status: 'failed',
+        failure: 'Messenger did not load',
+      }],
+      summary: null,
+    });
+    expect(markdown).toContain('| ❌ Claude basic bot flow | — | feishu-core-claude | failed | 0 | Messenger did not load |');
+  });
+
+  it('reports a cancelled Feishu job as cancelled, not skipped', () => {
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'success',
+      feishuOutcome: 'cancelled',
+      evidenceCases: [{ name: 'Claude basic bot flow', project: 'feishu-core-claude', status: 'not-run' }],
+      summary: {
+        status: 'success',
+        durationMs: 1000,
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [{ name: 'dashboard-smoke', cases: [{ name: 'Dashboard', status: 'success', attempts: [{}] }] }],
+      },
+    });
+
+    expect(markdown).toContain('Botmux × Midscene · Feishu run cancelled');
+    expect(markdown).toContain('1/2 cases passed · 0 failed · 0 skipped · 1 not run');
+    expect(markdown).not.toContain('was skipped because');
+  });
+
   it('labels unavailable live credentials as skipped without a report link', () => {
     const markdown = renderSummary({
       artifactName: 'midscene-feishu-report',
@@ -78,7 +119,10 @@ describe('Midscene CI summary', () => {
       artifactName: 'botmux-midscene-report',
       testOutcome: 'success',
       feishuOutcome: 'skipped',
-      skippedCases: ['Aiden basic bot flow', 'Streaming card lifecycle'],
+      skippedCases: [
+        { name: 'Aiden basic bot flow', project: 'feishu-full-bots' },
+        { name: 'Streaming card lifecycle', project: 'feishu-full-claude-ui' },
+      ],
       summary: {
         status: 'success',
         durationMs: 2500,
@@ -101,10 +145,10 @@ describe('Midscene CI summary', () => {
     expect(markdown).toContain('Botmux × Midscene · passed with skips');
     expect(markdown).toContain('1/3 cases passed · 0 failed · 2 skipped');
     expect(markdown).toContain(
-      '| ⏭️ Aiden basic bot flow | — | feishu-browser | skipped | 0 |',
+      '| ⏭️ Aiden basic bot flow | — | feishu-full-bots | skipped | 0 |',
     );
     expect(markdown).toContain(
-      '| ⏭️ Streaming card lifecycle | — | feishu-browser | skipped | 0 |',
+      '| ⏭️ Streaming card lifecycle | — | feishu-full-claude-ui | skipped | 0 |',
     );
   });
 

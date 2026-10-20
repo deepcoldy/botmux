@@ -19,6 +19,8 @@
  * the outer block (CommonMark spec).
  */
 
+import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
+import type { ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -158,9 +160,9 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
-  /** Latest executor-reported model. Rendered by session-status cards only. */
+  /** Observed runtime model, or the configured launch model when unavailable. */
   model?: string;
-  /** Latest executor-reported reasoning effort. */
+  /** Observed reasoning effort, or the configured session effort when unavailable. */
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
@@ -389,12 +391,12 @@ export function normalizeLocalHomeLinks(
 }
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
-export const DEFAULT_BRAND_LABEL = 'Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:';
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
- *   • `undefined` (unset)  → `Powered by [botmux](...) with :LOVE:`
+ *   • `undefined` (unset)  → the default botmux link
  *   • `''` / whitespace    → `null` (brand suppressed)
  *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
@@ -581,29 +583,22 @@ export function cardUsageFooterSegment(
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
-  // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
-  // the streaming card appends it to this metric string with ` · ` in one
-  // continuous markdown paragraph. Keep this function metric-only so reply-card
-  // footers remain unchanged and the streaming renderer owns the tail layout.
+  // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
+  // this function metric-only so callers can also render identity without usage.
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-/** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** variant · effort`
- * (model bolded within the shared grey markdown) or null when there is no model.
- * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
- * standalone runtime-only row when native usage is unavailable. The
- * model↔effort join uses a non-breaking space so the pair never wraps apart. */
+/** Runtime identity shared by status and reply cards, independent of metrics.
+ * Missing model/effort is never guessed. Keep the selected model ID intact
+ * within the label budget: CLIs such as Cursor encode effort in that ID. */
 export function cardUsageRuntimeSegment(
   usage: CardUsageSnapshot,
-  hasMetrics: boolean,
 ): string | null {
-  if (!hasMetrics) return null;
   // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
   // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
   // internal namespace. A value with no slash (e.g. `gpt-5.6-sol`) is untouched.
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
-  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 64);
   if (!model) return null;
   const variant = usage.modelBackendVariant === 'standard'
     ? 'Standard'
@@ -705,27 +700,32 @@ export function buildReplyCardFooter(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
   locale?: Locale;
 }): ReplyCardFooter | null {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return null;
   const parts: string[] = [];
-  const brandSeg = brandFooterSegment(opts.brand);
+  const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
   let hasUsage = false;
   if (opts.usage) {
-    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage);
+    if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
-  const durationMs = opts.executionDurationMs;
+  const durationMs = opts.presentation?.timing?.executionDurationMs ?? opts.executionDurationMs;
   const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
-  const waitingMs = opts.waitingDurationMs;
+  const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
   const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
   if (hasWaiting) {
     parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
   }
   if (hasDuration) {
-    parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
-  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
   if (hasRecipient) {
     parts.push(
@@ -769,6 +769,23 @@ export function buildReplyCardFooter(opts: {
   };
 }
 
+/** Compose the entire footer once: text, divider and optional voice action. */
+export function buildReplyCardFooterElements(
+  opts: Parameters<typeof buildReplyCardFooter>[0] & { voiceButton?: Record<string, unknown> },
+): any[] {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return [];
+  const footer = buildReplyCardFooter(opts);
+  const voice = policy.voice ? opts.voiceButton : undefined;
+  if (!footer && !voice) return [];
+  return [{ tag: 'hr' }, ...(voice ? [{
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'default', columns: [
+      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [footer?.element ?? { tag: 'markdown', text_size: 'notation', content: ' ' }] },
+      { tag: 'column', width: 'auto', vertical_align: 'center', elements: [voice] },
+    ],
+  }] : [footer!.element])];
+}
+
 /** Clone a caller-supplied schema-2 card and append the canonical reply
  * footer. Returns null for cards without a v2 `body.elements` array or when a
  * caller-owned element already occupies the globally unique footer id. */
@@ -795,8 +812,7 @@ export function appendReplyCardFooterToV2Card(
   ) {
     return null;
   }
-  const footer = buildReplyCardFooter(opts);
-  if (footer) body.elements.push({ tag: 'hr' }, footer.element);
+  body.elements.push(...buildReplyCardFooterElements(opts));
   return cloned;
 }
 
@@ -1535,7 +1551,7 @@ export function hasMarkdown(text: string): boolean {
  * addressing line (e.g. top-level broadcasts have no specific recipient).
  *
  * `brand` is the sending bot's configured `brandLabel` (see
- * {@link brandFooterSegment}): unset → default `Powered by [botmux](...) with :LOVE:`, `''` → brand
+ * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
@@ -1549,19 +1565,18 @@ export function buildMarkdownCard(
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   usage?: CardUsageSnapshot,
+  presentation?: ReplyCardPresentation,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    presentation,
   });
   // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
+  elements.push(...footerElements);
   const card = createReplyCard(elements);
   fitBuiltCard(card, 'markdown_card');
   return JSON.stringify(card);
@@ -1581,19 +1596,21 @@ export function buildCanonicalFinalReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
     : [];
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
     usage: opts.usage,
+    presentation: opts.presentation,
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
-  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  elements.push(...footerElements);
   const card = createReplyCard(elements);
   composeFinalCardSections(card, {
     ...(opts.completionProposal
@@ -1642,6 +1659,7 @@ export function buildContextualReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
   feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
@@ -1685,18 +1703,16 @@ export function buildContextualReplyCard(opts: {
 
   if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
 
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
+    presentation: opts.presentation,
   });
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
+  elements.push(...footerElements);
 
   const card = createReplyCard(elements);
   fitBuiltCard(card, 'contextual_reply');

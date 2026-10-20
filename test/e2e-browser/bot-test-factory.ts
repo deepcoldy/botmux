@@ -90,16 +90,16 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
         // and click 「直接开启会话」 before any streaming-card wait.
         const marker = `CODEX_E2E_MARKER_${Date.now()}`;
         const msg = `${testMessage('codex-marker', { plain: true })} 请在最终回复中原样包含 ${marker}`;
-        await sendMessage(agent, msg);
+        await sendMessage(agent, msg, page);
         await openThreadForMessage(agent, { timeoutMs: 120_000, msgHint: msg, page });
-        await clickDirectStartIfPresent(agent, page);
+        await clickDirectStartIfPresent(agent, page, { expectMs: 90_000 });
         await scrollThreadToBottom(agent);
         await waitForCodexSideResponse(agent, { marker, timeoutMs: 180_000 });
         return;
       }
 
       const msg = testMessage(botName.toLowerCase());
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Session started. Title 「等待输入」 is not the success gate: Claude
       // can send ACK-e2e-… while the card body still reads 「回复 — 工作中」.

@@ -14,12 +14,13 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -161,6 +162,8 @@ export const SESSION_CLEANUP_DEFAULT_INTERVAL_MINUTES = 60;
 export const SESSION_CLEANUP_DEFAULT_HOURS: SessionCleanupHours = 168;
 
 export interface SessionCleanupGlobalConfig {
+  /** 手动关闭或手动/定时清理时归档有明确归属的 Codex 会话；默认关闭。 */
+  archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
   /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
@@ -681,6 +684,7 @@ function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefine
   const value = raw as Record<string, unknown>;
   const out: SessionCleanupGlobalConfig = {};
   if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.archiveCodex === 'boolean') out.archiveCodex = value.archiveCodex;
   if (
     typeof value.olderThanHours === 'number'
     && (SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(value.olderThanHours)
@@ -776,6 +780,11 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
 }
 
 export function globalConfigPath(): string {
+  const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) throw new Error('BOTMUX_GLOBAL_CONFIG_FILE must be absolute');
+    return configured;
+  }
   return join(homedir(), '.botmux', 'config.json');
 }
 
@@ -1042,6 +1051,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  the file (and parent dir) on first write. Use `null` to explicitly delete
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
+  assertDurableConfigMutationAllowed('global');
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

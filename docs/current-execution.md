@@ -4,6 +4,8 @@
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。
 
+Codex 的原生 `codex-code-mode-host` 会跨轮复用，属于引擎的工具派发进程。只有它是已证明 Codex 根进程的直接子进程、内核报告的可执行文件位于同一发布目录且没有额外启动参数时，血缘检查才允许本轮新工具经过它；不凭进程名或命令行自报身份。常驻 host 自身、上一轮工具及其后续子进程仍不能取得本轮权限。`actor current` 和增量授权共用这条检查，并继续核对当前真人发送者及授权期间的轮次变化。
+
 成功响应：
 
 ```json

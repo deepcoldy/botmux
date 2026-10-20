@@ -906,7 +906,8 @@ function pushStreamBody(
   const usageSeg = usage
     ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
     : null;
-  if (usageSeg) {
+  const runtimeSeg = usage ? cardUsageRuntimeSegment(usage) : null;
+  if (usageSeg || runtimeSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
     // reads as "one row": when the content is short it's literally one line;
@@ -915,10 +916,9 @@ function pushStreamBody(
     // on a second line / left-anchored on mobile, which the user found jarring).
     // The trade-off the user accepted: on a long line the runtime is not pinned
     // to the right edge — it simply follows the metrics in reading order. The
-    // runtime self-truncates (model ≤20 chars) so the tail stays compact. No
+    // runtime self-truncates so the tail stays bounded. No
     // runtime → the metrics render alone, unchanged.
-    const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
-    const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    const line = [usageSeg, runtimeSeg].filter(Boolean).join(' · ');
     // 上下文吃紧时整行转红（而不是另起一行报警）：提示就在用量数字旁边，一眼可见，
     // 且不多占卡片高度。判据与 footer 里追加「建议压缩」的**是同一个谓词**——刻意不去
     // 嗅 usageSeg 里有没有那串提示文案：那份文案是可被用户自定义覆盖的（覆盖成空串时
@@ -2797,7 +2797,11 @@ export interface AdoptPickerEntry {
   kind: AdoptEntryKind;
   cliId?: CliId;
   cliDisplayName?: string;
-  /** resume: first user prompt; live: project (cwd basename). */
+  /** resume: the CLI's native title when the transcript has one, else the
+   *  first real user prompt (see ResumableSession.title); live: backend /
+   *  CLI display name (herdr pane label / Claude terminal title / TraeX native
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title), else
+   *  project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2855,7 +2859,7 @@ export function buildAdoptEntries(
       kind: 'live' as const,
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: project,
+      title: s.title || project,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,

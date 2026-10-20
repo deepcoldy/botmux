@@ -1,234 +1,79 @@
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
-describe('TRAE worker structured-bridge wiring', () => {
-  it('uses the TRAE-specific parser and rebinds a moved segment for the same session', () => {
-    expect(workerSource).toContain('traexSessionIdFromRolloutPath(path!)');
-    expect(workerSource).toContain('traexSessionIdFromRolloutPath(codexBridgeRolloutPath)');
-    expect(workerSource).toContain('rollout segment moved for ${cliSessionId}');
+function sliceBetween(start: string, end: string): string {
+  const at = workerSource.indexOf(start);
+  expect(at, `worker.ts 里找不到 ${start}`).toBeGreaterThanOrEqual(0);
+  const until = workerSource.indexOf(end, at);
+  expect(until, `worker.ts 里 ${start} 之后找不到 ${end}`).toBeGreaterThan(at);
+  return workerSource.slice(at, until);
+}
+
+describe('TRAE structured-bridge drain', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'traex-bridge-drain-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  /** A turn whose only agent text is deliberate-silence commentary, closed by task_complete. */
+  function sentinelOnlyRollout(name: string): string {
+    const path = join(dir, `${name}.jsonl`);
+    const turnId = '00000000-0000-7000-8000-000000000010';
+    const at = (s: number) => `2000-01-01T00:00:0${s}.000Z`;
+    writeFileSync(path, [
+      { timestamp: at(1), type: 'event_msg', payload: { type: 'user_message', message: 'do the work', images: [], local_images: [], text_elements: [] } },
+      { timestamp: at(2), type: 'event_msg', payload: { type: 'agent_message', message: '已回报。BOTMUX_NO_REPLY', phase: 'commentary', memory_citation: null } },
+      { timestamp: at(3), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, completed_at: 946_684_803, duration_ms: 1_000 } },
+    ].map(record => `${JSON.stringify(record)}\n`).join(''));
+    return path;
+  }
+
+  it('closes the turn on task_complete and keeps adopt-mode text verbatim (no synthesised sentinel)', () => {
+    const spec = bridgeSpecFor('traex')!;
+    const adopt = spec.drain(sentinelOnlyRollout('adopt'), 0, { adoptMode: true, state: undefined });
+    expect(adopt.events.at(-1)).toEqual(expect.objectContaining({ kind: 'assistant_final', text: '' }));
+    const managed = spec.drain(sentinelOnlyRollout('managed'), 0, { adoptMode: false, state: undefined });
+    expect(managed.events.at(-1)).toEqual(expect.objectContaining({ kind: 'assistant_final', text: 'BOTMUX_NO_REPLY' }));
   });
+});
 
-  it('gives the RPC app-server the non-secret Lark route required by botmux ask', () => {
-    const start = workerSource.indexOf('async function engageCodexRpc');
-    const end = workerSource.indexOf('engine = new CodexRpcEngine', start);
-    const envSetup = workerSource.slice(start, end);
-
-    expect(envSetup).toContain('engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;');
-    expect(envSetup).toContain('engineEnv.BOTMUX_CHAT_ID = cfg.chatId;');
-    expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
-    expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
-    expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
-    expect(envSetup).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);');
+describe('TRAE worker guards without a behavioural seam', () => {
+  // 源码结构护栏(K2)：engageCodexRpc 在 worker.ts 闭包里组装 RPC app-server（真正跑模型与 shell 工具的
+  // 进程）的 env，没有行为 seam。CLAUDE.md「飞书 owner 身份边界」：owner 必须在可配置 env（per-bot env）
+  // 合并之后由 applySessionOwnerEnv 注入并冻结，配置不能覆盖它；app secret 不得进入这个子进程。
+  it('pins the RPC app-server owner after the per-bot env merge and never hands it the app secret', () => {
+    const envSetup = sliceBetween('async function engageCodexRpc', 'new CodexRpcEngine({');
+    const merged = envSetup.lastIndexOf('botInjectedEnv(');
+    const owner = envSetup.indexOf('applySessionOwnerEnv(engineEnv');
+    expect(merged).toBeGreaterThan(-1);
+    expect(owner).toBeGreaterThan(merged);
+    expect(envSetup.indexOf('Object.assign(engineEnv', owner)).toBe(-1);
     expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
   });
 
-  it('dispatches TRAE rollouts to the dedicated task_complete reader', () => {
-    const start = workerSource.indexOf('function structuredBridgeIngestPath');
-    const end = workerSource.indexOf('\n}\n', start);
-    const body = workerSource.slice(start, end);
+  // 源码结构护栏(K2)：TRAE 的 history.jsonl 是同一 TRAE_HOME 下所有 pane 共享的全局文件，sibling pane
+  // 的同文本提交能让 worker 拿到 foreign session id。#748：把 bridge 绑到某个 rollout（并持久化 resume
+  // 目标）之前，必须先用 pid-fd 所有权闸确认这个 id 属于本 pid，否则 resume 目标被污染、回复从别的会话
+  // harvest。三个绑定点（rotation / initial attach / adopt poller）都在 worker.ts 闭包里没有行为 seam；
+  // 闸背后的纯判定 traexHistorySidIsOwned 在 traex-transcript.test.ts 里有行为测试。
+  it('runs the pid ownership gate before every TRAE session binding', () => {
+    expect(sliceBetween('function traexHistorySidOwnedByCurrentPid', '\n}\n')).toContain('traexHistorySidIsOwned(');
 
-    // Dispatch is capability-driven now: the worker asks the adapter's bridgeSpec
-    // for the drainer and commits driver state only for specs that declare it.
-    expect(body).toContain('bridgeSpecFor(lastInitConfig?.cliId)');
-    expect(body).toContain("if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;");
-    // adoptMode is threaded into the TRAE drainer so it does not synthesise a
-    // bare sentinel in adopt mode (where transcript text is posted verbatim).
-    expect(body).toContain("adoptMode: lastInitConfig?.adoptMode === true");
-    const traexSource = readFileSync(new URL('../src/adapters/cli/traex.ts', import.meta.url), 'utf8');
-    expect(traexSource).toContain('drainTraexRollout(path, offset, { adoptMode: ctx.adoptMode })');
-    // codex / traex share the rollout shape but NOT the drainer: codex carries state.
-    const codexSource = readFileSync(new URL('../src/adapters/cli/codex.ts', import.meta.url), 'utf8');
-    expect(codexSource).toContain('drainCodexRollout(path, offset, ctx.state as CodexDrainState | undefined)');
-    expect(codexSource).toContain("stateCommit: 'drain'");
-  });
+    const notify = sliceBetween('function codexBridgeNotifyCliSessionId', 'function maybeFollowGrokSessionRotationViaPid');
+    const rotation = notify.slice(notify.indexOf("if (structuredBridgeIs('traex'))"));
+    const rotationGate = rotation.indexOf('traexHistorySidOwnedByCurrentPid(cliSessionId)');
+    expect(rotationGate).toBeGreaterThan(-1);
+    expect(rotationGate).toBeLessThan(rotation.indexOf('codexBridgeDetachFile('));
 
-  it('publishes the latest TRAE runtime on attach and incremental ingest', () => {
-    const attachStart = workerSource.indexOf('function codexBridgeAttach');
-    const attachEnd = workerSource.indexOf('function codexBridgeDetachFile', attachStart);
-    const attach = workerSource.slice(attachStart, attachEnd);
-    // Baseline modes seed from a bounded backward read; fresh-empty/split-live
-    // are excluded so split-live does not re-scan the file it just drained.
-    expect(attach).toContain('publishActiveRuntime(readLatestTraexRuntime(rolloutPath))');
-    expect(attach).toMatch(/mode !== 'fresh-empty'\s*&&\s*mode !== 'split-live'[\s\S]*?publishActiveRuntime\(readLatestTraexRuntime/);
-    // split-live reuses its own drain result rather than a second full scan.
-    // Bound the block to the actual `split-live` success branch (up to the
-    // `else if (mode === 'split-live')` degraded branch) instead of a fixed
-    // char window, so unrelated code inserted ahead of the TRAE publish (e.g.
-    // the sibling Codex runtime block) can't push the assertion out of range.
-    const splitStart = attach.indexOf("mode === 'split-live' && existsSync");
-    const splitEnd = attach.indexOf("} else if (mode === 'split-live')", splitStart);
-    expect(splitStart).toBeGreaterThanOrEqual(0);
-    expect(splitEnd).toBeGreaterThan(splitStart);
-    const splitBlock = attach.slice(splitStart, splitEnd);
-    expect(splitBlock).toContain('publishActiveRuntime({');
-    expect(splitBlock).toContain('model: traex.latestModel');
-    expect(splitBlock).not.toContain('readLatestTraexRuntime');
+    const initialAttach = notify.lastIndexOf('resolveFileBridgePath(lastInitConfig?.cliId');
+    expect(initialAttach).toBeGreaterThan(-1);
+    const initialGate = notify.lastIndexOf('traexHistorySidOwnedByCurrentPid(cliSessionId)', initialAttach);
+    expect(initialGate).toBeGreaterThan(rotationGate);
 
-    const ingestStart = workerSource.indexOf('function codexBridgeIngest');
-    const ingestEnd = workerSource.indexOf('function codexBridgeMarkPendingTurn', ingestStart);
-    const ingest = workerSource.slice(ingestStart, ingestEnd);
-    expect(ingest).toContain('publishActiveRuntime({');
-    expect(ingest).toContain('reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort');
-  });
-
-  it('drains the retired rollout before reattaching a newly verified TRAE session', () => {
-    const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
-    const end = workerSource.indexOf('function maybeFollowGrokSessionRotationViaPid', start);
-    const notify = workerSource.slice(start, end);
-    const traexStart = notify.indexOf("if (structuredBridgeIs('traex'))");
-    const traexEnd = notify.indexOf('// Grok', traexStart);
-    const traex = notify.slice(traexStart, traexEnd);
-
-    expect(traexStart).toBeGreaterThanOrEqual(0);
-    expect(traex).toContain("resolveFileBridgePath('traex', { sessionId: cliSessionId })");
-    expect(traex.indexOf('codexBridgeIngest();')).toBeLessThan(traex.indexOf('codexBridgeDetachFile();'));
-    expect(traex.indexOf('codexBridgeDetachFile();')).toBeLessThan(traex.indexOf("codexBridgeAttach(next, 'fresh-empty');"));
-    expect(traex).toContain('codexBridgePendingSessionId = cliSessionId;');
-  });
-
-  it('gates the history-derived TRAE re-attach on pid-fd ownership (foreign sibling id refused)', () => {
-    // history.jsonl is a global file shared by every TRAE pane under one
-    // TRAE_HOME; a sibling pane's identical text (e.g. a bare adopt-mode reply
-    // with no unique <session_id>) can surface a foreign id. The rotation branch
-    // must refuse to re-attach the bridge to an id THIS pid does not own, and
-    // the ownership check must run BEFORE the bridge is detached/re-attached.
-    const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
-    const end = workerSource.indexOf('function maybeFollowGrokSessionRotationViaPid', start);
-    const notify = workerSource.slice(start, end);
-    const traexStart = notify.indexOf("if (structuredBridgeIs('traex'))");
-    const traex = notify.slice(traexStart, notify.indexOf('// Grok', traexStart));
-
-    expect(traex).toContain('traexHistorySidOwnedByCurrentPid(cliSessionId)');
-    // Gate must precede the detach/re-attach so an unowned id keeps the binding.
-    expect(traex.indexOf('traexHistorySidOwnedByCurrentPid(cliSessionId)'))
-      .toBeLessThan(traex.indexOf('codexBridgeDetachFile();'));
-    expect(traex).toContain('refusing history-only re-attach');
-  });
-
-  it('resolves the observed TRAE pid from backend.cliPid → child pid → adopt-pending pid', () => {
-    const start = workerSource.indexOf('function currentTraexObservedPid');
-    const end = workerSource.indexOf('\n}\n', start);
-    const body = workerSource.slice(start, end);
-
-    expect(body).toContain('.cliPid');
-    expect(body).toContain('backend?.getChildPid?.()');
-    expect(body).toContain('codexAdoptPendingPid');
-  });
-
-  it('gates the ownership decision through the pure fail-closed predicate', () => {
-    const start = workerSource.indexOf('function traexHistorySidOwnedByCurrentPid');
-    const end = workerSource.indexOf('\n}\n', start);
-    const body = workerSource.slice(start, end);
-
-    expect(body).toContain('currentTraexObservedPid()');
-    expect(body).toContain('findTraexRolloutSetByPid(pid)');
-    expect(body).toContain('traexHistorySidIsOwned(cliSessionId, ownedRollouts)');
-  });
-
-  it('wires fresh-managed TRAE cliPid without populating the adopt-only fallback', () => {
-    // Without this, backend.cliPid is unset for a normal TRAE PTY/tmux session
-    // and writeInput cannot prove the session id belongs to this process. The
-    // separate codexAdoptPendingPid fallback must stay adopt-only: populating it
-    // for a fresh spawn makes the 1s bridge poller run pid-fd discovery before
-    // the first submit. Start before the async launcher resolver so bwrap and
-    // forge-traex leaf-pid rewiring is covered alongside direct/zellij wiring.
-    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
-    const end = workerSource.indexOf('// Bridge fallback:', start);
-    const wiring = workerSource.slice(start, end);
-    // Both wiring sites go through the shared ownership-pid predicate, which names traex.
-    const matches = wiring.match(/cliAdapterBindsOwnershipPid\(cfg\.cliId, claudeDataDir\)/g) ?? [];
-    expect(matches.length).toBeGreaterThanOrEqual(2);
-    expect(readFileSync(new URL('../src/adapters/cli/ownership-pid.ts', import.meta.url), 'utf8')).toContain("cliId === 'traex'");
-    expect(wiring).toContain('.cliPid = realPid;');
-    expect(wiring).toContain('.cliPid = wiredPid;');
-    expect(wiring).not.toContain('codexAdoptPendingPid = realPid;');
-    expect(wiring).not.toContain('codexAdoptPendingPid = wiredPid;');
-  });
-
-  it('gates the TRAE INITIAL bridge attach on pid-fd ownership (adopt mode)', () => {
-    // The initial-attach path (no prior rollout bound) must refuse a foreign
-    // shared-history sid, mirroring the codex initial-attach gate. Fail closed:
-    // keep the poller armed rather than pinning an unverified sid.
-    expect(workerSource).toContain('TRAE initial-attach refused for unverified session');
-    const idx = workerSource.indexOf('TRAE initial-attach refused');
-    const ctx = workerSource.slice(workerSource.lastIndexOf("if (structuredBridgeIs('traex')", idx), idx + 200);
-    expect(ctx).toContain("lastInitConfig?.adoptMode && currentTraexObservedPid()");
-    expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(cliSessionId)');
-  });
-
-  it('gates the TRAE adopt poller attach on resolved-rollout ownership', () => {
-    // The 1s poller resolves a pending sid to a rollout path (sessionId-first),
-    // so a shared-TRAE_HOME sibling sid would resolve to a foreign rollout.
-    // attachOk must verify the resolved rollout's sid is pid-owned before
-    // attaching (and before it persists the discovered sid for traex).
-    expect(workerSource).toContain('traexAttachGated');
-    const idx = workerSource.indexOf('const codexAttachGated');
-    const ctx = workerSource.slice(idx, idx + 700);
-    expect(ctx).toContain("structuredBridgeIs('traex') && lastInitConfig?.adoptMode");
-    expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(sid)');
-  });
-
-  it('resolves the real traex leaf under a launcher process', () => {
-    // Under the file sandbox / credential-only bwrap, getChildPid() is the bwrap
-    // supervisor, not traex. resolveTraexOwnershipPid BFS-descends to the leaf so
-    // the ownership gate can admit the id. Forge x TraeX has the same launcher
-    // shape: the observed child is forge, while the rollout owner is traex.
-    const start = workerSource.indexOf('function resolveTraexOwnershipPid');
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    expect(body).toContain("findLaunchedCliPid(candidatePid, 'traex')");
-    expect(workerSource).toContain('const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;');
-    expect(workerSource).toContain("const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';");
-    expect(workerSource).toContain('lastSpawnTraexLauncherActive = traexLauncherActive;');
-  });
-
-  it('drives the sandbox leaf resolver as a BOUNDED RETRY (leaf may not be forked yet)', () => {
-    // One-shot resolution loses the common case where bwrap has not exec'd traex
-    // at wire time. The same is true for Forge spawning traex as an agent.
-    // startTraexLauncherPidResolve reuses scheduleWrapperRealCliPid (bounded
-    // retry + stale-backend guard), and both sync and zellij-async sites kick it.
-    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
-    const body = workerSource.slice(start, start + 900);
-    expect(body).toContain('scheduleWrapperRealCliPid(launcherPid');
-    expect(body).toContain("findLaunchedCliPid(lp, 'traex')");
-    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && traexLauncherActive\) startTraexLauncherPidResolve\(/g) ?? [];
-    expect(kicks.length).toBeGreaterThanOrEqual(2);
-  });
-
-
-  it('follows the adopted TRAE pid so direct local /new rotation is observable', () => {
-    expect(workerSource).toContain('maybeFollowTraexSessionRotationViaPid();');
-    const start = workerSource.indexOf('function maybeFollowTraexSessionRotationViaPid');
-    const end = workerSource.indexOf('\n}\n', start);
-    const follower = workerSource.slice(start, end);
-
-    expect(follower).toContain('lastInitConfig?.adoptMode !== true');
-    expect(follower).toContain('TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS');
-    expect(follower).toContain('findTraexRolloutByPid(pid, currentSid)');
-    expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
-    expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
-  });
-
-  it('keeps fresh late-attach session-id based and reserves pid fallback for adopt', () => {
-    const timerStart = workerSource.indexOf('function codexBridgeStartTimer');
-    const timerEnd = workerSource.indexOf('function hermesBridgeAttach', timerStart);
-    const timer = workerSource.slice(timerStart, timerEnd);
-
-    expect(timer).toContain('pid: lastInitConfig?.adoptMode ? codexAdoptPendingPid : undefined');
-    expect(timer).not.toContain('\n          pid: codexAdoptPendingPid,');
-  });
-
-  it('does not silently swallow completed TRAE turns whose final text is empty', () => {
-    const start = workerSource.indexOf('function emitReadyCodexTurns');
-    const end = workerSource.indexOf('\n}\n\nfunction stopCodexBridge', start);
-    const body = workerSource.slice(start, end);
-
-    // The empty-completed fallback is still wired — now via the extracted
-    // structuredFallbackKind decision, whose 'empty_completed' branch posts
-    // emptyCompletedBridgeFallbackContent().
-    expect(body).toContain('structuredFallbackKind');
-    expect(body).toContain('emptyCompletedBridgeFallbackContent()');
-    expect(body).not.toContain('if (!turn.finalText) continue;');
+    expect(sliceBetween('const attachOk = ', 'if (path && attachOk)')).toContain('traexHistorySidOwnedByCurrentPid(sid)');
   });
 });

@@ -176,6 +176,57 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).not.toContain('&amp;lt;');
   });
 
+  it('adds the durable scheduling skill hint to a Remote Runner opening', () => {
+    const output = buildNewTopicPrompt(
+      '帮我继续修这个问题', SESSION_ID, 'remote-runner', undefined, undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+      { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(output).toContain('<botmux_builtin_skills>');
+    expect(output).toContain('botmux-schedule');
+    expect(output).toContain('Remote Runner 临时环境');
+    expect(output).toContain('必须使用持久化的 `botmux schedule`');
+    expect(output).toContain('cron_create');
+    expect(output).not.toContain('<botmux_schedule_policy>');
+    expect(output).not.toContain('- botmux-ask:');
+  });
+
+  it('keeps the ordinary schedule skill metadata unchanged on local backends', () => {
+    const local = buildNewTopicPrompt(
+      '帮我定个提醒', SESSION_ID, 'traex', undefined, undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+      { larkAppId: 'app_test', chatId: 'oc_1', sessionBackendType: 'tmux' },
+    );
+    expect(local).toContain('botmux-schedule');
+    expect(local).not.toContain('Remote Runner 临时环境');
+    expect(local).not.toContain('cron_create');
+  });
+
+  it('does not advertise the Remote Runner scheduling boundary without Lark transport', () => {
+    mockBotConfig.apiOnly = true;
+    try {
+      const output = buildNewTopicPrompt(
+        '帮我定个提醒', SESSION_ID, 'remote-runner', undefined, undefined, undefined, undefined, undefined,
+        { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: 'app_test', chatId: 'oc_1', sessionBackendType: 'remote-runner' },
+      );
+      expect(output).not.toContain('Remote Runner 临时环境');
+      expect(output).not.toContain('cron_create');
+    } finally {
+      delete mockBotConfig.apiOnly;
+    }
+  });
+
+  it('respects zero prompt injection for Remote Runner sessions', () => {
+    const output = buildNewTopicPrompt(
+      '帮我定个提醒', SESSION_ID, 'remote-runner', undefined, undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+      { larkAppId: 'app_test', chatId: 'oc_1', sessionBackendType: 'remote-runner', promptInjection: 'none' },
+    );
+    expect(output).toBe('帮我定个提醒');
+    expect(output).not.toContain('Remote Runner 临时环境');
+  });
+
   it('puts the Cursor background-task note inside <botmux_routing> for cursor only (#1504)', () => {
     const cursor = buildNewTopicPrompt('hello', SESSION_ID, 'cursor');
     const routing = cursor.slice(cursor.indexOf('<botmux_routing>'), cursor.indexOf('</botmux_routing>'));

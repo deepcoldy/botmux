@@ -7,9 +7,9 @@
  * loses. The in-pane relay answers the probe before forwarding the DA1 query.
  * The tmux test below checks that ordering against a real tmux server.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -275,16 +275,28 @@ setTimeout(() => {
 }, 800);
 `;
 
+// Every case gets its OWN tmux server (fresh `-L` name per test). `kill-server`
+// returns before the server has finished exiting: while it tears down live panes
+// it still holds the socket open but closes every new connection, so a
+// `new-session` on the SAME name in that window fails with "server exited
+// unexpectedly" (exit 1) instead of starting a server. One shared name made the
+// next test's first command race the previous test's teardown — measured: 4/40
+// local runs and two master CI runs red at `new-session`, typically right after
+// the stty case, whose pane is still alive when that test ends.
 describe('OSC 7501 handshake ordering in a real tmux pane', () => {
   let dir = '';
-  const socket = `botmux-osc7501-${process.pid}`;
+  let socket = '';
   const tmux = (...args: string[]) => spawnSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], {
     cwd: REPO_ROOT, encoding: 'utf8', timeout: 10_000,
     env: { ...process.env, TMUX: '' },
   });
+  beforeEach(() => {
+    socket = `botmux-osc7501-${process.pid}-${randomUUID()}`;
+  });
   afterEach(() => {
     tmux('kill-server');
     if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = '';
   });
 
   async function runInPane(paneArgv: string[], resultFile: string): Promise<{ order: string[]; piped: string }> {
@@ -292,11 +304,18 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const created = tmux('new-session', '-d', '-s', 'p', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--', ...paneArgv);
     expect(created.status, created.stderr).toBe(0);
     tmux('pipe-pane', '-O', '-t', 'p', `cat >> '${pipeLog}'`);
+    // Poll for the report's CONTENT, not its existence: the fake CLI publishes it
+    // with one writeFileSync, which truncate-creates the file a beat before the
+    // bytes land, so an existence check can read the empty window under load.
+    // A complete JSON array is the only thing that parses.
     const deadline = Date.now() + 15_000;
-    while (!existsSync(resultFile) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
-    expect(existsSync(resultFile), 'fake CLI never reported').toBe(true);
-    const seen = JSON.parse(readFileSync(resultFile, 'utf8')) as Array<[string, number]>;
-    return { order: seen.map(([name]) => name), piped: existsSync(pipeLog) ? readFileSync(pipeLog, 'latin1') : '' };
+    let seen: Array<[string, number]> | undefined;
+    while (!seen && Date.now() < deadline) {
+      try { seen = JSON.parse(readFileSync(resultFile, 'utf8')) as Array<[string, number]>; }
+      catch { await new Promise(r => setTimeout(r, 50)); }
+    }
+    expect(seen, 'fake CLI never reported').toBeDefined();
+    return { order: seen!.map(([name]) => name), piped: existsSync(pipeLog) ? readFileSync(pipeLog, 'latin1') : '' };
   }
 
   it.skipIf(!hasTmux)('premise: without the relay tmux answers DA1 and nobody answers 7501 in time', async () => {
@@ -374,6 +393,56 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     expect(existsSync(done)).toBe(true);
     expect(existsSync(planted)).toBe(false);
   }, 30_000);
+
+  // Closing the pane hangs up the relay's stdin. Node's stream teardown then
+  // reads process.stderr for the first time, and creating that TTY stream
+  // re-opens the pane tty: on macOS the open() of a hung-up pty blocks forever,
+  // so the event loop — and with it the SIGHUP handler's SIGKILL escalation —
+  // never runs again. The relay and a CLI that outlives SIGHUP (Claude Code
+  // does) leaked three ptys per closed session until the machine ran out.
+  //
+  // Runs the relay as production does — plain node on emitted JS. Under
+  // `--import tsx` the loader itself touches process.stderr at startup, which
+  // masks the bug (verified: this case passes without the fix under tsx).
+  it.skipIf(!hasTmux || !!process.versions.bun)('exits, taking a SIGHUP-surviving CLI with it, when the pane is killed', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
+    // Inside the repo so the bundle's bare imports (node-pty) resolve.
+    const bundleDir = join(REPO_ROOT, 'node_modules', '.cache', `botmux-psr-test-${randomUUID()}`);
+    const relayJs = join(bundleDir, 'relay.mjs');
+    const childPid = join(dir, 'child.pid');
+    const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
+    const plan = join(planDir, 'plan.json');
+    const digest = writeRelayPlan(plan, { bin: '/bin/sh', args: ['-c', `trap '' HUP; echo $$ > '${childPid}.tmp'; mv '${childPid}.tmp' '${childPid}'; while :; do sleep 1; done`] });
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    let relayPid = 0;
+    let cliPid = 0;
+    try {
+      mkdirSync(bundleDir, { recursive: true });
+      const { build } = await import('esbuild');
+      await build({
+        entryPoints: [join(REPO_ROOT, 'src/program-status-relay.ts')],
+        outfile: relayJs, bundle: true, platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent',
+      });
+      const created = tmux('new-session', '-d', '-s', 'h', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--',
+        process.execPath, relayJs, digest, plan);
+      expect(created.status, created.stderr).toBe(0);
+      relayPid = Number(tmux('display-message', '-p', '-t', 'h', '#{pane_pid}').stdout.trim());
+      expect(relayPid).toBeGreaterThan(1);
+      let deadline = Date.now() + 15_000;
+      while (!existsSync(childPid) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      cliPid = Number(readFileSync(childPid, 'utf8').trim());
+      expect(alive(cliPid)).toBe(true);
+      tmux('kill-session', '-t', 'h');
+      // SIGNAL_EXIT_GRACE_MS (5 s) + FINAL_KILL_MS (2 s) + slack.
+      deadline = Date.now() + 12_000;
+      while ((alive(relayPid) || alive(cliPid)) && Date.now() < deadline) await new Promise(r => setTimeout(r, 100));
+      expect(alive(cliPid), 'CLI outlived its closed pane').toBe(false);
+      expect(alive(relayPid), 'relay outlived its closed pane').toBe(false);
+    } finally {
+      for (const pid of [relayPid, cliPid]) { if (pid > 1) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } } }
+      rmSync(bundleDir, { recursive: true, force: true });
+    }
+  }, 40_000);
 
   it.skipIf(!hasTmux)('with the relay the 7501 answer precedes tmux\'s DA1 answer and the probe never reaches the pane', async () => {
     dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));

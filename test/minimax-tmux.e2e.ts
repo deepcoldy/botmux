@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { collectNativePrint } from '../src/services/constrained-invocation/print-process.js';
@@ -24,8 +25,9 @@ it.skipIf(!enabled)('real mcode through tmux pipe: tools, owner, usage and exact
   const requests: any[] = [];
   let tools = 0;
   const server = createServer(async (req, res) => {
-    let raw = ''; for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw); requests.push(body);
+    const body = await readRequestBodyJson<any>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    requests.push(body);
     if (!body.stream) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'fixture', object: 'chat.completion', model: 'fixture-model',

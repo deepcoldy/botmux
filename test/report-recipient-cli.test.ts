@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
@@ -117,9 +118,9 @@ async function runReport(options: {
       res.end(JSON.stringify({ error: 'not_found' }));
       return;
     }
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    requests.push({ url: req.url, body: JSON.parse(body) });
+    const body = await readRequestBodyJson(req, { strict: true });
+    if (body === undefined) { res.writeHead(400, { 'content-type': 'application/json' }); res.end('{}'); return; }
+    requests.push({ url: req.url, body });
     res.writeHead(options.relayStatus ?? 404, { 'content-type': 'application/json' });
     res.end(JSON.stringify(options.relayBody ?? { error: 'dispatch_target_unavailable' }));
   });

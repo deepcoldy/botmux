@@ -60,6 +60,8 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
 | `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
+| `codexCapacityRecovery` | **Off by default**. Set `true` to continue explicit model-capacity failures in managed Codex Lark sessions, or use `/botconfig set codexCapacityRecovery on` / `off`. At most two recovery inputs are appended per task and may remain in native model context; disabling this does not delete history. Not provider-specific; ordinary rate limits and quota exhaustion are excluded. |
+| `suppressDeliveredFinalFailureNotice` | **Experimental, off by default**. When `true`, a structured-transcript session (such as Codex) that already delivered an explicit final with a Lark receipt for the same turn and dispatch attempt (`botmux send --response-kind final` or a managed final card) no longer posts the "model connection failed" notice if a later model-service error (such as 527) ends that turn; the failed terminal and logs are kept. It trusts the delivered final and does not compare it with text the model may write afterwards. Progress/auxiliary sends, unacknowledged sends and sends from other turns are unaffected. Missing/`false` keeps the previous behavior. Toggle with `/botconfig set suppressDeliveredFinalFailureNotice on` / `off`; takes effect on the next worker start |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
 | `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Toggle it under Dashboard **Advanced → Codex App**, or set it to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
 
@@ -234,7 +236,8 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
-| `brandLabel` | Branding text at the bottom of the card (rendered on final replies and top-level broadcasts only). `undefined` = default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`; `""` = hidden; any other string = rendered as-is (supports markdown). Also gated by the machine-wide `dashboard.cardBrandLabel` switch (Dashboard "Settings → Feishu Cards", on by default): when off, no bot shows a footer signature and this field is greyed out on the bot config page. Purely cosmetic, does not affect routing / permissions |
+| `replyCardMode` | `legacy` (default) sends progress and replies separately; `unified` updates public progress, tool activity, execution status and the final answer in one card per turn. Supports ordinary Claude Code / Codex / Grok Feishu sessions without a file sandbox, effective from the next turn. Grok displays public narration and tool events, excluding raw thoughts and hook payloads. Other entry points retain their existing delivery path. `disableStreamingCard` independently controls the terminal status card. |
+| `brandLabel` | Branding text at the bottom of the card (rendered on final replies and top-level broadcasts only). `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Also gated by the machine-wide `dashboard.cardBrandLabel` switch (Dashboard "Settings → Feishu Cards", on by default): when off, no bot shows a footer signature and this field is greyed out on the bot config page. Purely cosmetic, does not affect routing / permissions |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
 | `modelBackendVariant` display | A frozen TraeX backend variant appears only in the runtime identity on the live streaming session card. Reply-card footers show Context / Token usage only; they do not show the variant |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
@@ -475,3 +478,22 @@ Strict mode covers Botmux-owned PTY, tmux, tmux-pipe, zellij, zmx, local Codex/T
 Herdr, Riff, Mojo, Forge launch mode, adopted processes and externally owned App Servers cannot currently establish this boundary, so strict mode refuses those paths. Shells/profiles deliberately invoked by a CLI, credential/config files, OS file permissions and cloud identities remain outside this feature. Per-bot CODEX_HOME, codexAuthSync and file sandbox behavior remain independent.
 
 Dashboard reads only configured names. Its env form is write-only: saving replaces the complete map and saving blank clears it. Strict sessions do not return credential-bearing reproduction commands. Diagnostics show names/policy only. Explicit bot values are still plaintext in bots.json and process environments; this is not a secret vault.
+
+
+## Reply card footer
+
+Dashboard → Bot configuration → Message cards exposes a Footer master switch and independent block switches. They are also available through `/botconfig set <field> on|off`.
+
+| Field | Default | Scope |
+| --- | --- | --- |
+| `replyFooterEnabled` | `true` | Entire reply footer, including divider and voice button |
+| `replyFooterBrand` | `true` | Brand signature, still subject to the global brand switch and `brandLabel` |
+| `replyFooterModel` | `true` | Model, reasoning effort and backend variant |
+| `replyFooterUsage` | `true` | Footer usage, only when `usageDisplay` is `"footer"` |
+| `replyFooterRecipients` | `true` | Footer recipients and their @ notifications; explicit body mentions remain unchanged |
+| `replyFooterVoice` | `true` | Voice summary button when voice is configured |
+| `showReplyTiming` | `false` | Waiting time plus execution until reply for normal sends, or final execution duration for terminal fallback; unknown measurements are omitted |
+
+The master takes precedence without clearing block settings or signature text. Blocks remain editable while disabled; re-enabling restores the last saved choices. When all available blocks are hidden or empty and there is no voice button, the footer and divider are omitted. Status cards, accounting and model execution parameters are unchanged. User-authored custom card content remains intact; only Botmux-generated footers are controlled.
+
+Dashboard and `/botconfig` changes apply to subsequent new replies without restarting. Existing cards are not rewritten; final-output retries keep their first-render settings snapshot. Isolated or remote env-only sends without config or daemon access use the session spawn snapshot; recreate those sessions to refresh it. Restart after manually editing `bots.json` to synchronize the daemon.

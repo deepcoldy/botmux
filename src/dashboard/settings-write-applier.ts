@@ -115,6 +115,7 @@ export interface ResolvedDashboardSettingsView {
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
@@ -141,6 +142,8 @@ export type ParseMaintenanceResult =
 
 /** All IO this helper needs — injected so tests use mocks, production wires real impls. */
 export interface SettingsWriteApplierDeps {
+  /** Optional outer transaction used by durable multi-replica deployments. */
+  runConfigMutation?: <T>(mutation: () => Promise<T>) => Promise<T>;
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields. */
@@ -273,6 +276,7 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow_enabled'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_archiveCodex'
   | 'invalid_sessionCleanup_olderThanHours'
   | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
@@ -377,6 +381,10 @@ export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
 ): Promise<ApplySettingsWriteResult> {
+  if (deps.runConfigMutation) {
+    const { runConfigMutation, ...innerDeps } = deps;
+    return runConfigMutation(() => applySettingsWrite(body, innerDeps));
+  }
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
@@ -665,6 +673,10 @@ export async function applySettingsWrite(
     // Merge over the validated existing block so a partial patch (e.g. just the
     // toggle) keeps the other supported fields.
     const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('archiveCodex' in sc) {
+      if (typeof sc.archiveCodex !== 'boolean') return { ok: false, error: 'invalid_sessionCleanup_archiveCodex' };
+      next.archiveCodex = sc.archiveCodex;
+    }
     if ('enabled' in sc) {
       if (typeof sc.enabled !== 'boolean') {
         return { ok: false, error: 'invalid_sessionCleanup_enabled' };
@@ -690,7 +702,7 @@ export async function applySettingsWrite(
       }
       next.intervalMinutes = Math.floor(sc.intervalMinutes);
     }
-    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+    if (!('archiveCodex' in sc) && !('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });

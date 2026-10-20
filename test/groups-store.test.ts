@@ -181,6 +181,22 @@ describe('groups-store wrappers', () => {
     expect(chatUpdateStub).not.toHaveBeenCalled();
   });
 
+  it('renameChat compare-and-sets against the freshly read name when expectedOldName is given', async () => {
+    await expect(renameChat('appA', 'c1', 'AI 标题', { expectedOldName: '新会话 10/17 14:30' })).resolves.toEqual({
+      ok: false,
+      error: 'name_changed',
+      oldName: 'one',
+      newName: 'AI 标题',
+    });
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    await expect(renameChat('appA', 'c1', 'AI 标题', { expectedOldName: ' one ' })).resolves.toMatchObject({
+      ok: true,
+      changed: true,
+    });
+  });
+
   it('renameChat preserves old/new names and the Lark code on update failure', async () => {
     chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
     await expect(renameChat('appA', 'c1', 'two')).resolves.toMatchObject({

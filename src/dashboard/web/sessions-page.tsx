@@ -123,7 +123,7 @@ import {
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
-import { confirm, promptText } from './confirm-modal.js';
+import { confirm } from './confirm-modal.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
@@ -1964,7 +1964,7 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
+export function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1975,6 +1975,11 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
     const input = inputRef.current;
     input.focus();
     input.select();
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    if (!editing || !inputRef.current) return;
+    const input = inputRef.current;
     const fit = () => {
       const cs = getComputedStyle(input);
       const span = document.createElement('span');
@@ -3291,6 +3296,12 @@ function SessionsPage(): React.JSX.Element {
         if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
+      if (body?.archiveError) {
+        const detail = body.archiveError === 'codex_archive_target_unverified'
+          ? t('sessions.codexArchiveTargetUnverified') : body.archiveError === 'codex_archive_target_invalid'
+            ? t('sessions.codexArchiveTargetInvalid') : body.archiveError;
+        toast(t('sessions.codexArchiveFailed', { count: 1, detail }), { kind: 'warning' });
+      }
       // Closed locally, but a remote session was left running (its control plane
       // could not be verified). The drawer is about to close, so this is the only
       // moment the operator can be told.
@@ -3477,6 +3488,7 @@ function SessionsPage(): React.JSX.Element {
     // Counted separately: a residual is NOT a failure (the row closed) but must
     // never be folded into the silent success total.
     const residualIds: string[] = [];
+    const archiveErrors: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -3487,6 +3499,7 @@ function SessionsPage(): React.JSX.Element {
           if (!r.ok || body?.ok === false) {
             failed += 1;
           } else {
+            if (body?.archiveError) archiveErrors.push(String(body.archiveError));
             const residual = parseCloseResidual(body);
             if (residual) residualIds.push(describeCloseResidual(residual));
           }
@@ -3503,6 +3516,7 @@ function SessionsPage(): React.JSX.Element {
     setSelected(new Set());
     refresh();
     if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
+    if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.join(', ') }), { kind: 'warning' });
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is
       // entirely silent and the operator believes everything is gone. Kind-neutral
@@ -3594,6 +3608,10 @@ function SessionsPage(): React.JSX.Element {
         closed: Number(body?.closed ?? 0),
         failed: Number(body?.failed ?? 0),
       }));
+      const archiveErrors = (body?.results ?? []).filter((item: any) => item?.archiveError);
+      if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.map((item: any) => item.archiveError === 'codex_archive_target_unverified'
+        ? t('sessions.codexArchiveTargetUnverified') : item.archiveError === 'codex_archive_target_invalid'
+          ? t('sessions.codexArchiveTargetInvalid') : item.archiveError).join(', ') }), { kind: 'warning' });
       const idleResiduals = (body?.results ?? [])
         .filter((item: any) => item?.ok && item?.residual)
         .map((item: any) => describeCloseResidual(item.residual));
@@ -3789,34 +3807,6 @@ function SessionsPage(): React.JSX.Element {
     }
   }, []);
 
-  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
-  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
-  const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = await promptText({ title: t('sessions.debugTerminal'), message: t('sessions.debugTerminalPrompt') });
-    if (input === null) return; // 用户取消
-    const workingDir = input.trim();
-    const tab = window.open('about:blank', '_blank');
-    if (tab) tab.opener = null;
-    try {
-      const r = await fetch('/api/debug-terminal', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(workingDir ? { workingDir } : {}),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false || !body?.url) {
-        tab?.close();
-        if (r.status !== 401) toast(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
-        return;
-      }
-      if (tab) tab.location.href = body.url;
-      else window.open(body.url, '_blank', 'noopener');
-    } catch (e) {
-      tab?.close();
-      toast(`${t('sessions.debugTerminalFail')}: ${e}`, { kind: 'error' });
-    }
-  }, []);
-
   useEffect(() => {
     const maybeOpenFromEntry = () => {
       if (consumePendingCreateSession() && ui.authed) void openCreateSession();
@@ -3905,16 +3895,6 @@ function SessionsPage(): React.JSX.Element {
           {dashboardShellAllowsWebTerminal() ? (
             <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
               {t('sessions.monitorRoom')}
-            </button>
-          ) : null}
-          {ui.authed ? (
-            <button
-              type="button"
-              className="debug-terminal-btn"
-              title={t('sessions.debugTerminalHint')}
-              onClick={() => void openDebugTerminal()}
-            >
-              {t('sessions.debugTerminal')}
             </button>
           ) : null}
           {ui.authed ? (

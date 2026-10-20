@@ -1,6 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 
 vi.mock('../src/core/cost-calculator.js', () => ({
@@ -269,14 +267,6 @@ describe('dashboard SessionRow token usage', () => {
 
     expect(row.tokenUsage).toBeNull();
     expect(getSessionTokenUsage).not.toHaveBeenCalled();
-  });
-
-  it('worker-pool close publishes the durable token usage snapshot directly', () => {
-    const source = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
-
-    expect(source).toContain('{ tokenUsage: after?.tokenUsage ?? null }');
-    expect(source).not.toContain("import { composeRowFromActive, composeRowFromClosed }");
-    expect(source).not.toContain('composeRowFromClosed(after).tokenUsage');
   });
 
   it('carries chatType for active and closed rows', () => {

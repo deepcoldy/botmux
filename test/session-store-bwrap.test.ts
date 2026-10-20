@@ -140,9 +140,20 @@ describe.skipIf(!bwrapUsable())('bwrap persistent pane × SQLite store reopen', 
         .run(JSON.stringify({ v: 'v2' }), 's1');
       try {
         writeFileSync(join(ctlDir, 'go'), '1');
-        await pollFor(() => existsSync(join(ctlDir, 'out')), 'sandbox query result');
+        // Wait for CONTENT, not the file's existence: the reader publishes `out`
+        // with writeFileSync, which truncate-creates it a beat before the bytes
+        // land; an existence poll could observe that empty window under CI
+        // contention (same flake class as cli-identity-bwrap). The single
+        // writeFileSync is one short write, so non-empty ⇒ the query finished —
+        // the exact v2/ERR assertion below still runs on the final body.
+        const outPath = join(ctlDir, 'out');
+        let out = '';
+        await pollFor(() => {
+          out = existsSync(outPath) ? readFileSync(outPath, 'utf-8') : '';
+          return out.length > 0;
+        }, 'sandbox query result');
         // 单文件 bind 的旧形状在这里永远读到 v1（钉死的旧 WAL inode）。
-        expect(readFileSync(join(ctlDir, 'out'), 'utf-8')).toBe('v2');
+        expect(out).toBe('v2');
       } finally {
         writer2.close();
       }

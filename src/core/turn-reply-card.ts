@@ -7,6 +7,7 @@ import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
+import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
@@ -15,7 +16,7 @@ import { MessageWithdrawnError, uploadFile } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
-  normalizeReplyCardMode, TurnReplyCardStore,
+  normalizeReplyCardMode, replyCardIsTerminal, TurnReplyCardStore,
   type TurnReplyCardMode, type TurnReplyCardEvent, type TurnReplyCardKey,
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
@@ -65,10 +66,10 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   if (prior) return prior;
   let cfg;
   try { cfg = getBot(ds.larkAppId).config; } catch { return 'legacy'; }
-  const cli = ds.session.cliId ?? cfg.cliId;
+  const cli = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
   const existing = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, turnId));
   let mode: TurnReplyCardMode = existing?.mode ?? normalizeReplyCardMode(cfg.replyCardMode);
-  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex'].includes(cli)
+  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex', 'grok'].includes(cli)
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: cfg.apiOnly })
     || isDocNativeSession(ds) || ds.session.vcMeetingReceiver || ds.session.deferredScheduleRun
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.session.headless
@@ -138,7 +139,7 @@ export async function updateTurnReplyCard(
   if (normalizeUsageDisplay(cfg) === 'streaming') {
     try {
       usage = getSessionUsageSnapshot({
-        cliId: ds.session.cliId ?? cfg.cliId, sessionId: ds.session.sessionId,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId, sessionId: ds.session.sessionId,
         cliSessionId: ds.session.cliSessionId, cwd: ds.workingDir ?? ds.session.workingDir,
         larkAppId: ds.larkAppId, fresh: event.kind === 'final' || event.kind === 'terminal',
         pricing: resolvePricingConfig(cfg.pricing),
@@ -146,7 +147,7 @@ export async function updateTurnReplyCard(
     } catch { /* missing native usage is omitted */ }
   }
   const transport = {
-    usage,
+    usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
     send: async (body, uuid) => {
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
@@ -267,6 +268,29 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   try { await work; } finally { if (running.get(key) === work) running.delete(key); }
 }
 
+/** A confirmed merged input retires the old display, not the native task.
+ * Only an already-admitted exact attempt may own a reply card here. */
+export async function supersedeTurnReplyCard(
+  ds: DaemonSession, msg: Pick<ToolsUpdate, 'turnId' | 'dispatchAttempt'>, send: ReplyCardSender, owns: () => boolean,
+): Promise<void> {
+  const store = new TurnReplyCardStore(config.session.dataDir);
+  const record = store.read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+  if (!record) return;
+  // Flush an existing display before closing it. For an unshown turn, settle
+  // first so buffered activity cannot create an otherwise empty old card.
+  if (record.messageId || record.pendingCreate) {
+    await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+      logger.warn(`[reply-card] superseded tool flush: ${error.message}`);
+    });
+  }
+  const now = Date.now();
+  await updateTurnReplyCard(ds, msg.turnId, {
+    kind: 'terminal', phase: 'superseded', completedAtMs: now,
+    ...(record.startedAtMs !== undefined ? { durationMs: Math.max(0, now - record.startedAtMs) } : {}),
+  }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
+  if (owns() && ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+}
+
 /** A disconnected worker does not prove a surviving tmux task completed.
  * Close the visible activity indicator with an honest unknown state, without
  * creating a message in a quiet/recovered session. */
@@ -275,7 +299,7 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
   for (const [turnId, mode] of modes.get(ds) ?? []) {
     if (mode === 'legacy') continue;
     const record = store.read(replyCardKey(ds, turnId));
-    if (!record?.messageId || ['completed', 'failed', 'cancelled', 'ambiguous'].includes(record.phase)) continue;
+    if (!record?.messageId || replyCardIsTerminal(record)) continue;
     await settleDisconnectedReplyCard(store, record);
   }
   ds.replyCardRunningTurnId = undefined;
@@ -309,7 +333,8 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       const key = JSON.parse(readFileSync(join(store.directory, file), 'utf8')) as TurnReplyCardKey;
       if (key.larkAppId !== larkAppId) continue;
       const record = store.read(key);
-      if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn || ['completed', 'failed', 'cancelled'].includes(record.phase)) continue;
+      if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn
+        || (replyCardIsTerminal(record) && record.phase !== 'ambiguous')) continue;
       await settleDisconnectedReplyCard(store, record);
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);

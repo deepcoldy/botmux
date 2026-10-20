@@ -79,6 +79,8 @@ describe('command schema ↔ /help 文案', () => {
       }
     }
   });
+  // 源码结构护栏(K4)：/help 的键是在 handleCommand 的 `case '/help'` 块里内联拼的，没有可 import 的键表；只能读源码确认
+  // 每个用到的 help.* 键都归属 schema 里的某个命令或登记过的非命令键，防止 schema（唯一事实源，#1434）与 /help 漂移。
   it('/help 组装用到的 help.* 键都能在 schema 里找到归属（或属于非命令的节标题/透传/元命令）', () => {
     const src = readFileSync(join(repoRoot, 'src/core/command-handler.ts'), 'utf-8');
     const helpStart = src.indexOf("case '/help': {");
@@ -100,6 +102,8 @@ describe('command schema ↔ /help 文案', () => {
 });
 
 describe('command schema ↔ handleCommand switch', () => {
+  // 源码结构护栏(K4)：handleCommand 的 switch case 集合无法 import，只能读源码与 COMMANDS 双向比对；
+  // CLAUDE.md「命令路由」约定「加命令 = 加一行 + 加 case」，由这条红到两边对齐（#1434）。
   it('switch 的每个 case 都在 schema 里，schema 的每个命令（除 /vc-auth）都有 case', () => {
     const src = readFileSync(join(repoRoot, 'src/core/command-handler.ts'), 'utf-8');
     const body = src.slice(src.indexOf('export async function handleCommand('));

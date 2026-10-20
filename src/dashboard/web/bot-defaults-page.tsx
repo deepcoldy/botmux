@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
@@ -41,7 +42,9 @@ import {
   type BotDescriptionSnapshot,
 } from './bot-description.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { resolvePairedBackendId } from '../../core/remote-cli-ids.js';
 import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { supportsZeroPromptInjection } from '../../core/zero-prompt-support.js';
 import { confirm } from './confirm-modal.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -83,6 +86,10 @@ import {
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
+import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
+import { fetchAgents } from './agents-api.js';
+import { AGENT_SECTIONS } from '../agent-profiles-model.js';
+import { hashQueryParam } from './dashboard-routes.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
@@ -146,6 +153,24 @@ type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefau
 type CardPrefPatch = Record<string, boolean | string | string[]>;
 
 type JsonResponse = DashboardJsonResponse;
+
+type NativeSlashCommandRow = {
+  command: string;
+  description: { default_value?: string };
+  source: 'botmux' | 'remote';
+  status: 'synced' | 'missing' | 'outdated' | 'unknown' | 'remote-extra';
+  commandId?: string;
+};
+
+type NativeSlashCommandState = {
+  commands: NativeSlashCommandRow[];
+  summary: { total: number; synced: number; missing: number; outdated: number; remoteExtra: number };
+  permissionUrls?: { read?: string; write?: string };
+  /** false = 可选 scope 缺失或租户未进灰度：面板降级为只读候选清单 + 开通提示。 */
+  available: boolean;
+  reason?: 'missing_scope' | 'not_enabled' | 'core_only';
+  missingScopes?: string[];
+};
 
 type RuntimeMode = 'official' | 'legacy' | 'custom';
 type NativePolicyMode = 'passthrough' | 'custom';
@@ -580,9 +605,12 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
     : tr('botDefaults.maxLiveWorkersStateOn', { count: cap });
 }
 
-function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
+export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    // The server omits default-true keys; overwrite old false values as well.
+    ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
+    showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
@@ -629,7 +657,10 @@ export function BotDefaultsPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState('');
-  const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
+  // `#/bot-defaults?bot=<appId>` 深链（Agent 页「Bot 配置」入口）直接选中该 Bot。
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(() => hashQueryParam('bot'));
+  // larkAppId → 关联的 Agent 名称；只用于提示条，加载失败时静默为空。
+  const [linkedAgentNames, setLinkedAgentNames] = useState<Record<string, AgentLockInfo>>({});
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
@@ -640,16 +671,26 @@ export function BotDefaultsPage() {
     const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
-      const [nextBots, nextCli, nextBrandEnabled] = await Promise.all([
+      const [nextBots, nextCli, nextBrandEnabled, nextAgents] = await Promise.all([
         fetchBotDefaults(),
         fetchCliOptions(),
         fetchCardBrandLabelEnabled(),
+        fetchAgents().catch(() => null),
       ]);
       // Drop a stale response: a newer refresh() started after us (e.g. a
       // bots.changed fired while this request was in flight) — committing here
       // would overwrite the fresher roster and re-hide the new bot.
       if (!mountedRef.current || !req.commit()) return;
       setBots(nextBots.bots);
+      if (nextAgents) {
+        const byId = new Map(nextAgents.agents.map(agent => [agent.id, agent]));
+        setLinkedAgentNames(Object.fromEntries(Object.entries(nextAgents.links)
+          .filter(([, id]) => byId.has(id))
+          .map(([appId, id]) => {
+            const agent = byId.get(id)!;
+            return [appId, { id, name: agent.name, sections: AGENT_SECTIONS.filter(section => agent[section] !== undefined) }];
+          })));
+      }
       setLoadError(nextBots.error);
       setCliState(nextCli);
       setBrandEnabled(nextBrandEnabled);
@@ -739,6 +780,7 @@ export function BotDefaultsPage() {
         brandEnabled={brandEnabled}
         activeTab={activeTab}
         onTabChange={setActiveTab}
+        linkedAgent={linkedAgentNames[selectedBot.larkAppId] ?? null}
       />
     );
   } else {
@@ -868,6 +910,7 @@ function BotDefaultsCard(props: {
   brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
+  linkedAgent?: AgentLockInfo | null;
 }) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
@@ -931,6 +974,12 @@ function BotDefaultsCard(props: {
           <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
         </div>
       ) : null}
+      {props.linkedAgent ? (
+        <div className="bd-agent-linked" data-agent-linked={props.linkedAgent.id}>
+          <span>{tr('botDefaults.agentLinkedBanner', { name: props.linkedAgent.name })}</span>
+          <a href="#/agents">{tr('botDefaults.agentLinkedOpen')}</a>
+        </div>
+      ) : null}
       <div className="bd-body bd-tab-panels">
         <div
           id="bd-panel-common"
@@ -941,10 +990,10 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile">
-              <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
+              <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} lock={props.linkedAgent} />
             </section>
             <section className="bd-tile">
-              <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+              <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} lock={props.linkedAgent} />
             </section>
             <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -964,7 +1013,7 @@ function BotDefaultsCard(props: {
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
@@ -978,7 +1027,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
-              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {bot.cliId === 'codex' ? (
               <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
@@ -987,6 +1036,7 @@ function BotDefaultsCard(props: {
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -1020,7 +1070,7 @@ function BotDefaultsCard(props: {
                 无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
                 静默覆盖的假选择。隐藏该区块。 */}
             {!isRemoteCliId(bot.cliId) ? (
-              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             ) : null}
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
                 选了别的 agent 就隐藏，避免无效开关。 */}
@@ -1033,7 +1083,10 @@ function BotDefaultsCard(props: {
             ) : null}
             {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
-            <section className="bd-tile"><ReplyDeliverySection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile">
+              <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
+              <ReplyDeliverySection bot={bot} patchBot={patchBot} />
+            </section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -2140,11 +2193,50 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
   );
 }
 
+/** 关联到 Agent 的 Bot：哪些分组由该 Agent 统一管理（与 agent-profiles-model 的 AGENT_SECTIONS 同名）。 */
+export type AgentLockInfo = { id: string; name: string; sections: readonly string[] };
+
+/**
+ * Agent 托管分组的锁：置灰并整体 inert（不可聚焦、不可点击），点击锁定区域时提示去
+ * Agent 关联图解除关联。未关联或该分组不归 Agent 管时原样渲染。`quiet` 只锁不再重复
+ * 显示说明行（同一板块被拆成多段锁时用）。
+ */
+export function AgentManagedLock(props: {
+  lock?: AgentLockInfo | null;
+  section: string;
+  quiet?: boolean;
+  children: ReactNode;
+}) {
+  const tr = useT();
+  const lock = props.lock;
+  if (!lock || !lock.sections.includes(props.section)) return <>{props.children}</>;
+  const hint = tr('botDefaults.agentLinkedBanner', { name: lock.name });
+  return (
+    <div
+      className="bd-agent-lock"
+      data-agent-lock={props.section}
+      title={hint}
+      onClick={() => toast(hint, { kind: 'info', duration: 4000 })}
+    >
+      {props.quiet ? null : (
+        <p className="bd-agent-lock-note">
+          <span aria-hidden="true">🔒</span>
+          <span>{tr('botDefaults.agentLockedNote', { name: lock.name })}</span>
+          <a href="#/agents" onClick={event => event.stopPropagation()}>{tr('botDefaults.agentLinkedOpen')}</a>
+        </p>
+      )}
+      <div className="bd-agent-lock-body" inert>{props.children}</div>
+    </div>
+  );
+}
+
 export function BotAgentSection(props: {
   bot: BotDefaultsRow;
   sessionFallback: string;
   cliState: CliOptionsState;
   patchBot: PatchBot;
+  /** 由 Agent 托管时锁定 CLI / 模型 / 配置目录 / 思考强度；技能注入不在锁内。 */
+  lock?: AgentLockInfo | null;
 }) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
@@ -2178,6 +2270,8 @@ export function BotAgentSection(props: {
   const [dshRuntimeTouched, setDshRuntimeTouched] = useState(false);
   const [dshProfile, setDshProfile] = useState(bot.dshProfile ?? '');
   const [dshProfileTouched, setDshProfileTouched] = useState(false);
+  const [cliConfigDir, setCliConfigDir] = useState(bot.cliConfigDir ?? '');
+  const [cliConfigDirTouched, setCliConfigDirTouched] = useState(false);
   const [dshProfileList, setDshProfileList] = useState<string[]>([]);
   const [dshProfileStatus, setDshProfileStatus] = useState<StatusMessage>(null);
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
@@ -2211,6 +2305,8 @@ export function BotAgentSection(props: {
     setDshRuntimeTouched(false);
     setDshProfile(bot.dshProfile ?? '');
     setDshProfileTouched(false);
+    setCliConfigDir(bot.cliConfigDir ?? '');
+    setCliConfigDirTouched(false);
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -2225,6 +2321,7 @@ export function BotAgentSection(props: {
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
     bot.dshRuntime,
+    bot.cliConfigDir,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -2394,6 +2491,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
@@ -2408,6 +2506,8 @@ export function BotAgentSection(props: {
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
         ...(cliKey === 'dsh' && dshProfileTouched ? { dshProfile: dshProfile || null } : {}),
+        // Config profile: only when edited (absent = daemon preserves); '' clears.
+        ...(cliSupportsConfigDir(saveCliId) && cliConfigDirTouched ? { cliConfigDir: cliConfigDir.trim() || null } : {}),
         ...(runtimeTouched ? { cliRuntime } : {}),
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
@@ -2459,6 +2559,7 @@ export function BotAgentSection(props: {
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
           dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
+          cliConfigDir: typeof res.body.cliConfigDir === 'string' ? res.body.cliConfigDir : null,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
           readIsolation: res.body.readIsolation === true,
           readIsolationSupported: res.body.readIsolationSupported === true,
@@ -2474,6 +2575,7 @@ export function BotAgentSection(props: {
         setTurnTimeoutError(null);
         setDshRuntimeTouched(false);
         setRuntimeTouched(false);
+        setCliSelectionTouched(false);
         setNativePolicyTouched(false);
         const savedNativePolicy = res.body.nativeSubagentRuntime;
         setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
@@ -2693,6 +2795,7 @@ export function BotAgentSection(props: {
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionAgent')}</h3>
+      <AgentManagedLock lock={props.lock} section="exec">
       <div className="bd-row">
         <div className="bd-field">
           <span>{tr('botDefaults.agentCli')}</span>
@@ -2704,6 +2807,7 @@ export function BotAgentSection(props: {
             options={cliOptions}
             searchable
             onChange={updateCli}
+            notifyOnReselect
           />
           {option?.available === false && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
@@ -2848,6 +2952,24 @@ export function BotAgentSection(props: {
               detectedLabel={detectedLiveCount > 0
                 ? tr('botDefaults.modelPickerDetected', { count: detectedLiveCount })
                 : undefined}
+            />
+          </label>
+        </div>
+      )}
+      {cliSupportsConfigDir(selectedAgentCliId(cliKey)) && (
+        <div className="bd-row">
+          <label>
+            <FieldTitle help={tr('botDefaults.cliConfigDirHelp')}>{tr('botDefaults.cliConfigDir')}</FieldTitle>
+            <input
+              type="text"
+              data-input="agentCliConfigDir"
+              value={cliConfigDir}
+              placeholder={tr('botDefaults.cliConfigDirPlaceholder')}
+              disabled={agentBusy}
+              autoCapitalize="none"
+              autoComplete="off"
+              spellCheck={false}
+              onChange={event => { setCliConfigDir(event.currentTarget.value); setCliConfigDirTouched(true); }}
             />
           </label>
         </div>
@@ -3132,6 +3254,7 @@ export function BotAgentSection(props: {
         </div>
       )}
       {isRiff && <RiffSection bot={bot} patchBot={patchBot} persistCliSelection={persistRiffCliSelection} />}
+      </AgentManagedLock>
       {!isRiff && siSupport === 'dynamic' ? (
         <div className="bd-row">
           <div className="bd-field">
@@ -3165,10 +3288,12 @@ export function BotAgentSection(props: {
         </div>
       ) : null}
       {!isRiff && (
-        <div className="actions bd-section-actions">
-          <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
-          <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
-        </div>
+        <AgentManagedLock lock={props.lock} section="exec" quiet>
+          <div className="actions bd-section-actions">
+            <button type="button" className="primary" data-action="save-agent" disabled={agentBusy} onClick={() => void saveAgent()}>{tr('botDefaults.agentSave')}</button>
+            <StatusSpan status={agentStatus} attr={{ 'data-agent-status': '' }} />
+          </div>
+        </AgentManagedLock>
       )}
     </section>
   );
@@ -3232,6 +3357,7 @@ function WorkingDirSection(props: {
   bot: BotDefaultsRow;
   patchBot: PatchBot;
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
+  lock?: AgentLockInfo | null;
 }) {
   const tr = useT();
   const { bot, patchBot } = props;
@@ -3279,7 +3405,51 @@ function WorkingDirSection(props: {
     });
   }
 
-  const modeOptions: ModeOption<'off' | 'default' | 'oncall'>[] = [
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
+      <AgentManagedLock lock={props.lock} section="workspace">
+      <WorkingDirModeFields
+        mode={mode}
+        workingDir={workingDir}
+        autoWorktree={autoWorktree}
+        disabled={busy}
+        onChange={patch => {
+          if (patch.mode !== undefined) setMode(patch.mode);
+          if (patch.workingDir !== undefined) setWorkingDir(patch.workingDir);
+          if (patch.autoWorktree !== undefined) setAutoWorktree(patch.autoWorktree);
+        }}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-status': '' }} /></div>
+      </WorkingDirModeFields>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
+      </div>
+      </AgentManagedLock>
+      <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
+    </section>
+  );
+}
+
+export type WorkingDirMode = 'off' | 'default' | 'oncall';
+
+/**
+ * 工作目录三选一 + 目录 + 自动 worktree 的受控表单（不负责保存）。Bot 配置页的
+ * 「默认工作目录」与 Agent 页的「工作区」共用这一份，保证两边外观与交互一致。
+ * 样式挂在 `.bot-defaults-page` 作用域下，复用方需在该作用域内渲染。
+ */
+export function WorkingDirModeFields(props: {
+  mode: WorkingDirMode;
+  workingDir: string;
+  autoWorktree: boolean;
+  disabled?: boolean;
+  onChange(patch: { mode?: WorkingDirMode; workingDir?: string; autoWorktree?: boolean }): void;
+  /** 模式组标题行右侧的附加内容（如保存状态）。 */
+  children?: ReactNode;
+}) {
+  const tr = useT();
+  const { mode, workingDir, autoWorktree, disabled } = props;
+  const modeOptions: ModeOption<WorkingDirMode>[] = [
     {
       value: 'off', isDefault: true, name: tr('botDefaults.optWdOffName'),
       short: tr('botDefaults.optWdOffShort'),
@@ -3301,9 +3471,8 @@ function WorkingDirSection(props: {
   ];
 
   return (
-    <section className="bd-section">
-      <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
-      <ModeOptionGroup<'off' | 'default' | 'oncall'>
+    <>
+      <ModeOptionGroup<WorkingDirMode>
         dataInput="workingDirMode"
         groupName={tr('botDefaults.groupWorkingDir')}
         groupSub={tr('botDefaults.groupWorkingDirSub')}
@@ -3312,27 +3481,23 @@ function WorkingDirSection(props: {
         options={modeOptions}
         wideCols={3}
         narrowCols={1}
-        disabled={busy}
-        onChange={next => setMode(next)}
+        disabled={disabled}
+        onChange={next => props.onChange({ mode: next })}
       >
-        <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-status': '' }} /></div>
+        {props.children}
       </ModeOptionGroup>
       <div className="bd-row" data-wd-dir-row hidden={mode === 'off'}>
         <label>
           <span>{tr('botDefaults.workingDirField')}</span>
-          <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux" value={workingDir} disabled={busy} onChange={event => setWorkingDir(event.currentTarget.value)} />
+          <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux" value={workingDir} disabled={disabled} onChange={event => props.onChange({ workingDir: event.currentTarget.value })} />
         </label>
       </div>
       <label className="toggle-row" data-wd-worktree-row hidden={mode !== 'default'}>
-        <input type="checkbox" data-input="autoWorktree" checked={autoWorktree} disabled={busy} onChange={event => setAutoWorktree(event.currentTarget.checked)} />
+        <input type="checkbox" data-input="autoWorktree" checked={autoWorktree} disabled={disabled} onChange={event => props.onChange({ autoWorktree: event.currentTarget.checked })} />
         <span className="switch" aria-hidden="true" />
         <span className="toggle-tx"><strong><FieldTitle help={tr('botDefaults.autoWorktreeHelp')}>{tr('botDefaults.autoWorktree')}</FieldTitle></strong></span>
       </label>
-      <div className="actions">
-        <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
-      </div>
-      <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
-    </section>
+    </>
   );
 }
 
@@ -3532,12 +3697,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const enabled = policy?.enabled === true;
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
+  const credentialSource = policy?.credentialSource ?? 'auto';
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
+    platformBound?: boolean;
+    platformCredentialsUrl?: string;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -3571,7 +3739,11 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback });
+    void save({ enabled: true, tools: next, fallback, credentialSource });
+  }
+
+  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
+    void save({ enabled: true, tools, fallback, credentialSource: next });
   }
 
   return (
@@ -3584,7 +3756,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource } : null,
         )}
       />
       {enabled ? (
@@ -3604,6 +3776,33 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+            <select
+              data-action="trigger-user-auth-source"
+              value={credentialSource}
+              disabled={busy}
+              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+            >
+              <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
+              <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
+              <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
+            </select>
+          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          {credentialSource !== 'local' && info && info.platformBound === false ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
+              ⚠️ {tr(credentialSource === 'platform'
+                ? 'botDefaults.triggerUserAuthPlatformUnboundStrict'
+                : 'botDefaults.triggerUserAuthPlatformUnbound')}
+            </p>
+          ) : null}
+          {credentialSource !== 'local' && info?.platformBound && info.platformCredentialsUrl ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="bound">
+              {tr('botDefaults.triggerUserAuthPlatformBound')}{' '}
+              <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
+            </p>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -3627,6 +3826,45 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       ) : null}
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-trigger-user-auth-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const bound = bot.larkToolBinding !== false;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = bound;
+    patchBot(bot.larkAppId, { larkToolBinding: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/lark-tool-binding`, {
+        enabled: next,
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.larkToolBindingSaved'),
+      rollback: () => patchBot(bot.larkAppId, { larkToolBinding: previous }),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionLarkToolBinding')}</h3>
+      <ToggleRow
+        checked={bound}
+        disabled={busy}
+        dataAction="toggle-lark-tool-binding"
+        title={tr('botDefaults.larkToolBindingToggle')}
+        help={tr('botDefaults.larkToolBindingHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
       </div>
     </section>
   );
@@ -3677,7 +3915,7 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const mode: 'off' | 'oncall' | 'scratch' = bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
@@ -3712,27 +3950,16 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 
   const readIsoSupported = bot.readIsolationSupported === true;
   const scratchSupported = bot.scratchSupported !== false;
-  const modeBtn = (m: 'off' | 'oncall' | 'scratch', label: string) => (
-    <button
-      type="button"
-      className={`bd-seg-btn${selected === m ? ' bd-seg-btn-active' : ''}`}
-      data-action={`sandbox-mode-${m}`}
-      aria-pressed={selected === m}
-      disabled={busy || (m === 'scratch' && !scratchSupported)}
-      onClick={() => void save(m, m === 'scratch' ? storage : 'tmpfs')}
-    >
-      {label}
-    </button>
-  );
   return (
     <section className="bd-section" data-sandbox-mode={selected}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
-      <div className="bd-seg" role="group">
-        {modeBtn('off', tr('botDefaults.sandboxModeOff'))}
-        {modeBtn('oncall', tr('botDefaults.sandboxModeOncall'))}
-        {modeBtn('scratch', tr('botDefaults.sandboxModeScratch'))}
-      </div>
-      <p className="bd-section-note">{tr('botDefaults.sandboxModeHelp')}</p>
+      <AgentManagedLock lock={props.lock} section="sandbox">
+      <SandboxModeFields
+        mode={selected}
+        disabled={busy}
+        scratchSupported={scratchSupported}
+        onSelect={m => void save(m, m === 'scratch' ? storage : 'tmpfs')}
+      />
       {selected === 'oncall' ? (
         <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
           {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
@@ -3770,7 +3997,42 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
       </div>
+      </AgentManagedLock>
     </section>
+  );
+}
+
+export type SandboxMode = 'off' | 'oncall' | 'scratch';
+
+/** 文件沙盒三选一（不负责保存）。Bot 配置页与 Agent 页共用；`.bot-defaults-page` 作用域。 */
+export function SandboxModeFields(props: {
+  mode: SandboxMode;
+  disabled?: boolean;
+  scratchSupported?: boolean;
+  onSelect(mode: SandboxMode): void;
+}) {
+  const tr = useT();
+  const modeBtn = (m: SandboxMode, label: string) => (
+    <button
+      type="button"
+      className={`bd-seg-btn${props.mode === m ? ' bd-seg-btn-active' : ''}`}
+      data-action={`sandbox-mode-${m}`}
+      aria-pressed={props.mode === m}
+      disabled={props.disabled || (m === 'scratch' && props.scratchSupported === false)}
+      onClick={() => props.onSelect(m)}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <>
+      <div className="bd-seg" role="group">
+        {modeBtn('off', tr('botDefaults.sandboxModeOff'))}
+        {modeBtn('oncall', tr('botDefaults.sandboxModeOncall'))}
+        {modeBtn('scratch', tr('botDefaults.sandboxModeScratch'))}
+      </div>
+      <p className="bd-section-note">{tr('botDefaults.sandboxModeHelp')}</p>
+    </>
   );
 }
 
@@ -4034,7 +4296,7 @@ const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string; hintKey: st
   { value: 'pty', labelKey: 'botDefaults.backendPty', hintKey: 'botDefaults.backendPtyHint' },
 ];
 
-function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const [value, setValue] = useState(typeof bot.backendType === 'string' ? bot.backendType : '');
@@ -4042,11 +4304,6 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setValue(typeof bot.backendType === 'string' ? bot.backendType : ''), [bot.backendType]);
-
-  const options = useMemo(
-    () => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey), hint: tr(o.hintKey) })),
-    [tr],
-  );
 
   async function save(next: string): Promise<void> {
     const prev = value;
@@ -4064,23 +4321,37 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionBackend')}</h3>
+      <AgentManagedLock lock={props.lock} section="backend">
       <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.backendHelp')}>{tr('botDefaults.backendLabel')}</FieldTitle>
-          <DropdownField
-            dataInput="backendType"
-            ariaLabel={tr('botDefaults.backendLabel')}
-            value={value}
-            disabled={busy}
-            options={options}
-            onChange={next => void save(next)}
-          />
-        </div>
+        <BackendTypeField value={value} disabled={busy} onChange={next => void save(next)} />
         <div className="actions">
           <StatusSpan status={status} attr={{ 'data-backend-status': '' }} />
         </div>
       </div>
+      </AgentManagedLock>
     </section>
+  );
+}
+
+/** 会话后端下拉（''＝跟随全局默认，不负责保存）。Bot 配置页与 Agent 页共用。 */
+export function BackendTypeField(props: { value: string; disabled?: boolean; onChange(value: string): void }) {
+  const tr = useT();
+  const options = useMemo(
+    () => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey), hint: tr(o.hintKey) })),
+    [tr],
+  );
+  return (
+    <div className="bd-field">
+      <FieldTitle help={tr('botDefaults.backendHelp')}>{tr('botDefaults.backendLabel')}</FieldTitle>
+      <DropdownField
+        dataInput="backendType"
+        ariaLabel={tr('botDefaults.backendLabel')}
+        value={props.value}
+        disabled={props.disabled}
+        options={options}
+        onChange={props.onChange}
+      />
+    </div>
   );
 }
 
@@ -4292,6 +4563,9 @@ function ProfileRoles(props: { appId: string }) {
 export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [footerPrefs, setFooterPrefs] = useState(() => normalizeReplyFooter(bot));
+  const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
+  useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
@@ -4473,6 +4747,29 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             })}
           </div>
           {replyMode !== 'legacy' && pinToggle}
+        </section>
+
+        <section className="bd-card-setting-group" data-reply-footer-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.footerGroup')}</h4>
+          <p className="hint">{tr('botDefaults.footerHelp')}</p>
+          <div className="bd-card-control-list">
+            {REPLY_FOOTER_KEYS.map(key => (
+              <ToggleRow key={key} dataAction={`toggle-${key}`}
+                title={tr(`botDefaults.${key}`)} checked={footerPrefs[key] !== false}
+                disabled={busy !== null}
+                onChange={checked => {
+                  const previous = footerPrefs;
+                  setFooterPrefs({ ...footerPrefs, [key]: checked });
+                  void savePatch({ [key]: checked }, key, () => setFooterPrefs(previous));
+                }} />
+            ))}
+            <ToggleRow dataAction="toggle-showReplyTiming" title={tr('botDefaults.footerTiming')} help={tr('botDefaults.footerTimingHelp')}
+              checked={showTiming} disabled={busy !== null}
+              onChange={checked => {
+                const previous = showTiming; setShowTiming(checked);
+                void savePatch({ showReplyTiming: checked }, 'showReplyTiming', () => setShowTiming(previous));
+              }} />
+          </div>
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
@@ -4757,6 +5054,75 @@ function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: P
       </div>
       <StatusSpan status={status} />
     </div>
+  );
+}
+
+/** 按 Bot 当前行的 CLI / 后端 / 沙盒实时判断（与 daemon 写入时的校验同一个函数），
+ *  本页改了沙盒、后端或 CLI 后立即反映，不依赖加载时的快照。 */
+export function zeroPromptSupportedFor(bot: Pick<BotDefaultsRow, 'cliId' | 'backendType' | 'defaultBackendType' | 'sandbox' | 'sandboxMode'>): boolean {
+  const sandbox = bot.sandboxMode === 'off' || bot.sandboxMode === 'oncall' || bot.sandboxMode === 'scratch'
+    ? bot.sandboxMode
+    : bot.sandbox ? 'oncall' : 'off';
+  // 后端按新会话 spawn 时的生效值（覆盖值，否则 daemon 默认，再按 CLI 配对），与 daemon
+  // 写入校验、spawn 时的强制校验一致。
+  const backendType = resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType);
+  return supportsZeroPromptInjection(bot.cliId, { backendType, sandbox });
+}
+
+/**
+ * 零注入：执行会话不附带 Botmux 的提示词、提醒与技能目录，最终回答由 Botmux 从转写里
+ * 自动回传并 @ 发起人。只对新会话生效。当前 CLI / 后端 / 沙箱组合不支持时开关禁用；
+ * 关联的 Agent 统一管理零注入时整块锁定。
+ */
+export function PromptInjectionSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
+  const tr = useT();
+  const [zero, setZero] = useState(props.bot.promptInjection === 'none');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = zeroPromptSupportedFor(props.bot);
+
+  useEffect(() => setZero(props.bot.promptInjection === 'none'), [props.bot.promptInjection]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = zero;
+    setZero(next);
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/prompt-injection`, { promptInjection: next ? 'none' : 'default' }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.promptInjection === 'none';
+        setZero(saved);
+        // 零注入强制 transcript 回传；同时刷新旁边回复投递开关显示的生效值。
+        const replyDelivery = body.replyDelivery === 'transcript' || body.replyDelivery === 'send' ? body.replyDelivery : undefined;
+        props.patchBot(props.bot.larkAppId, { promptInjection: saved ? 'none' : 'default', ...(replyDelivery ? { replyDelivery } : {}) });
+      },
+      rollback: () => setZero(previous),
+    });
+  }
+
+  return (
+    <section className="bd-section" data-prompt-injection>
+      <h3 className="bd-section-title">{tr('botDefaults.promptInjection')}</h3>
+      <AgentManagedLock lock={props.lock} section="promptInjection">
+        <ToggleRow
+          checked={zero}
+          // 已开启但当前组合不支持时仍允许关掉，避免卡在一个无法生效的状态里。
+          disabled={busy || (!supported && !zero)}
+          dataAction="toggle-prompt-injection"
+          title={tr('botDefaults.promptInjectionToggle')}
+          help={tr('botDefaults.promptInjectionHelp')}
+          onChange={checked => void save(checked)}
+        />
+        <small className="bd-section-note">
+          {supported ? tr('botDefaults.promptInjectionNote') : tr('botDefaults.promptInjectionUnsupported')}
+        </small>
+      </AgentManagedLock>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-prompt-injection-status': '' }} />
+      </div>
+    </section>
   );
 }
 
@@ -6699,7 +7065,7 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const [value, setValue] = useState(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : '');
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -6724,6 +7090,7 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
+      <AgentManagedLock lock={props.lock} section="startup">
       <textarea
         data-input="startupCommands"
         rows={3}
@@ -6736,6 +7103,7 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <button type="button" className="primary" data-action="save-startup-commands" disabled={busy} onClick={() => void save()}>{tr('botDefaults.startupCommandsSave')}</button>
         <StatusSpan status={status} attr={{ 'data-startup-commands-status': '' }} />
       </div>
+      </AgentManagedLock>
     </section>
   );
 }
@@ -6743,6 +7111,282 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 // Slash 命令权限：把 /botconfig 的 customPassthroughCommands（透传给 CLI）与
 // canTalkDaemonCommands（daemon 命令降到 canTalk）搬到 Dashboard 可视化编辑。
 // 两者都是 stringList immediate 字段，走各自的 PUT 代理路由，空串＝清除回默认。
+export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const [state, setState] = useState<NativeSlashCommandState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  // 请求代次：切换 Bot 或其 CLI 时 +1。写请求发起时记下代次，返回时代次已变 = 过期
+  // 响应（属于切换前的 Bot/CLI 清单），整体丢弃，不覆盖新清单、不改状态。
+  const generation = useRef(0);
+
+  const applyBody = (body: any): void => {
+    if (!Array.isArray(body?.commands) || !body?.summary) return;
+    setState({
+      commands: body.commands as NativeSlashCommandRow[],
+      summary: body.summary,
+      available: body.available !== false,
+      ...(body.reason ? { reason: body.reason } : {}),
+      ...(Array.isArray(body.missingScopes) ? { missingScopes: body.missingScopes } : {}),
+      ...(body.permissionUrls ? { permissionUrls: body.permissionUrls } : {}),
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    generation.current += 1;
+    setBusy(null);
+    // 换 Bot/CLI 后旧清单不再代表当前目标：先清空回到未查询态；GET 失败就保持空，
+    // 不让旧候选继续可操作。
+    setState(null);
+    setLoading(true);
+    setStatus(null);
+    void sendJson(
+      'GET',
+      `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands`,
+    ).then(res => {
+      if (cancelled) return;
+      applyBody(res.body);
+      if (!res.ok) setStatus({ text: `✗ ${responseErrorText(res)}` });
+    }).catch(error => {
+      if (!cancelled) setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [props.bot.larkAppId, props.bot.cliId]);
+
+  // 缺可选 scope 时给出可读提示，而不是把飞书原始错误码甩给用户。
+  // 非权限类失败逐条列出失败命令；请求异常（超时/连接重置）标「结果未确认」。
+  const writeFailureText = (res: JsonResponse): string => {
+    if (res.body?.reason === 'core_only') return tr('botDefaults.nativeSlashCoreOnly');
+    if (res.body?.reason === 'not_enabled') return tr('botDefaults.nativeSlashNotEnabled');
+    if (res.body?.reason === 'missing_scope') {
+      return tr('botDefaults.nativeSlashMissingScope', { scopes: (res.body?.missingScopes ?? []).join(' / ') });
+    }
+    const outcomes: Array<{ command?: string; ok?: boolean; message?: string; uncertain?: boolean }> =
+      Array.isArray(res.body?.report?.outcomes) ? res.body.report.outcomes : [];
+    const failed = outcomes.filter(outcome => outcome && outcome.ok === false);
+    if (failed.length === 0) return responseErrorText(res);
+    return failed.map(outcome => {
+      const detail = outcome.uncertain
+        ? tr('botDefaults.nativeSlashUncertain', { error: outcome.message ?? '' })
+        : (outcome.message ?? '');
+      return `/${outcome.command ?? '?'}${detail ? `: ${detail}` : ''}`;
+    }).join('；');
+  };
+  // 写已确认、只是事后刷新清单失败：附加提示，不把它当成写失败。
+  const refreshNote = (res: JsonResponse): string => (
+    typeof res.body?.refreshError === 'string' && res.body.refreshError
+      ? ` · ${tr('botDefaults.nativeSlashRefreshFailed', { error: res.body.refreshError })}`
+      : ''
+  );
+
+  async function sync(): Promise<void> {
+    setBusy('all');
+    setStatus(null);
+    const issuedAt = generation.current;
+    const stale = (): boolean => issuedAt !== generation.current;
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/sync`,
+        undefined,
+        controlCsrfHeaders(),
+      );
+      if (stale()) return;
+      applyBody(res.body);
+      if (res.ok && res.body?.report) {
+        const report = res.body.report as { created?: number; updated?: number; failed?: number };
+        setStatus({
+          text: `✓ ${tr('botDefaults.nativeSlashSyncResult', {
+            created: report.created ?? 0,
+            updated: report.updated ?? 0,
+          })}${refreshNote(res)}`,
+          ok: true,
+        });
+      } else {
+        const failed = Number(res.body?.report?.failed ?? 0);
+        const prefix = failed > 0 ? `${tr('botDefaults.nativeSlashSyncPartial', { failed })}: ` : '';
+        setStatus({ text: `✗ ${prefix}${writeFailureText(res)}${refreshNote(res)}` });
+      }
+    } catch (error) {
+      if (stale()) return;
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      if (!stale()) setBusy(null);
+    }
+  }
+
+  async function syncOne(command: string): Promise<void> {
+    setBusy(`sync:${command}`);
+    setStatus(null);
+    const issuedAt = generation.current;
+    const stale = (): boolean => issuedAt !== generation.current;
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/sync-one`,
+        { command },
+        controlCsrfHeaders(),
+      );
+      if (stale()) return;
+      applyBody(res.body);
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.nativeSlashSyncOneResult', { command: `/${command}` })}${refreshNote(res)}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${writeFailureText(res)}${refreshNote(res)}` });
+      }
+    } catch (error) {
+      if (stale()) return;
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      if (!stale()) setBusy(null);
+    }
+  }
+
+  async function deleteOne(command: string): Promise<void> {
+    if (!globalThis.confirm(tr('botDefaults.nativeSlashDeleteConfirm', { command: `/${command}` }))) return;
+    setBusy(`delete:${command}`);
+    setStatus(null);
+    const issuedAt = generation.current;
+    const stale = (): boolean => issuedAt !== generation.current;
+    try {
+      const res = await sendJson(
+        'POST',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/slash-commands/delete`,
+        { command },
+        controlCsrfHeaders(),
+      );
+      if (stale()) return;
+      applyBody(res.body);
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.nativeSlashDeleteResult', { command: `/${command}` })}${refreshNote(res)}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${writeFailureText(res)}${refreshNote(res)}` });
+      }
+    } catch (error) {
+      if (stale()) return;
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      if (!stale()) setBusy(null);
+    }
+  }
+
+  const sourceLabel: Record<NativeSlashCommandRow['source'], string> = {
+    botmux: tr('botDefaults.nativeSlashSourceBotmux'),
+    remote: tr('botDefaults.nativeSlashSourceRemote'),
+  };
+  const unavailable = state !== null && !state.available;
+  const writeDisabled = busy !== null || loading || !ui.authed || unavailable || state === null;
+  const statusLabel: Record<NativeSlashCommandRow['status'], string> = {
+    synced: tr('botDefaults.nativeSlashStatusSynced'),
+    missing: tr('botDefaults.nativeSlashStatusMissing'),
+    outdated: tr('botDefaults.nativeSlashStatusOutdated'),
+    unknown: tr('botDefaults.nativeSlashStatusUnknown'),
+    'remote-extra': tr('botDefaults.nativeSlashStatusRemoteExtra'),
+  };
+
+  return (
+    <div className="bd-subsection bd-native-slash" data-native-slash-commands="">
+      <h4 className="bd-subsection-title">
+        <FieldTitle help={tr('botDefaults.nativeSlashHelp')}>{tr('botDefaults.nativeSlashTitle')}</FieldTitle>
+      </h4>
+      <p className="bd-native-slash-note">{tr('botDefaults.nativeSlashNote')}</p>
+      {state ? (
+        <div className="bd-native-slash-summary" aria-label={tr('botDefaults.nativeSlashSummaryLabel')}>
+          <span>{tr('botDefaults.nativeSlashTotal', { total: state.summary.total })}</span>
+          {state.available ? <span className="ok">{tr('botDefaults.nativeSlashSynced', { synced: state.summary.synced })}</span> : null}
+          {state.summary.missing > 0 ? <span className="warn">{tr('botDefaults.nativeSlashMissing', { missing: state.summary.missing })}</span> : null}
+          {state.summary.outdated > 0 ? <span className="warn">{tr('botDefaults.nativeSlashOutdated', { outdated: state.summary.outdated })}</span> : null}
+          {state.summary.remoteExtra > 0 ? <span>{tr('botDefaults.nativeSlashRemoteExtra', { extra: state.summary.remoteExtra })}</span> : null}
+        </div>
+      ) : null}
+      <div className="actions bd-native-slash-actions">
+        <button
+          type="button"
+          className="primary"
+          data-action="sync-native-slash-commands"
+          disabled={writeDisabled}
+          onClick={() => void sync()}
+        >
+          {busy === 'all' ? tr('botDefaults.nativeSlashSyncing') : tr('botDefaults.nativeSlashSync')}
+        </button>
+        {loading ? <span className="muted">{tr('common.loading')}</span> : null}
+        <StatusSpan status={status} attr={{ 'data-native-slash-status': '' }} />
+      </div>
+      {unavailable ? (
+        <div className="bd-native-slash-unavailable" role="status" data-native-slash-unavailable={state?.reason ?? ''}>
+          <strong>{tr('botDefaults.nativeSlashUnavailableTitle')}</strong>
+          <span>
+            {state?.reason === 'not_enabled'
+              ? tr('botDefaults.nativeSlashNotEnabled')
+              : state?.reason === 'core_only'
+                ? tr('botDefaults.nativeSlashCoreOnly')
+                : tr('botDefaults.nativeSlashMissingScope', { scopes: (state?.missingScopes ?? []).join(' / ') })}
+          </span>
+        </div>
+      ) : null}
+      {state?.permissionUrls && state.reason !== 'not_enabled' ? (
+        <div className="bd-native-slash-permissions">
+          <span>{tr('botDefaults.nativeSlashPermissionHint')}</span>
+          {state.permissionUrls.read ? <a href={state.permissionUrls.read} target="_blank" rel="noreferrer">read ↗</a> : null}
+          {state.permissionUrls.write ? <a href={state.permissionUrls.write} target="_blank" rel="noreferrer">write ↗</a> : null}
+        </div>
+      ) : null}
+      {state?.commands.length ? (
+        <div className="bd-native-slash-table" role="table" aria-label={tr('botDefaults.nativeSlashTableLabel')}>
+          <div className="bd-native-slash-row head" role="row">
+            <span role="columnheader">{tr('botDefaults.nativeSlashCommand')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashDescription')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashState')}</span>
+            <span role="columnheader">{tr('botDefaults.nativeSlashAction')}</span>
+          </div>
+          {state.commands.map(command => {
+            const canSync = !unavailable && command.source !== 'remote' && command.status !== 'synced';
+            const canDelete = command.status === 'synced'
+              || command.status === 'outdated'
+              || command.status === 'remote-extra';
+            return (
+              <div className="bd-native-slash-row" role="row" key={`${command.source}:${command.command}`} data-slash-status={command.status}>
+                <span role="cell"><code>/{command.command}</code><small>{sourceLabel[command.source]}</small></span>
+                <span role="cell">{command.description?.default_value ?? ''}</span>
+                <span role="cell" className={`bd-native-slash-state ${command.status}`}>{statusLabel[command.status]}</span>
+                <span role="cell" className="bd-native-slash-row-actions">
+                  {canSync ? (
+                    <button
+                      type="button"
+                      data-action="sync-native-slash-command"
+                      data-command={command.command}
+                      disabled={writeDisabled}
+                      onClick={() => void syncOne(command.command)}
+                    >
+                      {busy === `sync:${command.command}` ? tr('botDefaults.nativeSlashSyncing') : tr('botDefaults.nativeSlashSyncOne')}
+                    </button>
+                  ) : null}
+                  {canDelete ? (
+                    <button
+                      type="button"
+                      className="danger"
+                      data-action="delete-native-slash-command"
+                      data-command={command.command}
+                      disabled={writeDisabled}
+                      onClick={() => void deleteOne(command.command)}
+                    >
+                      {busy === `delete:${command.command}` ? tr('botDefaults.nativeSlashDeleting') : tr('botDefaults.nativeSlashDelete')}
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
@@ -6790,6 +7434,7 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.sectionSlashCommandsHelp')}>{tr('botDefaults.sectionSlashCommands')}</FieldTitle></h3>
+      <NativeSlashCommandRegistration bot={props.bot} />
       <div className="bd-subsection">
         <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
         <textarea

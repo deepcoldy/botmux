@@ -24,6 +24,8 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 export interface RemoteRunnerSessionToolHostContext {
   sessionId: string;
   turnId: string;
+  chatId: string;
+  controllerOpenId?: string;
   dispatchAttempt?: number;
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
@@ -38,6 +40,7 @@ function boundedDiagnostic(value: string, fallback: string): string {
 export function remoteRunnerSessionToolArgs(
   request: RemoteRunnerSessionToolRequest,
   sessionId: string,
+  chatId: string,
 ): string[] {
   switch (request.tool) {
     case 'history':
@@ -65,6 +68,45 @@ export function remoteRunnerSessionToolArgs(
       return ['skill', 'read', request.name, request.path];
     case 'skill.resources':
       return ['skill', 'resources', request.name];
+    case 'schedule.list':
+      return [
+        'schedule', 'list', '--chat-id', chatId, '--remote-runner-session-tool',
+      ];
+    case 'schedule.add': {
+      const position = request.position ?? 'top-level';
+      return [
+        'schedule', 'add', `--schedule=${request.schedule}`,
+        `--prompt=${request.prompt}`,
+        ...(request.name ? [`--name=${request.name}`] : []),
+        position === 'topic' ? '--topic' : position === 'new-topic' ? '--new-topic' : '--top-level',
+        ...(request.followActive ? ['--follow-active'] : []),
+        ...(request.topicTitle ? [`--topic-title=${request.topicTitle}`] : []),
+        ...(request.silent ? ['--silent'] : []),
+        ...(request.model ? [`--model=${request.model}`] : []),
+        ...(request.reasoningEffort ? [`--reasoning-effort=${request.reasoningEffort}`] : []),
+        ...(request.calendar ? [`--calendar=${request.calendar}`] : []),
+        ...(request.calendarDayType ? [`--calendar-day-type=${request.calendarDayType}`] : []),
+        '--remote-runner-session-tool',
+      ];
+    }
+    case 'schedule.update':
+      return [
+        'schedule', 'update', request.taskId,
+        ...(request.prompt !== undefined ? [`--prompt=${request.prompt}`] : []),
+        ...(request.calendar !== undefined
+          ? [`--calendar=${request.calendar === null ? 'none' : request.calendar}`]
+          : []),
+        ...(request.calendarDayType ? [`--calendar-day-type=${request.calendarDayType}`] : []),
+        '--remote-runner-session-tool',
+      ];
+    case 'schedule.remove':
+    case 'schedule.pause':
+    case 'schedule.resume':
+    case 'schedule.run':
+      return [
+        'schedule', request.tool.slice('schedule.'.length), request.taskId,
+        '--remote-runner-session-tool',
+      ];
   }
 }
 
@@ -138,19 +180,29 @@ function quotedAttachments(
   };
 }
 
-/** Execute one strictly structured, read-only BotMux session helper on the
- * trusted host.  The provider cannot select a session, chat, bot, executable,
- * arbitrary argv or environment value. */
+/** Execute one strictly structured BotMux session helper on the trusted host.
+ * The provider cannot select a session, chat, bot, executable, arbitrary argv
+ * or environment value. Schedule mutations still pass through the daemon's
+ * current-turn authorization. */
 export async function runRemoteRunnerSessionTool(
   request: RemoteRunnerSessionToolRequest,
   context: RemoteRunnerSessionToolHostContext,
 ): Promise<RemoteRunnerSessionToolResult> {
   const invocation = botmuxCliInvocation(context.cliPath);
-  const args = [...invocation.args, ...remoteRunnerSessionToolArgs(request, context.sessionId)];
+  const args = [
+    ...invocation.args,
+    ...remoteRunnerSessionToolArgs(request, context.sessionId, context.chatId),
+  ];
   const env = buildRelayHostEnv(context.env ?? process.env);
   env.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
   env.BOTMUX_SESSION_ID = context.sessionId;
   env.BOTMUX_TURN_ID = context.turnId;
+  env.BOTMUX_CHAT_ID = context.chatId;
+  if (context.controllerOpenId) {
+    env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID = context.controllerOpenId;
+  } else {
+    delete env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID;
+  }
   if (context.dispatchAttempt !== undefined) {
     env.BOTMUX_DISPATCH_ATTEMPT = String(context.dispatchAttempt);
   } else {

@@ -7,38 +7,90 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture every SDK Client constructed by lark-upload + stub the upload call.
-const constructed: Array<Record<string, unknown>> = [];
-
-vi.mock('@larksuiteoapi/node-sdk', () => {
-  class FakeClient {
-    opts: Record<string, unknown>;
-    im = { v1: { image: { create: async () => ({ image_key: 'img_xyz' }) } } };
-    constructor(opts: Record<string, unknown>) {
-      this.opts = opts;
-      constructed.push(opts);
+const H = vi.hoisted(() => {
+  const constructed: Array<Record<string, unknown>> = [];
+  const createdAgents: Array<{ kind: string; destroys: number; cfg: Record<string, unknown> }> = [];
+  let uploadCreate: ((...args: unknown[]) => Promise<unknown>) | undefined;
+  class FakeAgent {
+    private rec: { kind: string; destroys: number; cfg: Record<string, unknown> };
+    constructor(kind: string, cfg: Record<string, unknown>) {
+      this.rec = { kind, destroys: 0, cfg };
+      createdAgents.push(this.rec);
+    }
+    destroy() {
+      this.rec.destroys++;
     }
   }
-  // Mirror the real SDK's separable http instance so the upload-timeout path is
-  // exercised (create() → own instance + copyable interceptor registry) instead
-  // of only hitting the fail-safe fallback.
-  const makeInstance = (): any => ({
-    defaults: { timeout: 0 },
-    create: (cfg: { timeout?: number }) => {
-      const inst = makeInstance();
-      if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
-      return inst;
+  return {
+    constructed,
+    createdAgents,
+    FakeAgent,
+    setUploadCreate: (fn: typeof uploadCreate) => {
+      uploadCreate = fn;
     },
-    interceptors: {
-      request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
-      response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+    getUploadCreate: () => uploadCreate,
+    // Factory for the default (with-http-instance) SDK mock. Reusable from both
+    // the static vi.mock and the fallback test's doMock/restore so an earlier
+    // doUnmock cannot leak the real SDK into later describe blocks.
+    sdkMock: () => {
+      class FakeClient {
+        opts: Record<string, unknown>;
+        im = {
+          v1: {
+            image: {
+              create: (...args: unknown[]) => {
+                const fn = uploadCreate;
+                return fn ? fn(...args) : Promise.resolve({ image_key: 'img_xyz' });
+              },
+            },
+          },
+        };
+        constructor(opts: Record<string, unknown>) {
+          this.opts = opts;
+          constructed.push(opts);
+        }
+      }
+      const makeInstance = (): any => ({
+        defaults: { timeout: 0 },
+        create: (cfg: { timeout?: number; httpAgent?: any; httpsAgent?: any }) => {
+          const inst = makeInstance();
+          if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
+          if (cfg?.httpAgent) inst.httpAgent = cfg.httpAgent;
+          if (cfg?.httpsAgent) inst.httpsAgent = cfg.httpsAgent;
+          return inst;
+        },
+        interceptors: {
+          request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+          response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+        },
+      });
+      return { Client: FakeClient, LoggerLevel: { error: 0 }, defaultHttpInstance: makeInstance() };
     },
-  });
-  return { Client: FakeClient, LoggerLevel: { error: 0 }, defaultHttpInstance: makeInstance() };
+  };
 });
+const { constructed, createdAgents, setUploadCreate } = H;
+
+vi.mock('node:http', () => ({
+  Agent: class extends H.FakeAgent {
+    constructor(cfg: Record<string, unknown>) {
+      super('http', cfg);
+    }
+  },
+}));
+vi.mock('node:https', () => ({
+  Agent: class extends H.FakeAgent {
+    constructor(cfg: Record<string, unknown>) {
+      super('https', cfg);
+    }
+  },
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => H.sdkMock());
 
 async function fresh() {
   vi.resetModules();
   constructed.length = 0;
+  createdAgents.length = 0;
   return await import('../src/utils/lark-upload.js');
 }
 
@@ -102,7 +154,69 @@ describe('uploadImageBuffer — brand domain', () => {
       expect(constructed[0]?.httpInstance).toBeUndefined();
     } finally {
       vi.doUnmock('@larksuiteoapi/node-sdk');
+      // Restore the default mock so later describe blocks don't fall through to
+      // the real SDK (static vi.mock is not re-armed after doUnmock).
+      vi.doMock('@larksuiteoapi/node-sdk', () => H.sdkMock());
       vi.resetModules();
     }
+  });
+});
+
+describe('uploadImageBuffer — keep-alive pool resilience', () => {
+  beforeEach(() => {
+    constructed.length = 0;
+    createdAgents.length = 0;
+    setUploadCreate(undefined);
+  });
+
+  it('provisions a dedicated keep-alive https agent with a short idle TTL', async () => {
+    const { uploadImageBuffer } = await fresh();
+    await uploadImageBuffer('app', 'sec', Buffer.from('x'));
+    const httpInstance = constructed[0]?.httpInstance as { httpsAgent?: any } | undefined;
+    expect(httpInstance?.httpsAgent).toBeDefined();
+    const httpsAgentRec = createdAgents.find((a) => a.kind === 'https');
+    expect(httpsAgentRec).toBeDefined();
+    expect(httpsAgentRec?.cfg.keepAlive).toBe(true);
+    // Idle TTL must be finite and short so pooled sockets are reaped before an
+    // intermediary can silently reclaim them.
+    expect(httpsAgentRec?.cfg.timeout as number).toBeGreaterThan(0);
+    expect(httpsAgentRec?.cfg.timeout as number).toBeLessThanOrEqual(30_000);
+  });
+
+  it('destroys pooled agents and rebuilds the client after a transport failure', async () => {
+    const { uploadImageBuffer } = await fresh();
+    // A network/timeout error has no HTTP response attached.
+    setUploadCreate(async () => {
+      const e: any = new Error('socket hang up');
+      e.code = 'ECONNRESET';
+      throw e;
+    });
+    await expect(uploadImageBuffer('app', 'sec', Buffer.from('x'))).rejects.toThrow(/hang up/);
+    const firstAgents = createdAgents.filter((a) => a.kind === 'https');
+    expect(firstAgents.length).toBe(1);
+    expect(firstAgents[0].destroys).toBe(1);
+    expect(constructed.length).toBe(1);
+
+    // Next upload rebuilds a clean pool and client instead of reusing the dead one.
+    setUploadCreate(undefined);
+    const key = await uploadImageBuffer('app', 'sec', Buffer.from('x'));
+    expect(key).toBe('img_xyz');
+    expect(constructed.length).toBe(2);
+    const httpsAgents = createdAgents.filter((a) => a.kind === 'https');
+    expect(httpsAgents.length).toBe(2);
+  });
+
+  it('keeps the pool intact after a normal HTTP status error (has response)', async () => {
+    const { uploadImageBuffer } = await fresh();
+    setUploadCreate(async () => {
+      const e: any = new Error('Request failed with status code 400');
+      e.response = { status: 400, data: { code: 1 } };
+      throw e;
+    });
+    await expect(uploadImageBuffer('app', 'sec', Buffer.from('x'))).rejects.toThrow(/400/);
+    const httpsAgents = createdAgents.filter((a) => a.kind === 'https');
+    expect(httpsAgents.length).toBe(1);
+    expect(httpsAgents[0].destroys).toBe(0);
+    expect(constructed.length).toBe(1);
   });
 });

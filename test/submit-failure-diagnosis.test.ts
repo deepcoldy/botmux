@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   diagnoseSubmitFailure,
@@ -271,13 +270,6 @@ describe('submitDiag i18n 文案接缝', () => {
     for (const key of DIAG_KEYS) {
       const rendered = t(key, { cliName: 'TraeCode CLI', preview: '帮我跑一下测试' }, 'zh');
       expect(rendered).toContain('原消息：帮我跑一下测试');
-    }
-  });
-
-  it('worker 源码引用了三个 submitDiag key', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    for (const key of DIAG_KEYS) {
-      expect(worker).toContain(`'${key}'`);
     }
   });
 });

@@ -89,6 +89,30 @@ export const GOAL_ENV = {
   V3_MARKER: 'BOTMUX_V3_GOAL',
 } as const;
 
+/** Native slash command a goal-mode worker is started with. */
+export const GOAL_COMMAND = '/goal';
+
+/** The objective botmux v3 hands every goal-mode worker (the text after
+ *  `/goal`): a short pointer at the file-backed instructions, see
+ *  `buildGoalCommand` / `renderGoalFile`. Single source shared with
+ *  {@link isBotmuxGoalObjective} so the two cannot drift apart. */
+export const GOAL_COMMAND_OBJECTIVE =
+  `Read $${GOAL_ENV.GOAL_PATH}. Write files in $${GOAL_ENV.OUTPUT_DIR} and manifest at `
+  + `$${GOAL_ENV.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+
+/** True when `text` is the goal botmux v3 sends — with or without the leading
+ *  `/goal`, whitespace-insensitive. Native stores keep it as the thread's first
+ *  input (TraeX 0.210 goal mode: `threads.preview` = the objective, empty
+ *  `first_user_message`), and none of the Lark-envelope checks match it, so
+ *  session discovery needs this to recognise a botmux workflow run. */
+export function isBotmuxGoalObjective(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const objective = normalized.startsWith(`${GOAL_COMMAND} `)
+    ? normalized.slice(GOAL_COMMAND.length + 1).trim()
+    : normalized;
+  return objective === GOAL_COMMAND_OBJECTIVE;
+}
+
 // ─── Runtime human-ask (goal worker → human, rides the blocked+retry rail) ──
 
 /**

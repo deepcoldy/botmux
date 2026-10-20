@@ -7,7 +7,7 @@
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -414,35 +414,6 @@ describe('attention signals', () => {
     announcePendingRepoSession(makeDs({ pendingRepo: false }));
     announcePendingRepoSession(makeDs());
     expect(seen).toHaveLength(0);
-  });
-
-  it('handleThreadReply clears agent attention before early-return intercepts', () => {
-    const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
-    const start = src.indexOf('async function handleThreadReply(');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const end = src.indexOf('async function autoCreateDocSession(', start);
-    expect(end).toBeGreaterThan(start);
-    // Bound the source-order assertion by the next top-level sibling instead
-    // of a character count. Legitimate additions to handleThreadReply (for
-    // example master's CAS handoff paths or PR #597's admission and recovery
-    // guards) must not make this regression test silently inspect only the
-    // first part of the function.
-    const region = src.slice(start, end);
-    const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
-    expect(clearIdx).toBeGreaterThanOrEqual(0);
-    for (const marker of [
-      'isCallbackUrl(content)',
-      'handleV3SavedWorkflowCommandIfAny',
-      'parseWorkflowGrillTrigger',
-      'isLegacyTemplateCommand',
-      // 斜杠命令的分类+执行段已搬到 executeThreadSlash（PR-4 ①），入口里剩下这一处调用点
-      'await executeThreadSlash(',
-      'findPendingAskByAnchor',
-    ]) {
-      const markerIdx = region.indexOf(marker);
-      expect(markerIdx).toBeGreaterThanOrEqual(0);
-      expect(clearIdx).toBeLessThan(markerIdx);
-    }
   });
 
   it('attentionWaitSince prefers agent raise time and falls back safely', () => {

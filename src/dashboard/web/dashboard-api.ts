@@ -48,10 +48,11 @@ export async function sendJson<T = any>(
   method: string,
   url: string,
   body?: unknown,
+  extraHeaders: Record<string, string> = {},
 ): Promise<DashboardJsonResponse<T>> {
   const response = await fetch(url, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...extraHeaders },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const parsed = await readJson<any>(response);

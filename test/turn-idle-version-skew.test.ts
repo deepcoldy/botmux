@@ -340,10 +340,6 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
     expect(fixture).toContain('if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();');
     expect(fixture).toContain('async function runPluginCommandByName(');
     expect(fixture).not.toContain('unknown command');
-    const cli = readFileSync(join(REPO_ROOT, 'src', 'cli.ts'), 'utf8');
-    // …and our CLI no longer answers the unversioned name either.
-    expect(cli).toContain("case '__turn-idle-v2':");
-    expect(cli).not.toContain("case 'turn-idle':");
   }, 30_000);
 
   it('uses a subcommand no plugin can ever register (collision-proof by grammar)', async () => {

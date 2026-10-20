@@ -107,6 +107,34 @@ describe('durable Lark inbox shadow', () => {
     });
   });
 
+  it('persists and revalidates a recalled-message event for primary processing', () => {
+    const data = {
+      event_id: 'evt_recall_1',
+      message_id: 'om_1',
+      chat_id: 'oc_1',
+      recall_time: '1700000009000',
+    };
+    const event = durableLarkMessageEvent({
+      larkAppId: 'cli_1',
+      eventType: 'lark.im.message.recalled_v1',
+      eventId: 'im.message.recalled_v1:cli_1:evt_recall_1',
+      partitionKey: 'lark-message-routing:cli_1:oc_1',
+      data,
+      now: 10,
+    });
+    expect(observeDurableLarkMessageClaim({
+      event,
+      workerId: 'worker-1',
+      claimEpoch: 1,
+      claimUntil: 100,
+      attempts: 1,
+    })).toMatchObject({
+      eventType: 'lark.im.message.recalled_v1',
+      eventId: 'im.message.recalled_v1:cli_1:evt_recall_1',
+      messageId: 'om_1',
+    });
+  });
+
   it('rejects a claimed envelope whose durable event id does not match the message', () => {
     const event = durableLarkMessageEvent({
       larkAppId: 'cli_1',

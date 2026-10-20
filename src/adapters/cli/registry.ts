@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter, CliId, StructuredBridgeSpec } from './types.js';
+import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
+export { cliSupportsConfigDir };
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
 import { createRelayAdapter } from './relay.js';
@@ -221,12 +223,25 @@ export function locateOnPath(cmd: string): string | null {
 
 const adapterCache = new Map<string, CliAdapter>();
 
+/** Per-bot launch options that change WHERE an adapter's CLI keeps its data. */
+export interface CliAdapterOptions {
+  /**
+   * CLI config profile dir (`cliConfigDir`). Claude Code only: launched with
+   * `CLAUDE_CONFIG_DIR=<dir>`, and the adapter's data root, hook target,
+   * `.claude.json` and MCP gateway entry all follow it. Ignored for CLIs that do
+   * not support it (see `cliSupportsConfigDir`).
+   */
+  readonly configDir?: string;
+}
+
+
 /** Async adapter factory (uses dynamic import for lazy loading in daemon process). */
-export async function createCliAdapter(id: CliId, pathOverride?: string): Promise<CliAdapter> {
+export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): Promise<CliAdapter> {
   const normalized = id.toLowerCase() as CliId;
-  const key = `${normalized}:${pathOverride ?? ''}`;
+  const configDir = cliSupportsConfigDir(normalized) ? opts?.configDir : undefined;
+  const key = `${normalized}:${pathOverride ?? ''}:${configDir ?? ''}`;
   if (adapterCache.has(key)) return adapterCache.get(key)!;
-  const adapter = createCliAdapterSync(normalized, pathOverride);
+  const adapter = createCliAdapterSync(normalized, pathOverride, { configDir });
   adapterCache.set(key, adapter);
   return adapter;
 }
@@ -234,9 +249,9 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
 export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter };
 
 /** Synchronous version for use in worker process. */
-export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
+export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {
   switch (id.toLowerCase() as CliId) {
-    case 'claude-code': return createClaudeCodeAdapter(pathOverride);
+    case 'claude-code': return createClaudeCodeAdapter(pathOverride, opts?.configDir || undefined);
     case 'seed': return createSeedAdapter(pathOverride);
     case 'relay': return createRelayAdapter(pathOverride);
     case 'aiden': return createAidenAdapter(pathOverride);

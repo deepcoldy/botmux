@@ -22,6 +22,9 @@ import {
 } from '../services/claude-transcript.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
+import { readCursorUsage } from '../services/cursor-usage.js';
+import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1374,11 +1377,15 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
-  if (q.cliId === 'minimax') return getSessionUsageSnapshot(q).tokens;
+  if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
   return readSessionUsage(q)?.result ?? null;
 }
 
 export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  if (q.cliId === 'cursor') {
+    return readCursorUsage(cursorConfigDirForBot(q.larkAppId), config.session.dataDir,
+      q.sessionId, q.cliSessionId || q.sessionId, q.fresh, q.pricing);
+  }
   if (q.cliId === 'minimax') {
     const resolved = resolveSessionTranscriptPath(q);
     const snapshot = resolved ? readMinimaxUsage(resolved.path, q.cliSessionId || q.sessionId, q.fresh) : null;

@@ -412,6 +412,8 @@ export interface DaemonSession {
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
+  /** Native write observations, scoped to the worker generation and exact attempt. */
+  replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -427,6 +429,11 @@ export interface DaemonSession {
    * captured it). Trusted only while `imageKey === currentImageKey`; a cache
    * restored from disk has no provenance and is treated as legacy. */
   currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** Read-only preview shown while the card's own turn is waiting for the
+   * previous turn to finish. It is deliberately separate from currentImageKey:
+   * never persisted, never treated as this card turn's frame, and cleared as
+   * soon as the target turn activates or the worker generation changes. */
+  waitingTurnPreview?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
   /** The worker's actual screenshot capture identity, from capture_identity
    * events emitted at real CLI write points (never from input ACKs). Scoped to
    * one worker generation: once a generation announced it, that generation's

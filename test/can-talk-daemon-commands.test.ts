@@ -103,6 +103,17 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/status')).toBe(false);
   });
 
+  it('schema talk-level command (/resume) needs only canTalk, without any downgrade list', () => {
+    getBot('ct1').config.canTalkDaemonCommands = undefined;
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/resume')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_oncall', 'ou_stranger', undefined, '/resume')).toBe(true);
+    // Still gated on talk: a sender who cannot talk here cannot resume either.
+    expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/resume')).toBe(false);
+    // Other commands keep the operator gate.
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);
+  });
+
   it('no list configured → behaves exactly like canOperate', () => {
     getBot('ct1').config.canTalkDaemonCommands = undefined;
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/status')).toBe(false);

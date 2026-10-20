@@ -102,4 +102,29 @@ describe('botmux skill session command', () => {
   it('refuses to run without a session id', () => {
     expect(runSkillSessionCommand(['list'], {}).stderr).toContain('missing BOTMUX_SESSION_ID');
   });
+
+  it('reports a corrupt manifest as unreadable, not not-found', () => {
+    write(join(dataDir, 'skill-manifests', 'broken.json'), '{ nope');
+    const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'broken' });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain('corrupt');
+    expect(res.stderr).not.toContain('not found');
+  });
+
+  it('reports a present-but-unreadable manifest as unreadable (exit 1), for any uid', () => {
+    // EISDIR stands in for a permission fault: root bypasses mode bits, so a
+    // chmod-000 file would be readable exactly where the daemon runs.
+    mkdirSync(join(dataDir, 'skill-manifests', 'locked.json'), { recursive: true });
+    const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'locked' });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain('exists but is unreadable');
+    expect(res.stderr).toContain('EISDIR');
+    expect(res.stderr).not.toContain('not found');
+  });
+
+  it('still reports a genuinely absent manifest as not found', () => {
+    const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'absent' });
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('manifest not found');
+  });
 });

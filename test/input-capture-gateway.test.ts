@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { deliverCapturedInput } from '../src/core/plugins/input-capture/gateway.js';
 import { createInputCaptureRuntime } from '../src/core/plugins/input-capture/runtime.js';
 import { createInputCaptureStore, type InputBinding, type CapturedInput } from '../src/core/plugins/input-capture/store.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { readPluginServiceState } from '../src/core/plugins/service-manager.js';
 import { readPluginCardActionToken } from '../src/core/plugins/card-actions/auth.js';
 import type { PluginServiceState } from '../src/core/plugins/types.js';
@@ -58,10 +59,10 @@ it.each([
 it('posts the original binding/input and host credential to the registered service', async () => {
   const requests: unknown[] = [];
   await serve(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
+    const body = await readRequestBodyJson(req, { strict: true });
+    if (body === undefined) { res.writeHead(400).end(); return; }
     requests.push({ method: req.method, path: req.url, authorization: req.headers.authorization,
-      contentType: req.headers['content-type'], body: JSON.parse(body) });
+      contentType: req.headers['content-type'], body });
     res.end(JSON.stringify(ack));
   });
   await expect(deliverCapturedInput(binding, input)).resolves.toBeUndefined();
@@ -112,9 +113,8 @@ it('keeps an unconfirmed input pending and retries its original ID through the g
   const received: string[] = [];
   let confirm = false;
   await serve(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    const delivery = JSON.parse(body);
+    const delivery = await readRequestBodyJson<{ input: { id: string }; binding: { id: string } }>(req, { strict: true });
+    if (!delivery) { res.writeHead(400).end(); return; }
     received.push(delivery.input.id);
     res.end(JSON.stringify({ schemaVersion: 1, bindingId: delivery.binding.id,
       acceptedInputId: confirm ? delivery.input.id : 'another-input' }));

@@ -9,6 +9,7 @@ export interface BotmuxCapabilitiesDocument {
     managed_activation_v2: true;
     current_actor_v2: true;
     current_execution_v1: true;
+    controlled_failure_recovery_v1: true;
     headless_session_v1: true;
     constrained_invocation_v1: true;
     model_only_invocation_v1: true;
@@ -42,6 +43,7 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
       managed_activation_v2: true,
       current_actor_v2: true,
       current_execution_v1: true,
+      controlled_failure_recovery_v1: true,
       headless_session_v1: true,
       constrained_invocation_v1: true,
       model_only_invocation_v1: true,

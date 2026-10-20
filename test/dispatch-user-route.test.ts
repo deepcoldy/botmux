@@ -14,6 +14,12 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
+import {
+  isDispatchOriginNotSendableError,
+  isolatedDispatchOutputSinkAllowed,
+  withIsolatedDispatchSinkFence,
+} from '../src/core/dispatch-output-sink.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
@@ -48,6 +54,8 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
+    validateCodexAppManagedSendOrigin, isCodexAppCliId,
+    isolatedDispatchOutputSinkAllowed, withIsolatedDispatchSinkFence, isDispatchOriginNotSendableError,
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
     lookupMessageChatId: vi.fn(async () => 'oc_target'), readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: vi.fn(() => ({ ok: true })),
@@ -82,6 +90,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn() },
+    remoteRunnerRecoveredTurnInFlight: false,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
     stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,

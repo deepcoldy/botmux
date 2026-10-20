@@ -50,10 +50,10 @@ import {
   injectControlCsrfMeta,
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
-import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
+import { DaemonRegistry, botsRosterSignature, trackRosterFrames } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
-import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
+import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -68,7 +68,7 @@ import {
   parseDashboardAskAnswerRequest,
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
-import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
+import { createHostTerminalManager } from './dashboard/host-terminal.js';
 import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
 import {
   mintPreviewContentCapability,
@@ -104,7 +104,9 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
+import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
@@ -129,6 +131,11 @@ import {
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
+import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import {
+  handlePluginResultAccess,
+  resolvePluginResultViewerIdentity,
+} from './dashboard/plugin-result-access.js';
 import { FileControlAuditSink } from './dashboard/control-audit.js';
 import {
   TerminalControlManager,
@@ -171,7 +178,7 @@ import {
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -181,6 +188,12 @@ import {
 } from './core/dashboard-url.js';
 import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/workbench-shell.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
@@ -458,6 +471,12 @@ const dashboardH5Auth = createDashboardH5AuthController({
   sessions: dashboardSessions,
   audit: dashboardControlAudit,
 });
+const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+try {
+  pluginResultArtifacts.sweepExpired();
+} catch (error) {
+  logger.warn(`[dashboard] Failed to sweep expired plugin results: ${(error as Error).message}`);
+}
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,
@@ -895,22 +914,26 @@ aggregator.on(ev => {
   if (dashboardEventInvalidatesGroupsMatrix(ev)) groupsMatrixSnapshot.invalidate();
 });
 
-// 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
-// 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
-const debugTerminalManager = createDebugTerminalManager({
+// 宿主网页终端（管理 → 终端，owner-only）：本机登录 shell / tmux / herdr attach。
+const hostTerminalManager = createHostTerminalManager({
   getActiveToken: currentDashboardToken,
-  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/host-terminal` 那条 `legacyAuthed`
   // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
-  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把宿主 shell
   // 开放给平台上的任何人。
   isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
-  defaultWorkingDirs: () => {
-    const dirs = new Set<string>();
+  // `bmx-<sessionId 前 8 位>`（TmuxBackend.sessionName）→ 「bot · 话题」，让终端页的
+  // tmux 列表里托管会话有个人话名字。
+  describeManagedTmuxSession: (name) => {
+    const prefix = name.slice('bmx-'.length);
+    if (prefix.length !== 8) return undefined;
     for (const s of aggregator.getSessions()) {
-      const wd = (s as { workingDir?: unknown }).workingDir;
-      if (typeof wd === 'string' && wd.trim()) dirs.add(wd.trim());
+      if (!s.sessionId.startsWith(prefix)) continue;
+      const row = s as { botName?: unknown; title?: unknown };
+      const parts = [row.botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
+      return parts.length ? parts.join(' · ') : undefined;
     }
-    return [...dirs];
+    return undefined;
   },
 });
 
@@ -1067,11 +1090,6 @@ function resolveScheduleOwner(id: string): string | undefined {
   const primary = registry.list().find(d => d.botIndex === 0);
   return primary?.larkAppId;
 }
-const botOnboarding = new BotOnboardingManager({
-  botsJsonPath: BOTS_JSON_PATH,
-  stopBotLive: spawnStopBotLive,
-  startBotLive: spawnStartBotLive,
-});
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
 // 写 ~/.botmux/feishu-session.json，与 setup / onboarding 复用同一份登录态。
 const feishuLogin = new FeishuLoginManager();
@@ -1169,6 +1187,7 @@ interface ResolvedDashboardSettings {
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
@@ -1338,7 +1357,11 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
   const persistedBotNames = readPersistedBotNames();
   return {
     readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
-    updateCatalog: updateVcMeetingSharedConsumerCatalog,
+    updateCatalog: input => runDurableConfigMutation({
+      scope: 'global',
+      path: globalConfigPath(),
+      mutation: async () => updateVcMeetingSharedConsumerCatalog(input),
+    }),
     loadBotConfigs,
     effectiveDefaultWorkingDir,
     onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
@@ -1670,19 +1693,25 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
   let changed = false;
   try {
     const path = requireConfigPath();
-    await withFileLock(path, async () => {
-      const raw = await readRawConfig(path);
-      const idx = findEntryIndex(raw, targetAppId);
-      if (idx < 0) throw new Error('bot_not_in_config');
-      const entry = raw[idx] as Record<string, unknown>;
-      const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-      if (next.larkCliProfile) return;
-      next.larkCliProfile = targetAppId;
-      compactVcMeetingAgentEntry(entry, next);
-      // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
-      parseBotConfigsFromText(JSON.stringify(raw));
-      await writeRawConfigAtomic(path, raw);
-      changed = true;
+    await runDurableConfigMutation({
+      scope: 'bots',
+      path,
+      mutation: async () => {
+        await withFileLock(path, async () => {
+          const raw = await readRawConfig(path);
+          const idx = findEntryIndex(raw, targetAppId);
+          if (idx < 0) throw new Error('bot_not_in_config');
+          const entry = raw[idx] as Record<string, unknown>;
+          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+          if (next.larkCliProfile) return;
+          next.larkCliProfile = targetAppId;
+          compactVcMeetingAgentEntry(entry, next);
+          // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
+          parseBotConfigsFromText(JSON.stringify(raw));
+          await writeRawConfigAtomic(path, raw);
+          changed = true;
+        });
+      },
     });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
@@ -1763,6 +1792,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     sessionCleanup: {
+      archiveCodex: global.sessionCleanup?.archiveCodex === true,
       enabled: global.sessionCleanup?.enabled === true, // default OFF
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
@@ -1780,6 +1810,35 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config-CAS provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableConfigCoordinator({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `config-dashboard:${process.pid}:${randomBytes(12).toString('hex')}`,
+    })
+  : undefined;
+setDurableConfigCoordinator(dashboardConfigCoordinator);
+// BotOnboardingManager 的 constructor 会立刻恢复中断的 activation marker，
+// 其中可能写 bots.json。必须先注册 durable coordinator，再创建 manager；否则
+// primary 启动时恢复流程会绕过或缺失跨副本 CAS。
+const botOnboarding = new BotOnboardingManager({
+  botsJsonPath: BOTS_JSON_PATH,
+  stopBotLive: spawnStopBotLive,
+  startBotLive: spawnStartBotLive,
+  runBotsMutation: mutation => runDurableConfigMutation({
+    scope: 'bots',
+    path: BOTS_JSON_PATH,
+    mutation: async () => mutation(),
+  }),
+});
+
 async function reloadLocaleOnAllDaemons(): Promise<void> {
   await Promise.all(registry.list().map(d =>
     fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
@@ -1799,6 +1858,14 @@ const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
 );
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
+settingsWriteApplierDeps.runConfigMutation = mutation => runDurableConfigMutation({
+  scope: 'global',
+  path: globalConfigPath(),
+  mutation: async () => {
+    invalidateGlobalConfigCache();
+    return mutation();
+  },
+});
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -2559,10 +2626,17 @@ function pluginPinnedPatch(body: unknown): boolean | null {
   return typeof pinned === 'boolean' ? pinned : null;
 }
 
-function writeDashboardPluginPin(pluginId: string, pinned: boolean): void {
-  const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
-  const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-  mergeDashboardConfig({ pinnedPlugins: next });
+async function writeDashboardPluginPin(pluginId: string, pinned: boolean): Promise<void> {
+  await runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: async () => {
+      invalidateGlobalConfigCache();
+      const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+      const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+      mergeDashboardConfig({ pinnedPlugins: next });
+    },
+  });
 }
 
 function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
@@ -2662,35 +2736,46 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   return { plugins, globalPlugins, bots, gatewayAdapters };
 }
 
-function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
-  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-  assertPluginBindingTransition(pluginId, enabled, current);
-  if (enabled) materializePlugin(pluginId);
-  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  await runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: async () => {
+      invalidateGlobalConfigCache();
+      const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+      assertPluginBindingTransition(pluginId, enabled, current);
+      if (enabled) materializePlugin(pluginId);
+      const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+      mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+    },
+  });
 }
 
 async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
   try { loadBotConfigs(); } catch { return false; }
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-  return withFileLock(path, async () => {
-    const raw = await readRawConfig(path);
-    const index = findEntryIndex(raw, larkAppId);
-    if (index < 0) return false;
-    const entry = raw[index];
-    const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
-    const effective = resolveEffectivePluginIds(
-      { plugins: normalizePluginIdList(current) ?? [] },
-      { plugins: defaults },
-    );
-    assertPluginBindingTransition(pluginId, enabled, effective);
-    if (enabled) materializePlugin(pluginId);
-    const next = updateBotPluginOverride(current, pluginId, enabled);
-    if (next.length > 0) entry.plugins = next;
-    else delete entry.plugins;
-    await writeRawConfigAtomic(path, raw);
-    return true;
+  return runDurableConfigMutation({
+    scope: 'bots',
+    path,
+    mutation: () => withFileLock(path, async () => {
+      const raw = await readRawConfig(path);
+      const index = findEntryIndex(raw, larkAppId);
+      if (index < 0) return false;
+      const entry = raw[index];
+      const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
+      const effective = resolveEffectivePluginIds(
+        { plugins: normalizePluginIdList(current) ?? [] },
+        { plugins: defaults },
+      );
+      assertPluginBindingTransition(pluginId, enabled, effective);
+      if (enabled) materializePlugin(pluginId);
+      const next = updateBotPluginOverride(current, pluginId, enabled);
+      if (next.length > 0) entry.plugins = next;
+      else delete entry.plugins;
+      await writeRawConfigAtomic(path, raw);
+      return true;
+    }),
   });
 }
 
@@ -2734,7 +2819,7 @@ async function handlePluginManagementApi(
     try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
     const pinned = pluginPinnedPatch(body);
     if (pinned === null) return pluginJson(res, 400, { ok: false, error: 'invalid_pinned' });
-    writeDashboardPluginPin(pluginId, pinned);
+    await writeDashboardPluginPin(pluginId, pinned);
     return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
   }
 
@@ -2748,7 +2833,7 @@ async function handlePluginManagementApi(
     const enabled = pluginEnabledPatch(body);
     if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
     try {
-      writeGlobalPluginBinding(pluginId, enabled);
+      await writeGlobalPluginBinding(pluginId, enabled);
     } catch (error) {
       const message = describePluginDependencyError(error);
       if (message) return pluginJson(res, 409, { ok: false, error: message });
@@ -2933,7 +3018,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2952,6 +3037,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       turnTimeoutMs: b.turnTimeoutMs,
       dshRuntime: b.dshRuntime,
       dshProfile: b.dshProfile,
+      cliConfigDir: b.cliConfigDir,
     }]));
   } catch {
     return new Map();
@@ -3001,6 +3087,7 @@ async function configuredBotDefaultsRecoveryRows(
           turnTimeoutMs: bot.turnTimeoutMs,
           dshRuntime: bot.dshRuntime,
           dshProfile: bot.dshProfile,
+          cliConfigDir: bot.cliConfigDir,
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
@@ -3022,12 +3109,12 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -3043,6 +3130,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
     dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
     dshProfile: bot.dshProfile ?? fallback?.dshProfile,
+    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
   };
 }
 
@@ -3897,6 +3985,27 @@ const server = createServer(async (req, res) => {
     // gate; no authorization code or session capability is ever put in a URL.
     if (await dashboardH5Auth.handle(req, res, url)) return;
 
+    // Result entry URLs carry an owner-bound view token valid for the artifact
+    // retention period. The token is distinct from every internal result id.
+    // route owns its identity gate because it must be reachable before the
+    // ordinary management-token gate, while still requiring the exact human
+    // principal bound when the artifact was created.
+    if (await handlePluginResultAccess(req, res, url, {
+      store: pluginResultArtifacts,
+      identity(req) {
+        return resolvePluginResultViewerIdentity(
+          dashboardRequestIdentity(req),
+          dashboardH5Auth.resolve(req),
+        );
+      },
+      loginUrl(returnTo) {
+        const platformLogin = buildPlatformDashboardLoginUrl(returnTo);
+        if (platformLogin) return platformLogin;
+        if (!dashboardH5AuthConfig.enabled) return undefined;
+        return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
+      },
+    })) return;
+
     // Session Web preview is an authenticated, same-origin reverse proxy to an
     // agent-registered literal loopback target. It owns its auth gate because
     // WebSocket upgrades do not pass through decideDashboardAuth; using one
@@ -4314,19 +4423,16 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // 调试终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token。
-    // /api/debug-terminal（创建/关闭）+ /debug-terminal/<id>（xterm 页面）。
-    // WS 升级 /debug-terminal/<id>/ws 在下方 server.on('upgrade') 里由本 manager
-    // 自行校验 cookie（upgrade 不经这段 gate）。
-    if (
-      url.pathname === '/api/debug-terminal'
-      || url.pathname.startsWith('/api/debug-terminal/')
-      || url.pathname.startsWith('/debug-terminal/')
-    ) {
+    // 宿主网页终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token，
+    // 这里再收窄到本机 legacy 管理身份。会 spawn 进程的 POST（新建/关闭）另过控制类
+    // CSRF 门禁。WS 升级 /host-terminal/<id>/ws 在下方 server.on('upgrade') 里由 manager
+    // 自行校验 cookie + 身份（upgrade 不经这段 gate）。
+    if (url.pathname === '/api/host-terminal' || url.pathname.startsWith('/api/host-terminal/')) {
       // H5 sessions are scoped to Dashboard/workbench control. They never
-      // inherit the legacy owner's unrestricted debug shell.
-      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
-      if (debugTerminalManager.handleHttp(req, res, url)) return;
+      // inherit the legacy owner's unrestricted host shell.
+      if (!legacyAuthed || !requestIdentity) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      if (hostTerminalManager.handleHttp(req, res, url)) return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
@@ -4430,6 +4536,27 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
+      if (coordinationModeIsPrimary()) {
+        const daemons = registry.list();
+        if (daemons.length === 0) {
+          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
+        }
+        const snapshots = await Promise.all(daemons.map(daemon =>
+          reconcileDaemonSessions(
+            daemon,
+            aggregator,
+            AbortSignal.timeout(2_500),
+          ),
+        ));
+        if (snapshots.some(snapshot => snapshot === undefined)) {
+          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
+        }
+        for (let index = 0; index < snapshots.length; index += 1) {
+          for (const row of snapshots[index] ?? []) {
+            sessionPresentation.schedule(daemons[index]!.larkAppId, row);
+          }
+        }
+      }
       // Sessions spawned before a bot config carried a display name store the
       // raw appId as botName — resolve through the live registry so consumers
       // (dashboard) always see the human-facing name.
@@ -4517,7 +4644,7 @@ const server = createServer(async (req, res) => {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
             `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-            { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
+            { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idleCleanup: true, idleCleanupSource: 'manual' }), signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
           );
           const text = await upstream.text();
           let parsed: any = null;
@@ -4533,6 +4660,7 @@ const server = createServer(async (req, res) => {
           return {
             sessionId: s.sessionId,
             ok,
+            archiveError: parsed?.archiveError,
             ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
@@ -4591,6 +4719,9 @@ const server = createServer(async (req, res) => {
         settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
+        // 「终端」页只对本机 legacy 管理身份开放（同 /api/host-terminal 门禁），协管者
+        // 虽然 authed 也看不到这个入口。
+        hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
       });
     }
@@ -5351,8 +5482,15 @@ const server = createServer(async (req, res) => {
         }
         patch.delivery = delivery;
       }
-      const currentSkills = readGlobalConfig().skills ?? {};
-      mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+      await runDurableConfigMutation({
+        scope: 'global',
+        path: globalConfigPath(),
+        mutation: async () => {
+          invalidateGlobalConfigCache();
+          const currentSkills = readGlobalConfig().skills ?? {};
+          mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+        },
+      });
       return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
     }
 
@@ -5560,22 +5698,20 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url, {
-      getBotNames: () => {
-        const names = readPersistedBotNames();
-        for (const bot of registry.list()) {
-          const name = bot.botName?.trim();
-          // A daemon can publish its App ID while the Feishu probe warms up.
-          // Keep a known cached name until a real live name is available.
-          if (name && name !== bot.larkAppId) names.set(bot.larkAppId, name);
-        }
-        return names;
-      },
-    })) {
+    if (await handleCustomizationApi(req, res, url)) {
       return;
     }
 
     if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // ─── Agent 配置模板（agents.json）─────────────────────────────────────────
+    // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；写操作在 handler 内另要 canManageHost。
+    if (await handleAgentProfilesApi(req, res, url, {
+      canManageHost: authed,
+      knownBotIds: () => new Set(monitorBotConfigs().map(bot => bot.larkAppId)),
+    })) {
       return;
     }
 
@@ -5944,6 +6080,12 @@ const server = createServer(async (req, res) => {
       if (op === 'locate' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const row = aggregator.getSession(sid);
+      const rootId = typeof row?.rootMessageId === 'string' && row.rootMessageId
+        ? row.rootMessageId
+        : typeof row?.chatId === 'string' && row.chatId
+          ? row.chatId
+          : undefined;
       // Defensive client-side deadline: the daemon side of every op here replies
       // promptly (close resolves its fence on the worker's flushed ACK; restart/
       // resume/start return after a fire-and-forget IPC). Close gets a separate
@@ -5953,6 +6095,12 @@ const server = createServer(async (req, res) => {
       try {
         upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
           method: 'POST',
+          ...(op === 'close' && rootId
+            ? {
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ rootId }),
+              }
+            : {}),
           signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs(op)),
         });
       } catch (err: any) {
@@ -7199,6 +7347,16 @@ const server = createServer(async (req, res) => {
     // 所以在此一次性匹配整张表与原先的穿插排布先后等价。新增穿插路由时别让它的 path 与表内条目重叠。
     if (await handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)) return;
 
+    // GET  /api/bots/:appId/slash-commands — native Lark slash-command catalog.
+    // POST /api/bots/:appId/slash-commands/{sync,sync-one,delete} — writes go
+    // through the P1-11 control gate (same-origin + session-bound CSRF ticket).
+    // 不走纯转发表：写操作必须挂控制类门禁，path 与表内条目互斥。
+    if (await handleNativeSlashCommandsProxy(req, res, url, {
+      identity: requestIdentity,
+      csrfTokens: controlCsrfTokens,
+      proxy: proxyToDaemon,
+    })) return;
+
     if (await handleOncallServiceSecret(req, res, url, { identity: requestIdentity, csrfTokens: controlCsrfTokens })) return;
 
     // GET /api/fs/list?path=… — read-only directory listing for the sandbox-paths
@@ -7645,20 +7803,25 @@ const server = createServer(async (req, res) => {
         }
         stream.write(ev.type, { larkAppId: ev.larkAppId, body });
       });
+      // `source: 'dashboard'` 标出这是本流自己的 15s 心跳：各 daemon 的心跳也经上面的
+      // aggregator 转发过来，前端判断「链路是否逐帧实时」只能拿单一来源的节奏来比。
       const hb = setInterval(() => {
-        stream.write('heartbeat', { ts: Date.now() });
+        stream.write('heartbeat', { ts: Date.now(), source: 'dashboard' });
       }, 15_000);
       // Push a bots.changed frame whenever the online bot roster actually
       // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
       // page can auto-refresh without a manual reload. registry.on fires on
       // every 15s poll and 30s heartbeat rewrite, so gate on a roster signature
       // that ignores lastHeartbeat — otherwise we'd spam a frame every poll.
-      let lastRoster = botsRosterSignature(registry.list());
+      // 连上先推一份名册对账摘要（含 daemon 进程代次）：断线 / 后台挂起期间名册若变了，
+      // 或有 bot 重启过（配置可能随之变了），前端据此补发一次 bots.changed；没变就不
+      // 打扰——Bot 配置页重拉会卸掉编辑器、丢掉未保存的草稿。连接期间的帧见
+      // trackRosterFrames。
+      const roster = trackRosterFrames(registry.list());
+      stream.write(roster.connect.event, { body: roster.connect.body });
       const offRoster = registry.on(online => {
-        const sig = botsRosterSignature(online);
-        if (sig === lastRoster) return;
-        lastRoster = sig;
-        stream.write('bots.changed', { body: { signature: sig } });
+        const frame = roster.next(online);
+        if (frame) stream.write(frame.event, { body: frame.body });
       });
       res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
       return;
@@ -7719,12 +7882,12 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
     // 凭据是路径里的 content capability，绝不能被下面的管理类 Origin 校验误杀。
     if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
-    // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
+    // P1-11：管理类 WS（会话终端 / 宿主终端）升级不经 HTTP 门禁，浏览器对 WS 握手
     // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
     // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
     //
     // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
-    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // 出去的终端页就住在 `t-`），而 `/host-terminal/*` 的另一头是宿主 shell，只认
     // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
     const upgradeRoute = classifyManagementUpgrade(rawUrl);
     const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
@@ -7741,9 +7904,9 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       ].join('\r\n'));
       return;
     }
-    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
-    if (upgradeRoute.route === 'debug-terminal') {
-      if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
+    // 宿主终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
+    if (upgradeRoute.route === 'host-terminal') {
+      if (hostTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
     clientSocket.destroy();
@@ -7815,7 +7978,7 @@ listenWithProbe({
         const upstream = await proxyToDaemon(
           s.larkAppId ?? '',
           `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-          { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
+          { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idleCleanup: true, idleCleanupSource: 'scheduled' }), signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
         );
         const text = await upstream.text();
         let parsed: any = null;
@@ -7825,6 +7988,7 @@ listenWithProbe({
         return {
           sessionId: s.sessionId,
           ok,
+          archiveError: parsed?.archiveError,
           ...(residual ? { residual } : {}),
           error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
         };
@@ -7998,12 +8162,19 @@ function shutdown(): void {
   registry.stop();
   resourceMonitor.stop();
   platformTunnel?.stop();
-  debugTerminalManager.shutdown();
+  hostTerminalManager.shutdown();
   feedbackAnalyticsService?.close();
+  setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
-  server.close(() => process.exit(gracefulProcessExitCode()));
+  server.close(() => {
+    void dashboardCoordinationRuntime?.close()
+      .catch(error => logger.warn(`[durable-config] provider close failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => process.exit(gracefulProcessExitCode()));
+    if (!dashboardCoordinationRuntime) process.exit(gracefulProcessExitCode());
+  });
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+process.on('exit', () => dashboardCoordinationRuntime?.terminate());

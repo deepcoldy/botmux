@@ -137,6 +137,27 @@ describe('schedule form chat picker', () => {
       .toHaveLength(0);
   }
 
+  it('marks the schedule as required and shows its inline error after an empty submit', async () => {
+    const form = await renderForm();
+    const tr = createDashboardTranslator('zh');
+    const nameInput = form.root.findByProps({ name: 'name' });
+    const scheduleInput = form.root.findByProps({ placeholder: tr('schedules.form.scheduleHelp') });
+    const scheduleField = scheduleInput.parent!;
+
+    expect(nameInput.parent!.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
+      .toEqual(['*']);
+    expect(scheduleInput.props.required).toBe(true);
+    expect(scheduleField.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
+      .toEqual(['*']);
+
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(scheduleInput.props['aria-invalid']).toBe(true);
+    expect(scheduleField.findByProps({ className: 'schedule-form-error-inline' }).children)
+      .toEqual(['请输入调度规则']);
+  });
+
   it.each([
     ['create', null],
     ['edit', EDITING],
@@ -330,6 +351,31 @@ describe('schedule form chat picker', () => {
     expect(form.trigger().props.title).toBe('Beta');
     expect(form.trigger().findByType('small').children).toEqual(['已选择 1 个群']);
     expect(form.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('drops the retained topic root once an edited topic schedule moves to another group', async () => {
+    const form = await renderForm({ ...EDITING, executionPosition: 'topic', rootMessageId: 'om_existing' });
+    const rootInput = () => form.root.findByProps({ placeholder: 'om_...' });
+    const submit = () => act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+
+    expect(rootInput().props.value).toBe('om_existing');
+    submit();
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      executionPosition: 'topic',
+      rootMessageId: 'om_existing',
+      chatIds: ['oc_alpha'],
+      updateExecutionPosition: true,
+    }));
+    form.onSubmit.mockClear();
+
+    // The old root belongs to Alpha's thread; keeping it after switching to Beta
+    // would bind the schedule to a topic in a different group.
+    form.toggle();
+    act(() => form.checkbox('oc_beta')!.props.onChange({ currentTarget: { checked: true } }));
+    expect(rootInput().props.value).toBe('');
+    submit();
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(rootInput().props['aria-invalid']).toBe(true);
   });
 
   it.each([

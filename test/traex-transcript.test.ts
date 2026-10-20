@@ -20,8 +20,12 @@ import {
   traexHistorySize,
   traexHistorySidIsOwned,
   traexSessionIdFromRolloutPath,
+  readTraexThreadDetails,
+  readTraexThreadIndex,
+  readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
+import { GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
 let dir: string;
@@ -2827,5 +2831,203 @@ describe('TRAE pid ownership probe on macOS/BSD', () => {
       process.env.PATH = originalPath;
     }
     expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+});
+
+describe('TraeX native thread metadata', () => {
+  it('reads authoritative titles and normalises second timestamps to milliseconds', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    const db = openDatabaseSyncNow(dbPath)!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY,',
+      '  title TEXT NOT NULL,',
+      '  first_user_message TEXT NOT NULL,',
+      '  cwd TEXT NOT NULL,',
+      '  rollout_path TEXT NOT NULL,',
+      '  updated_at INTEGER NOT NULL',
+      ');',
+      "INSERT INTO threads VALUES ('traex-native-id', 'Native renamed title', 'original prompt', '/root/current', '/root/rollout.jsonl', 1787900000);",
+    ].join('\n'));
+    db.close();
+
+    expect(readTraexThreadIndex(dbPath).get('traex-native-id')).toEqual({
+      id: 'traex-native-id',
+      cwd: '/root/current',
+      rolloutPath: '/root/rollout.jsonl',
+      updatedAtMs: 1_787_900_000_000,
+    });
+    // No `preview` column: first_user_message is mutable (0.210 rewrites it),
+    // so it is not origin evidence — the rollout's first-turn rule decides.
+    expect(readTraexThreadDetails(['traex-native-id'], dbPath).get('traex-native-id')).toEqual({
+      id: 'traex-native-id',
+      title: 'Native renamed title',
+    });
+    expect(readTraexThreadTitle('traex-native-id', dbPath)).toBe('Native renamed title');
+  });
+
+  it('returns empty metadata when the state DB is absent', () => {
+    const dbPath = join(dir, 'missing-state.sqlite');
+    expect(readTraexThreadIndex(dbPath).size).toBe(0);
+    expect(readTraexThreadDetails(['missing'], dbPath).size).toBe(0);
+    expect(readTraexThreadTitle('missing', dbPath)).toBeUndefined();
+  });
+
+  /** TraeX 0.208+ `threads` subset: `name` holds the display name (/rename or
+   *  TraeX auto-naming), `title` only mirrors the first prompt (0.209) or stays
+   *  empty (0.210, which fills `preview` instead of `first_user_message`). */
+  function writeModernThreads(dbPath: string, rows: Array<{
+    id: string; name: string | null; title: string; firstUserMessage: string; preview: string;
+  }>): void {
+    const db = openDatabaseSyncNow(dbPath)!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL,',
+      '  updated_at INTEGER NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL,',
+      "  first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    const insert = db.prepare(
+      'INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, title, first_user_message, preview, name) '
+      + 'VALUES (?, ?, 1792249700, 1792249771, ?, ?, ?, ?, ?)',
+    );
+    for (const row of rows) {
+      insert.run(row.id, `/root/.trae/cli/sessions/rollout-${row.id}.jsonl`, '/root/project', row.title, row.firstUserMessage, row.preview, row.name);
+    }
+    db.close();
+  }
+
+  const BOTMUX_ENVELOPE = '<session_id>4f6c2e1a-1111-4222-8333-944455556666</session_id>\n<user_message>\n请只回复两个字：收到。\n</user_message>';
+
+  it('prefers the 0.208+ name column and falls back to preview for the first prompt', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      // 0.210.1 shape: title / first_user_message empty, prompt only in preview.
+      { id: 'native-0210', name: '回复确认收到', title: '', firstUserMessage: '', preview: '请只回复两个字：收到。' },
+      // 0.209.1 shape: title mirrors the first prompt, name is the display name.
+      { id: 'native-0209', name: 'Fix TraeX terminal fence wedge', title: 'hi', firstUserMessage: 'hi', preview: 'hi' },
+      // name not assigned yet → the legacy title column still shows.
+      { id: 'native-unnamed', name: null, title: 'Legacy display title', firstUserMessage: '', preview: '' },
+    ]);
+
+    const index = readTraexThreadDetails(['native-0210', 'native-0209', 'native-unnamed'], dbPath);
+    expect(index.get('native-0210')).toMatchObject({ title: '回复确认收到', firstUserMessage: '请只回复两个字：收到。' });
+    expect(index.get('native-0210')?.botmuxOrigin).toBeUndefined();
+    expect(index.get('native-0209')).toMatchObject({ title: 'Fix TraeX terminal fence wedge', firstUserMessage: 'hi' });
+    expect(readTraexThreadTitle('native-0210', dbPath)).toBe('回复确认收到');
+    expect(readTraexThreadTitle('native-0209', dbPath)).toBe('Fix TraeX terminal fence wedge');
+    expect(readTraexThreadTitle('native-unnamed', dbPath)).toBe('Legacy display title');
+  });
+
+  it('never returns a live title for a botmux-origin thread', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      // ≤0.207: TraeX defaulted the title to the first prompt — the envelope itself.
+      { id: 'botmux-title', name: null, title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: '' },
+      // Older schema rows often left first_user_message empty; title alone must suffice.
+      { id: 'botmux-title-only', name: null, title: BOTMUX_ENVELOPE, firstUserMessage: '', preview: '' },
+      // 0.209/0.210: the auto-generated name looks clean, the prompt is the envelope.
+      { id: 'botmux-named', name: '确认收到消息', title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: BOTMUX_ENVELOPE },
+      { id: 'botmux-preview', name: '[BotMux·Lark] 收到', title: '', firstUserMessage: '', preview: BOTMUX_ENVELOPE },
+    ]);
+
+    for (const id of ['botmux-title', 'botmux-title-only', 'botmux-named', 'botmux-preview']) {
+      expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
+    }
+    // Origin evidence is `preview` only: the two rows that have it are
+    // botmux-origin. Without it (≤0.207 rows) origin is left to the rollout;
+    // their envelope title is still never shown (display safety).
+    for (const id of ['botmux-named', 'botmux-preview']) {
+      expect(readTraexThreadDetails([id], dbPath).get(id)?.botmuxOrigin, id).toBe(true);
+    }
+    for (const id of ['botmux-title', 'botmux-title-only']) {
+      expect(readTraexThreadDetails([id], dbPath).get(id), id).toEqual({ id });
+    }
+  });
+
+  it('derives origin from the original first input, never from mutable display fields', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      // External thread; a later prompt (title / first_user_message, rewritten
+      // by 0.210) and even the name carry an envelope — still external.
+      { id: 'external-later-envelope', name: BOTMUX_ENVELOPE, title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: 'external first prompt' },
+      // External thread renamed with a clean name, later envelope in title.
+      { id: 'external-renamed', name: 'Release checklist', title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: 'external first prompt' },
+      // Botmux thread renamed to something clean, later clean input: still botmux.
+      { id: 'botmux-laundered', name: 'Totally normal name', title: 'plain follow-up', firstUserMessage: 'plain follow-up', preview: BOTMUX_ENVELOPE },
+    ]);
+
+    expect(readTraexThreadDetails(['external-later-envelope'], dbPath).get('external-later-envelope'))
+      .toEqual({ id: 'external-later-envelope', firstUserMessage: 'external first prompt' });
+    expect(readTraexThreadTitle('external-later-envelope', dbPath)).toBeUndefined(); // envelope never displayed
+    expect(readTraexThreadDetails(['external-renamed'], dbPath).get('external-renamed'))
+      .toEqual({ id: 'external-renamed', title: 'Release checklist', firstUserMessage: 'external first prompt' });
+    expect(readTraexThreadTitle('external-renamed', dbPath)).toBe('Release checklist');
+    expect(readTraexThreadDetails(['botmux-laundered'], dbPath).get('botmux-laundered')?.botmuxOrigin).toBe(true);
+    expect(readTraexThreadTitle('botmux-laundered', dbPath)).toBeUndefined();
+  });
+
+  it('marks a botmux v3 goal worker as botmux-origin but keeps a user-run goal session', () => {
+    // Measured on TraeX 0.210.1 goal mode: name is a truncated objective,
+    // title / first_user_message empty, preview = the full /goal objective.
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      { id: 'v3-goal', name: 'Read $BOTMUX_GOAL_PATH. Write files', title: '', firstUserMessage: '', preview: GOAL_COMMAND_OBJECTIVE },
+      { id: 'user-goal', name: 'Ship release notes', title: '', firstUserMessage: '', preview: 'ship the release notes' },
+    ]);
+
+    expect(readTraexThreadDetails(['v3-goal'], dbPath).get('v3-goal')?.botmuxOrigin).toBe(true);
+    expect(readTraexThreadTitle('v3-goal', dbPath)).toBeUndefined();
+    expect(readTraexThreadDetails(['user-goal'], dbPath).get('user-goal')?.botmuxOrigin).toBeUndefined();
+    expect(readTraexThreadTitle('user-goal', dbPath)).toBe('Ship release notes');
+  });
+
+  it('keeps a goal worker botmux-origin after a later normal turn rewrites title / first_user_message', () => {
+    // Measured on TraeX 0.210.1: once a goal-mode thread receives an ordinary
+    // input, title and first_user_message become that input while preview
+    // keeps the goal objective — preview must be judged on its own.
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      { id: 'v3-goal-steered', name: 'Read $BOTMUX_GOAL_PATH. Write files', title: 'status?', firstUserMessage: 'status?', preview: GOAL_COMMAND_OBJECTIVE },
+      { id: 'envelope-preview', name: 'Clean name', title: 'clean follow-up', firstUserMessage: 'clean follow-up', preview: BOTMUX_ENVELOPE },
+    ]);
+
+    for (const id of ['v3-goal-steered', 'envelope-preview']) {
+      expect(readTraexThreadDetails([id], dbPath).get(id)?.botmuxOrigin, id).toBe(true);
+      expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
+    }
+  });
+
+  it('reads only identity columns for the index and prompt columns only for requested ids', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, Array.from({ length: 450 }, (_, i) => ({
+      id: `t-${i}`, name: `Name ${i}`, title: `prompt ${i}`, firstUserMessage: `prompt ${i}`, preview: `prompt ${i}`,
+    })));
+
+    const index = readTraexThreadIndex(dbPath);
+    expect(index.size).toBe(450);
+    expect(Object.keys(index.get('t-1')!).sort()).toEqual(['cwd', 'id', 'rolloutPath', 'updatedAtMs']);
+    // More ids than one IN (...) batch, plus unknown / duplicate ids.
+    const ids = [...Array.from({ length: 450 }, (_, i) => `t-${i}`), 't-3', 'nope'];
+    const details = readTraexThreadDetails(ids, dbPath);
+    expect(details.size).toBe(450);
+    expect(details.get('t-449')).toEqual({ id: 't-449', title: 'Name 449', firstUserMessage: 'prompt 449' });
+    expect(readTraexThreadDetails(['t-7'], dbPath).size).toBe(1);
+  });
+
+  it('reads the title from schemas that predate first_user_message / name / preview', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    const db = openDatabaseSyncNow(dbPath)!;
+    db.exec([
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL);',
+      "INSERT INTO threads VALUES ('old-native', '/r.jsonl', 1787900000, '/root/old', 'Old schema title');",
+      "INSERT INTO threads VALUES ('old-botmux', '/r2.jsonl', 1787900000, '/root/old', '<user_message>hi</user_message>');",
+    ].join('\n'));
+    db.close();
+
+    expect(readTraexThreadIndex(dbPath).get('old-native')).toMatchObject({ cwd: '/root/old' });
+    expect(readTraexThreadDetails(['old-native'], dbPath).get('old-native')).toMatchObject({ title: 'Old schema title' });
+    expect(readTraexThreadTitle('old-native', dbPath)).toBe('Old schema title');
+    expect(readTraexThreadTitle('old-botmux', dbPath)).toBeUndefined();
   });
 });

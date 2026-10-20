@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
+import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
 
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
@@ -97,6 +97,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS=5000',
       'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS=30000',
       'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=0',
+      'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+      'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     ].join('\n'))).toMatchObject({
       BOTMUX_COORDINATION_MODE: 'primary',
       BOTMUX_COORDINATION_PROVIDER_BIN: '/opt/botmux/provider',
@@ -104,6 +106,8 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS: '5000',
       BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS: '30000',
       BOTMUX_FORWARD_FOLLOWUP_WAIT_MS: '0',
+      BOTMUX_GLOBAL_CONFIG_FILE: '/mnt/shared/global-config.json',
+      BOTMUX_GROUP_CONTEXT_SETTINGS_FILE: '/mnt/shared/group-context-settings.json',
     });
   });
 
@@ -235,16 +239,19 @@ describe('DAEMON_ENV_KEYS enforces fleet credential boundaries', () => {
   });
 
   it('keeps every var resolveDashboardH5AuthConfig reads OFF the whitelist (drift guard)', () => {
-    // Scrape the single consumer's source: an H5 knob added to h5-auth.ts and
-    // then "helpfully" whitelisted here would put a credential-family key back
-    // into the shared fleet block. Also sweep the whole prefix so no future
-    // DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
-    const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
-    const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
-    expect(read.size).toBeGreaterThan(0);
-    for (const key of read) {
-      expect(DAEMON_ENV_KEYS as readonly string[], key).not.toContain(key);
-    }
+    // Record what the single consumer actually reads: an H5 knob added to
+    // h5-auth.ts and then "helpfully" whitelisted here would put a
+    // credential-family key back into the shared fleet block. The only shared
+    // key it may read is the non-secret public URL.
+    const read = new Set<string>();
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, key) => { if (typeof key === 'string') read.add(key); return undefined; },
+    });
+    resolveDashboardH5AuthConfig(env);
+    expect([...read].filter(key => key.startsWith(DASHBOARD_H5_ENV_PREFIX)).length).toBeGreaterThan(0);
+    const shared = [...read].filter(key => (DAEMON_ENV_KEYS as readonly string[]).includes(key));
+    expect(shared).toEqual(['BOTMUX_PUBLIC_URL']);
+    // Sweep the whole prefix so no future DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
     for (const key of DAEMON_ENV_KEYS) {
       expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(false);
     }

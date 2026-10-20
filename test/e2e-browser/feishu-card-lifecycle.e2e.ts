@@ -61,7 +61,7 @@ export function registerMidsceneSuites(): void {
 
     it('full card lifecycle: active status → toggle → no artifacts → idle', async () => {
       const msg = testMessage('card');
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Wait for bot to respond, open thread panel, handle repo selection
       await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });
