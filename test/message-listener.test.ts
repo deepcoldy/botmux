@@ -1046,4 +1046,46 @@ describe('refreshListenerForwardTextFromParsed', () => {
     refreshListenerForwardTextFromParsed(match, '<forwarded_messages />');
     expect(match.messageText).toBe('原始正文');
   });
+
+  it('does not re-fill when rerouted with the already-rendered listener prompt (CAS-loser regression)', () => {
+    // A new-topic registration that loses to an existing session re-enters the
+    // thread route carrying the same parsed object — whose content was already
+    // replaced by the rendered listener prompt. Filling again would embed the
+    // whole prompt inside <observed_message> and double-escape the body.
+    const match = {
+      prompt: '整理转发内容',
+      messageText: '',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+    const expanded = '<forwarded_messages>\n<msg from="A">转发正文：登录失败</msg>\n</forwarded_messages>';
+
+    refreshListenerForwardTextFromParsed(match, expanded);
+    const firstPrompt = renderMessageListenerPrompt(match);
+
+    // Reroute: the caller now hands back the prompt that the first render produced.
+    refreshListenerForwardTextFromParsed(match, firstPrompt);
+    const secondPrompt = renderMessageListenerPrompt(match);
+
+    expect(match.messageText).toBe(expanded);
+    expect(secondPrompt).toBe(firstPrompt);
+    // The observed body is the forwarded XML exactly once (single-escape) —
+    // never a nested listener prompt.
+    expect(secondPrompt).not.toContain('&lt;message_listener&gt;');
+    expect(secondPrompt.match(/&lt;forwarded_messages&gt;/g)).toEqual(['&lt;forwarded_messages&gt;']);
+    expect(secondPrompt).toContain('转发正文：登录失败');
+    expect(secondPrompt).not.toContain('&amp;lt;forwarded_messages&amp;gt;');
+  });
+
+  it('ignores an empty expanded body without blanking a previously filled match', () => {
+    const match = {
+      prompt: 'p',
+      messageText: '<forwarded_messages>\n<msg from="A">x</msg>\n</forwarded_messages>',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+
+    refreshListenerForwardTextFromParsed(match, '   ');
+    expect(match.messageText).toBe('<forwarded_messages>\n<msg from="A">x</msg>\n</forwarded_messages>');
+  });
 });
