@@ -31,6 +31,7 @@ import {
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { AdoptableSession } from '../src/core/session-discovery.js';
+import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
@@ -120,6 +121,25 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
     expect(texts[0]).not.toContain('Session ID:');
+  });
+
+  it('renders a native title for a live TraeX session instead of the project directory', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'tmux',
+      tmuxTarget: 'traex:0.0',
+      cliPid: 42,
+      cliId: 'traex',
+      sessionId: 'traex-session-id',
+      title: 'Investigate rollout title metadata',
+      cwd: '/Users/test/project-dir',
+      paneCols: 120,
+      paneRows: 40,
+    }], 'om_root', 'en'));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('Investigate rollout title metadata');
+    expect(texts[0]).not.toMatch(/^\*\*project-dir\*\*/);
   });
 
   it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
@@ -280,16 +300,28 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     const tmux: AdoptableSession = {
       source: 'tmux', tmuxTarget: 'dev:0.0', cliPid: 42, cliId: 'codex', cwd: '/work/alpha', paneCols: 80, paneRows: 24,
     };
-    // A stray `title` on a zellij target must not leak into the heading.
-    const zellij = {
-      zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex' as const,
-      cwd: '/work/beta', paneCols: 80, paneRows: 24, title: '修复登录页样式',
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid: 7, cliId: 'codex',
+      cwd: '/work/beta', paneCols: 80, paneRows: 24,
     };
-    const texts = cardTexts(parse(buildAdoptSelectCard([tmux, zellij as any], 'om_root', 'en')));
+    const texts = cardTexts(parse(buildAdoptSelectCard([tmux, zellij], 'om_root', 'en')));
     expect(texts).toEqual([
       ['**alpha**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/alpha`', 'Location: `dev:0.0`', 'Uptime: unknown'].join('\n'),
       ['**beta**', 'Source: 🟢 Running', 'CLI: Codex', 'Path: `/work/beta`', 'Location: `mywork/terminal\\_1`', 'Uptime: unknown'].join('\n'),
     ]);
+  });
+
+  it('titles a zellij TraeX entry by the native title its discovery resolved', () => {
+    // zellij discovery only sets `title` for TraeX, through traexLiveTitle
+    // (botmux-origin filtered, cleaned like herdr titles).
+    const zellij: ZellijAdoptableSession = {
+      zellijSession: 'mywork', zellijPaneId: 'terminal_2', cliPid: 8, cliId: 'traex',
+      cwd: '/work/gamma', paneCols: 80, paneRows: 24, title: '回复确认收到',
+    };
+    const texts = cardTexts(parse(buildAdoptSelectCard([zellij], 'om_root', 'en')));
+    expect(texts).toHaveLength(1);
+    expect(texts[0]!.split('\n')[0]).toBe('**回复确认收到**');
+    expect(texts[0]).toContain('Path: `/work/gamma`');
   });
 });
 

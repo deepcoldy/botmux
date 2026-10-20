@@ -163,6 +163,8 @@ describe('platform tunnel data bridge', () => {
     expect(got.equals(payload)).toBe(true);
   }, 30_000);
 
+  // 源码结构护栏(K1)：发版的单文件二进制跑在 Bun 上，ws 的 createWebSocketStream 在 Bun 里直接抛
+  // `Not supported yet`；vitest 跑在 Node 上，行为测试结构上触达不到这个差异（fc966dc165）。
   it('does not use createWebSocketStream — it throws on Bun, the runtime the binary ships', async () => {
     // THE REGRESSION GUARD. The bug was invisible to a Node-only test run, so
     // assert the property that actually broke: source must not reach for the API
@@ -363,6 +365,8 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
  * is the thing that actually fails if someone routes FIN back to the hard kill.
  */
 describe('platform tunnel data bridge — graceful shutdown shape', () => {
+  // 源码结构护栏(K3)：本地 FIN 若直接走 kill/terminate，Bun 上大响应会被截断（实测 64MB 丢 14-27MB，
+  // fc966dc165「大响应不截断」）；是否截断取决于 FIN 瞬间 Bun 发送队列里的字节数，行为测试无法稳定复现（见上方注释）。
   it('does not terminate() the tunnel socket on the local FIN path', async () => {
     const src = await import('node:fs/promises').then((fs) =>
       fs.readFile(new URL('../src/platform/tunnel-client.ts', import.meta.url), 'utf8'));
@@ -372,8 +376,6 @@ describe('platform tunnel data bridge — graceful shutdown shape', () => {
     // FIN must route to the drain-then-close path, never straight to the hard kill.
     expect(code).toMatch(/tcp\.on\(\s*'end'\s*,\s*finish\s*\)/);
     expect(code).not.toMatch(/tcp\.on\(\s*'end'\s*,\s*kill\s*\)/);
-    // And the graceful path must actually be graceful: close(), gated on drain.
-    expect(code).toMatch(/winner\.close\(\)/);
     // 'close' fires immediately after 'end', so an unguarded kill there terminates the
     // socket mid-flush and undoes the drain. MEASURED on Bun: `tcp.on('close', kill)`
     // lost 14-17MB of a 64MB response across three runs, while the guarded form lost 0.

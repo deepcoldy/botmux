@@ -204,6 +204,7 @@ vi.mock('../src/core/scheduled-turn-provenance.js', async (importOriginal) => {
 import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  adoptSandboxBlocked,
   auxUiSuppressedFor,
   detachWorkerForTransfer,
   ensureOrdinaryTurnRecoveryAttached,
@@ -242,6 +243,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
@@ -465,6 +467,25 @@ describe('host memory pressure worker admission', () => {
 
     expect(forkMock).toHaveBeenCalledTimes(1);
     expect(admissions).toEqual(['accepted']);
+  });
+
+  it('forks the worker without the pm2 graceful-exit sentinel or the bot GitHub tokens', () => {
+    // The sentinel is the daemon/dashboard cores' private exit code: a worker
+    // that inherited it would exit 90 on a clean stop, read as a crash.
+    const keys = ['BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
+    const prev = keys.map(key => process.env[key]);
+    keys.forEach(key => { process.env[key] = 'leaked'; });
+    try {
+      expect(forkWorker(makeDs(), 'hello', false)).toBe(true);
+      const options = forkMock.mock.calls[0]![2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.PATH).toBeDefined();
+      for (const key of keys) expect(key in options.env, key).toBe(false);
+    } finally {
+      keys.forEach((key, i) => {
+        if (prev[i] === undefined) delete process.env[key];
+        else process.env[key] = prev[i];
+      });
+    }
   });
 
   it('leaves explicit retry ownership with the caller during device isolation', async () => {
@@ -3953,6 +3974,30 @@ describe('persistent backend target handoff', () => {
       persistentBackendTarget: target,
     }));
   });
+
+  it('passes the herdr config when herdr comes from the session stamp rather than the bot', () => {
+    // The bot sets no backendType, so herdr is decided by the stamp (or the
+    // daemon-wide BACKEND_TYPE). The env-level herdr config must still reach
+    // the worker, with the bot's own herdr fields layered over it.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ herdr: { tab: '3' } }));
+    const daemon = config.daemon as { herdr?: unknown };
+    daemon.herdr = { sessionName: 'default', placement: 'split', tab: '9' };
+    try {
+      const ds = makeDs();
+      ds.session.backendType = 'herdr';
+
+      forkWorker(ds, 'resume', true);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+        type: 'init',
+        backendType: 'herdr',
+        backendConfig: { sessionName: 'default', placement: 'split', tab: '3' },
+      }));
+    } finally {
+      delete daemon.herdr;
+    }
+  });
 });
 
 describe('no-transport read isolation follows local sandbox config (not forced)', () => {
@@ -3960,7 +4005,7 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
   // only — driven purely by explicit per-bot `readIsolation` — so a no-transport
   // session with no sandbox config reads the disk like a normal chat. The env
-  // secret-withhold (asserted in api-only-mode-wiring) is a SEPARATE boundary and
+  // secret-withhold (asserted in the describe below) is a SEPARATE boundary and
   // stays independent of this.
   const readInit = () => {
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3999,6 +4044,67 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
     const ds = makeDs();
     forkWorker(ds, 'hello', false);
     expect(readInit().readIsolation).toBe(false);
+  });
+});
+
+describe('no-transport workers never receive the Lark app secret', () => {
+  // The secret is withheld at the daemon→worker boundary (fork env AND init
+  // message) rather than trusting an apiOnly flag the sandboxed agent could
+  // flip; both fork paths (fresh + adopt) must do it.
+  const lastFork = (ds: DaemonSession) => ({
+    env: (forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> }).env ?? {},
+    init: vi.mocked((ds.worker as any).send).mock.calls[0][0],
+  });
+  const virtualDs = (overrides: Partial<DaemonSession> = {}) => makeDs({
+    chatId: 'http_async_secret', session: { ...makeDs().session, chatId: 'http_async_secret' }, ...overrides,
+  });
+  const adoptedFrom = {
+    source: 'tmux', tmuxTarget: 'work:0.0', originalCliPid: 4242, sessionId: 'sess-adopt-secret',
+    cliId: 'claude-code', cwd: '/repo', paneCols: 200, paneRows: 50,
+  } as DaemonSession['adoptedFrom'];
+
+  it('apiOnly bot: empty secret in fork env and init even when bots.json carries one', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: 'real-secret' }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('');
+    expect(init.larkAppSecret).toBe('');
+    expect(init.apiOnly).toBe(true);
+  });
+
+  it('HTTP virtual chat on a normal bot: secret withheld, and the adopt path never forks at all', () => {
+    const fresh = virtualDs();
+    forkWorker(fresh, 'hello', false);
+    expect(lastFork(fresh).env.LARK_APP_SECRET).toBe('');
+    expect(lastFork(fresh).init.larkAppSecret).toBe('');
+
+    // Adopt would attach an unconfined pre-existing CLI: refused before any fork
+    // and the stale adopt metadata is dropped so it cold-starts instead.
+    forkMock.mockClear();
+    const adopted = virtualDs({ adoptedFrom });
+    forkAdoptWorker(adopted, { prompt: 'hi', turnId: 'om_adopt_secret' });
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(adopted.adoptedFrom).toBeUndefined();
+  });
+
+  it('a real chat keeps the secret, and the init freezes the daemon-loaded bots config path', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('secret');
+    expect(init.larkAppSecret).toBe('secret');
+    // Host-owned facts the worker's fs policy denies against — never re-guessed
+    // from env inside the worker.
+    expect(init.loadedBotsConfigPath).toBe('/home/u/.botmux/bots.json');
+    expect(init.loadedBotsConfigProvenance).toBe('loaded');
+  });
+
+  it('adopt-observe is refused for apiOnly bots and HTTP virtual chats (cold-start instead)', () => {
+    expect(adoptSandboxBlocked({ apiOnly: true })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'http_async_adopt' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'headless_hl_adopt1234' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'oc_real_chat' })).toBe(false);
   });
 });
 
@@ -8238,4 +8344,49 @@ it('an admitted Codex successor fences old recovery even when saving its new sta
   await vi.advanceTimersByTimeAsync(60_000);
   expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
   expect(vi.mocked(worker.send).mock.calls.map(c => c[0] as any).filter(m => m?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+});
+
+describe('/btw side answer relay', () => {
+  const forkWithReply = (overrides?: Partial<DaemonSession>) => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    expect(forkWorker(makeDs(overrides), 'hello', false)).toBe(true);
+    return { sessionReply, worker: forkMock.mock.results.at(-1)!.value };
+  };
+
+  it('replies under the /btw turn, capping long answers and flagging screen-read ones', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_short', question: 'what is 1+1?', answer: 'Two.', source: 'clipboard' });
+    const long = `${'a'.repeat(6_000)}TAIL_BEYOND_CAP`;
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_clip', question: 'long?', answer: long, source: 'clipboard' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_screen', question: 'long?', answer: long, source: 'screen' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([
+      ['interactive', 'om_btw_short'],
+      ['interactive', 'om_btw_clip'],
+      ['interactive', 'om_btw_screen'],
+    ]);
+    const [short, clip, screen] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(short).toContain('what is 1+1?');
+    expect(short).toContain('Two.');
+    for (const card of [clip, screen]) {
+      expect(card).toContain('a'.repeat(1_000));
+      expect(card).not.toContain('TAIL_BEYOND_CAP');
+    }
+    // A screen-read answer carries an extra "may be partial" note.
+    expect(screen.length).toBeGreaterThan(clip.length);
+  });
+
+  it('drops the answer when the session has no Lark transport', async () => {
+    const { sessionReply, worker } = forkWithReply({ chatId: 'http_async_btw' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw', question: 'q', answer: 'a', source: 'clipboard' });
+    await new Promise(resolveTick => setTimeout(resolveTick, 20));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
 });

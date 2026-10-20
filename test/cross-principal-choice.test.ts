@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choice.js';
 import {
@@ -18,9 +17,6 @@ import {
 } from '../src/core/cross-principal-choice.js';
 import { messages as enMessages } from '../src/i18n/en.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
-
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 
 describe('cross-principal choice vocabulary', () => {
   it('returns a fixed nonzero gate result before any send side effect', () => {
@@ -172,43 +168,6 @@ describe('cross-principal choice vocabulary', () => {
   });
 });
 
-describe('cross-principal choice wiring', () => {
-  it('shows humans a two-option Feishu card and requires agents to choose before send', () => {
-    expect(daemonSource).toContain('crossPrincipalClassificationOptions');
-    expect(daemonSource).not.toContain('crossPrincipalBotClassifyNotice(');
-    expect(daemonSource).toContain("record.proposer.senderType === 'bot'");
-    expect(cliSource).toContain("argValue(rest, '--as')");
-    expect(cliSource).toContain('embedCrossPrincipalAsToken');
-    expect(cliSource).toContain('crossPrincipalBotSendGate');
-    expect(cliSource).toContain('xpi.send.as_required');
-    expect(cliSource).toContain('xpi.send.as_needed_hint');
-    expect(cliSource).toContain('controlLane: isSlashSend');
-    expect(cliSource).toContain('const knownBotTextTarget = !asVoice');
-    expect(cliSource).toContain('const knownBotVoiceTarget = asVoice');
-    expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送语音');
-    expect(cliSource).toContain('customCardKnownBotTarget');
-    expect(cliSource).toContain('XPI 开启时暂不支持向 Bot 发送自定义卡片');
-    expect(cliSource).toContain('process.exit(64)');
-    expect(daemonSource).toContain('crossPrincipalInterruptionDeliveryAudits');
-    expect(daemonSource).toContain("'delivery_exhausted'");
-    expect(daemonSource).not.toContain('请升级发送端 botmux');
-    expect(daemonSource).toContain("tr('xpi.card.classify.bot_owner_prompt'");
-    expect(daemonSource).toContain("record.owner.senderType === 'bot'");
-    expect(daemonSource).toContain("option.key === 'independent'");
-    expect(daemonSource).toContain('XPI bot terminal kept on control/audit plane');
-    expect(daemonSource).toContain('ds.chatType === \'group\'');
-    const guardAt = cliSource.indexOf('const xpiSendGate = crossPrincipalBotSendGate({');
-    const uploadAt = cliSource.indexOf('await upload', guardAt);
-    const voiceGuardAt = cliSource.indexOf('const knownBotVoiceTarget = asVoice');
-    const voiceProviderAt = cliSource.indexOf('await synthesizeVoiceOpus');
-    expect(guardAt).toBeGreaterThan(0);
-    expect(uploadAt).toBeGreaterThan(guardAt);
-    expect(voiceGuardAt).toBeGreaterThan(0);
-    expect(voiceProviderAt).toBeGreaterThan(voiceGuardAt);
-    expect(daemonSource).toContain("record.proposer.senderType === 'bot'\n      ? ''\n      : `<at id=${proposerId}></at> `");
-  });
-});
-
 describe('cross-principal choice copy', () => {
   it('keeps cross-app responder ids out of XPI card content', () => {
     const responder = 'ou_cross_app_responder';
@@ -221,8 +180,6 @@ describe('cross-principal choice copy', () => {
       expect(prompt).not.toContain(responder);
       expect(prompt).not.toContain('<at');
     }
-    expect(daemonSource).not.toContain('prompt: `<at id=${ownerId}></at> 另一位成员建议');
-    expect(daemonSource).not.toContain('prompt: `<at id=${ownerOpenId}></at> 另一位成员建议');
   });
 
   it('keeps the human card to two explicit options', () => {

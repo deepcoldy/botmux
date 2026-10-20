@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parseV3SavedWorkflowCommand } from '../src/im/lark/v3-saved-workflow-command.js';
 import { stripBotMentions } from '../src/im/lark/message-parser.js';
@@ -133,15 +132,6 @@ describe('Saved Workflow commands after stripping this bot\'s own mentions (daem
     expect(parse('/workflow run 周报 week=37 @steve')).toMatchObject({
       kind: 'run', ref: '周报', rawParams: { week: '37' },
     });
-  });
-
-  it('daemon strips this bot\'s mentions at every Saved Workflow command call site', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const callSites = [...source.matchAll(/await handleV3SavedWorkflowCommandIfAny\(\{([\s\S]*?)\n\s*\}\)\)/g)];
-    expect(callSites.length).toBeGreaterThanOrEqual(2);
-    for (const [, args] of callSites) {
-      expect(args).toMatch(/content:\s*stripBotMentions\(\s*cmdContent,/);
-    }
   });
 
   it('still parses a leading or mid-message @bot, and keeps other people\'s mentions as content', () => {

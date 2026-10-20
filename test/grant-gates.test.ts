@@ -21,6 +21,18 @@ describe('grant gates', () => {
     bot.config.globalGrants = ['ou_global', 'ou_both'];
   });
 
+  it.each([true, false])('email hiding preserves permission decisions with senderTag=%s', senderTag => {
+    const bot = getBot('g1');
+    bot.config.senderTag = senderTag;
+    const decisions = () => ['ou_owner', 'ou_guest', 'ou_stranger'].map(user => ({
+      talk: canTalk('g1', 'oc_1', user), operate: canOperate('g1', 'oc_1', user),
+    }));
+    const before = decisions();
+    bot.config.senderTagHideEmail = true;
+    expect(decisions()).toEqual(before);
+    expect(bot.resolvedAllowedUsers).toEqual(['ou_owner']);
+  });
+
   it('chatGrant grants canTalk in that chat only', () => {
     expect(canTalk('g1', 'oc_1', 'ou_guest')).toBe(true);
     expect(canTalk('g1', 'oc_2', 'ou_guest')).toBe(false);

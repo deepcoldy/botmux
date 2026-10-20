@@ -1,6 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { t } from '../src/i18n/index.js';
 
 /**
  * #1260：文档评论事件被丢弃时给触发回复打 ❌，让「这条 @ 我没能处理」看得见。
@@ -11,24 +11,52 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const mocks = vi.hoisted(() => ({
+  events: {} as Record<string, (data: unknown) => void>,
   addCommentReactionChecked: vi.fn(),
   isBotAuthoredReply: vi.fn(() => false),
+  getDocComment: vi.fn(),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
   getBot: vi.fn(() => ({ botOpenId: 'ou_selfbot', config: {} })),
   sendUserMessage: vi.fn(),
+  getDocSubscription: vi.fn(),
+  putDocSubscription: vi.fn(),
+  removeDocSubscription: vi.fn(),
+  settleDocCommentWsDelivery: vi.fn(),
+  recordDocWatchActivity: vi.fn(),
+  handleDocComment: vi.fn(),
   debug: vi.fn(),
   info: vi.fn(),
   rollback: vi.fn(),
 }));
 
-vi.mock('../src/im/lark/doc-comment.js', () => ({
+vi.mock('@larksuiteoapi/node-sdk', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  EventDispatcher: class {
+    register(events: typeof mocks.events) {
+      mocks.events = events;
+      return this;
+    }
+  },
+}));
+
+vi.mock('../src/im/lark/transport/connection.js', () => ({ startLarkConnection: vi.fn() }));
+
+vi.mock('../src/im/lark/doc-comment.js', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   addCommentReactionChecked: mocks.addCommentReactionChecked,
   addCommentReaction: vi.fn(),
-  getDocComment: vi.fn(),
+  getDocComment: mocks.getDocComment,
   isBotAuthoredReply: mocks.isBotAuthoredReply,
-  hasBotSentinel: vi.fn(() => false),
-  commentTriggerAllowed: vi.fn(() => true),
-  BOT_REPLY_SENTINEL: '​',
+  fetchDocTitle: vi.fn(async () => undefined),
+}));
+
+vi.mock('../src/services/doc-subs-store.js', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getDocSubscription: mocks.getDocSubscription,
+  putDocSubscription: mocks.putDocSubscription,
+  removeDocSubscription: mocks.removeDocSubscription,
+  settleDocCommentWsDelivery: mocks.settleDocCommentWsDelivery,
+  recordDocWatchActivity: mocks.recordDocWatchActivity,
 }));
 
 vi.mock('../src/im/lark/client.js', async (importOriginal) => ({
@@ -126,6 +154,18 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
     expect(mocks.rollback).not.toHaveBeenCalled();
   });
 
+  /**
+   * 失败标记给 owner 的通知必须是「事件未处理」文案；退回审计门默认的 'reply' 文案
+   * 就是 180f2b4 修掉的「失败通知谎称已触发回复」。
+   */
+  it('非 owner 触发失败标记时，owner 收到的是「未处理」通知而不是「已触发回复」', async () => {
+    await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
+    const text = String(mocks.sendUserMessage.mock.calls[0]?.[2]);
+    const locales = ['zh', 'en'] as const;
+    expect(locales.some(loc => text.startsWith(t('daemon.doc_dropped_notify_title', undefined, loc)))).toBe(true);
+    for (const loc of locales) expect(text).not.toContain(t('daemon.doc_mention_notify_title', undefined, loc));
+  });
+
   it('非 owner + owner 通知失败：拒绝、不打、回滚（owner 无法感知 = 越权）', async () => {
     mocks.sendUserMessage.mockRejectedValue(new Error('DM 发不出去'));
     const outcome = await markCommentEventDropped('app-test', FILE, COMMENT_ID, REPLY_ID, 'ou_someone_else', 'summary', mocks.rollback);
@@ -207,170 +247,170 @@ describe('markCommentEventDropped: 丢弃事件在文档里留下可见标记', 
 });
 
 /**
- * 接线点用源码形状钉住：processCommentEvent 没有导出，且要跑通它得 mock 订阅表、
- * open_id 探针、审计通知等整条链路。这里按仓库已有做法钉源码形状，保证标记被接在
- * **该接的那两个丢弃点**上，且**没有**被接到不该打的那几个上。
+ * processCommentEvent 本身没有导出：经 startLarkEventDispatcher 注册的
+ * drive.notice.comment_add_v1 处理器真实跑一遍（订阅表、拉评论、通知、投递都 mock），
+ * 断言三个丢弃点的 ❌、auto-sub 回滚、结局记录与 WS 投递的 settle。
  */
-describe('processCommentEvent 的接线点（源码形状）', () => {
-  const src = readFileSync(new URL('../src/im/lark/event-dispatcher.ts', import.meta.url), 'utf-8');
+describe('processCommentEvent：丢弃点的失败标记、auto-sub 回滚与投递结局', () => {
+  const BOT = 'ou_selfbot';
+  const STRANGER = 'ou_stranger';
+  const APP = 'app-drop-signal';
 
-  /**
-   * 取源码区间。**每个锚点都必须先断言找得到** —— `indexOf` 找不到返回 -1，
-   * `slice(-1, n)` 会静默给出空串，下面的 `not.toContain` 就必然通过，测试变成
-   * 永远绿的空断言。而这几条负向断言的全部价值就是「防止后续有人把标记顺手扩大
-   * 到所有 return」，假绿等于没测。
-   */
-  function regionBetween(startAnchor: string, endAnchor: string, from = 0): string {
-    const start = src.indexOf(startAnchor, from);
-    expect(start, `锚点失效（源码已变动？）: ${startAnchor}`).toBeGreaterThan(-1);
-    const end = src.indexOf(endAnchor, start);
-    expect(end, `锚点失效（源码已变动？）: ${endAnchor}`).toBeGreaterThan(-1);
-    return src.slice(start, end);
-  }
+  const thread = (author: string, text: string, mentions: string[], replyId = REPLY_ID) => ({
+    commentId: COMMENT_ID, isWhole: false, isSolved: false,
+    replies: [{ replyId, userId: author, text, mentions }],
+  });
+  const subscription = (commentTriggerMode: 'mention-only' | 'all') => ({
+    fileToken: FILE.fileToken, fileType: 'docx', ownerOpenId: OWNER,
+    sessionAnchor: `doc:${FILE.fileToken}`, commentTriggerMode, docTitle: 'Doc',
+  });
+  const dispatch = async (opts: { isMentioned?: boolean; operator?: string } = {}) => {
+    mocks.events['drive.notice.comment_add_v1']({
+      comment_id: COMMENT_ID,
+      reply_id: REPLY_ID,
+      is_mentioned: opts.isMentioned ?? true,
+      notice_meta: {
+        file_token: FILE.fileToken, file_type: 'docx', notice_type: 'add_reply',
+        to_user_id: { open_id: BOT }, from_user_id: { open_id: opts.operator ?? OWNER },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1);
+  };
+  const outcomes = () => mocks.recordDocWatchActivity.mock.calls.map(call => call[3].outcome);
 
-  const region = regionBetween('async function processCommentEvent', 'export function startLarkEventDispatcher');
+  /** 三个会打 ❌ 的丢弃点：拉不到评论 / 触发回复不在拉到的回复里（分页截断）/ 纯 @bot 无正文。 */
+  const DROPS = {
+    'no-comment': () => null,
+    'trigger-missing': () => thread(OWNER, '请整理这一段', [BOT], 'reply-outside-fetched-page'),
+    'empty-text': () => thread(OWNER, '', [BOT]),
+  } as const;
 
-  it('三个该打的丢弃点都接上了：拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文', () => {
-    expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(3);
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    for (const fn of Object.values(mocks)) if (typeof fn === 'function' && 'mockReset' in fn) fn.mockReset();
+    mocks.getOwnerOpenId.mockReturnValue(OWNER);
+    mocks.getBot.mockReturnValue({ botOpenId: BOT, config: {} });
+    mocks.isBotAuthoredReply.mockReturnValue(false);
+    mocks.sendUserMessage.mockResolvedValue('om_notice');
+    mocks.addCommentReactionChecked.mockResolvedValue({ ok: true });
+    mocks.getDocSubscription.mockReturnValue(subscription('mention-only'));
+    mocks.handleDocComment.mockResolvedValue(true);
+    const dispatcher = await import('../src/im/lark/event-dispatcher.js');
+    dispatcher.__resetEventClaimsForTest();
+    dispatcher.startLarkEventDispatcher(APP, 'test-secret', {
+      handleDocComment: mocks.handleDocComment,
+    } as unknown as import('../src/im/lark/event-dispatcher.js').EventHandlers);
   });
 
-  it('前两个打点都必须收窄，不能在别人的评论上打标记', () => {
-    // trigger 缺失只证明回复数据不完整，不证明这条回复冲 bot 来的 —— 已订阅文档下
-    // 别人的普通回复同样推事件，那条 reply 没被拉到就会走到第二个打点。
-    const firstDrop = regionBetween('取不到评论内容', 'const trigger = parsed.replyId');
-    const secondDrop = regionBetween('不在拉到的', 'const triggerIndex');
-    expect(firstDrop).toContain('mayConcernThisBot');
-    expect(secondDrop).toContain('mayConcernThisBot');
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
   });
 
-  /**
-   * 三个打点的闸口必须一致，且**只在 mention-only 下打**。
-   * 'all' 有列表 poller 兜底；mention-only 的 pending 要到正文/@/审计均通过后
-   * 才建立，所以本文件覆盖的 pre-dispatch 读失败仍不能靠 pending 恢复；
-   * 而 ❌ 是终态不清理，在 'all' 下打就会永久挂在一条根本没丢的评论上。
-   */
-  it("收窄谓词只认 mention-only + is_mentioned（'all' 有轮询兜底，不该打)", () => {
-    expect(region).toContain(`sub.commentTriggerMode === 'mention-only' && parsed.isMentioned === true`);
+  it.each(Object.keys(DROPS) as (keyof typeof DROPS)[])(
+    'mention-only 下确实 @ 了 bot 的 %s 丢弃：给触发回复打 ❌、不投递、记对应结局',
+    async drop => {
+      mocks.getDocComment.mockResolvedValue(DROPS[drop]());
+      await dispatch();
+      expect(mocks.addCommentReactionChecked).toHaveBeenCalledWith(
+        APP, FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true },
+      );
+      expect(mocks.handleDocComment).not.toHaveBeenCalled();
+      expect(outcomes()).toEqual([drop]);
+    },
+  );
+
+  it.each([
+    ['no-comment', 'all', true],
+    ['no-comment', 'mention-only', false],
+    ['trigger-missing', 'all', true],
+    ['trigger-missing', 'mention-only', false],
+    ['empty-text', 'all', true],
+  ] as const)('%s 丢弃在 %s / is_mentioned=%s 下不打 ❌（\'all\' 有轮询兜底，没 @ 的不是找 bot 的）', async (drop, mode, isMentioned) => {
+    mocks.getDocSubscription.mockReturnValue(subscription(mode));
+    mocks.getDocComment.mockResolvedValue(DROPS[drop]());
+    await dispatch({ isMentioned });
+    expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+    expect(mocks.handleDocComment).not.toHaveBeenCalled();
+    expect(outcomes()).toEqual([drop]);
   });
 
-  it('第三个打点的闸口与前两个一致（都只认 mention-only）', () => {
-    expect(region).toContain(`const markEligible = sub.commentTriggerMode === 'mention-only'`);
-  });
+  // 不打 ❌ 的早退：未过审计就结束，本次新建的 auto-sub 占位必须回滚；而既有订阅（用户
+  // /watch-comment 建的）在任何早退里都绝不能被删。
+  const UNMARKED_EXITS = {
+    'self-authored': { comment: () => thread(BOT, '机器人自己的回复', [BOT]), isMentioned: true, operator: BOT },
+    'not-mentioned': { comment: () => thread(STRANGER, '@ 了同事', ['ou_colleague']), isMentioned: true, operator: STRANGER },
+    'no-comment': { comment: () => null, isMentioned: false, operator: STRANGER },
+    'trigger-missing': { comment: DROPS['trigger-missing'], isMentioned: false, operator: STRANGER },
+  } as const;
 
-  /**
-   * ⚠️ 生产调用点必须传 'dropped-signal'。audit-gate 那组测试**证明不了**这一点 ——
-   * 它直调 helper 并手动传 kind，所以把这里的 'dropped-signal' 悄悄改回默认
-   * 'reply'（即 180f2b4 修掉的「失败通知谎称已触发回复」），两组共 31 个用例
-   * 一条都不会红。这条断言就是补那个缺口。
-   */
-  it("dropped-signal 打点必须传 kind，不能退回成功文案", () => {
-    // 这个调用在 markCommentEventDropped 里，位于 processCommentEvent **之前**，
-    // 不在 region 切片内 —— 用整份源码断言，别锚错范围（锚错就又是一条假绿）。
-    expect(src).toContain("rollbackAutoSub, 'dropped-signal')");
-  });
+  it.each(Object.keys(UNMARKED_EXITS) as (keyof typeof UNMARKED_EXITS)[])(
+    '%s 早退不打 ❌，只回滚本次新建的 auto-sub',
+    async exit => {
+      const { comment, isMentioned, operator } = UNMARKED_EXITS[exit];
+      mocks.getDocSubscription.mockReturnValue(undefined);
+      mocks.getDocComment.mockResolvedValue(comment());
+      await dispatch({ isMentioned, operator });
+      expect(mocks.addCommentReactionChecked).not.toHaveBeenCalled();
+      expect(mocks.removeDocSubscription).toHaveBeenCalledTimes(1);
+      expect(mocks.removeDocSubscription).toHaveBeenCalledWith(expect.any(String), APP, FILE.fileToken);
+      expect(outcomes()).toEqual([exit]);
+    },
+  );
 
-  it('WS 未接纳或抛错都先交给持久重试，再结束 ACK-safe 任务', () => {
-    expect(region).toContain('accepted = await handlers.handleDocComment(delivery)');
-    expect(region.indexOf('const retryOutcome = settleDocCommentWsDelivery(')).toBeGreaterThan(
-      region.indexOf('accepted = await handlers.handleDocComment(delivery)'),
-    );
-    expect(region).toContain('if (deliveryError) throw deliveryError');
-  });
-
-  it('每个未打标记的早退都回滚 auto-sub（不留 owner 不知情的订阅）', () => {
-    // 三个 dropped 打点的 else 分支 + self-filter + mention gate。
-    expect((region.match(/rollbackAutoSub\(\);/g) ?? []).length).toBeGreaterThanOrEqual(5);
-  });
-
-  it('自触发过滤不打标记（那是 bot 自己的回复，打了是自己标自己）', () => {
-    // 锚在 processCommentEvent 里的那段注释上 —— helper 内部也有个 selfBotOpenId
-    // 声明（它自己挡了一次自触发），直接锚变量名会命中 helper、把区间撑到整个文件。
-    const selfFilter = regionBetween(
-      '// 3) 自触发过滤（防死循环）',
-      '// 4) 触发范围闸',
-    );
-    expect(selfFilter).not.toMatch(/markCommentEventDropped\(/);
-  });
-
-  it('mention-only 未 @ 本 bot 不打标记（压根不该触发，打了是在别人评论上留噪音）', () => {
-    const gate = regionBetween(
-      'if (!commentTriggerAllowed(',
-      'const text = trigger.text.trim();',
-    );
-    expect(gate).not.toMatch(/markCommentEventDropped\(/);
-  });
-
-  /**
-   * ⚠️ 五处回滚全都经由同一个闭包，而**唯一**阻止它删掉「用户此前用
-   * /watch-comment 建的既有订阅」的，就是那句 `if (autoCreatedSub)`。
-   * 本 PR 把 rollback 的调用点从 2 处扩到 11 处，这个守卫一旦丢失，
-   * 任何一条陌生人的无关评论都会静默退订用户真正想要的订阅 —— 破坏性远大于
-   * 本 PR 要修的问题。这里把它钉死。
-   */
-  it('rollback 闭包必须由 autoCreatedSub 守卫 —— 绝不能删掉既有订阅', () => {
-    expect(region).toContain('const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(');
-  });
-
-  it('removeDocSubscription 只在那一个闭包里被调用，没有旁路', () => {
-    expect(region.match(/removeDocSubscription\(/g) ?? []).toHaveLength(1);
-  });
-
-
-  /**
-   * 运行态观测：六个丢弃出口 + 一个真接纳成功各记一种结局。dispatched 只能在
-   * daemon 真接纳（accepted）后记，未接纳落 pending 重试，提前记成功是假结局。
-   */
-  it('六个丢弃出口各记对应结局：no-comment / trigger-missing / self-authored / not-mentioned / empty-text / audit-rejected', () => {
-    // 同样只看非注释代码行，防止把 noteOutcome('x') 写进注释就骗过计数。
-    const codeLines = region
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0 && !line.startsWith('//'));
-    for (const outcome of ['no-comment', 'trigger-missing', 'self-authored', 'not-mentioned', 'empty-text', 'audit-rejected']) {
-      const hit = codeLines.some(line => line.includes(`noteOutcome('${outcome}')`));
-      expect(hit, `缺少真实的 noteOutcome('${outcome}') 调用（注释不算）`).toBe(true);
+  it.each([...Object.keys(UNMARKED_EXITS), 'audit-rejected'])('%s 早退绝不删除既有订阅', async exit => {
+    if (exit === 'audit-rejected') {
+      mocks.getDocComment.mockResolvedValue(thread(STRANGER, '帮我改一下', [BOT]));
+      mocks.sendUserMessage.mockRejectedValue(new Error('DM unavailable'));
+      await dispatch({ operator: STRANGER });
+    } else {
+      const { comment, isMentioned, operator } = UNMARKED_EXITS[exit as keyof typeof UNMARKED_EXITS];
+      mocks.getDocComment.mockResolvedValue(comment());
+      await dispatch({ isMentioned, operator });
     }
+    expect(mocks.handleDocComment).not.toHaveBeenCalled();
+    expect(mocks.removeDocSubscription).not.toHaveBeenCalled();
+    expect(outcomes()).toEqual([exit]);
   });
 
-  it("dispatched 只在 handleDocComment 真接纳（accepted=true）后记，且在 WS settle 之后", () => {
-    // ⚠️ 不能对整段 region 做 `toContain("if (accepted) noteOutcome(...)")`：那种纯
-    // 文本断言能被一行**注释**骗过（把同样的字串写进注释里，代码删了测试仍绿）。
-    // 这里只保留「非注释代码行」，再对真实语句断言。
-    const codeLines = region
-      .split('\n')
-      .map(line => line.trim())
-      // 去整行注释；行尾注释按最后一个 // 剥掉。本区间没有「字符串里含 //」的代码行，
-      // 且只匹配固定守卫前缀，误剥不影响结论。
-      .map(line => (line.startsWith('//') ? '' : line.replace(/\s*\/\/.*$/, '')))
-      .filter(line => line.length > 0);
-
-    // ① 必须存在一条真实的 accepted 守卫语句（注释里的同名字串不算）。
-    const guardedIdx = codeLines.findIndex(line => line.startsWith("if (accepted) noteOutcome('dispatched')"));
-    expect(guardedIdx, '缺少「if (accepted) noteOutcome(\'dispatched\')」真实语句（注释不算）').toBeGreaterThan(-1);
-
-    // ② 在 WS settle 之后。
-    const settleIdx = codeLines.findIndex(line => line.includes('const retryOutcome = settleDocCommentWsDelivery('));
-    expect(settleIdx).toBeGreaterThan(-1);
-    expect(guardedIdx).toBeGreaterThan(settleIdx);
-
-    // ③ 在 handleDocComment 调用之后（不能提前记成功）。
-    const dispatchIdx = codeLines.findIndex(line => line.includes('accepted = await handlers.handleDocComment(delivery)'));
-    expect(dispatchIdx).toBeGreaterThan(-1);
-    expect(guardedIdx).toBeGreaterThan(dispatchIdx);
-
-    // 反向保证：不允许出现别的「无条件」noteOutcome('dispatched')。
-    const unconditional = codeLines.filter(line =>
-      line.includes("noteOutcome('dispatched')") && !line.startsWith('if (accepted)'));
-    expect(unconditional).toEqual([]);
+  it('陌生人 @ 出来的 auto-sub 占位带溯源字段', async () => {
+    mocks.getDocSubscription.mockReturnValue(undefined);
+    mocks.getDocComment.mockResolvedValue(thread(STRANGER, '帮我改一下', [BOT]));
+    await dispatch({ operator: STRANGER });
+    expect(mocks.putDocSubscription).toHaveBeenCalledWith(expect.any(String), APP, expect.objectContaining({
+      commentTriggerMode: 'mention-only', autoCreated: true, autoCreatedBy: STRANGER,
+    }));
   });
 
-  it('标题补齐 fire-and-forget 且不 await（热路径不能为显示字段插同步往返）', () => {
-    expect(region).toContain('void fetchDocTitle(');
+  it('事件 reply_id 命中较早的回复时投递那一条，而不是 thread 最后一条', async () => {
+    mocks.getDocComment.mockResolvedValue({
+      ...thread(OWNER, '第一条：请整理', [BOT]),
+      replies: [
+        { replyId: REPLY_ID, userId: OWNER, text: '第一条：请整理', mentions: [BOT] },
+        { replyId: 'later-reply', userId: OWNER, text: '后来的回复', mentions: [BOT] },
+      ],
+    });
+    await dispatch();
+    expect(mocks.handleDocComment).toHaveBeenCalledWith(expect.objectContaining({
+      replyId: REPLY_ID, text: '第一条：请整理',
+    }));
   });
 
-  it('auto-sub 占位带溯源三字段（陌生人 @ 出来的订阅要能事后审计是谁触发的）', () => {
-    const autoSubRegion = regionBetween('const autoSub: DocSubscription = {', 'putDocSubscription(config.session.dataDir, larkAppId, autoSub)');
-    expect(autoSubRegion).toContain('autoCreated: true');
-    expect(autoSubRegion).toContain('autoCreatedBy: operatorOpenId');
+  it.each([
+    ['接纳', () => mocks.handleDocComment.mockResolvedValue(true), true],
+    ['未接纳', () => mocks.handleDocComment.mockResolvedValue(false), false],
+    ['抛错', () => mocks.handleDocComment.mockRejectedValue(new Error('daemon down')), false],
+  ] as const)('WS 投递%s时先 settle 持久重试，只有真接纳才记 dispatched', async (_label, arrange, accepted) => {
+    arrange();
+    mocks.getDocComment.mockResolvedValue(thread(OWNER, '请整理这一段', [BOT]));
+    await dispatch();
+    expect(mocks.handleDocComment).toHaveBeenCalledTimes(1);
+    expect(mocks.settleDocCommentWsDelivery).toHaveBeenCalledTimes(1);
+    expect(mocks.settleDocCommentWsDelivery).toHaveBeenCalledWith(
+      expect.any(String), APP, FILE.fileToken,
+      expect.objectContaining({ commentId: COMMENT_ID, replyId: REPLY_ID, text: '请整理这一段' }),
+      accepted,
+    );
+    expect(outcomes()).toEqual(accepted ? ['dispatched'] : []);
   });
 });

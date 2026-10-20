@@ -46,7 +46,12 @@ export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
  *  `cliPathOverride` when configured. Prompt is appended as the last arg. */
 export const ONE_SHOT_ARGV: Record<string, string[]> = {
-  'claude-code': ['claude', '-p'],
+  // Pin the permission mode: the bot's profile (oneShotProfileEnv →
+  // CLAUDE_CONFIG_DIR) may set `permissions.defaultMode: "bypassPermissions"`,
+  // which Claude Code refuses under root without IS_SANDBOX ("--dangerously-
+  // skip-permissions cannot be used with root/sudo privileges"), failing every
+  // title. A title call needs no tools, so never inherit bypass either way.
+  'claude-code': ['claude', '-p', '--permission-mode', 'dontAsk'],
   codex: ['codex', 'exec', '--skip-git-repo-check'],
   // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
   traex: ['traex', 'exec', '--skip-git-repo-check'],

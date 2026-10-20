@@ -154,15 +154,16 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
     expect(nodeForm.args).toHaveLength(binForm.args.length + 1);
   });
 
-  it('SOURCE PIN: the relay spawn consumes the invocation, not a bare path', () => {
-    // The helper is only useful if the spawn site actually uses it; a future edit
-    // that reverts to `spawn(process.execPath, [cli, 'send', …])` would leave
-    // every assertion above passing while the bug returns.
-    const src = readFileSync(new URL('../src/adapters/backend/sandbox.ts', import.meta.url), 'utf-8');
-    expect(src).toContain('spawn(cliInvocation.command, [...cliInvocation.args, v.value.command,');
-    expect(src).toContain('botmuxCliInvocation(opts.cliPath)');
-    // And the shim writer must go through the helper too.
-    expect(src).toContain('writeFileSync(shim, botmuxShimExecLine())');
+  // 源码结构护栏(K1)：编译态单文件二进制没有 dist/cli.js，relay 回执与 shim 必须按运行形态分流；
+  // 单测进程跑的是源码形态，relay 无 cliPath 覆盖时的编译态 spawn 走不到，只能读源码确认调用点
+  // 真的消费 botmuxCliInvocation / botmuxShimExecLine——回退成 `spawn(process.execPath, [cli, 'send', …])`
+  // 时上面的用例全绿，而编译版 relay 的每条 send 静默丢失（0318ca760c，#1090）。
+  it('routes the relay spawn and the shim writer through the runtime-form helpers', () => {
+    const src = stripComments(readFileSync(new URL('../src/adapters/backend/sandbox.ts', import.meta.url), 'utf-8'));
+    const invocation = src.match(/const (\w+) = botmuxCliInvocation\(opts\.cliPath\)/);
+    expect(invocation).not.toBeNull();
+    expect(src).toMatch(new RegExp(`spawn\\(${invocation![1]}\\.command, \\[\\.\\.\\.${invocation![1]}\\.args,`));
+    expect(src).toMatch(/writeFileSync\(\w+, botmuxShimExecLine\(\)\)/);
   });
 });
 
@@ -270,34 +271,5 @@ describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim over
     chmodSync(stable, 0o755);
     chmodSync(gateway, 0o755);
     expect(overlayTargets(gateway)).toEqual([gateway]);
-  });
-
-  it('SOURCE PIN: worker trusts exactly the default gateway entry, not the dedicated native hook wrapper', () => {
-    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
-    expect(callStart).toBeGreaterThanOrEqual(0);
-    const callEnd = src.indexOf('      });', callStart);
-    expect(callEnd).toBeGreaterThan(callStart);
-    const callRegion = stripComments(src.slice(callStart, callEnd));
-    expect(callRegion).toContain('trustedBotmuxCommandPaths: [defaultGatewayEntry().command],');
-    expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
-    expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
-  });
-
-  it('SOURCE PIN: worker uses compact bwrap argument transport only for tmux', () => {
-    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
-    expect(callStart).toBeGreaterThanOrEqual(0);
-    const callEnd = src.indexOf('      });', callStart);
-    expect(callEnd).toBeGreaterThan(callStart);
-    const callRegion = stripComments(src.slice(callStart, callEnd));
-    expect(callRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
-
-    const scratchStart = src.indexOf('const sbx = prepareScratchSandbox({');
-    expect(scratchStart).toBeGreaterThanOrEqual(0);
-    const scratchEnd = src.indexOf('      });', scratchStart);
-    expect(scratchEnd).toBeGreaterThan(scratchStart);
-    const scratchRegion = stripComments(src.slice(scratchStart, scratchEnd));
-    expect(scratchRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
   });
 });

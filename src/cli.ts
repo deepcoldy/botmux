@@ -208,8 +208,26 @@ import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
-import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
-import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  dispatchDeferredTopicSend,
+  localDeferredTopicBindingStore,
+  reusableDeferredTopicRoot,
+  type DeferredScheduleRunData,
+  type DeferredTopicBindingStore,
+  type DeferredTopicSendSession,
+} from './cli/deferred-topic-send.js';
+import {
+  peekRemoteDeferredTopicBinding,
+  remoteDeferredTopicBindingStore,
+  resolveDeferredTopicIpcPort,
+  type DeferredTopicClaimPost,
+} from './cli/deferred-topic-remote-store.js';
+import {
+  probeDeferredTopicBindingWritable,
+  readDeferredTopicBinding,
+  type DeferredTopicBinding,
+} from './core/deferred-topic-binding.js';
+import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './core/deferred-topic-claim.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
@@ -5936,7 +5954,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE,
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5966,6 +5984,60 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+let deferredTopicSidecarWritable: boolean | undefined;
+
+/** The daemon's deferred-topic claim route, or undefined when no daemon port is
+ * known. Used only when this process cannot write the host binding sidecar. */
+function deferredTopicClaimPost(sessionId: string): DeferredTopicClaimPost | undefined {
+  const claim = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  const ipcPort = resolveDeferredTopicIpcPort(claim?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) return undefined;
+  return async (request) => {
+    const res = await postSessionCliIpc(ipcPort, sessionId, DEFERRED_TOPIC_CLAIM_ROUTE, { ...request });
+    const parsed = await res.json().catch(() => undefined) as DeferredTopicClaimResponse | { ok?: false; error?: string } | undefined;
+    if (res.ok && parsed && parsed.ok === true) return parsed as DeferredTopicClaimResponse;
+    return {
+      ok: false,
+      status: (res.status === 400 || res.status === 404 || res.status === 409 || res.status === 502 ? res.status : 409),
+      error: (parsed && 'error' in parsed && typeof parsed.error === 'string') ? parsed.error : `HTTP ${res.status}`,
+    };
+  };
+}
+
+function deferredTopicUsesDaemon(dataDir: string): boolean {
+  deferredTopicSidecarWritable ??= probeDeferredTopicBindingWritable(dataDir);
+  return !deferredTopicSidecarWritable;
+}
+
+/** Binding store for a silent fresh-topic schedule run. A sandboxed /
+ * read-isolated CLI cannot create `<dataDir>/deferred-topics` (EPERM), so the
+ * first-message claim goes through the daemon, which keeps the binding
+ * host-owned. Every other process keeps the local sidecar unchanged. */
+function resolveDeferredTopicStore(dataDir: string, session: DeferredTopicSendSession): DeferredTopicBindingStore {
+  if (deferredTopicUsesDaemon(dataDir)) {
+    const post = deferredTopicClaimPost(session.sessionId);
+    if (post) return remoteDeferredTopicBindingStore(session, post);
+  }
+  return localDeferredTopicBindingStore(dataDir, session.sessionId);
+}
+
+/** Read-only binding lookup for advisory routing checks. Falls back to the
+ * daemon only for a deferred run whose sidecar this process cannot use. */
+async function readDeferredTopicBindingForSend(
+  dataDir: string,
+  session: DeferredTopicSendSession,
+): Promise<DeferredTopicBinding | undefined> {
+  const local = readDeferredTopicBinding(dataDir, session.sessionId);
+  if (local || !session.deferredScheduleRun || !deferredTopicUsesDaemon(dataDir)) return local;
+  const post = deferredTopicClaimPost(session.sessionId);
+  return post ? peekRemoteDeferredTopicBinding(session, post) : undefined;
 }
 
 async function cmdContinuation(argv: string[]): Promise<void> {
@@ -11198,7 +11270,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
       const scheduledRoot = reusableDeferredTopicRoot({
         session: { ...topicSourceSession, larkAppId: sourceAppId },
-        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        binding: await readDeferredTopicBindingForSend(dataDir, { ...topicSourceSession, larkAppId: sourceAppId }),
         explicitTopLevel: false,
       });
       await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
@@ -11310,6 +11382,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
             ? await dispatchDeferredTopicSend({
                 dataDir: resolveDataDir(),
+                store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
                 session: s as SessionData & { larkAppId: string },
                 currentTurnId,
                 explicitTopLevel: sendTopLevel,
@@ -11850,7 +11923,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
-    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    ? await readDeferredTopicBindingForSend(dataDir, s as SessionData & { larkAppId: string })
     : undefined;
   const deferredRoot = reusableDeferredTopicRoot({
     session: s as SessionData & { larkAppId: string },
@@ -11961,6 +12034,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
         dataDir: resolveDataDir(),
+        store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
         session: s as SessionData & { larkAppId: string },
         currentTurnId,
         explicitTopLevel: sendTopLevel,

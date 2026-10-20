@@ -1410,3 +1410,53 @@ describe('async group message input contract', () => {
       }
     });
 });
+
+describe('senderTagHideEmail', () => {
+  const sender = Object.freeze({ openId: 'ou_email_test', type: 'user' as const, name: 'Test User', email: 'sender@example.test' });
+  afterEach(() => {
+    delete mockBotConfig.senderTagHideEmail;
+    delete mockBotConfig.senderTag;
+  });
+
+  it('preserves default output and omits only email without mutating identity', () => {
+    const original = renderSenderTag(sender, 'app_test');
+    expect(original).toContain('email="sender@example.test"');
+    mockBotConfig.senderTagHideEmail = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe(original);
+    mockBotConfig.senderTagHideEmail = true;
+    expect(renderSenderTag(sender, 'app_test')).toBe(original.replace(' email="sender@example.test"', ''));
+    expect(sender.email).toBe('sender@example.test');
+    expect(renderSenderTag({ ...sender, email: undefined }, 'app_test')).toBe(original.replace(' email="sender@example.test"', ''));
+    mockBotConfig.senderTag = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe('');
+    mockBotConfig.senderTag = true;
+    expect(renderSenderTag(sender, 'app_test')).not.toContain('email=');
+  });
+
+  it.each(['claude-code', 'codex', 'codex-app', 'cursor'] as const)('covers opening, follow-up and sidecars for %s', cliId => {
+    const build = () => {
+      const opts = { larkAppId: 'app_test', chatId: 'oc_test', cliId, sender, locale: 'en' as const };
+      return [
+        buildNewTopicCliInput('hello', 'sid', cliId, undefined, undefined, undefined,
+          undefined, undefined, undefined, 'en', sender, opts),
+        buildFollowUpCliInput('hello', 'sid', opts),
+      ];
+    };
+    const original = build();
+    mockBotConfig.senderTagHideEmail = true;
+    const hidden = build();
+    for (let i = 0; i < hidden.length; i++) {
+      const before = JSON.stringify(original[i]);
+      const after = JSON.stringify(hidden[i]);
+      expect(before).toContain('sender@example.test');
+      expect(after).not.toContain('sender@example.test');
+      expect(after).toContain('ou_email_test');
+      expect(after).toContain('Test User');
+      expect(after).toBe(before.replaceAll(' email=\\"sender@example.test\\"', ''));
+    }
+    const buffered = renderBufferedSenderBlock(sender, cliId, 'en', 'app_test');
+    expect(buffered).not.toContain('email=');
+    expect(buffered).toContain('ou_email_test');
+    expect(buildFollowUpContent('body@example.test', 'sid', { cliId, sender, larkAppId: 'app_test' })).toContain('body@example.test');
+  });
+});

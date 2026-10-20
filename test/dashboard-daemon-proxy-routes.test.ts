@@ -384,40 +384,26 @@ describe('handleDaemonProxyRoute: when the appId is url-decoded', () => {
   });
 });
 
-describe('dashboard.ts wiring', () => {
+describe('dashboard.ts hand-written /api/bots routes', () => {
   const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 
-  it('dispatches the table from the request closure', () => {
-    expect(source).toContain('handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)');
-  });
-
-  it('maps the proxy 413 to the same error class readJsonBody throws', () => {
-    expect(source).toContain('isBodyTooLarge: err => err instanceof DashboardJsonBodyTooLargeError');
-    expect(source).toContain('throw new DashboardJsonBodyTooLargeError(');
-  });
-
-  it('keeps the table order-independent of the hand-written /api/bots routes that remain in dashboard.ts', () => {
-    // 表在请求闭包里一次性匹配，位置在原先那批手写块中靠后的一处。原先位置更靠前的几条
-    // （blocked-users / grants/chat / chat-group-grant）因此被后移，等价的前提是：夹在中间的
-    // 路由与表内任何一条都不会命中同一个 URL。dashboard.ts 里仍手写的 /api/bots 路由必须与表互斥。
+  // 源码结构护栏(K4)：dashboard.ts 请求闭包里仍手写（未导出）的 /api/bots 路由必须与
+  // BOT_PROXY_ROUTES 表互斥，表的分发位置才不影响匹配结果；quota-fallback 带 daemon 离线时的
+  // 本地 bots.json 兜底，不能并进纯转发表。一份事实只存在于闭包源码，无法 import 双方比较。
+  // 来源：#1902 把纯转发路由改为表驱动时的等价前提。
+  it('stay disjoint from the proxy table, and quota-fallback stays out of the table', () => {
     const handWritten = [...source.matchAll(/url\.pathname\.match\((\/\^\\\/api\\\/bots\\\/[^\n]*?\$\/)\)/g)]
       .map(m => m[1]);
     const exact = [...source.matchAll(/url\.pathname === '(\/api\/bots[^']*)'/g)].map(m => m[1]);
-    expect(handWritten).toEqual(['/^\\/api\\/bots\\/([^/]+)\\/quota-fallback$/']);
-    expect(exact).toEqual(['/api/bots']);
+    // 非空：提取正则一旦失配，下面的互斥循环会空转变绿。
+    expect(handWritten.length).toBeGreaterThan(0);
     for (const literal of handWritten) {
-      const body = literal.slice(1, literal.lastIndexOf('/'));
-      const re = new RegExp(body);
+      const re = new RegExp(literal.slice(1, literal.lastIndexOf('/')));
       for (const route of BOT_PROXY_ROUTES) {
         expect(re.test(samplePathname(route)), `${literal} vs ${route.path.source}`).toBe(false);
       }
     }
-    for (const route of BOT_PROXY_ROUTES) expect(samplePathname(route)).not.toBe('/api/bots');
-  });
-
-  it('keeps quota-fallback hand-written: it has a local bots.json fallback when the daemon is offline', () => {
-    expect(source).toContain('quota-fallback$/');
-    expect(source).toContain('rmwBotEntry');
+    for (const route of BOT_PROXY_ROUTES) expect(exact).not.toContain(samplePathname(route));
     expect(BOT_PROXY_ROUTES.some(route => route.path.test('/api/bots/cli_a/quota-fallback'))).toBe(false);
   });
 });

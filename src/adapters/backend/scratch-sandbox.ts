@@ -59,7 +59,14 @@ import {
 } from 'node:fs';
 import { join, basename, dirname, isAbsolute, resolve, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { botmuxShimExecLine, reexposeRunBinArgs } from './sandbox.js';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import {
+  botmuxShimExecLine,
+  reattachableRelayOutbox,
+  removeTreeUnlessMounted,
+  reexposeRunBinArgs,
+  SCRATCH_TREE_MARKER,
+} from './sandbox.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import {
@@ -252,7 +259,7 @@ function readRelevantSubmounts(infraRoots: readonly string[]): HostMountEntry[] 
 // ───────────────────────── layout + meta ────────────────────────────────────
 
 function metaPath(sessionRoot: string): string {
-  return join(sessionRoot, 'scratch.json');
+  return join(sessionRoot, SCRATCH_TREE_MARKER);
 }
 
 function readMeta(sessionRoot: string): ScratchMeta | null {
@@ -386,7 +393,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
     for (const p of [...rolledBack].reverse()) unmountAny(p);
     if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
-    if (!isMountpoint(merged)) try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+    // Never rm through anything still mounted (the merged root, a submount).
+    removeTreeUnlessMounted(sessionRoot);
     return null;
   };
 
@@ -499,7 +507,12 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       createdAt: Date.now(),
       tmpfsSizeMb: storage === 'tmpfs' ? opts.tmpfsSizeMb : undefined,
     };
-  try { writeFileSync(metaPath(sessionRoot), JSON.stringify(meta), { mode: 0o600 }); } catch { /* */ }
+  // Atomic (tmp + rename): a truncated marker would read as "not a scratch
+  // session" to the scratch sweep while still being a scratch marker to the
+  // generic sweep, so neither would ever reclaim the upper.
+  try {
+    atomicWriteFileSync(metaPath(sessionRoot), JSON.stringify(meta), { mode: 0o600, followTargetSymlink: false, durable: true });
+  } catch { /* */ }
 
   // ── shim + outbox (REAL host tree, passthrough-bound over the merged root) ──
   const shim = join(shimBin, 'botmux');
@@ -716,10 +729,12 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   };
 }
 
-/** Re-attach the daemon side to a LIVE scratch pane after a daemon restart:
- *  the mount lives in the host mount namespace and the pane's bwrap keeps its
- *  own namespace — never unmount/remount here. Returns the outbox + host-view
- *  root, or null when the session has no scratch tree. */
+/** Re-attach the daemon side to a LIVE scratch pane after a daemon restart or
+ *  a topic transfer: the mount lives in the host mount namespace and the
+ *  pane's bwrap keeps its own namespace — never unmount/remount here. Returns
+ *  the outbox + host-view root, or null when the session has no scratch tree or
+ *  the outbox the pane bound by inode is gone (never recreated — see
+ *  reattachableRelayOutbox). */
 export function attachScratchSession(opts: { sessionId: string; dataDir: string }): {
   outbox: string;
   mergedHostPath: string;
@@ -729,8 +744,8 @@ export function attachScratchSession(opts: { sessionId: string; dataDir: string 
   const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
   const meta = readMeta(sessionRoot);
   if (!meta) return null;
-  const outbox = join(sessionRoot, 'outbox');
-  try { mkdirSync(outbox, { recursive: true }); } catch { /* */ }
+  const outbox = reattachableRelayOutbox(sessionRoot);
+  if (!outbox) return null;
   return {
     outbox,
     mergedHostPath: meta.merged,
@@ -772,10 +787,11 @@ export function teardownScratchSession(sessionId: string, dataDirInput: string):
   // 3. main overlay + tmpfs slot
   unmountAny(merged);
   if (meta?.slot) unmountAny(meta.slot);
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
-  if (meta?.slot) {
-    try { rmSync(meta.slot, { recursive: true, force: true }); } catch { /* */ }
-  }
+  // 4. remove — but never THROUGH a mount that refused to go away (a recursive
+  //    rm crosses filesystem boundaries; through the merged root that walks the
+  //    whole host). Anything still mounted is left for the next teardown/sweep.
+  removeTreeUnlessMounted(sessionRoot);
+  if (meta?.slot) removeTreeUnlessMounted(meta.slot);
 }
 
 /** Whether a scratch session's overlay can be brought back for a COLD resume
@@ -792,14 +808,27 @@ export function scratchSessionRecoverable(sessionId: string, dataDir: string): b
 }
 
 /**
- * Reclaim orphan scratch sessions: scratch trees WITH a scratch.json whose
- * session is not active and no live process references. Unlike the oncall
- * sweep (plain rm), scratch must UNMOUNT the overlay, the submount binds and
- * the tmpfs slot first. Slot dirs under /var/tmp/botmux-scratch with no
+ * Reclaim orphan scratch sessions: scratch trees WITH a scratch.json marker
+ * whose session is not active and no live process references. Unlike the
+ * oncall sweep (plain rm), scratch must UNMOUNT the overlay, the submount binds
+ * and the tmpfs slot first. Slot dirs under /var/tmp/botmux-scratch with no
  * matching session tree are also swept. Guards mirror the oncall sweep:
  * /proc cmdline detection, active set, mtime grace.
+ *
+ * A marker that no longer parses (truncated by a crash mid-write on an older
+ * build) still marks a scratch tree: the generic sweep leaves it alone, so this
+ * sweep must not skip it either. teardownScratchSession then works from the
+ * default layout (`<tree>/root` + subroots) and still never removes through
+ * anything that stays mounted.
+ *
+ * `slotRoot` exists for tests only: the slot pass is host-wide.
  */
-export function sweepOrphanScratchSandboxes(dataDir: string, activeSessionIds: Set<string>): void {
+export function sweepOrphanScratchSandboxes(
+  dataDir: string,
+  activeSessionIds: Set<string>,
+  opts: { slotRoot?: string } = {},
+): void {
+  const slotRoot = opts.slotRoot ?? VARTMP_ROOT;
   const live = new Set<string>();
   let pids: string[];
   try { pids = readdirSync('/proc'); } catch { return; }
@@ -820,7 +849,9 @@ export function sweepOrphanScratchSandboxes(dataDir: string, activeSessionIds: S
   const now = Date.now();
   for (const sid of sids) {
     const sessionRoot = join(root, sid);
-    if (!readMeta(sessionRoot)) continue; // oncall/off session — other sweep
+    // No marker at all → oncall/off session, the generic sweep's. A marker that
+    // does not parse is still ours (see above).
+    try { lstatSync(metaPath(sessionRoot)); } catch { continue; }
     if (live.has(sid) || activeSessionIds.has(sid)) continue;
     let ageOk = false;
     try { ageOk = now - statSync(sessionRoot).mtimeMs > GRACE_MS; } catch { ageOk = false; }
@@ -830,16 +861,16 @@ export function sweepOrphanScratchSandboxes(dataDir: string, activeSessionIds: S
 
   // /var/tmp slot orphans (tmpfs mounts whose session tree is already gone).
   let slots: string[] = [];
-  try { slots = readdirSync(VARTMP_ROOT); } catch { return; }
+  try { slots = readdirSync(slotRoot); } catch { return; }
   for (const sid of slots) {
     if (live.has(sid) || activeSessionIds.has(sid)) continue;
     if (existsSync(join(root, sid))) continue; // tree still around → tree sweep owns it
-    const slotDir = join(VARTMP_ROOT, sid);
+    const slotDir = join(slotRoot, sid);
     let ageOk = false;
     try { ageOk = now - statSync(slotDir).mtimeMs > GRACE_MS; } catch { ageOk = false; }
     if (!ageOk) continue;
     unmountAny(slotDir);
-    try { rmSync(slotDir, { recursive: true, force: true }); } catch { /* */ }
+    removeTreeUnlessMounted(slotDir); // never through a slot that stayed mounted
   }
 }
 

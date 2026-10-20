@@ -8,15 +8,16 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
-import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
+import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
   trailingAssistantText,
+  isClaudeMemoryToolUse,
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
@@ -1766,5 +1767,99 @@ describe('trailingAssistantText', () => {
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
     // 新行为：尾段 900 < 749×2 → 抑制 ✓
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
+  });
+});
+
+// ─── transcript 投递：回答之后的 Claude Code memory 写入不得截掉回答 ──
+//
+// 2026-10-20 现场（零注入 bot，后台任务回调轮）：模型先写出 1278 字的分配结果，
+// 再 Write ×2 + Bash 维护自身 memory，最后补一句 240 字附言。尾段算法停在 memory
+// 写入处，只把附言发进了群，分配结果丢失。
+describe('trailingAssistantText across memory writes', () => {
+  const projects = '/root/.claude-api/projects/';
+  const transcriptPath = `${projects}-root-iserver-edenx/359e31a6.jsonl`;
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string, name: string, input: Record<string, unknown>): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name, input } as any] },
+  });
+  const toolResult = (uuid: string, toolUseUuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${toolUseUuid}` } as any] },
+  });
+  const opts = {
+    isHousekeepingToolUse: (block: { name?: unknown; input?: unknown }) => isClaudeMemoryToolUse(block, transcriptPath),
+    endsWithSentinel: hasTrailingBridgeSentinelLine,
+  };
+  const memWrite = (uuid: string) => aTool(uuid, 'Write', { file_path: `${projects}-root-iserver-edenx/memory/${uuid}.md` });
+  const answer = '已写进文档：末尾新增了「十、Reviewer 分配」一节。'.padEnd(400, '表');
+  const postscript = 'I also saved two notes in memory.';
+
+  const fieldTurn = (): TranscriptEvent[] => [
+    aTool('w0', 'Bash', { command: 'cat /tmp/out.log' }), toolResult('r0', 'w0'),
+    aText('ans', answer),
+    memWrite('m1'), toolResult('r1', 'm1'),
+    { type: 'attachment' } as TranscriptEvent,
+    memWrite('m2'), toolResult('r2', 'm2'),
+    aTool('m3', 'Bash', { command: `cd ${projects}-root-iserver-edenx/memory && printf '%s\\n' x >> MEMORY.md` }),
+    toolResult('r3', 'm3'),
+    aText('ps', postscript),
+  ];
+  const fieldUuids = ['w0', 'ans', 'm1', 'm2', 'm3', 'ps'];
+
+  it('field replay: answer before the memory writes is delivered together with the postscript', () => {
+    expect(trailingAssistantText(fieldTurn(), fieldUuids)).toBe(postscript);
+    expect(trailingAssistantText(fieldTurn(), fieldUuids, opts)).toBe(`${answer}\n\n${postscript}`);
+  });
+
+  it('a short "saving memory" note before the writes stays out when the answer follows them', () => {
+    const final = '结论：'.padEnd(300, '答');
+    const events = [aText('n', '先把这次结论记到 memory。'), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['n', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a substantive run is not prepended when the trailing run is longer', () => {
+    const before = '中间分析：'.padEnd(300, '析');
+    const final = '最终结论：'.padEnd(500, '答');
+    const events = [aText('a', before), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a trailing run ending with the sentinel is returned unchanged', () => {
+    for (const tail of ['BOTMUX_NOTHING_TO_SEND', 'CI 还在跑，继续等。\n\nBOTMUX_NOTHING_TO_SEND']) {
+      const events = [aText('a', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', tail)];
+      expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(tail);
+    }
+  });
+
+  it('any non-memory tool call between the runs keeps the trailing run alone', () => {
+    const events = [
+      aText('a', answer),
+      memWrite('m1'), toolResult('r1', 'm1'),
+      aTool('w', 'Write', { file_path: '/root/iserver/edenx/notes.md' }), toolResult('r2', 'w'),
+      aText('f', postscript),
+    ];
+    expect(trailingAssistantText(events, ['a', 'm1', 'w', 'f'], opts)).toBe(postscript);
+  });
+
+  it('text from another turn before the memory writes is never swept in', () => {
+    const events = [aText('prev', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', postscript)];
+    expect(trailingAssistantText(events, ['m1', 'f'], opts)).toBe(postscript);
+  });
+
+  it('isClaudeMemoryToolUse: only writes into the owning data dir\'s project memory', () => {
+    const home = homedir();
+    const homePath = `${home}/.claude-api/projects/-root-iserver-botmux-wt-3/s.jsonl`;
+    const mem = `${home}/.claude-api/projects/-root-iserver-botmux/memory`;
+    // 工作树会话的 memory 落在主仓库的 project 目录下，不要求 slug 一致。
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Edit', input: { file_path: `${mem}/MEMORY.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cd ${mem} && ls` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: 'cat ~/.claude-api/projects/-root-iserver-botmux/memory/MEMORY.md' } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: '/root/iserver/botmux/memory/a.md' } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${home}/.claude/projects/-root-iserver-botmux/memory/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cat ${mem}-backup/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Read', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, undefined)).toBe(false);
   });
 });

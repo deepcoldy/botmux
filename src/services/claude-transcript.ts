@@ -12,6 +12,7 @@
  * to keep them unit-testable.
  */
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
@@ -1002,8 +1003,23 @@ function hasToolUseBlock(ev: TranscriptEvent): boolean {
  * never contribute: only uuids in `turnAssistantUuids` are collected.
  * Returns '' for a turn with no text after its last tool_use (nothing worth
  * falling back with — e.g. the turn ended in a `botmux send` call).
+ *
+ * `opts.isHousekeepingToolUse` (transcript-delivery sessions only): Claude
+ * Code's auto-memory step can run AFTER the answer — answer text, memory file
+ * writes, then a short postscript ("I also saved two notes…"). The plain walk
+ * stops at those writes and returns only the postscript, so the answer never
+ * reaches Lark. When the tool calls separating the trailing run from the text
+ * before it are all housekeeping, that earlier run is the answer if it is
+ * substantive and longer than the trailing one; the usual shape — a one-line
+ * "saving memory" note before the writes and the real answer after them —
+ * keeps the trailing run alone. A trailing run that `opts.endsWithSentinel`
+ * flags is returned as is: the model declared its output complete there.
  */
-export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+export function trailingAssistantText(
+  events: TranscriptEvent[],
+  turnAssistantUuids: readonly string[],
+  opts: TrailingAnswerOptions = {},
+): string {
   if (turnAssistantUuids.length === 0) return '';
   const uuids = new Set(turnAssistantUuids);
   const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
@@ -1022,23 +1038,127 @@ export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUu
     if (role === 'assistant' && hasToolUseBlock(ev)) return '';
     if (role === 'user' && isMeaningfulUserEvent(ev)) break;
   }
-  const tail: TranscriptEvent[] = [];
+  const { run, boundary } = collectTrailingTextRun(events, end, uuids);
+  const trailing = joinAssistantText(run);
+  if (!opts.isHousekeepingToolUse || !trailing || opts.endsWithSentinel?.(trailing)) return trailing;
+  const answer = textBeforeHousekeeping(events, boundary, uuids, opts.isHousekeepingToolUse);
+  return answer.length >= HOUSEKEEPING_ANSWER_MIN_CHARS && answer.length > trailing.length
+    ? `${answer}\n\n${trailing}`
+    : trailing;
+}
+
+/** Below this the text before housekeeping writes is a narration note
+ *  ("saving memory first"), not an answer. Longer notes exist but precede a
+ *  still longer answer, which the length comparison already keeps alone. */
+const HOUSEKEEPING_ANSWER_MIN_CHARS = 200;
+
+export interface TrailingAnswerOptions {
+  /** tool_use blocks that are bookkeeping rather than work, e.g. Claude Code's
+   *  own memory writes ({@link isClaudeMemoryToolUse}). */
+  isHousekeepingToolUse?: (block: { name?: unknown; input?: unknown }) => boolean;
+  /** The trailing text ends with the nothing-to-send sentinel line. */
+  endsWithSentinel?: (text: string) => boolean;
+}
+
+/** Walk back from `end` over this turn's contiguous assistant-text run.
+ *  `boundary` is the index of the tool_use / user event that ended the walk
+ *  (-1 when it reached the start of the transcript). */
+function collectTrailingTextRun(
+  events: TranscriptEvent[],
+  end: number,
+  uuids: ReadonlySet<string>,
+): { run: TranscriptEvent[]; boundary: number } {
+  const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
     if (!ev || typeof ev !== 'object') continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant') {
-      if (hasToolUseBlock(ev)) break;
-      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      if (hasToolUseBlock(ev)) return { run, boundary: i };
+      if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
       // Thinking-only / non-turn assistant lines: cross unless they belong to
       // a DIFFERENT turn's visible text (then we've walked past our turn).
-      if (pickAssistantTextEvents([ev]).length > 0) break;
+      if (pickAssistantTextEvents([ev]).length > 0) return { run, boundary: i };
       continue;
     }
-    if (role === 'user') break;
+    if (role === 'user') return { run, boundary: i };
     // system / attachment / meta lines (last-prompt, ai-title, …): cross.
   }
-  return joinAssistantText(tail);
+  return { run, boundary: -1 };
+}
+
+/** The turn's text run that directly precedes a run of housekeeping-only tool
+ *  calls ending at `boundary`. '' unless every tool call crossed is
+ *  housekeeping, every tool_result crossed answers one of them, and the run
+ *  belongs to this turn. */
+function textBeforeHousekeeping(
+  events: TranscriptEvent[],
+  boundary: number,
+  uuids: ReadonlySet<string>,
+  isHousekeeping: (block: { name?: unknown; input?: unknown }) => boolean,
+): string {
+  const toolUseIds = new Set<string>();
+  const toolResultIds: string[] = [];
+  let i = boundary;
+  for (; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
+    if (role === 'assistant') {
+      const hasText = pickAssistantTextEvents([ev]).length > 0;
+      const uses = content.filter(b => b?.type === 'tool_use');
+      if (uses.length === 0) {
+        if (hasText) break;
+        continue;
+      }
+      if (hasText || !uses.every(isHousekeeping)) return '';
+      for (const use of uses) if (typeof use.id === 'string') toolUseIds.add(use.id);
+      continue;
+    }
+    if (role === 'user') {
+      if (!isPureToolResultUserEvent(ev.message?.content)) return '';
+      for (const block of content) toolResultIds.push(block.tool_use_id);
+      continue;
+    }
+  }
+  if (i < 0 || toolUseIds.size === 0) return '';
+  if (!toolResultIds.every(id => typeof id === 'string' && toolUseIds.has(id))) return '';
+  if (!events[i].uuid || !uuids.has(events[i].uuid!)) return '';
+  return joinAssistantText(collectTrailingTextRun(events, i, uuids).run);
+}
+
+/**
+ * True when a Claude Code tool_use only maintains the CLI's own auto-memory —
+ * `<dataDir>/projects/<project>/memory/` of the data dir that owns
+ * `transcriptPath` (`<dataDir>/projects/<project>/<session>.jsonl`). The
+ * project slug is not compared: a worktree session keeps its memory under the
+ * main repo's project dir.
+ */
+export function isClaudeMemoryToolUse(
+  block: { name?: unknown; input?: unknown },
+  transcriptPath: string | undefined,
+): boolean {
+  if (!transcriptPath) return false;
+  const marker = '/projects/';
+  const at = transcriptPath.lastIndexOf(marker);
+  if (at === -1) return false;
+  const projectsRoot = transcriptPath.slice(0, at + marker.length);
+  const input = (block.input && typeof block.input === 'object' ? block.input : {}) as Record<string, unknown>;
+  const home = homedir();
+  const roots = [projectsRoot];
+  if (home && projectsRoot.startsWith(`${home}/`)) roots.push(`~${projectsRoot.slice(home.length)}`);
+  const escaped = roots.map(r => r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  if (block.name === 'Write' || block.name === 'Edit' || block.name === 'MultiEdit') {
+    return typeof input.file_path === 'string'
+      && new RegExp(`^(?:${escaped})[^/]+/memory/`).test(input.file_path);
+  }
+  if (block.name === 'Bash') {
+    // e.g. `cd ~/.claude/projects/-repo/memory && printf … >> MEMORY.md`
+    return typeof input.command === 'string'
+      && new RegExp(`(?:${escaped})[^/\\s'"\`]+/memory(?![\\w.-])`).test(input.command);
+  }
+  return false;
 }
 
 /** XML wrappers Claude Code uses for synthetic user events that aren't real

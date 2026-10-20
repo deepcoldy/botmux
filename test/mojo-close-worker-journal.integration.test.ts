@@ -34,7 +34,7 @@
  * Run:  pnpm vitest run test/mojo-close-worker-journal.integration.test.ts
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -110,32 +110,6 @@ import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const APP_ID = 'app';
 const HOOK = resolve('test/fixtures/mojo-e2e-destroy-hook.ts');
-
-/**
- * Does this tree carry the split `admission` contract (review note 3)?
- *
- * The two cases below assert a field that only exists once close_result reports
- * `admission` separately from `recovery`. Detected instead of assumed so this
- * file stays honest when run on a tree that predates it: a hard failure there
- * would say "the fence is broken" when the truth is "the contract is not in this
- * tree yet", and silently deleting the cases would hide the gap entirely.
- */
-/**
- * Does the DURABLE journal persist the exact verdict (review note 4)?
- *
- * Keyed on `commitOnly`, which only the journal block declares. An earlier
- * attempt matched `recovery?:` and silently hit the pre-existing close_result
- * IPC type instead, so the guard read "present" on a tree where the journal has
- * no verdict at all — a guard that lies is worse than no guard.
- */
-const HAS_JOURNAL_VERDICT = readFileSync(
-  resolve('src/types.ts'),
-  'utf-8',
-).includes('commitOnly?: boolean');
-const HAS_ADMISSION_CONTRACT = readFileSync(
-  resolve('src/adapters/backend/types.ts'),
-  'utf-8',
-).includes("admission?: 'restorable' | 'fenced'");
 
 /**
  * Did the daemon try to ROLL BACK? This is the one observable that stays sharp
@@ -553,11 +527,8 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     // reads this row to decide whether re-cancelling is required, forbidden or
     // merely useless, so recording a thrown teardown as `retryable` tells the
     // next daemon it may re-open admission on a lineage whose remote cancel may
-    // already have completed. Guarded because `recovery` is only persisted once
-    // the durable-verdict work (review note 4) is in the tree.
-    if (HAS_JOURNAL_VERDICT) {
-      expect(durableJournal(sessionId)).toMatchObject({ recovery: 'uncertain' });
-    }
+    // already have completed.
+    expect(durableJournal(sessionId)).toMatchObject({ recovery: 'uncertain' });
     // The row stays active, which is what keeps its device-isolation blocker.
     expect(sessionStore.getSession(sessionId)?.status).toBe('active');
   }, 60_000);
@@ -623,7 +594,7 @@ describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {
     expect(sessionStore.getSession(sessionId)?.status).toBe('active');
   }, 60_000);
 
-  it.skipIf(!HAS_ADMISSION_CONTRACT)('keeps writes fenced when recovery says retryable but admission says fenced', async () => {
+  it('keeps writes fenced when recovery says retryable but admission says fenced', async () => {
     // The case where the two answers legitimately DISAGREE, and the only one
     // that can catch a daemon which re-derives `admission` from `recovery`.
     //

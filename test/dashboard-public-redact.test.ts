@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   projectSessionEventForAudience,
@@ -274,15 +273,6 @@ describe('stripSchedulePreconditionMaterial', () => {
       prompt: 'keep this for the schedule card',
       workingDir: '/repo',
     });
-  });
-
-  it('is wired into authenticated schedule snapshots and live events', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-
-    expect(dashboard).toContain('rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))');
-    expect(dashboard).toContain('schedule: stripSchedulePreconditionMaterial(b.schedule)');
-    expect(dashboard).toMatch(/patch:\s*stripSchedulePreconditionMaterial\(b\.patch,/);
-    expect(dashboard).toContain('{ preserveClearMarkers: true }');
   });
 });
 

@@ -16,7 +16,7 @@
  * Run:  bunx vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -408,7 +408,9 @@ describe('HerdrBackend.spawn', () => {
       'workspace create', 'pane run', 'agent list', 'agent list', 'agent rename', 'agent get',
     ]);
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(launcherPath))).toBe(false);
+    // A launched launcher removes itself (see the Gatekeeper fallback test).
+    expect(existsSync(dirname(launcherPath))).toBe(true);
+    rmSync(dirname(launcherPath), { recursive: true, force: true });
     be.kill();
   });
 
@@ -459,7 +461,8 @@ describe('HerdrBackend.spawn', () => {
     expect(captured.pollCount).toBe(2);
     expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(launcherPath))).toBe(false);
+    expect(existsSync(dirname(launcherPath))).toBe(true);
+    rmSync(dirname(launcherPath), { recursive: true, force: true });
     be.kill();
   });
 
@@ -490,8 +493,29 @@ describe('HerdrBackend.spawn', () => {
     );
     expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(true);
+    rmSync(dirname(paneLauncherPath()), { recursive: true, force: true });
     be.kill();
+  });
+
+  it('Herdr 0.7.5: leaves a detected launcher to remove itself and reaps it only as a fallback', () => {
+    // Herdr can detect the launcher by its argv while macOS still holds the exec
+    // for a Gatekeeper assessment. Deleting the file then fails the XProtect scan
+    // and Gatekeeper SIGKILLs the CLI, so detection must not delete it.
+    setManagedLaunchResponses('claude');
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION);
+    withPlatform('darwin', () => be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    }));
+    be.kill();
+
+    const launcherDir = dirname(paneLauncherPath());
+    expect(existsSync(launcherDir)).toBe(true);
+    vi.advanceTimersByTime(59_000);
+    expect(existsSync(launcherDir)).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(existsSync(launcherDir)).toBe(false);
   });
 
   it('Herdr 0.7.5: rejects the wrong detected kind and closes only the new workspace', () => {
@@ -1530,6 +1554,40 @@ describe('HerdrBackend callbacks', () => {
     agentAlive = false;
     vi.advanceTimersByTime(600);
     expect(exits).toEqual([[0, null]]);
+    // Not a managed agent this backend owns: its pane is left alone.
+    expect(herdrCall('pane', 'close')).toBeUndefined();
+  });
+
+  it('closes the pane of an owned managed agent once its CLI exits', () => {
+    // The worker drops an exited backend before restarting, so without this
+    // every crashed attempt left an empty shell pane behind in the host.
+    let agentAlive = true;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => agentAlive
+          ? AGENT_LIST_REPLY('1-1')
+          : JSON.stringify({ result: { agents: [] } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, {
+      isReattach: true, agentName: 'botmux', ownsSession: false, ownsAgent: true,
+    });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('pane', 'close')).toBeUndefined();
+
+    agentAlive = false;
+    vi.advanceTimersByTime(600);
+    expect(exits).toEqual([[0, null]]);
+    expect(herdrCall('pane', 'close')).toEqual(['--session', SESSION, 'pane', 'close', '1-1']);
+    expect(herdrCall('session', 'stop')).toBeUndefined();
   });
 
   it('agent list probe failures do NOT report an exit while the herdr session still exists', () => {
@@ -2028,5 +2086,326 @@ describe('HERDR spawn publishes a usable CLI PID', () => {
       be.spawn(cli, [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
       expect(be.getChildPid()).toBe(21);
     } finally { be.kill(); }
+  });
+});
+
+describe('Herdr placement and wrapper resolution', () => {
+  const WORKSPACE_LIST_REPLY = JSON.stringify({
+    result: {
+      workspaces: [
+        { workspace_id: 'ws-main', label: '~', focused: true },
+      ],
+    },
+  });
+
+  const TAB_LIST_REPLY = JSON.stringify({
+    result: {
+      tabs: [
+        { tab_id: 't-sec', workspace_id: 'ws-main', label: '1 秘书', focused: false },
+        { tab_id: 't-urg', workspace_id: 'ws-main', label: '2 紧急重要', focused: false },
+        { tab_id: 't-oth', workspace_id: 'ws-main', label: '3 其他', focused: true },
+      ],
+    },
+  });
+
+  const PANE_LIST_REPLY = JSON.stringify({
+    result: {
+      panes: [
+        { pane_id: 'p-1', tab_id: 't-oth', focused: true },
+      ],
+    },
+  });
+
+  it('recognizes wrapper script filenames like claude-botmux as claude', () => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(MANAGED_PANE) },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    try {
+      expect(() => {
+        be.spawn('/usr/local/bin/claude-botmux', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      }).not.toThrow();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('recognizes unknown wrapper when cliId is provided in spawn options', () => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(MANAGED_PANE) },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    try {
+      expect(() => {
+        be.spawn('/opt/custom/my-launcher.sh', [], { cwd: '/tmp', cols: 80, rows: 24, env: {}, cliId: 'claude' });
+      }).not.toThrow();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('places pane in dedicated tab when placement is tab', () => {
+    let tabCreated = false;
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      {
+        match: a => a.includes('tab') && a.includes('create'),
+        reply: () => {
+          tabCreated = true;
+          return JSON.stringify({ result: { tab: { tab_id: 't-new' }, root_pane: { pane_id: MANAGED_PANE } } });
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(MANAGED_PANE) },
+    ]);
+
+    const be = new HerdrBackend(SESSION, {
+      herdrConfig: { placement: 'tab' },
+    });
+    try {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(tabCreated).toBe(true);
+      expect(herdrCall('tab', 'create')).toBeDefined();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('splits pane inside matching tab when placement is split', () => {
+    let paneSplit = false;
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      { match: a => a.includes('tab') && a.includes('list'), reply: () => TAB_LIST_REPLY },
+      { match: a => a.includes('pane') && a.includes('list'), reply: () => PANE_LIST_REPLY },
+      {
+        match: a => a.includes('pane') && a.includes('split'),
+        reply: () => {
+          paneSplit = true;
+          return JSON.stringify({ result: { pane: { pane_id: MANAGED_PANE, tab_id: 't-oth' } } });
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(MANAGED_PANE) },
+    ]);
+
+    const be = new HerdrBackend(SESSION, {
+      herdrConfig: { placement: 'split', tab: '3 其他', splitDirection: 'right' },
+    });
+    try {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(paneSplit).toBe(true);
+      const splitCall = herdrCall('pane', 'split');
+      expect(splitCall).toBeDefined();
+      expect(splitCall).toContain('p-1');
+      expect(splitCall).toContain('right');
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('auto-creates tab when matching tab does not exist in split mode', () => {
+    let tabCreated = false;
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      { match: a => a.includes('tab') && a.includes('list'), reply: () => TAB_LIST_REPLY },
+      {
+        match: a => a.includes('tab') && a.includes('create'),
+        reply: () => {
+          tabCreated = true;
+          return JSON.stringify({ result: { tab: { tab_id: 't-auto' }, root_pane: { pane_id: MANAGED_PANE } } });
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(MANAGED_PANE) },
+    ]);
+
+    const be = new HerdrBackend(SESSION, {
+      herdrConfig: { placement: 'split', tab: '9 暂无', splitDirection: 'right' },
+    });
+    try {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(tabCreated).toBe(true);
+      const call = herdrCall('tab', 'create');
+      expect(call).toBeDefined();
+      expect(call).toContain('9 暂无');
+    } finally {
+      be.kill();
+    }
+  });
+
+  it.each([
+    { list: 'workspace', failure: 'command' },
+    { list: 'tab', failure: 'command' },
+    { list: 'pane', failure: 'command' },
+    { list: 'workspace', failure: 'shape' },
+    { list: 'tab', failure: 'shape' },
+    { list: 'pane', failure: 'shape' },
+  ])('fails closed when the $list list fails ($failure), creating nothing in the session', ({ list, failure }) => {
+    const replies: Record<string, string> = {
+      workspace: WORKSPACE_LIST_REPLY,
+      tab: TAB_LIST_REPLY,
+      pane: PANE_LIST_REPLY,
+    };
+    setManagedLaunchResponses('claude', ['workspace', 'tab', 'pane'].map(kind => ({
+      match: (a: string[]) => a.includes(kind) && a.includes('list'),
+      reply: () => {
+        if (kind !== list) return replies[kind];
+        if (failure === 'shape') return JSON.stringify({ result: {} });
+        throw Object.assign(new Error('Command failed: herdr'), { status: 1, stdout: '', stderr: 'socket busy' });
+      },
+    })));
+    const be = new HerdrBackend(SESSION, {
+      herdrConfig: { placement: 'split', tab: '3 其他' },
+    });
+    try {
+      expect(() => be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} }))
+        .toThrow(`herdr ${list} list in ${SESSION} failed`);
+      expect(herdrCall('workspace', 'create')).toBeUndefined();
+      expect(herdrCall('tab', 'create')).toBeUndefined();
+      expect(herdrCall('pane', 'split')).toBeUndefined();
+      expect(herdrCall('pane', 'run')).toBeUndefined();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('creates a workspace only when the session has none, named after the target', () => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => JSON.stringify({ result: { workspaces: [] } }) },
+      {
+        match: a => a.includes('tab') && a.includes('create'),
+        reply: () => JSON.stringify({ result: { tab: { tab_id: 't-new' }, root_pane: { pane_id: MANAGED_PANE } } }),
+      },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      herdrConfig: { placement: 'tab', workspace: 'dev' },
+    });
+    try {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(herdrCall('workspace', 'create')).toEqual([
+        '--session', SESSION, 'workspace', 'create', '--label', 'dev', '--no-focus',
+      ]);
+      expect(herdrCall('tab', 'create')).toContain(MANAGED_WORKSPACE);
+    } finally {
+      be.kill();
+    }
+  });
+
+  it.each([
+    { target: '3', expected: 't-oth' },
+    { target: 't-oth', expected: 't-oth' },
+    { target: '30 归档', expected: 't-arc' },
+    { target: '归档', expected: 't-arc' },
+  ])('matches tab target "$target" to $expected, preferring the label\'s first word over a longer prefix', ({ target, expected }) => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      {
+        match: a => a.includes('tab') && a.includes('list'),
+        reply: () => JSON.stringify({ result: { tabs: [
+          // Listed first on purpose: a plain prefix match would pick it for "3".
+          { tab_id: 't-arc', workspace_id: 'ws-main', label: '30 归档' },
+          { tab_id: 't-oth', workspace_id: 'ws-main', label: '3 其他' },
+        ] } }),
+      },
+      {
+        match: a => a.includes('pane') && a.includes('list'),
+        reply: () => JSON.stringify({ result: { panes: [
+          { pane_id: 'p-arc', tab_id: 't-arc' },
+          { pane_id: 'p-oth', tab_id: 't-oth' },
+        ] } }),
+      },
+      {
+        match: a => a.includes('pane') && a.includes('split'),
+        reply: () => JSON.stringify({ result: { pane: { pane_id: MANAGED_PANE } } }),
+      },
+    ]);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'split', tab: target } });
+    try {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(herdrCall('pane', 'split')).toContain(expected === 't-oth' ? 'p-oth' : 'p-arc');
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('closes the tab it created and its pane when the launch fails, leaving the workspace alone', () => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      { match: a => a.includes('tab') && a.includes('list'), reply: () => TAB_LIST_REPLY },
+      {
+        match: a => a.includes('tab') && a.includes('create'),
+        reply: () => JSON.stringify({ result: { tab: { tab_id: 't-auto' }, root_pane: { pane_id: MANAGED_PANE } } }),
+      },
+      {
+        match: a => a.includes('pane') && a.includes('run'),
+        reply: () => { throw Object.assign(new Error('Command failed: herdr'), { status: 1, stdout: '', stderr: 'pane gone' }); },
+      },
+    ]);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'split', tab: '9 暂无' } });
+    try {
+      expect(() => be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} })).toThrow('pane gone');
+      expect(herdrCall('tab', 'close')).toEqual(['--session', SESSION, 'tab', 'close', 't-auto']);
+      expect(herdrCall('pane', 'close')).toEqual(['--session', SESSION, 'pane', 'close', MANAGED_PANE]);
+      expect(herdrCall('workspace', 'close')).toBeUndefined();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('closes only its split pane when the launch fails inside an existing tab', () => {
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => WORKSPACE_LIST_REPLY },
+      { match: a => a.includes('tab') && a.includes('list'), reply: () => TAB_LIST_REPLY },
+      { match: a => a.includes('pane') && a.includes('list'), reply: () => PANE_LIST_REPLY },
+      {
+        match: a => a.includes('pane') && a.includes('split'),
+        reply: () => JSON.stringify({ result: { pane: { pane_id: MANAGED_PANE, tab_id: 't-oth' } } }),
+      },
+      {
+        match: a => a.includes('pane') && a.includes('run'),
+        reply: () => { throw Object.assign(new Error('Command failed: herdr'), { status: 1, stdout: '', stderr: 'pane gone' }); },
+      },
+    ]);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'split', tab: '3 其他' } });
+    try {
+      expect(() => be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} })).toThrow('pane gone');
+      expect(herdrCall('pane', 'close')).toEqual(['--session', SESSION, 'pane', 'close', MANAGED_PANE]);
+      expect(herdrCall('tab', 'close')).toBeUndefined();
+      expect(herdrCall('workspace', 'close')).toBeUndefined();
+    } finally {
+      be.kill();
+    }
+  });
+
+  it('never kills custom user session on destroySession even if ownsSession is true', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => JSON.stringify({ sessions: [{ name: 'default', running: true }] }) },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('p-my') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+      { match: a => a.includes('pane') && a.includes('close'), reply: () => JSON.stringify({ result: { type: 'ok' } }) },
+    ]);
+
+    const be = new HerdrBackend('default', {
+      isReattach: true,
+      ownsSession: true,
+      herdrConfig: { sessionName: 'default' },
+    });
+    be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+    be.destroySession();
+
+    expect(herdrCall('session', 'stop')).toBeUndefined();
+    expect(herdrCall('session', 'delete')).toBeUndefined();
+    expect(herdrCall('pane', 'close', 'p-my')).toBeDefined();
+  });
+
+  it('refuses to start when custom user session is not running', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EMPTY_SESSIONS_REPLY },
+    ]);
+
+    const be = new HerdrBackend('default', {
+      herdrConfig: { sessionName: 'default' },
+    });
+    expect(() => {
+      be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+    }).toThrow('herdr session "default" is not running');
+    expect(mockedSpawn).not.toHaveBeenCalled();
   });
 });

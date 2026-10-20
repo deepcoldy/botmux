@@ -71,7 +71,7 @@ bwrap:
 1. **子挂载点递归 overlay**：`lowerdir=/` 时 overlayfs **不递归**挂载点（独立数据盘如 `/data00`、bind mount 在 merged 里会变空目录）。scratch 会枚举所有相关子挂载、各挂一层自己的 overlay 再 bind 进主 merged；无法 overlay 的子挂载只读透传，workingDir 落在其上时**硬失败**（绝不把真实项目读写穿透给宿主）。
 2. **宿主零写入**：容器内写任何路径（含 `/etc`、`$HOME`、项目）都 copy-up；host 侧只在 `<merged>/…` 可见，真实路径逐项无变化。探针：`node scripts/scratch-sandbox-probe.mjs [--disk]`，真 CLI 端到端：`node scripts/scratch-real-cli-probe.mjs [--codex]`。
 3. **daemon 侧读改写**：CLI 在容器里写的 transcript/rollout/events，宿主真实路径看不到，daemon/worker 统一从 `<merged>/<绝对路径>` 读（`scratchHostView`；transcript-resolver 按会话冻结的 scratch 状态自动 remap，unmount 时自然 ENOENT，**不回退读宿主真实路径**）。worker 是每会话进程，CODEX_HOME/TRAE_HOME 在进程内重指 merged、对容器子进程经 `--setenv/--unsetenv` 强制保持原生路径。
-4. **resume**：活 pane（tmux 等）reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
+4. **resume**：活 pane（tmux 等）跨 daemon 重启 / 话题转移时整棵会话树（overlay、上层、outbox）保留，reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
 5. **生命周期**：正常关闭/sweep 按「子 bind → 子 overlay → 主 overlay → tmpfs 槽」逆序卸载并删目录；daemon 启动与周期 reconciler 调 `sweepOrphanScratchSandboxes`，/proc cmdline 活进程守卫 + 60s grace（沿用 oncall sweep 的事故教训）。
 6. 非 root：自动走 `fuse-overlayfs`（需 /dev/fuse），storage 强制为 disk 语义；依赖缺失自动装失败则**报错不裸跑**。
 
@@ -206,6 +206,36 @@ worker spawnCli
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
 → **所有飞书密钥全程不进沙盒**。
+
+**沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
+
+- 持久后端（tmux 等）的 worker 退出但不结束 CLI 时——daemon 重启 / 父进程退出 / 看门狗、
+  话题转移、worker 崩溃——pane 仍在运行（Linux 上 outbox 以 inode bind 进 pane，scratch
+  的 COW 根也在这棵树里），目录**保留**，由后继 worker 热重连、重启 outbox watcher 并重新
+  发布 relay capability；只有真正关闭会话才删除。PTY 后端的 CLI 随 worker 一起结束，目录
+  照旧清理（转移除外：替代 worker 会在同一棵树上冷启）。
+- 热重连**绝不重建** outbox：新建的目录是 pane 看不到的另一个 inode。Linux 上原目录已丢失
+  （例如由未含此修复的旧版本在重启时删掉）时不重连，改为 kill + 冷启；macOS scratch 仍按
+  原逻辑原样重连。
+- 全新启动在 pane 建立前失败时回滚目录；pane 一旦建立就立即标记保留，之后的任何失败出口（spawn 内
+  FIFO / pipe-pane 失败、provenance 提交失败、Codex App 代际确认失败）只有在证实 pane 已消失后才回滚：
+  tmux 由同一条服务端命令（`if-shell -F` 同时比较 server pid、会话 id、创建时间）终止本次新建的会话，
+  无法确认终止则保留。
+- 沙盒形态切换（开/关、oncall ↔ scratch ↔ credential-only）跨重启时收敛在一处：读出旧目录记录的形态
+  （`scratch.json` / 挂载 → scratch，shim 与遮罩脚手架 → oncall，仅 outbox → credential-only），旧 pane
+  不会以新形态热重连；证实旧 pane 已消失后先按旧形态拆除（scratch 先卸载），拆不干净则拒绝启动，
+  然后才按新形态准备。同形态（冷启 / 转移）照旧复用。
+- worker 已不在（崩溃后未重连）就关闭会话时，daemon 杀掉 backing pane 并确认消失后，按形态拆除目录：
+  scratch 先卸载（子 bind → 子 overlay → 主 overlay → tmpfs 槽）再删除。
+- daemon 的孤儿目录清扫只回收「会话已不活跃、且没有活进程引用」的目录，被保留的目录属于
+  仍活跃的会话，不会被误删。通用清扫跳过 scratch 树（`scratch.json`，由 scratch 清扫先卸载再删），
+  且任何删除路径遇到目录内（含自身）仍有挂载点一律跳过，绝不递归进挂载点——递归删除不会停在
+  文件系统边界（实测 Bun 的 `rmSync` 会删进挂载点；Node 22 在挂载点 `rmdir` 先得 EBUSY 而止步），
+  对仍挂载的 scratch 树等于遍历整个宿主文件系统。`scratch.json` 以临时文件 + rename 原子写入；
+  旧版本留下的截断标记仍按 scratch 树处理：scratch 清扫在会话不活跃、无活进程引用、超过宽限期后
+  按默认布局先卸载再删除，仍有挂载就保留。
+- 全新启动认领 tmux 会话只认 `new-session -P -F` 在创建时原子打印的身份；重试时撞上的同名会话
+  （`duplicate session`）无法证明归属，一律不认领、不终止。
 
 ### Linux 隔离判据
 

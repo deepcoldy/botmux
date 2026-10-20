@@ -623,6 +623,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     privateCard: body.privateCard,
     cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
+    senderTagHideEmail: body.senderTagHideEmail,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -3697,12 +3698,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const enabled = policy?.enabled === true;
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
+  const credentialSource = policy?.credentialSource ?? 'auto';
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
+    platformBound?: boolean;
+    platformCredentialsUrl?: string;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -3736,7 +3740,11 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback });
+    void save({ enabled: true, tools: next, fallback, credentialSource });
+  }
+
+  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
+    void save({ enabled: true, tools, fallback, credentialSource: next });
   }
 
   return (
@@ -3749,7 +3757,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource } : null,
         )}
       />
       {enabled ? (
@@ -3769,6 +3777,33 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+            <select
+              data-action="trigger-user-auth-source"
+              value={credentialSource}
+              disabled={busy}
+              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+            >
+              <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
+              <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
+              <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
+            </select>
+          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          {credentialSource !== 'local' && info && info.platformBound === false ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
+              ⚠️ {tr(credentialSource === 'platform'
+                ? 'botDefaults.triggerUserAuthPlatformUnboundStrict'
+                : 'botDefaults.triggerUserAuthPlatformUnbound')}
+            </p>
+          ) : null}
+          {credentialSource !== 'local' && info?.platformBound && info.platformCredentialsUrl ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="bound">
+              {tr('botDefaults.triggerUserAuthPlatformBound')}{' '}
+              <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
+            </p>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -5145,13 +5180,16 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   );
 }
 
-function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [on, setOn] = useState(props.bot.senderTag !== false);
+  const [hideEmail, setHideEmail] = useState(props.bot.senderTagHideEmail === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setOn(props.bot.senderTag !== false), [props.bot.senderTag]);
+
+  useEffect(() => setHideEmail(props.bot.senderTagHideEmail === true), [props.bot.senderTagHideEmail]);
 
   async function save(next: boolean): Promise<void> {
     const previous = on;
@@ -5167,6 +5205,20 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
     });
   }
 
+  async function saveHideEmail(next: boolean): Promise<void> {
+    const previous = hideEmail;
+    setHideEmail(next);
+    await saveBotField({
+      request: () => props.putCardPref({ senderTagHideEmail: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: () => props.patchBot(props.bot.larkAppId, { senderTagHideEmail: next }),
+      rollback: () => setHideEmail(previous),
+    });
+  }
+
   return (
     <section className="bd-section" data-sender-tag>
       <h3 className="bd-section-title">{tr('botDefaults.senderTag')}</h3>
@@ -5177,6 +5229,14 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
         title={tr('botDefaults.senderTagInject')}
         help={tr('botDefaults.senderTagHelp')}
         onChange={checked => void save(checked)}
+      />
+      <ToggleRow
+        checked={hideEmail}
+        disabled={busy}
+        dataAction="toggle-sender-tag-hide-email"
+        title={tr('botDefaults.senderTagHideEmail')}
+        help={tr('botDefaults.senderTagHideEmailHelp')}
+        onChange={checked => void saveHideEmail(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
       <div className="actions">

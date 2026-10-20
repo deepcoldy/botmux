@@ -13,6 +13,8 @@ const h = vi.hoisted(() => ({
   disband: vi.fn(async (): Promise<{ ok: true } | { ok: false; error: string }> => ({ ok: true })),
   inventory: vi.fn<() => Session[]>(),
   remove: vi.fn(),
+  online: vi.fn((app: string): { larkAppId: string; ipcPort: number } | null => ({ larkAppId: app, ipcPort: 4100 })),
+  ipc: vi.fn(),
 }));
 vi.mock('../src/services/session-groups-store.js', () => ({
   getSessionGroup: () => h.entry,
@@ -25,6 +27,8 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({ closeSession: h.close }));
 vi.mock('../src/services/groups-store.js', () => ({ disbandChat: h.disband }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { warn: vi.fn() } }));
+vi.mock('../src/utils/daemon-discovery.js', () => ({ findOnlineDaemon: h.online }));
+vi.mock('../src/core/daemon-ipc-auth.js', () => ({ fetchDaemonIpc: h.ipc }));
 import { dismissSessionGroup } from '../src/core/dismiss-command.js';
 
 const APP = 'cli_test';
@@ -34,20 +38,35 @@ const active = new Map<string, DaemonSession>();
 const request = { larkAppId: APP, chatId: CHAT, rootId: CHAT, senderId: OWNER, activeSessions: active };
 /** Capture the actual confirmation, so tests also exercise the no-side-effect first step. */
 async function confirmation(): Promise<string> {
+  return (await confirmed()).state;
+}
+async function confirmed(): Promise<Extract<Awaited<ReturnType<typeof dismissSessionGroup>>, { status: 'confirm' }>> {
   const result = await dismissSessionGroup(request);
   expect(result.status).toBe('confirm');
   if (result.status !== 'confirm') throw new Error('missing confirmation');
-  return result.state;
+  return result;
 }
+/** Peer daemon close response, as `/api/sessions/:id/close` serializes CloseSessionResult. */
+const peerReply = (status: number, body: unknown) => ({ ok: status < 300, status, json: async () => body });
+/** A co-resident session another local bot holds in the same group. */
+const peer = (sessionId: string, larkAppId = 'cli_other'): Session =>
+  ({ ...h.rows[0], sessionId, scope: 'thread', larkAppId, status: 'active' });
 beforeEach(() => {
   vi.clearAllMocks(); active.clear();
   h.entry = { ownerOpenId: OWNER, lastSessionId: 's1', createdAt: 1, lastActiveAt: 1 };
   h.rows = [{ sessionId: 's1', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', status: 'active', createdAt: '2026-09-29T00:00:00Z', title: 'Test', larkAppId: APP }];
   h.peers = [];
-  h.inventory.mockImplementation(() => [...h.rows.filter(s => s.status === 'active'), ...h.peers]);
-  h.close.mockImplementation(async () => {
-    h.rows[0].status = 'closed'; active.clear();
+  h.inventory.mockImplementation(() => [...h.rows, ...h.peers].filter(s => s.status === 'active'));
+  h.close.mockImplementation(async (id: string) => {
+    const row = h.rows.find(r => r.sessionId === id); if (row) row.status = 'closed';
+    for (const [key, ds] of active) if (ds.session.sessionId === id) active.delete(key);
     return { ok: true, known: true, alreadyClosed: false, outcome: 'closed' };
+  });
+  h.online.mockImplementation((app: string) => ({ larkAppId: app, ipcPort: 4100 }));
+  h.ipc.mockImplementation(async (_port: number, path: string) => {
+    const id = decodeURIComponent(path.split('/')[3]);
+    const row = h.peers.find(p => p.sessionId === id); if (row) row.status = 'closed';
+    return peerReply(200, { ok: true, outcome: 'closed', alreadyClosed: false, known: true });
   });
   h.disband.mockResolvedValue({ ok: true });
   h.remove.mockImplementation(() => { h.entry = undefined; });
@@ -89,10 +108,70 @@ describe('dismissSessionGroup', () => {
     expect((await dismissSessionGroup({ ...request, confirmedState: state })).status).toBe('confirm');
     expect(h.close).not.toHaveBeenCalled();
   });
-  it('blocks foreign bot sessions and topics in the same group', async () => {
-    h.peers = [{ ...h.rows[0], sessionId: 's2', scope: 'thread', larkAppId: 'cli_other' }];
-    expect((await dismissSessionGroup(request)).status).toBe('other_sessions');
+  it('lists every local bot session in the group for confirmation, resident first', async () => {
+    h.rows.push({ ...h.rows[0], sessionId: 's3', scope: 'thread', rootMessageId: 'om_topic' });
+    h.peers = [peer('s2')];
+    const { sessions } = await confirmed();
+    expect(sessions.map(s => [s.larkAppId, s.session.sessionId, s.resident])).toEqual([
+      [APP, 's1', true], [APP, 's3', false], ['cli_other', 's2', false],
+    ]);
+    expect(h.close).not.toHaveBeenCalled(); expect(h.ipc).not.toHaveBeenCalled();
+  });
+  it('closes co-resident sessions of this and peer bots before the resident, then disbands', async () => {
+    h.rows.push({ ...h.rows[0], sessionId: 's3', scope: 'thread', rootMessageId: 'om_topic' });
+    h.peers = [peer('s2')];
+    const state = await confirmation();
+    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed' });
+    expect(h.close.mock.calls.map(c => c[0])).toEqual(['s3', 's1']);
+    expect(h.ipc).toHaveBeenCalledWith(4100, '/api/sessions/s2/close', expect.objectContaining({ method: 'POST' }));
+    expect(h.online).toHaveBeenCalledWith('cli_other');
+    expect(h.ipc.mock.invocationCallOrder[0]).toBeLessThan(h.close.mock.invocationCallOrder[1]);
+    expect(h.close.mock.invocationCallOrder[1]).toBeLessThan(h.disband.mock.invocationCallOrder[0]);
+  });
+  it('lists a group with only a closed resident as having nothing to close', async () => {
+    h.rows[0].status = 'closed';
+    expect((await confirmed()).sessions).toEqual([]);
+  });
+  it('refuses before confirmation when a peer bot is offline', async () => {
+    h.peers = [peer('s2'), peer('s4', 'cli_third')];
+    h.online.mockImplementation((app: string) => app === 'cli_third' ? null : { larkAppId: app, ipcPort: 4100 });
+    expect(await dismissSessionGroup(request)).toEqual({ status: 'peer_offline', larkAppIds: ['cli_third'] });
+    expect(h.close).not.toHaveBeenCalled(); expect(h.ipc).not.toHaveBeenCalled();
+  });
+  it.each(['row', 'live'])('refuses a co-resident shared adopt it cannot end (%s)', async shape => {
+    if (shape === 'row') h.peers = [{ ...peer('s2'), adoptedFrom: 'tmux:test' }];
+    else active.set('om_topic', { larkAppId: APP, session: { ...h.rows[0], sessionId: 's5', scope: 'thread' }, chatId: CHAT, scope: 'thread', adoptedFrom: 'tmux:test' } as unknown as DaemonSession);
+    expect((await dismissSessionGroup(request)).status).toBe('shared_adopt');
+    expect(h.close).not.toHaveBeenCalled(); expect(h.ipc).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['failed', peerReply(502, { ok: false, alreadyClosed: false, error: 'riff_cancel_failed' }), 'close_failed', 'riff_cancel_failed'],
+    ['unknown', peerReply(200, { ok: true, outcome: 'closed', alreadyClosed: false, known: false }), 'close_failed', 'unknown'],
+    ['residual', peerReply(200, { ok: true, outcome: 'closed_with_residual', residual: { reason: 'mojo_lineage_quarantined', taskId: 'peer-survivor' } }), 'residual', 'peer-survivor'],
+  ])('keeps the resident and the group when a peer close is %s', async (_shape, reply, status, detail) => {
+    h.peers = [peer('s2')];
+    const state = await confirmation();
+    h.ipc.mockResolvedValue(reply);
+    const result = await dismissSessionGroup({ ...request, confirmedState: state, botName: app => `bot:${app}` });
+    expect(result.status).toBe(status);
+    expect('detail' in result && result.detail).toContain('bot:cli_other');
+    expect('detail' in result && result.detail).toContain(detail);
     expect(h.close).not.toHaveBeenCalled();
+    expect(h.disband).not.toHaveBeenCalled(); expect(h.remove).not.toHaveBeenCalled();
+  });
+  it('treats a peer daemon that cannot be reached as an unverified close', async () => {
+    h.peers = [peer('s2')];
+    const state = await confirmation();
+    h.ipc.mockRejectedValue(new Error('The operation was aborted due to timeout'));
+    const result = await dismissSessionGroup({ ...request, confirmedState: state });
+    expect(result.status).toBe('close_failed');
+    expect(h.disband).not.toHaveBeenCalled();
+  });
+  it('re-confirms when a session appears after the card was shown', async () => {
+    const state = await confirmation();
+    h.peers = [peer('s2')];
+    expect((await dismissSessionGroup({ ...request, confirmedState: state })).status).toBe('confirm');
+    expect(h.close).not.toHaveBeenCalled(); expect(h.ipc).not.toHaveBeenCalled();
   });
   it('fails closed when the cross-bot inventory is unreadable', async () => {
     h.inventory.mockImplementation(() => { throw new Error('unreadable store'); });
@@ -114,7 +193,7 @@ describe('dismissSessionGroup', () => {
       h.rows[0].status = 'closed'; h.peers.push({ ...h.rows[0], sessionId: 's2', status: 'active' });
       return { ok: true, known: true, alreadyClosed: false, outcome: 'closed' };
     });
-    expect((await dismissSessionGroup({ ...request, confirmedState: state })).status).toBe('other_sessions');
+    expect((await dismissSessionGroup({ ...request, confirmedState: state })).status).toBe('changed');
     expect(h.disband).not.toHaveBeenCalled();
   });
   it('returns a surviving remote ID for the operator to inspect', async () => {
@@ -138,8 +217,11 @@ describe('dismissSessionGroup', () => {
   });
   it('does not mistake another bot with the same session ID for the target', async () => {
     h.peers = [{ ...h.rows[0], larkAppId: 'cli_other' }];
-    expect((await dismissSessionGroup(request)).status).toBe('other_sessions');
-    expect(h.close).not.toHaveBeenCalled();
+    const { sessions, state } = await confirmed();
+    expect(sessions.map(s => [s.larkAppId, s.resident])).toEqual([[APP, true], ['cli_other', false]]);
+    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed' });
+    expect(h.ipc).toHaveBeenCalledWith(4100, '/api/sessions/s1/close', expect.anything());
+    expect(h.close).toHaveBeenCalledTimes(1);
   });
   it('rejects a live shared adopt even before its metadata reaches storage', async () => {
     active.set(CHAT, { larkAppId: APP, session: h.rows[0], chatId: CHAT, scope: 'chat', adoptedFrom: 'tmux:test' } as DaemonSession);

@@ -122,6 +122,9 @@ export type BotDefaultsRow = {
     enabled: boolean;
     tools: Array<'lark-cli' | 'bytedcli'>;
     fallback: 'bot-identity' | 'none';
+    /** Where the sender's credentials come from: central platform first
+     *  (`auto`, default), platform only, or this machine only. */
+    credentialSource?: 'auto' | 'platform' | 'local';
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
@@ -165,6 +168,7 @@ export type BotDefaultsRow = {
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
+  senderTagHideEmail?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {

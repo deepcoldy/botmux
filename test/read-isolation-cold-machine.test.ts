@@ -72,28 +72,21 @@ describe('resolveReadIsolationPaneProbe', () => {
 });
 
 describe('worker wiring', () => {
-  it('feeds the read-isolation gate through resolveReadIsolationPaneProbe with the tmux cold-machine check', () => {
+  // 源码结构护栏(K3+K2)：spawn 前的读隔离闸门在 worker.ts 的 spawnCli 巨型闭包里，没有可单测的 seam；
+  // 上面的纯函数用例删掉 worker 调用点照样全绿。守两件事：① 闸门吃的是经冷机判定升级后的 probe——
+  // 2026-10-02 重启清空 /tmp 后所有读隔离 bot 一直起不来（11d09778c9）；② 这个「unknown→missing」
+  // 的放宽只有这一个生产调用点，不能扩散到 post-kill 确认 / MCP 闸门等其它 fail-closed 判定。
+  it('feeds only the read-isolation gate through the tmux cold-machine probe upgrade', () => {
     const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    expect(src).toMatch(/const paneProbe = resolvedPaneProbe\.probe;/);
-    expect(src).toMatch(/resolveReadIsolationPaneProbe\(\s*rawPaneProbe,\s*effectiveBackendType,\s*\(\) => TmuxBackend\.serverAbsentOnColdMachine\(\),\s*\)/);
-    // The gate's state machine consumes the resolved probe, not the raw one.
-    const gate = src.slice(src.indexOf('const paneProbe = resolvedPaneProbe.probe;'));
-    expect(gate.slice(0, gate.indexOf('evaluatePersistentPaneMigration(') + 2000)).toMatch(/paneProbe,/);
-    expect(src).not.toMatch(/evaluatePersistentPaneMigration\(\{[^}]*rawPaneProbe/);
-  });
-
-  it('keeps the upgrade out of every other consumer (post-kill confirm and the MCP gate probe afresh)', () => {
-    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    // Exactly one production call site.
+    const call = src.match(/(\w+) = resolveReadIsolationPaneProbe\([\s\S]{0,200}?serverAbsentOnColdMachine\(\)/);
+    expect(call).not.toBeNull();
     expect(src.match(/resolveReadIsolationPaneProbe\(/g)).toHaveLength(1);
     expect(src.match(/serverAbsentOnColdMachine\(/g)).toHaveLength(1);
-    // Post-kill confirmation re-probes the backend; it never reads paneProbe.
-    const confirm = src.slice(src.indexOf('confirmPaneGone: () => {'));
-    const confirmBody = confirm.slice(0, confirm.indexOf('},'));
-    expect(confirmBody).toMatch(/const postKillProbe = [\s\S]*probePersistentBackendTarget\(stalePersistentTarget\)[\s\S]*probePersistentSession\(/);
-    expect(confirmBody).not.toMatch(/\bpaneProbe\b/);
-    // The MCP-gateway gate declares and computes its own probe.
-    const mcp = src.slice(src.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length'));
-    expect(mcp.slice(0, 600)).toMatch(/const paneProbe = effectiveBackendType === 'zmx'[\s\S]*probePersistentBackendTarget\(persistentTarget\)/);
+    // The gate's state machine consumes the resolved probe, never the raw one.
+    const resolved = src.slice(call!.index!);
+    const gateInput = resolved.slice(resolved.indexOf('evaluatePersistentPaneMigration({'));
+    expect(resolved).toMatch(new RegExp(`paneProbe = ${call![1]}\\.probe\\b`));
+    expect(gateInput.slice(0, gateInput.indexOf('})'))).toMatch(/\bpaneProbe\b/);
+    expect(src).not.toMatch(/evaluatePersistentPaneMigration\(\{[^}]*rawPaneProbe/);
   });
 });

@@ -126,7 +126,7 @@ export function isBridgeNothingToSendFinal(finalText: string | undefined): boole
  *  (current or legacy). Used to tell "model deliberately terminated with the
  *  sentinel" apart from a normal answer that merely mentions the token inline
  *  or has prose after it. */
-function hasTrailingBridgeSentinelLine(finalText: string): boolean {
+export function hasTrailingBridgeSentinelLine(finalText: string): boolean {
   const lines = finalText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();

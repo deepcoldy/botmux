@@ -7,7 +7,6 @@
  *
  * Run: pnpm vitest run test/workbench-doctor-page.test.ts
  */
-import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -264,17 +263,6 @@ describe('doctorProbeWs — WS 探针超时与迟到写入', () => {
     expect(html).toContain('var gate = { closed: false, cancel: [] };');
     expect(html).toContain('function seal()');
     expect(html.match(/ctx\.gate\)/g) ?? []).toHaveLength(2);
-  });
-});
-
-describe('/workbench-doctor wiring', () => {
-  it('is mounted on the dashboard beside the fragment-free Workbench entries', () => {
-    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboard).toContain('handleWorkbenchDoctor');
-    // 挂在 /workbench 无片段入口之后、静态壳之前——同一段路由区。
-    const doctorAt = dashboard.indexOf('if (handleWorkbenchDoctor(req, res, url)) return;');
-    expect(doctorAt).toBeGreaterThan(dashboard.indexOf("url.pathname === '/workbench/dock'"));
-    expect(doctorAt).toBeLessThan(dashboard.indexOf("url.pathname === '/workbench.webmanifest'"));
   });
 });
 

@@ -76,10 +76,10 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -103,7 +103,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
+import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
   parseReadOnlyRemoteScrollPayload,
@@ -207,6 +207,7 @@ import {
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { sessionSkillManifestPath } from './core/skills/manifest-store.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import {
   buildPluginCardActionCapabilitiesSnapshot,
@@ -228,6 +229,7 @@ import {
 } from './global-config.js';
 import {
   stopSessionScope,
+  sessionScopePayloadPid,
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import {
@@ -435,6 +437,7 @@ import {
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
+  sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
   sandboxEnabled,
   localSandboxApplies,
@@ -454,6 +457,11 @@ import {
 import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
 import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
 import {
+  reconcileSandboxTreeFlavour,
+  recordedSandboxTreeFlavour,
+  requestedSandboxTreeFlavour,
+} from './adapters/backend/sandbox-tree-teardown.js';
+import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
 } from './platform/device-paths.js';
@@ -467,6 +475,7 @@ import type {
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import { herdrConfigForSession } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import {
   IdleDetector,
@@ -1670,12 +1679,14 @@ let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
-/** The credential-only relay belongs to a persistent pane that keeps running
- *  when this worker exits (tmux/zellij/herdr/zmx `kill()` only detaches). A
- *  parent-exit shutdown (daemon restart, IPC disconnect, watchdog) must then
- *  leave its outbox for the successor worker to re-serve; only a real close /
- *  restart / a PTY-owned CLI tears it down. */
-let credentialOnlyRelayOutlivesWorker = false;
+/** This CLI generation's per-session sandbox tree (oncall / scratch file
+ *  sandbox or credential-only relay) belongs to a persistent pane that keeps
+ *  running when this worker exits (tmux/zellij/herdr/zmx `kill()` only
+ *  detaches). A detach-style exit (daemon restart, IPC disconnect, watchdog,
+ *  crash) must then leave the tree for the successor worker to re-serve; only a
+ *  real close / in-worker restart / a PTY-owned CLI tears it down. See
+ *  sandboxTreeSurvivesWorkerExit. */
+let sandboxTreeOutlivesWorker = false;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
@@ -2170,6 +2181,14 @@ let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
 let activeRestartAttemptId: string | undefined;
+/** Launch settings (cwd / env / model / larkToolBinding) the current restart
+ *  window's replacement is built from. Reset when a window (owned restart or
+ *  Codex auto-upgrade) begins; set when it captures `restartCfg`. */
+let restartWindowLaunch: RestartLaunchSettings | undefined;
+/** A correlated restart folded into the current window asked for launch
+ *  settings the window's replacement does not run (see foldRestartIntoWindow).
+ *  Its attempt is settled only by the convergence replacement that follows. */
+let pendingLaunchConvergence: { attemptId?: string; requested: RestartLaunchSettings } | undefined;
 /** Distinguishes a replacement's synchronous ready signal (Riff) from a late
  * idle callback emitted by the backend being torn down. */
 let replacementSpawnInProgress = false;
@@ -2686,6 +2705,9 @@ async function observeCodexRuntimeVersionOnReady(): Promise<void> {
 }
 
 async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]): Promise<void> {
+  /** Restore passes before giving up on launch settings that keep moving (the
+   *  upgrade pass plus at most two launch-config convergence passes). */
+  const MAX_RESTORE_PASSES = 3;
   // No await may separate this final safety check and closing the input gates.
   const blocked = codexUpgradeBlocked();
   if (blocked || !config.autoUpgradeCodexSessions) throw new Error(blocked ?? 'automatic upgrade disabled');
@@ -2694,12 +2716,48 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
   if (!threadId) throw new Error('An exact Codex thread ID is required for automatic upgrade');
   codexAutoUpgrade = { stage: 'stopping', threadId };
   cliRestartInProgress = true;
+  restartWindowLaunch = undefined;
   rawInputRestartGate = true;
   cliSpawnGeneration++;
-  const oldBackend = backend!;
-  intentionalRestartBackend = oldBackend;
+  intentionalRestartBackend = backend!;
+  // What EVERY restore pass of this upgrade inherits — the first one and any
+  // launch-config convergence pass alike. A convergence pass is not an
+  // ordinary restart: it must keep the upgrade's guarantees, or it would undo
+  // the upgrade right after verifying it.
+  const upgradeContext = {
+    threadId,
+    /** The verified executable (lastInitConfig never learns it: an ordinary
+     *  restart would fall back to whatever `codex` resolves to on PATH). */
+    executable: target.path,
+    version: target.version,
+    /** Accepted input AND accepted slash injections survive every teardown
+     *  (the slash endpoint already answered "queued"). */
+    killOptions: { preservePending: true, preservePolicyCapability: true, preserveInjections: true },
+    // Exact resume (no fresh fallback, no tier-2 FRESH) is enforced by spawnCli
+    // while `codexAutoUpgrade.stage === 'restoring'`; runtime version + thread fd
+    // verification runs after every pass, before anything is settled; inputs
+    // stay fenced (cliRestartInProgress / rawInputRestartGate) across passes.
+  } as const;
+  /** `thread`: the upgrade pass resumes the thread on its own model / effort.
+   *  `requested`: a convergence pass runs the launch settings a restart folded
+   *  into the upgrade asked for (the latest lastInitConfig). */
+  const restoreCfg = (launch: 'thread' | 'requested') => ({
+    ...cfg, resume: true, prompt: '', cliSessionId: upgradeContext.threadId, forkSession: false,
+    cliPathOverride: upgradeContext.executable,
+    nativeSessionTitle: undefined, nativeSessionTitlePrompt: undefined,
+    ...(launch === 'thread' ? { model: undefined, reasoningEffort: undefined } : {}),
+  });
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
-  try {
+  /** Stop the current generation and resume the exact thread on the verified
+   *  executable; returns the verified replacement processes. */
+  const restorePass = async (pass: number, launch: 'thread' | 'requested', stopping: CodexProcess[]): Promise<CodexProcess[]> => {
+    if (pass > 1) {
+      codexAutoUpgrade!.stage = 'stopping';
+      replacementSpawnInProgress = false;
+      cliSpawnGeneration++;
+      intentionalRestartBackend = backend!;
+    }
+    const oldBackend = backend!;
     await Promise.race([
       Promise.resolve(oldBackend.destroySession?.()),
       new Promise<never>((_, reject) => {
@@ -2707,9 +2765,9 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
       }),
     ]);
     if (readyTimer) clearTimeout(readyTimer);
-    killCli({ preservePending: true, preservePolicyCapability: true, preserveInjections: true });
-    await waitForCodexExit(running);
-    codexAutoUpgrade.stage = 'restoring';
+    killCli(upgradeContext.killOptions);
+    await waitForCodexExit(stopping);
+    codexAutoUpgrade!.stage = 'restoring';
     const ready = new Promise<void>((resolve, reject) => {
       codexAutoUpgrade!.ready = resolve;
       codexAutoUpgrade!.reject = reject;
@@ -2718,17 +2776,17 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
     // Attach rejection handling before spawn, which can itself fail or emit an
     // exit notification. The original error is still awaited below.
     void ready.catch(() => undefined);
-    const restartCfg = {
-      ...cfg, resume: true, prompt: '', cliSessionId: threadId, forkSession: false,
-      cliPathOverride: target.path, model: undefined, reasoningEffort: undefined,
-      nativeSessionTitle: undefined, nativeSessionTitlePrompt: undefined,
-    };
+    const restartCfg = restoreCfg(launch);
+    // This pass's launch snapshot: a restart folded in from here on is judged
+    // against what this replacement actually runs (foldRestartIntoWindow).
+    restartWindowLaunch = restartLaunchSettings(restartCfg);
+    adoptPendingLaunchConvergence();
     let pluginGenerationPrepared = false;
     if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
-      await prepareCliPluginGenerationAndGateway(restartCfg, createCliAdapterSync(restartCfg.cliId as CliId, target.path));
+      await prepareCliPluginGenerationAndGateway(restartCfg, createCliAdapterSync(restartCfg.cliId as CliId, upgradeContext.executable));
       pluginGenerationPrepared = true;
       const outcome = await engageCodexRpc(restartCfg);
-      if (outcome !== 'resumed' || remoteThreadId !== threadId) {
+      if (outcome !== 'resumed' || remoteThreadId !== upgradeContext.threadId) {
         throw new Error('Codex RPC did not resume the original thread');
       }
     }
@@ -2738,21 +2796,53 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
     replacementSpawnInProgress = true;
     await spawnCli(restartCfg, { pluginGenerationPrepared });
     await ready;
+    if (readyTimer) clearTimeout(readyTimer);
     const replacement = await inspectCodexUpgradeRuntime();
     const resumedOriginal = replacement.some(item => {
       const open = findCodexRolloutSetByPid(item.pid);
-      return open?.size === 1 && open.has(threadId.toLowerCase());
+      return open?.size === 1 && open.has(upgradeContext.threadId.toLowerCase());
     });
-    if (replacement.some(item => item.version !== target.version)
-        || !resumedOriginal || (remoteThreadId ?? lastInitConfig?.cliSessionId) !== threadId) {
+    if (replacement.some(item => item.version !== upgradeContext.version)
+        || !resumedOriginal || (remoteThreadId ?? lastInitConfig?.cliSessionId) !== upgradeContext.threadId) {
       throw new Error('Replacement Codex runtime or thread identity did not match');
     }
-    if (cfg.workingDir !== restartCfg.workingDir || cfg.env !== restartCfg.env) {
-      throw new Error('Session launch settings changed during upgrade; restart is required');
+    return replacement;
+  };
+  try {
+    let stopping = running;
+    let launch: 'thread' | 'requested' = 'thread';
+    for (let pass = 1; ; pass++) {
+      stopping = await restorePass(pass, launch, stopping);
+      // Launch settings, by value. After the upgrade pass: what a restart
+      // folded into the upgrade asked for, plus any cwd / env change since the
+      // snapshot (which used to fail the upgrade and leave input closed). After
+      // a convergence pass (built from the latest settings): only a request
+      // folded in after its snapshot. A difference runs one more restore pass
+      // with the SAME upgrade context; the folded attempt is settled only once
+      // that verified replacement exists (or failed if the pass fails).
+      const converge = launch === 'thread'
+        ? decideUpgradeLaunchConvergence({
+          upgradeLaunch: restartWindowLaunch ?? restartLaunchSettings(restoreCfg(launch)),
+          current: restartLaunchSettings(lastInitConfig),
+          restartRequested: pendingLaunchConvergence?.requested
+            ?? (activeRestartAttemptId ? restartLaunchSettings(lastInitConfig) : undefined),
+        })
+        : !!pendingLaunchConvergence;
+      if (!converge) break;
+      if (pass >= MAX_RESTORE_PASSES) {
+        throw new Error('Session launch settings kept changing during upgrade; restart is required');
+      }
+      log(`Codex auto-upgrade pass ${pass} verified; launch settings changed during the upgrade — converging with another restore pass before settling the folded restart`);
+      adoptPendingLaunchConvergence();
+      launch = 'requested';
     }
-    send({ type: 'cli_runtime_version', version: target.version });
+    send({ type: 'cli_runtime_version', version: upgradeContext.version });
     codexAutoUpgrade = undefined;
     cliRestartInProgress = false;
+    adoptPendingLaunchConvergence();
+    // A restart merged into the upgrade window was held until now (the prompt
+    // edge alone proves nothing before runtime/thread/settings verification).
+    if (isPromptReady) settleRestartAttemptOnReady('Codex auto-upgrade verified', { republishPromptReady: true });
     releaseRawInputRestartGate();
     void flushPendingInjections();
     void flushPending();
@@ -2762,6 +2852,20 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
     codexAutoUpgrade = { stage: 'failed', threadId };
     cliRestartInProgress = true;
     rawInputRestartGate = true;
+    // A restart merged into the upgrade window did not get a usable CLI: input
+    // stays closed until the next /restart, so the daemon's fence must stay
+    // down too. Fail the adopted (or pending) attempt instead of leaving it to
+    // time out.
+    failPendingLaunchConvergence();
+    if (activeRestartAttemptId) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'failed',
+        category: 'spawn_failed',
+      });
+      activeRestartAttemptId = undefined;
+    }
     send({ type: 'user_notify', message: `Codex 会话自动升级未完成，原会话和待处理消息已保留。请检查后在当前会话发送 /restart 重启。原因：${error instanceof Error ? error.message : String(error)}` });
     throw error;
   } finally {
@@ -7514,7 +7618,14 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // material-longer gate, re-posting turns the model already `botmux send`ed.
     // Adopt keeps the full join: transcript drain is that mode's only channel,
     // so interim narration is the user's only window into the turn.
-    const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
+    // Transcript delivery also has no other channel: an answer written before
+    // Claude Code's post-answer memory writes must not be cut down to the
+    // postscript that follows them.
+    const assistantText = adoptMode
+      ? joinAssistantText(matched)
+      : trailingAssistantText(drained.events, turn.assistantUuids, replyDeliveryMode() === 'transcript'
+        ? { isHousekeepingToolUse: block => isClaudeMemoryToolUse(block, path), endsWithSentinel: hasTrailingBridgeSentinelLine }
+        : {});
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
@@ -13599,9 +13710,20 @@ function releaseRawInputRestartGate(): void {
 }
 
 function readPaneLeafComm(observedBackend: SessionBackend | null = backend): string | undefined {
-  const pid = observedBackend?.getChildPid?.();
-  if (!pid) return undefined;
-  const comm = readComm(pid);
+  const panePid = observedBackend?.getChildPid?.();
+  if (!panePid) return undefined;
+  let pid = panePid;
+  let comm = readComm(pid);
+  if (isBareShellComm(comm)) {
+    // The owned scope supervisor deliberately remains a shell so tmux cannot
+    // move the payload out of its cgroup. Inspect its actual child; a payload
+    // stuck in an rcfile shell must still trigger the normal input hold.
+    const payloadPid = sessionScopePayloadPid(pid);
+    if (payloadPid !== pid) {
+      pid = payloadPid;
+      comm = readComm(pid) ?? comm;
+    }
+  }
   if (lastSpawnOuterBwrapActive && process.platform === 'linux' && isBareShellComm(comm)) {
     try {
       const commandLine = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
@@ -13839,6 +13961,104 @@ function markRemoteRunnerStartupReady(): void {
   }
 }
 
+/**
+ * A `restart` landed while a restart window is in flight (owned restart, its
+ * continuation, or a Codex auto-upgrade) and is folded into it — the merge
+ * guard never stacks a second respawn. Its launch settings were already
+ * applied to lastInitConfig. Decide by value who may settle its attempt:
+ *  - the window's replacement, if it runs (or, before the snapshot, will run)
+ *    exactly these settings: adopt the receipt, unless an attempt already
+ *    owns it (never displaced);
+ *  - otherwise only the convergence replacement the window chains afterwards:
+ *    record it as pending (newest id and settings win), so neither the stale
+ *    replacement's ready edge nor the continuation end can settle it.
+ */
+function foldRestartIntoWindow(attemptId: string | undefined): void {
+  const requested = restartLaunchSettings(lastInitConfig);
+  const disposition = classifyMergedRestart({
+    windowLaunch: restartWindowLaunch,
+    requested,
+    convergencePending: !!pendingLaunchConvergence,
+  });
+  if (disposition === 'converge') {
+    pendingLaunchConvergence = { attemptId: attemptId ?? pendingLaunchConvergence?.attemptId, requested };
+    log('Restart folded into in-flight window asks for different launch settings — converging with one more respawn before settling it');
+    return;
+  }
+  activeRestartAttemptId ??= attemptId;
+}
+
+/** The replacement about to be (or just) built satisfies the pending folded
+ *  request: hand its attempt the receipt of this window. */
+function adoptPendingLaunchConvergence(): void {
+  if (!pendingLaunchConvergence) return;
+  if (pendingLaunchConvergence.attemptId) activeRestartAttemptId = pendingLaunchConvergence.attemptId;
+  pendingLaunchConvergence = undefined;
+}
+
+/** Fail a pending folded attempt whose convergence can no longer happen. */
+function failPendingLaunchConvergence(): void {
+  const attemptId = pendingLaunchConvergence?.attemptId;
+  pendingLaunchConvergence = undefined;
+  if (attemptId && attemptId !== activeRestartAttemptId) {
+    send({ type: 'restart_result', attemptId, status: 'failed', category: 'spawn_failed' });
+  }
+}
+
+/**
+ * Settle the correlated restart attempt with success, if the CURRENT replacement
+ * may vouch for it. Called on every prompt-ready edge, and again wherever an
+ * owned replacement finishes with its CLI already at the prompt (restart
+ * continuation end, verified Codex auto-upgrade): the merge guard can adopt an
+ * attempt id AFTER the replacement's ready edge already fired — e.g. a /restart
+ * minted once the previous attempt settled, landing while the continuation
+ * still awaits prepareCodexNativeTitleGeneration(), or a crash auto-restart
+ * folded into a worker-internal respawn. markPromptReady() dedupes repeated
+ * ready, so without these settle points that attempt would wait for an edge
+ * that never comes and time out a healthy session.
+ *
+ * Off the ready edge (`republishPromptReady`), the settle re-sends `prompt_ready`
+ * first: the daemon cleared `ds.cliReady` when it requested the adopted attempt,
+ * and `prompt_ready` is the only edge that sets it again — a receipt alone would
+ * restore `workerReady` but leave the idle CLI looking like it is still spawning
+ * (waitForCliIdle cascades would wait out their timeout). The CLI is genuinely at
+ * its prompt here (isPromptReady, input still fenced by the restart gate), so a
+ * duplicate for an attempt adopted BEFORE the edge is harmless.
+ *
+ * Withheld (attempt kept) when:
+ *  - no replacement backend is installed (a stray late callback must not claim
+ *    success — leave it for the real replacement or the coordinator timeout);
+ *  - a Codex auto-upgrade owns the restart window: it verifies runtime, thread
+ *    and launch settings only after ready, and settles (or fails) the adopted
+ *    attempt itself.
+ */
+function settleRestartAttemptOnReady(
+  trigger: string,
+  opts: { republishPromptReady?: boolean } = {},
+): void {
+  if (!activeRestartAttemptId) return;
+  const receipt = decideRestartReceipt({
+    backendInstalled: !!backend,
+    upgradeInFlight: !!codexAutoUpgrade,
+  });
+  if (receipt === 'emit') {
+    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'succeeded',
+      category: 'prompt_ready',
+    });
+    activeRestartAttemptId = undefined;
+    return;
+  }
+  if (receipt === 'defer_upgrade') {
+    log(`${trigger}: Codex auto-upgrade owns this restart window — deferring restart success receipt until the upgrade is verified`);
+  } else {
+    log(`${trigger} with no backend installed — deferring restart success receipt`);
+  }
+}
+
 function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
@@ -14071,26 +14291,7 @@ function markPromptReady(): void {
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
   }
-  if (activeRestartAttemptId) {
-    // Defense in depth: only report a successful restart when a replacement
-    // backend is actually installed. Every legitimate ready path assigns
-    // `backend` before firing (spawnCli sets it, then idle/PTY callbacks run);
-    // a stray callback that reached here with no backend (e.g. a late stale
-    // generation slipping through a future gate change) must NOT claim success
-    // and consume the attempt id — leave it for the real replacement or the
-    // coordinator timeout.
-    if (backend) {
-      send({
-        type: 'restart_result',
-        attemptId: activeRestartAttemptId,
-        status: 'succeeded',
-        category: 'prompt_ready',
-      });
-      activeRestartAttemptId = undefined;
-    } else {
-      log('prompt-ready with no backend installed — deferring restart success receipt');
-    }
-  }
+  settleRestartAttemptOnReady('prompt-ready');
   // Send an immediate status snapshot so Lark card / card-off reactions track
   // real work. Skip pure idle when:
   //  - messages are pending — flushPending() will immediately make the CLI
@@ -17334,6 +17535,13 @@ async function spawnCli(
     && credentialIsolationGate.mode !== 'remote-bypass';
   const credentialOnlySeatbelt = credentialIsolationGate.mode === 'seatbelt';
   const credentialOnlyBwrap = credentialIsolationGate.mode === 'bwrap';
+  /** Flavour of the per-session tree this spawn builds (null: none). */
+  const requestedTreeFlavour = requestedSandboxTreeFlavour({
+    platform: process.platform,
+    scratchRequested,
+    sandboxRequested,
+    credentialOnlyBwrap,
+  });
   const appliedIsolationCapabilities: IsolationCapability[] = [];
   if (credentialBoundaryActive || sandboxRequested) {
     appliedIsolationCapabilities.push('credential');
@@ -17398,6 +17606,9 @@ async function spawnCli(
   );
   const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
   const reuseRecordedHerdrTarget = !sandboxRequested && !hasMcpRuntimeEntries;
+  // `chatTypes` can keep e.g. DM sessions on the default host; retirement and
+  // selection below must see the same decision.
+  const effectiveHerdrConfig = herdrConfigForSession(cfg.backendConfig, cfg.chatType);
   if (effectiveBackend === 'herdr' && !reuseRecordedHerdrTarget) {
     // Isolation/MCP incarnations move historical shared-host agents to the
     // data-root-scoped managed target. Retire the exact old pane before backend
@@ -17407,12 +17618,14 @@ async function spawnCli(
       ownershipScope: isolationRuntimeDataDir,
       reuseRecordedHerdrTarget,
       persistentBackendTarget: cfg.persistentBackendTarget,
+      herdrConfig: effectiveHerdrConfig,
     });
   }
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
@@ -17760,20 +17973,36 @@ async function spawnCli(
           policyDigest: managedOriginChannelPolicyDigest,
         } : {}),
       });
-    // A live credential-only bwrap pane can only send through the relay outbox
-    // it bound at spawn (by inode). If that directory is gone, a successor
-    // worker cannot re-serve it — recreating the path yields an inode the pane
-    // never sees — so every send would time out. Treat it like any other unsafe
-    // generation: kill + cold-spawn, which provisions a fresh outbox and bind.
-    const credentialOnlyRelayReattachable = !credentialOnlyBwrap
-      || attachCredentialOnlyRelayOutbox({
-        sessionId: cfg.sessionId,
-        dataDir: isolationRuntimeDataDir,
-      }) !== null;
-    if (paneLive && isolationMarkerMatches && !credentialOnlyRelayReattachable) {
-      log(`[device-credential-isolation] persistent pane ${cfg.sessionId} lost its relay outbox — killing + cold-spawning instead of reattaching`);
+    // Every Linux bwrap pane (oncall / scratch file sandbox, credential-only)
+    // can only send through the relay outbox it bound at spawn (by inode). If
+    // that directory is gone, a successor worker cannot re-serve it —
+    // recreating the path yields an inode the pane never sees — so every send
+    // would time out (and a scratch pane's host-side COW view is gone with it).
+    // Treat it like any other unsafe generation: kill + cold-spawn, which
+    // provisions a fresh tree and bind. The probes below never create anything.
+    const paneRelayBoundByInode = process.platform === 'linux'
+      && (sandboxRequested || credentialOnlyBwrap);
+    // The live pane runs against the tree of the flavour it was spawned with.
+    // A policy flip that keeps the same isolation capabilities (oncall ↔
+    // scratch) must not reattach it under the other flavour's arm.
+    const recordedTreeFlavour = paneRelayBoundByInode
+      ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
+      : null;
+    const paneRelayReattachable = !paneRelayBoundByInode
+      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+        ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
+        : sandboxRequested
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
+          : attachCredentialOnlyRelayOutbox({
+              sessionId: cfg.sessionId,
+              dataDir: isolationRuntimeDataDir,
+            })) !== null);
+    if (paneLive && isolationMarkerMatches && !paneRelayReattachable) {
+      log(recordedTreeFlavour && recordedTreeFlavour !== requestedTreeFlavour
+        ? `[sandbox] persistent pane ${cfg.sessionId} runs a ${recordedTreeFlavour} sandbox tree, not ${requestedTreeFlavour} — killing + cold-spawning instead of reattaching`
+        : `[sandbox] persistent pane ${cfg.sessionId} lost its relay outbox — killing + cold-spawning instead of reattaching`);
     }
-    const isolationMarkerReattachSafe = isolationMarkerMatches && credentialOnlyRelayReattachable;
+    const isolationMarkerReattachSafe = isolationMarkerMatches && paneRelayReattachable;
     // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
     // read (real 0600 regular file, right owner) + schema/version validation — a
     // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
@@ -19079,6 +19308,33 @@ async function spawnCli(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
+  /** Liveness of this session's persistent pane, by its exact target. Only an
+   *  authoritative `missing` proves it gone (a PTY CLI never outlives its worker). */
+  const probeOwnPersistentPane = (): string => {
+    if (!persistentSessionName || effectiveBackendType === 'pty') return 'missing';
+    try {
+      return effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+        : (selectedBackend.persistentBackendTarget
+          ? probePersistentBackendTarget(selectedBackend.persistentBackendTarget)
+          : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+    } catch (probeErr) {
+      return `unknown (${(probeErr as Error).message})`;
+    }
+  };
+  // A tree of ANOTHER flavour inherited across a restart (sandbox on/off,
+  // oncall ↔ scratch ↔ credential-only) is torn down with its own teardown —
+  // scratch unmounts first — once its pane is proven gone, BEFORE this spawn
+  // prepares its own tree in the same place. Same flavour: reused as before.
+  reconcileSandboxTreeFlavour({
+    sessionId: cfg.sessionId,
+    dataDir: isolationRuntimeDataDir,
+    requested: requestedTreeFlavour,
+    reattach: willReattachPersistent,
+    probePane: probeOwnPersistentPane,
+    log,
+  });
+
   // ── UNIFIED file sandbox (fs-policy): ONE policy source, BOTH platforms. ──
   // Three-tier deny-by-default whitelist compiled to Seatbelt (darwin) or bwrap
   // (linux). Cross-bot read isolation is inherent (siblings' data simply isn't
@@ -19228,7 +19484,12 @@ async function spawnCli(
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
     // would EPERM/ENOENT writing its <hash>.content into an unbound dir).
     // prepareDirectSandbox re-mkdirs it too; recursive make is idempotent.
-    if (outbox) { try { mkdirSync(outbox, { recursive: true }); } catch { /* best-effort; prepareDirectSandbox retries */ } }
+    // Never on a warm reattach: the live pane bound its outbox by inode, and a
+    // recreated directory is one it can never see (the reattach arm below
+    // re-serves the existing one or refuses).
+    if (outbox && !willReattachPersistent) {
+      try { mkdirSync(outbox, { recursive: true }); } catch { /* best-effort; prepareDirectSandbox retries */ }
+    }
 
     // The botmux install/checkout root (dir containing dist/ + node_modules).
     // This module compiles to <checkout>/dist/worker.js, so `../../` from here is
@@ -19412,6 +19673,32 @@ async function spawnCli(
         config.session.dataDir,
       ).map(canonical));
     }
+    // The sandboxed CLI reads its OWN session's skill manifest via
+    // `botmux skill list/show/read/resources` (manifest-store.ts). Without an
+    // explicit carve-out the deny-by-default policy never exposes it — bwrap
+    // simply doesn't mount it (ENOENT → "skill manifest not found"), Seatbelt
+    // denies it (EPERM). Expose ONLY this session's own manifest file,
+    // read-only: the single `<sessionId>.json`, never the skill-manifests dir,
+    // so a task cannot read other sessions' manifests. Mandatory (not the
+    // session-owned channel): the file name is `<sid>.json`, which that
+    // channel's segment==sessionId containment deliberately rejects, and a
+    // no-transport turn needs it too (no Feishu credential in it). The enabled
+    // skills' BODIES are a per-session SNAPSHOT under runtime-skills/<sid>/
+    // (core/skills/snapshot.ts) that rides sessionOwnedReadonlyRoots via
+    // cfg.skillReadonlyRoots — no host source dir is ever granted.
+    // Path from the store's own helper (same dataDir — SESSION_DATA_DIR is
+    // required above), so the store and the sandbox cannot drift. The leaf must
+    // be a regular file the daemon just (re)wrote in prepareCliPluginGeneration:
+    // a planted symlink would otherwise be followed by canonical() and turn this
+    // MANDATORY read-only grant (beats user/baseline denies by depth) onto an
+    // arbitrary target. Only the parent is canonicalized (symlinked HOME
+    // `/home/u` → `/data00/home/u`). Absent = this session has no user skills.
+    const ownSkillManifest = sessionSkillManifestPath(cfg.sessionId, dataDir);
+    try {
+      if (lstatSync(ownSkillManifest).isFile()) {
+        mandatoryReadOnlyPaths.push(join(canonical(dirname(ownSkillManifest)), basename(ownSkillManifest)));
+      }
+    } catch { /* absent — no user-skill manifest for this session */ }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
         sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : sessionMcpGatewaySocketRoot(),
@@ -19624,26 +19911,31 @@ async function spawnCli(
       spawnBin = 'sandbox-exec';
       log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
     } else if (willReattachPersistent) {
-      // Daemon-restart reattach to a live bwrap'd pane: backend.spawn() ignores
-      // bin/args and just re-attaches. Only re-wire the outbox watcher (so the
-      // live CLI's `botmux send` keeps being serviced) + the cleanup ref. The
-      // direct model has NO mounts — cleanup is a plain rm at close/exit.
+      // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
+      // backend.spawn() ignores bin/args and just re-attaches. Only re-wire the
+      // outbox watcher (so the live CLI's `botmux send` keeps being serviced) +
+      // the cleanup ref. The direct model has NO mounts — cleanup is a plain rm
+      // at close/exit. The isolation gate already cold-spawned any pane whose
+      // outbox is gone, so a null here means it vanished in between: fail
+      // closed rather than reattach a pane whose relay nothing serves.
       const att = attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir });
-      if (att) {
-        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        sandboxCleanup = att.cleanup;
-        sandboxRelayOutbox = att.outbox;
-        sandboxStopWatcher = startOutboxWatcher(
-          att.outbox,
-          childEnv,
-          cfg.sessionId,
-          { authorize: authorizeManagedSend },
+      if (!att) {
+        throw new Error(
+          `[file-sandbox] refusing to reattach session ${cfg.sessionId}: `
+          + 'relay outbox disappeared before it could be re-served',
         );
-        publishSandboxRelayCapability();
-        log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
-      } else {
-        log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane as-is`);
       }
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      sandboxCleanup = att.cleanup;
+      sandboxRelayOutbox = att.outbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        att.outbox,
+        childEnv,
+        cfg.sessionId,
+        { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
     } else {
       // Canonical lark-cli data root pinned into the child so the in-sandbox lark-cli
       // resolves the SAME physical keystore the policy denied/carved-out (avoiding a
@@ -19795,21 +20087,25 @@ async function spawnCli(
           log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
         }
       } else {
+        // Same contract as the oncall arm: the isolation gate cold-spawned a
+        // pane whose tree is gone, so null here means it vanished in between.
         const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
-        if (att) {
-          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-          sandboxCleanup = att.cleanup;
-          sandboxRelayOutbox = att.outbox;
-          scratchMappings = scratchLinuxMappings(att.mergedHostPath);
-          scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
-          sandboxStopWatcher = startOutboxWatcher(
-            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+        if (!att) {
+          throw new Error(
+            `[scratch-sandbox] refusing to reattach session ${cfg.sessionId}: `
+            + 'scratch tree or relay outbox disappeared before it could be re-served',
           );
-          publishSandboxRelayCapability();
-          log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
-        } else {
-          log(`Scratch REATTACH (${cfg.cliId}): no scratch tree found — reattaching live pane as-is`);
         }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        sandboxCleanup = att.cleanup;
+        sandboxRelayOutbox = att.outbox;
+        scratchMappings = scratchLinuxMappings(att.mergedHostPath);
+        scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
+        sandboxStopWatcher = startOutboxWatcher(
+          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+        );
+        publishSandboxRelayCapability();
+        log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
       }
     } else if (process.platform === 'darwin') {
       // ── macOS: APFS clonefile COW clone + Seatbelt ──
@@ -20358,7 +20654,6 @@ async function spawnCli(
     if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
-    credentialOnlyRelayOutlivesWorker = !!persistentSessionName && effectiveBackendType !== 'pty';
     // session-id is FORCED so a relayed send cannot target another session.
     sandboxStopWatcher = startOutboxWatcher(
       credentialRelay.outbox,
@@ -20398,7 +20693,6 @@ async function spawnCli(
     if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
-    credentialOnlyRelayOutlivesWorker = effectiveBackendType !== 'pty';
     sandboxStopWatcher = startOutboxWatcher(
       credentialRelay.outbox,
       childEnv,
@@ -20408,6 +20702,35 @@ async function spawnCli(
     publishSandboxRelayCapability();
     log(`[device-credential-isolation] REATTACH (${cfg.cliId}): live pane kept, re-wired relay outbox=${credentialRelay.outbox}`);
   }
+  // One lifecycle rule for every flavour above that established (or re-served)
+  // this generation's per-session tree — oncall, scratch, credential-only;
+  // fresh spawn or warm reattach: a persistent pane outlives this worker, so a
+  // detach-style exit keeps the tree for the successor; a PTY-owned CLI dies
+  // with the worker and its tree goes with it.
+  const sandboxTreeOutlivesPane = sandboxTreeSurvivesWorkerExit({
+    ownsTree: sandboxCleanup !== null,
+    backendType: effectiveBackendType,
+    persistentSessionName,
+  });
+  // It only applies while such a pane exists. A warm reattach (restore /
+  // transfer) runs against one that is already alive; a fresh launch has none
+  // until backend.spawn() below creates it, so a failure before that point
+  // must roll the just-built tree back (deny-mask mountpoints, an unconsumed
+  // bwrap args file, a scratch overlay) — the orphan sweep skips this still-
+  // active session and would never reclaim it.
+  sandboxTreeOutlivesWorker = willReattachPersistent && sandboxTreeOutlivesPane;
+  /** True once a failed fresh launch's pane is proven gone (see the spawn catch). */
+  const retireFailedFreshPersistentPane = (): boolean => {
+    const retired = (backend as { retireSessionCreatedBySpawn?: () => boolean } | null)
+      ?.retireSessionCreatedBySpawn?.() === true;
+    const probe = probeOwnPersistentPane();
+    if (probe === 'missing') {
+      if (retired) log(`Failed fresh launch: retired the ${effectiveBackendType} session it had created; rolling back the sandbox tree`);
+      return true;
+    }
+    log(`Failed fresh launch: ${effectiveBackendType} session not proven gone (probe: ${probe}${retired ? ', after retiring our own' : ''}) — keeping the sandbox tree for the pane that may still run`);
+    return false;
+  };
 
   // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
   // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
@@ -20443,6 +20766,7 @@ async function spawnCli(
   // proof, not a backend's prediction flag.
   let programStatusRelayPlanCleanup: (() => void) | undefined;
   let programStatusRelayLaunched = false;
+  let scopePayloadLauncherActive = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -20465,6 +20789,7 @@ async function spawnCli(
       );
       spawnBin = scoped.bin;
       spawnArgs = scoped.args;
+      scopePayloadLauncherActive = !!scoped.unitName;
       if (scoped.unitName) {
         log(
           `Launching owned CLI in ${scoped.unitName}`
@@ -20515,6 +20840,7 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      cliId: cfg.cliId,
       model: cfg.model,
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,
@@ -20523,10 +20849,23 @@ async function spawnCli(
   } catch (err) {
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
+    if (!willReattachPersistent && sandboxTreeOutlivesPane) {
+      // A fresh persistent launch can fail AFTER it created its pane (tmux:
+      // new-session done, then mkfifo / the FIFO wake fd / pipe-pane failed).
+      // That pane would still run the CLI against this tree, so retire exactly
+      // the session this spawn created, and roll the tree back only once the
+      // name authoritatively resolves to nothing. Otherwise keep the tree.
+      sandboxTreeOutlivesWorker = !retireFailedFreshPersistentPane();
+    }
     throw err;
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
   }
+  // A pane exists now (created by this launch or re-attached), so from here on
+  // its tree outlives this worker. Every post-spawn failure exit below clears
+  // this ONLY after proving the pane gone: an exit that leaves it running (an
+  // unconfirmed kill) must keep the relay tree the live pane is bound to.
+  sandboxTreeOutlivesWorker = sandboxTreeOutlivesPane;
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
   // A late same-named pane was reused, so the relay never ran to consume its plan.
@@ -20594,6 +20933,8 @@ async function spawnCli(
             + `post-kill probe ${postKill} (not missing) — pending proof retained`,
           );
         }
+        // The pane is proven gone: nothing runs against the tree any more.
+        sandboxTreeOutlivesWorker = false;
       }
       throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${why}`);
     };
@@ -20665,6 +21006,8 @@ async function spawnCli(
       } catch (killErr: any) {
         log(`Failed to kill unauthenticated Codex App persistent generation: ${killErr?.message ?? killErr}`);
       }
+      // Roll the tree back only for a pane proven gone (see above).
+      if (probeOwnPersistentPane() === 'missing') sandboxTreeOutlivesWorker = false;
     }
     throw err;
   }
@@ -20741,7 +21084,11 @@ async function spawnCli(
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
-  const startWrapperRealPidResolve = (panePid: number): void => {
+  // Continue relay/wrapper resolution from `chainPid` while the backend's
+  // child-pid fence stays pinned to `fencePid` (the pane process; identical to
+  // chainPid except under an owned scope, where the pane is a fixed sh
+  // supervisor and the chain starts at its payload child).
+  const enterPidChain = (chainPid: number, fencePid: number): void => {
     // The OSC 7501 relay sits between the pane and what used to be the pane
     // process: its single direct child is exactly the pid the pane reported
     // before the relay existed (CLI, sandbox wrapper or wrapperCli launcher),
@@ -20751,10 +21098,10 @@ async function spawnCli(
     // daemon-restart reattach to an already-relayed pane is recognised from
     // its cmdline.
     const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
-      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(panePid)));
-    if (!viaRelay) { resolveBehindWrapper(panePid, panePid); return; }
+      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(chainPid)));
+    if (!viaRelay) { resolveBehindWrapper(chainPid, fencePid); return; }
     if (!claudeDataDir && cfg.cliId !== 'codex') return;
-    scheduleWrapperRealCliPid(panePid, {
+    scheduleWrapperRealCliPid(chainPid, {
       findRealPid: (lp) => {
         if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
         // The relay briefly runs `stty` (raw mode) before creating the CLI's
@@ -20763,10 +21110,51 @@ async function spawnCli(
         return children.length === 1 ? children[0] : null;
       },
       getBackend: () => backend,
-      getChildPid: () => backend?.getChildPid?.(),
+      getChildPid: () => (backend?.getChildPid?.() === fencePid ? chainPid : null),
       applyRealPid: (childPid) => {
-        applyResolvedCliPid(childPid, 'program-status relay', panePid);
-        resolveBehindWrapper(childPid, panePid);
+        applyResolvedCliPid(childPid, 'program-status relay', chainPid);
+        resolveBehindWrapper(childPid, fencePid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  // Owned session scope: the pane pid is a fixed sh supervisor deliberately
+  // kept outside the unit (some tmux versions migrate the pane pid into their
+  // own cgroup after fork). The CLI is its single foreground child — unwrap
+  // that layer first, then continue with relay/wrapper resolution from the
+  // payload. Fail-closed: an unrecognised pane behaves exactly as before.
+  const startWrapperRealPidResolve = (panePid: number): void => {
+    if (!scopePayloadLauncherActive) { enterPidChain(panePid, panePid); return; }
+    const bindScopePayload = (payloadPid: number): void => {
+      // Preserve a deeper wrapper/native CLI resolution that already won.
+      // The pane PID remains a valid marker ancestor, but it cannot identify
+      // the payload's open transcript files or Claude's PID-keyed metadata.
+      const observed = backend as SessionBackend & { cliPid?: number };
+      if (!observed.cliPid || observed.cliPid === panePid || observed.cliPid === payloadPid) {
+        applyResolvedCliPid(payloadPid, 'session scope payload', panePid);
+      } else if (bridgeCliPid === panePid) {
+        bridgeCliPid = payloadPid;
+      }
+      log(`Session scope: resolved payload pid ${payloadPid} under pane ${panePid}`);
+    };
+    const payloadPid = sessionScopePayloadPid(panePid);
+    if (payloadPid !== panePid) {
+      bindScopePayload(payloadPid);
+      enterPidChain(payloadPid, panePid);
+      return;
+    }
+    // Payload not observable yet (slow launch rcfile / systemd startup). Keep
+    // discovering until it appears; the shared stale-backend fence (backend
+    // identity + the pane sh staying the backend child) stops the loop on
+    // close or replacement.
+    scheduleWrapperRealCliPid(panePid, {
+      maxAttempts: Number.POSITIVE_INFINITY,
+      findRealPid: sessionScopePayloadPid,
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (resolvedPid) => {
+        bindScopePayload(resolvedPid);
+        enterPidChain(resolvedPid, panePid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -20856,13 +21244,16 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+    // Under an owned scope the pane pid is the supervisor sh; ownership roots
+    // (traex rollout fd / codex native leaf) live under its payload child.
+    const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(cliPid) : cliPid;
     // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
     const wiredPid = cfg.cliId === 'traex'
-      ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
+      ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
       : cfg.cliId === 'codex'
-        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive, codexFilterExecutable)
-        : cliPid;
+        ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+        : ownershipPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
@@ -20896,11 +21287,12 @@ async function spawnCli(
           }
         }
         if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+          const ownershipPid = scopePayloadLauncherActive ? sessionScopePayloadPid(pid) : pid;
           const wiredPid = cfg.cliId === 'traex'
-            ? resolveTraexOwnershipPid(pid, traexLauncherActive)
+            ? resolveTraexOwnershipPid(ownershipPid, traexLauncherActive)
             : cfg.cliId === 'codex'
-              ? resolveCodexOwnershipPid(pid, codexLauncherActive, codexFilterExecutable)
-              : pid;
+              ? resolveCodexOwnershipPid(ownershipPid, codexLauncherActive, codexFilterExecutable)
+              : ownershipPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
@@ -20948,7 +21340,7 @@ async function spawnCli(
     const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
       ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
-      cliPid: cliPid ?? undefined,
+      cliPid: cliPid ? sessionScopePayloadPid(cliPid) : undefined,
       cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
@@ -21924,7 +22316,7 @@ function killCli(opts: {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
   }
-  credentialOnlyRelayOutlivesWorker = false;
+  sandboxTreeOutlivesWorker = false;
   isPromptReady = false;
   forceClearSessionRenameInFlight();
   if (!opts.preservePending) {
@@ -21995,6 +22387,7 @@ async function restartCliProcess(
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
   replacementSpawnInProgress = false;
+  restartWindowLaunch = undefined;
   rawInputRestartGate = true;
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
@@ -22071,12 +22464,19 @@ async function restartCliProcess(
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
+        let spawnedLaunch: RestartLaunchSettings | undefined;
         if (lastInitConfig) {
           startScreenUpdates();
           startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
             spawnedWorkingDir = restartCfg.workingDir;
+            // Launch snapshot of this window. A folded request still pending
+            // from before it is satisfied by this replacement (built from the
+            // latest settings): it owns this window's receipt now.
+            restartWindowLaunch = restartLaunchSettings(restartCfg);
+            spawnedLaunch = restartWindowLaunch;
+            adoptPendingLaunchConvergence();
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
             // remote* on success, else spawnCli falls back to paste.
@@ -22117,18 +22517,42 @@ async function restartCliProcess(
         //    second restart). Recover now or the session strands at
         //    backend=null needing a manual /restart. Genuine crash recovery →
         //    COUNTS toward tier-2 FRESH.
+        //  - launch-config: a correlated restart folded in AFTER restartCfg was
+        //    captured asked (by value) for different cwd / env / model /
+        //    larkToolBinding (foldRestartIntoWindow). Same convergence respawn
+        //    as cwd-move; that request's attempt rides into it and is settled
+        //    only by the converged replacement.
         const followup = decideRestartFollowup({
           spawnedWorkingDir,
           currentWorkingDir: lastInitConfig?.workingDir,
           backendAlive: !!backend,
+          spawnedLaunch,
+          requestedLaunch: pendingLaunchConvergence?.requested,
         });
         if (followup.kind !== 'none') {
           const reason = followup.kind === 'cwd-move'
             ? `cwd-move follow-up respawn → ${lastInitConfig?.workingDir}`
-            : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
+            : followup.kind === 'launch-config'
+              ? 'launch-config follow-up respawn (a restart folded into this window asked for different env/model/tool binding)'
+              : 'replacement-exit follow-up restart (replacement exited during in-flight restart)';
           log(reason);
+          // The follow-up builds from the latest settings: the pending folded
+          // request owns its receipt (the stale replacement never settles it).
+          adoptPendingLaunchConvergence();
           void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
           return;
+        }
+        // A request folded in after the snapshot whose settings this
+        // replacement already runs (by value) needs no respawn: it settles here.
+        adoptPendingLaunchConvergence();
+        // The replacement may already have reached its prompt while this
+        // continuation was still awaiting (spawnCli / Codex title prep). Its
+        // ready edge settled whatever attempt existed then; an attempt the
+        // merge guard adopted afterwards would otherwise never see another
+        // edge (markPromptReady dedupes). killCli reset isPromptReady before
+        // the spawn, so a true value here is THIS replacement's prompt.
+        if (isPromptReady) {
+          settleRestartAttemptOnReady('restart continuation finished at the prompt', { republishPromptReady: true });
         }
         // Remote backends mark themselves prompt-ready inside spawnCli(); that
         // early flush is intentionally held by the restart gate above. Release
@@ -24538,6 +24962,16 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  const pendingAttemptId = pendingLaunchConvergence?.attemptId;
+  pendingLaunchConvergence = undefined;
+  if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
+    await sendAndFlush({
+      type: 'restart_result',
+      attemptId: pendingAttemptId,
+      status: 'failed',
+      category: 'spawn_failed',
+    });
+  }
   if (activeRestartAttemptId) {
     await sendAndFlush({
       type: 'restart_result',
@@ -25424,9 +25858,21 @@ process.on('message', async (raw: unknown) => {
       // 补 recovery（见 decideRestartFollowup）；健康的重复 restart 就该被合并掉，
       // 记 flag 反而会逼健康进程再重启一轮、烧预算丢 --resume（正是合并要防的）。
       if (cliRestartInProgress || tmuxRestartTimer) {
+        // 回执归属（不是 flag，不会触发任何额外重启）：被合并的 restart 带了 attemptId、
+        // 而在飞这一轮还没有 attempt 认领回执时——worker 自发的重启（如 durable 租约
+        // 到期），或上一个 attempt 已因 replacement 退出被判 failed、daemon 随即为
+        // claude_exit 铸了新 attempt——由它认领：在飞 respawn 的 prompt_ready（或续体
+        // 结束时已就绪的 replacement，见 settleRestartAttemptOnReady）就是它的成功回执。
+        // 否则 daemon 侧这个 attempt 永远等不到 restart_result，workerReady 栅栏放不开，
+        // fork/relay 永久 worker_busy（#1863）。已有 attempt 认领时绝不替换，不抢它的回执。
+        foldRestartIntoWindow(msg.attemptId);
         log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
         break;
       }
+      // A fresh restart opens a new window built from the latest settings; any
+      // folded request left over from a superseded window is moot (the daemon
+      // mints a new attempt only after the previous one settled or timed out).
+      pendingLaunchConvergence = undefined;
       activeRestartAttemptId = msg.attemptId;
       codexRunnerFreshness = 'restarting_fresh';
       // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
@@ -26335,21 +26781,25 @@ function shutdownWorkerForParentExit(reason: string): void {
     // only the tree-removal reference: the exit hook still stops the watcher
     // and revokes this generation's capability leaf (the successor republishes
     // it), but must not delete the outbox the live TUI sends through.
-    if (credentialOnlyRelayOutlivesWorker) {
-      log(`Preserving credential-only relay outbox for the surviving remote TUI during ${reason}`);
+    if (sandboxTreeOutlivesWorker) {
+      log(`Preserving the sandbox relay outbox for the surviving remote TUI during ${reason}`);
       sandboxCleanup = null;
     }
     cleanup();
     process.exit(0);
     return;
   }
-  // A persistent credential-only pane survives this exit (backend.kill() only
-  // detaches) and still holds a bind of its relay outbox by inode. Deleting the
-  // tree here would make the next worker's reattach gate kill + cold-spawn it,
+  // A persistent sandboxed pane (oncall / scratch / credential-only) survives
+  // this exit (backend.kill() only detaches) and still runs against its
+  // per-session tree: the relay outbox is bound into it by inode, and a scratch
+  // CLI's COW root lives there. Deleting the tree here would leave the
+  // successor nothing to re-serve — every later `botmux send` would go
+  // unanswered (or the reattach gate would kill + cold-spawn the pane),
   // interrupting in-flight work on every daemon restart. Keep it, exactly like
-  // detach_for_transfer / suspend; a real close still removes it.
-  const preserveSandbox = credentialOnlyRelayOutlivesWorker;
-  if (preserveSandbox) log(`Preserving credential-only relay outbox for the surviving pane during ${reason}`);
+  // detach_for_transfer / suspend; a real close still removes it, and a
+  // PTY-owned CLI (which dies with this worker) still cleans up here.
+  const preserveSandbox = sandboxTreeOutlivesWorker;
+  if (preserveSandbox) log(`Preserving the sandbox tree of the surviving persistent pane during ${reason}`);
   killCli({ preserveSandbox });
   cleanup();
   process.exit(0);
@@ -26396,7 +26846,12 @@ function teardownSandboxBestEffort(): void {
   sandboxTeardownDone = true;
   try { sandboxStopWatcher?.(); } catch { /* */ }
   sandboxStopWatcher = null;
-  try { sandboxCleanup?.(); } catch { /* */ }
+  // A crashed worker's persistent pane keeps running exactly as on a daemon
+  // restart, and the next worker reattaches it: keep the tree it runs against
+  // (the daemon sweep reclaims it once the session is no longer active).
+  if (!sandboxTreeOutlivesWorker) {
+    try { sandboxCleanup?.(); } catch { /* */ }
+  }
   sandboxCleanup = null;
   unlinkManagedOriginCapabilityFiles();
   sandboxRelayCapability = null;
