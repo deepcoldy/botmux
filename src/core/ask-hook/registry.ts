@@ -1,6 +1,5 @@
 import type { HookAskAdapter } from './types.js';
 import claude from './claude-code.js';
-import codex from './codex.js';
 import opencode from './opencode.js';
 import coco from './coco.js';
 import dsh from './dsh.js';
@@ -14,7 +13,6 @@ const REGISTRY: Record<string, HookAskAdapter> = {
   // Relay is the current release name of the Seed fork — same Claude-compatible
   // AskUserQuestion hook payload, so `botmux hook relay` reuses the claude adapter.
   relay: claude,
-  codex,
   opencode,
   // MiMoCode is an OpenCode fork and emits the same question.asked payload.
   mimocode: opencode,

@@ -34,6 +34,10 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
+import { errorMessage } from './utils/error-message.js';
+import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -97,37 +101,30 @@ interface DshUsage {
 }
 
 const output = new RunnerControlWriter();
+const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { sessionId: '', dshBin: '', turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS };
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (key === '--session-id' && val !== undefined) { out.sessionId = val; i++; }
-    else if (key === '--dsh-bin' && val !== undefined) { out.dshBin = val; i++; }
-    else if (key === '--cwd' && val !== undefined) { out.cwd = val; i++; }
-    else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
-    else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
-    else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
-    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
-    else if (key === '--dsh-profile' && val !== undefined) { out.dshProfile = val; i++; }
-    else if (key === '--bridge-patch' && val !== undefined) { out.bridgePatch = val; i++; }
-    else if (key === '--turn-timeout-ms' && val !== undefined) {
+  parseRunnerFlags(argv, out, {
+    '--session-id': 'sessionId',
+    '--dsh-bin': 'dshBin',
+    '--cwd': 'cwd',
+    '--bot-name': 'botName',
+    '--bot-open-id': 'botOpenId',
+    '--locale': 'locale',
+    '--model': 'model',
+    '--dsh-profile': 'dshProfile',
+    '--bridge-patch': 'bridgePatch',
+    '--turn-timeout-ms': (target, val) => {
       const n = Number(val);
       // Accept only a positive integer within the arm-able bound; anything else
       // (≤0, non-integer, over-bound) is ignored → falls back to the default.
-      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) out.turnTimeoutMs = n;
-      i++;
-    }
-  }
+      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
+    },
+  });
   if (!out.sessionId) throw new Error('--session-id is required');
   if (!out.dshBin) throw new Error('--dsh-bin is required');
   return out;
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }
 
 function truncate(text: string, max: number): string {
@@ -219,18 +216,6 @@ function parsePromptMessageId(result: unknown): string {
     throw new Error(`dsh protocol error: session/prompt returned no message id: ${JSON.stringify(result)}`);
   }
   return result.messageId;
-}
-
-function emitMarker(kind: string, payload: unknown): void {
-  output.marker(kind, payload);
-}
-
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
 }
 
 /** Native dsh config resolved from ~/.dsh (profile + settings.yaml + .credentials.yaml).
@@ -468,13 +453,13 @@ function addUsage(a: DshUsage, b: DshUsage): DshUsage {
 /** Minimal JSON-RPC client over the dsh runtime's stdio transport. */
 class DshJsonRpcClient {
   private child?: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private readonly pending = new Map<number, {
-    resolve: (result: unknown) => void;
-    reject: (err: Error) => void;
-    timer: NodeJS.Timeout;
-  }>();
-  private stdoutBuffer = '';
+  private readonly rpc = new JsonRpcStdioCore({
+    mapRpcError: (_method, error) => new Error(`dsh error: ${error.message ?? JSON.stringify(error)}`),
+    onMessage: msg => {
+      if (msg.method) this.onNotification?.(msg.method, msg.params);
+    },
+    onInvalidLine: line => output.error(`[dsh] non-JSON stdout line: ${truncate(line, 200)}`),
+  });
   private exited = false;
   onNotification?: (method: string, params: unknown) => void;
   onExit?: (code: number | null, signal: string | null) => void;
@@ -495,13 +480,13 @@ class DshJsonRpcClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stdout.setEncoding('utf8');
-    this.child.stdout.on('data', chunk => this.handleStdout(String(chunk)));
+    this.child.stdout.on('data', chunk => this.rpc.push(String(chunk)));
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', chunk => output.error(`[dsh] ${String(chunk)}`));
-    this.child.on('error', err => this.failAll(err));
+    this.child.on('error', err => this.rpc.failAll(err));
     this.child.on('exit', (code, signal) => {
       this.exited = true;
-      this.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
+      this.rpc.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
       this.onExit?.(code, signal);
     });
   }
@@ -510,20 +495,18 @@ class DshJsonRpcClient {
     if (!this.child || this.exited) {
       return Promise.reject(new Error('dsh child is not running'));
     }
-    const id = this.nextId++;
+    const id = this.rpc.nextId();
     const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`dsh request '${method}' timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: result => resolve(result as T),
-        reject,
-        timer,
-      });
-      this.child!.stdin.write(payload);
+    const response = this.rpc.track<T>(id, method, {
+      timeoutMs,
+      onTimeout: (m, ms) => new Error(`dsh request '${m}' timed out after ${ms}ms`),
     });
+    try {
+      this.child.stdin.write(payload);
+    } catch (err) {
+      this.rpc.abort(id, err as Error);
+    }
+    return response;
   }
 
   kill(): void {
@@ -537,45 +520,6 @@ class DshJsonRpcClient {
       await this.request('shutdown', {}, SHUTDOWN_GRACE_MS);
     } catch { /* runtime may exit on its own; SIGTERM below is the backstop */ }
     this.kill();
-  }
-
-  private handleStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    for (;;) {
-      const idx = this.stdoutBuffer.indexOf('\n');
-      if (idx < 0) break;
-      const line = this.stdoutBuffer.slice(0, idx).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(idx + 1);
-      if (!line) continue;
-      let msg: { id?: number; result?: unknown; error?: { message?: string }; method?: string; params?: unknown };
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        output.error(`[dsh] non-JSON stdout line: ${truncate(line, 200)}`);
-        continue;
-      }
-      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-        const entry = this.pending.get(msg.id);
-        if (!entry) continue;
-        this.pending.delete(msg.id);
-        clearTimeout(entry.timer);
-        if (msg.error) {
-          entry.reject(new Error(`dsh error: ${msg.error.message ?? JSON.stringify(msg.error)}`));
-        } else {
-          entry.resolve(msg.result);
-        }
-      } else if (msg.method) {
-        this.onNotification?.(msg.method, msg.params);
-      }
-    }
-  }
-
-  private failAll(err: Error): void {
-    for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
-      entry.reject(err);
-    }
-    this.pending.clear();
   }
 }
 
@@ -614,6 +558,10 @@ function buildPreamble(): string {
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
     `- 工作目录：${cwd}。语言：${locale}。`,
+    ...(() => {
+      const prompt = larkToolPromptFromEnv(locale);
+      return prompt ? [`- ${prompt}`] : [];
+    })(),
     '</botmux_identity>',
     '',
   ].join('\n');

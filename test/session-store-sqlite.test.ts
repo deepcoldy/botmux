@@ -181,6 +181,22 @@ describe('first-start JSON import', () => {
     expect(JSON.parse(readFileSync(jsonFp, 'utf-8')).s1.status).toBe('active');
   });
 
+  it('closeSession removes the session\'s skill manifest and runtime-skills snapshot (sibling sessions untouched)', () => {
+    seedJson('sessions-appA.json', { s1: row('s1'), s2: row('s2') });
+    init('appA');
+    for (const sid of ['s1', 's2']) {
+      mkdirSync(join(tempDir, 'skill-manifests'), { recursive: true });
+      writeFileSync(join(tempDir, 'skill-manifests', `${sid}.json`), '{}');
+      mkdirSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy'), { recursive: true });
+      writeFileSync(join(tempDir, 'runtime-skills', sid, 'snapshot', 'deploy', 'SKILL.md'), '# Deploy');
+    }
+    closeSession('s1');
+    expect(existsSync(join(tempDir, 'skill-manifests', 's1.json'))).toBe(false);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's1'))).toBe(false);
+    expect(existsSync(join(tempDir, 'skill-manifests', 's2.json'))).toBe(true);
+    expect(existsSync(join(tempDir, 'runtime-skills', 's2', 'snapshot', 'deploy', 'SKILL.md'))).toBe(true);
+  });
+
   it('publishes the store atomically: no .db.tmp survives, and stale tmp leftovers are replaced', () => {
     // 上次导入中途崩溃的残留 tmp（垃圾内容）不得阻塞、也不得泄漏进结果
     const storeDir = join(tempDir, 'session-stores', 'appA');

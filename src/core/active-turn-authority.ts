@@ -79,6 +79,18 @@ export function sameTrustedPrincipal(
  */
 export class ActiveTurnAuthority {
   private active?: ActiveTurnAuthoritySnapshot;
+  private executionActive = false;
+
+  constructor(private readonly onActiveEnvelopeChanged?: (previousTurnId: string, turnId: string) => void) {}
+
+  /** Only a live execution can pass its output policy to an interruption.
+   * Reservations and turns started after release have no execution to inherit. */
+  private notifyActiveEnvelopeChanged(previous: ActiveTurnAuthoritySnapshot | undefined): void {
+    if (this.executionActive && previous?.turnId && this.active?.turnId
+      && previous.turnId !== this.active.turnId) {
+      this.onActiveEnvelopeChanged?.(previous.turnId, this.active.turnId);
+    }
+  }
 
   snapshot(): ActiveTurnAuthoritySnapshot | undefined {
     if (!this.active) return undefined;
@@ -154,6 +166,7 @@ export class ActiveTurnAuthority {
       started: false,
       reservedAtMs: nowMs,
     });
+    this.notifyActiveEnvelopeChanged(active);
     return true;
   }
 
@@ -162,6 +175,7 @@ export class ActiveTurnAuthority {
     if (!this.active) return false;
     if (!this.matches(identity)) {
       if (this.blocks(identity)) return false;
+      const previous = this.active;
       this.active = Object.freeze({
         turnId: identity.turnId,
         ...(identity.dispatchAttempt !== undefined
@@ -176,9 +190,12 @@ export class ActiveTurnAuthority {
         started: true,
         reservedAtMs: Date.now(),
       });
+      this.notifyActiveEnvelopeChanged(previous);
+      this.executionActive = true;
       return true;
     }
     if (!this.active.started) this.active = Object.freeze({ ...this.active, started: true });
+    this.executionActive = true;
     return true;
   }
 
@@ -220,6 +237,7 @@ export class ActiveTurnAuthority {
   clear(): ActiveTurnAuthoritySnapshot | undefined {
     const prior = this.active;
     this.active = undefined;
+    this.executionActive = false;
     return prior;
   }
 }

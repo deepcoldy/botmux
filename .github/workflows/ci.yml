@@ -34,13 +34,13 @@ jobs:
         with:
           node-version: 22
 
-      # Bun is the package manager (packageManager: bun@1.4.2). node-pty's native
-      # build runs only because it is in `trustedDependencies` — bun skips
+      # Bun is the package manager (packageManager: bun@1.4.3). node-pty's install
+      # script runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
-      # need a real build/Release/pty.node.
+      # need a loadable pty.node (here node-pty's own linux-x64 prebuild).
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
@@ -71,14 +71,19 @@ jobs:
       # AppArmor profile,bwrap 一起 userns 就秒退("setting up uid map:
       # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
       # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
-      # 有 bwrap 运行时探测 gate,跑不了会 loud skip 而不是超时挂掉。
+      # 有 bwrap 运行时探测 gate,跑不了会 loud skip。sudo/apt 卡住时 `|| true`
+      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 20 分钟超时。
       # install 前必须先 apt-get update:runner 镜像自带的 apt 索引会滞后于镜像源,
       # 实测索引里的 bubblewrap 0.9.0-1ubuntu0.1 被 0.9.0-1ubuntu0.2 顶替后,
       # 不 update 直接 install 全部镜像源 404(2026-09-19 master 自身 CI 因此红)。
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
+          # output and otherwise burns the whole job timeout.
+          timeout -k 15s 90s bash -c '
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
@@ -87,7 +92,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
       # Wrapper retries once only when every file already passed and vitest's
@@ -182,8 +187,12 @@ jobs:
       # sync with the `test` job's copy.
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
+          # output and otherwise burns the whole job timeout.
+          timeout -k 15s 90s bash -c '
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
@@ -192,7 +201,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
@@ -242,11 +251,12 @@ jobs:
   # The musl (Alpine) binary, gated on PRs — not only at release time.
   #
   # WHY THIS JOB EXISTS SEPARATELY FROM `bun-binary`: the musl binary is a shipped
-  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time and
-  # node-pty ships no linux prebuild, so it is compiled against whatever libc the
-  # builder runs on (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine →
-  # `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
-  # cleanly and fails only when the native is dlopen'd, on the user's machine.
+  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time, and
+  # node-pty's linux prebuilds are glibc-only, so the musl native must be compiled
+  # from source on musl (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine
+  # → `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
+  # cleanly, loads, and crashes (SIGSEGV) at the first PTY spawn on the user's
+  # machine.
   #
   # This job previously lived ONLY in release.yml, which runs on tag push. That
   # meant a PR could change the build script, the embed plugin, or node-pty's
@@ -282,15 +292,19 @@ jobs:
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             node:22-alpine sh -euc '
-              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty has no linux
-              # prebuild and must compile here. binutils supplies readelf.
+              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty must compile
+              # here because its linux prebuilds are glibc-only. binutils supplies
+              # readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.2 --loglevel=error
+              npm i -g bun@1.4.3 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
-              bun install --frozen-lockfile
+              # build_from_source makes node-pty'"'"'s install script delete its
+              # (glibc) prebuilds and run node-gyp. It only takes effect when
+              # node-pty is actually (re)installed — a clean checkout here.
+              npm_config_build_from_source=true bun install --frozen-lockfile
 
               # Fail closed rather than compiling a musl binary around a glibc
               # native: that mistake survives the build and surfaces only when the
@@ -409,7 +423,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
 
       # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
       # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
@@ -485,6 +499,32 @@ jobs:
             found=1
             echo "verifying signature: $f"
             codesign --verify --strict --verbose=2 "$f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
+      - name: Verify the canvas skia native is embedded in every darwin binary
+        # Parity with release.yml's identical step (and the same reason this job
+        # exists at all): the cross-built darwin-x64 shipped in v3.40.0 without
+        # @napi-rs/canvas's skia native, while the smoke below runs only the host
+        # arch, so nothing here would have inspected the x64 file. Bun embeds the
+        # skia .node as raw bytes, so a skia-only symbol name is a cheap presence
+        # check. `SkBitmap` (not the generic napi-rs `Create Custom GC
+        # ThreadsafeFunction`, which rolldown/lightningcss also carry, and not
+        # `SkCanvas`/`GrDirectContext`, which are stripped out of the published
+        # .node) is measurably present 3x in the pinned skia and absent from every
+        # other embedded native. Fail closed: a darwin binary without it cannot
+        # render cards and must not ship.
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            if ! grep -aq "SkBitmap" "$f"; then
+              echo "::error::skia native missing from $f"
+              exit 1
+            fi
+            echo "skia native present: $f"
           done
           if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
 

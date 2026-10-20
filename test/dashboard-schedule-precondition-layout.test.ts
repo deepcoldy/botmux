@@ -1,9 +1,12 @@
 import { createElement } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fetchWorkCalendars } from '../src/dashboard/web/work-calendars-api.js';
 import { fetchGroupsSnapshot } from '../src/dashboard/web/groups-api.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { ScheduleFormModal } from '../src/dashboard/web/schedules-page.js';
+
+vi.mock('../src/dashboard/web/work-calendars-api.js', () => ({ fetchWorkCalendars: vi.fn() }));
 
 vi.mock('../src/dashboard/web/groups-api.js', () => ({
   fetchGroupsSnapshot: vi.fn(),
@@ -67,6 +70,7 @@ describe('schedule precondition compact editor', () => {
   let renderer: TestRenderer.ReactTestRenderer | undefined;
 
   beforeEach(() => {
+  vi.mocked(fetchWorkCalendars).mockResolvedValue({ calendars: [] });
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.stubGlobal('document', { addEventListener: vi.fn(), removeEventListener: vi.fn() });
     vi.stubGlobal('fetch', vi.fn());
@@ -143,6 +147,32 @@ describe('schedule precondition compact editor', () => {
       formDialog, helpDialog: helpDialog!, helpCloseNode, onClose, onSubmit,
     };
   }
+
+  it('selects the named calendar and rest days without changing its ID or Bash draft', async () => {
+    vi.mocked(fetchWorkCalendars).mockResolvedValue({ calendars: [{
+      id: 'cn', kind: 'builtin', displayNames: { zh: '中国法定工作日历', en: 'China Statutory Work Calendar' },
+    }] });
+    const form = await renderForm({ ...EDITING, calendar: 'cn' });
+    const field = form.root.findByProps({ className: 'schedule-calendar-fields' });
+    const selects = field.findAllByType('select');
+    expect(textContent(selects[0])).toContain('中国法定工作日历');
+    act(() => selects[1].props.onChange({ target: { value: 'restday' } }));
+    form.setScript('printf changed');
+    form.submit();
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({ calendar: 'cn', calendarDayType: 'restday', preconditionScript: 'printf changed' }));
+    expect(EDITING.preconditionScript).toBe('printf 1');
+  });
+
+  it('retries a partial calendar load without losing the precondition draft', async () => {
+    vi.mocked(fetchWorkCalendars).mockResolvedValueOnce({ calendars: [], localError: 'calendar_invalid' });
+    const form = await renderForm();
+    form.setScript('printf draft');
+    const field = form.root.findByProps({ className: 'schedule-calendar-fields' });
+    await act(async () => { field.findByType('button').props.onClick(); });
+    expect(fetchWorkCalendars).toHaveBeenCalledTimes(2);
+    expect(form.inline().props.value).toBe('printf draft');
+    expect(form.onSubmit).not.toHaveBeenCalled();
+  });
 
   it('places the title and accessible switch in one compact header without a routine status row', async () => {
     const form = await renderForm();

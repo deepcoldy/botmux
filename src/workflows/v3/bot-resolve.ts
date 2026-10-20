@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 /**
  * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
  *
@@ -11,6 +12,7 @@
  * file is edited.)
  */
 
+import { normalizeEnvPolicy } from '../../core/env-policy.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 import { newSessionCodexInstanceState, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
@@ -73,14 +75,24 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
   return {
     ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
     larkAppId: bot.larkAppId,
+    ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
-    ...(bot.sandbox === true ? { sandbox: true } : {}),
+    ...(bot.sandbox === true || bot.sandbox === 'oncall'
+      ? { sandbox: true }
+      : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
+    ...(bot.sandbox === 'scratch' ? {
+      ...(bot.scratchStorage ? { scratchStorage: bot.scratchStorage } : {}),
+      ...(bot.scratchTmpfsSizeMb ? { scratchTmpfsSizeMb: bot.scratchTmpfsSizeMb } : {}),
+      ...(bot.scratchDenyPaths?.length ? { scratchDenyPaths: [...bot.scratchDenyPaths] } : {}),
+    } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
 }
@@ -141,12 +153,15 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'wrapperCli',
     'model',
+    'envPolicy',
     'sandbox',
     'sandboxPaths',
     'sandboxHidePaths',
     'sandboxReadonlyPaths',
     'sandboxNetwork',
+    'sandboxNetworkPolicy',
     'workingDir',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
@@ -155,6 +170,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] must be an object`);
     }
     const obj = value as Record<string, unknown>;
+    if (obj.envPolicy !== undefined) normalizeEnvPolicy(obj.envPolicy);
     const extra = Object.keys(obj).filter((field) => !allowed.has(field));
     if (extra.length > 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] has unsupported key(s): ${extra.join(', ')}`);
@@ -170,7 +186,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
@@ -218,14 +234,21 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.cliInstanceBinding ? { cliInstanceBinding: obj.cliInstanceBinding as SessionCliInstanceBindingV1,
         cliRuntime: obj.cliRuntime as BotSnapshot['cliRuntime'] } : {}),
       larkAppId: obj.larkAppId,
+      ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
-      ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
+      ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
+        : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),
+      ...(obj.scratchStorage !== undefined ? { scratchStorage: obj.scratchStorage as 'tmpfs' | 'disk' } : {}),
+      ...(obj.scratchTmpfsSizeMb !== undefined ? { scratchTmpfsSizeMb: obj.scratchTmpfsSizeMb as number } : {}),
+      ...(Array.isArray(obj.scratchDenyPaths) ? { scratchDenyPaths: [...obj.scratchDenyPaths as string[]] } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
       ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
+      ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
       workingDir: obj.workingDir,
     });
   }

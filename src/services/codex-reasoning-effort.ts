@@ -3,6 +3,9 @@ export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
 export const TRAEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 3);
+/** Remote providers validate what they support. BotMux transports its generic
+ * reasoning vocabulary without borrowing any one provider's model catalog. */
+export const REMOTE_RUNNER_REASONING_EFFORTS = CODEX_REASONING_EFFORTS;
 /** Claude Code's `--effort` flag parses exactly low|medium|high|xhigh|max —
  *  `ultra` is codex/traex-only and Claude answers it with an unknown-value
  *  warning. Spelled out rather than sliced off CODEX_REASONING_EFFORTS: the two
@@ -33,8 +36,11 @@ export function claudeReasoningEffortsForModel(model: string | undefined): reado
 
 export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
 
-const SIX_LEVEL_MODELS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra']);
-const FIVE_LEVEL_MODELS = new Set(['gpt-5.6-luna']);
+const SIX_LEVEL_MODELS = new Set([
+  'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol',
+  'gpt-5.6-sol', 'gpt-5.6-terra',
+]);
+const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
 const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
   ['seed-evolving', []],
@@ -65,9 +71,10 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
   return cliId === 'codex' || cliId === 'codex-app';
 }
 
-/** Backend variants are currently a TraeX-only launch capability. */
+/** Backend variants are a TraeX launch capability, either local or delegated
+ * through the provider-neutral Remote Runner start/resume contract. */
 export function isBackendVariantCliId(cliId: string | undefined): boolean {
-  return cliId === 'traex';
+  return cliId === 'traex' || cliId === 'remote-runner';
 }
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
@@ -110,6 +117,7 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
+  if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);

@@ -10,9 +10,10 @@
  *
  * Registry answers three questions:
  *   1. isSessionGroup(chatId)      — typing / feature gating
- *   2. lastSessionId for a chatId  — same-group resume: a new message in a
- *      session group whose session was /close'd resumes that session instead
- *      of spawning a fresh one (的话题内续聊同款体验).
+ *   2. lastSessionId for a chatId  — the group's current chat-scope resident
+ *      (what /dismiss and AI titling act on). Closing does NOT auto-resume: a
+ *      later message starts a fresh session, which becomes the resident once
+ *      it wins registration; any successful resume re-points it.
  *   3. ownerOpenId                 — the DM user the group was born for.
  *   4. origin* provenance          — WHICH authorization birthed the group, so
  *      the dispatcher can keep charging that same quota/expiry instead of
@@ -32,7 +33,7 @@ import { logger } from '../utils/logger.js';
 export interface SessionGroupEntry {
   /** The DM user this group was born for (open_id in the bot's app scope). */
   ownerOpenId: string;
-  /** Most recent session anchored in this group; same-group resume target. */
+  /** The group's chat-scope resident session (the last one created or resumed here). */
   lastSessionId: string;
   /** Epoch ms the group was created. */
   createdAt: number;

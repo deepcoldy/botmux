@@ -15,6 +15,11 @@ import {
   commitDocCommentPollCursor,
   normalizeDocNativeWatchSubscription,
   settleDocCommentWsDelivery,
+  isPollingDocTriggerMode,
+  recordDocWatchActivity,
+  setDocTitle,
+  asDocWatchOutcome,
+  DOC_WATCH_LAST_ERROR_MAX,
   type DocSubscription,
 } from '../src/services/doc-subs-store.js';
 
@@ -185,5 +190,127 @@ describe('doc-subs-store', () => {
       sessionId: undefined,
       chatId: 'doc:doccnFILE1:watch',
     });
+  });
+});
+
+describe('asDocWatchOutcome（跨版本收窄）', () => {
+  it('收已知值，拒绝未知/非字符串', () => {
+    expect(asDocWatchOutcome('dispatched')).toBe('dispatched');
+    expect(asDocWatchOutcome('poll-failed')).toBe('poll-failed');
+    expect(asDocWatchOutcome('from-a-future-version')).toBeUndefined();
+    expect(asDocWatchOutcome(undefined)).toBeUndefined();
+    expect(asDocWatchOutcome(42)).toBeUndefined();
+  });
+});
+
+describe('recordDocWatchActivity（运行态诊断，绝不抛）', () => {
+  it('记结局/时刻；dispatched 累加计数并推进 lastDispatchAt', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    expect(recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 5_000 })).toBe(true);
+    let row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.lastOutcome).toBe('dispatched');
+    expect(row.lastActivityAt).toBe(5_000);
+    expect(row.lastDispatchAt).toBe(5_000);
+    expect(row.dispatchCount).toBe(1);
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 6_000 });
+    row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.dispatchCount).toBe(2);
+    expect(row.lastDispatchAt).toBe(6_000);
+  });
+
+  it('非 dispatched 结局推进 lastActivityAt 但不动投递计数/时刻', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched', at: 1_000 });
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'not-mentioned', at: 2_000 });
+    const row = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(row.lastActivityAt).toBe(2_000);
+    expect(row.lastDispatchAt).toBe(1_000);
+    expect(row.dispatchCount).toBe(1);
+    expect(row.lastOutcome).toBe('not-mentioned');
+  });
+
+  it('成功后清掉旧 lastError；错误时截断到上限', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed', error: 'boom' });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toBe('boom');
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'dispatched' });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toBeUndefined();
+    recordDocWatchActivity(dataDir, APP_A, 'doccnFILE1', { outcome: 'poll-failed', error: 'x'.repeat(5_000) });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.lastError).toHaveLength(DOC_WATCH_LAST_ERROR_MAX);
+  });
+
+  it('订阅已不存在时不写（不复活被回滚/退订的行）', () => {
+    expect(recordDocWatchActivity(dataDir, APP_A, 'ghost', { outcome: 'dispatched' })).toBe(false);
+    expect(getDocSubscription(dataDir, APP_A, 'ghost')).toBeNull();
+  });
+});
+
+describe('setDocTitle', () => {
+  it('trim 后写入；与现值相同/空串/未知 token 不写', () => {
+    putDocSubscription(dataDir, APP_A, sub());
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', ' 需求文档 ')).toBe(true);
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')?.docTitle).toBe('需求文档');
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', '需求文档')).toBe(false);
+    expect(setDocTitle(dataDir, APP_A, 'doccnFILE1', '   ')).toBe(false);
+    expect(setDocTitle(dataDir, APP_A, 'ghost', 'x')).toBe(false);
+  });
+});
+
+describe('putDocSubscription inheritRuntime（运行态 vs 溯源，策略相反）', () => {
+  const watchRow = (over: Partial<DocSubscription> = {}): DocSubscription => ({
+    fileToken: 'doccnFILE1', fileType: 'docx',
+    sessionAnchor: 'doc:doccnFILE1:watch', scope: 'chat', chatId: 'doc:doccnFILE1:watch',
+    commentTriggerMode: 'mention-only', managedBy: 'watch-comment', createdAt: 1,
+    lastActivityAt: 900, lastOutcome: 'dispatched', lastDispatchAt: 900, dispatchCount: 3,
+    autoCreated: true, autoCreatedBy: 'ou_stranger', autoCreatedAt: 100,
+    ...over,
+  });
+
+  it('默认整行覆盖：运行态与溯源都不带入（只保 pending 功能状态）', () => {
+    putDocSubscription(dataDir, APP_A, watchRow());
+    putDocSubscription(dataDir, APP_A, watchRow({
+      lastActivityAt: undefined, lastOutcome: undefined, lastDispatchAt: undefined, dispatchCount: undefined,
+      autoCreated: undefined, autoCreatedBy: undefined, autoCreatedAt: undefined,
+    }));
+    const after = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(after.dispatchCount).toBeUndefined();
+    expect(after.autoCreated).toBeUndefined();
+  });
+
+  it('inheritRuntime 只补运行态五项，不碰溯源三项（owner 接管后不再是 auto-sub）', () => {
+    putDocSubscription(dataDir, APP_A, watchRow());
+    putDocSubscription(dataDir, APP_A, {
+      fileToken: 'doccnFILE1', fileType: 'docx',
+      sessionAnchor: 'om_ownerThread', sessionId: 'sess-owner', scope: 'thread',
+      chatId: 'oc_ownerGroup', commentTriggerMode: 'all', managedBy: 'watch-comment',
+      ownerOpenId: 'ou_owner', createdAt: 1,
+    }, { inheritRuntime: true });
+    const after = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(after.dispatchCount).toBe(3);
+    expect(after.lastOutcome).toBe('dispatched');
+    expect(after.lastActivityAt).toBe(900);
+    expect(after.autoCreated).toBeUndefined();
+    expect(after.autoCreatedBy).toBeUndefined();
+    expect(after.autoCreatedAt).toBeUndefined();
+  });
+
+  it('inheritRuntime 不覆盖调用方显式给出的运行态值；无旧行时纯新增', () => {
+    putDocSubscription(dataDir, APP_A, watchRow());
+    putDocSubscription(dataDir, APP_A, watchRow({ dispatchCount: 0, lastOutcome: 'poll-failed' }), { inheritRuntime: true });
+    expect(getDocSubscription(dataDir, APP_A, 'doccnFILE1')!.dispatchCount).toBe(0);
+    removeDocSubscription(dataDir, APP_A, 'doccnFILE1');
+    putDocSubscription(dataDir, APP_A, watchRow({ dispatchCount: undefined, lastOutcome: undefined }), { inheritRuntime: true });
+    const fresh = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
+    expect(fresh.dispatchCount).toBeUndefined();
+    expect(fresh.lastOutcome).toBeUndefined();
+  });
+});
+
+describe('isPollingDocTriggerMode（哪些模式靠轮询而非 WS 推送）', () => {
+  it('all 与 owner-mention 都走轮询；mention-only 不靠轮询', () => {
+    expect(isPollingDocTriggerMode('all')).toBe(true);
+    expect(isPollingDocTriggerMode('owner-mention')).toBe(true);
+    expect(isPollingDocTriggerMode('mention-only')).toBe(false);
+    expect(isPollingDocTriggerMode(undefined)).toBe(false);
   });
 });

@@ -367,7 +367,7 @@ function commonHomeBaseline(h: string): FsRule[] {
     // Scratch/caches every CLI + spawned tool needs.
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
-    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`),
+    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
     // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
     // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
@@ -433,6 +433,16 @@ function linuxBaseline(h: string): FsRule[] {
     // /proc via bwrap primitives — all emitted by the compiler, not rules.
     rw(`${h}/.cache`), rw(`${h}/.npm`),
   ];
+}
+
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
 }
 
 // ───────────────────────────── policy assembly ───────────────────────────────
@@ -893,6 +903,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog
@@ -913,6 +924,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // ready-signal 诊断轨迹（dsh-tui wrapper 插件在沙盒内 append）：同 turn-sends 形态，
+  // 只授本会话的**单个文件**（路径常量见 services/ready-signal-log.ts，此处按本模块的
+  // "no imports / pure" 约定内联）。append-only + 写满时 in-place 截断（保 inode），所以
+  // 单文件 bind 有效；worker 预创建文件与父目录（bwrap 不能 bind 不存在的源）。共享根与
+  // 兄弟会话保持 deny-by-default —— 这份轨迹含会话标识与派发结果，不该跨会话可读可写。
+  if (ctx.sessionId) push([`${sd}/ready-signal/${ctx.sessionId}.log`], 'readWrite', 'internal');
+  // Cursor stop hook appends only its own usage journal (no sibling writes).
+  if (ctx.sessionId) push([`${sd}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
   // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
   // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
   // write = tmp + rename in the parent dir, so a single-file grant (as for
@@ -920,6 +939,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // session-scoped: sibling sessions' dirs are not exposed. The worker
   // pre-creates the dir so bwrap has a bind source.
   if (ctx.sessionId) push([`${sd}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+  // turn-send-ledger: `botmux send` keeps its per-turn final-answer fence in
+  // `turn-send-ledger/<sessionId>/<hash>.json` (atomic tmp+rename plus a
+  // sibling `.lock`), so — like statusline — grant the per-session DIRECTORY.
+  // Never the shared root: it holds every session's fence, and write access
+  // there would let one session forge "final already sent" for another (its
+  // answer is then refused) or delete a record (its retry then duplicates).
+  // The worker pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -1029,8 +1056,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+    // Own turn-send-ledger session dir (see the larkTransport branch).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.
@@ -1363,7 +1393,7 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 // ───────────────────────────── legacy config migration ───────────────────────
 
 export interface LegacySandboxFields {
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
   sandboxReadonlyPaths?: readonly string[];
   sandboxHidePaths?: readonly string[];
@@ -1371,7 +1401,9 @@ export interface LegacySandboxFields {
 }
 
 export interface MigratedSandboxFields {
-  sandbox: boolean;
+  // Tri-state preserved: a scratch bot carrying legacy path fields must NOT
+  // be silently downgraded to oncall(boolean true) by the migration.
+  sandbox: boolean | 'oncall' | 'scratch';
   sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
 }
 
@@ -1388,7 +1420,14 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
-  const sandbox = entry.sandbox === true || entry.readIsolation === true;
+  // Preserve the tri-state: only oncall representations collapse to boolean
+  // true; 'scratch' passes through unchanged (the old path lists are irrelevant
+  // to scratch's full-root COW, but the mode itself must not be downgraded).
+  const sandbox: boolean | 'oncall' | 'scratch' = entry.sandbox === 'scratch'
+    ? 'scratch'
+    : (entry.sandbox === true
+      || entry.sandbox === 'oncall'
+      || entry.readIsolation === true);
   if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
   const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
   const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];

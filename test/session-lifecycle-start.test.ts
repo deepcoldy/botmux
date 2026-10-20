@@ -204,6 +204,7 @@ vi.mock('../src/core/scheduled-turn-provenance.js', async (importOriginal) => {
 import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  adoptSandboxBlocked,
   auxUiSuppressedFor,
   detachWorkerForTransfer,
   ensureOrdinaryTurnRecoveryAttached,
@@ -213,7 +214,10 @@ import {
   initWorkerPool,
   ensureReadonlyTaskContinuationAttached,
   ensureAutomaticTaskContinuationLease,
+  codexAppCleanInputAcceptedForSession,
   promoteQueuedActivationTail,
+  reserveQueuedActivationTailAdmission,
+  resolveQuarantinedForkPlan,
   restartCounts,
   sendWorkerInput,
   setActiveSessionsRegistry,
@@ -415,6 +419,40 @@ describe('host memory pressure worker admission', () => {
     );
   });
 
+  it('hands blocked admission to a durable caller without a direct provider reply', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue({
+      allowed: false,
+      reasons: ['MemAvailable 1.0 GiB is below the reserved 8.0 GiB'],
+      pressure: { warnings: [] },
+      policy: {
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    } as any);
+    const ds = makeDs({ hasHistory: true });
+    const blocked = vi.fn();
+
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_durable_retry' }, {
+      onAdmissionBlocked: blocked,
+    })).toBe(true);
+
+    expect(blocked).toHaveBeenCalledWith({
+      content: expect.stringMatching(/memory pressure.*retry/i),
+      turnId: 'om_durable_retry',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
   it('reports accepted after a worker receives its init message', () => {
     const ds = makeDs();
     const admissions: string[] = [];
@@ -425,6 +463,25 @@ describe('host memory pressure worker admission', () => {
 
     expect(forkMock).toHaveBeenCalledTimes(1);
     expect(admissions).toEqual(['accepted']);
+  });
+
+  it('forks the worker without the pm2 graceful-exit sentinel or the bot GitHub tokens', () => {
+    // The sentinel is the daemon/dashboard cores' private exit code: a worker
+    // that inherited it would exit 90 on a clean stop, read as a crash.
+    const keys = ['BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'GITHUB_TOKEN', 'GH_TOKEN'] as const;
+    const prev = keys.map(key => process.env[key]);
+    keys.forEach(key => { process.env[key] = 'leaked'; });
+    try {
+      expect(forkWorker(makeDs(), 'hello', false)).toBe(true);
+      const options = forkMock.mock.calls[0]![2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.PATH).toBeDefined();
+      for (const key of keys) expect(key in options.env, key).toBe(false);
+    } finally {
+      keys.forEach((key, i) => {
+        if (prev[i] === undefined) delete process.env[key];
+        else process.env[key] = prev[i];
+      });
+    }
   });
 
   it('leaves explicit retry ownership with the caller during device isolation', async () => {
@@ -794,6 +851,30 @@ describe('host memory pressure worker admission', () => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
+  it('propagates durable-primary attribution through the actual fork init message', () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'durable opening', {
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    })).toBe(true);
+
+    expect(ds.initConfig).toMatchObject({
+      type: 'init',
+      prompt: 'durable opening',
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    });
+  });
+
   it('starts standalone init delivery only after the Worker IPC bootstrap is ready', async () => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);
@@ -860,10 +941,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   });
 
   it.each([
-    { cliId: 'codex', codexRpcInput: false, waitMs: 90_000 },
-    { cliId: 'codex', codexRpcInput: true, waitMs: 2_000 },
-    { cliId: 'claude-code', codexRpcInput: false, waitMs: 2_000 },
-  ])('uses the commit deadline for $cliId rpc=$codexRpcInput without extending duplicate receipts', async ({ cliId, codexRpcInput, waitMs }) => {
+    { cliId: 'codex', codexRpcInput: false },
+    { cliId: 'codex', codexRpcInput: true },
+    { cliId: 'claude-code', codexRpcInput: false },
+  ])('waits quietly for $cliId rpc=$codexRpcInput to commit after duplicate receipts', async ({ cliId, codexRpcInput }) => {
     vi.useFakeTimers();
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, codexRpcInput }));
     const sessionReply = vi.fn(async () => 'om_delayed');
@@ -888,12 +969,11 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(waitMs - 1);
+    await vi.advanceTimersByTimeAsync(90_001);
     expect(sessionReply).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(1);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(sessionReply).not.toHaveBeenCalled();
     const businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
@@ -932,7 +1012,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('keeps tracking after a delayed notice so a later worker exit is visible', async () => {
+  it('keeps tracking a pending turn so a later worker exit is visible', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -954,25 +1034,17 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(1_500);
-    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(88_499);
+    await vi.advanceTimersByTimeAsync(90_001);
     expect(sessionReply).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    await Promise.resolve();
-
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
 
     worker.emit('exit', 1, null);
     await Promise.resolve();
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(sessionReply.mock.calls[1]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
-    expect(sessionReply.mock.calls[1]?.[1]).toContain('不要直接重发');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('不要直接重发');
   });
 
-  it('does not repeat a delayed notice when the worker receipt arrives late', async () => {
+  it('waits quietly when the worker receipt arrives late', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -993,17 +1065,16 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     });
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
-    await vi.advanceTimersByTimeAsync(2_100);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('消息已进入 Worker 的 IPC 队列');
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(sessionReply).not.toHaveBeenCalled();
 
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(90_001);
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('clears tracking when a delayed turn later commits', async () => {
+  it('clears tracking when a pending turn later commits', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -1025,17 +1096,17 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(90_000);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(sessionReply).not.toHaveBeenCalled();
 
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
     worker.emit('exit', 1, null);
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('keeps tracking after a delayed notice so a later rejection retries and fails visibly', async () => {
+  it('keeps tracking a pending turn so a later rejection retries and fails visibly', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -1057,7 +1128,8 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(sessionReply).not.toHaveBeenCalled();
 
     worker.emit('message', {
       type: 'turn_input_rejected',
@@ -1077,13 +1149,94 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     });
     await Promise.resolve();
 
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
-    expect(sessionReply.mock.calls[1]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('无法确认这条消息是否已进入 Worker 的执行队列');
     businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(2);
+  });
+
+  it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    // The daemon declines the handoff — this is the real fallback path: the XPI
+    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
+    // delivery then falls back to retry/fail, and its terminal notice must still
+    // describe a KNOWN outcome: the turn never entered the worker queue.
+    const onOrdinaryImInputRejected = vi.fn(async () => false);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    const trustedCaller = {
+      requestUserOpenId: 'ou_b',
+      requestUserUnionId: 'on_b',
+      requestLarkAppId: 'app_test',
+      senderType: 'user' as const,
+    };
+    expect(sendWorkerInput(ds, {
+      content: 'business turn',
+      rerouteEnvelope: {
+        turnId: 'om_business',
+        text: 'business turn',
+        userPrompt: 'business turn',
+        senderName: 'B',
+        createdAt: 1,
+      },
+    }, 'om_business', { trustedCaller })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'om_active_a',
+      activeCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    };
+    const businessSends = () => vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(businessSends()).toHaveLength(2));
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalled());
+
+    const bodies = sessionReply.mock.calls.map(call => String(call[1]));
+    const terminal = bodies.at(-1)!;
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    // The ambiguous-outcome notice must not be used for a rejection the daemon
+    // can describe exactly: it tells the user not to resend, which would strand
+    // a message that provably never ran.
+    for (const body of bodies) {
+      expect(body).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+      expect(body).not.toContain('不要直接重发');
+    }
+    expect(businessSends()).toHaveLength(2);
   });
 
   it('hands a deterministic pre-admission rejection back exactly once without retrying the worker input', async () => {
@@ -1212,7 +1365,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(businessSends).toHaveLength(2);
   });
 
-  it('does not retry or report failure after parent IPC confirms the enqueue', async () => {
+  it('waits quietly after parent IPC confirms the enqueue', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -1230,22 +1383,14 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     });
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_001);
     await Promise.resolve();
 
     const businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
-    expect(sessionReply).toHaveBeenCalledWith(
-      'om_root',
-      expect.stringContaining('消息已进入 Worker 的 IPC 队列'),
-      'text',
-      'app_test',
-      'om_business',
-    );
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
-    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('请重发本条消息');
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('retries immediately when the parent IPC callback rejects the enqueue', async () => {
@@ -1280,7 +1425,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     );
   });
 
-  it('settles on a delayed state when an IPC retry is later confirmed', async () => {
+  it('waits quietly when an IPC retry is later confirmed', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -1302,15 +1447,14 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     await vi.runAllTicks();
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_001);
     await Promise.resolve();
 
     const businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(2);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('消息已进入 Worker 的 IPC 队列');
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('settles a transport retry when the first attempt ACK arrives late', async () => {
@@ -1694,7 +1838,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply.mock.calls[0]?.[1]).toContain('resend the message only if it did not run');
   });
 
-  it('renders transport, commit, and failure notices in the bot English locale', async () => {
+  it('renders delivery failure notices in the bot English locale', async () => {
     vi.useFakeTimers();
     vi.mocked(getBot).mockImplementation(() => defaultBot({ lang: 'en' }));
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -1710,27 +1854,13 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
     await Promise.resolve();
     sessionReply.mockClear();
-    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
-      callback?.(null);
-      return true;
-    });
-
-    expect(sendWorkerInput(ds, 'transport delayed', 'om_transport_delayed')).toBe(true);
-    await vi.advanceTimersByTimeAsync(2_000);
-
-    expect(sendWorkerInput(ds, 'commit delayed', 'om_commit_delayed')).toBe(true);
-    worker.emit('message', { type: 'turn_input_received', turnId: 'om_commit_delayed' });
-    await vi.advanceTimersByTimeAsync(90_000);
-
     vi.mocked(worker.send).mockImplementation(() => true);
     expect(sendWorkerInput(ds, 'delivery failed', 'om_delivery_failed')).toBe(true);
     await vi.advanceTimersByTimeAsync(4_000);
 
-    expect(sessionReply.mock.calls.map(call => call[1])).toEqual(expect.arrayContaining([
-      expect.stringContaining('entered the Worker IPC queue'),
-      expect.stringContaining('Worker received this message'),
+    expect(sessionReply.mock.calls.map(call => call[1])).toEqual([
       expect.stringContaining('could not confirm whether this message entered the Worker execution queue'),
-    ]));
+    ]);
     expect(sessionReply.mock.calls.every(call => String(call[1]).includes('do not resend'))).toBe(true);
   });
 
@@ -1826,23 +1956,17 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     forkMock.mockImplementationOnce(() => worker);
 
     forkWorker(ds, 'cold start', 'om_kickoff');
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_001);
     await Promise.resolve();
 
     const initSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
     expect(initSends).toHaveLength(1);
-    expect(sessionReply).toHaveBeenCalledWith(
-      'om_root',
-      expect.stringContaining('消息已进入 Worker 的 IPC 队列'),
-      'text',
-      'app_test',
-      'om_kickoff',
-    );
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('reports a slow startup as delayed rather than failed after init is received', async () => {
+  it('waits quietly during a slow startup after init is received', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
@@ -1856,21 +1980,16 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     forkWorker(ds, 'cold start', 'om_kickoff');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_kickoff' });
-    await vi.advanceTimersByTimeAsync(89_999);
-    expect(sessionReply).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(90_001);
 
     const initSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
     expect(initSends).toHaveLength(1);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
-    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认');
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('does not falsely report non-codex cold start as delayed at 2 seconds', async () => {
+  it('waits quietly for a non-codex cold start and follow-up to commit', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
@@ -1900,24 +2019,18 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_claude_kickoff' });
 
-    // In steady-state, ack settlement timeout is 2s, but cold-start init must not fire at 2s.
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_001);
     expect(sessionReply).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(sessionReply).not.toHaveBeenCalled();
-
-    // Simulates CLI spawn finishing after 12s and emitting commit.
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_claude_kickoff' });
 
     // Follow-up message arriving before worker emits ready (still cold starting) must also be protected
     expect(sendWorkerInput(ds, 'followup prompt', 'om_claude_followup')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_claude_followup' });
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_001);
     expect(sessionReply).not.toHaveBeenCalled();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_claude_followup' });
 
-    // After commit, advancing past 90s must never notify delay.
     await vi.advanceTimersByTimeAsync(90_000);
     expect(sessionReply).not.toHaveBeenCalled();
   });
@@ -3310,7 +3423,9 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it.each([
-    ['codex', {}],
+    ['gemini', {}],
+    ['codex', { adoptedFrom: { sessionId: 'external' } }],
+    ['codex', { chatId: 'http_async_test' }],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
     ['claude-code', { session: { vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 } } }],
     ['claude-code', { chatId: 'http_async_test' }],
@@ -3862,7 +3977,7 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
   // only — driven purely by explicit per-bot `readIsolation` — so a no-transport
   // session with no sandbox config reads the disk like a normal chat. The env
-  // secret-withhold (asserted in api-only-mode-wiring) is a SEPARATE boundary and
+  // secret-withhold (asserted in the describe below) is a SEPARATE boundary and
   // stays independent of this.
   const readInit = () => {
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3901,6 +4016,67 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
     const ds = makeDs();
     forkWorker(ds, 'hello', false);
     expect(readInit().readIsolation).toBe(false);
+  });
+});
+
+describe('no-transport workers never receive the Lark app secret', () => {
+  // The secret is withheld at the daemon→worker boundary (fork env AND init
+  // message) rather than trusting an apiOnly flag the sandboxed agent could
+  // flip; both fork paths (fresh + adopt) must do it.
+  const lastFork = (ds: DaemonSession) => ({
+    env: (forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> }).env ?? {},
+    init: vi.mocked((ds.worker as any).send).mock.calls[0][0],
+  });
+  const virtualDs = (overrides: Partial<DaemonSession> = {}) => makeDs({
+    chatId: 'http_async_secret', session: { ...makeDs().session, chatId: 'http_async_secret' }, ...overrides,
+  });
+  const adoptedFrom = {
+    source: 'tmux', tmuxTarget: 'work:0.0', originalCliPid: 4242, sessionId: 'sess-adopt-secret',
+    cliId: 'claude-code', cwd: '/repo', paneCols: 200, paneRows: 50,
+  } as DaemonSession['adoptedFrom'];
+
+  it('apiOnly bot: empty secret in fork env and init even when bots.json carries one', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: 'real-secret' }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('');
+    expect(init.larkAppSecret).toBe('');
+    expect(init.apiOnly).toBe(true);
+  });
+
+  it('HTTP virtual chat on a normal bot: secret withheld, and the adopt path never forks at all', () => {
+    const fresh = virtualDs();
+    forkWorker(fresh, 'hello', false);
+    expect(lastFork(fresh).env.LARK_APP_SECRET).toBe('');
+    expect(lastFork(fresh).init.larkAppSecret).toBe('');
+
+    // Adopt would attach an unconfined pre-existing CLI: refused before any fork
+    // and the stale adopt metadata is dropped so it cold-starts instead.
+    forkMock.mockClear();
+    const adopted = virtualDs({ adoptedFrom });
+    forkAdoptWorker(adopted, { prompt: 'hi', turnId: 'om_adopt_secret' });
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(adopted.adoptedFrom).toBeUndefined();
+  });
+
+  it('a real chat keeps the secret, and the init freezes the daemon-loaded bots config path', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('secret');
+    expect(init.larkAppSecret).toBe('secret');
+    // Host-owned facts the worker's fs policy denies against — never re-guessed
+    // from env inside the worker.
+    expect(init.loadedBotsConfigPath).toBe('/home/u/.botmux/bots.json');
+    expect(init.loadedBotsConfigProvenance).toBe('loaded');
+  });
+
+  it('adopt-observe is refused for apiOnly bots and HTTP virtual chats (cold-start instead)', () => {
+    expect(adoptSandboxBlocked({ apiOnly: true })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'http_async_adopt' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'headless_hl_adopt1234' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'oc_real_chat' })).toBe(false);
   });
 });
 
@@ -4028,6 +4204,28 @@ describe('CLI runtime session freeze', () => {
     expect(resumedInit.cliRuntime).toEqual(firstInit.cliRuntime);
     expect(resumedInit.cliPathOverride).toBe('/opt/vendor-codex');
     expect(ds.session.cliRuntime).toEqual(firstInit.cliRuntime);
+  });
+});
+
+describe('delivered-final failure-notice opt-in init wiring', () => {
+  it.each([undefined, false, 'true'])('does not send the experimental field when the bot value is %s', value => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: value }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_default' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.type).toBe('init');
+    expect(init).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it('freezes an explicit opt-in on the worker init', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: true }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_opt_in' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(ds.initConfig?.suppressDeliveredFinalFailureNotice).toBe(true);
   });
 });
 
@@ -4165,6 +4363,34 @@ describe('Codex App clean-input feature gate', () => {
     // both still carry the flag (promote exactInput + acceptCodexAppDispatch COPY).
     expect(ds.session.queuedActivationInput?.codexAppSteerable).toBe(true);
     expect(ds.session.codexAppDispatchLedger?.some(e => e.codexAppSteerable === true)).toBe(true);
+  });
+
+  // The promote IPC must take the caller from the FROZEN promote record. A tail
+  // that sat in the queue past the replyTargets eviction window has no live
+  // senderOpenId to look up, and an empty caller makes the wrapper refuse a
+  // legitimate same-principal continuation.
+  it('promoted activation carries turnCallerOpenId from the frozen record, not a live replyTargets lookup', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true } as any);
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening' };
+    const trustedCaller = {
+      requestUserOpenId: 'ou_tail', requestLarkAppId: 'app_test', senderType: 'user' as const,
+    };
+    expect(sendWorkerInput(ds, 'follow', 'turn-tail-caller', { trustedCaller })).toBe(true);
+    // The turn never landed in replyTargets — emulate the eviction/prune window.
+    delete ds.session.replyTargets?.['turn-tail-caller'];
+    ds.activeInteractiveTurn = undefined;
+    ds.session.queuedActivationPending = false;
+
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'message',
+      turnId: 'turn-tail-caller',
+      turnCallerOpenId: 'ou_tail',
+    });
   });
 
   it('R5-B1-2: a missing/false steer authorization stays forced-serial through the same copy chain', () => {
@@ -4619,6 +4845,139 @@ describe('Codex App clean-input feature gate', () => {
       // The old head is left exactly where it was — the guard did not promote it.
       expect(ds.session.queuedActivationPending).toBeUndefined();
       expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+  });
+
+  // `/cli <id>` 只在会话「尚未启动」时生效：它写一个 pending 的 cliLaunchSnapshot，既不动
+  // session.cliId（此时仍为空）也不起 worker；首次 forkWorker 的 sessionAgentConfig 才把它
+  // resolve 并把 session.cliId 盖成所选 CLI。所以「snapshot 与 session.cliId 不一致」的窗口只有
+  // 一个：pending 且尚未首次 fork。该窗口里的 admission / 记账判定必须按 snapshot 所选 CLI，
+  // 而不是 bot 默认 CLI——否则和 forkWorker（resolve 之后才判定）对同一会话给出相反结论。
+  describe('/cli-selected CLI before the first fork (pending cliLaunchSnapshot)', () => {
+    function snapshotFor(cliId: string, state: 'pending' | 'resolved' = 'pending') {
+      return {
+        version: 1,
+        state,
+        entryId: cliId,
+        cliId,
+        cliRuntime: null,
+        cliPathOverride: null,
+        wrapperCli: null,
+        cliLaunchMode: null,
+        model: null,
+        reasoningEffort: null,
+        modelBackendVariant: null,
+        launchShell: null,
+        startupCommands: [],
+      } as any;
+    }
+
+    /** 尚未首次 fork 的 /cli 会话：snapshot pending、session.cliId 为空。 */
+    function preForkSelectedDs(selected: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliLaunchSnapshot = snapshotFor(selected);
+      expect(ds.session.cliId).toBeUndefined();
+      return ds;
+    }
+
+    function withTail(ds: DaemonSession): DaemonSession {
+      ds.session.queuedActivationTail = [{
+        id: 'tail-follow',
+        order: 1,
+        userPrompt: 'FOLLOW',
+        cliInput: { content: 'FOLLOW' },
+        turnId: 'turn-follow',
+      }];
+      ds.session.queuedActivationTailNextOrder = 1;
+      return ds;
+    }
+
+    it('clean-input gate follows the selected Codex App even when the bot default is another CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(true);
+      // follower 的 arrival-time 冻结决定也走同一判定（reserve → admit 把它固化进 durable tail）。
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(true);
+    });
+
+    it('clean-input gate rejects a selected non-Codex-App CLI even when the bot default is codex-app', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('claude-code');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(false);
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(false);
+    });
+
+    it('agrees with the post-fork judgement: resolved snapshot (session.cliId stamped) gives the same answer', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+      const pending = codexAppCleanInputAcceptedForSession(ds);
+
+      // 首次 fork 之后：snapshot resolved，session.cliId 被盖成所选 CLI。
+      ds.session.cliLaunchSnapshot!.state = 'resolved';
+      ds.session.cliId = 'codex-app';
+      ds.session.agentFrozen = true;
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(pending);
+      expect(pending).toBe(true);
+    });
+
+    it('promoting a tail head before the first fork opens a Codex App ledger entry for a selected Codex App', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const ds = withTail(preForkSelectedDs('codex-app'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
+      expect(ds.session.codexAppDispatchLedger?.[0]).toEqual(expect.objectContaining({
+        turnId: 'turn-follow',
+        queuedActivationToken: ds.session.queuedActivationToken,
+      }));
+    });
+
+    it('promoting a tail head before the first fork never opens a Codex App ledger entry for a selected non-Codex-App CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = withTail(preForkSelectedDs('claude-code'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('quarantined-tail recovery decides ledger-vs-resubmit by the selected CLI, in step with the promote it just ran', () => {
+      // 选了 Codex App、bot 默认不是：promote 开了 ledger entry，恢复 fork 就必须走 ledger（空 prompt），
+      // 不能再按 bot 默认 CLI 重提交 queuedActivationInput（同一 turn 会被投递两次）。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const codexAppSelected = withTail(preForkSelectedDs('codex-app'));
+      codexAppSelected.quarantinedActivationTailPromotion = true;
+      const viaLedger = resolveQuarantinedForkPlan(codexAppSelected, '', true);
+      expect(viaLedger.fork).toBe(true);
+      expect(viaLedger.promptInput).toBe('');
+      expect(codexAppSelected.session.codexAppDispatchLedger).toHaveLength(1);
+
+      // 反过来：bot 默认是 codex-app、会话选了别的 CLI：不能走 ledger，必须原样重提交。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const otherSelected = withTail(preForkSelectedDs('claude-code'));
+      otherSelected.quarantinedActivationTailPromotion = true;
+      const resubmit = resolveQuarantinedForkPlan(otherSelected, '', true);
+      expect(resubmit.fork).toBe(true);
+      expect((resubmit.promptInput as { content: string }).content).toBe('FOLLOW');
+      expect(otherSelected.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('sessions without a snapshot keep the session.cliId ?? bot.cliId judgement (unchanged)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      // 没冻结过 cliId：回落 bot。
+      expect(codexAppCleanInputAcceptedForSession(makeDs())).toBe(true);
+      // 已冻结成别的 CLI：不被 bot 后来改成 codex-app 带偏。
+      const frozen = makeDs();
+      frozen.session.cliId = 'claude-code';
+      expect(codexAppCleanInputAcceptedForSession(frozen)).toBe(false);
+      // adopt 会话永不接受 clean sidecar。
+      const adopted = makeDs({ adoptedFrom: { cliId: 'codex-app' } } as any);
+      expect(codexAppCleanInputAcceptedForSession(adopted)).toBe(false);
     });
   });
 
@@ -6057,6 +6416,7 @@ describe('managed turn authority worker generations', () => {
     requestUserOpenId: 'ou_schedule_owner',
     requestUserUnionId: 'on_schedule_owner',
     requestLarkAppId: 'app_test',
+    senderType: 'user' as const,
     source: 'schedule_creator' as const,
     taskId: 'feedbeef',
   };
@@ -7013,6 +7373,7 @@ describe('forkWorker session agent config freeze', () => {
         sandboxHidePaths: ['~/.ssh'],
         sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
         sandboxNetwork: false,
+        sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } },
       },
       resolvedAllowedUsers: [],
       botOpenId: 'ou_bot',
@@ -7026,6 +7387,7 @@ describe('forkWorker session agent config freeze', () => {
     expect(ds.session.sandboxHidePaths).toEqual(['~/.ssh']);
     expect((ds.session as any).sandboxReadonlyPaths).toEqual(['/srv/source-a-readonly', '/srv/source-b-readonly']);
     expect((ds.session as any).sandboxNetwork).toBe(false);
+    expect(ds.session.sandboxNetworkPolicy).toEqual({ version: 1, public: { mode: 'block' }, private: { mode: 'allow' } });
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -7033,7 +7395,18 @@ describe('forkWorker session agent config freeze', () => {
       sandboxHidePaths: ['~/.ssh'],
       sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
       sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } },
     }));
+  });
+
+  it('restore forwards the frozen network policy even when the bot config changes', () => {
+    const ds = makeDs();
+    const frozen = { version: 1 as const, public: { mode: 'block' as const }, private: { mode: 'allow' as const } };
+    ds.session.sandbox = true; ds.session.sandboxNetworkPolicy = structuredClone(frozen);
+    forkWorker(ds, 'resume', true);
+    expect(ds.session.sandboxNetworkPolicy).toEqual(frozen);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', sandboxNetworkPolicy: frozen }));
   });
 
   it('records cli wrapper on fresh sessions and launches with the live bot model (model NOT frozen)', () => {
@@ -7325,6 +7698,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
     requestLarkAppId: 'cli_creator',
+    senderType: 'user' as const,
     source: 'schedule_creator',
     taskId: 'abcdef12',
   };
@@ -7616,5 +7990,375 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN)).toHaveLength(0);
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('attention_required');
+  });
+});
+
+describe('Codex capacity recovery', () => {
+  async function boot(botOverrides: Record<string, unknown> = {}) {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, ...botOverrides }));
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_capacity');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_capacity' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_capacity' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null); return true;
+    });
+    worker.send.mockClear(); sessionReply.mockClear();
+    return { ds, worker, sessionReply };
+  }
+  function continuations(worker: any) {
+    return vi.mocked(worker.send).mock.calls.map(call => call[0] as any)
+      .filter(message => message?.type === 'message' && message.turnId?.startsWith('bmx-recovery-'));
+  }
+  function fail(ds: DaemonSession, worker: any, turnId = 'om_capacity', errorCode = 'codex_capacity_exceeded') {
+    worker.emit('message', { type: 'final_output', turnId, lastUuid: turnId, content: 'capacity diagnostic', turnFailed: true, turnFailureCode: errorCode });
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'failed', errorCode });
+  }
+
+  it.each([undefined, false])('does not inject recovery inputs when the opt-in is %s', async codexCapacityRecovery => {
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('does not restore an old persisted Codex backoff when the opt-in is absent', async () => {
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery: undefined });
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'backoff', continuationsStarted: 0,
+      nextAttemptAt: Date.now() - 1, lastErrorCode: 'codex_capacity_exceeded',
+    };
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it.each(['final-first', 'terminal-first'] as const)('opt-off mid-backoff settles durably and sends one card (%s)', async order => {
+    const { ds, worker, sessionReply } = await boot();
+    let durable: any;
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => { durable = structuredClone(s.ordinaryTurnRecovery); });
+    if (order === 'final-first') fail(ds, worker);
+    else worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.agentAttention).toBeDefined();
+    expect(durable).toMatchObject({ status: 'cancelled', lastErrorCode: 'recovery_disabled', warningDispatched: true });
+    // A late rollout must not duplicate the explicit opt-off notice.
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'disabled-diagnostic', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const { disposeOrdinaryTurnRecovery } = await import('../src/services/ordinary-turn-recovery.js');
+    disposeOrdinaryTurnRecovery(ds.session);
+    // Fresh process with only the durable row, and the feature enabled again.
+    const restored = makeDs({ session: { ...structuredClone(ds.session), ordinaryTurnRecovery: structuredClone(durable) } });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('opt-off followed by a diagnostic before the timer settles once without a second card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'before-opt-off-timer', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning recovery off after success still suppresses the already recovered predecessor diagnostic', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'success-then-opt-off', content: 'obsolete diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+  });
+
+  it('opt-off save failure still fences the pending recovery and reports its failure once', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'cancelled') throw new Error('disk full on opt-off');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(ds.agentAttention).toBeDefined();
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning the opt-in off before failure keeps the normal failure UI', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+  });
+
+  it('continues capacity failures twice with backoff and one actionable exhaustion card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+    const first = continuations(worker)[0];
+    expect(first.content).toContain('checkpoint');
+    expect(first.content).not.toContain('original task');
+    worker.emit('message', { type: 'turn_input_received', turnId: first.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: first.turnId });
+    fail(ds, worker, first.turnId);
+    await vi.advanceTimersByTimeAsync(44_999);
+    expect(continuations(worker)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const second = continuations(worker)[1];
+    expect(second.turnId).not.toBe(first.turnId);
+    worker.emit('message', { type: 'turn_input_received', turnId: second.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: second.turnId });
+    fail(ds, worker, second.turnId);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(2);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'exhausted', continuationsStarted: 2 });
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it('uses capacity advice for a Codex runtime with a custom display name', async () => {
+    const { ds, worker } = await boot({ wrapperCli: undefined, cliRuntime: {
+      id: 'vendor-codex', displayName: 'VendorCodex', executable: '/opt/vendor-codex', update: { provider: 'none' },
+    } });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    fail(ds, worker, continuations(worker)[0].turnId);
+    await vi.advanceTimersByTimeAsync(45_000);
+    fail(ds, worker, continuations(worker)[1].turnId);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention?.reason).toContain('VendorCodex');
+    expect(ds.agentAttention?.reason).toMatch(/切换模型|change models/);
+  });
+
+  it.each(['codex_auth_failed', 'codex_rate_limited', 'codex_upstream_error', 'codex_connection_failed'])(
+    'keeps %s on the normal failure path without automatic continuation', async errorCode => {
+      const { ds, worker, sessionReply } = await boot();
+      fail(ds, worker, 'om_capacity', errorCode);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(continuations(worker)).toHaveLength(0);
+      expect(sessionReply).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('new user input cancels the backoff and cannot revive the failed task', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ logicalTurnId: 'om_new', status: 'running' });
+  });
+
+  it('a type-ahead successor prevents late predecessor failure from scheduling recovery', async () => {
+    const { ds, worker } = await boot();
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe('om_new');
+  });
+
+  it('Ctrl+C cancels recovery during the backoff', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' })).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+  });
+
+  it('backoff persistence failure still delivers exactly one failure card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'backoff') throw new Error('disk full saving backoff');
+    });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it.each(['ctrlc', 'esc'] as const)('%s cancellation lets a late capacity diagnostic use the failure UI', async key => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key })).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'late-after-stop', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('a timer persistence failure stops recovery without crashing or executing input', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_persist_failed' });
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses a capacity fallback arriving after the RPC terminal', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'om_capacity', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+  });
+
+  it('does not show an old capacity diagnostic after its continuation succeeded', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'very-late-capacity', content: 'obsolete capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+    expect(continuations(worker)).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('never continues a capacity failure that belongs to an HTTP waiter', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    const reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['om_capacity', { resolve: vi.fn(), reject }]]);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reject).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('a completed continuation settles recovery without another retry', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+  });
+});
+
+it('an admitted Codex successor fences old recovery even when saving its new state fails', async () => {
+  vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
+  vi.useFakeTimers();
+  const ds = makeDs();
+  forkWorker(ds, 'original task', 'om_original');
+  const worker = forkMock.mock.results.at(-1)!.value;
+  worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+  worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+  worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(worker.send).mockImplementation((_message: any, cb?: (err?: Error | null) => void) => { cb?.(null); return true; });
+  worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+    if (s.ordinaryTurnRecovery?.logicalTurnId === 'om_new' && s.ordinaryTurnRecovery.status === 'running') throw new Error('disk full after admission');
+  });
+  expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+  expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId: 'om_new' }), expect.any(Function));
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
+  expect(vi.mocked(worker.send).mock.calls.map(c => c[0] as any).filter(m => m?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+});
+
+describe('/btw side answer relay', () => {
+  const forkWithReply = (overrides?: Partial<DaemonSession>) => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    expect(forkWorker(makeDs(overrides), 'hello', false)).toBe(true);
+    return { sessionReply, worker: forkMock.mock.results.at(-1)!.value };
+  };
+
+  it('replies under the /btw turn, capping long answers and flagging screen-read ones', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_short', question: 'what is 1+1?', answer: 'Two.', source: 'clipboard' });
+    const long = `${'a'.repeat(6_000)}TAIL_BEYOND_CAP`;
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_clip', question: 'long?', answer: long, source: 'clipboard' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_screen', question: 'long?', answer: long, source: 'screen' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([
+      ['interactive', 'om_btw_short'],
+      ['interactive', 'om_btw_clip'],
+      ['interactive', 'om_btw_screen'],
+    ]);
+    const [short, clip, screen] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(short).toContain('what is 1+1?');
+    expect(short).toContain('Two.');
+    for (const card of [clip, screen]) {
+      expect(card).toContain('a'.repeat(1_000));
+      expect(card).not.toContain('TAIL_BEYOND_CAP');
+    }
+    // A screen-read answer carries an extra "may be partial" note.
+    expect(screen.length).toBeGreaterThan(clip.length);
+  });
+
+  it('drops the answer when the session has no Lark transport', async () => {
+    const { sessionReply, worker } = forkWithReply({ chatId: 'http_async_btw' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw', question: 'q', answer: 'a', source: 'clipboard' });
+    await new Promise(resolveTick => setTimeout(resolveTick, 20));
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 });

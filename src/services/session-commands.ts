@@ -26,6 +26,7 @@ import type { LarkAttachment, Session } from '../types.js';
 
 /** Close inputs only the owning daemon can produce. */
 type DaemonCloseOptions = {
+  workspaceRetirement?: Session['workspaceRetirement'];
   /**
    * Close-time token snapshot, sampled by the caller BEFORE the write (the
    * daemon's transcript scan, never run under the store lock). Omit to leave
@@ -86,8 +87,9 @@ type Assert<T extends true> = T;
 /** Compile-time proof of the host boundary (checked by the build's `tsc`):
  *  a daemon close command must never be assignable to a host command, so no
  *  daemon-only option can become nameable by a host. Widening
- *  `HostSessionCommand` turns this into a TS2344 error. */
-type _HostCloseCannotNameDaemonOptions =
+ *  `HostSessionCommand` turns this into a TS2344 error.
+ *  `export` 仅为让这条纯编译期断言不被 noUnusedLocals 当作未使用的局部类型，别无调用方。 */
+export type _HostCloseCannotNameDaemonOptions =
   Assert<SessionCloseCommand extends HostSessionCommand ? false : true>;
 
 export type SessionRowRefusal =
@@ -156,6 +158,10 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
   // The materialised images are cleaned up AFTER the row commits, so the list
   // is handed back before it is dropped from the row.
   const released: SessionRowReleased = {};
+  if (command.workspaceRetirement && !row.workspaceRetirement) {
+    row.workspaceRetirement = { ...command.workspaceRetirement };
+    changed = true;
+  }
 
   if (!alreadyClosed) {
     if (row.dashboardAttachments?.length) {

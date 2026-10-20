@@ -1,0 +1,699 @@
+import { describe, expect, it, vi } from 'vitest';
+import type {
+  DurableInsertResult,
+  LeaseMutationResult,
+  SessionLease,
+} from '../src/services/durable-coordination.js';
+import {
+  DurableLarkIngressAckTimeoutError,
+  DurableLarkIngressNotLeaderError,
+  startDurableLarkPrimaryIngress,
+  type DurableLarkPrimaryIngressStore,
+} from '../src/services/durable-lark-primary-ingress.js';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function lease(epoch = 1): SessionLease {
+  return {
+    sessionKey: 'botmux.ingress:lark:cli_test',
+    ownerId: 'ingress-boot-1',
+    epoch,
+    leaseUntil: 60_000,
+  };
+}
+
+function fakeStore() {
+  const initialLease = lease();
+  const store: DurableLarkPrimaryIngressStore = {
+    acquireSessionLease: vi.fn(async () => ({ kind: 'acquired', lease: initialLease })),
+    renewSessionLease: vi.fn(async input => ({
+      kind: 'applied',
+      lease: { ...input.lease, leaseUntil: input.lease.leaseUntil + input.leaseDurationMs },
+    })),
+    releaseSessionLease: vi.fn(async released => ({ kind: 'applied', lease: released })),
+    enqueueInbox: vi.fn(async () => ({ kind: 'inserted' })),
+    enqueueInboxWithLease: vi.fn(async () => ({ kind: 'inserted' })),
+    claimNextInbox: vi.fn(),
+    renewInboxClaim: vi.fn(),
+    completeInboxClaim: vi.fn(),
+    retryInboxClaim: vi.fn(),
+  };
+  return store;
+}
+
+function message(messageId: string, partition = 'oc_chat') {
+  return {
+    eventId: `im.message.receive_v1:cli_test:${messageId}`,
+    partitionKey: `lark-message-routing:cli_test:${partition}`,
+    data: { message: { message_id: messageId } },
+  };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve();
+}
+
+describe('durable Lark primary ingress', () => {
+  it('acquires one application lease and refreshes the leadership proof on the configured cadence', async () => {
+    vi.useFakeTimers();
+    try {
+      let monotonicNow = 0;
+      const store = fakeStore();
+      const onLeadershipAcquired = vi.fn();
+      const ingress = startDurableLarkPrimaryIngress({
+        store,
+        larkAppId: 'cli_test',
+        ownerId: 'ingress-boot-1',
+        leaseDurationMs: 3_000,
+        renewalIntervalMs: 250,
+        leadershipProofMaxAgeMs: 250,
+        electionIntervalMs: 100,
+        monotonicNow: () => monotonicNow,
+        onLeadershipAcquired,
+      });
+
+      await ingress.ready;
+      expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+      expect(onLeadershipAcquired).toHaveBeenCalledOnce();
+      expect(store.acquireSessionLease).toHaveBeenCalledWith({
+        sessionKey: 'botmux.ingress:lark:cli_test',
+        ownerId: 'ingress-boot-1',
+        leaseDurationMs: 3_000,
+      });
+
+      monotonicNow = 300;
+      await vi.advanceTimersByTimeAsync(249);
+      expect(store.renewSessionLease).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+      await ingress.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('remains standby when the application lease is occupied and rejects admission', async () => {
+    const store = fakeStore();
+    vi.mocked(store.acquireSessionLease).mockResolvedValue({
+      kind: 'occupied',
+      ownerId: 'other-boot',
+      epoch: 7,
+      leaseUntil: 90_000,
+    });
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+
+    await ingress.ready;
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    await expect(ingress.enqueueBeforeAck(message('om_1')))
+      .rejects.toBeInstanceOf(DurableLarkIngressNotLeaderError);
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+
+  it('accepts realtime cluster delivery on a standby replica without the recovery lease', async () => {
+    const store = fakeStore();
+    vi.mocked(store.acquireSessionLease).mockResolvedValue({
+      kind: 'occupied',
+      ownerId: 'other-boot',
+      epoch: 7,
+      leaseUntil: 90_000,
+    });
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+
+    await ingress.ready;
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    await expect(ingress.enqueueClusterBeforeAck(message('om_standby')))
+      .resolves.toEqual({ kind: 'inserted' });
+    await expect(ingress.enqueueClusterControlBeforeAck({
+      eventId: 'card.action.trigger:cli_test:evt_standby',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      data: {
+        event_id: 'evt_standby',
+        action: { value: { action: 'close', session_id: 'session-1', root_id: 'om_root' } },
+        operator: { open_id: 'ou_operator' },
+        context: { open_message_id: 'om_card' },
+      },
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: 'im.message.receive_v1:cli_test:om_standby',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+    }));
+    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: 'card.action.trigger:cli_test:evt_standby',
+      lane: 'session-control',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+    }));
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+
+  it('deduplicates the same realtime event delivered to two cluster clients', async () => {
+    const store = fakeStore();
+    vi.mocked(store.acquireSessionLease)
+      .mockResolvedValueOnce({ kind: 'acquired', lease: lease() })
+      .mockResolvedValueOnce({
+        kind: 'occupied',
+        ownerId: 'ingress-boot-1',
+        epoch: 1,
+        leaseUntil: 60_000,
+      });
+    vi.mocked(store.enqueueInbox)
+      .mockResolvedValueOnce({ kind: 'inserted' })
+      .mockResolvedValueOnce({ kind: 'duplicate' });
+    const leader = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    const standby = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-2',
+      electionIntervalMs: 60_000,
+    });
+    await Promise.all([leader.ready, standby.ready]);
+
+    await expect(leader.enqueueClusterBeforeAck(message('om_duplicate')))
+      .resolves.toEqual({ kind: 'inserted' });
+    await expect(standby.enqueueClusterBeforeAck(message('om_duplicate')))
+      .resolves.toEqual({ kind: 'duplicate' });
+    expect(store.enqueueInbox).toHaveBeenCalledTimes(2);
+    await Promise.all([leader.stop(), standby.stop()]);
+  });
+
+  it('reports a realtime store failure without surrendering recovery leadership', async () => {
+    const store = fakeStore();
+    vi.mocked(store.enqueueInbox).mockRejectedValue(new Error('provider unavailable'));
+    const onLeadershipLost = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueClusterBeforeAck(message('om_failed')))
+      .rejects.toThrow('provider unavailable');
+    expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+    expect(onLeadershipLost).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+
+  it('serializes one partition and assigns strictly increasing timestamps', async () => {
+    const store = fakeStore();
+    const first = deferred<DurableInsertResult>();
+    vi.mocked(store.enqueueInboxWithLease)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ kind: 'duplicate' });
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      now: () => 1_000,
+    });
+    await ingress.ready;
+
+    const n = ingress.enqueueBeforeAck(message('om_1'));
+    const nPlusOne = ingress.enqueueBeforeAck(message('om_2'));
+    await flushMicrotasks();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
+
+    first.resolve({ kind: 'inserted' });
+    await expect(n).resolves.toEqual({ kind: 'inserted' });
+    await expect(nPlusOne).resolves.toEqual({ kind: 'duplicate' });
+    const firstRow = vi.mocked(store.enqueueInboxWithLease).mock.calls[0]![0].event;
+    const secondRow = vi.mocked(store.enqueueInboxWithLease).mock.calls[1]![0].event;
+    expect(secondRow.createdAt).toBe(firstRow.createdAt + 1);
+    expect(secondRow.visibleAt).toBe(secondRow.createdAt);
+    await ingress.stop();
+  });
+
+  it('ACKs inserted and duplicate rows but fails closed on a conflicting duplicate', async () => {
+    const store = fakeStore();
+    vi.mocked(store.enqueueInboxWithLease)
+      .mockResolvedValueOnce({ kind: 'inserted' })
+      .mockResolvedValueOnce({ kind: 'duplicate' })
+      .mockResolvedValueOnce({ kind: 'conflict' });
+    const onLeadershipLost = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck(message('om_1', 'oc_a')))
+      .resolves.toEqual({ kind: 'inserted' });
+    await expect(ingress.enqueueBeforeAck(message('om_2', 'oc_b')))
+      .resolves.toEqual({ kind: 'duplicate' });
+    await expect(ingress.enqueueBeforeAck(message('om_3', 'oc_c')))
+      .rejects.toThrow(/conflicting duplicate/);
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    expect(onLeadershipLost).toHaveBeenCalledOnce();
+    await ingress.stop();
+  });
+
+  it('rejects an enqueue atomically fenced by an expired ingress lease', async () => {
+    const store = fakeStore();
+    vi.mocked(store.enqueueInboxWithLease).mockResolvedValueOnce({ kind: 'stale_lease' });
+    const onLeadershipLost = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck(message('om_stale')))
+      .rejects.toBeInstanceOf(DurableLarkIngressNotLeaderError);
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    expect(onLeadershipLost).toHaveBeenCalledOnce();
+    await ingress.stop();
+  });
+
+  it('rejects a mismatched event identity before writing the durable inbox', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      ...message('om_payload'),
+      eventId: 'im.message.receive_v1:cli_test:om_other',
+    })).rejects.toThrow(/message identity/);
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
+    expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+    await ingress.stop();
+  });
+
+  it('persists a message-updated event under the same fenced primary ingress', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      data: { event_id: 'evt_edit_1', message: { message_id: 'om_1', chat_id: 'oc_chat' } },
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+        payload: expect.objectContaining({ type: 'lark.im.message.updated_v1' }),
+      }),
+    }));
+    await ingress.stop();
+  });
+
+  it('persists a recalled-message event under the same fenced primary ingress', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.recalled_v1',
+      eventId: 'im.message.recalled_v1:cli_test:evt_recall_1',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      data: {
+        event_id: 'evt_recall_1',
+        message_id: 'om_1',
+        chat_id: 'oc_chat',
+        recall_time: '1700000009000',
+      },
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'im.message.recalled_v1:cli_test:evt_recall_1',
+        payload: expect.objectContaining({ type: 'lark.im.message.recalled_v1' }),
+      }),
+    }));
+    await ingress.stop();
+  });
+
+  it('rejects a chatless update before it can escape the receive partition', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_test:evt_chatless',
+      partitionKey: 'lark-message-routing:cli_test:__chatless__',
+      data: { event_id: 'evt_chatless', message: { message_id: 'om_1' } },
+    })).rejects.toThrow(/message identity/);
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+
+  it('persists stable close/resume interactions in the isolated session-control lane', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      now: () => 10,
+    });
+    await ingress.ready;
+
+    const data = {
+      event_id: 'evt_close_1',
+      action: { value: { action: 'close', session_id: 'session-1', root_id: 'om_root' } },
+      operator: { open_id: 'ou_operator' },
+      context: { open_message_id: 'om_card' },
+    };
+    await expect(ingress.enqueueControlBeforeAck({
+      eventId: 'card.action.trigger:cli_test:evt_close_1',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      data,
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'card.action.trigger:cli_test:evt_close_1',
+        lane: 'session-control',
+        partitionKey: 'lark-session-control:cli_test:session-1',
+        payload: expect.objectContaining({ type: 'botmux.lark.session-control' }),
+      }),
+    }));
+    await ingress.stop();
+  });
+
+  it('keeps a timed-out enqueue in the partition tail so the next event cannot overtake it', async () => {
+    const store = fakeStore();
+    const first = deferred<DurableInsertResult>();
+    vi.mocked(store.enqueueInboxWithLease)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ kind: 'inserted' });
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      ackTimeoutMs: 100,
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    const n = ingress.enqueueBeforeAck(message('om_1'));
+    const nPlusOne = ingress.enqueueBeforeAck(message('om_2'));
+    // Attach real rejection handlers immediately. Bun's native `expect(...).rejects`
+    // matcher observes the promise lazily and reports this intentional timeout as
+    // unhandled before the assertion below runs.
+    const nRejected = n.catch(error => error);
+    const nPlusOneRejected = nPlusOne.catch(error => error);
+    await flushMicrotasks();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
+    await expect(nRejected).resolves.toBeInstanceOf(DurableLarkIngressAckTimeoutError);
+    await expect(nPlusOneRejected).resolves.toBeInstanceOf(DurableLarkIngressAckTimeoutError);
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
+
+    first.resolve({ kind: 'inserted' });
+    await flushMicrotasks();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledTimes(2);
+    expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+    await ingress.stop();
+  });
+
+  it('drops leadership when a partition enqueue fails', async () => {
+    const store = fakeStore();
+    vi.mocked(store.enqueueInboxWithLease).mockRejectedValue(new Error('provider unavailable'));
+    const onLeadershipLost = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck(message('om_1'))).rejects.toThrow('provider unavailable');
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    expect(onLeadershipLost).toHaveBeenCalledOnce();
+    await ingress.stop();
+  });
+
+  it.each([
+    ['stale result', async (): Promise<LeaseMutationResult> => ({ kind: 'stale' })],
+    ['provider error', async (): Promise<LeaseMutationResult> => { throw new Error('renew failed'); }],
+  ])('drops leadership after a renewal %s', async (_label, renew) => {
+    vi.useFakeTimers();
+    try {
+      const store = fakeStore();
+      vi.mocked(store.renewSessionLease).mockImplementation(renew);
+      const onLeadershipLost = vi.fn();
+      const ingress = startDurableLarkPrimaryIngress({
+        store,
+        larkAppId: 'cli_test',
+        ownerId: 'ingress-boot-1',
+        leaseDurationMs: 3_000,
+        renewalIntervalMs: 250,
+        electionIntervalMs: 100,
+        onLeadershipLost,
+      });
+      await ingress.ready;
+
+      await vi.advanceTimersByTimeAsync(250);
+      expect(ingress.status()).toEqual({ kind: 'standby' });
+      expect(onLeadershipLost).toHaveBeenCalledOnce();
+      await ingress.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases the lease if the leadership activation callback fails', async () => {
+    const store = fakeStore();
+    const activationError = new Error('WS start failed');
+    const onError = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipAcquired: async () => { throw activationError; },
+      onError,
+    });
+
+    await ingress.ready;
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    expect(store.releaseSessionLease).toHaveBeenCalledWith(lease());
+    expect(onError).toHaveBeenCalledWith(activationError);
+    await ingress.stop();
+  });
+
+  it('drains admitted writes before releasing the ingress lease', async () => {
+    const store = fakeStore();
+    const pending = deferred<DurableInsertResult>();
+    vi.mocked(store.enqueueInboxWithLease).mockReturnValue(pending.promise);
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    const enqueue = ingress.enqueueBeforeAck(message('om_1'));
+    await flushMicrotasks();
+    const stopping = ingress.stop(1_000);
+    await flushMicrotasks();
+    expect(store.releaseSessionLease).not.toHaveBeenCalled();
+
+    pending.resolve({ kind: 'inserted' });
+    await expect(enqueue).resolves.toEqual({ kind: 'inserted' });
+    await expect(stopping).resolves.toEqual({
+      kind: 'stopped',
+      pendingPartitions: 0,
+      leaseReleased: true,
+    });
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+  });
+
+  it('waits for leadership cleanup before releasing the ingress lease', async () => {
+    const store = fakeStore();
+    const cleaned = deferred<void>();
+    const onLeadershipLost = vi.fn(() => cleaned.promise);
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    const stopping = ingress.stop(1_000);
+    await flushMicrotasks();
+    expect(onLeadershipLost).toHaveBeenCalledOnce();
+    expect(store.releaseSessionLease).not.toHaveBeenCalled();
+
+    cleaned.resolve();
+    await expect(stopping).resolves.toEqual({
+      kind: 'stopped',
+      pendingPartitions: 0,
+      leaseReleased: true,
+    });
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+  });
+
+  it('does not release the lease when leadership cleanup exceeds the shutdown deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = fakeStore();
+      const cleaned = deferred<void>();
+      const onLeadershipLost = vi.fn(() => cleaned.promise);
+      const ingress = startDurableLarkPrimaryIngress({
+        store,
+        larkAppId: 'cli_test',
+        ownerId: 'ingress-boot-1',
+        electionIntervalMs: 60_000,
+        onLeadershipLost,
+      });
+      await ingress.ready;
+
+      const stopping = ingress.stop(25);
+      await flushMicrotasks();
+      expect(onLeadershipLost).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopping).resolves.toEqual({
+        kind: 'timed_out',
+        pendingPartitions: 0,
+        leaseReleased: false,
+      });
+      expect(store.releaseSessionLease).not.toHaveBeenCalled();
+      cleaned.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out without releasing while an admitted write is still pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = fakeStore();
+      const pending = deferred<DurableInsertResult>();
+      vi.mocked(store.enqueueInboxWithLease).mockReturnValue(pending.promise);
+      const ingress = startDurableLarkPrimaryIngress({
+        store,
+        larkAppId: 'cli_test',
+        ownerId: 'ingress-boot-1',
+        ackTimeoutMs: 2_500,
+        electionIntervalMs: 60_000,
+      });
+      await ingress.ready;
+
+      const enqueue = ingress.enqueueBeforeAck(message('om_1'));
+      void enqueue.catch(() => undefined);
+      await flushMicrotasks();
+      const stopping = ingress.stop(25);
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopping).resolves.toEqual({
+        kind: 'timed_out',
+        pendingPartitions: 1,
+        leaseReleased: false,
+      });
+      expect(store.releaseSessionLease).not.toHaveBeenCalled();
+
+      pending.resolve({ kind: 'inserted' });
+      await flushMicrotasks();
+      expect(store.releaseSessionLease).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('includes lease release in the same shutdown deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = fakeStore();
+      const release = deferred<LeaseMutationResult>();
+      vi.mocked(store.releaseSessionLease).mockReturnValue(release.promise);
+      const ingress = startDurableLarkPrimaryIngress({
+        store,
+        larkAppId: 'cli_test',
+        ownerId: 'ingress-boot-1',
+        electionIntervalMs: 60_000,
+      });
+      await ingress.ready;
+
+      const stopping = ingress.stop(25);
+      await flushMicrotasks();
+      expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(stopping).resolves.toEqual({
+        kind: 'timed_out',
+        pendingPartitions: 0,
+        leaseReleased: false,
+      });
+      release.resolve({ kind: 'applied', lease: lease() });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('validates the shutdown budget before changing leadership state', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    expect(() => ingress.stop(-1)).toThrow(/timeoutMs/);
+    expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
+    expect(store.releaseSessionLease).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+});

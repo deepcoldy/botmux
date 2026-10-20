@@ -9,8 +9,10 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from '../services/codex-instance-config-guard.js';
 import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
+import { assertDurableConfigMutationAllowed } from '../services/durable-config-mutation.js';
 
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
+  assertDurableConfigMutationAllowed('bots');
   // PM2 start surfaces hold this same generation lock from snapshot through
   // post-start verification/rollback, so the ecosystem and its expected names
   // can never be built from different bots.json generations.

@@ -168,7 +168,17 @@ export type CredentialOnlyIsolationGate =
   | { required: true; mode: 'blocked'; failClosedReason: string };
 
 /** Mandatory device-credential isolation is independent of the optional bot
- * sandbox toggle: once enrolled, every local child must be confined. */
+ * sandbox toggle: once enrolled, every local child must be confined.
+ *
+ * Threat model / known boundary: this isolation (credential-only included)
+ * keeps an agent from INADVERTENTLY reading device credentials. It is not a
+ * code-integrity boundary against a malicious agent. A credential-only pane
+ * has `/` writable, so it can modify this install's built CLI (`dist/cli.js`)
+ * and its dependencies; the host relay watcher re-executes that CLI outside
+ * the pane, and the daemon executes the same files on its next worker/CLI
+ * spawn. That held before the relay existed — the relay adds no capability.
+ * Code-integrity needs the full file sandbox (read-only install tree) or a
+ * remote backend. See docs/file-sandbox.md「仅凭据隔离」. */
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
@@ -365,7 +375,24 @@ export function buildSeatbeltProfile(
 // Linux. Warm reattach would retain the old lexical env/mount namespace split.
 // 15 adds an inherited Linux seccomp isolation probe. Existing processes cannot
 // acquire it on warm reattach and must cold-spawn under the new contract.
-export const ISOLATION_PANE_MARKER_VERSION = 15;
+// 16 gives a Linux credential-only pane a read-WRITE relay outbox bind plus
+// BOTMUX_SEND_RELAY in its startup env. Inside that flavour `botmux send` had no
+// satisfiable authority: the inherited seccomp probe (and `--unshare-pid`) force
+// the read-isolated arm, whose data-root locator is never written on Linux AND
+// would be masked to /dev/null by this flavour's own `.dashboard-secret.*`
+// enumeration. A v15 pane carries neither the mount nor the env, so a warm
+// reattach would keep failing every send; it must cold-spawn once.
+// 17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only pane's wrapper env
+// (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
+// reattach would keep refusing the legacy --bot / --repo / --standby dispatch
+// forms; it must cold-spawn once.
+// 18 binds a sandboxed pane's OWN skill manifest (`skill-manifests/<sid>.json`)
+// and its per-session skill SNAPSHOT dir (`runtime-skills/<sid>/snapshot`),
+// read-only, at spawn time (`botmux skill show/read/resources` under
+// sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
+// its ORIGINAL mount set and skips skill generation, so such a pane could never
+// read either — it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 18;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -777,6 +804,31 @@ export type PersistentPaneMigrationDecision =
    *  the guard is security-concerned; an ordinary transport chat with no provenance
    *  skips on `unknown` instead (no gratuitous start-failures on probe flakiness). */
   | { action: 'refuse-inconclusive-probe' };
+
+/**
+ * Break the cold-machine tie for the read-isolation pre-spawn gate.
+ *
+ * After a reboot /tmp is wiped, so the tmux socket file does not exist and the
+ * liveness probe reads 'unknown' (a connection-level error is deliberately
+ * never 'missing' — #962). evaluatePersistentPaneMigration fail-closes on
+ * 'unknown', the refused session never starts a tmux server, and so every
+ * isolated session on the machine is refused until something unrelated starts
+ * one. Only here — not in the general probe that kill-verify / close / wake
+ * paths consume — an 'unknown' tmux probe is upgraded to 'missing' when the
+ * caller's cold-machine check (TmuxBackend.serverAbsentOnColdMachine) confirms the
+ * socket is gone AND no tmux process is visible. `exists` / `missing` and every
+ * non-tmux backend pass through untouched; the check is not even invoked then.
+ */
+export function resolveReadIsolationPaneProbe(
+  paneProbe: SessionProbe,
+  backendType: string,
+  serverAbsentOnColdMachine: () => boolean,
+): { probe: SessionProbe; coldServerAbsent: boolean } {
+  if (paneProbe !== 'unknown' || backendType !== 'tmux') return { probe: paneProbe, coldServerAbsent: false };
+  let absent = false;
+  try { absent = serverAbsentOnColdMachine() === true; } catch { absent = false; }
+  return absent ? { probe: 'missing', coldServerAbsent: true } : { probe: 'unknown', coldServerAbsent: false };
+}
 
 export function evaluatePersistentPaneMigration(
   input: PersistentPaneMigrationInput,

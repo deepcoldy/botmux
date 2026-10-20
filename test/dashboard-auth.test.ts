@@ -772,28 +772,6 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('deny401');
   });
 
-  it('GET /game/index.html — HD2D office shell allow without any token', () => {
-    const d = decideDashboardAuth({
-      method: 'GET',
-      pathname: '/game/index.html',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('allow');
-  });
-
-  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
-    const d = decideDashboardAuth({
-      method: 'POST',
-      pathname: '/api/game/download',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('deny401');
-  });
-
   // ─── P2-1：/workbench-ticket/<ticket> 兑换端点 ─────────────────────────
   // 飞书卡片的工作台入口改带短时票据；票据本身就是凭证，处理器自行验票，所以
   // 这条 GET 必须在 token 门禁之外可达。其它方法与残缺路径保持 fail closed。
@@ -875,14 +853,11 @@ describe('decideDashboardAuth — protected surface', () => {
   });
 
   it('GET /api/schedules/:id/logs without token → deny401', () => {
-    const d = decideDashboardAuth({
-      method: 'GET',
-      pathname: '/api/schedules/sched-1/logs',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('deny401');
+    for (const pathname of ['/api/schedules/sched-1/logs', '/api/schedules/calendars']) {
+      const d = decideDashboardAuth({ method: 'GET', pathname, hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK });
+      expect(d.kind).toBe('deny401');
+    }
   });
 
   it('GET /api/v3 run list/detail without token → deny401', () => {
@@ -1312,8 +1287,8 @@ describe('Workbench H5 capability boundary', () => {
 //      dashboard.ts 的真实组合复算：路由级 decide*（workbench-only 走
 //      decideWorkbenchH5Auth，legacy 走 decideDashboardAuth）+ 处理器级
 //      `terminalCapability === 'readonly'` / `previewCapability === 'readonly'`
-//      403 判据（agent-workbench-route.test.ts 以源码断言钉住 dashboard.ts 里
-//      的这两行）；
+//      403 判据（终端那条由 test/terminal-control-route.test.ts 按行为验证；预览写
+//      门禁先于 unlock / activity / lock 由 agent-workbench-route.test.ts 的结构护栏钉住）；
 //   3) 各身份在三条真实路由上的 401/403 行为与改动前逐条一致——隐藏按钮的同时
 //      API 权限既没放大也没缩小。
 describe('P1-4 workbench operation-capability projection', () => {

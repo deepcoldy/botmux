@@ -1,11 +1,11 @@
-import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
+import { detectModelsViaExec } from './model-catalog-json.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
 import { delay } from '../../utils/timing.js';
@@ -425,7 +425,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
     // below the measured tmux ceiling.  Over-limit prompts defer to the
     // normal post-start input queue.
-    maxInitialPromptArgBytes: 8192,
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
@@ -496,7 +496,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
           // Raw PTY has no tmux paste-buffer to add these markers. Without
           // them, long/deferred or multiline prompts are parsed as individual
           // key events and can be dropped instead of submitted as one message.
-          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
+          pty.write(needsPaste ? wrapBracketedPaste(content) : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -547,21 +547,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     // 不在 daemon/worker 启动路径上；任何异常（spawn 失败/超时/输出为空）一律
     // fail-soft 返回 null，picker 回退到下面的 modelChoices。
     async detectModels(): Promise<readonly string[] | null> {
-      try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
-        const { stdout } = await execFileAsync(this.resolvedBin, [...runtime.modelListArgs], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-        });
-        const models = parseModelList(String(stdout));
-        return models.length > 0 ? models : null;
-      } catch {
-        return null;
-      }
+      return detectModelsViaExec(this.resolvedBin, runtime.modelListArgs, parseModelList);
     },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
@@ -581,5 +567,3 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }
-
-export const create = createOpenCodeAdapter;

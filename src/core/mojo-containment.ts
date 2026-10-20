@@ -60,6 +60,7 @@ import type { TurnQuiescence } from '../adapters/backend/mojo-process-tree.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
 
 const FILE_NAME = 'mojo-containment-handles.json';
 
@@ -334,10 +335,9 @@ export function readProcStartTime(pid: number, opts: { procRoot?: string } = {})
     } catch {
         return null;
     }
-    const close = text.lastIndexOf(')');
-    if (close < 0) return null;
-    const rest = text.slice(close + 1).trim().split(/\s+/);
-    const started = Number(rest[19]);
+    const rest = procStatFieldsAfterComm(text);
+    if (!rest) return null;
+    const started = Number(rest[PROC_STAT_STARTTIME_INDEX]);
     return Number.isInteger(started) ? started : null;
 }
 

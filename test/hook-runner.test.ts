@@ -221,7 +221,7 @@ describe('prepareHookPayload', () => {
   });
 
   it('truncates long text/label in the real optionsPreview field too', () => {
-    // Mirror the path actually emitted by worker-pool.ts tui_prompt
+    // Mirror the shape the retired worker-pool.ts tui_prompt path emitted
     // (`optionsPreview: ...`) — the previous fix only covered the synthetic
     // `options` alias, leaving the production emit shape unredacted.
     const longText = 'p'.repeat(700);
@@ -896,11 +896,16 @@ describe('sync gate hooks (prompt.submit)', () => {
     gateHooks([{
       event: 'prompt.submit',
       command: writeHook('observer-payload.js', `
-        import { writeFileSync } from 'node:fs';
+        import { writeFileSync, renameSync } from 'node:fs';
         let input = '';
         process.stdin.setEncoding('utf8');
         process.stdin.on('data', c => { input += c; });
-        process.stdin.on('end', () => { writeFileSync(${JSON.stringify(seen)}, input); });
+        process.stdin.on('end', () => {
+          // Existence is the completion signal read by the parent. Publish only
+          // after the entire payload is written, not at open/truncate time.
+          writeFileSync(${JSON.stringify(seen + '.tmp')}, input);
+          renameSync(${JSON.stringify(seen + '.tmp')}, ${JSON.stringify(seen)});
+        });
       `, dir),
     }]);
     await evaluatePromptGate('prompt.submit', { content: 'Z'.repeat(900) });

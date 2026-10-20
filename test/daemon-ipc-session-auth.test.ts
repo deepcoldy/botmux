@@ -79,6 +79,17 @@ describe('daemon IPC session-scoped fallback', () => {
     })).toEqual({ ok: true });
   });
 
+  it('overrides a stale project-card root with the live chat route', () => {
+    const ask = { sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_project_card', requestId: 'req-a' };
+    const bound = bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: null,
+    });
+    expect(bound).toEqual({ ...ask, rootMessageId: null });
+    expect(bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_live_topic',
+    })).toEqual({ ...ask, rootMessageId: 'om_live_topic' });
+  });
+
   it('binds ask and hook routing fields to the authenticated session', () => {
     const bound = bindSessionScopedIpcIdentity({
       sessionId: 'session-b',
@@ -107,40 +118,46 @@ describe('daemon IPC session-scoped fallback', () => {
 describe('daemon session-scoped IPC route wiring', () => {
   const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
-  function between(start: string, end: string): string {
-    const from = source.indexOf(start);
-    const to = source.indexOf(end, from + start.length);
-    expect(from, `missing route marker: ${start}`).toBeGreaterThanOrEqual(0);
-    expect(to, `missing route marker: ${end}`).toBeGreaterThan(from);
-    return source.slice(from, to);
+  function route(path: string): string {
+    const from = source.indexOf(`ipcRoute('POST', '${path}'`);
+    expect(from, `missing route: ${path}`).toBeGreaterThanOrEqual(0);
+    const to = source.indexOf('ipcRoute(', from + 1);
+    return source.slice(from, to > from ? to : undefined);
   }
 
-  it('binds ask routing before registering an observable card', () => {
-    const route = between(
-      "ipcRoute('POST', '/api/asks'",
-      "ipcRoute('POST', '/api/attention'",
-    );
-    const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskForResponse({');
-    expect(bindAt).toBeGreaterThanOrEqual(0);
-    expect(registerAt).toBeGreaterThan(bindAt);
-    expect(route).toContain('const askChatType = askSession?.chatType;');
-    expect(route).toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
-    );
-    expect(route).not.toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
-    );
-  });
+  function blockEnd(text: string, openAt: number): number {
+    let depth = 0;
+    for (let i = text.indexOf('{', openAt); i >= 0 && i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}' && --depth === 0) return i;
+    }
+    return -1;
+  }
 
-  it('binds hook identity before emitting the event', () => {
-    const route = between(
-      "ipcRoute('POST', '/api/hooks/emit'",
-      '// ─── adopt-session',
-    );
-    const bindAt = route.indexOf('boundPayload = bindSessionScopedIpcIdentity(');
-    const emitAt = route.indexOf('emitHookEventLocal(event as HookEvent, boundPayload)');
-    expect(bindAt).toBeGreaterThanOrEqual(0);
-    expect(emitAt).toBeGreaterThan(bindAt);
+  // 源码结构护栏(K2)：ask / hook 两条 IPC 路由里，路由与身份字段（larkAppId / chatId / rootMessageId）必须先由
+  // bindSessionScopedIpcIdentity 从已认证的 daemon 会话覆写，才能注册可观测的确认卡或发出 hook 事件；否则持有会话 A
+  // 能力的调用方可以在 payload 里冒充会话 B。#1740 起 HMAC 宿主调用方同样要绑定，绑定不能嵌回
+  // `if (!isTrustedHostIpcRequest(req))` 鉴权块里。路由处理器内联在 daemon.ts 入口模块，没有行为 seam；
+  // 绑定函数本身由上方 'daemon IPC session-scoped fallback' 行为用例覆盖。
+  it('binds ask and hook identity from the authenticated session before any observable side effect', () => {
+    const ask = route('/api/asks');
+    const askBindAt = ask.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
+    const authAt = ask.indexOf('if (!isTrustedHostIpcRequest(req)) {');
+    expect(askBindAt).toBeGreaterThan(-1);
+    expect(authAt).toBeGreaterThan(-1);
+    // Host HMAC callers are bound too: the bind sits after the auth block closes.
+    expect(askBindAt).toBeGreaterThan(blockEnd(ask, authAt));
+    const inputAt = ask.indexOf('const askInput = {');
+    expect(inputAt).toBeGreaterThan(askBindAt);
+    const askInput = ask.slice(inputAt, ask.indexOf('};', inputAt));
+    expect(askInput).toContain('boundAsk.larkAppId');
+    expect(askInput).not.toContain('parsed.larkAppId');
+    expect(ask.indexOf('registerAskForResponse(askInput')).toBeGreaterThan(inputAt);
+
+    const hook = route('/api/hooks/emit');
+    const hookBindAt = hook.indexOf('boundPayload = bindSessionScopedIpcIdentity(');
+    const emitAt = hook.search(/emitHookEventLocal\([^)]*boundPayload\)/);
+    expect(hookBindAt).toBeGreaterThan(-1);
+    expect(emitAt).toBeGreaterThan(hookBindAt);
   });
 });

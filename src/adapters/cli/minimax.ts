@@ -1,122 +1,132 @@
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
-import { resolveCommand } from './registry.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { resolveCommandReal } from './registry.js';
+import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { writeRunnerInput } from './runner-input.js';
+import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveRunnerPath } from './runner-path.js';
+import { locateExecutable } from '../../utils/executable.js';
+import type { CliAdapter } from './types.js';
+import { minimaxDataDir } from '../../services/minimax-paths.js';
+export { minimaxDataDir } from '../../services/minimax-paths.js';
 
-import { delay } from '../../utils/timing.js';
-
-/**
- * MiniMax CLI (`mmx`, package `mmx-cli`) adapter.
- *
- * `mmx` is MiniMax's multimodal generation CLI. Its ONLY interactive,
- * multi-turn surface is `mmx text repl` — a readline-style chat prompt
- * (banner "MiniMax Chat REPL", a boxed `> ` input line, streamed model
- * output, `/exit` to quit). It hard-requires a TTY (`repl requires an
- * interactive terminal`), which the PTY/tmux backend provides.
- *
- * IMPORTANT — capability envelope: `text repl` is a pure chat/generation
- * loop with NO shell or file-tool surface, so this bot CANNOT run the
- * `botmux send` wrapper the way agentic CLIs do. botmux relays its answers
- * the same way it does for other tool-less TUIs: quiescence detection +
- * headless screen capture of the streamed reply. Hence no `skillsDir`
- * (nothing to install into) and `injectsSessionContext: true` to suppress
- * the inline routing/identity envelope it cannot act on (see below). The
- * first user prompt is written to stdin after idle detection — `mmx text
- * repl` has no launch-time `-i`/prompt flag, and its readline input accepts
- * a single line only, so `writeInput` folds newlines to spaces (see below).
- *
- * Auth: `mmx auth login` writes `~/.mmx/config.json` (the whole `~/.mmx`
- * dir is the authPath so a sandboxed first login persists). The `--api-key`
- * flag and `MMX_CONFIG_DIR` env are alternative resolution paths; we do not
- * bake a key into argv.
- *
- * Region (CN vs. global) — supported, resolved by mmx itself:
- *   `mmx` picks the API host by precedence `--base-url` > `--region` >
- *   the `region` field in `~/.mmx/config.json` (written at login, default
- *   `global`). `cn` → api.minimaxi.com, `global` → api.minimax.io. This
- *   adapter does NOT pass `--region`, so a bot follows whichever region you
- *   chose at `mmx auth login`:
- *     mmx auth login --api-key sk-... --region cn        # China
- *     mmx auth login --api-key sk-... --region global    # international
- *
- *   Running a CN bot and a global bot on the SAME host: `~/.mmx` holds one
- *   region, so give each bot its own credential dir via the per-bot `env`
- *   field in bots.json (`MMX_CONFIG_DIR`), each logged into its own region:
- *     bot-cn:      env: { "MMX_CONFIG_DIR": "~/.mmx-cn" }
- *     bot-global:  env: { "MMX_CONFIG_DIR": "~/.mmx-global" }
- *   Prepare each once, e.g.
- *     MMX_CONFIG_DIR=~/.mmx-cn mmx auth login --api-key sk-... --region cn
- *   (Under the file sandbox, `authPaths` is the static `~/.mmx`; a
- *   redirected MMX_CONFIG_DIR would additionally need that dir exposed —
- *   irrelevant to the default non-sandboxed setup.)
- */
-export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
-  // resolvedBin is lazy: setup constructs adapters only to read static
-  // modelChoices and must not shell out (see resolveCommand); the binary
-  // path is a spawn-time concern.
-  const rawBin = pathOverride ?? 'mmx';
-  let cachedBin: string | undefined;
-  return {
-    id: 'minimax',
-    // Whole dir, not just config.json: the file may not exist yet on a fresh
-    // login inside the sandbox, and a single-file carve-out would be skipped
-    // (bwrap can't bind a missing source) — see CLAUDE.md sandbox note (3).
-    authPaths: ['~/.mmx'],
-    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
-
-    buildArgs({ model }) {
-      // `mmx text repl` keeps no daemon-resumable session state, so we always
-      // start fresh (like gemini). Auth comes from `mmx auth login` (persisted
-      // in ~/.mmx) or the MMX_CONFIG_DIR / --api-key escape hatches.
-      const args = ['text', 'repl'];
-      if (model && model.trim()) {
-        args.push('--model', model.trim());
-      }
-      return args;
-    },
-
-    async writeInput(pty: PtyHandle, content: string) {
-      // `mmx text repl` is a single-line readline prompt. Embedded newlines are
-      // NOT multi-line input: verified on mmx 1.0.25 that its readline SWALLOWS
-      // interior '\n'/'\r' (the whole payload accretes onto one input line) and
-      // only the FINAL terminator submits — so a raw multi-line write submits
-      // once but the model receives every line jammed together with no
-      // separator (e.g. "line1line2"), and a leading-only routing/scaffold line
-      // makes the real question invisible → empirically an empty/garbled reply.
-      // It is a plain readline, not an Ink bracketed-paste widget: it never
-      // requests ?2004h, so paste markers (\e[200~…) are echoed literally to the
-      // model, not consumed. There is therefore no way to preserve hard line
-      // breaks here; fold every run of whitespace-with-newline down to a single
-      // space so the model at least sees the full text as one coherent line.
-      const flattened = content.replace(/\s*\n\s*/g, ' ').replace(/[ \t]+/g, ' ').trim();
-      // Prefer the tmux literal-send + Enter path; fall back to raw write + CR.
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(flattened);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(flattened);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
-
-    completionPattern: undefined,   // quiescence only — no explicit marker
-    readyPattern: undefined,        // rely on quiescence; '> ' prompt is too generic
-    // Tool-less chat loop: it has no shell/file surface to act on botmux's
-    // routing/@/send hints, and (verified) an inline <botmux_routing> block on
-    // the first turn just becomes noise the model apologizes about. So set
-    // `injectsSessionContext: true` — the same suppression switch mira / riff /
-    // mojo use — which makes session-manager skip the inline routing / identity
-    // / session_id envelope entirely. Unlike those three we push NOTHING back
-    // via a system-prompt flag (`mmx text repl` has none), so `systemHints` is
-    // also empty: the bot runs as a plain chat model with no botmux scaffolding.
-    injectsSessionContext: true,
-    systemHints: [],
-    // mmx repl redraws its input line in place (cursor hide + line clears)
-    // but does NOT switch into the alternate screen buffer.
-    altScreen: false,
-    modelChoices: CLI_MODEL_CHOICES['minimax'],
-  };
+/** npm's bin symlink resolves inside the package. Bind that package, including
+ * its chunks/assets/native dependencies, rather than the shared global prefix.
+ * Stop at the nearest manifest: an unrelated wrapper/package is not MCode. */
+function npmPackageRoot(bin: string): string | undefined {
+  if (!isAbsolute(bin)) return undefined;
+  for (let dir = dirname(bin); ; dir = dirname(dir)) {
+    const manifest = join(dir, 'package.json');
+    if (existsSync(manifest)) {
+      try {
+        return JSON.parse(readFileSync(manifest, 'utf8')).name === '@minimax-ai/code' ? dir : undefined;
+      } catch { return undefined; }
+    }
+    if (dirname(dir) === dir) return undefined;
+  }
 }
 
-export const create = createMinimaxAdapter;
+/** Official installers may reuse Node outside the installation root. Their
+ * launcher pins nodeExecutable, so that runtime also needs an executable bind. */
+function officialNodeExecutable(root: string): string | undefined {
+  try {
+    const node: unknown = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8')).nodeExecutable;
+    return typeof node === 'string' && isAbsolute(node) && locateExecutable(node)
+      ? realpathSync(node) : undefined;
+  } catch { return undefined; }
+}
+
+/** The adapter's buildArgs entry also prepares persistent bind sources before
+ * the worker existence-filters authPaths. Moving this into the in-sandbox
+ * runner would lose first-run data on the disposable tmpfs root. */
+function prepareNativeDirectories(dataDir: string, officialRoot?: string): void {
+  mkdirSync(dataDir, { recursive: true });
+  if (officialRoot) mkdirSync(join(officialRoot, '.mcode-active'), { recursive: true });
+}
+
+/** Keep the stable minimax ID/setup number, replacing mmx completely.
+ * A long-lived runner drives native `mcode acp` per turn. Native Session IDs
+ * from ACP are persisted through the runner control channel; every
+ * later turn uses --session, never the shared/racy --continue shortcut.
+ * ACP preserves file/shell tools and bridges native questions to Lark. */
+export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
+  const rawBin = pathOverride ?? 'mcode';
+  let cachedBin: string | undefined;
+  let dataDir = minimaxDataDir();
+  let nodeBin: string | undefined;
+  const nativeBin = () => (cachedBin ??= resolveCommandReal(rawBin));
+  const installRoot = () => {
+    const root = dirname(dirname(nativeBin()));
+    return existsSync(join(root, 'install.json')) ? root : undefined;
+  };
+  return {
+    id: 'minimax',
+    resolvedBin: process.execPath,
+    get authPaths() {
+      const root = installRoot();
+      return [dataDir, ...(root ? [join(root, '.mcode-active')] : [])];
+    },
+    get skillsDir() { return join(dataDir, 'skills'); },
+    allowExtraArgs: false,
+    sandboxExtraExecPaths() {
+      const root = installRoot();
+      const runtime = root ? officialNodeExecutable(root) : nodeBin;
+      return [nativeBin(), ...(runtime ? [runtime] : [])];
+    },
+    sandboxReadonlyPaths() {
+      // Official launchers in <install>/bin read sibling current/releases and
+      // the managed Node runtime; the bin directory alone is insufficient.
+      const root = installRoot();
+      const npmRoot = root ? undefined : npmPackageRoot(nativeBin());
+      return root ? [root] : npmRoot ? [npmRoot] : [];
+    },
+    buildArgs({ resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, turnTimeoutMs, forkSession, env }) {
+      if (resume && forkSession) throw new Error('MiniMax Code exec does not support session forks; create a new topic instead.');
+      const nativeEnv = { ...process.env, ...env };
+      dataDir = minimaxDataDir(nativeEnv);
+      // Official installer tracks active processes outside the data directory.
+      // Keep only this marker directory writable; releases/runtime stay read-only.
+      const root = installRoot();
+      prepareNativeDirectories(dataDir, root);
+      nodeBin = undefined;
+      if (!root && npmPackageRoot(nativeBin())) {
+        const node = locateExecutable('node', nativeEnv);
+        if (!node) throw new Error('MiniMax Code npm installation requires node on PATH.');
+        nodeBin = realpathSync(node);
+      }
+      const args = [runnerArgv0('minimax-runner', resolveRunnerPath('minimax-runner.js', { fallback: 'dist' })), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
+      if (nodeBin) args.push('--node-bin', nodeBin);
+      if (workingDir) args.push('--cwd', workingDir);
+      if (resume && resumeSessionId) args.push('--native-session-id', resumeSessionId);
+      if (model?.trim()) {
+        // Existing mmx bots used bare MiniMax model names. Custom providers
+        // already use MCode's provider/model syntax and pass through unchanged.
+        const selected = model.trim();
+        args.push('--model', selected.startsWith('MiniMax-') ? `minimax/${selected}` : selected);
+      }
+      if (reasoningEffort) args.push('--effort', reasoningEffort);
+      args.push('--permission', disableCliBypass ? 'smart' : 'full');
+      if (turnTimeoutMs && turnTimeoutMs > 0) args.push('--turn-timeout-ms', String(turnTimeoutMs));
+      return args;
+    },
+    resumeRequiresCliSessionId: true,
+    buildResumeCommand({ cliSessionId }) {
+      if (!cliSessionId) return null;
+      return `mcode --session '${cliSessionId.replace(/'/g, "'\\''")}'`;
+    },
+    writeInput(pty, content, context) {
+      return writeRunnerInput(pty, '::botmux-minimax:', content, undefined, context?.turnId);
+    },
+    supportsTypeAhead: false,
+    readyPattern: /^›\r?$/m,
+    staticBusyPattern: /\[MiniMax Code\] running…/,
+    staticBusyClearPattern: /^›\r?$/m,
+    deferFirstPromptTimeoutUntilReady: true,
+    // Keep the normal inline routing/identity envelope: mcode can execute
+    // botmux send and shell commands, unlike mmx's tool-less REPL.
+    systemHints: BOTMUX_SHELL_HINTS,
+    altScreen: false,
+    modelChoices: CLI_MODEL_CHOICES.minimax,
+  };
+}

@@ -17,13 +17,15 @@ function parseWatchSpec(raw: string): DocWatchCommand {
   const workingDir = dirMatch?.[1];
   const hasAll = /(?:^|\s)--all(?:\s|$)/i.test(raw);
   const hasMentionsOnly = /(?:^|\s)--mentions-only(?:\s|$)/i.test(raw);
-  if (hasAll && hasMentionsOnly) {
+  const hasOwnerMentions = /(?:^|\s)--owner-mentions(?:\s|$)/i.test(raw);
+  if ([hasAll, hasMentionsOnly, hasOwnerMentions].filter(Boolean).length > 1) {
     return { kind: 'invalid', reason: 'conflicting_modes' };
   }
 
   const docRef = raw
     .replace(/(?:^|\s)--dir\s+\S+/gi, ' ')
     .replace(/(?:^|\s)--mentions-only(?=\s|$)/gi, ' ')
+    .replace(/(?:^|\s)--owner-mentions(?=\s|$)/gi, ' ')
     .replace(/(?:^|\s)--all(?=\s|$)/gi, ' ')
     .trim();
   if (!docRef) return { kind: 'invalid', reason: 'missing_argument' };
@@ -32,7 +34,7 @@ function parseWatchSpec(raw: string): DocWatchCommand {
     kind: 'watch',
     docRef,
     workingDir,
-    requestedMode: hasAll ? 'all' : hasMentionsOnly ? 'mention-only' : undefined,
+    requestedMode: hasAll ? 'all' : hasMentionsOnly ? 'mention-only' : hasOwnerMentions ? 'owner-mention' : undefined,
   };
 }
 

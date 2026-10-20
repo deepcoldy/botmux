@@ -2,10 +2,11 @@
  * Team-level bot capability label store.
  * Run: pnpm vitest run test/bot-profile-store.test.ts
  */
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import {
   getBotProfile, getBotCapability, setBotCapability, clearBotCapability, listBotProfiles,
   getBotSpecialties, setBotSpecialties,
@@ -137,5 +138,25 @@ describe('bot-profile-store specialties', () => {
     raw.specialties = ['ok', 'ok', 42, '', '  dup ', 'dup'];
     writeFileSync(fp, JSON.stringify(raw));
     expect(getBotSpecialties(dataDir, 'app1')).toEqual(['ok', 'dup']);
+  });
+});
+
+describe('bot-profile-store: corrupt file is quarantined, not overwritten', () => {
+  beforeEach(() => { vi.spyOn(logger, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('keeps the corrupt profile as <appId>.json.corrupt-* after the next write, and it is not listed as a profile', () => {
+    mkdirSync(join(dataDir, 'bot-profiles'), { recursive: true });
+    const corrupt = '{"capability":"后端 bot","specialties":["backend","pr-rev';
+    writeFileSync(join(dataDir, 'bot-profiles', 'app1.json'), corrupt);
+
+    expect(getBotProfile(dataDir, 'app1')).toBeNull(); // degraded read: treated as absent
+    setBotSpecialties(dataDir, 'app1', ['backend']);
+
+    const quarantined = readdirSync(join(dataDir, 'bot-profiles')).filter(f => f.startsWith('app1.json.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    expect(readFileSync(join(dataDir, 'bot-profiles', quarantined[0]), 'utf-8')).toBe(corrupt);
+    expect(Object.keys(listBotProfiles(dataDir))).toEqual(['app1']);
+    expect(getBotSpecialties(dataDir, 'app1')).toEqual(['backend']);
   });
 });

@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import {
@@ -14,7 +15,9 @@ import {
 } from '../../services/grok-paths.js';
 import {
   discoverGrokSessions,
+  drainGrokUpdates,
   findGrokSessionByPid,
+  findGrokUpdatesBySessionId,
   grokFileSize,
   grokSessionDirExists,
   grokSessionExists,
@@ -92,8 +95,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  poll window (the bound is the running turn's duration, unbounded) and
  *  the caller sees a spurious「提交未确认」. Pre-existing on master; the
  *  verify-semantics fix (dequeue-independent evidence) is a separate PR.
- *  Ready gate: global `$GROK_HOME/hooks/botmux-session-ready.json`
- *  SessionStart → `botmux session-ready` (`injectsReadyHook`).
+ *  Ready gate: Do NOT arm ready-gate (no `injectsReadyHook`).
+ *  Measured on Grok 1.0.46 / 1.0.50: a bare spawn DOES create a session and
+ *  DOES fire the SessionStart hook pre-prompt (~1.2s on a light GROK_HOME).
+ *  The failure this removes is different: on a heavy production `~/.grok`
+ *  (marketplace + MCP servers such as lynx-devtool) session creation can run
+ *  past the gate's whole window, so the signal arrives after the 45s fallback
+ *  — the gate then holds the first prompt for 45s for no benefit. Readiness is
+ *  driven by `readyPattern: /❯/` and quiescence, the same shape as Hermes.
  *
  *  ## Session context / system prompt
  *  Grok's append flag is `--rules` (docs: alias of Claude's
@@ -119,6 +128,22 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  a path not in authPaths doesn't exist, so they'd be unreachable / lack fcntl
  *  locks.
  */
+/** Grok updates.jsonl. botmux passes `--session-id`, so the adapter id is a valid first
+ *  lookup key; a collision-fallback spawn (grok mints its own id) is recovered through
+ *  writeInput's prompt_history verify. */
+export const grokBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainGrokUpdates(path, offset, { includePublicActivity: true }),
+  locate: {
+    bySessionId: (sessionId, cwd) => findGrokUpdatesBySessionId(sessionId, cwd),
+    byPid: pid => {
+      const probed = findGrokSessionByPid(pid);
+      return probed && existsSync(probed.updatesPath) ? probed.updatesPath : undefined;
+    },
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+  adopt: { attach: 'split-live' },
+};
+
 export function createGrokAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand).
@@ -126,6 +151,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'grok',
+    bridgeSpec: grokBridgeSpec,
     // Absolute runtime paths (not `~/…` literals): GROK_HOME can override the
     // data root, and sandbox/auth carve-outs must track the same resolved dir
     // the spawned CLI uses (split-brain bug if we freezed `~/.grok` at build).
@@ -140,11 +166,17 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // idle. Crash/submit failures are reconciled by the worker's exact-attempt
     // terminal path.
     reliableTurnTerminal: true,
-    injectsReadyHook: true,
+    // Do NOT arm Botmux's ready-gate for Grok. The gate exists to hold the
+    // first prompt until a SessionStart hook proves an outer startup selector
+    // has been passed. Grok has no such selector, and its SessionStart fires
+    // pre-prompt only after the TUI has finished bringing the session up
+    // (measured ~1.2s on a light GROK_HOME; the production `~/.grok` with
+    // marketplace + MCP servers can take far longer, and a hook pointing at a
+    // stale checkout path never signals at all). Arming it therefore buys no
+    // safety and only adds a 45s hold whenever the signal is late or absent.
+    // Instead, like Hermes, Grok relies on `readyPattern: /❯/` and
+    // `deferFirstPromptTimeoutUntilReady: true` to detect composer readiness.
     injectsSessionContext: true,
-    // Hold soft first-prompt timeout until SessionStart ready signal or the
-    // composer's readyPattern — cold-start TUI can accept (and drop) stdin
-    // before the real composer exists.
     deferFirstPromptTimeoutUntilReady: true,
 
     buildArgs({
@@ -163,6 +195,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      larkToolAppId,
       promptInjection,
     }) {
       const args: string[] = [];
@@ -219,6 +252,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           botOpenId,
           noTransport,
           triggerUserAuth,
+          larkToolAppId,
           builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),
@@ -234,6 +268,9 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // Tighter than TMUX_INITIAL_PROMPT_ARG_BUDGET: `--rules` is already in this
+    // command. See GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET.
+    maxInitialPromptArgBytes: GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       const sid = cliSessionId || sessionId;
@@ -293,7 +330,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             return pty.sendText(content) !== false;
           }
           // Raw PTY: wrap the markers ourselves (codex parity).
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
           return true;
         } catch {
           return false;
@@ -361,9 +398,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // Composer box `❯` renders once the TUI is interactive — pairs with
+    // Composer box `❯` renders once the TUI is interactive. This is Grok's
+    // ONLY readiness signal (no ready-gate): pairs with
     // deferFirstPromptTimeoutUntilReady to keep the first prompt held past
-    // the soft timeout (the SessionStart ready hook is the primary signal).
+    // the soft timeout until the composer actually exists.
     readyPattern: /❯/,
     // Busy markers verified on 0.2.93: "⠧ Waiting for response…" spinner
     // during the model phase, and the "Ctrl+c:cancel" shortcut-bar entry
@@ -379,7 +417,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // Global skill root under $GROK_HOME (TUI has no --plugin-dir); layout is
     // `skills/<name>/SKILL.md`, same operational model as Codex.
     get skillsDir(): string { return grokSkillsDir(); },
-    // SessionStart → botmux session-ready for injectsReadyHook gate.
+    // Installed for historical / diagnostic parity only: the worker no longer
+    // arms a ready-gate for Grok, so no `session_ready` IPC is consumed.
+    // Deliberately kept rather than deleted: dropping this block does NOT
+    // uninstall the already-written `$GROK_HOME/hooks/botmux-session-ready.json`
+    // (installHook only ever writes, there is no uninstall path), so the hook
+    // would keep firing either way — while removing it here would also discard
+    // the only code that can rewrite that file. The hook itself is fail-open
+    // (`botmux session-ready` exits 0 without a matching session), so the cost
+    // is one no-op subprocess per session. Revisit together with the gate.
     hookInstall: {
       get configPath(): string { return join(grokHooksDir(), 'botmux-session-ready.json'); },
       format: 'grok-hooks',
@@ -388,5 +434,3 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
-
-export const create = createGrokAdapter;

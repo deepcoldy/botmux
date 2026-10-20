@@ -1,9 +1,9 @@
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { writeTextThenEnter } from './tui-input.js';
+import type { CliAdapter } from './types.js';
 
-import { delay } from '../../utils/timing.js';
 
 /** GitHub Copilot CLI adapter (`@github/copilot`).
  *
@@ -65,22 +65,12 @@ export function createCopilotAdapter(pathOverride?: string): CliAdapter {
     // Tells the worker to demote resume-without-id to a fresh launch + notify.
     resumeRequiresCliSessionId: true,
 
-    async writeInput(pty: PtyHandle, content: string) {
-      // Copilot's Ink TUI behaves like Gemini/OpenCode: the TextInput
-      // component has an async startup phase; writing during that window can
-      // be silently lost. Once the prompt is rendered, sendText + Enter is
-      // reliable. No documented bracketed-paste fold (unlike cursor), so the
-      // simple write+Enter path mirrors the gemini adapter.
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
+    // Copilot's Ink TUI behaves like Gemini/OpenCode: the TextInput
+    // component has an async startup phase; writing during that window can
+    // be silently lost. Once the prompt is rendered, sendText + Enter is
+    // reliable. No documented bracketed-paste fold (unlike cursor), so the
+    // simple write+Enter path mirrors the gemini adapter.
+    writeInput: writeTextThenEnter,
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Ink TUI prompt is too generic to match reliably
@@ -92,5 +82,3 @@ export function createCopilotAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['copilot'],
   };
 }
-
-export const create = createCopilotAdapter;

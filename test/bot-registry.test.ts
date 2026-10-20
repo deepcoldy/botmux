@@ -1451,6 +1451,24 @@ describe('parseBotConfigsFromText — dshProfile cold read', () => {
   });
 });
 
+describe('parseBotConfigsFromText — serviceTier cold read', () => {
+  it('keeps valid tiers only on codex-family CLIs and drops invalid values', async () => {
+    const mod = await freshImport();
+    const [tui, app, unset, invalid, nonCodex] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'tier-tui', larkAppSecret: 's', cliId: 'codex', serviceTier: 'priority' },
+      { larkAppId: 'tier-app', larkAppSecret: 's', cliId: 'codex-app', serviceTier: 'ultrafast' },
+      { larkAppId: 'tier-unset', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'tier-invalid', larkAppSecret: 's', cliId: 'codex', serviceTier: 'flex' },
+      { larkAppId: 'tier-claude', larkAppSecret: 's', cliId: 'claude-code', serviceTier: 'priority' },
+    ]));
+    expect(tui.serviceTier).toBe('priority');
+    expect(app.serviceTier).toBe('ultrafast');
+    expect(unset.serviceTier).toBeUndefined();
+    expect(invalid.serviceTier).toBeUndefined();
+    expect(nonCodex.serviceTier).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -1612,7 +1630,7 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
   const saved: Record<string, string | undefined> = {};
-  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL', 'BOTMUX_CORE_BACKEND'];
 
   beforeEach(async () => {
     mod = await freshImport();
@@ -1675,6 +1693,23 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     const [cfg] = mod.loadBotConfigs();
     expect(cfg.larkAppId).toBe('local_riff');
     expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.backendType).toBeUndefined();
+  });
+
+  it('applies an explicit core-only PTY backend without changing the default', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'pty';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.backendType).toBe('pty');
+  });
+
+  it('rejects an invalid core-only backend instead of falling back to tmux', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'zellij';
+    expect(() => mod.loadBotConfigs()).toThrow('BOTMUX_CORE_BACKEND must be tmux or pty');
   });
 
   it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {
@@ -1898,9 +1933,9 @@ describe('getAllBots', () => {
 });
 
 
-// ─── isChatOncallBoundForAnyBot ───────────────────────────────────────────
+// ─── findOncallChatForAnyBot ──────────────────────────────────────────────
 
-describe('isChatOncallBoundForAnyBot', () => {
+describe('findOncallChatForAnyBot', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
 
@@ -1931,9 +1966,8 @@ describe('isChatOncallBoundForAnyBot', () => {
     mod.registerBot(configs[0]);
 
     expect(mod.findOncallChat('app_a', 'oc_oncall')).toBeUndefined();
-    expect(mod.isChatOncallBoundForAnyBot('oc_oncall')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_oncall')).toEqual({ chatId: 'oc_oncall', workingDir: '/repo' });
-    expect(mod.isChatOncallBoundForAnyBot('oc_other')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_other')).toBeUndefined();
   });
 
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
@@ -1950,14 +1984,13 @@ describe('isChatOncallBoundForAnyBot', () => {
 
     // First lookup builds a negative cache from the original file content.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
     ]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_new')?.workingDir).toBe('/repo');
   });
 });
@@ -2782,5 +2815,30 @@ describe('parseBotConfigsFromText — askOptionLayout 冷读', () => {
     }]));
 
     expect(mod.loadBotConfigAtIndex(0).askOptionLayout).toBe('vertical');
+  });
+});
+
+
+describe('topic write policy configuration', () => {
+  it('enables source checks only for an explicit stop policy', async () => {
+    const mod = await freshImport();
+    const inputs = ['stop', 'legacy', undefined, 'STOP', true, null];
+    const parsed = mod.parseBotConfigsFromText(JSON.stringify(inputs.map((policy, i) =>
+      makeCfg({ larkAppId: `app_policy_${i}`, topicUnavailablePolicy: policy }))));
+    expect(parsed.map(config => config.topicUnavailablePolicy))
+      .toEqual(['stop', undefined, undefined, undefined, undefined, undefined]);
+  });
+});
+
+describe('network policy configuration loading', () => {
+  it('rejects invalid handwritten policy without dropping it', async () => {
+    const mod = await freshImport();
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandboxNetworkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'typo' } } })]))).toThrow();
+  });
+  it('normalizes a valid policy and preserves legacy false independently', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, sandboxNetwork: false, sandboxNetworkPolicy: { version: 1, public: { mode: 'allowlist', rules: [{ cidr: '8.8.8.8' }] }, private: { mode: 'block' } } })]));
+    expect(config.sandboxNetwork).toBe(false);
+    expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
   });
 });

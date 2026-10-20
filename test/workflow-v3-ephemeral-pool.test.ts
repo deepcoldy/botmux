@@ -1,14 +1,14 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
-import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
-import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
+import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, type RunNodeRequest } from '../src/workflows/v3/contract.js';
+import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import type { BotConfig } from '../src/bot-registry.js';
@@ -69,6 +69,110 @@ afterEach(async () => {
   }
 });
 
+// A v3 attempt runs on a SYNTHETIC session id with no persistent row, so
+// sessionStore.closeSession() never runs for it: the pool must reclaim the
+// attempt's skill manifest + runtime-skills snapshot once the worker process
+// has really exited — on every outcome — and never earlier.
+describe('v3 ephemeral pool reclaims the attempt\'s skill snapshot on worker exit', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = join(dir, 'data');
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  const plant = (req: RunNodeRequest) => {
+    const sid = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
+    const snapshotFile = join(dataDir, 'runtime-skills', sid, 'snapshot', 'deploy', 'SKILL.md');
+    const manifest = join(dataDir, 'skill-manifests', `${sid}.json`);
+    mkdirSync(dirname(snapshotFile), { recursive: true });
+    writeFileSync(snapshotFile, '# Deploy');
+    mkdirSync(dirname(manifest), { recursive: true });
+    writeFileSync(manifest, '{}');
+    return {
+      present: () => existsSync(snapshotFile) && existsSync(manifest),
+      gone: () => !existsSync(join(dataDir, 'runtime-skills', sid)) && !existsSync(manifest),
+    };
+  };
+  const pool = (worker: WorkerHandle) => createEphemeralPool({
+    factory: { spawn: () => worker }, workerPath: '/tmp/worker.js', quiesceMs: 1,
+    cancelGraceMs: 10_000, resolveLarkAppSecret: () => 'secret',
+  });
+
+  it('ok: kept while the outcome is claimed, removed once the worker exits', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    expect(files.present()).toBe(true); // claimed, but the worker has not exited yet
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('fail: removed on worker exit', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 1, signal: null });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    expect(files.present()).toBe(true);
+    worker.emitExit(1);
+    await expect(running).resolves.toMatchObject({ status: 'fail' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('cancelled: kept through the cancel request, removed once the worker exits', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = pool(worker).runNode({ ...req, cancelSignal: ac.signal });
+    await worker.waitForInit();
+    ac.abort('user-requested');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(worker.kills).toContain('SIGINT');
+    expect(files.present()).toBe(true);
+    worker.emitExit(130);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' });
+    expect(files.gone()).toBe(true);
+  });
+
+  it('bind failure: removed after the drained outer close', async () => {
+    const req = request();
+    const files = plant(req);
+    const worker = new UnbindableWorker();
+    const running = pool(worker).runNode(req);
+    await waitFor(() => worker.closeRequested);
+    expect(files.present()).toBe(true);
+    worker.emit('close', 1);
+    await expect(running).rejects.toThrow(/process identity/);
+    expect(files.gone()).toBe(true);
+  });
+
+  it('only touches its own synthetic session (a sibling attempt\'s snapshot stays)', async () => {
+    const req = request();
+    const other = plant({ ...req, attemptId: 'research/attempts/002' });
+    const files = plant(req);
+    const worker = new ScriptedWorker();
+    const running = pool(worker).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await running;
+    expect(files.gone()).toBe(true);
+    expect(other.present()).toBe(true);
+  });
+});
+
 describe('v3WorkerBackendType', () => {
   it('follows a tmux daemon and keeps PTY for every other backend, never a remote one', () => {
     expect(v3WorkerBackendType('tmux')).toBe('tmux');
@@ -79,6 +183,36 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
+    vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
+    vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');
+    try {
+      const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'secret', cliId: 'codex',
+        envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] }, env: { MODEL_AUTH: 'bot-sentinel' } };
+      const frozen = botToSnapshot(bot, dir);
+      const serialized = JSON.stringify({ '': frozen });
+      expect(serialized.includes('bot-sentinel')).toBe(false);
+      const restored = parseFrozenBotSnapshots(JSON.parse(serialized)).get('')!;
+      bot.envPolicy = { mode: 'inherit' };
+      const worker = new ScriptedWorker(); const factory = factoryFor(worker);
+      const resolveBotEnv = vi.fn(appId => appId === bot.larkAppId ? bot.env : undefined);
+      const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret', resolveBotEnv });
+      const running = pool.runNode({ ...request(), botSnapshot: restored });
+      await worker.waitForInit();
+      expect(worker.init.envPolicy).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY'] });
+      expect(worker.init.env.MODEL_AUTH === 'bot-sentinel').toBe(true);
+      expect(factory.lastOpts!.env.UNLISTED_CLOUD_CREDENTIAL).toBeUndefined();
+      expect(factory.lastOpts!.env.HTTPS_PROXY === 'proxy-sentinel').toBe(true);
+      expect(resolveBotEnv).toHaveBeenCalledWith('cli_app');
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+      await waitFor(() => worker.kills.includes('SIGTERM')); worker.emitExit(0);
+      await expect(running).resolves.toMatchObject({ status: 'ok' });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
     const home = join(dir, 'codex-a');
     mkdirSync(home, { mode: 0o700 });
@@ -193,6 +327,26 @@ describe('v3 ephemeral pool', () => {
     // never the old hardcoded 'pty' which is unusable in the compiled binary.
     expect(worker.init?.backendType).toBe(v3WorkerBackendType(config.daemon.backendType));
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+  });
+
+  it('passes the frozen wrapperCli to worker init', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.wrapperCli = 'wrapper codex';
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.wrapperCli).toBe('wrapper codex');
+    worker.emitExit(0);
+    await promise;
   });
 
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
@@ -627,6 +781,17 @@ describe('v3 ephemeral pool', () => {
     expect(cmd).not.toContain('status:"fail"');
     expect(cmd).not.toContain('\n');
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
+  });
+
+  it('recognises its own /goal line, with or without the command, for session discovery', () => {
+    const cmd = buildGoalCommand(request());
+    expect(cmd).toBe(`${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`);
+    expect(isBotmuxGoalObjective(cmd)).toBe(true);
+    // TraeX 0.210 goal mode stores only the objective (threads.preview).
+    expect(isBotmuxGoalObjective(GOAL_COMMAND_OBJECTIVE)).toBe(true);
+    expect(isBotmuxGoalObjective(`  ${GOAL_COMMAND_OBJECTIVE.replace(/ /g, '\n')}  `)).toBe(true);
+    expect(isBotmuxGoalObjective(`${GOAL_COMMAND} ship the release notes`)).toBe(false);
+    expect(isBotmuxGoalObjective(`Please explain: ${GOAL_COMMAND_OBJECTIVE}`)).toBe(false);
   });
 
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {

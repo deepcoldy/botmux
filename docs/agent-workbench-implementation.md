@@ -111,7 +111,7 @@ BOTMUX_PUBLIC_URL=https://<dashboard-host>
 
 本次只验证配置解析与模拟链路，没有把这些值写入运行中的服务。
 
-Dashboard 进程读 `~/.botmux/.env` 时只按**白名单**取键（H5 族 + 上表这些 dashboard/daemon 设置，见 `src/utils/dashboard-env.ts`）：同一份文件里其它凭据（历史单 bot 的 `LARK_APP_SECRET`、GitHub token、模型 API key 等）不会进入 dashboard 的 `process.env`，因而也进不了它 fork 出来的调试终端、`start-bot/stop-bot`、全局更新安装与插件安装。Bot daemon 仍按原样整份加载，不受影响。
+Dashboard 进程读 `~/.botmux/.env` 时只按**白名单**取键（H5 族 + 上表这些 dashboard/daemon 设置，见 `src/utils/dashboard-env.ts`）：同一份文件里其它凭据（历史单 bot 的 `LARK_APP_SECRET`、GitHub token、模型 API key 等）不会进入 dashboard 的 `process.env`，因而也进不了它 fork 出来的 `start-bot/stop-bot`、全局更新安装与插件安装（「管理 → 终端」起的宿主 shell 本来就只拿一份 SSH 登录口径的干净环境，不继承 dashboard env）。Bot daemon 仍按原样整份加载，不受影响。
 
 ## 4. 接口契约
 
@@ -188,7 +188,7 @@ central proxy 只在 loopback hop 注入签名 read/write grant。租约释放�
 - opaque origin 让应用访问自己的 dev server 变成跨源请求，因此内容流对 `Origin: null` 回 `Access-Control-Allow-Origin: null`，并就地应答 preflight（不转发给应用）；**从不**附带 credentials，应用自己的 `Access-Control-*` 响应头一律剥掉，避免它扩大 Dashboard 的 CORS 面。
 - 代价（已知取舍）：opaque origin 没有 same-origin storage，强依赖 localStorage/IndexedDB/`document.cookie` 的 dev server 在预览里会抛 SecurityError。这是隔离本身的要求，不是 bug。
 
-Preview guard 的覆盖层只防误触，不是应用级强只读：解锁后应用脚本照样能自己发请求、产生副作用。真正的信任边界是 origin 隔离——应用跑在 opaque origin 上，读不到 Dashboard DOM、发不出带 Dashboard/H5 cookie 的请求、碰不到 same-origin storage，因此够不着 /api/*、/events、终端代理与调试终端。若还要防应用对**它自己**那台 dev server 做的事，仍需容器与应用级授权。
+Preview guard 的覆盖层只防误触，不是应用级强只读：解锁后应用脚本照样能自己发请求、产生副作用。真正的信任边界是 origin 隔离——应用跑在 opaque origin 上，读不到 Dashboard DOM、发不出带 Dashboard/H5 cookie 的请求、碰不到 same-origin storage，因此够不着 /api/*、/events、终端代理与宿主终端（管理 → 终端）。若还要防应用对**它自己**那台 dev server 做的事，仍需容器与应用级授权。
 
 ### 5.3 Chat 边界
 
@@ -278,7 +278,7 @@ Store 快照或终端代理跑通的证据**——后者见 8.2.1。结果 JSON 
 | terminal_disconnect_returns_readonly — 写 WebSocket 断开后回只读 | 通过 |
 | preview_idle_timeout_relocks — 15 分钟 idle 到点回锁并落审计 | 通过 |
 
-P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真 debug-terminal，会真的 spawn /bin/bash）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/debug-terminal 后连 /debug-terminal/&lt;id&gt;/ws，最后把战利品外传给外部收集器。前三类取数全部失败（parent DOM / cookie / localStorage 抛 SecurityError，两个管理接口抛 TypeError，debug WebSocket 升级零次被接受，且另有一条断言证明它确实尝试过、不是空断言）。最后这步外传要单独说清楚，**沙箱不封出网**：恶意页对外部收集器的 POST 真的拿到 200 并送出 448 字节，脚本反而要求这次外传成功发生（否则视为攻击页压根没试）；真正被断言的是这份载荷里不含任何受保护值（Dashboard token、会话清单标记、RCE 标记、已知 debug 终端 id）——通道在，战利品为空。同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json；其中 `assertions.exfiltrationEmpty` 说的正是「载荷里没有受保护值」，与同一份 JSON 里的 `exfiltratedBytes: 448`、`attack.exfiltration: "sent:200"` 并不矛盾。
+P0 origin 隔离另有一套独立的真实浏览器套件 `scripts/verify-preview-origin-isolation.ts`（真 Chromium + 真宿主终端，会真的 spawn 登录 shell）：恶意预览页依次尝试读 parent DOM、带 cookie 调 /api/sessions、POST /api/host-terminal 后连 /host-terminal/&lt;id&gt;/ws，最后把战利品外传给外部收集器。前三类取数全部失败（parent DOM / cookie / localStorage 抛 SecurityError，两个管理接口抛 TypeError，宿主终端 WebSocket 升级零次被接受，且另有一条断言证明它确实尝试过、不是空断言）。最后这步外传要单独说清楚，**沙箱不封出网**：恶意页对外部收集器的 POST 真的拿到 200 并送出 462 字节，脚本反而要求这次外传成功发生（否则视为攻击页压根没试）；真正被断言的是这份载荷里不含任何受保护值（Dashboard token、会话清单标记、RCE 标记、已知宿主终端 id）——通道在，战利品为空。同时断言预览自身的相对脚本、相对 fetch 与自身 WebSocket 仍然工作。机器可读结果见 assets/preview-origin-isolation-results.json；其中 `assertions.exfiltrationEmpty` 说的正是「载荷里没有受保护值」，与同一份 JSON 里的 `exfiltratedBytes: 462`、`attack.exfiltration: "sent:200"` 并不矛盾。
 
 guard 蒙层的时序与能力渲染另有 `scripts/verify-preview-guard-race.ts`（真 Chromium + 真 guard 壳 + 真交互状态机 + 真角色门禁）：① 一份在点击「返回预览模式」**之前**就已经落到浏览器手里的 activity 响应，在锁定之后才被交给壳，蒙层必须保持锁定（这类响应 AbortController 已经拦不住，只能靠请求代号丢弃）；② 不做任何注入的原生路径上，服务端挂住的 activity 被客户端 abort，放行后同样掀不开蒙层；③ 只读身份（platform teammate）的壳里没有解锁/锁定按钮、蒙层锁定、预览内容照常可见，同时直接 POST unlock 仍是 403。截图 assets/preview-guard-race-unlocked.png、assets/preview-guard-race-locked.png、assets/preview-guard-readonly.png，机器可读结果见 assets/preview-guard-race-results.json。
 

@@ -57,6 +57,8 @@ export interface ResolvedDashboardSettingsView {
   autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  /** Machine-wide reply-card footer brand signature switch. Default ON. */
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -113,12 +115,17 @@ export interface ResolvedDashboardSettingsView {
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
+  /** Proxy for binary self-update downloads, null/absent = unset. */
+  httpProxy?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -135,6 +142,8 @@ export type ParseMaintenanceResult =
 
 /** All IO this helper needs — injected so tests use mocks, production wires real impls. */
 export interface SettingsWriteApplierDeps {
+  /** Optional outer transaction used by durable multi-replica deployments. */
+  runConfigMutation?: <T>(mutation: () => Promise<T>) => Promise<T>;
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields. */
@@ -235,6 +244,7 @@ export type ApplySettingsWriteError =
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
+  | 'invalid_cardBrandLabel'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -266,10 +276,12 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow_enabled'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_archiveCodex'
   | 'invalid_sessionCleanup_olderThanHours'
   | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
+  | 'invalid_httpProxy'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -369,6 +381,10 @@ export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
 ): Promise<ApplySettingsWriteResult> {
+  if (deps.runConfigMutation) {
+    const { runConfigMutation, ...innerDeps } = deps;
+    return runConfigMutation(() => applySettingsWrite(body, innerDeps));
+  }
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
@@ -474,6 +490,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
     }
     patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
+  }
+  if ('cardBrandLabel' in obj) {
+    if (typeof obj.cardBrandLabel !== 'boolean') {
+      return { ok: false, error: 'invalid_cardBrandLabel' };
+    }
+    patch.cardBrandLabel = obj.cardBrandLabel;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
@@ -651,6 +673,10 @@ export async function applySettingsWrite(
     // Merge over the validated existing block so a partial patch (e.g. just the
     // toggle) keeps the other supported fields.
     const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('archiveCodex' in sc) {
+      if (typeof sc.archiveCodex !== 'boolean') return { ok: false, error: 'invalid_sessionCleanup_archiveCodex' };
+      next.archiveCodex = sc.archiveCodex;
+    }
     if ('enabled' in sc) {
       if (typeof sc.enabled !== 'boolean') {
         return { ok: false, error: 'invalid_sessionCleanup_enabled' };
@@ -676,10 +702,24 @@ export async function applySettingsWrite(
       }
       next.intervalMinutes = Math.floor(sc.intervalMinutes);
     }
-    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+    if (!('archiveCodex' in sc) && !('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
+  if ('multiTopic' in obj) {
+    const raw = obj.multiTopic;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_multiTopic' };
+    }
+    const multiTopic = raw as Record<string, unknown>;
+    if (typeof multiTopic.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_enabled' };
+    }
+    const current = deps.readGlobalConfig().multiTopic ?? {};
+    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
     touched = true;
   }
 
@@ -736,6 +776,22 @@ export async function applySettingsWrite(
       touched = true;
     } else {
       return { ok: false, error: 'invalid_oauthRedirectBase' };
+    }
+  }
+
+  if ('httpProxy' in obj) {
+    const v = obj.httpProxy;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → release-download 退回 HTTPS_PROXY / HTTP_PROXY 环境变量。
+      deps.mergeGlobalConfig({ httpProxy: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeHttpProxy(v);
+      if (!normalized) return { ok: false, error: 'invalid_httpProxy' };
+      deps.mergeGlobalConfig({ httpProxy: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_httpProxy' };
     }
   }
 
@@ -819,4 +875,18 @@ export async function applySettingsWrite(
 
   if (!touched) return { ok: false, error: 'empty_patch' };
   return { ok: true, settings: deps.resolveDashboardSettings() };
+}
+
+/** `http://[user:pass@]host[:port]` with no path / query — what
+ *  release-download's CONNECT tunnel accepts. It always dials the proxy over
+ *  plain HTTP (then TLS to GitHub inside the tunnel), so an `https://` proxy
+ *  URL would only fail later with an opaque socket error; reject it here.
+ *  Returns the trimmed value without a trailing slash, or null. */
+export function normalizeHttpProxy(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  let url: URL;
+  try { url = new URL(trimmed); } catch { return null; }
+  if (url.protocol !== 'http:') return null;
+  if (!url.hostname || url.pathname !== '/' || url.search || url.hash) return null;
+  return trimmed;
 }

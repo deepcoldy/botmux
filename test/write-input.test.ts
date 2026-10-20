@@ -39,7 +39,9 @@ vi.mock('node:child_process', () => {
   return {
     ...actual,
     execSync: vi.fn(() => ''),
-    execFileSync: vi.fn(),
+    // Bounded pid → open-file probes (utils/process-open-files) run lsof via
+    // execFileSync; mirror execSync's "ran fine, nothing open" stub.
+    execFileSync: vi.fn(() => ''),
     // writeInput's coco/codex paths call execFile. Spreading the real builtin
     // without stubbing it would spawn live CLIs and hang the file (measured).
     execFile: vi.fn((...args: unknown[]) => {
@@ -93,6 +95,8 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
+import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
+import * as codexTranscript from '../src/services/codex-transcript.js';
 
 // ── Speed: collapse the adapters' real-time submit waits ───────────────────
 // writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
@@ -731,18 +735,24 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
-  it('cursor: submits then activates the follow-up steer action in tmux', async () => {
+  // #1504 regression: exactly ONE Enter per write. A second Enter on a
+  // queued follow-up is Cursor's "steer" — it detaches a running shell tool
+  // into a background task whose completion later makes Cursor inject a
+  // synthetic "Briefly inform the user about the task result…" turn (the
+  // "auto-continue after final" symptom), and it races the follow-ups panel
+  // re-render (lost Enter → message parked at "enter steer"). Cursor submits a
+  // queued follow-up by itself at the turn boundary, so one Enter is enough.
+  it('cursor: submits with a single Enter in tmux (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeTmuxPty();
-      const write = adapter.writeInput(pty, 'steer this turn');
+      const write = adapter.writeInput(pty, 'queue this turn');
       await flushFakeTimers();
       await write;
 
-      expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
+      expect(pty.sendText).toHaveBeenCalledWith('queue this turn');
       expect(pty.sendSpecialKeys.mock.calls).toEqual([
-        ['Enter'],
         ['Enter'],
       ]);
     } finally {
@@ -750,20 +760,37 @@ describe('writeInput: edge cases', () => {
     }
   });
 
-  it('cursor: submits then activates follow-up steering in raw PTY mode', async () => {
+  it('cursor: submits with a single Enter in raw PTY mode (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeRawPty();
-      const write = adapter.writeInput(pty, 'steer raw turn');
+      const write = adapter.writeInput(pty, 'queue raw turn');
       await flushFakeTimers();
       await write;
 
       expect(pty.write.mock.calls.map(c => c[0])).toEqual([
-        'steer raw turn',
-        '\r',
+        'queue raw turn',
         '\r',
       ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: a multi-line type-ahead message still ends with exactly one Enter', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, '<botmux_routing>\nline two\n</botmux_routing>');
+      await flushFakeTimers();
+      await write;
+
+      // Soft newlines are C-j; the only Enter is the final submit.
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter')).toHaveLength(1);
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'C-j')).toHaveLength(2);
+      expect(pty.sendSpecialKeys.mock.calls[pty.sendSpecialKeys.mock.calls.length - 1]).toEqual(['Enter']);
     } finally {
       vi.useRealTimers();
     }
@@ -1343,6 +1370,10 @@ Active whiteboard content
   <name>Project Group</name>
 </chat_context>
 
+<botmux_lark_tool>
+  lark-cli defaults to the current bot.
+</botmux_lark_tool>
+
 Fix the test suite failure on CI
 
 <sender type="user" id="ou_123" />
@@ -1354,6 +1385,7 @@ Fix the test suite failure on CI
     expect(hookPayload).not.toContain('chat_context');
     expect(hookPayload).not.toContain('whiteboard');
     expect(hookPayload).not.toContain('attachments');
+    expect(hookPayload).not.toContain('botmux_lark_tool');
 
     // ReDoS safety on unclosed <user_message>
     const unclosed = '<user_message>'.repeat(3000) + 'safe content';
@@ -1665,6 +1697,109 @@ describe('genius writeInput submission confirmation', () => {
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('uses live footer identity for consecutive messages without adding any status command', async () => {
+    resetCodexHistory();
+    let sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const other = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const sendText = vi.fn();
+    const keys: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), sendText,
+      captureCurrentScreen: vi.fn(() => ''),
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      pasteText(text) { pasted = text; },
+      sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    sid = other;
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
+    expect(keys).toEqual(['Enter', 'Enter']);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
+  });
+
+  it('confirms daemon-backed tmux input against its live footer, rejecting another pane with identical text', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const calls: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write() { throw new Error('Unexpected raw write'); },
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      sendText(text) { calls.push(text); },
+      sendSpecialKeys(key) {
+        calls.push(key);
+        appendCodexHistory(pasted, foreign);
+        appendCodexHistory(pasted, sid);
+      },
+      pasteText(text) { pasted = text; calls.push('paste:' + text); },
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    expect(calls).toEqual(['paste:hi', 'Enter']);
+    expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
+  });
+
+  it('submits without a footer ID and confirms the owned history', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    const owned = new Set<string>();
+    const ownership = vi.spyOn(codexTranscript, 'findCodexRolloutSetByPid').mockReturnValue(owned);
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => {
+        owned.add(sid);
+        appendCodexHistory('hi', foreign);
+        appendCodexHistory('hi', sid);
+      }),
+      captureInputState: vi.fn(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      })),
+    };
+    try {
+      const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+      expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+      expect(pty.captureInputState).toHaveBeenCalledTimes(1);
+      expect(pty.write).not.toHaveBeenCalled();
+      expect(pty.pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally {
+      ownership.mockRestore();
+    }
+  });
+
+  it('writes without a terminal snapshot and confirms history without ownership proof', async () => {
+    resetCodexHistory();
+    const pasteText = vi.fn();
+    const sendText = vi.fn();
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), pasteText, sendText,
+      sendSpecialKeys: vi.fn(() => appendCodexHistory('hi', 'foreign-session')),
+      captureCurrentScreen: () => '', captureInputState: () => null,
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result).toEqual({ submitted: true });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');

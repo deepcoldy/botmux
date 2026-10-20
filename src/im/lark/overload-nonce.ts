@@ -52,7 +52,6 @@ export function claimOverloadNonce(nonce: string, action: string): boolean {
 }
 
 export function _resetOverloadNoncesForTest(): void { nonces.clear(); lastPrunedAt = 0; }
-export function _overloadNonceCountForTest(): number { return nonces.size; }
 
 /**
  * Undo a claim for `(nonce, action)` so the button can be retried. Called when

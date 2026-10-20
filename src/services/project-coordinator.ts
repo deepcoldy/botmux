@@ -1,6 +1,9 @@
+import { localeForBot } from '../i18n/index.js';
+import { logger } from '../utils/logger.js';
 import {
   buildProjectGroupCard,
   buildProjectGroupOnboardingCard,
+  buildProjectGroupStartedNoticeCard,
   type ProjectGroupOnboardingCardInput,
 } from '../im/lark/project-group-card.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
@@ -24,6 +27,7 @@ export interface ProjectCoordinatorTransport {
   unpinMessage(larkAppId: string, messageId: string): Promise<boolean>;
   resolveThreadId(larkAppId: string, dispatchRoot: string): Promise<string | null>;
   isMessageWithdrawn(error: unknown): boolean;
+  isMessageUpdateExpired(error: unknown): boolean;
   brand(larkAppId: string): Brand;
 }
 
@@ -162,12 +166,24 @@ export class ProjectCoordinator {
     const current = readGroupCollaborationMode(context.dataDir, context.chatId)?.onboardingCard;
     if (!current) return;
     if (current.larkAppId !== context.larkAppId) throw new Error('project_onboarding_coordinator_mismatch');
+    try {
+      await this.transport.updateCard(context.larkAppId, current.messageId,
+        JSON.stringify(buildProjectGroupStartedNoticeCard(localeForBot(context.larkAppId))));
+    } catch (error) {
+      if (!this.transport.isMessageWithdrawn(error) && !this.transport.isMessageUpdateExpired(error)) {
+        logger.warn(`[project] Could not retire onboarding card ${current.messageId}; will retry on refresh: ${error}`);
+        return;
+      }
+    }
     if (current.pinned) {
       try {
         const unpinned = await this.transport.unpinMessage(context.larkAppId, current.messageId);
         if (!unpinned) return;
       } catch (error) {
-        if (!this.transport.isMessageWithdrawn(error)) throw error;
+        if (!this.transport.isMessageWithdrawn(error)) {
+          logger.warn(`[project] Could not retire onboarding card ${current.messageId}; will retry on refresh: ${error}`);
+          return;
+        }
       }
     }
     await writeProjectOnboardingCard(context.dataDir, context.chatId, undefined);

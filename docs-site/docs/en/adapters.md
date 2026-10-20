@@ -130,8 +130,30 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 1. Create a new file under `src/adapters/cli/` implementing the `CliAdapter` interface
 2. Add the new ID to the `CliId` union type in `src/adapters/cli/types.ts`
 3. Add the import / switch case / export in `src/adapters/cli/registry.ts`
-4. Add the display name to `CLI_DISPLAY_NAMES` in `src/worker.ts` and `cliDisplayNames` in `card-builder.ts`
+4. Add the display name to `CLI_DISPLAY_NAMES` in `src/adapters/cli/display-names.ts` (shared by cards, the worker and the setup / dashboard pickers)
 5. Add an option to the setup interactive menu in `src/cli.ts`
 6. Update the README
 
 See [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) for details.
+
+## Native Codex App questions
+
+Botmux-managed `codex-app` sessions and `codex` sessions using app-server RPC bridge native `request_user_input` requests to Lark ask cards. A selection or text reply in the current conversation is returned under the original question IDs to the same native turn. TRAE RPC uses the same bridge.
+
+A batch preserves all questions and option descriptions. Text-only questions appear on a card awaiting a conversation text reply. A batch containing text-only questions is answered entirely through one text reply. Recommended labels are never accepted automatically. A text reply supplies the same batch-level comment to the questions, without including unsubmitted selections. Existing Ask routing and responder permissions apply.
+
+The wait lasts up to one hour. Dispatch errors, timeout, invalidation, or unsupported questions interrupt the native turn instead of returning empty answers. Turn completion, process exit, and session shutdown cancel pending waits; late answers are ignored. Native waits are not retried or restored across daemon restarts.
+
+Choice questions require at least two options. Secret inputs and malformed batches fail explicitly without answering only part of the batch. Do not send secrets through chat cards. Workflow subagents use `humanGate` / decision nodes instead. API-only sessions without Lark transport, ordinary terminal paste mode, and the App history service do not use this bridge.
+
+To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
+
+In `codex-app`, `request_user_input_async` messages carrying `delivery: async` and `questions` create standalone Lark ask cards while the model continues independent work. Cards remain answerable after normal turn completion. Answers preserve the native call ID and question index and use the existing session delivery queue to start a follow-up turn in the same native thread. Duplicate events create one card; recommended options require explicit submission.
+
+Async questions accept nonempty native batches, one option, and duplicate labels. Human-origin cards use the existing canTalk registration policy and freeze the initiating answerer at registration; later speakers or reply-target eviction cannot retarget them. Authorized scheduled/autonomous cards use the existing canTalk responder policy; scheduled task creators still require canOperate permission and silent schedules never post cards. Document-comment turns privately deliver cards to the verified original author, who alone may answer. The answer's follow-up turn retains the original document-comment reply route instead of inheriting a later comment or the session owner.
+
+With concurrent cards, quote the intended card for text answers; unquoted input continues as an ordinary turn with a visible hint. A batch is submitted atomically; text replies provide a shared comment for the entire batch, and TUI-style partial per-question submission is not supported. Requests expire after one hour; expiry, card failures and undelivered answers produce notices. Turn failure/interruption, runner exit, session closure, or replacement cancels requests. Pending cards do not survive daemon/runner restarts and historical questions are not backfilled. Native availability depends on the Codex version; this async event bridge applies to `codex-app`.
+
+Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

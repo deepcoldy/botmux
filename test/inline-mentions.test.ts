@@ -125,3 +125,42 @@ describe('applyInlineMentionsToCard', () => {
       .toBe('负责人 <at id=ou_owner></at>');
   });
 });
+
+describe('applyInlineMentions — Markdown code stays literal (#1744)', () => {
+  const botB = { open_id: 'ou_botb', name: 'BotB' };
+
+  it('rewrites prose but leaves inline code and fenced blocks verbatim', () => {
+    const text = '这里只汇报 @BotB 的结果。\n\n行内示例：`@BotB`\n\n```text\n@BotB\n```';
+    const r = applyInlineMentions(text, [botB]);
+    expect(r.text).toBe('这里只汇报 <at id=ou_botb></at> 的结果。\n\n行内示例：`@BotB`\n\n```text\n@BotB\n```');
+    expect([...r.usedIds]).toEqual(['ou_botb']);
+  });
+
+  it('does not count a code-only mention as inlined (so it stays on the footer)', () => {
+    const r = applyInlineMentions('示例：`botmux send --mention @BotB`\n~~~\n@BotB\n~~~', [botB]);
+    expect(r.text).toBe('示例：`botmux send --mention @BotB`\n~~~\n@BotB\n~~~');
+    expect(r.usedIds.size).toBe(0);
+  });
+
+  it('rewrites mentions directly adjacent to code and between multiple spans', () => {
+    const r = applyInlineMentions('`a`@BotB ``@BotB`` @BotB`b`', [botB]);
+    expect(r.text).toBe('`a`<at id=ou_botb></at> ``@BotB`` <at id=ou_botb></at>`b`');
+  });
+
+  it('does not rewrite a match whose name runs into code (name with a tilde)', () => {
+    const tilde = { open_id: 'ou_t', name: 'B~' };
+    expect(applyInlineMentions('@B~~~\nx\n~~~', [tilde]).text).toBe('@B~~~\nx\n~~~');
+    expect(applyInlineMentions('@B~ ok', [tilde]).text).toBe('<at id=ou_t></at> ok');
+  });
+
+  it('treats an unbalanced stray backtick as a literal', () => {
+    const r = applyInlineMentions('it`s @BotB', [botB]);
+    expect(r.text).toBe('it`s <at id=ou_botb></at>');
+  });
+
+  it('keeps code literal inside custom-card markdown too', () => {
+    const card = { elements: [{ tag: 'markdown', content: '@BotB 看 `@BotB`' }] };
+    const r = applyInlineMentionsToCard(card, [botB]);
+    expect((r.card.elements as Array<{ content: string }>)[0].content).toBe('<at id=ou_botb></at> 看 `@BotB`');
+  });
+});

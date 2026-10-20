@@ -7,7 +7,8 @@
  *
  * 仅作为可选 helper, **未启用于 setup / start 主链路**:
  * - {@link checkRequiredScopes} —— 调 `application.v6.scope.list` 比对 botmux
- *   需要的 scope. 待 spike 用真实/可复现 mock 证明 grant_status 闭环后再启用.
+ *   需要的 scope. grant_status 映射已在 Lark 国际版自建应用真机闭环验证
+ *   (见该函数注释), 1 与 2 均视为已开通.
  * - {@link applyScopesUnverified} —— 调 `application.v6.scope.apply` 触发管理
  *   员审批. Lark 文档表明它只能提交"已声明但未授权"的 scope, 不能给 manifest
  *   加新 scope, 所以无法绕开"用户去开放平台勾"这步; 同样待 spike 后启用.
@@ -148,6 +149,24 @@ export const VC_MEETING_FEATURE_SCOPES: RequiredScope[] = [
 /** Realtime voice is only required when vcMeetingAgent.realtimeVoice.enabled is true. */
 export const VC_MEETING_REALTIME_VOICE_SCOPES: RequiredScope[] = [
   { name: 'vc:meeting.bot.realtime:write', desc: '会议智能体实时语音发言', critical: false },
+];
+
+/**
+ * Dashboard「飞书原生命令面板」（应用级 Slash 命令注册）专用的**可选**权限。
+ *
+ * 刻意**不在** {@link BOTMUX_REQUIRED_SCOPES}、也**不在** lark-scopes.json 默认 manifest：
+ * - 该能力在飞书侧仍处于灰度（需 FG 白名单 + 7.70+ PC 端），部分租户的权限目录里可能
+ *   根本没有这两个 scope；放进 manifest 会让新建应用的导入多一个不可识别项。
+ * - 放进 BOTMUX_REQUIRED_SCOPES 时，启动自检会把 non-critical 缺失项静默补进应用并
+ *   **发布新版本**（event-dispatcher 的 optional top-up）——为一个用户可能永远不用、
+ *   且可能不可用的 Dashboard 功能去改应用版本，违背「可选」。
+ * 缺失时只有 Dashboard 的该面板降级为「不可用 + 开通深链」，不影响 daemon 启动与其它功能。
+ */
+export const APP_SLASH_COMMAND_READ_SCOPE = 'application:app_slash_command:read';
+export const APP_SLASH_COMMAND_WRITE_SCOPE = 'application:app_slash_command:write';
+export const APP_SLASH_COMMAND_FEATURE_SCOPES: RequiredScope[] = [
+  { name: APP_SLASH_COMMAND_READ_SCOPE, desc: '读取应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
+  { name: APP_SLASH_COMMAND_WRITE_SCOPE, desc: '注册 / 更新 / 删除应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
 ];
 
 /** VC bot push 事件。开放平台当前没有公开 API 可列出已订阅事件，只能给管理员检查清单。 */
@@ -347,13 +366,23 @@ export type ScopeCheckResult =
 /**
  * 列出应用的 scope grant 状态, 比对 BOTMUX_REQUIRED_SCOPES.
  *
- * **不在主路径使用** — 待 spike 用真实/可复现 mock 证明 grant_status 含义和
- * 状态闭环后再启用. 当前主路径只输出"剩余步骤 + 深链", 不做 grant_status 判定.
+ * **不在主路径使用** — 当前主路径只输出"剩余步骤 + 深链", 不做 grant_status 判定.
+ * (daemon 启动的"缺少 N 项必需权限"自检走 event-dispatcher.checkRequiredScopes,
+ * 数据源是 application/v6/applications 的**生效 scope 名列表**, 不消费 grant_status,
+ * 因此不受本映射影响。)
  *
  * scope.list 返回 shape (SDK type):
  *   `{ data: { scopes: [{ scope_name, grant_status, scope_type }] } }`
- * grant_status 含义未在官方文档明确, 但社区 SDK / 实测一般约定:
- *   1 = 已申请未生效, 2 = 已生效. 启用前 spike 务必确认这个映射.
+ * grant_status 含义未在官方文档明确. 曾按社区约定只认 2 = 已生效; Lark 国际版
+ * (larksuite.com) 自建应用真机 spike 推翻了"1 = 已申请未生效"的假设: **已开通的
+ * scope 返回 grant_status = 1, 且功能实测可用** — 用 bot tenant token 直调
+ * `im/v1/messages` (im:message.group_msg) code 0 且拿到群历史消息;
+ * `im/v1/chats/{id}/members` (im:chat.members:read) 同样 code 0. 这两个 scope
+ * 在 scope.list 里都是 status=1. 故 1 与 2 均视为 granted, 避免对已开通 scope
+ * 持续误报 missing.
+ *
+ * 边界: 该实证来自 Lark 国际版自建应用; feishu.cn 域未单独验证. 两侧 scope.list
+ * 是同一 API, 故按同一映射处理 (行为一致), 如后续发现 feishu.cn 语义不同再分域.
  */
 export async function checkRequiredScopes(
   appId: string,
@@ -388,9 +417,10 @@ export async function checkRequiredScopes(
   }
 
   const scopes = resp?.data?.scopes ?? [];
-  // grant_status === 2 → granted (待 spike 确认这是正确映射)
+  // grant_status 1 与 2 都算 granted —— Lark 国际版真机实证: 已开通 scope 返回 1
+  // 且 API 直调可用 (见函数头注释). 只认 2 会把已开通的 scope 误报成 missing.
   const grantedNames: string[] = scopes
-    .filter((s: any) => s?.grant_status === 2 && typeof s?.scope_name === 'string')
+    .filter((s: any) => (s?.grant_status === 1 || s?.grant_status === 2) && typeof s?.scope_name === 'string')
     .map((s: any) => s.scope_name);
 
   const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedNames.includes(s.name));

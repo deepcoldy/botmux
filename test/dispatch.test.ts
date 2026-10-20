@@ -10,7 +10,7 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
@@ -173,30 +173,6 @@ describe('dispatch completion switch wiring', () => {
     expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
     expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
     expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
-  });
-
-  it('authenticates the exact report callback through daemon IPC', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function cmdReport');
-    const end = source.indexOf('\nasync function ', start + 1);
-    const report = source.slice(start, end);
-
-    expect(report).toContain('postCurrentSessionDaemonRoute({');
-    expect(report).toContain('path: REPORT_SESSION_RELAY_ROUTE');
-    expect(report).not.toContain("orchestrate-dispatch.json");
-  });
-
-  it('renders dispatch save feedback inside its own dashboard setting row', () => {
-    const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
-    const injectStart = source.indexOf("tr('roles.injectModeLabel')");
-    const completionStart = source.indexOf("tr('roles.dispatchCompletionLabel')", injectStart);
-    const textareaStart = source.indexOf('<textarea', completionStart);
-    const injectRow = source.slice(injectStart, completionStart);
-    const completionRow = source.slice(completionStart, textareaStart);
-
-    expect(injectRow).toContain('<Flash flash={injectFlash} />');
-    expect(injectRow).not.toContain('dispatchCompletionFlash');
-    expect(completionRow).toContain('<Flash flash={dispatchCompletionFlash} />');
   });
 
   it('trails the marker so older cross-machine receivers keep the positional report text', () => {

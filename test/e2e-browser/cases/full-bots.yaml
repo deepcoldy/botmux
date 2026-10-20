@@ -1,0 +1,18 @@
+# Lane: the remaining bot runtimes in their private chats.
+cases:
+  - name: Aiden basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-aiden-basic }
+  - name: CoCo basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-coco-basic }
+  - name: OpenCode basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-opencode-basic }
+  - name: Bot reply smoke test
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-reply-smoke }

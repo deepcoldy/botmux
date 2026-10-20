@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -42,6 +42,24 @@ const owner = (turnId: string, dispatchAttempt?: number) => ({
 });
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
+  it('runs a strict app-server with approved auth and identity but no unknown host credential', async () => {
+    const { buildSessionChildEnv, botInjectedEnv } = await import('../src/core/env-policy.js');
+    const { applySessionOwnerEnv } = await import('../src/utils/child-env.js');
+    const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-env-probe-'));
+    const path = join(dir, 'report');
+    const policy = { mode: 'strict' as const };
+    const env = { ...buildSessionChildEnv({ PATH: process.env.PATH, HOME: dir, UNLISTED_CLOUD_CREDENTIAL: 'host-sentinel' }, policy),
+      ...botInjectedEnv({ OPENAI_API_KEY: 'rpc-sentinel' }, policy), CODEX_HOME: '/test/rpc/codex', FAKE_ENV_PROBE_PATH: path };
+    applySessionOwnerEnv(env, 'ou_rpc');
+    const engine = makeEngine({ env });
+    try {
+      await engine.start();
+      for (const [key, ok] of Object.entries(JSON.parse(readFileSync(path, 'utf8')))) expect(ok, key).toBe(true);
+    } finally { engine.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('passes exact argv and env to the model-owning app-server through a portable spawn seam', async () => {
     const launches: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
     const childEnv = { ...process.env, BOTMUX_SESSION_ID: 'rpc-spawn-capture' };
@@ -164,6 +182,50 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(params.config?.model).toBe('gpt-5.6-terra');
     expect(params.config?.model_reasoning_effort).toBe('ultra');
   }, 20_000);
+
+  it('forwards serviceTier top-level on start AND resume while resume still suppresses model/effort', async () => {
+    const startFile = join(tmpdir(), `fake-tier-start-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-tier-resume-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'tier-wiring',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      serviceTier: 'priority',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    }, {
+      spawnProcess: spawn,
+      validateServiceTier: async input => {
+        expect(input).toMatchObject({ cliBin: FIXTURE, model: 'gpt-5.6-terra', serviceTier: 'priority' });
+        return { ok: true };
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    // serviceTier is a thread-level field: top-level on both request shapes.
+    expect(startParams.serviceTier).toBe('priority');
+    expect(startParams.config?.serviceTier).toBeUndefined();
+    expect(resumeParams.serviceTier).toBe('priority');
+    // Carrying the tier must not reopen the model/effort resume-drift hole.
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+  }, 20_000);
+
+  it('fails closed before spawning when the model does not support serviceTier', async () => {
+    const engine = makeEngine({ model: 'gpt-5.6-terra', serviceTier: 'priority' }, {
+      spawnProcess(): ChildProcess {
+        throw new Error('spawn must not run');
+      },
+      validateServiceTier: async () => ({ ok: false, error: 'not_supported_by_model' }),
+    });
+    await expect(engine.start()).rejects.toThrow('Codex service tier rejected: not_supported_by_model');
+    engine.stop();
+  });
 
   it('forwards backend variant on fresh thread/start and suppresses it on resume', async () => {
     const startFile = join(tmpdir(), `fake-variant-start-${Math.round(performance.now())}.json`);
@@ -295,7 +357,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     let resolveReceived!: () => void;
     const receivedPromise = new Promise<void>(resolve => { resolveReceived = resolve; });
     const engine = makeEngine({
-      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1', FAKE_USER_INPUT_STRING_ID: '1' },
       appServerFeatures: ['default_mode_request_user_input'],
       onRequestUserInput: async params => {
         received = params;
@@ -312,6 +374,47 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     });
     engine.stop();
   }, 20_000);
+
+  it('does not spend the transport timeout while waiting for a human before the turn/start response', async () => {
+    let ready!: () => void;
+    const asked = new Promise<void>(resolve => { ready = resolve; });
+    let answer!: (value: unknown) => void;
+    const engine = makeEngine({ env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      requestTimeoutMs: 300,
+      onRequestUserInput: async () => { ready(); return new Promise(resolve => { answer = resolve; }); },
+    });
+    await engine.start(); await engine.startThread();
+    const turn = engine.sendTurn('ask me', owner('human-wait', 1));
+    await asked;
+    await new Promise(resolve => setTimeout(resolve, 650));
+    answer({ answers: { choice: { answers: ['Yes'] } } });
+    await expect(turn).resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+  }, 20_000);
+
+  it.each(['completed', 'stopped', 'dead'] as const)('cancels native question waiters on %s and ignores late answers', async event => {
+    let signal!: AbortSignal;
+    let resolveAnswer!: (answer: unknown) => void;
+    const engine = makeEngine({ onRequestUserInput: async (_params, abortSignal) => {
+      signal = abortSignal;
+      return new Promise(resolve => { resolveAnswer = resolve; });
+    } });
+    const sent: unknown[] = [];
+    (engine as any).respond = (_id: number, answer: unknown) => { sent.push(answer); };
+    (engine as any).handleOrdinaryServerRequest({ id: 'native-question', method: 'item/tool/requestUserInput',
+      params: { turnId: 'question-turn' } });
+    await Promise.resolve();
+    expect(signal.aborted).toBe(false);
+    // A different turn's completion must not dismiss this question.
+    (engine as any).onMessage(JSON.stringify({ method: 'turn/completed', params: { turn: { id: 'other-turn' } } }));
+    expect(signal.aborted).toBe(false);
+    if (event === 'completed') (engine as any).onMessage(JSON.stringify({ method: 'turn/completed', params: { turn: { id: 'question-turn' } } }));
+    else if (event === 'stopped') engine.stop();
+    else (engine as any).failAll(new Error('connection lost'));
+    expect(signal.aborted).toBe(true);
+    resolveAnswer({ answers: { choice: { answers: ['Yes'] } } });
+    await Promise.resolve(); await Promise.resolve();
+    expect(sent).toEqual([]);
+  });
 
   it('interrupts the turn (not a benign reply) when the input bridge rejects', async () => {
     // The blocker fix. Verified against real traex 0.200.19: replying to
@@ -666,6 +769,25 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       errorCode: 'codex_output_limit_exceeded',
     })]);
     engine.stop();
+  }, 20_000);
+
+  it('classifies a native capacity failure independently of a generic error code', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-capacity',
+      env: { ...process.env, FAKE_TURN_STATUS: 'failed', FAKE_TURN_ERROR_CODE: 'generic_turn_failed',
+        FAKE_TURN_ERROR_MESSAGE: 'Selected model is at capacity. Please try a different model.' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    try {
+      await engine.start();
+      await engine.startThread();
+      await engine.sendTurn('continue task', owner('turn-capacity', 7));
+      await vi.waitFor(() => expect(terminals).toEqual([expect.objectContaining({
+        identity: { turnId: 'turn-capacity', dispatchAttempt: 7 },
+        status: 'failed', errorCode: 'codex_capacity_exceeded',
+      })]));
+    } finally { engine.stop(); }
   }, 20_000);
 
   it('P1-1 sendFirstTurn: dispatched, no ack, NO rollout evidence → ambiguous (never downgraded to safe)', async () => {

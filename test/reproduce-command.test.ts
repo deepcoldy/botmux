@@ -23,6 +23,16 @@ describe('buildReproduceCommand', () => {
     })).toBeNull();
   });
 
+  it('remote-runner backend returns null (provider protocol is not a local CLI command)', () => {
+    expect(buildReproduceCommand({
+      backendType: 'remote-runner',
+      bin: '/opt/example/provider',
+      args: [],
+      cwd: '/repo',
+      env: baseEnv,
+    })).toBeNull();
+  });
+
   it('empty bin returns null', () => {
     expect(buildReproduceCommand({
       backendType: 'pty',

@@ -8,6 +8,7 @@ import {
   registerHostAsk,
   restorePersistedAsks,
   tryResolveAsk,
+  submitDocumentAskReply,
   setCardDispatcher,
   setCanTalkChecker,
   setAskPersistStore,
@@ -103,6 +104,31 @@ function onlyPersisted(): PersistedAsk {
 }
 
 describe('ask persistence (injected store)', () => {
+  it('preserves document recipient, responder lock and exact-card text routing across restart', async () => {
+    const target = { kind: 'document-author' as const, openId: 'ou_owner', turnId: 'turn-A',
+      fileToken: 'fixture', commentId: 'comment' };
+    const input = makeInput({ chatId: 'doc:fixture:comment', rootMessageId: null,
+      answererOpenId: 'ou_owner', deliveryTarget: target });
+    const first = mockDispatcher();
+    setCardDispatcher(first);
+    void registerAsk(input);
+    await new Promise(r => setTimeout(r, 5));
+    expect(onlyPersisted()).toMatchObject({ deliveryTarget: target, answererOpenId: 'ou_owner' });
+    const original = first.sendCalls[0];
+    _resetForTest();
+    bindStore();
+    const second = mockDispatcher();
+    setCardDispatcher(second);
+    setCanTalkChecker((_app, _chat, by, type) => by === 'ou_owner' && type === 'p2p');
+    restorePersistedAsks(Date.now(), 'cli_app');
+    const pending = registerAsk(input);
+    expect(tryResolveAsk({ askId: original.askId, nonce: original.nonce, selected: 'yes', by: 'ou_intruder' })).toBe('unauthorized');
+    expect(submitDocumentAskReply({ larkAppId: 'cli_app', chatType: 'p2p',
+      parentMessageId: `om_card_${original.askId}`, by: 'ou_owner', text: 'Keep the original scope' })).toBe(true);
+    expect(await pending).toMatchObject({ kind: 'answered', by: 'ou_owner', comment: 'Keep the original scope' });
+    expect(second.sendCalls).toHaveLength(0);
+  });
+
   it('registerAsk writes a durable record; answering removes it', async () => {
     setCardDispatcher(mockDispatcher());
     const p = registerAsk(makeInput());

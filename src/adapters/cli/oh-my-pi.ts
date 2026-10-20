@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { resolveCommand } from './registry.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
@@ -11,15 +11,15 @@ import { piTurnBoundaryExtensionPath } from './pi.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
+import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-transcript.js';
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 
 export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -93,7 +93,7 @@ async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<b
     // Emit the markers ourselves instead of relying on backend pasteText():
     // tmux/zellij implement bracketed paste, while herdr's pasteText is only a
     // literal write. One explicit wire format keeps every backend equivalent.
-    if (!sendLiteral(pty, `${BRACKETED_PASTE_START}${chunk}${BRACKETED_PASTE_END}`)) return false;
+    if (!sendLiteral(pty, wrapBracketedPaste(chunk))) return false;
     await delay(OMP_INPUT_THROTTLE_MS);
   }
   return true;
@@ -116,6 +116,23 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 }
 
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
+/** OMP isolated-session JSONL, addressed only by the botmux adapter session id (no pid
+ *  or cwd discovery). Holds a provisional terminal in driver state until a decisive
+ *  record or a quiet tick proves no plugin continuation follows. */
+export const ompBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainOmpTranscript(
+    path,
+    offset,
+    (ctx.state as OmpTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => ompTranscriptPath(sessionId) ?? undefined,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+};
+
 export function createOhMyPiAdapter(
   pathOverride?: string,
   resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
@@ -146,6 +163,7 @@ export function createOhMyPiAdapter(
 
   return {
     id: 'oh-my-pi',
+    bridgeSpec: ompBridgeSpec,
     authPaths: ['~/.omp/agent'],
     resolvedBin: bin,
 
@@ -166,6 +184,7 @@ export function createOhMyPiAdapter(
       botOpenId,
       replyDelivery,
       triggerUserAuth,
+      larkToolAppId,
       noTransport,
       solo,
       skillPluginDir,
@@ -195,6 +214,7 @@ export function createOhMyPiAdapter(
         botOpenId,
         noTransport,
         triggerUserAuth,
+        larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
       });
@@ -288,5 +308,3 @@ export function createOhMyPiAdapter(
     skillsDir: '~/.omp/agent/skills',
   };
 }
-
-export const create = createOhMyPiAdapter;

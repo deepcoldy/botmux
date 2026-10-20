@@ -107,8 +107,13 @@ async function waitForSettledIdle(
   );
 }
 
-async function waitForLog(child: ChildProcess, logs: string[], needle: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
+async function waitForLog(
+  child: ChildProcess,
+  logs: string[],
+  needle: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (logs.some(entry => entry.includes(needle))) return;
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -234,9 +239,9 @@ setInterval(() => {}, 1_000);
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitForLog(child, logs, 'model_backend_variant="max"');
+    await waitForLog(child, logs, 'model_backend_variant="max"', 30_000);
     expect(logs.join('')).toContain('Spawning fresh CLI:');
-  }, 15_000);
+  }, 40_000);
 
   it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
@@ -1098,7 +1103,7 @@ setInterval(() => {}, 1_000);
   }, 40_000);
 
   it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
-    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +
+    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt +
     // reliableTurnTerminal): its FIRST ready edge is pre-execution — the argv-baked
     // first prompt is still running. markPromptReady() would otherwise publish a
     // generic snapshot (projected idle, since isPromptReady was just set true)

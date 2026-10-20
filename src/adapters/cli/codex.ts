@@ -1,15 +1,23 @@
-import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { parseDebugModelsJson } from './model-catalog-json.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
+import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
-import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
+import {
+  drainCodexRollout,
+  findCodexRolloutByPid,
+  findCodexRolloutBySessionId,
+  findCodexRolloutSetByPid,
+  findCodexSessionIdByBotmuxSessionId,
+  type CodexDrainState,
+} from '../../services/codex-transcript.js';
+import { refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 
@@ -63,10 +71,10 @@ function restoredCodexHistoryReady(history: string): boolean {
   const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
   const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
   const lines = history.trimEnd().split(/\r?\n/);
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
   if (footer.length !== 1) return false;
   const restoredReady = (restored || initialized)
@@ -86,10 +94,10 @@ function restoredCodexHistoryReady(history: string): boolean {
 function resumedCodexPromptReady(screen: string): boolean {
   if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
   const lines = screen.trimEnd().split('\n');
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   // The composer must be the bottom input surface, followed only by its
   // initialized model/path footer. Pickers, review dialogs and history alone
   // cannot satisfy this shape. Do not depend on a particular model name.
@@ -109,6 +117,20 @@ function currentFileSize(path: string): number {
 interface HistoryMatch {
   found: boolean;
   cliSessionId?: string;
+  /** True only when the matched line's session id passed a POSITIVE ownership
+   *  check (explicit expected thread id, or an available owned-rollout set that
+   *  contains it). An unfiltered match or one accepted because enumeration was
+   *  unavailable is a submit confirmation, not proof that THIS pane consumed
+   *  the input. */
+  ownershipProven?: boolean;
+}
+
+function historyMatchResult(match: HistoryMatch, requireOwnership: boolean): { submitted: true; cliSessionId?: string; ownershipProven?: true } {
+  return {
+    submitted: true,
+    ...(match.cliSessionId && (!requireOwnership || match.ownershipProven) ? { cliSessionId: match.cliSessionId } : {}),
+    ...(match.ownershipProven ? { ownershipProven: true } : {}),
+  };
 }
 
 function readCliSessionId(parsed: unknown): string | undefined {
@@ -134,9 +156,11 @@ function historyTextMatches(actual: string, expected: string): boolean {
  *  owned rollout fd that appears AFTER its history line can still be accepted on
  *  a later poll. */
 type HistorySidFilter = (cliSessionId: string | undefined) => boolean;
+/** Positive ownership predicate; see HistoryMatch.ownershipProven. */
+type HistorySidProof = (cliSessionId: string | undefined) => boolean;
 
 function matchHistoryDelta(
-  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter,
+  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
 ): HistoryMatch {
   if (!existsSync(path)) return { found: false };
   let size: number;
@@ -161,7 +185,7 @@ function matchHistoryDelta(
         // collision). Keep scanning — the owned line may be later in this delta
         // or arrive on a subsequent poll.
         if (acceptSid && !acceptSid(cliSessionId)) continue;
-        return { found: true, cliSessionId };
+        return { found: true, cliSessionId, ownershipProven: !!proveSid && proveSid(cliSessionId) };
       }
     } catch {
       // Ignore partial/non-JSON lines. A later poll will see the completed
@@ -172,57 +196,39 @@ function matchHistoryDelta(
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter,
+  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
 ): Promise<HistoryMatch> {
   const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
-    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid);
+    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid, proveSid);
     if (match.found) return match;
     await delay(100);
   }
   return { found: false };
 }
 
-/** Build a JSON-escaped prefix for a cheap raw-line prefilter before parsing
- *  history.jsonl. The final match is exact against the decoded `text` field;
- *  the prefix only avoids JSON-parsing unrelated lines from other sessions. */
-function historyMarker(content: string): string {
-  const prefix = content.slice(0, 40);
-  return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
+function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+  // Resume must find the mapping however old it is, so no tail cap; the lookup
+  // is a bounded-memory newest-first scan that stops at the first hit, and a
+  // mention without a session_id falls through to an older one.
+  return findCodexSessionIdByBotmuxSessionId(botmuxSessionId, {
+    maxTailBytes: Number.POSITIVE_INFINITY,
+    skipUnmapped: true,
+  });
 }
 
-function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
-  const historyPath = codexHistoryPath();
-  if (!existsSync(historyPath)) return undefined;
-  try {
-    const size = statSync(historyPath).size;
-    const fd = openSync(historyPath, 'r');
-    const buf = Buffer.alloc(size);
-    try {
-      readSync(fd, buf, 0, size, 0);
-    } finally {
-      closeSync(fd);
-    }
-    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
-    const lines = buf.toString('utf8').trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      if (!line.includes(marker)) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
-          const sid = readCliSessionId(parsed);
-          if (sid) return sid;
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
+/** Codex rollout bridge. Spawn attach additionally honours an existing App Server
+ *  share (`split-live`); terminal `/adopt` keeps a dedicated worker branch because
+ *  the thread id comes from a live terminal-session refresh. */
+export const codexBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainCodexRollout(path, offset, ctx.state as CodexDrainState | undefined),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => findCodexRolloutBySessionId(sessionId),
+    byPid: pid => findCodexRolloutByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', appServerShare: true },
+};
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -230,8 +236,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // is a spawn-time concern.
   const rawBin = pathOverride ?? 'codex';
   let cachedBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      return await loadCodexServiceTierCatalog({
+        cliBin: (cachedBin ??= resolveCommand(rawBin)),
+        env: options?.env,
+      });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex',
+    bridgeSpec: codexBridgeSpec,
     mcpGateway: {
       get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
@@ -261,7 +280,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
       if (promptInjection === 'none') {
         assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
       }
@@ -377,6 +396,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // 用户请求的档位。
         baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       }
+      if (serviceTier) {
+        // A root override also covers resume/fork; the splitter below moves it
+        // before the subcommand where launcher-provided -c flags stay active.
+        baseArgs.push('-c', `service_tier=${JSON.stringify(serviceTier)}`);
+      }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
       // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
@@ -434,6 +458,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      const terminalSession = await refreshCodexTerminalSession(pty);
       // Codex's input mode treats every literal \n as Enter. The old path
       // (`send-keys -l` with the whole multi-line blob) therefore submitted
       // each line as its own turn — a single Lark message fragmented into
@@ -471,12 +496,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // Ownership filter for the shared global history.jsonl. An external App
       // Server viewer cannot own the rollout fd: `codex --remote` is merely a
       // second client and the existing App Server holds the actual thread. For
-      // that explicit mode accept ONLY its already-selected thread id. Normal
-      // local terminal sessions keep the PID/rollout ownership filter below.
+      // that explicit mode accept ONLY its already-selected thread id. A local
+      // daemon-backed TUI proves its exact thread through its live footer;
+      // embedded sessions retain the PID/rollout ownership filter.
       const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
         ? pty.cliPid
         : undefined;
-      const expectedRemoteSid = typeof pty.expectedCodexSessionId === 'string'
+      const expectedRemoteSid = terminalSession.kind === 'terminal' ? terminalSession.sessionId
+        : typeof pty.expectedCodexSessionId === 'string'
         && pty.expectedCodexSessionId.trim()
         ? pty.expectedCodexSessionId.trim()
         : undefined;
@@ -486,10 +513,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           ? (sid) => {
             if (!sid) return false;
             const owned = findCodexRolloutSetByPid(cliPid);
-            // set unavailable (enumeration failed) → don't block the submit
-            // confirmation; the worker attach gate re-checks ownership.
-            if (!owned) return true;
+            if (!owned || owned.size === 0) return true;
             return owned.has(sid.toLowerCase());
+          }
+          : undefined;
+      // Positive ownership only: the explicit expected thread, or an owned
+      // rollout set that is available AND contains the line's session. The
+      // empty/unavailable-set and unfiltered acceptances above keep their
+      // submit semantics but never prove that this pane consumed the input.
+      const proveSid: HistorySidProof | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            return !!owned && owned.has(sid.toLowerCase());
           }
           : undefined;
 
@@ -501,7 +539,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
         }
       } catch {
         return { submitted: false };
@@ -510,29 +548,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : { submitted: true };
-        }
+        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+        if (match.found) return historyMatchResult(match, cliPid !== undefined);
         if (!trySendEnter()) return { submitted: false };
       }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : { submitted: true };
-      }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+      if (match.found) return historyMatchResult(match, cliPid !== undefined);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
       const recheck = () => {
-        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid);
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
+        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
+        return late.found ? historyMatchResult(late, cliPid !== undefined) : false;
       };
       return { submitted: false, recheck };
     },
@@ -548,7 +576,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // the update. Keep accepting the composer marker anywhere in a TUI redraw,
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
-    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    readyPattern: /[›»](?!\s*\d+\.)|\d+% left/,
     // 0.153.x paints a skeleton composer before thread initialization. The
     // `›` and two seconds of silence do not prove it can submit yet; history
     // can remain empty throughout bootstrap even when a TUI input is queued.
@@ -614,31 +642,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // mis-fire risk is negligible.
     get skillsDir(): string { return join(codexHome(), 'skills'); },
     // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
-    // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
+    // live 探测成功时只使用 live 目录；live 不可用时以此快照兜底。
     modelChoices: CLI_MODEL_CHOICES['codex'],
-    // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
-    // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
-    // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中
-    // codex 时按需调用，不在 daemon/worker 启动路径上；任何异常（spawn 失败/
-    // 超时/输出非法）一律 fail-soft 返回 null，picker 回退到上面的 modelChoices。
+    // 与保存/启动校验共用真实 binary + env 的能力目录、超时和缓存。
+    detectModelCapabilities,
+
     async detectModels(): Promise<readonly string[] | null> {
-      try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
-        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-        });
-        const models = parseDebugModelsJson(stdout);
-        return models.length > 0 ? models : null;
-      } catch {
-        return null;
-      }
+      return capabilitySlugs(await detectModelCapabilities());
     },
   };
 }
-
-export const create = createCodexAdapter;

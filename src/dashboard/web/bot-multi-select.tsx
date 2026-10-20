@@ -6,6 +6,8 @@ import { useMemo, useState } from 'react';
 export interface BotMultiSelectOption {
   larkAppId: string;
   botName?: string;
+  /** Optional second line replacing the `(appId)` suffix, e.g. what selecting it would change. */
+  hint?: string;
 }
 
 /**
@@ -69,7 +71,7 @@ export function BotMultiSelect(props: {
               />
               <span className="bot-multi-select-main">
                 <strong>{bot.botName ?? bot.larkAppId}</strong>
-                <small>({bot.larkAppId})</small>
+                <small>{bot.hint ?? `(${bot.larkAppId})`}</small>
               </span>
             </label>
           ))}

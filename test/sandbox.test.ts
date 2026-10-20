@@ -9,9 +9,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -197,6 +197,7 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       sessionId: 'binlink', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
+      tempDir: join(dir, 'session-temp'),
     });
     // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
     // only assert the canonicalization when it actually produced a plan.
@@ -207,7 +208,72 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     expect(execTarget).toBe(realpathSync(linkBin)); // canonical, not the lexical symlink
     expect(execTarget).not.toBe(linkBin);
     expect(r.args.slice(dashDash + 2)).toEqual(['--v']); // cliArgs preserved verbatim
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) {
+      const index = r.args.indexOf(key);
+      expect(index).toBeGreaterThan(0);
+      expect(r.args[index - 1]).toBe('--setenv');
+      expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
+    }
     r.cleanup();
+  });
+});
+
+describe('prepareDirectSandbox mcode data alias', () => {
+  function fixture() {
+    const root = mkdtempSync(join(tmpdir(), 'sbx-mcode-alias-'));
+    const data = join(root, 'native-data');
+    mkdirSync(data);
+    const target = realpathSync(data);
+    const lexicalHome = join(root, 'lexical-home');
+    symlinkSync(root, lexicalHome);
+    const alias = join(lexicalHome, 'native-data');
+    const opts = { sessionId: 'mcode-alias', dataDir: join(root, 'botmux'),
+      policy: { rules: [{ path: target, access: 'readWrite' as const, source: 'internal' as const }], net: true, writeRegexes: [] },
+      chdir: target, home: root, cliBin: '/bin/true', cliArgs: [] };
+    return { root, target, alias, opts };
+  }
+  it.each([false, true])('preserves only the granted native data alias (args file: %s)', useBwrapArgsFile => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
+      if (!plan) return;
+      const args = plan.argsFile ? readFileSync(plan.argsFile, 'utf8').split('\0') : plan.args;
+      const aliasAt = args.findIndex((arg, i) => arg === '--symlink' && args[i + 2] === f.alias);
+      expect(aliasAt).toBeGreaterThan(-1);
+      expect(args[aliasAt + 1]).toBe(f.target);
+      const bindAt = args.findIndex((arg, i) => arg === '--bind' && args[i + 1] === f.target);
+      expect(bindAt).toBeGreaterThan(aliasAt);
+      expect(args[bindAt + 2]).toBe(f.target);
+      // No host bind of the lexical home or additional credential directory.
+      expect(args.filter((arg, i) => ['--bind', '--ro-bind'].includes(args[i - 1])).includes(f.alias)).toBe(false);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each([false, true])('does not add an alias for other CLIs or a canonical data path: %s', canonical => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
+      if (!plan) return;
+      expect(plan.args).not.toContain(f.alias);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each(['missing', 'parent-only', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    const baseline = prepareDirectSandbox(f.opts);
+    try {
+      if (!baseline) return;
+      baseline.cleanup();
+      const rules = scenario === 'missing' ? [] : scenario === 'parent-only'
+        ? [{ path: dirname(f.target), access: 'readWrite' as const, source: 'user' as const }]
+        : [...f.opts.policy.rules,
+        { path: scenario === 'denied' ? f.target : f.alias, access: 'deny' as const, source: 'user' as const }];
+      expect(() => prepareDirectSandbox({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
+      expect(existsSync(join(f.opts.dataDir, 'sandboxes', f.opts.sessionId))).toBe(false);
+    } finally { baseline?.cleanup(); rmSandboxScratch(f.root); }
   });
 });
 
@@ -287,6 +353,48 @@ describe('prepareDirectSandbox tmux argument transport', () => {
 });
 
 
+describe('sandbox tree across a detach-style worker exit', () => {
+  it('outlives the worker only for a persistent pane that owns a tree', () => {
+    for (const backendType of ['tmux', 'zellij', 'herdr', 'zmx']) {
+      expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType, persistentSessionName: 'bmx-1' })).toBe(true);
+    }
+    // PTY owns its CLI: it dies with the worker, so its tree is cleaned up.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'pty', persistentSessionName: 'bmx-1' })).toBe(false);
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'tmux', persistentSessionName: undefined })).toBe(false);
+    // Unsandboxed: nothing to keep.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: false, backendType: 'tmux', persistentSessionName: 'bmx-1' })).toBe(false);
+  });
+
+  it('re-serves the outbox a live pane bound and never recreates a lost one', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-reattach-'));
+    const sessionId = 'live-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const outbox = join(sessionRoot, 'outbox');
+    try {
+      // Tree without its outbox (the pane's bind source is gone): a new
+      // directory would be an inode the pane can never see.
+      mkdirSync(join(sessionRoot, 'empties'), { recursive: true });
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      expect(existsSync(outbox)).toBe(false);
+      // A symlinked outbox is not the directory the pane bound either.
+      const elsewhere = join(root, 'elsewhere');
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, outbox);
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      rmSync(outbox);
+      // The preserved outbox is handed back as-is.
+      mkdirSync(outbox);
+      const inode = statSync(outbox).ino;
+      const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+      expect(plan?.outbox).toBe(join(realpathSync(root), 'sandboxes', sessionId, 'outbox'));
+      expect(statSync(plan!.outbox).ino).toBe(inode);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
+
 describe('sandbox tree cleanup', () => {
   it.each(['reattach', 'sweep'] as const)('removes a mode-000 mask during %s cleanup', method => {
     if (process.platform !== 'linux') return;
@@ -295,6 +403,7 @@ describe('sandbox tree cleanup', () => {
     const sessionRoot = join(root, 'sandboxes', sessionId);
     const empty = join(sessionRoot, 'empty');
     mkdirSync(empty, { recursive: true });
+    mkdirSync(join(sessionRoot, 'outbox'));
     chmodSync(empty, 0o000);
     try {
       if (method === 'reattach') {
@@ -342,7 +451,7 @@ describe('sandbox tree cleanup', () => {
     const sessionId = 'closed-session';
     const sessionRoot = join(root, 'sandboxes', sessionId);
     const outside = join(root, 'outside');
-    mkdirSync(sessionRoot, { recursive: true });
+    mkdirSync(join(sessionRoot, 'outbox'), { recursive: true });
     mkdirSync(outside);
     writeFileSync(join(outside, 'keep'), 'host data');
     symlinkSync(outside, join(sessionRoot, 'empty'));
@@ -385,6 +494,7 @@ describe('validateRelayRequest', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
+      completionProposalFile: 'c.completion-proposal.json',
       attachments: ['a.png'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
@@ -394,6 +504,7 @@ describe('validateRelayRequest', () => {
     if (!r.ok) return;
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
+    expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
     expect(r.value.attachmentNames).toEqual(['a.png']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
@@ -492,6 +603,18 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
   });
 
+  it('allows final schedule self-removal through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: {
+        flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+      },
+    });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
@@ -577,6 +700,7 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videos: ['../secret.mp4'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);

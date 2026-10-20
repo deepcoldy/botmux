@@ -2,6 +2,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { isRemoteBackendId } from './remote-cli-ids.js';
 
 export type AgentSessionRenameRequest =
   | { status: 'requested'; cliId: CliId }
@@ -36,9 +37,9 @@ export function requestAgentSessionRename(
 
   // A remote backend's write() creates one remote turn/task per call, so a TUI
   // command split into text + Enter would create two unrelated ones. Neither
-  // riff nor mojo has a local TUI to rename anyway.
+  // remote backends have no local TUI to rename anyway.
   const renameBackend = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (renameBackend === 'riff' || renameBackend === 'mojo') {
+  if (renameBackend && isRemoteBackendId(renameBackend)) {
     return { status: 'unsupported', ...(cliId ? { cliId } : {}) };
   }
 

@@ -126,7 +126,7 @@ export function isBridgeNothingToSendFinal(finalText: string | undefined): boole
  *  (current or legacy). Used to tell "model deliberately terminated with the
  *  sentinel" apart from a normal answer that merely mentions the token inline
  *  or has prose after it. */
-function hasTrailingBridgeSentinelLine(finalText: string): boolean {
+export function hasTrailingBridgeSentinelLine(finalText: string): boolean {
   const lines = finalText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -193,9 +193,21 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
  *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
  *  one place and is unit-tested directly. codex-app does not use adopt and drives
  *  its own strip on the deliverable content path. */
+export function hasUserVisibleText(text: string): boolean {
+  // String.trim() deliberately does not remove Unicode format controls. A
+  // Remote Runner final containing only U+200B therefore used to produce a
+  // footer-only Lark card. Ignore Unicode whitespace and Cf controls for the
+  // visibility predicate, but preserve the original bytes whenever any real
+  // text remains (for example an emoji ZWJ sequence still has visible bases).
+  return String(text ?? '').replace(/[\p{White_Space}\p{Cf}]/gu, '').length > 0;
+}
+
 export function bridgePostText(finalText: string, adoptMode: boolean): string {
   const withoutMemoryCitation = stripTrailingOaiMemoryCitation(finalText);
-  return adoptMode ? withoutMemoryCitation : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  const postText = adoptMode
+    ? withoutMemoryCitation
+    : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  return hasUserVisibleText(postText) ? postText : '';
 }
 
 export interface BridgeSendMarker {
@@ -204,8 +216,18 @@ export interface BridgeSendMarker {
   responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
+  /** The last user-visible carrier left by this send. The daemon uses this
+   *  positive evidence at turn_terminal to PATCH a normal BotMux reply card
+   *  in place, while files/voice/custom cards deliberately fall back to a
+   *  separate compact terminal strip. Older markers omit the field and simply
+   *  degrade to the live streaming-card terminal state. */
+  terminalCarrier?: 'standard_reply_card' | 'non_patchable';
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  /** The send is explicitly an interim side effect and must never stand in for
+   * the turn's eventual final/failure delivery. Remote Runner outbound_message
+   * uses this while ordinary historical `botmux send` keeps its old heuristic. */
+  terminalIndependent?: true;
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
@@ -219,6 +241,11 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
+  /** Exact BotMux turn identity. Headless backends may not have a transcript
+   * mark time, so a delivered final marker can still deduplicate by this
+   * stronger correlation (including the durable dispatch attempt). */
+  turnId?: string;
+  dispatchAttempt?: number;
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
    *  "never suppress" in that case. */
@@ -229,6 +256,12 @@ export interface BridgeGateInput {
   /** Zero-injection sessions forward real terminal answers through the same
    * delivery channel. Keep local attribution for failure/empty-turn filtering. */
   forwardLocalFinal?: boolean;
+  /** A Claude Code built-in scheduled turn (CronCreate fire). It is attributed
+   *  as a local turn (no Lark fingerprint) but its final is auto-forwarded
+   *  into the originating Lark thread, so it must bypass the ambient
+   *  local-typing suppression — while the NOTHING_TO_SEND check above and the
+   *  send-marker dedup below still apply exactly as for ordinary turns. */
+  isScheduled?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -365,13 +398,30 @@ export function shouldSuppressBridgeEmit(
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
-  if (turn.isLocal && !turn.forwardLocalFinal) return true;
+  // Built-in scheduled turns are isLocal but user-scheduled: their final
+  // belongs in the Lark thread. The marker rules below still dedup an explicit
+  // `botmux send` and the NOTHING_TO_SEND check above already ran.
+  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
+  // Headless backends (notably Remote Runner) do not always own a transcript
+  // mark window. An exact delivered final marker is stronger than timestamp
+  // attribution and survives provider completion latency / host recovery.
+  // Keep the dispatch attempt in the identity so a stale durable retry cannot
+  // suppress a later attempt of the same logical turn.
+  if (turn.turnId && markers.some(marker => marker.turnId === turn.turnId
+      && marker.dispatchAttempt === turn.dispatchAttempt
+      && marker.terminalIndependent !== true
+      && isFinalBridgeSendMarker(marker)
+      && (marker.replyCardResponseKind === undefined
+        || marker.replyCardResponseKind === 'final'))) {
+    return true;
+  }
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
+    && m.terminalIndependent !== true);
   // An explicit `botmux send --response-kind final` already delivered this
   // turn's final answer to Lark. The unified-reply path also writes
   // replyCardResponseKind='final'; the plain (non-unified) path writes only
@@ -385,6 +435,14 @@ export function shouldSuppressBridgeEmit(
   }
   const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
     || m.replyCardResponseKind === 'final');
+  // A built-in scheduled turn whose final text hasn't been read yet must not be
+  // declared "already delivered" on a progress/legacy marker alone: that marker
+  // may be a short progress note followed by the real (materially longer)
+  // final, and suppressing here would swallow it before the length comparison
+  // can run. Defer — the caller re-evaluates WITH finalText. An explicit
+  // responseKind:'final' marker above already returned true, so a declared
+  // final send still dedups even pre-text.
+  if (turn.isScheduled && turn.finalText === undefined) return false;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:
@@ -429,9 +487,9 @@ export function shouldSuppressBridgeEmit(
  * visible outcome. Emit a diagnostic fallback only for that narrow case.
  *
  * Scope note (shared path): this gate feeds worker.ts:emitReadyCodexTurns,
- * which is shared by every structured-bridge CLI (Codex / Traex / Cursor / Pi /
- * Grok / Hermes / Mtr / Coco). In practice only two of them can produce an
- * empty-finalText `assistant_final` that reaches here:
+ * which is shared by every structured-bridge CLI (Codex / Traex / Cursor /
+ * Antigravity / Pi / Grok / Hermes / Mtr / Coco). In practice only two of
+ * them can produce an empty-finalText `assistant_final` that reaches here:
  *   - Traex — `task_complete` with an empty `last_agent_message`
  *     (terminalStatus undefined → treated as completed below);
  *   - Grok  — `turn_completed` + stop_reason `end_turn` where the post-tool
@@ -479,29 +537,47 @@ export function shouldEmitFailedBridgeFallback(
   // also reports a failed terminal. Never turn that internal token into visible
   // failure content.
   if (isBridgeNothingToSendFinal(turn.finalText)) return false;
-  // A progress/final send only proves that some user-facing content was already
-  // delivered; it cannot replace the structured terminal failure reason. The
-  // existing delivery path uses the current turn's stable key for deduplication.
+  // Keep the structured failure as an execution fact. The opt-in delivery gate
+  // below may suppress its notification after an exact explicit final, but
+  // progress and legacy sends must never replace the terminal failure reason.
   return true;
 }
 
-/** Failure fallbacks are terminal diagnostics, not another model answer. Only
- * bypass marker-based suppression; preserve deliberate silence and the existing
- * local/adopt ownership gates. Non-failure output keeps the ordinary gate. */
+/** Failure fallbacks are terminal diagnostics, not another model answer. Do not
+ * apply the ordinary length/preview heuristic to them. By default only the
+ * adopt / isLocal / bare-sentinel gates apply. The experimental opt-in
+ * additionally treats an acknowledged, explicit final for this exact
+ * turn/attempt as making the notice redundant; it trusts that final and does
+ * not compare it with later transcript text.
+ * Execution status and retry accounting remain independent of notification. */
 export function shouldSuppressStructuredFallback(
   fallbackKind: StructuredFallbackKind,
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
-  /** failed 走下面的 mode-agnostic 三门禁，用不到它；non-failed 必须透传，
+  /** failed 走下面的 mode-agnostic 门禁，用不到它；non-failed 必须透传，
    *  否则 transcript 下的重复判定会退回 send 缺省的「明显更长才放行」。 */
   replyDelivery: 'send' | 'transcript' = 'send',
+  /** 实验性、默认关闭（per-bot `suppressDeliveredFinalFailureNotice`）。只有显式
+   *  true 才启用下面的「已送达 final」门禁；缺省与旧行为逐字一致。 */
+  suppressDeliveredFinalFailureNotice = false,
 ): boolean {
   if (fallbackKind !== 'failed') {
     return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
   }
-  return adoptMode || Boolean(turn.isLocal) || isBridgeNothingToSendFinal(turn.finalText);
+  if (adoptMode || turn.isLocal || isBridgeNothingToSendFinal(turn.finalText)) return true;
+  if (suppressDeliveredFinalFailureNotice !== true) return false;
+  if (!turn.turnId || turn.markTimeMs === undefined) return false;
+  const lower = turn.markTimeMs;
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  return markers.some(marker => isFinalBridgeSendMarker(marker)
+    && typeof marker.messageId === 'string' && marker.messageId.trim().length > 0
+    && marker.turnId === turn.turnId
+    && marker.dispatchAttempt === turn.dispatchAttempt
+    && marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && marker.terminalIndependent !== true
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
 }
 
 /** Compose a failed-turn diagnostic without replaying partial text that the
@@ -545,8 +621,8 @@ export function structuredFallbackKind(
 ): StructuredFallbackKind {
   const rateLimitHandled = hasDedicatedRateLimitChain
     && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
-  // failed 判定在 #1337 之后是 mode-agnostic 的（恒开，只留 adopt / isLocal /
-  // 裸 sentinel 三道门禁，不读 markers），所以这里不传 replyDelivery。
+  // Failure classification is mode-agnostic. Delivery suppression is a separate
+  // decision below the caller's composition step; do not erase failure facts.
   if (!rateLimitHandled
     && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
     return 'failed';

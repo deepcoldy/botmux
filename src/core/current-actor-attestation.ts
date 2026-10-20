@@ -1,12 +1,17 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } from '../cli/current-actor.js';
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import {
+  PROC_STAT_STARTTIME_INDEX,
+  procStatFieldsAfterComm,
+  procStatStartTimeDigits,
+} from '../utils/proc-stat.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -22,11 +27,7 @@ export type LoopbackPeerResolution =
 function readProcStart(pid: number, procRoot: string): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   try {
-    const raw = readFileSync(join(procRoot, String(pid), 'stat'), 'utf8');
-    const closeParen = raw.lastIndexOf(')');
-    if (closeParen < 0) return undefined;
-    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-    return /^\d+$/.test(fields[19] ?? '') ? fields[19] : undefined;
+    return procStatStartTimeDigits(readFileSync(join(procRoot, String(pid), 'stat'), 'utf8'));
   } catch { /* use the hardened ps fallback below when procfs is unavailable */ }
   if (procRoot !== '/proc') return undefined;
   const ps = ['/usr/bin/ps', '/bin/ps'].find(existsSync);
@@ -130,6 +131,26 @@ export function resolveLoopbackPeerProcesses(input: {
     : { ok: false, reason: 'peer_unresolved' };
 }
 
+/** Codex keeps its native tool dispatcher alive across turns. It is part of
+ * the attested engine, not an old user command. Never recognize it from argv
+ * alone: require a direct attested Codex parent and the release sibling exe. */
+function isNativeCodexToolHost(
+  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+): boolean {
+  if (!trustedRootPids.has(parent)) return false;
+  try {
+    const parentExe = readlinkSync(join(procRoot, String(parent), 'exe'));
+    const hostExe = readlinkSync(join(procRoot, String(pid), 'exe'));
+    const cmdline = readFileSync(join(procRoot, String(pid), 'cmdline'), 'utf8');
+    const argv = cmdline.endsWith('\0') ? cmdline.slice(0, -1).split('\0') : [];
+    return basename(parentExe) === 'codex'
+      && hostExe === join(dirname(parentExe), 'codex-code-mode-host')
+      && argv.length === 1 && argv[0].length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
   trustedRootPids: ReadonlySet<number>;
@@ -141,12 +162,18 @@ function peerBelongsToCurrentTurn(input: {
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (input.trustedRootPids.has(pid)) return true;
     try {
-      const raw = readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8');
-      const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
+      const fields = procStatFieldsAfterComm(readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8'));
+      if (!fields) return false;
       const parent = Number(fields[1]);
-      const started = fields[19];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')
-        || input.preexistingProcessIdentities.has(`${pid}:${started}`)) return false;
+      const started = fields[PROC_STAT_STARTTIME_INDEX];
+      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return false;
+      if (input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
+        // Only traverse the native dispatcher as an ancestor of a new tool.
+        // It cannot itself claim this turn, nor can old tool descendants.
+        if (pid === input.peer.pid
+          || !isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids)
+          || readProcStart(pid, input.procRoot) !== started) return false;
+      }
       pid = parent;
     } catch {
       return false;
@@ -163,6 +190,7 @@ export interface CurrentTurnPeerAttestation {
   ds: DaemonSession;
   turnId: string;
   generation: number;
+  dispatchAttempt?: number;
   callerOpenId: string;
   capability: string;
   cliPid?: number;
@@ -174,6 +202,10 @@ export interface CurrentTurnPeerAttestation {
   expectedScheduledTurnId?: string;
   processIdentities: string[];
 }
+
+export type CurrentExecutionPeerAttestation = Omit<CurrentTurnPeerAttestation, 'callerOpenId'> & {
+  callerOpenId?: string;
+};
 
 export interface CurrentTurnPeerAttestationInput {
   sessionId: string;
@@ -190,13 +222,14 @@ export interface CurrentTurnPeerAttestationInput {
  * host-session lineage proof (no rotating capability, no channel env) has a
  * single source of truth.
  */
-export function attestCurrentTurnLoopbackPeer(
+export function attestCurrentExecutionLoopbackPeer(
   input: CurrentTurnPeerAttestationInput,
-): CurrentTurnPeerAttestation | null {
+): CurrentExecutionPeerAttestation | null {
   const procRoot = input.procRoot ?? '/proc';
   const ds = input.findSession(input.sessionId);
   const turnId = ds?.managedTurnOrigin?.turnId;
   const generation = ds?.workerGeneration;
+  const dispatchAttempt = ds?.managedTurnOrigin?.dispatchAttempt;
   const attestation = ds?.localProcessAttestation;
   const cliPid = attestation?.cliPid;
   const cliProcStart = attestation?.cliProcStart;
@@ -219,7 +252,8 @@ export function attestCurrentTurnLoopbackPeer(
     || ((enginePid === undefined) !== (engineProcStart === undefined))
     || (cliPid === undefined && enginePid === undefined)
     || !processIdentities || processIdentities.length === 0
-    || !callerOpenId?.startsWith('ou_') || !capability
+    || !capability
+    || (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0))
     || (cliPid !== undefined
       && readProcStart(cliPid, procRoot) !== cliProcStart)
     || (enginePid !== undefined
@@ -252,12 +286,23 @@ export function attestCurrentTurnLoopbackPeer(
   }
   return {
     ds, turnId, generation, callerOpenId, capability,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),
     processIdentities: [...processIdentities],
   };
+}
+
+/** Human identity remains a separate requirement for actor and authorization
+ * callers. Machine-triggered executions can prove their lineage without it. */
+export function attestCurrentTurnLoopbackPeer(
+  input: CurrentTurnPeerAttestationInput,
+): CurrentTurnPeerAttestation | null {
+  const proof = attestCurrentExecutionLoopbackPeer(input);
+  if (!proof || typeof proof.callerOpenId !== 'string' || !proof.callerOpenId.startsWith('ou_')) return null;
+  return { ...proof, callerOpenId: proof.callerOpenId };
 }
 
 /** Re-run the peer attestation and confirm the live turn is byte-for-byte the
@@ -271,6 +316,7 @@ export function currentTurnPeerAttestationStable(
   return !!again
     && again.ds === frozen.ds && again.turnId === frozen.turnId
     && again.generation === frozen.generation && again.callerOpenId === frozen.callerOpenId
+    && again.dispatchAttempt === frozen.dispatchAttempt
     && again.capability === frozen.capability && again.cliPid === frozen.cliPid
     && again.cliProcStart === frozen.cliProcStart && again.workerPid === frozen.workerPid
     && again.workerProcStart === frozen.workerProcStart

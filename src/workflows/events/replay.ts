@@ -34,7 +34,6 @@ import type {
   RunCanceledEvent,
   RunCreatedEvent,
   RunFailedEvent,
-  RunStartedEvent,
   RunSucceededEvent,
   WaitCreatedEvent,
   WaitDeadlineExceededEvent,

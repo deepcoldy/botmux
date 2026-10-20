@@ -1,5 +1,5 @@
 import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 
 /**
  * Spawn one of botmux's own entry modules (daemon / core-only / worker /
@@ -29,12 +29,13 @@ import { join, dirname } from 'node:path';
 
 export type BotmuxEntry =
   | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
-  | 'plugin-supervisor'
+  | 'plugin-supervisor' | 'sandbox-network-runner' | 'program-status-relay'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
-  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner';
+  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
+  | 'minimax-runner' | 'lark-tool-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -44,10 +45,14 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
   'plugin-supervisor': '__plugin-supervisor',
+  'sandbox-network-runner': '__sandbox-network-runner',
+  'program-status-relay': '__program-status-relay',
   'codex-app-runner': '__codex-app-runner',
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
   'mir-runner': '__mir-runner',
+  'minimax-runner': '__minimax-runner',
+  'lark-tool-runner': '__lark-tool-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -58,10 +63,14 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
   'plugin-supervisor': 'index-plugin-supervisor.js',
+  'sandbox-network-runner': 'sandbox-network-runner.js',
+  'program-status-relay': 'program-status-relay.js',
   'codex-app-runner': 'codex-app-runner.js',
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',
   'mir-runner': 'mir-runner.js',
+  'minimax-runner': 'minimax-runner.js',
+  'lark-tool-runner': 'lark-tool-runner.js',
 };
 
 /**
@@ -82,7 +91,8 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  * → dist filename) rather than checking one and assuming the rest.
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
-  'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
+  'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner',
+  'lark-tool-runner',
 ] as const;
 
 /**

@@ -42,6 +42,26 @@ export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
+ * Where a person's credentials come from.
+ *
+ * - `auto` (default): ask the central platform first when this machine is
+ *   bound to one; otherwise, or when the platform knows nothing about the
+ *   person, fall back to the per-person HOME on this machine. A bound machine
+ *   never STARTS a local device login on its own — the person is pointed at
+ *   the platform, so one authorization serves every machine.
+ * - `platform`: platform only. An unbound machine, or an unreachable platform,
+ *   refuses the call. For deployments that require central audit.
+ * - `local`: today's behaviour — per-person HOME on this machine only, the
+ *   platform is never consulted. The open-source default when unbound.
+ *
+ * Deliberately a separate field from `credentialsSourceDir` (the per-bot Claude
+ * login directory): that one is the BOT's model account, this one is the
+ * trigger PERSON's tool credentials.
+ */
+export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
+export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+
+/**
  * Policy intent for a sender who has not authorized this tool.
  *
  * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
@@ -63,6 +83,10 @@ export interface TriggerUserAuthConfig {
   /** Tools this applies to. Empty means the policy is inert. */
   tools: TriggerUserAuthTool[];
   fallback: TriggerUserAuthFallback;
+  /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
+   *  it; it is optional on the type only so hand-built configs (tests, legacy
+   *  callers) keep compiling — read it through {@link credentialSourceOf}. */
+  credentialSource?: TriggerUserAuthCredentialSource;
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -192,6 +216,17 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     fallback = rec.fallback as TriggerUserAuthFallback;
   }
 
+  let credentialSource: TriggerUserAuthCredentialSource = 'auto';
+  if (rec.credentialSource !== undefined && rec.credentialSource !== null) {
+    if (!(TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(rec.credentialSource)) {
+      throw new TriggerUserAuthConfigError(
+        `triggerUserAuth.credentialSource must be one of ${TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ')}`
+        + ` (got ${JSON.stringify(rec.credentialSource)})`,
+      );
+    }
+    credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
+  }
+
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -202,6 +237,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     enabled,
     tools,
     fallback,
+    credentialSource,
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
@@ -236,6 +272,13 @@ function optionalHttpsUrl(value: unknown, field: string): string | undefined {
     );
   }
   return value;
+}
+
+/** The effective credential source; absent means `auto`. */
+export function credentialSourceOf(
+  config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
+): TriggerUserAuthCredentialSource {
+  return config?.credentialSource ?? 'auto';
 }
 
 /** Whether this policy governs `tool` right now. */

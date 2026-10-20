@@ -24,6 +24,7 @@ import { type Locale, t } from '../../i18n/index.js';
 import { scheduleTimeZone } from '../../utils/timezone.js';
 import { getMessageChatId as defaultGetMessageChatId } from './client.js';
 import type { CardActionData } from './card-handler.js';
+import { DASH_PAGE_SIZE, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 import { STREAM_STATUS_TEMPLATE_ICON, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 
 export const GROUP_SESSIONS_ACTION_REFRESH = 'group_sessions_refresh' as const;
@@ -31,7 +32,6 @@ export const GROUP_SESSIONS_ACTION_PAGE = 'group_sessions_page' as const;
 export const GROUP_SESSIONS_ACTION_LOCATE = 'group_sessions_locate' as const;
 export const GROUP_SESSIONS_ACTION_RESUME = 'group_sessions_resume' as const;
 
-const PAGE_SIZE = 5;
 const GROUP_SESSIONS_ACTIONS = new Set<string>([
   GROUP_SESSIONS_ACTION_REFRESH,
   GROUP_SESSIONS_ACTION_PAGE,
@@ -54,14 +54,6 @@ export function filterGroupSessions(
     && row.chatId === scope.chatId
     && row.scope === 'thread',
   );
-}
-
-function escapeLarkMd(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
 }
 
 function statusIcon(status: string): string {
@@ -134,7 +126,7 @@ export function buildGroupSessionsCard(
 ): string {
   const filtered = filterGroupSessions(rawRows, opts);
   const sortedRows = sortByStatus(composeEntries(filtered)).map(entry => entry.raw);
-  const { items, meta } = paginate(sortedRows, opts.page, PAGE_SIZE);
+  const { items, meta } = paginate(sortedRows, opts.page, DASH_PAGE_SIZE);
   const activeCount = filtered.filter(row => row.status !== 'closed').length;
   const closedCount = filtered.length - activeCount;
   const elements: unknown[] = [{
@@ -281,10 +273,7 @@ export interface GroupSessionsCardHandlerDeps extends DashboardAdminLookupDeps {
   nowMs?: () => number;
 }
 
-export interface GroupSessionsCardHandlerResult {
-  toast?: { type: 'info' | 'success' | 'error'; content: string };
-  card?: { type: 'raw'; data: Record<string, unknown> };
-}
+export type GroupSessionsCardHandlerResult = DashCardHandlerResult;
 
 function info(key: string, locale: Locale): GroupSessionsCardHandlerResult {
   return { toast: { type: 'info', content: t(key, undefined, locale) } };
@@ -367,6 +356,7 @@ export async function handleGroupSessionsCardAction(
       });
       if (response.status !== 200 || (response.body as { ok?: boolean } | undefined)?.ok !== true) {
         const reason = String((response.body as Record<string, unknown> | undefined)?.error ?? `http_${response.status}`);
+        if (reason === 'workspace_retired') return error('card.action.resume_workspace_retired', undefined, locale);
         return error('card.group_sessions.resume_failed', { reason }, locale);
       }
       const refreshed = await getScopedRows(client, { larkAppId, chatId }, locale);

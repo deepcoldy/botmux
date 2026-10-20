@@ -65,8 +65,8 @@ const INTERACTIVE_MENU_RULES: readonly ScreenRule[] = [
   { id: 'interactive_menu:trust_files', re: /trust the files/i },
   { id: 'interactive_menu:trust_this_folder', re: /trust this folder/i },
   { id: 'interactive_menu:trust_and_continue', re: /trust and continue/i },
-  // 行首编号选择光标
-  { id: 'interactive_menu:numbered_cursor', re: /(?:^|[\n\r])\s*[›❯]\s*\d+\s*[.)]/ },
+  // 行首编号选择光标（» 是 codex ≥0.154 画的选中光标）
+  { id: 'interactive_menu:numbered_cursor', re: /(?:^|[\n\r])\s*[›❯»]\s*\d+\s*[.)]/ },
 ];
 
 const DRAFT_PARKED_RULES: readonly ScreenRule[] = [

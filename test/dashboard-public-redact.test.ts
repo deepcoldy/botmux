@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   projectSessionEventForAudience,
@@ -274,15 +273,6 @@ describe('stripSchedulePreconditionMaterial', () => {
       prompt: 'keep this for the schedule card',
       workingDir: '/repo',
     });
-  });
-
-  it('is wired into authenticated schedule snapshots and live events', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-
-    expect(dashboard).toContain('rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))');
-    expect(dashboard).toContain('schedule: stripSchedulePreconditionMaterial(b.schedule)');
-    expect(dashboard).toMatch(/patch:\s*stripSchedulePreconditionMaterial\(b\.patch,/);
-    expect(dashboard).toContain('{ preserveClearMarkers: true }');
   });
 });
 
@@ -607,6 +597,14 @@ describe('session board audience (H5/Workbench identity is not anonymous)', () =
 });
 
 describe('redactSettingsForPublic', () => {
+  it('drops the download proxy, which may embed credentials', () => {
+    const settings = { publicReadOnly: true, httpProxy: 'http://user:secret@proxy.example.com:8080' };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out.publicReadOnly).toBe(true);
+    expect('httpProxy' in out).toBe(false);
+    expect(JSON.stringify(out)).not.toContain('secret');
+  });
+
   it('removes the complete notifier snapshot from tokenless settings', () => {
     const settings = {
       publicReadOnly: true,

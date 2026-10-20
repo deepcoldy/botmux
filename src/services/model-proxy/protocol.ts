@@ -13,7 +13,7 @@ const message = z.discriminatedUnion('role', [
   z.object({ role: z.literal('system'), content, name: name.optional() }).strict(),
   z.object({ role: z.literal('developer'), content, name: name.optional() }).strict(),
   z.object({ role: z.literal('user'), content, name: name.optional() }).strict(),
-  z.object({ role: z.literal('assistant'), content: content.nullable().optional(), name: name.optional(), tool_calls: z.array(call).min(1).max(16).optional() }).strict(),
+  z.object({ role: z.literal('assistant'), content: content.nullable().optional(), name: name.optional(), tool_calls: z.array(call).min(1).optional() }).strict(),
   z.object({ role: z.literal('tool'), content, tool_call_id: z.string().min(1).max(128) }).strict(),
 ]);
 const tool = z.object({ type: z.literal('function'), function: z.object({ name, description: z.string().optional(), parameters: z.record(z.unknown()), strict: z.boolean().optional() }).strict() }).strict();
@@ -94,7 +94,7 @@ export function completionResponse(request: ChatRequest, result: InvocationResul
   if (result.state !== 'completed' || !matchesSchema(result.output, completionEnvelope)) throw new ProxyError(502, 'invalid_model_output');
   const output = result.output as { content: string; tool_calls: Array<{ name: string; arguments: string }> };
   const tools = new Map((request.tools ?? []).map(t => [t.function.name, t.function.parameters]));
-  if (output.tool_calls.length > 16 || (request.parallel_tool_calls === false && output.tool_calls.length > 1)
+  if ((request.parallel_tool_calls === false && output.tool_calls.length > 1)
     || (request.tool_choice === 'none' && output.tool_calls.length)
     || ((request.tool_choice === 'required' || typeof request.tool_choice === 'object') && !output.tool_calls.length)) throw new ProxyError(502, 'tool_choice_violation');
   const toolCalls = output.tool_calls.map((c, i) => {

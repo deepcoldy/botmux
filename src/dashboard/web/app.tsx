@@ -31,7 +31,19 @@ import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
-import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
+import {
+  updateAndRestartBotmux,
+  type BotmuxUpdatePhase,
+  type BinaryUpdateStatus,
+  type UpdateStatusSnapshot,
+  type OtherUpdateState,
+  updateActionErrorCode,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  pollUpdateStatus,
+  binaryProgressRingValue,
+  binaryProgressText,
+} from './update-action.js';
 import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
@@ -70,6 +82,9 @@ type BotmuxUpdateStatus = {
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
   runningDaemons?: Array<{ larkAppId: string; version?: string }>;
   runningDaemonRestartHint?: string;
+  // Present on backends that report live binary-download progress.
+  updateInFlight?: boolean;
+  binaryUpdate?: BinaryUpdateStatus | null;
 };
 
 type NavItem = {
@@ -94,8 +109,10 @@ const MANAGE_ROUTES = [
   'roles',
   'role-profiles',
   'bot-defaults',
+  'agents',
   'skills',
   'customization',
+  'doc-watches',
   'message-listeners',
   'plugins',
   'team',
@@ -103,6 +120,7 @@ const MANAGE_ROUTES = [
   'insights',
   'feedback',
   'whiteboards',
+  'terminal',
 ];
 
 const NAV_ITEMS: NavItem[] = [
@@ -170,13 +188,16 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
   { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
-  { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
+  { id: 'doc-watches', href: '#/doc-watches', labelKey: 'nav.docWatches', manage: true, icon: <><path d="M3.2 2.2h6.2l3.4 3.4v8.2H3.2z" /><path d="M9.2 2.4v3.4h3.4" /><path d="M5.4 9h4M5.4 11.2h2.6" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
+  { id: 'agents', href: '#/agents', labelKey: 'nav.agents', manage: true, icon: <><rect x="1.8" y="2.6" width="5.2" height="4.4" rx="1.4" /><rect x="9" y="1.8" width="5.2" height="3.6" rx="1.2" /><rect x="9" y="10.6" width="5.2" height="3.6" rx="1.2" /><path d="M7 4.8c1.2 0 1.2-1.2 2-1.2M7 4.8c1.4 0 .6 7.6 2 7.6" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
   { id: 'customization', href: '#/customization', labelKey: 'nav.customization', manage: true, icon: <><path d="M11.5 2.5l2 2-7 7-2.6.6.6-2.6z" /><path d="M2.5 13.5h5" /></> },
   { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
+  // 宿主网页终端：本机 shell / tmux / herdr。只给本机 owner（ui.hostTerminal），客户端壳里不出现。
+  { id: 'terminal', href: '#/terminal', labelKey: 'nav.terminal', manage: true, icon: <><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.8" /><path d="M4.4 6.2l2.2 1.8-2.2 1.8M8 10.6h3.4" /></> },
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
 ];
 
@@ -188,10 +209,10 @@ const NAV_ITEMS: NavItem[] = [
  */
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
-  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
-  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'bot-defaults'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
+  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
-  { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
+  { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];
 
 let pinnedPluginNavItems: NavItem[] = [];
@@ -243,9 +264,13 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 }
 
 function sidebarNavItems(): NavItem[] {
-  const builtInItems = readDashboardClientShell()
-    ? NAV_ITEMS.filter(item => item.id !== 'workflows')
-    : NAV_ITEMS;
+  const clientShell = readDashboardClientShell();
+  const builtInItems = NAV_ITEMS.filter(item => {
+    if (clientShell && item.id === 'workflows') return false;
+    // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
+    if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
+    return true;
+  });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
   const pluginIndex = builtInItems.findIndex(item => item.id === 'plugins');
   if (pluginIndex < 0) return [...builtInItems, ...pinnedPluginNavItems];
@@ -632,6 +657,8 @@ function TopbarVersionControl(props: {
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
   const [progress, setProgress] = useState(0);
+  const [binaryStatus, setBinaryStatus] = useState<BinaryUpdateStatus | null>(null);
+  const [observeKind, setObserveKind] = useState<OtherUpdateState | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [errorDetail, setErrorDetail] = useState('');
@@ -645,6 +672,15 @@ function TopbarVersionControl(props: {
   const actionInFlightRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const progressTimerRef = useRef<number | null>(null);
+  const stopPollingRef = useRef<(() => void) | null>(null);
+  // After a 409 update_in_flight we attach to the update that blocked us, which
+  // may run in another tab (flag visible) or in the CLI/maintenance process
+  // (flag invisible — install completion is detected from version state, and
+  // the actual reload only after the dashboard instance changes).
+  const observingRef = useRef(false);
+  const observeRollbackRef = useRef(false);
+  const observeStartVersionRef = useRef('');
+  const observeInstanceRef = useRef('');
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLElement>(null);
@@ -664,8 +700,13 @@ function TopbarVersionControl(props: {
 
   useEffect(() => {
     actionInFlightRef.current = false;
+    observingRef.current = false;
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
     setPhase('idle');
     setProgress(0);
+    setBinaryStatus(null);
+    setObserveKind(null);
     setRefreshing(false);
     setRefreshFailed(false);
     setErrorDetail('');
@@ -681,12 +722,18 @@ function TopbarVersionControl(props: {
   // Faux progress bar. npm install gives no reliable percentage, so we creep a
   // deliberately-capped bar per phase: install climbs toward 50% (the real
   // install ends there), restart+reconnect climbs toward ~95%; the actual
-  // reconnect reload finishes the job, so we never fake a 100%. Reset to 0 on
+  // reconnect reload finishes the job, so we never fake a 100%. A live binary
+  // download replaces the creep with its measured byte progress. Reset to 0 on
   // idle/error clears it.
   useEffect(() => {
     clearProgressTimer();
     if (phase === 'idle' || phase === 'error') {
       setProgress(0);
+      return;
+    }
+    if (phase === 'updating' && binaryStatus) {
+      const ring = binaryProgressRingValue(binaryStatus);
+      if (ring !== null) setProgress(ring);
       return;
     }
     const cap = phase === 'updating' ? 50 : 95;
@@ -695,7 +742,7 @@ function TopbarVersionControl(props: {
       setProgress(value => (value >= cap ? cap : value + Math.max(0.5, (cap - value) * 0.08)));
     }, 400);
     return () => clearProgressTimer();
-  }, [phase]);
+  }, [phase, binaryStatus]);
 
   useEffect(() => {
     if (status) setRefreshFailed(status.versionLookupOk === false);
@@ -745,7 +792,7 @@ function TopbarVersionControl(props: {
     };
   }, [open]);
 
-  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); }, []);
+  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); stopPollingRef.current?.(); }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -772,11 +819,7 @@ function TopbarVersionControl(props: {
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
-  // Rollback is its own capability, reported explicitly by the backend: the
-  // self-replacing binary CAN update but /api/update/rollback only drives a
-  // package manager, so deriving this from `updateSupported` would show a button
-  // that always fails. Older backends omit the field — fall back to the previous
-  // derivation so a stale dashboard/daemon pair behaves as before.
+  // Older backends omit rollbackSupported; retain their update capability fallback.
   const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
     && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
@@ -818,6 +861,73 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = window.setTimeout(() => void tick(), 3_000);
   };
 
+  // Called by the status poller both while OUR OWN POST is in flight (live byte
+  // progress) and after a 409, while observing an update running elsewhere.
+  const handleStatusSnapshot = (snapshot: UpdateStatusSnapshot): void => {
+    if (!observingRef.current) {
+      setBinaryStatus(snapshot.binaryUpdate ?? null);
+      return;
+    }
+    // A cross-process updater never flips this dashboard's in-memory flag, so
+    // install completion comes from version state: rollback moves current, an
+    // update makes `behind` false. But "installed on disk" is NOT "running":
+    // the winner may still be sitting on a restart confirmation (Settings) or
+    // be a CLI update that never restarts. So we only switch to the restart
+    // phase here and let the /__selfcheck instance watcher decide about the
+    // reload — never reload on version state alone.
+    if (observedInstallCompleted(snapshot, observeStartVersionRef.current, observeRollbackRef.current)) {
+      observingRef.current = false;
+      stopPollingRef.current?.();
+      stopPollingRef.current = null;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('restarting');
+      pollReconnect(observeInstanceRef.current);
+      return;
+    }
+    const kind = classifyOtherUpdate(snapshot);
+    setObserveKind(kind);
+    setBinaryStatus(kind === 'progress' ? snapshot.binaryUpdate ?? null : null);
+  };
+
+  // Progress-only polling while our own POST is in flight (no timeout: the
+  // POST settling ends it).
+  const startStatusPolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000);
+
+  // Polling after a 409: bounded by an independent timer so persistent 503s /
+  // dead network / a hung request still reach a terminal state.
+  const startObservePolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000, 10 * 60_000, () => {
+      observingRef.current = false;
+      actionInFlightRef.current = false;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('error');
+      setErrorDetail(t('update.inProgressSlow'));
+    });
+
+  // Our POST lost to an update running in another tab/process: stay in the
+  // updating UI and track that update instead of reporting a failure.
+  const beginObserve = (isRollback: boolean, instance: string): void => {
+    observingRef.current = true;
+    observeRollbackRef.current = isRollback;
+    observeStartVersionRef.current = status?.current ?? '';
+    observeInstanceRef.current = instance;
+    setBinaryStatus(null);
+    setObserveKind('busy');
+    setPhase('updating');
+    setErrorDetail('');
+    stopPollingRef.current?.();
+    stopPollingRef.current = startObservePolling();
+  };
+
+  const stopStatusPolling = (): void => {
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
+    setBinaryStatus(null);
+  };
+
   const run = async () => {
     if (!behind) return;
     if (!automatic) {
@@ -828,12 +938,27 @@ function TopbarVersionControl(props: {
     if (actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(null);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       const result = await updateAndRestartBotmux(fetch, setPhase);
+      stopStatusPolling();
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -844,6 +969,11 @@ function TopbarVersionControl(props: {
       }
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(false, previousInstance);
+        return; // the status poller keeps tracking the winner
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -885,14 +1015,34 @@ function TopbarVersionControl(props: {
     if (!selectedRollback || !rollbackSupported || rollbackLoading || actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(selectedRollback);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       await updateAndRestartBotmux(fetch, setPhase, selectedRollback);
+      stopStatusPolling();
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(true, previousInstance);
+        return;
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -913,9 +1063,15 @@ function TopbarVersionControl(props: {
   };
 
   const message = phase === 'updating'
-    ? activeRollback
-      ? t('update.rollbackInstalling', { version: activeRollback })
-      : t('update.updating', { command })
+    ? binaryStatus
+      ? binaryProgressText(binaryStatus, t)
+      : observeKind === 'busy'
+        ? t('update.inProgressBusy')
+        : observeKind === 'waiting'
+          ? t('update.inProgressExternal')
+          : activeRollback
+            ? t('update.rollbackInstalling', { version: activeRollback })
+            : t('update.updating', { command })
     : phase === 'restarting'
       ? activeRollback
         ? t('update.rollbackRestarting', { version: activeRollback })
@@ -1466,6 +1622,7 @@ async function loadAuthState(): Promise<void> {
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
       ui.workbenchAuthed = isAuthed;
+      ui.hostTerminal = isAuthed && j.hostTerminal === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
@@ -1476,12 +1633,14 @@ async function loadAuthState(): Promise<void> {
       isAuthed = false;
       ui.authed = false;
       ui.workbenchAuthed = true;
+      ui.hostTerminal = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
     } else if (r.status === 401) {
       isAuthed = false;
       ui.authed = false;
       ui.workbenchAuthed = false;
+      ui.hostTerminal = false;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
     }

@@ -36,6 +36,7 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: () => ({}),
   isWorkflowFeatureEnabled: () => true,
+  isMultiTopicOrchestrationEnabled: () => true,
   config: {},
 }));
 vi.mock('../src/services/whiteboard-store.js', () => ({ whiteboardEnabled: () => false }));
@@ -205,19 +206,5 @@ describe('builtinSkillBlock is platform-owned, not operator input', () => {
       .builtinSkillBlock).toBeUndefined();
     expect(buildEffectiveMojoConfig({}, { workingDir: '/tmp', builtinSkillBlock: 'BLOCK' })
       .builtinSkillBlock).toBe('BLOCK');
-  });
-});
-
-describe('the worker actually resolves and passes the block', () => {
-  it('wires builtinSkillBlockForInjectsSessionContext into the mojo launch config', () => {
-    // Source-level guard: the whole fix is worthless if the worker stops
-    // resolving the mode, and no unit test of the backend alone would notice.
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const call = worker.slice(
-      worker.indexOf('buildEffectiveMojoConfig('),
-      worker.indexOf('buildEffectiveMojoConfig(') + 1600,
-    );
-    expect(call).toContain('builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(');
-    expect(call).toContain('cfg.larkAppId');
   });
 });

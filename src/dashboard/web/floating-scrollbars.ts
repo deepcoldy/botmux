@@ -51,7 +51,9 @@ function canScroll(target: HTMLElement, axis: Axis): boolean {
 }
 
 function isVisible(target: HTMLElement): boolean {
-  if (!target.isConnected || target.closest('[hidden]')) return false;
+  // An overlay that makes the page behind it `inert` (e.g. the Bot config example
+  // drawer) leaves that page unscrollable; its bars must not float over the overlay.
+  if (!target.isConnected || target.closest('[hidden], [inert]')) return false;
   const rect = target.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
 }
@@ -256,7 +258,7 @@ export function initFloatingScrollbars(root: HTMLElement): void {
   });
   mutationObserver.observe(root, {
     attributes: true,
-    attributeFilter: ['class', 'style', 'hidden', 'open'],
+    attributeFilter: ['class', 'style', 'hidden', 'inert', 'open'],
     childList: true,
     subtree: true,
   });

@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../im/lark/turn-reply-card-size.js';
+import { omitReplyCardImages } from '../im/lark/md-card.js';
+import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import type { AskResult, PendingAsk } from '../core/ask-types.js';
 
 export type ReplyCardMode = 'legacy' | 'unified';
@@ -23,7 +25,7 @@ export interface TurnReplyCardKey {
   dispatchAttempt?: number;
 }
 
-export type ReplyCardPhase = 'queued' | 'working' | 'waiting' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+export type ReplyCardPhase = 'queued' | 'working' | 'waiting' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded';
 export interface ReplyCardTool { id: string; name: string; subject: string; completed?: boolean; result?: string }
 export type ReplyCardActivity =
   | { kind: 'thinking' | 'progress'; id: string; text: string }
@@ -50,6 +52,8 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   finalSource?: 'explicit' | 'bridge';
   feedback?: { policy: import('./feedback-policy.js').FeedbackPolicy; requesterSubjectId?: string };
   finalDelivered?: boolean;
+  /** Persist a provider-confirmed image rejection across publishers/retries. */
+  omitImages?: boolean;
   messageId?: string;
   pendingCreate?: { content: string; atMs: number };
   lastCard?: string;
@@ -66,11 +70,11 @@ export type TurnReplyCardEvent =
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'refresh' };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
-  return ['completed', 'failed', 'cancelled', 'ambiguous'].includes(record.phase);
+  return ['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'].includes(record.phase);
 }
 
 export interface TurnReplyCardTransport {
@@ -252,11 +256,22 @@ export class TurnReplyCardStore {
       // A late final (or a corrected, still-undelivered final) must not keep
       // pointing at an attachment containing the previous progress/answer.
       if (record.overflowMessageId && overflowText !== priorOverflowText) delete record.overflowMessageId;
+      if (record.omitImages && record.finalCard) record.finalCard = omitReplyCardImages(record.finalCard);
       this.write(key, record);
+      // Retire an unshown merged turn under the publication lock. A delayed
+      // start must not resurrect it, while an unknown POST still needs its
+      // original UUID replayed and the resulting card patched to superseded.
+      if (record.phase === 'superseded' && !record.messageId && !record.pendingCreate && !record.finalCard) {
+        return { delivered: false, record };
+      }
       const visible = record.mode === 'unified' || io.forceVisible || !!record.finalCard || terminal || event.kind === 'terminal';
       if (!visible) return { delivered: false, record };
 
-      let card = io.render(record);
+      const render = () => {
+        const body = io.render(record);
+        return record.omitImages ? omitReplyCardImages(body) : body;
+      };
+      let card = render();
       const completeRecordNeedsFile = replyCardIsTerminal(record) && !record.disconnected && !record.finalCard
         && Buffer.byteLength(record.progress.join('\n\n'), 'utf8') > 6000;
       if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES || completeRecordNeedsFile) {
@@ -269,9 +284,26 @@ export class TurnReplyCardStore {
           record.overflowMessageId = await io.sendOverflow(overflowText, `brf_${digest}`);
           this.write(key, record);
         }
-        card = io.render(record);
+        card = render();
         if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES) throw new Error('Reply-card summary exceeds size limit');
       }
+
+      const imageFallback = { omitImages: record.omitImages === true };
+      const publish = <T>(content: string, effect: (body: string) => Promise<T>): Promise<T> =>
+        replyWithImageFallback(content, 'interactive', async body => {
+          if (imageFallback.omitImages && !record.omitImages) {
+            // Only a definitive rejection permits changing a pending POST.
+            // Persist the downgrade before retrying: an unknown fallback result
+            // must replay the same body/UUID, including after process recovery.
+            record.omitImages = true;
+            if (record.finalCard) record.finalCard = omitReplyCardImages(record.finalCard);
+            if (record.pendingCreate) record.pendingCreate.content = omitReplyCardImages(record.pendingCreate.content);
+            card = omitReplyCardImages(card);
+            this.write(key, record);
+          }
+          await io.beforeEffect();
+          return effect(body);
+        }, imageFallback);
 
       try {
         if (!record.messageId) {
@@ -283,16 +315,15 @@ export class TurnReplyCardStore {
             throw new Error('Reply-card send result is unknown; automatic resend window expired');
           }
           this.write(key, record);
-          await io.beforeEffect();
-          record.messageId = await io.send(record.pendingCreate.content, `brc_${this.id(key)}`);
+          record.messageId = await publish(record.pendingCreate.content, body => io.send(body, `brc_${this.id(key)}`));
           if (!record.messageId) throw new Error('Missing reply-card message ID');
           record.lastCard = record.pendingCreate.content;
           delete record.pendingCreate;
           this.write(key, record);
         }
         if (record.lastCard !== card || io.forcePatch) {
-          await io.beforeEffect();
-          await io.patch(record.messageId, card);
+          const messageId = record.messageId;
+          await publish(card, body => io.patch(messageId, body));
           record.lastCard = card;
         }
         if (record.finalCard && !(event.kind === 'terminal' && event.disconnected)) record.finalDelivered = true;

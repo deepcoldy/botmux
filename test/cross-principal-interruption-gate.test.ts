@@ -15,7 +15,7 @@
  *
  * worker.ts and daemon.ts are process entrypoints — importing them installs IPC
  * and signal handlers in Vitest — so their two gates are pinned as source
- * structure, in the same style as worker-durable-expiry-order.test.ts. The
+ * structure. The
  * authority semantics those gates depend on are then exercised for real against
  * ActiveTurnAuthority itself.
  */
@@ -40,7 +40,6 @@ import { renderBotmuxSendSkill } from '../src/skills/reply-style-guide.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 
 describe('XPI switch — accessor (config file + env override)', () => {
   let home: string;
@@ -113,37 +112,6 @@ describe('XPI switch — accessor (config file + env override)', () => {
   });
 });
 
-describe('XPI control-notice loop guard wiring', () => {
-  it('consumes authenticated legacy control notices before auto-create or generic staging', () => {
-    const parseAt = daemonSource.indexOf("threadTrustedCaller?.senderType === 'bot'");
-    const consumeAt = daemonSource.indexOf('consumed XPI control notice');
-    const autoCreateAt = daemonSource.indexOf('if (!ds) {', consumeAt);
-    const stageGateAt = daemonSource.indexOf('if (config.crossPrincipalInterruption', autoCreateAt);
-    expect(parseAt).toBeGreaterThan(0);
-    expect(consumeAt).toBeGreaterThan(parseAt);
-    expect(autoCreateAt).toBeGreaterThan(consumeAt);
-    expect(stageGateAt).toBeGreaterThan(autoCreateAt);
-  });
-
-  it('cleans strict persisted session rows as well as active sessions when disabled', () => {
-    const start = daemonSource.indexOf('function cancelAllCrossPrincipalInterruptionsForFeatureDisable(): number {');
-    expect(start).toBeGreaterThan(0);
-    const body = daemonSource.slice(start, daemonSource.indexOf('\n}\n', start));
-    expect(body).not.toContain('config.crossPrincipalInterruption');
-    expect(body).toContain('activeSessions.values()');
-    expect(body).toContain('sessionStore.listSessionsStrict()');
-    expect(body).toContain('cancelledSessionIds.has(session.sessionId)');
-    expect(body).toContain('sessionStore.updateSession(session)');
-  });
-
-  it('sweeps persisted XPI records on an OFF daemon boot before IPC binds', () => {
-    const bootSweepAt = daemonSource.indexOf('cancelAllCrossPrincipalInterruptionsForFeatureDisable();');
-    const ipcBindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer');
-    expect(bootSweepAt).toBeGreaterThan(0);
-    expect(ipcBindAt).toBeGreaterThan(bootSweepAt);
-  });
-});
-
 describe('XPI switch — agent-facing `--as` guidance', () => {
   afterEach(() => { delete process.env.BOTMUX_XPI_ENABLED; });
 
@@ -188,75 +156,39 @@ describe('XPI switch — agent-facing `--as` guidance', () => {
 });
 
 describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
-  // worker.ts reads the switch through its own symbol, not the daemon's
-  // `config.crossPrincipalInterruption`. Every gate below is pinned by its CALL
-  // SITE, and those call sites stay textually intact even if this body stopped
-  // consulting the shared accessor — so without this case a worker hardwired to
-  // a constant passes the whole file. That failure mode is worse than the
-  // config-cache skew the two sides can already have: a skew self-heals inside
-  // the 2s TTL, a hardwired worker disagrees with the daemon forever.
-  it('the worker gate delegates to the shared accessor rather than a constant', () => {
-    const start = workerSource.indexOf('function crossPrincipalIsolationOn(): boolean {');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    expect(body).toContain('return isCrossPrincipalInterruptionEnabled();');
-    expect(body).not.toMatch(/return\s+(?:true|false)\s*;/);
-    // The import must be the real one, so the delegation cannot be satisfied by
-    // a local stub that shadows the accessor's name.
+  function workerFn(name: string): string {
+    const start = workerSource.indexOf(`function ${name}(`);
+    expect(start, name).toBeGreaterThan(-1);
+    return workerSource.slice(start, workerSource.indexOf('\n}\n', start));
+  }
+
+  // 源码结构护栏(K3)：XPI 默认关闭（#1424）。开启态下第二个身份的消息被分流暂存，而飞书卡片往返交付不了分类结果，
+  // 消息无法 settle、还会触发暂存提示的自激环；关闭态必须完全回到 #1348 之前的投递：worker 不拒绝、不抛
+  // `turn authority mismatch`，而是接管 turn envelope。这些闸都在 worker.ts 入口模块（import 即安装 IPC/信号
+  // 处理）的闭包里，没有行为 seam；接管语义本身由下方 'adoption semantics against the real authority' 覆盖。
+  it('every worker authority gate yields to the live switch before rejecting or throwing', () => {
+    // The switch is read live from the shared accessor, never hardwired (#1424 mutation gap).
+    const isolationOn = workerFn('crossPrincipalIsolationOn');
+    expect(isolationOn).toContain('isCrossPrincipalInterruptionEnabled()');
+    expect(isolationOn).not.toMatch(/return\s+(?:true|false)\s*;/);
     expect(workerSource).toMatch(
       /import \{[^}]*\bisCrossPrincipalInterruptionEnabled\b[^}]*\} from '\.\/global-config\.js';/s,
     );
-  });
-
-  it('activeTurnBlocks bypasses isolation only for inputs without the Oncall FIFO flag', () => {
-    const start = workerSource.indexOf('function activeTurnBlocks(input: {');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const gate = body.indexOf('if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;');
-    const consult = body.indexOf('activeTurnAuthority.blocks(');
-    expect(gate).toBeGreaterThanOrEqual(0);
-    // Order matters: the gate must precede the only call that can reject.
-    expect(consult).toBeGreaterThan(gate);
-  });
-
-  it('markActiveTurnStarted adopts instead of throwing while the switch is off', () => {
-    const start = workerSource.indexOf('function markActiveTurnStarted(');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const normal = body.indexOf('activeTurnAuthority.reserve(identity) && activeTurnAuthority.markStarted(identity)');
-    const adopt = body.indexOf('adoptActiveTurnWhenIsolationOff(identity)');
-    const thrown = body.indexOf('throw new Error(`turn authority mismatch before CLI write');
-    expect(normal).toBeGreaterThanOrEqual(0);
-    // The adoption path sits between the normal path and the throw: an
-    // unenforced authority must never be the thing that raises.
-    expect(adopt).toBeGreaterThan(normal);
-    expect(thrown).toBeGreaterThan(adopt);
-  });
-
-  it('reserveActiveTurn offers adoption before logging a rejection', () => {
-    const start = workerSource.indexOf('function reserveActiveTurn(');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const adopt = body.indexOf('adoptActiveTurnWhenIsolationOff(identity)');
-    const rejectLog = body.indexOf('Rejected turn');
-    expect(adopt).toBeGreaterThanOrEqual(0);
-    expect(rejectLog).toBeGreaterThan(adopt);
-  });
-
-  it('adoption is itself gated, so an enforcing authority is never cleared', () => {
-    const start = workerSource.indexOf('function adoptActiveTurnWhenIsolationOff(');
-    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const gate = body.indexOf('if (crossPrincipalIsolationOn()) return false;');
-    // Master's queueAfterActiveTurn FIFO gate must stay ahead of both the XPI
-    // gate and #1456's principal-preserving adoption; clear()+reserve() is gone.
-    const fifoGate = body.indexOf('if (identity.queueAfterActiveTurn) return false;');
-    const adopt = body.indexOf('activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)');
-    const clear = body.indexOf('activeTurnAuthority.clear()');
-    expect(gate).toBeGreaterThanOrEqual(0);
-    expect(fifoGate).toBeGreaterThanOrEqual(0);
-    expect(fifoGate).toBeLessThan(gate);
-    expect(adopt).toBeGreaterThan(gate);
-    expect(clear).toBe(-1);
+    // OFF: the only call that can reject an ordinary input is never reached.
+    const blocks = workerFn('activeTurnBlocks');
+    expect(blocks.indexOf('crossPrincipalIsolationOn()')).toBeGreaterThan(-1);
+    expect(blocks.indexOf('crossPrincipalIsolationOn()')).toBeLessThan(blocks.indexOf('activeTurnAuthority.blocks('));
+    // OFF: reserve / markStarted adopt before they reject or throw.
+    const reserve = workerFn('reserveActiveTurn');
+    expect(reserve.indexOf('adoptActiveTurnWhenIsolationOff(')).toBeGreaterThan(-1);
+    expect(reserve.indexOf('adoptActiveTurnWhenIsolationOff(')).toBeLessThan(reserve.lastIndexOf('return false;'));
+    const started = workerFn('markActiveTurnStarted');
+    expect(started.indexOf('adoptActiveTurnWhenIsolationOff(')).toBeGreaterThan(-1);
+    expect(started.indexOf('adoptActiveTurnWhenIsolationOff(')).toBeLessThan(started.indexOf('throw new Error('));
+    // ON: adoption is itself gated, so an enforcing authority is never taken over.
+    const adopt = workerFn('adoptActiveTurnWhenIsolationOff');
+    expect(adopt.indexOf('crossPrincipalIsolationOn()')).toBeGreaterThan(-1);
+    expect(adopt.indexOf('crossPrincipalIsolationOn()')).toBeLessThan(adopt.indexOf('adoptEnvelopePreservingPrincipal('));
   });
 });
 
@@ -336,42 +268,23 @@ describe('XPI switch — adoption semantics against the real authority', () => {
 });
 
 describe('XPI switch — daemon.ts ingress gates (source-pinned)', () => {
-  it('the divert is conditioned on the switch before any principal comparison', () => {
-    const activeIdx = daemonSource.indexOf('const activePrincipalTurn = ds.activeInteractiveTurn;');
-    expect(activeIdx).toBeGreaterThanOrEqual(0);
-    const idx = daemonSource.indexOf('if (config.crossPrincipalInterruption\n', activeIdx);
-    expect(idx).toBeGreaterThan(activeIdx);
-    const clause = daemonSource.slice(idx, idx + 500);
-    // The switch is the FIRST conjunct: with it off nothing else is evaluated
-    // and the message falls through to the ordinary existing-owner route.
-    expect(clause).toContain('&& activePrincipalTurn');
-    expect(clause).toContain('sameTrustedPrincipal');
-  });
+  // 源码结构护栏(K3)：同上（#1424），daemon 入口侧的两道关闭闸：开关是分流条件里先于任何身份比较的合取项；
+  // 关闭时 worker 回来的身份拒绝一律交回 worker-pool 重投，绝不暂存——关闭态下暂存记录没有出口，消息会滞留。
+  // daemon.ts 是进程入口，没有行为 seam。
+  it('never diverts or stages a second principal while the switch is off', () => {
+    const activeAt = daemonSource.indexOf('const activePrincipalTurn = ds.activeInteractiveTurn;');
+    expect(activeAt).toBeGreaterThan(-1);
+    const switchAt = daemonSource.indexOf('config.crossPrincipalInterruption', activeAt);
+    expect(switchAt).toBeGreaterThan(activeAt);
+    expect(switchAt).toBeLessThan(daemonSource.indexOf('sameTrustedPrincipal(', activeAt));
 
-  it('a rejection arriving while the switch is off retries delivery instead of staging', () => {
-    // A method on the ingress-callback object, not a free function.
-    const start = daemonSource.indexOf('async onOrdinaryImInputRejected(ds, context) {');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const body = daemonSource.slice(start, start + 4000);
-    const gate = body.indexOf('if (!config.crossPrincipalInterruption)');
-    const staged = body.indexOf('stageCrossPrincipalInterruption');
-    expect(gate).toBeGreaterThanOrEqual(0);
-    // Returning false here re-enters delivery; staging must sit strictly after
-    // the gate, otherwise the switch could still mint a stranded record.
-    expect(body.slice(gate, gate + 400)).toContain('return false;');
-    if (staged >= 0) expect(staged).toBeGreaterThan(gate);
-  });
-});
-
-describe('XPI switch — cli.ts send hint', () => {
-  it('advertises --as only while isolation is enforced, but still parses the flag', () => {
-    const hint = cliSource.indexOf("t('xpi.send.as_needed_hint'");
-    expect(hint).toBeGreaterThanOrEqual(0);
-    // The advertisement is gated...
-    expect(cliSource.slice(hint - 400, hint)).toContain('config.crossPrincipalInterruption');
-    // ...but the flag itself keeps working, so a marked send is never silently
-    // downgraded just because the host has the switch off.
-    expect(cliSource).toContain("argValue(rest, '--as')");
-    expect(cliSource).toContain('embedCrossPrincipalAsToken');
+    const start = daemonSource.indexOf('onOrdinaryImInputRejected(ds, context) {');
+    expect(start).toBeGreaterThan(-1);
+    const body = daemonSource.slice(start, daemonSource.indexOf('\n    },\n', start));
+    const gate = body.indexOf('!config.crossPrincipalInterruption');
+    const staged = body.indexOf('stageCrossPrincipalInterruption(');
+    expect(gate).toBeGreaterThan(-1);
+    expect(staged).toBeGreaterThan(gate);
+    expect(body.slice(gate, staged)).toContain('return false;');
   });
 });

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Build a Linux release binary inside the oldest supported glibc runtime.
 #
-# node-pty has no Linux prebuild, so its install script compiles pty.node against
-# the BUILDER's libc. Building on ubuntu-latest silently raised the shipped
-# binary's floor to GLIBC_2.34. Node 22 itself supports glibc 2.28, so keep that as
+# pty.node is compiled from source (npm_config_build_from_source below) against the
+# BUILDER's libc. Building on ubuntu-latest silently raised the shipped binary's
+# floor to GLIBC_2.34. Node 22 itself supports glibc 2.28, so keep that as
 # Botmux's explicit Linux floor and smoke the complete binary inside the same
 # manylinux_2_28 environment before it can become a release artifact.
 set -eu
@@ -90,12 +90,16 @@ docker run --rm \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
     export PATH="/opt/node/bin:$PATH"
     node --version
-    npm install -g bun@1.4.2 --loglevel=error
+    npm install -g bun@1.4.3 --loglevel=error
     bun --version
 
     # Compiles node-pty on glibc 2.28; trustedDependencies makes this lifecycle
-    # script run under Bun. Stamp only after the frozen install, mirroring release.
-    bun install --frozen-lockfile
+    # script run under Bun. Since 1.2.0-beta.15 node-pty ships linux prebuilds and
+    # would skip node-gyp; build_from_source makes its install script delete them
+    # and compile, so the floor check below inspects what we built. It only takes
+    # effect when node-pty is actually (re)installed — a clean checkout in CI.
+    # Stamp only after the frozen install, mirroring release.
+    npm_config_build_from_source=true bun install --frozen-lockfile
     npm version "$BUILD_VERSION" --no-git-tag-version --allow-same-version
     bun run build
 

@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -337,6 +337,62 @@ describe('worktreeSafetyStatus', () => {
     expect(status.dirtyFiles).toContain('secret.env');
     expect(status.dirtyFiles).toContain('cache/');
     expect(status.dirtyFiles).not.toContain('cache/a.txt');
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.uncommittedFiles).toEqual([]);
+    expect(status.ignoredCount).toBe(2);
+    expect(status.ignoredFiles).toEqual(expect.arrayContaining(['secret.env', 'cache/']));
+  });
+
+  it('fingerprints ignored directories whose expanded status exceeds the child-process buffer', async () => {
+    const repo = makeUpstream('large-ignored-status');
+    writeFileSync(join(repo, '.gitignore'), 'cache/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore generated cache');
+    const component = 'd'.repeat(120);
+    const cache = join(repo, 'cache', component, component, component);
+    mkdirSync(cache, { recursive: true });
+    for (let i = 0; i < 2_500; i++) {
+      const name = `entry-${String(i).padStart(4, '0')}-${'x'.repeat(100)}`;
+      writeFileSync(join(cache, name), '');
+    }
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.ignoredCount).toBe(1);
+    expect(status.ignoredFiles).toEqual(['cache/']);
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('fingerprints an ignored directory symlink without following its target', async () => {
+    const repo = makeUpstream('ignored-symlink-safety');
+    writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore dependencies');
+    const firstTarget = join(tempRoot, 'dependencies-v1');
+    const secondTarget = join(tempRoot, 'dependencies-v2');
+    mkdirSync(firstTarget);
+    mkdirSync(secondTarget);
+    const firstTargetFile = join(firstTarget, 'package.json');
+    writeFileSync(firstTargetFile, '{"version":1}\n');
+    writeFileSync(join(secondTarget, 'package.json'), '{"version":2}\n');
+    const link = join(repo, 'node_modules');
+    symlinkSync(firstTarget, link, 'dir');
+
+    const first = await worktreeSafetyStatus(repo);
+    writeFileSync(firstTargetFile, '{"version":3}\n');
+    const targetContentChanged = await worktreeSafetyStatus(repo);
+    unlinkSync(link);
+    symlinkSync(secondTarget, link, 'dir');
+    const retargeted = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('node_modules');
+    expect(first.uncommittedFiles).toEqual([]);
+    expect(first.ignoredFiles).toContain('node_modules');
+    expect(first.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(targetContentChanged.fingerprint).toBe(first.fingerprint);
+    expect(retargeted.fingerprint).not.toBe(first.fingerprint);
   });
 
   it('detects untracked files even when git config hides them', async () => {
@@ -347,6 +403,8 @@ describe('worktreeSafetyStatus', () => {
     const status = await worktreeSafetyStatus(repo);
 
     expect(status.dirtyFiles).toContain('new.txt');
+    expect(status.uncommittedFiles).toContain('new.txt');
+    expect(status.ignoredFiles).toEqual([]);
   });
 
   it('reports the full dirty count while bounding file examples', async () => {

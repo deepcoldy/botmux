@@ -39,6 +39,7 @@
 
 import { readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
 
 export const DEFAULT_PROC_ROOT = '/proc';
 
@@ -192,7 +193,7 @@ interface ProcStat {
 
 /**
  * 读 /proc/<pid>/stat 的 ppid 与 starttime。comm 字段可以含空格与右括号，所以按
- * **最后一个** `)` 切分——与 utils/process-identity.ts 的口径一致。
+ * **最后一个** `)` 切分——与 utils/process-identity.ts 同走 utils/proc-stat.ts。
  */
 function readProcStat(procRoot: string, pid: number): ProcStat | undefined {
   let raw: string;
@@ -201,11 +202,10 @@ function readProcStat(procRoot: string, pid: number): ProcStat | undefined {
   } catch {
     return undefined;
   }
-  const closeParen = raw.lastIndexOf(')');
-  if (closeParen < 0) return undefined;
-  const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+  const fields = procStatFieldsAfterComm(raw);
+  if (!fields) return undefined;
   const ppid = Number(fields[1]);
-  const startTime = fields[19];
+  const startTime = fields[PROC_STAT_STARTTIME_INDEX];
   if (!Number.isSafeInteger(ppid) || ppid < 0) return undefined;
   if (typeof startTime !== 'string' || !/^\d+$/.test(startTime)) return undefined;
   return { ppid, startTime };

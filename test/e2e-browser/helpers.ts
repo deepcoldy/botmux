@@ -1,9 +1,20 @@
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type BrowserContextOptions,
+  type Page,
+} from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import 'dotenv/config';
+import { E2E_VIDEO_DIR, e2eVideoRecordingEnabled } from './e2e-video.js';
+import { RECALL_FIRST_MARKER_TOKEN } from '../helpers/mock-llm-server/marker-extractor.js';
+import { chatLeaseKey, dmLeaseKey, holdLeaseForPage } from './chat-lease.js';
+import { attachAgentToReportScope } from './report-scope.js';
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../..');
 
@@ -22,6 +33,11 @@ export type BotName = (typeof BOT_NAMES)[number];
 // ---------------------------------------------------------------------------
 // Env helpers
 // ---------------------------------------------------------------------------
+
+/** `BOTMUX_MOCK_LLM=1`: CLIs talk to the synthetic model in test/helpers/mock-llm-server. */
+export function mockLlmEnabled(): boolean {
+  return process.env.BOTMUX_MOCK_LLM === '1' || process.env.BOTMUX_MOCK_LLM === 'true';
+}
 
 export function getRequiredEnv(key: string): string {
   const value = process.env[key];
@@ -105,7 +121,7 @@ export async function createBrowser(headless = true): Promise<Browser> {
 export async function createPage(
   browser: Browser,
 ): Promise<{ context: BrowserContext; page: Page }> {
-  const contextOpts: Record<string, unknown> = {
+  const contextOpts: BrowserContextOptions = {
     viewport: BROWSER_CONFIG.viewport,
     deviceScaleFactor: BROWSER_CONFIG.deviceScaleFactor,
     locale: BROWSER_CONFIG.locale,
@@ -113,23 +129,78 @@ export async function createPage(
   if (existsSync(STORAGE_STATE_PATH)) {
     contextOpts.storageState = STORAGE_STATE_PATH;
   }
+  // Continuous WebM of this context. Enabled only for Midscene runs
+  // (`BOTMUX_E2E_RECORD_VIDEO=1`); the file is saved when the context closes.
+  if (e2eVideoRecordingEnabled()) {
+    await mkdir(E2E_VIDEO_DIR, { recursive: true });
+    // Half resolution: a full-HD recording ran 40–60 MB per case. Midscene
+    // screenshots still come from the full-size page.
+    contextOpts.recordVideo = {
+      dir: E2E_VIDEO_DIR,
+      size: {
+        width: BROWSER_CONFIG.viewport.width / 2,
+        height: BROWSER_CONFIG.viewport.height / 2,
+      },
+    };
+  }
   const context = await browser.newContext(contextOpts);
   const page = await context.newPage();
   return { context, page };
 }
 
 export function createAgent(page: Page): PlaywrightAgent {
-  return new PlaywrightAgent(page);
+  const agent = new PlaywrightAgent(page);
+  attachAgentToReportScope(agent);
+  return agent;
 }
 
 // ---------------------------------------------------------------------------
 // Navigation helpers
 // ---------------------------------------------------------------------------
 
-/** Navigate to the messenger page and wait for it to load. */
-export async function navigateToMessenger(page: Page): Promise<void> {
-  await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(3000);
+// Concurrent lanes log in the same account. Several Messenger pages booting
+// at once leave the chat list on skeleton placeholders for minutes (seen in
+// CI), so pages load one at a time; a loaded page then works normally.
+let messengerLoadQueue: Promise<void> = Promise.resolve();
+
+function messengerShellReady(requireChatList: boolean): boolean {
+  const title = document.title;
+  const titleReady = /messenger|飞书|lark/i.test(title);
+  const body = document.body?.innerText ?? '';
+  const searchReady = /search|搜索/i.test(body);
+  const messengerReady = /messenger|消息/i.test(body);
+  // The shell renders before the chat list; skeleton rows carry no text, so
+  // require a real chat entry (every test account has [Botmux] bot DMs).
+  const chatListReady = !requireChatList || body.includes('[Botmux]');
+  return titleReady && searchReady && messengerReady && chatListReady;
+}
+
+/** Navigate to the messenger page and wait until its chat list has loaded. */
+export async function navigateToMessenger(page: Page, url = getMessengerUrl()): Promise<void> {
+  const load = messengerLoadQueue.then(() => loadMessenger(page, url));
+  messengerLoadQueue = load.catch(() => {});
+  await load;
+}
+
+async function loadMessenger(page: Page, url: string): Promise<void> {
+  // The saved account can render either the English ("Messenger - Feishu",
+  // "Search"/"Messenger") or Chinese ("消息 - 飞书", "搜索"/"消息") UI, so do
+  // not gate on a single language.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt === 1) await page.goto(url, { waitUntil: 'domcontentloaded' });
+    else await page.reload({ waitUntil: 'domcontentloaded' });
+    try {
+      // A deep link (the test group) may open a view without the chat list.
+      await page.waitForFunction(messengerShellReady, url === getMessengerUrl(), { timeout: 45_000 });
+      return;
+    } catch {
+      console.warn(`[e2e] Feishu Messenger chat list not loaded (attempt ${attempt}/3); reloading`);
+    }
+  }
+  throw new Error(
+    `Feishu Messenger chat list did not load after 3 attempts (URL: ${page.url()}, title: ${await page.title()}). ` +
+      'A login redirect means the saved storage state expired; a skeleton list means Feishu web is stalling.',
+  );
 }
 
 /**
@@ -137,48 +208,148 @@ export async function navigateToMessenger(page: Page): Promise<void> {
  * Works for both bot private chats ("Claude") and group chats.
  * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
+/**
+ * Display name of the Botmux bot conversation in Feishu.
+ *
+ * The test account also has same-named *native* Feishu AI agents (labelled
+ * 智能体, e.g. a DM literally named "codex"/"claude") that never reply to
+ * botmux traffic. The Botmux-backed bots are the conversations explicitly
+ * named `[Botmux]<Name>` with a 机器人/Bot badge. Opening the bare name makes
+ * the visual agent click the native agent, so always resolve and match the
+ * prefixed bot conversation.
+ */
+export function botChatName(botName: string): string {
+  return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
+}
+
 export async function openChat(
   page: Page,
   agent: PlaywrightAgent,
-  chatName: string,
+  botName: string,
 ): Promise<void> {
+  // Concurrent lanes share this bot's DM; a case that switches its DM mode
+  // holds the lease exclusively (see chat-lease.ts).
+  await holdLeaseForPage(page, dmLeaseKey(botName.replace(/^\[Botmux\]/, '')), 'shared');
+  // Match the Botmux-backed bot conversation, never the same-named native AI
+  // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
+  // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
+  const chatName = botChatName(botName);
+  let opened = false;
   // Try clicking directly first
   try {
     await agent.aiAct(
-      `在左侧"消息"列表中或者"消息"列表的置顶会话中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
+      `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
+        `"${chatName}"（名称以 [Botmux] 开头、带"机器人/Bot"徽标）。` +
+        `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
+        '也不要点话题里的消息或群聊。',
     );
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 8_000, checkIntervalMs: 2_000 },
+    );
+    opened = true;
   } catch {
-    // Chat not visible in sidebar — use search to find it
+    opened = false;
+  }
+
+  if (!opened) {
+    // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
     await page.keyboard.type(chatName);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中，点击名称为"${chatName}"的群聊或对话`,
+      `在搜索结果中点击 Botmux 机器人会话 "${chatName}"（[Botmux] 前缀、机器人徽标），` +
+        `不要点名称仅为"${botName}"的原生智能体。`,
     );
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
+    // Wait for chat to load
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
   }
-  // Wait for chat to load — verify by checking the chat header
-  await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示"${chatName}"`,
-    { timeoutMs: 15_000, checkIntervalMs: 3_000 },
-  );
+}
+
+/**
+ * Open a group chat by its exact name. Holds the group exclusively for the
+ * case: group modes are per group and no-reply assertions need a quiet group.
+ * Pass `lease: false` for a group only this case knows (a fresh session group).
+ */
+export async function openGroupChat(
+  page: Page,
+  agent: PlaywrightAgent,
+  groupName: string,
+  opts?: { lease?: boolean; timeoutMs?: number },
+): Promise<void> {
+  if (opts?.lease !== false) await holdLeaseForPage(page, chatLeaseKey(groupName), 'exclusive');
+  if (groupName === getGroupChatName()) {
+    // Name search does not find groups reliably (CI: 暂无相关结果), and the
+    // group's direct link never loaded the chat list in CI — three reloads,
+    // over two minutes per case before any fallback. The test account pins
+    // the group (shortcut 「普通群聊」) above the chat list; click its label.
+    if (!(await page.getByText(groupName, { exact: true }).count()) && !(await page.getByText('普通群聊', { exact: true }).count())) {
+      await navigateToMessenger(page);
+    }
+    const opened = '右侧聊天区域打开了一个普通群聊（标题栏显示群名和成员数，不是与机器人的私聊，不是话题群，也不是空白的欢迎页）';
+    for (const label of [...new Set([groupName, '普通群聊'])]) {
+      const entry = page.getByText(label, { exact: true }).first();
+      try {
+        if ((await entry.count()) === 0) continue;
+        await entry.click({ timeout: 5_000 });
+        await agent.aiWaitFor(opened, { timeoutMs: 15_000, checkIntervalMs: 3_000 });
+        return;
+      } catch {
+        // Try the next label, then the vision fallback.
+      }
+    }
+    await agent.aiAct(
+      `在左侧"消息"列表（包括顶部置顶的头像快捷入口）中点击名为"${groupName}"的群聊；` +
+        '如果没有，点击顶部置顶快捷入口里名为"普通群聊"的群聊（不是"话题群聊"，也不是机器人私聊）。',
+    );
+    await agent.aiWaitFor(opened, { timeoutMs: opts?.timeoutMs ?? 30_000, checkIntervalMs: 3_000 });
+    return;
+  }
+  const opened = `右侧聊天区域顶部标题栏显示群聊名称"${groupName}"`;
+  try {
+    await agent.aiAct(
+      `在左侧"消息"列表中点击名称为"${groupName}"的群聊（不是机器人私聊，也不是话题）。`,
+    );
+    await agent.aiWaitFor(opened, { timeoutMs: 8_000, checkIntervalMs: 2_000 });
+    return;
+  } catch {
+    // Not in the visible list (e.g. a group created moments ago): search.
+  }
+  await page.keyboard.press('Control+k');
+  await page.waitForTimeout(1_000);
+  await page.keyboard.type(groupName);
+  await page.waitForTimeout(2_500);
+  await agent.aiAct(`在搜索结果的"群组"部分点击名称为"${groupName}"的群聊`);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
+  await agent.aiWaitFor(opened, {
+    timeoutMs: opts?.timeoutMs ?? 20_000,
+    checkIntervalMs: 3_000,
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Message helpers
 // ---------------------------------------------------------------------------
 
-/** Send a plain text message in the currently open chat. */
+/**
+ * Send a plain text message in the currently open chat. Typed with real key
+ * presses: the vision agent's typing dropped the leading character in CI
+ * (`e2e-…` arrived as `2e-…`), which hides the tag the topic is found by.
+ */
 export async function sendMessage(
   agent: PlaywrightAgent,
   message: string,
+  page: Page,
 ): Promise<void> {
-  await agent.aiAct(
-    `在底部消息输入框中输入 "${message}" 然后按 Enter 发送`,
-  );
+  await typeChatMessage(agent, page, message);
 }
 
 /**
@@ -191,19 +362,264 @@ export async function sendMentionMessage(
   botName: string,
   message: string,
 ): Promise<void> {
-  // Click into the input box
-  await agent.aiAct('点击底部的消息输入框');
-  // Type @ to trigger mention dropdown
-  await page.keyboard.type('@');
-  await page.waitForTimeout(1000);
-  // Type bot name to filter the dropdown, then select
-  await agent.aiAct(
-    `在弹出的@提及搜索列表中，找到并点击"${botName}"`,
-  );
+  await focusOrAsk(page, agent, 'chat', '点击底部的消息输入框');
   await page.waitForTimeout(500);
-  // Type the rest of the message and send
-  await page.keyboard.type(` ${message}`);
-  await page.keyboard.press('Enter');
+  await warmUpInput(page);
+  await typeMention(page, agent, botName, message);
+}
+
+/** Text of the rich-text input that currently has focus. */
+/**
+ * In-page expression for the message editor: the focused rich-text input,
+ * else the one holding the caret. A string on purpose — CI loads this file
+ * through tsx (esbuild keepNames), which wraps functions declared inside an
+ * evaluate callback in `__name(...)`, a helper the page does not have
+ * ("ReferenceError: __name is not defined" failed every case once).
+ */
+const FIND_EDITOR = `(() => {
+  for (const node of [document.activeElement, document.getSelection()?.anchorNode]) {
+    const element = node instanceof HTMLElement ? node : node?.parentElement;
+    const editor = element?.closest('[contenteditable="true"]');
+    if (editor) return editor;
+  }
+  return null;
+})()`;
+
+/**
+ * Text of the message editor being typed into: the focused rich-text input,
+ * else the one holding the caret. Never the page body — CI once compared the
+ * whole page's text against a mention because focus had left the editor.
+ */
+async function focusedInputText(page: Page): Promise<string> {
+  return page.evaluate(`(${FIND_EDITOR}?.innerText ?? '')`);
+}
+/**
+ * The input holds exactly one mention and it is `botName`. A selected mention
+ * renders the member's display name (`[Botmux]<Name>`); the filter query typed
+ * after `@` is the bare name, so an unselected query never passes. `@@` means
+ * a stray literal `@` stayed in front of the chip, which breaks command parsing.
+ */
+export function holdsOnlyMention(text: string, botName: string): boolean {
+  // `[Botmux]Claude` in the editor; `BotmuxClaude` where brackets are dropped.
+  const mentioned = [...text.matchAll(/\[?Botmux\]?\s*([A-Za-z][\w-]*)/g)].map((match) => match[1]);
+  return mentioned.length === 1 && mentioned[0] === botName && !text.includes('@@');
+}
+
+/**
+ * Compare editor text by content only. Feishu's editor pads paragraphs with
+ * zero-width spaces (`"/reply-mode \u200b\n\u200b\n\u200b"`), which `\s`
+ * does not match — the first version of this check rejected every input.
+ */
+export function normalizeInput(text: string): string {
+  return text.replace(/[\u200b-\u200d\u2060\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Type `text` into the focused input and confirm the input ends with it.
+ * CI lost the first keystrokes right after focusing the input: the daemon
+ * received "eply-mode new-topic" and "2e-sg2-claude-…". For a command that
+ * means a silently skipped step (a mode never restored), so a garbled input
+ * is cleared and retyped instead of sent.
+ */
+async function typeVerified(
+  page: Page,
+  text: string,
+  delay: number,
+  lead = '',
+): Promise<boolean> {
+  await page.keyboard.type(text, { delay });
+  await page.waitForTimeout(300);
+  return inputHolds(await focusedInputText(page), text, lead);
+}
+
+/**
+ * The editor holds exactly `lead` (a mention chip, or nothing) followed by what
+ * was typed. Lost keystrokes hit the start, so the head must be there in full
+ * and nothing else may precede it — leftover text would ride along and stop a
+ * slash command from parsing. The tail anchors the end; the middle is not
+ * compared character by character, so editor rendering cannot fail a send.
+ */
+export function inputHolds(editorText: string, typed: string, lead = ''): boolean {
+  const have = normalizeInput(editorText);
+  const prefix = normalizeInput(lead);
+  if (!have.startsWith(prefix)) return false;
+  const rest = have.slice(prefix.length).trim();
+  const want = normalizeInput(typed);
+  return (
+    rest.startsWith(want.slice(0, 24)) &&
+    rest.endsWith(want.slice(-24)) &&
+    Math.abs(rest.length - want.length) <= 2
+  );
+}
+
+/**
+ * Click the message editor without vision: the bottom-most visible editor in
+ * the conversation area. `topic` picks the right-most one, which is the reply
+ * box of an open topic panel or topic detail; `chat` the left-most, the chat's
+ * own input. Returns false when no editor is visible.
+ */
+export async function focusEditor(page: Page, where: 'chat' | 'topic'): Promise<boolean> {
+  const editors = page.locator('[contenteditable="true"]');
+  const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
+  const boxes: { index: number; x: number; y: number; bottom: number }[] = [];
+  const count = await editors.count();
+  for (let index = 0; index < count; index++) {
+    const box = await editors.nth(index).boundingBox().catch(() => null);
+    if (!box || box.width < 80 || box.height < 8) continue;
+    // The conversation sits right of the chat list; inputs sit low.
+    if (box.x < viewport.width * 0.3 || box.y < viewport.height * 0.45) continue;
+    boxes.push({ index, x: box.x, y: box.y, bottom: box.y + box.height });
+  }
+  if (boxes.length === 0) return false;
+  boxes.sort((a, b) => (where === 'topic' ? b.x - a.x : a.x - b.x) || b.bottom - a.bottom);
+  await editors.nth(boxes[0].index).click({ timeout: 5_000 });
+  return true;
+}
+
+async function focusOrAsk(
+  page: Page,
+  agent: PlaywrightAgent,
+  where: 'chat' | 'topic',
+  prompt: string,
+): Promise<void> {
+  // CI once typed into nothing after a positional click ("the input still
+  // read ''"): only trust it when focus actually landed in an editor.
+  if ((await focusEditor(page, where).catch(() => false)) && (await page.evaluate(`!!${FIND_EDITOR}`))) return;
+  await agent.aiAct(prompt);
+}
+
+/**
+ * Focus an input via `focus`, type `text` and send it. Slash commands get a
+ * trailing space so Feishu's suggestion popup cannot take the Enter; the
+ * daemon trims it before parsing.
+ */
+export async function sendTyped(
+  page: Page,
+  focus: () => Promise<unknown>,
+  text: string,
+  delay: number,
+): Promise<void> {
+  const typed = text.startsWith('/') ? `${text} ` : text;
+  let seen = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await focus();
+    await page.waitForTimeout(500);
+    await warmUpInput(page);
+    if (await typeVerified(page, typed, delay)) {
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(1_000);
+      return;
+    }
+    seen = await focusedInputText(page);
+    console.warn(`[e2e] Typed input garbled (attempt ${attempt}): ${JSON.stringify(seen.slice(0, 80))}; retyping`);
+  }
+  await clearFocusedInput(page);
+  throw new Error(`Could not type ${JSON.stringify(text.slice(0, 60))}: the input read ${JSON.stringify(seen.slice(0, 80))}`);
+}
+
+/**
+ * Empty the message editor. Feishu's editor ignores Ctrl+A and a DOM
+ * selection set from script (CI: retries piled up "eply-mode eply-mode …" and
+ * a restore command was appended to an old probe three times), so delete from
+ * the end one character at a time and check it reads empty.
+ */
+async function clearFocusedInput(page: Page): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const text = normalizeInput(await focusedInputText(page));
+    if (text === '') return;
+    await page.keyboard.press('Control+End');
+    await page.keyboard.press('End');
+    for (let i = 0; i < text.length + 4; i++) await page.keyboard.press('Backspace');
+    await page.waitForTimeout(300);
+  }
+}
+
+/**
+ * The first keys after focusing the editor are sometimes swallowed ("/r" of
+ * "/reply-mode", "e" of "e2e-…"). Spend them on throwaway characters, then
+ * clear, so the real text starts on a warmed-up editor.
+ */
+async function warmUpInput(page: Page): Promise<void> {
+  await page.keyboard.type('xxx', { delay: 30 });
+  await page.waitForTimeout(200);
+  await clearFocusedInput(page);
+}
+
+/**
+ * Mention `botName` in the focused input, type `message` after it and send.
+ * CI showed the vision pick from the @ dropdown landing on a neighbouring bot
+ * (Aiden, OpenCode, another app) a few times per run — so the dropdown is
+ * filtered by typing the name, and the input is checked before sending: a
+ * message @ing the wrong bot is never sent. Slash commands get a trailing
+ * space so Feishu's suggestion popup cannot take the Enter; the daemon trims it.
+ */
+async function typeMention(
+  page: Page,
+  agent: PlaywrightAgent,
+  botName: string,
+  message: string,
+): Promise<void> {
+  const name = botName.replace(/^\[Botmux\]/, '');
+  let text = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await page.keyboard.type(`@${name}`, { delay: 60 });
+    await page.waitForTimeout(1_500);
+    if (attempt < 3) {
+      // The filtered dropdown highlights its first match.
+      await page.keyboard.press('Enter');
+    } else {
+      await agent.aiAct(
+        `在弹出的@提及列表中点击名称恰好为"${botChatName(name)}"的机器人（带"机器人"徽标）；` +
+          '不要选其它机器人，也不要选同名的原生智能体',
+      );
+    }
+    await page.waitForTimeout(600);
+    text = await focusedInputText(page);
+    if (
+      holdsOnlyMention(text, name) &&
+      (await typeVerified(page, ` ${message}${message.startsWith('/') ? ' ' : ''}`, 20, text)) &&
+      holdsOnlyMention(await focusedInputText(page), name)
+    ) {
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(1_000);
+      return;
+    }
+    text = await focusedInputText(page);
+    console.warn(`[e2e] @${name} selection attempt ${attempt} left the input as ${JSON.stringify(text)}; retrying`);
+    await clearFocusedInput(page);
+  }
+  throw new Error(`Could not mention ${botChatName(name)}: the input still read ${JSON.stringify(text)}`);
+}
+
+/** @mention `botName` from the reply input of the topic open in the main area. */
+export async function sendMentionInOpenTopic(
+  page: Page,
+  agent: PlaywrightAgent,
+  botName: string,
+  message: string,
+): Promise<void> {
+  await scrollThreadToBottom(agent);
+  await focusOrAsk(page, agent, 'topic', '点击主内容区正在显示的测试话题最底部的回复输入框');
+  await page.waitForTimeout(500);
+  await warmUpInput(page);
+  await typeMention(page, agent, botName, message);
+}
+
+/**
+ * Type `text` into the chat's bottom message input with real key presses and
+ * send it as a top-level message (not inside a topic).
+ */
+export async function typeChatMessage(
+  agent: PlaywrightAgent,
+  page: Page,
+  text: string,
+): Promise<void> {
+  await sendTyped(
+    page,
+    () => focusOrAsk(page, agent, 'chat', '点击聊天区域最底部的消息输入框（不是话题回复框）'),
+    text,
+    20,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -240,23 +656,6 @@ export async function waitForCardStatus(
   );
 }
 
-export async function waitForIdleOrCodexUsageLimit(
-  agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number },
-): Promise<'idle' | 'codex-usage-limit'> {
-  await agent.aiWaitFor(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话已经进入可验证的结束态：' +
-      '要么最新流式卡片标题包含"等待输入"，要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
-      '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
-    { timeoutMs: opts?.timeoutMs ?? 120_000, checkIntervalMs: 5_000 },
-  );
-
-  const isUsageLimited = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话的最新回复或最新流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示',
-  );
-  return isUsageLimited ? 'codex-usage-limit' : 'idle';
-}
-
 /**
  * Full flow after sending a message:
  *  1. Switch to Feishu's 「话题」filter tab so the test topic opens in the
@@ -277,6 +676,21 @@ export async function waitForStreamingCard(
   const timeoutMs = opts?.timeoutMs ?? 60_000;
   await openThreadForMessage(agent, { timeoutMs, msgHint: opts?.msgHint, page: opts?.page });
   await clickDirectStartIfPresent(agent, opts?.page);
+
+  // Load what the topic holds before looking: a reply that arrived while the
+  // topic was open sits behind 「N 条新消息」 (CI: repo card never rendered,
+  // the streaming-card wait timed out). Click it, and a late repo card, until
+  // the card's buttons are in the DOM.
+  const page = opts?.page;
+  if (page) {
+    const tag = opts?.msgHint ? messageTag(opts.msgHint) : '';
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && (await pageTextCount(page, '打开 Web 终端')) === 0) {
+      await revealNewMessages(page);
+      if (tag) await clickDirectStartAfter(page, tag);
+      await page.waitForTimeout(2_000);
+    }
+  }
 
   // Step 5: Wait for streaming card.
   await agent.aiWaitFor(
@@ -309,16 +723,24 @@ export async function openThreadForMessage(
     );
   }
 
-  // Step 1: Switch to the 「话题」filter tab on the left-middle column.
-  // After this, the middle column shows the topic list (not the message list).
+  // Step 1: Switch to the 「话题 / Topics」filter tab on the left-middle
+  // column. The saved Feishu account can render either the Chinese UI (tab
+  // labelled 「话题」) or the English UI (tab labelled "Topics" / "Topic
+  // chats"), so the instruction accepts either label instead of demanding the
+  // literal Chinese characters (which made the agent refuse to click when the
+  // UI was English). After this, the middle column shows the topic list.
   await agent.aiAct(
-    '点击飞书左侧中间那一列顶部的"话题"筛选入口（图标是📇/方框，文字就是"话题"两个字）。' +
-      '不要点"话题群"、不要点"消息"、不要点"@我"、不要点"未读"、也不要点"标签"。' +
-      '点击后，中间那一列应切换成"话题"列表',
+    'Click the "Topics" filter tab at the top of the left-middle column ' +
+      '(Chinese UI: the tab labelled 「话题」; English UI: the tab labelled ' +
+      '"Topics" or "Topic chats"). Its icon looks like an index-card/contact ' +
+      'card (📇/▯). It is NOT "Messages/消息", NOT "@mentions/@我", NOT ' +
+      '"Unread/未读", NOT "Labels/标签". After clicking, the middle column ' +
+      'switches to the topics list.',
   );
   await agent.aiWaitFor(
-    '左侧中间那一列顶部显示当前筛选是"话题"（比如标题栏显示"话题"二字），' +
-      '并且中间列是一个话题条目列表（而不是普通的"消息"列表）',
+    'The middle column is now a list of topic/thread entries (a topic list, ' +
+      'not the ordinary message/chats list). The active filter tab is Topics ' +
+      '(「话题」in Chinese).',
     { timeoutMs: 15_000, checkIntervalMs: 2_000 },
   );
 
@@ -369,7 +791,7 @@ export async function openThreadForMessage(
   await agent.aiWaitFor(
     `页面右侧主内容区（宽版，占据页面大部分空间，不是那一条窄的侧栏）已经打开包含"${tag}"的测试话题；` +
       '区域内可见该测试消息，以及下方的机器人相关内容（普通文本气泡、"项目仓库管理"卡、"直接开启会话"按钮或流式卡片之一）',
-    { timeoutMs: 20_000, checkIntervalMs: 3_000 },
+    { timeoutMs: 35_000, checkIntervalMs: 3_000 },
   );
 
   await scrollThreadToBottom(agent);
@@ -378,17 +800,37 @@ export async function openThreadForMessage(
 export async function clickDirectStartIfPresent(
   agent: PlaywrightAgent,
   page?: Page,
+  opts?: { expectMs?: number },
 ): Promise<void> {
+  if (page) await revealNewMessages(page);
+  if (page && opts?.expectMs) {
+    // The bot always posts a repo card first (Codex): wait for it rather than
+    // giving up when the topic's replies are still rendering — and load
+    // replies held behind 「N 条新消息」, or the card never renders.
+    const deadline = Date.now() + opts.expectMs;
+    while (Date.now() < deadline && !(await anyVisible(page.getByText(DIRECT_START_LABEL)))) {
+      await revealNewMessages(page);
+      await page.waitForTimeout(2_000);
+    }
+  }
   if (page) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const directStart = page.getByText('直接开启会话').last();
+        // The visible one: hidden cached copies share the label.
+        const matches = page.getByText(DIRECT_START_LABEL);
+        let directStart = matches.last();
+        for (let i = (await matches.count()) - 1; i >= 0; i--) {
+          if (await matches.nth(i).isVisible().catch(() => false)) {
+            directStart = matches.nth(i);
+            break;
+          }
+        }
         await directStart.scrollIntoViewIfNeeded({ timeout: 3_000 });
         await directStart.click({ timeout: 3_000 });
         await page.waitForTimeout(1000);
         return;
       } catch {
-        await page.mouse.wheel(0, 1200);
+        await scrollConversation(page, 1_200);
         await page.waitForTimeout(500);
       }
     }
@@ -424,8 +866,20 @@ export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
 ): Promise<void> {
+  // The ACK text bubble is the last item after a successful reply, so "the
+  // bottom of the thread" is that bubble (thumbs-up / copy / forward), not
+  // the streaming card. Bring the card's own button into view first.
+  const cardButton = page.getByRole('button', { name: /显示输出|隐藏输出/ }).last();
+  try {
+    await cardButton.scrollIntoViewIfNeeded({ timeout: 15_000 });
+  } catch {
+    // The vision checks below report a real miss.
+  }
+  const cardClause =
+    '主内容区正在显示的测试话题里，当前会话的流式卡片（带"打开 Web 终端"或"显示输出/隐藏输出"的那张，可能在 ACK 文本气泡上方）。' +
+    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
   const needShow = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📖 显示输出"按钮',
+    `${cardClause}这张卡片的操作按钮中有"📖 显示输出"按钮`,
   );
   if (needShow) {
     try {
@@ -435,14 +889,15 @@ export async function showStreamingOutput(
         .click({ timeout: 5_000 });
     } catch {
       await agent.aiAct(
-        '点击主内容区正在显示的测试话题最底部，当前会话流式卡片里的"📖 显示输出"按钮；不要点击"打开 Web 终端"按钮',
+        `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
       );
     }
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
   }
-  await agent.aiAssert(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📕 隐藏输出"，' +
+  await agent.aiWaitFor(
+    `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
       '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
+    { timeoutMs: 30_000, checkIntervalMs: 2_000 },
   );
 }
 
@@ -498,15 +953,343 @@ export async function waitForCodexSideResponse(
   agent: PlaywrightAgent,
   opts?: { marker?: string; timeoutMs?: number },
 ): Promise<void> {
-  const markerClause = opts?.marker
-    ? `要么来自 Codex 的回复包含"${opts.marker}"，`
-    : '';
+  if (opts?.marker) {
+    await agent.aiWaitFor(
+      `主内容区正在显示的测试话题里出现一条来自 Codex 或机器人的独立文本气泡（不是流式卡片、不是仓库选择卡、绝对不是用户自己发出的提问消息），` +
+        `气泡正文中必须同时包含"【MOCK-REPLY】"和"${opts.marker}"（"【MOCK-REPLY】"是模型回复专用的固定前缀，用户提问中绝无此标记），` +
+        '不要把流式卡片标题或用户提问误认为回复',
+      { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
+    );
+    return;
+  }
   await agent.aiWaitFor(
-    `主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：${markerClause}` +
+    '主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：' +
+      '要么来自 Codex 的独立文本气泡回复，' +
       '要么来自 Codex 的回复或流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
       '同时当前测试话题中没有出现"没能确认提交"或"可能卡在输入框里"的 botmux 提交失败警告',
     { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
   );
+}
+
+/**
+ * Wait until `text` occurs at least `min` times in the rendered page text,
+ * including parts scrolled out of view. Use it for replies above the fold that a
+ * screenshot cannot see. An ACK marker also appears inside the prompt that asked
+ * for it, so a reply needs `min: 2`. That holds only while the topic-list
+ * preview cannot show this marker, so check the newest marker visually instead.
+ */
+export async function waitForPageTextCount(
+  page: Page,
+  text: string,
+  min: number,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let count = 0;
+  while (Date.now() < deadline) {
+    count = await pageTextCount(page, text);
+    if (count >= min) return;
+    await page.waitForTimeout(2_000);
+  }
+  throw new Error(`"${text}" appeared ${count} time(s), expected at least ${min}`);
+}
+
+/**
+ * Scroll the conversation on the right (chat, topic detail or session group),
+ * not whatever sits under the mouse. After a click in the 「话题」 list the
+ * mouse rests on that list, and a bare wheel scrolled it instead of the topic:
+ * replies below the fold — the repo card included — never rendered, so
+ * 「直接开启会话」 was never clicked and the session never started.
+ */
+export async function scrollConversation(page: Page, deltaY = 2_000): Promise<void> {
+  const viewport = page.viewportSize() ?? BROWSER_CONFIG.viewport;
+  await page.mouse.move(Math.round(viewport.width * 0.68), Math.round(viewport.height * 0.5));
+  await page.mouse.wheel(0, deltaY);
+  await revealNewMessages(page);
+}
+
+// 「⌄ 1 条新消息」: the chevron may render as text or as an icon.
+const NEW_MESSAGES_PILL = /^[^\d]{0,3}\d+\s*条新消息\s*$/;
+
+/**
+ * Click Feishu's 「⌄ N 条新消息」 pill. A topic view does not render replies
+ * that arrive while it is open until this is clicked: CI showed a topic
+ * reading 「1 条话题回复」 with an empty body, the repo card never in the DOM,
+ * so 「直接开启会话」 could not be clicked by any means.
+ */
+export async function revealNewMessages(page: Page): Promise<boolean> {
+  const pills = page.getByText(NEW_MESSAGES_PILL);
+  const count = await pills.count().catch(() => 0);
+  let seen = false;
+  for (let i = 0; i < count; i++) {
+    const pill = pills.nth(i);
+    if (!(await pill.isVisible().catch(() => false))) continue;
+    seen = true;
+    // Click by coordinates: locator.click() waits for the pill to be "stable",
+    // and CI never got past that — the pill stayed up with the card unloaded.
+    const box = await pill.boundingBox().catch(() => null);
+    try {
+      if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      else await pill.click({ force: true, timeout: 2_000 });
+    } catch (error) {
+      console.warn(`[e2e] Clicking 「新消息」 failed: ${(error as Error).message.split('\n')[0]}`);
+    }
+    await page.waitForTimeout(800);
+  }
+  return seen;
+}
+
+/** Occurrences of `text` in the rendered page text, including off-screen parts. */
+export async function pageTextCount(page: Page, text: string): Promise<number> {
+  return (await page.locator('body').innerText()).split(text).length - 1;
+}
+
+/**
+ * Click the 「直接开启会话」 button of the repo card that follows `anchor` (the
+ * probe's tag). Only the button label counts — the bot's status message
+ * 「▶️ 已直接开启会话（工作目录：.）」 also contains the words, and CI "clicked"
+ * that while the topic's real card kept waiting for repo selection. Among
+ * visible buttons, the nearest one below the visible anchor wins, so an
+ * earlier conversation's card is never restarted.
+ */
+export const DIRECT_START_LABEL = /^\s*(▶️\s*)?直接开启会话\s*$/;
+
+export async function clickDirectStartAfter(page: Page, anchor: string): Promise<boolean> {
+  try {
+    const anchors = page.getByText(anchor, { exact: false });
+    const anchorBoxes = [];
+    for (let i = 0; i < (await anchors.count()); i++) {
+      const box = await anchors.nth(i).boundingBox().catch(() => null);
+      if (box && box.width > 0) anchorBoxes.push(box);
+    }
+    if (anchorBoxes.length === 0) return false;
+    const buttons = page.getByText(DIRECT_START_LABEL);
+    const candidates: { index: number; distance: number }[] = [];
+    for (let i = 0; i < (await buttons.count()); i++) {
+      const box = await buttons.nth(i).boundingBox().catch(() => null);
+      if (!box || box.width === 0) continue;
+      let nearest = Infinity;
+      for (const anchorBox of anchorBoxes) {
+        const distance = box.y - anchorBox.y;
+        // Below this anchor, in the same column (topic panel vs chat).
+        const sameColumn = box.x + box.width > anchorBox.x && box.x < anchorBox.x + anchorBox.width + 400;
+        if (distance > 0 && sameColumn) nearest = Math.min(nearest, distance);
+      }
+      if (nearest < Infinity) candidates.push({ index: i, distance: nearest });
+    }
+    // Nearest first, but a hidden copy (group topic views keep cached ones)
+    // must not block the visible card: CI never clicked the real button.
+    candidates.sort((a, b) => a.distance - b.distance);
+    for (const { index } of candidates) {
+      const button = buttons.nth(index);
+      if (!(await button.isVisible().catch(() => false))) continue;
+      try {
+        await button.scrollIntoViewIfNeeded({ timeout: 3_000 });
+        await button.click({ timeout: 3_000 });
+        return true;
+      } catch {
+        // Try the next candidate.
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait until `line` occurs at least `min` times in the page (a recall line
+ * exists only in the reply: `min` 1; an ACK marker also sits in its prompt:
+ * `min` 2). On the way, clicks the repo card the bot may post first — both
+ * Claude and Codex do when the session has no pinned working directory.
+ */
+export async function waitForReplyLine(
+  page: Page,
+  line: string,
+  opts?: {
+    min?: number;
+    timeoutMs?: number;
+    anchor?: string;
+    agent?: PlaywrightAgent;
+    /**
+     * Re-open the view being watched. Used when a 「新消息」 pill stays up after
+     * being clicked: a topic opened after its reply arrived renders the reply.
+     */
+    reopen?: () => Promise<void>;
+  },
+): Promise<void> {
+  const min = opts?.min ?? 1;
+  const timeoutMs = opts?.timeoutMs ?? 240_000;
+  // `ACK-<tag> …` → the probe's tag, which its prompt contains. Other reply
+  // shapes pass the prompt text the repo card follows.
+  const anchor = opts?.anchor ?? line.split(/\s+/)[0].replace(/^ACK-/, '');
+  const started = Date.now();
+  const deadline = started + timeoutMs;
+  let clicks = 0;
+  let lastClick = 0;
+  let visionClicked = false;
+  let pillSince: number | null = null;
+  let reopened = 0;
+  let count = 0;
+  while (Date.now() < deadline) {
+    count = await pageTextCount(page, line);
+    if (count >= min) return;
+    const pillUp = await anyVisible(page.getByText(NEW_MESSAGES_PILL));
+    pillSince = pillUp ? pillSince ?? Date.now() : null;
+    if (pillSince !== null && Date.now() - pillSince > 25_000 && opts?.reopen && reopened < 2) {
+      reopened += 1;
+      pillSince = null;
+      console.warn(`[e2e] 「新消息」 pill stayed up; re-opening the view (${reopened}/2)`);
+      try {
+        await opts.reopen();
+      } catch (error) {
+        console.warn(`[e2e] Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
+      }
+      continue;
+    }
+    // Last resort when a visible repo card still waits after the DOM tries.
+    if (
+      opts?.agent &&
+      !visionClicked &&
+      Date.now() - started > 45_000 &&
+      (await anyVisible(page.getByText(DIRECT_START_LABEL)))
+    ) {
+      visionClicked = true;
+      try {
+        await opts.agent.aiAct(
+          '点击当前打开的话题（或会话）里「项目仓库管理」卡片上的"▶️ 直接开启会话"按钮；只点这一张卡片上的按钮',
+        );
+        clicks += 1;
+        lastClick = Date.now();
+      } catch (error) {
+        // The DOM loop keeps trying.
+        console.warn(`[e2e] Vision click on 直接开启会话 failed: ${(error as Error).message.split('\n')[0]}`);
+      }
+    }
+    // A click that did not register leaves the button in place; a started
+    // session replaces it, so the exact-label match finds nothing more.
+    if (clicks < 3 && Date.now() - lastClick > 20_000 && (await clickDirectStartAfter(page, anchor))) {
+      clicks += 1;
+      lastClick = Date.now();
+    }
+    await scrollConversation(page);
+    await page.waitForTimeout(3_000);
+  }
+  const diagnosis = await repoCardDiagnosis(page, anchor);
+  const message =
+    `Reply "${line}" appeared ${count} time(s) within ${timeoutMs}ms, expected ${min}` +
+    ` (clicked 直接开启会话 ${clicks}×; re-opened ${reopened}×; ${diagnosis})`;
+  if (opts?.agent) await recordFailureState(opts.agent, page, anchor, message);
+  throw new Error(message);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Send a command and wait for the bot's answer to it: text matching `pattern`
+ * that appears after the last echo of `command` (the user's bubble, or the
+ * quote in the bot's reply). Returns the match. DOM order instead of counts,
+ * because older messages drop out of Feishu's partial rendering.
+ */
+export async function sendAndAwaitReply(
+  page: Page,
+  send: () => Promise<void>,
+  command: string,
+  pattern: RegExp,
+  timeoutMs = 60_000,
+): Promise<RegExpMatchArray> {
+  const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
+  await send();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const body = await page.locator('body').innerText();
+    const echoes = [...body.matchAll(echo)];
+    const after = echoes.length > 0 ? body.slice(echoes.at(-1)!.index! + echoes.at(-1)![0].length) : '';
+    const match = after.match(pattern);
+    if (match) return match;
+    await scrollConversation(page);
+    await page.waitForTimeout(2_000);
+  }
+  throw new Error(`No reply matching ${pattern} after "${command}" within ${timeoutMs}ms`);
+}
+
+/**
+ * Scroll the newest occurrence of `text` into view and record a screenshot in
+ * the Midscene report. For checks already decided by an exact DOM match: the
+ * report should show the reply, but a vision assertion on top only adds
+ * failures for replies that sit outside the viewport.
+ */
+export async function recordTextEvidence(
+  agent: PlaywrightAgent,
+  page: Page,
+  text: string,
+  title: string,
+): Promise<void> {
+  try {
+    await page.getByText(text, { exact: false }).last().scrollIntoViewIfNeeded({ timeout: 5_000 });
+    await page.waitForTimeout(800);
+  } catch {
+    // Evidence only; the DOM check already passed.
+  }
+  await agent.recordToReport(title, { content: text });
+}
+
+async function anyVisible(locator: ReturnType<Page['getByText']>): Promise<boolean> {
+  const count = await locator.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    if (await locator.nth(i).isVisible().catch(() => false)) return true;
+  }
+  return false;
+}
+
+/** What the page held when a reply never came: tells "no card" from "not clicked". */
+async function repoCardDiagnosis(page: Page, anchor: string): Promise<string> {
+  const buttons = page.getByText(DIRECT_START_LABEL);
+  const total = await buttons.count().catch(() => 0);
+  let visible = 0;
+  for (let i = 0; i < total; i++) if (await buttons.nth(i).isVisible().catch(() => false)) visible += 1;
+  const anchors = await page.getByText(anchor, { exact: false }).count().catch(() => 0);
+  const pills = await page.getByText(NEW_MESSAGES_PILL).count().catch(() => 0);
+  return `repo card buttons ${visible} visible / ${total} total, anchor matches ${anchors}, new-message pills ${pills}`;
+}
+
+/**
+ * Screenshot the page at the moment a check fails, named so the report picks
+ * it as the case preview — later clean-up steps would otherwise supply it.
+ */
+export async function recordFailureState(
+  agent: PlaywrightAgent,
+  page: Page,
+  anchor: string,
+  detail: string,
+): Promise<void> {
+  try {
+    await page.getByText(anchor, { exact: false }).last().scrollIntoViewIfNeeded({ timeout: 3_000 });
+  } catch {
+    // Keep whatever is on screen.
+  }
+  await agent.recordToReport('失败现场', { content: detail }).catch(() => {});
+}
+
+/** A `reopen` for waitForReplyLine: reload Messenger and open the topic of `msg` again. */
+export function reopenTopic(agent: PlaywrightAgent, page: Page, msg: string): () => Promise<void> {
+  return async () => {
+    await navigateToMessenger(page);
+    await openThreadForMessage(agent, { msgHint: msg, page, timeoutMs: 90_000 });
+  };
+}
+
+/** Assert no reply carrying `line` appears for `waitMs`. */
+export async function expectNoReplyLine(page: Page, line: string, waitMs = 45_000): Promise<void> {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    if ((await pageTextCount(page, line)) > 0) {
+      throw new Error(`Unexpected reply "${line}" appeared`);
+    }
+    await page.waitForTimeout(3_000);
+  }
 }
 
 /**
@@ -517,9 +1300,8 @@ export async function waitForCodexSideResponse(
 export async function scrollThreadToBottom(
   agent: PlaywrightAgent,
 ): Promise<void> {
-  await agent.aiScroll(
-    '主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题',
-    { direction: 'down', scrollType: 'untilBottom' },
+  await agent.aiAct(
+    '滚动主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题到底部，显示最新回复和回复输入框',
   );
 }
 
@@ -535,7 +1317,7 @@ export async function closeSession(
   try {
     // Use Playwright for teardown so a slow Midscene locate call cannot hold
     // the whole suite open after the test body has already finished.
-    await page.mouse.wheel(0, 2000);
+    await scrollConversation(page);
     await page.waitForTimeout(500);
     const closeButton = page.getByText('关闭会话').last();
     await closeButton.click({ timeout: 5_000 });
@@ -562,6 +1344,26 @@ export async function sendThreadReply(
 }
 
 /**
+ * Type a reply into the open topic with real key presses. Slash commands go
+ * through this instead of `sendThreadReply`: the daemon parses the literal
+ * text, so a visual agent that retypes, quotes or translates it would test the
+ * wrong input.
+ */
+export async function typeThreadReply(
+  agent: PlaywrightAgent,
+  page: Page,
+  text: string,
+): Promise<void> {
+  await scrollThreadToBottom(agent);
+  await sendTyped(
+    page,
+    () => focusOrAsk(page, agent, 'topic', '点击主内容区正在显示的测试话题最底部的回复输入框'),
+    text,
+    30,
+  );
+}
+
+/**
  * Generate a unique test message. We tell the bot to emit a unique,
  * timestamped ACK marker via `botmux send`, which guarantees that (a)
  * there IS a standalone text bubble from the model and (b) we can match
@@ -582,6 +1384,27 @@ export function testMessage(label?: string, opts?: { plain?: boolean }): string 
     `请立刻调用 botmux send 在本话题里回复一行内容："${marker}"（原样复制这一串 ASCII 字符，不要翻译、不要改动、不要加引号或额外文字）。` +
     '做完这一步就结束本轮工作，不要再做别的操作。'
   );
+}
+
+/**
+ * A follow-up for the same topic that asks the model to repeat the ACK marker
+ * of the topic's first message. Only a session that still holds the earlier
+ * turn can answer, so the reply proves context continuity. The token lets the
+ * mock LLM recognise the request; a real model follows the instruction text.
+ */
+export function followUpMessage(label: string): string {
+  const tag = `e2e-${label}-${Date.now()}`;
+  const marker = `ACK-${tag}`;
+  return (
+    `${tag} ${RECALL_FIRST_MARKER_TOKEN} ` +
+    `请立刻调用 botmux send 在本话题里回复一行内容："${marker} RECALL <本话题第一条消息要求你回复的那串 ACK- 开头的标记>"` +
+    '（尖括号部分替换成那串标记原文，其余原样保留，不要加引号或额外文字）。做完这一步就结束本轮工作。'
+  );
+}
+
+/** The reply line `followUpMessage()` expects after `firstMsg` opened the topic. */
+export function expectedRecallMarker(followUp: string, firstMsg: string): string {
+  return `${expectedReplyMarker(followUp)} RECALL ${expectedReplyMarker(firstMsg)}`;
 }
 
 /** The bare `e2e-<label>-<ts>` tag portion of a `testMessage()` value — useful for UI/locator matching. */

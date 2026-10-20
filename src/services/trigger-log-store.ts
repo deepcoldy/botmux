@@ -1,7 +1,7 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import type { TriggerAction, TriggerErrorCode } from './trigger-types.js';
 
 export interface TriggerLogEntry {
@@ -276,12 +276,7 @@ export function pruneTriggerLogs(
 
   const fp = logPath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, kept.map(entry => JSON.stringify(entry)).join('\n') + (kept.length ? '\n' : ''), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, kept.map(entry => JSON.stringify(entry)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600, followTargetSymlink: false });
 
   return { before, after: kept.length, deleted: before - kept.length };
 }
@@ -311,11 +306,6 @@ export function pruneTriggerLogsByConnectorRetention(
   if (kept.length === before) return { before, after: before, deleted: 0 };
   const fp = logPath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, kept.map(entry => JSON.stringify(entry)).join('\n') + (kept.length ? '\n' : ''), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, kept.map(entry => JSON.stringify(entry)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600, followTargetSymlink: false });
   return { before, after: kept.length, deleted: before - kept.length };
 }

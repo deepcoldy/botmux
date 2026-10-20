@@ -24,7 +24,12 @@ import {
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
-import { sessionIdentityBinDir, sessionIdentityPath, writeSessionIdentity } from '../src/core/cli-identity.js';
+import {
+  ensureSessionIdentityPlaceholders,
+  sessionIdentityBinDir,
+  sessionIdentityPath,
+  writeSessionIdentity,
+} from '../src/core/cli-identity.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 const USRMERGE = ['/bin', '/lib', '/lib64', '/sbin', '/lib32', '/libx32'];
@@ -79,6 +84,7 @@ function compileIdentityPolicy(): IdentityPolicyHarness {
   }
 
   const sessionId = 'sess-live';
+  ensureSessionIdentityPlaceholders(dataDir, sessionId, ['lark-cli', 'bytedcli']);
   const identityPath = writeSessionIdentity(dataDir, sessionId, {
     tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
   });
@@ -189,8 +195,21 @@ describe.skipIf(!bwrapUsable())('bwrap persistent pane × trigger-user identity'
       expect(statSync(sessionIdentityPath(harness.dataDir, harness.sessionId, 'lark-cli')).ino)
         .not.toBe(firstInode);
       writeFileSync(join(harness.ctlDir, 'go'), '1');
-      await pollFor(() => existsSync(join(harness.ctlDir, 'out')), 'sandbox identity read');
-      const body = readFileSync(join(harness.ctlDir, 'out'), 'utf8');
+      // Wait for the REFRESHED CONTENT, not merely for the file's existence:
+      // the reader publishes `out` with a plain `cat identity > out`, which
+      // truncates-creates the file a beat before the bytes land. Under CI
+      // contention a 50 ms poll could observe that empty window (the observed
+      // flake: "expected '' to contain 'token-second'"). An existence predicate
+      // cannot tell "publishing" from "published"; only content can. A stale
+      // read (the regression this test exists to catch — token-first) never
+      // satisfies this predicate, so it fails via timeout instead of a false
+      // green.
+      const outPath = join(harness.ctlDir, 'out');
+      let body = '';
+      await pollFor(() => {
+        body = existsSync(outPath) ? readFileSync(outPath, 'utf8') : '';
+        return body.includes('token-second');
+      }, 'sandbox identity read containing the refreshed token');
       expect(body).toContain('token-second');
       expect(body).not.toContain('token-first');
     } finally {

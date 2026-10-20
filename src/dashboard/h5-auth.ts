@@ -42,13 +42,17 @@ export interface DashboardH5AuthConfig {
 export interface DashboardAuthIdentity {
   kind: 'feishu-h5';
   userId: string;
+  /** Cross-app stable principal used by owner-bound result views. */
+  unionId?: string;
+  /** Authenticated only for an owner-bound result page, never Workbench. */
+  resultOnly?: true;
   authSessionId: string;
   issuedAt: number;
   expiresAt: number;
 }
 
 export interface FeishuH5CodeExchanger {
-  exchange(code: string, signal?: AbortSignal): Promise<{ openId: string }>;
+  exchange(code: string, signal?: AbortSignal): Promise<{ openId: string; unionId?: string }>;
 }
 
 export type DashboardSessionEndReason = 'expired' | 'logout';
@@ -104,14 +108,19 @@ export class DashboardSessionStore {
     this.cancel = opts.clearTimer ?? clearTimeout;
   }
 
-  create(userId: string): { token: string; identity: DashboardAuthIdentity } {
+  create(userId: string, unionId?: string, resultOnly = false): { token: string; identity: DashboardAuthIdentity } {
     if (!validOpenId(userId)) throw new Error('invalid dashboard session user');
+    if (unionId !== undefined && !/^on_[A-Za-z0-9_-]{6,128}$/.test(unionId)) {
+      throw new Error('invalid dashboard session union id');
+    }
     const now = this.now();
     const token = this.randomToken();
     if (!/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error('invalid dashboard session token source');
     const identity: DashboardAuthIdentity = {
       kind: 'feishu-h5',
       userId,
+      ...(unionId ? { unionId } : {}),
+      ...(resultOnly ? { resultOnly: true as const } : {}),
       authSessionId: randomBytes(18).toString('base64url'),
       issuedAt: now,
       expiresAt: now + this.ttlMs,
@@ -196,6 +205,8 @@ export class DashboardSessionStore {
     return {
       kind: 'feishu-h5',
       userId: stored.userId,
+      ...(stored.unionId ? { unionId: stored.unionId } : {}),
+      ...(stored.resultOnly ? { resultOnly: true as const } : {}),
       authSessionId: stored.authSessionId,
       issuedAt: stored.issuedAt,
       expiresAt: stored.expiresAt,
@@ -280,7 +291,7 @@ export function createFeishuH5CodeExchanger(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_EXCHANGE_TIMEOUT_MS;
   const base = larkHosts(config.brand).openApi;
   return {
-    async exchange(code: string, outerSignal?: AbortSignal): Promise<{ openId: string }> {
+    async exchange(code: string, outerSignal?: AbortSignal): Promise<{ openId: string; unionId?: string }> {
       if (!config.appId || !config.appSecret) throw new Error('auth_not_configured');
       const controller = new AbortController();
       const onAbort = () => controller.abort();
@@ -312,7 +323,13 @@ export function createFeishuH5CodeExchanger(
         const userBody = await userResponse.json().catch(() => null) as FeishuEnvelope | null;
         if (!userResponse.ok || userBody?.code !== 0 || !userBody.data) throw new Error('provider_rejected');
         const directOpenId = userBody.data.open_id;
-        if (typeof directOpenId === 'string' && validOpenId(directOpenId)) return { openId: directOpenId };
+        const directUnionId = userBody.data.union_id;
+        if (typeof directOpenId === 'string' && validOpenId(directOpenId)) return {
+          openId: directOpenId,
+          ...(typeof directUnionId === 'string' && /^on_[A-Za-z0-9_-]{6,128}$/.test(directUnionId)
+            ? { unionId: directUnionId }
+            : {}),
+        };
 
         // Some compatible responses only return user_access_token. Resolve the
         // identity and immediately discard that token as well.
@@ -327,10 +344,16 @@ export function createFeishuH5CodeExchanger(
         });
         const infoBody = await infoResponse.json().catch(() => null) as FeishuEnvelope | null;
         const openId = infoBody?.data?.open_id;
+        const unionId = infoBody?.data?.union_id;
         if (!infoResponse.ok || infoBody?.code !== 0 || typeof openId !== 'string' || !validOpenId(openId)) {
           throw new Error('provider_identity_missing');
         }
-        return { openId };
+        return {
+          openId,
+          ...(typeof unionId === 'string' && /^on_[A-Za-z0-9_-]{6,128}$/.test(unionId)
+            ? { unionId }
+            : {}),
+        };
       } finally {
         clearTimeout(timer);
         outerSignal?.removeEventListener('abort', onAbort);
@@ -632,7 +655,7 @@ function json(res: ServerResponse, status: number, value: unknown, headers: Reco
   res.end(JSON.stringify(value));
 }
 
-async function readCode(req: IncomingMessage): Promise<string | null> {
+async function readCode(req: IncomingMessage): Promise<{ code: string; resultOnly: boolean } | null> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const raw of req) {
@@ -643,16 +666,20 @@ async function readCode(req: IncomingMessage): Promise<string | null> {
   }
   let parsed: unknown;
   try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
-  const code = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? (parsed as { code?: unknown }).code
-    : undefined;
+  const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as { code?: unknown; resultOnly?: unknown }
+    : {};
+  const code = body.code;
   return typeof code === 'string' && code.length >= 4 && code.length <= 2_048 && !/[\s\0]/.test(code)
-    ? code
+    ? { code, resultOnly: body.resultOnly === true }
     : null;
 }
 
 export function safeDashboardH5ReturnTo(value: string | null | undefined): string {
-  if (!value || value.length > 1_024 || !value.startsWith('/#/agent-workbench')) return '/';
+  if (!value || value.length > 1_024) return '/';
+  if (/^\/plugin-result-access\/[A-Za-z0-9_-]{20,256}$/.test(value)
+    || /^\/plugin-results\/[A-Za-z0-9_-]{20,256}$/.test(value)) return value;
+  if (!value.startsWith('/#/agent-workbench')) return '/';
   const hash = value.slice(1).split('?')[0].replace(/\/+$/, '');
   const bases = ['#/agent-workbench-dock', '#/agent-workbench'];
   for (const base of bases) {
@@ -680,7 +707,7 @@ function h5EntryHtml(appId: string, exchangePath: string, returnTo = '/'): strin
 <script>(function(){
 var appId=${safeAppId},endpoint=${safeExchangePath},returnTo=${safeReturnTo},status=document.getElementById('status'),error=document.getElementById('error'),retry=document.getElementById('retry'),attempt=0,timer=0,controller=null,sdkScript=null,timeoutMs=${DASHBOARD_H5_CLIENT_TIMEOUT_MS},sdkUrl='https://lf-scm-cn.feishucdn.com/lark/op/h5-js-sdk-1.5.44.js';
 function fail(id){if(id!==undefined&&id!==attempt)return;if(controller){controller.abort();controller=null}if(sdkScript){sdkScript.onload=sdkScript.onerror=null;sdkScript.remove();sdkScript=null}clearTimeout(timer);timer=0;attempt++;status.textContent='未能完成免登。';error.textContent='请确认正在飞书客户端中打开，或联系管理员检查入口配置。';retry.hidden=false}
-function exchange(code,id){if(id!==attempt)return;controller=typeof AbortController==='function'?new AbortController():null;fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({code:code}),signal:controller?controller.signal:undefined}).then(function(r){if(!r.ok)throw new Error('denied');return r.json()}).then(function(){if(id!==attempt)return;clearTimeout(timer);timer=0;controller=null;location.replace(returnTo)}).catch(function(){fail(id)})}
+function exchange(code,id){if(id!==attempt)return;controller=typeof AbortController==='function'?new AbortController():null;fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({code:code,resultOnly:returnTo.indexOf('/plugin-result')===0}),signal:controller?controller.signal:undefined}).then(function(r){if(!r.ok)throw new Error('denied');return r.json()}).then(function(){if(id!==attempt)return;clearTimeout(timer);timer=0;controller=null;location.replace(returnTo)}).catch(function(){fail(id)})}
 function auth(id){if(id!==attempt)return;if(!window.tt){fail(id);return}var fallback=function(){if(id!==attempt)return;try{window.tt.requestAuthCode({appId:appId,success:function(r){exchange(r&&r.code,id)},fail:function(){fail(id)}})}catch(e){fail(id)}};try{if(window.tt.requestAccess){window.tt.requestAccess({appID:appId,scopeList:[],success:function(r){exchange(r&&r.code,id)},fail:function(e){if(e&&e.errno===103)fallback();else fail(id)}})}else fallback()}catch(e){fail(id)}}
 function ready(id){if(id!==attempt)return;try{if(window.h5sdk&&window.h5sdk.ready)window.h5sdk.ready(function(){auth(id)});else auth(id)}catch(e){fail(id)}}
 function loadSdk(id){if(window.tt||window.h5sdk){ready(id);return}sdkScript=document.createElement('script');sdkScript.src=sdkUrl;sdkScript.async=true;sdkScript.referrerPolicy='no-referrer';sdkScript.onload=function(){sdkScript=null;ready(id)};sdkScript.onerror=function(){sdkScript=null;fail(id)};document.head.appendChild(sdkScript)}
@@ -751,10 +778,11 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
    * audit record. Everything lives inside so that N concurrent replays produce
    * ONE upstream call, ONE session and ONE audit line — not N of each.
    */
-  const exchangeOnce = async (codeKey: string, code: string): Promise<H5ExchangeOutcome> => {
+  const exchangeOnce = async (codeKey: string, code: string, resultOnly: boolean): Promise<H5ExchangeOutcome> => {
     let openId: string;
+    let unionId: string | undefined;
     try {
-      ({ openId } = await exchanger.exchange(code));
+      ({ openId, unionId } = await exchanger.exchange(code));
     } catch (error) {
       // 上游的错因优先：审计再写不进去也不能把它盖掉，否则日志里只剩本地错误、
       // 看不出飞书那边到底怎么了。这条路径本来就要抛，没有任何状态要 fail closed。
@@ -765,7 +793,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       }
       throw error;
     }
-    if (!allowed.has(openId)) {
+    if (!allowed.has(openId) && !resultOnly) {
       auditOrFail(openId, 'auth.login_denied');
       return { ok: false, openId };
     }
@@ -778,7 +806,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
     auditOrFail(openId, 'auth.login');
     let created: { token: string; identity: DashboardAuthIdentity };
     try {
-      created = sessions.create(openId);
+      created = sessions.create(openId, unionId, resultOnly && !allowed.has(openId));
     } catch (error) {
       throw new DashboardH5LocalFailure('session create', error);
     }
@@ -833,11 +861,12 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         rateLimited(res, 'rate_limited', admission.retryAfterMs);
         return true;
       }
-      const code = await readCode(req);
-      if (!code) {
+      const parsedCode = await readCode(req);
+      if (!parsedCode) {
         json(res, 400, { ok: false, error: 'invalid_authorization_code' });
         return true;
       }
+      const { code, resultOnly } = parsedCode;
       const codeKey = exchangeCodeKey(code);
       // The spent check and the single-flight lookup must observe the same
       // tick — no `await` between them. Otherwise a code whose flight settles
@@ -851,7 +880,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       // its single session; distinct codes beyond the global cap 429
       // immediately (never queue, so spam cannot stack pending exchanges on
       // the event loop).
-      const flight = exchangeGate.share(codeKey, () => exchangeOnce(codeKey, code));
+      const flight = exchangeGate.share(codeKey, () => exchangeOnce(codeKey, code, resultOnly));
       if (!flight.ok) {
         rateLimited(res, 'exchange_busy', flight.retryAfterMs);
         return true;

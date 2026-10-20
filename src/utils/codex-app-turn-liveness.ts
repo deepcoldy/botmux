@@ -145,10 +145,33 @@ export class CodexAppTurnLiveness {
   private nextHandle = 1;
   private promptDeferred = false;
 
-  constructor(private readonly timeoutMs = CODEX_APP_NO_PROGRESS_TIMEOUT_MS) {
+  private timeoutMs: number;
+
+  constructor(timeoutMs = CODEX_APP_NO_PROGRESS_TIMEOUT_MS) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new Error('Codex App liveness timeout must be a positive finite number');
     }
+    this.timeoutMs = timeoutMs;
+  }
+
+  /** Current liveness window; the worker renders it in the nudge message. */
+  getTimeoutMs(): number {
+    return this.timeoutMs;
+  }
+
+  /**
+   * Swap the liveness window (per-bot `noProgressNotify.timeoutMs`), applied
+   * at the worker's first init when no turns exist yet. Kept as a pure
+   * state-preserving swap — not a reset — so it stays correct if a future
+   * caller ever retimes mid-turn: in-flight turns keep their
+   * `lastActivityAtMs` / `notified` state and only the window computation
+   * changes.
+   */
+  retimeout(timeoutMs: number): void {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error('Codex App liveness timeout must be a positive finite number');
+    }
+    this.timeoutMs = timeoutMs;
   }
 
   /**

@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # 与 package.json 的 packageManager 字段保持一致（发版编译也钉在此版本）。
-BUN_VERSION="1.4.2"
+BUN_VERSION="1.4.3"
 
 echo "[install] repo root: $REPO_ROOT"
 

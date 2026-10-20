@@ -577,7 +577,7 @@ describe('installHook — claude-settings', () => {
     expect(askGroups[0].hooks.some((e: any) => e.command === hookCommand)).toBe(true);
   });
 
-  it('(d) 迁移旧 PermissionRequest botmux entry 到 PreToolUse', () => {
+  it('(d) 旧 PermissionRequest botmux entry 收敛为唯一的权限确认桥 entry，并补上 PreToolUse', () => {
     const existing = {
       hooks: {
         PermissionRequest: [
@@ -599,11 +599,24 @@ describe('installHook — claude-settings', () => {
 
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     const permGroups: any[] = settings.hooks?.PermissionRequest ?? [];
-    expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === hookCommand))).toBe(false);
+    const botmuxPermGroups = permGroups.filter((g) => g.hooks?.some((e: any) => e.command === hookCommand));
+    // 旧的 matcher='*'/timeout 86400 条目被替换成唯一一条：无 matcher、timeout 900
+    expect(botmuxPermGroups).toEqual([{ hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] }]);
     expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/other-permission-hook'))).toBe(true);
 
     const preToolGroups: any[] = settings.hooks?.PreToolUse ?? [];
     expect(preToolGroups.some((g) => g.matcher === 'AskUserQuestion' && g.hooks?.some((e: any) => e.command === hookCommand))).toBe(true);
+  });
+
+  it('(e) 权限确认桥 entry 重复安装保持幂等（只一条，文件内容不变）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    const first = readFileSync(configPath, 'utf-8');
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    expect(readFileSync(configPath, 'utf-8')).toBe(first);
+    const settings = JSON.parse(first);
+    expect(settings.hooks.PermissionRequest).toEqual([
+      { hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] },
+    ]);
   });
 });
 

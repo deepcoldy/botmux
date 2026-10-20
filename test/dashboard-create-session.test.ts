@@ -70,6 +70,8 @@ vi.mock('../src/services/project-scanner.js', () => ({
 const forkWorkerMock = vi.fn();
 const sendWorkerInputMock = vi.fn();
 const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
+/** Registration-time quarantine check (the real one scans the session store). */
+const findQuarantinedRoutingConflictMock = vi.fn((_key: string, _appId: string): unknown => undefined);
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
@@ -83,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
+  findQuarantinedRoutingConflict: (...a: [string, string]) => findQuarantinedRoutingConflictMock(...a),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);
@@ -595,6 +598,43 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({ prepareTurn }));
   });
 
+  it('resumes a restored auto-worktree on the same explicit path', async () => {
+    const pending: Session = {
+      sessionId: 'pending-explicit-worktree',
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      scope: 'chat',
+      larkAppId: APP,
+      title: 'restore path',
+      status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      queued: true,
+      queuedPrompt: 'OPENING_N',
+      pendingRepoSetup: {
+        mode: 'auto_worktree',
+        prompt: 'OPENING_N',
+        baseDir: '/repos/base',
+        turnId: 'om_original_turn',
+        force: true,
+        worktreePath: '/repos/base-wt-botmux-abc',
+        branch: 'wt/botmux-abc',
+        reuseExisting: true,
+      },
+    };
+    store.set(pending.sessionId, pending);
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({
+      baseDir: '/repos/base',
+      force: true,
+      worktreePath: '/repos/base-wt-botmux-abc',
+      branch: 'wt/botmux-abc',
+      reuseExisting: true,
+    }));
+  });
+
   it('contains detached auto-worktree recovery rejection and leaves the setup retryable', async () => {
     const pending: Session = {
       sessionId: 'pending-auto-worktree',
@@ -995,6 +1035,27 @@ describe('spawnDashboardSession — guards', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect([...store.keys()]).toEqual(['quarantined-session']);
     expect(active.size).toBe(0);
+  });
+
+  it('re-checks quarantine under the key lock, after the pre-lock scan', async () => {
+    // A restore can quarantine the anchor while spawn awaits banner /
+    // attachment posts; the pre-lock store scan has already passed by then.
+    findQuarantinedRoutingConflictMock.mockReturnValueOnce({ sessionId: 'quarantined-late' });
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: '锁内复查',
+      column: 'in_progress',
+      role: 'solo',
+      postBanner: false,
+    });
+
+    expect(result).toEqual({ ok: false, error: 'session_exists' });
+    expect(store.size).toBe(0);
+    expect(active.size).toBe(0);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
   });
 });
 
