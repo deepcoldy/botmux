@@ -201,10 +201,7 @@ function herdrUsesManagedAgentFacade(): boolean {
   }
 }
 
-function paneAgentKindForExecutable(bin: string, cliId?: string, explicitKind?: string): string | undefined {
-  if (explicitKind && PANE_AGENT_KIND_BY_EXECUTABLE[explicitKind]) {
-    return PANE_AGENT_KIND_BY_EXECUTABLE[explicitKind];
-  }
+function paneAgentKindForExecutable(bin: string, cliId?: string): string | undefined {
   const base = basename(bin);
   if (PANE_AGENT_KIND_BY_EXECUTABLE[base]) {
     return PANE_AGENT_KIND_BY_EXECUTABLE[base];
@@ -1048,7 +1045,7 @@ export class HerdrBackend implements SessionBackend {
     // Identify the managed kind by the original CLI; the launcher still
     // executes the complete wrapped command.
     const cliBin = opts.cliBin ?? bin;
-    const kind = paneAgentKindForExecutable(cliBin, opts.cliId, opts.herdrAgentKind);
+    const kind = paneAgentKindForExecutable(cliBin, opts.cliId);
     if (!kind) {
       throw new Error(
         `Herdr >=0.7.5 cannot launch executable "${basename(cliBin)}" as a managed coding agent; ` +

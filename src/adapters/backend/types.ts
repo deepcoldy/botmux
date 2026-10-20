@@ -214,8 +214,6 @@ export interface SpawnOpts {
   cliBin?: string;
   /** Logical CLI identifier (e.g. 'claude', 'codex') for agent kind fallback. */
   cliId?: string;
-  /** Explicit Herdr managed agent kind override. */
-  herdrAgentKind?: string;
   /** Provider-neutral model selection for structured remote runners. */
   model?: string;
   /** Provider-neutral model backend variant for structured remote runners. */
