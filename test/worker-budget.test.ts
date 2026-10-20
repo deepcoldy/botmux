@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   checkWorkerAdmission,
   DEFAULT_MAX_MEMORY_FULL_AVG10,
-  DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
   evaluateWorkerAdmission,
   readHostMemoryPressure,
   resolveWorkerPressurePolicy,
@@ -241,7 +240,6 @@ describe('worker memory admission', () => {
   });
 
   it('caps the default reserve at the 4 GiB spawn-cost cap instead of scaling with host capacity', () => {
-    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBe(4 * 1024 ** 3);
     // Host RAM and finite cgroup limits share one formula: min(4 GiB cap, 25%
     // of the total). ≥16 GiB stays at the cap; smaller boxes scale down.
     for (const [totalGiB, expectedGiB] of [

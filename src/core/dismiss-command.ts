@@ -29,7 +29,9 @@ export type DismissResult =
   | { status: 'confirm'; state: string; sessions: DismissSession[] }
   | { status: 'close_failed' | 'residual'; detail?: string }
   | { status: 'peer_offline'; larkAppIds: string[] }
-  | { status: 'unsupported' | 'owner_only' | 'shared_adopt' | 'changed' | 'disband_failed' | 'dismissed' | 'unavailable' };
+  /** `workingDirs`: where the closed sessions ran, for the worktree cleanup offer. */
+  | { status: 'dismissed'; workingDirs: string[] }
+  | { status: 'unsupported' | 'owner_only' | 'shared_adopt' | 'changed' | 'disband_failed' | 'unavailable' };
 
 type CloseFailure = { kind: 'failed' | 'residual'; reason: string };
 
@@ -172,7 +174,11 @@ export async function dismissSessionGroup(args: {
         return { status: 'disband_failed' };
       }
       removeSessionGroup(args.chatId);
-      return { status: 'dismissed' };
+      const workingDirs = [
+        live?.workingDir ?? session.workingDir,
+        ...others.map(s => s.live?.workingDir ?? s.session.workingDir),
+      ].filter((dir): dir is string => !!dir);
+      return { status: 'dismissed', workingDirs: [...new Set(workingDirs)] };
     });
   } catch (err) {
     logger.warn(`[dismiss] group preserved or deletion unconfirmed: ${err}`);

@@ -28,7 +28,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persist
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
-import { buildDismissConfirmCard } from '../im/lark/dismiss-card.js';
+import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dismiss-card.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -141,7 +141,8 @@ import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
-import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
 
@@ -1946,48 +1947,15 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
           break;
         }
-        let job;
-        try {
-          job = getWorktreeCleanupJob(config.session.dataDir, cleanupId);
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ 无法读取 worktree 清理任务：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        if (!job || job.larkAppId !== appId) {
-          await sessionReply(rootId, '未找到该 worktree 清理任务。');
-          break;
-        }
-        try {
-          const containingRoot = await worktreeRootFor(job.worktreeDir);
-          const main = containingRoot ? await mainWorktreeFor(containingRoot) : undefined;
-          if (!containingRoot || resolve(containingRoot) !== resolve(job.worktreeDir)
-            || resolve(main ?? '') !== resolve(job.worktreeMain)
-            || !(await isLinkedWorktree(containingRoot))) {
-            await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
-            break;
-          }
-          const refusal = await withWorktreeTargetLock(job.worktreeDir, async () => {
-            const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
-            if (active.length > 0) {
-              return `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`;
-            }
-            const safety = await worktreeSafetyStatus(job.worktreeDir);
-            if (safety.fingerprint !== job.safetyFingerprint) {
-              return '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。';
-            }
-            await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
-            deleteWorktreeCleanupJob(config.session.dataDir, job.id);
-            return undefined;
-          });
-          if (refusal) {
-            await sessionReply(rootId, refusal);
-            break;
-          }
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
+        const run = await runWorktreeCleanupJob(appId, cleanupId);
+        const reply = run.status === 'unreadable' ? `⚠️ 无法读取 worktree 清理任务：${run.error}`
+          : run.status === 'not_found' ? '未找到该 worktree 清理任务。'
+          : run.status === 'identity_changed' ? '⚠️ worktree 身份已变化，拒绝重试删除。'
+          : run.status === 'busy' ? `⚠️ worktree 仍有 ${run.activeCount} 个活动会话，暂不删除。`
+          : run.status === 'changed' ? '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。'
+          : run.status === 'failed' ? `⚠️ worktree 清理重试失败，任务已保留：${run.error}`
+          : `🧹 已重试并移除 worktree：\`${run.dir}\``;
+        await sessionReply(rootId, reply);
         break;
       }
 
@@ -2291,9 +2259,13 @@ export async function handleCommand(
           confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
-          // The deleted group cannot receive the receipt; notify privately.
-          try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
-          catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+          // The deleted group cannot receive the receipt; notify privately,
+          // offering one-click cleanup of the worktrees those sessions used.
+          try {
+            const offers = await offerWorktreeCleanup(appId, result.workingDirs);
+            await sendUserMessage(appId, message.senderId,
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+          } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
         } else if (result.status === 'confirm') {
           await sessionReply(rootId, buildDismissConfirmCard({
             chatId,
@@ -3006,7 +2978,8 @@ export async function handleCommand(
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
               || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
+              || current.pendingChatContext !== undefined
+              || current.pendingGroupJoinContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -3040,6 +3013,7 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  groupJoinContext: current.pendingGroupJoinContext,
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
@@ -3079,7 +3053,10 @@ export async function handleCommand(
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? {
+                turnId: pendingTurnId,
+                ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
+              } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -3098,6 +3075,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;

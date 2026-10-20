@@ -98,7 +98,14 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
-import { DISMISS_CONFIRM_ACTION, buildDismissSubmittedCard } from './dismiss-card.js';
+import {
+  DISMISS_CLEANUP_WT_ACTION,
+  DISMISS_CONFIRM_ACTION,
+  buildDismissSubmittedCard,
+  buildWorktreeCleanupResultCard,
+  buildWorktreeCleanupRunningCard,
+} from './dismiss-card.js';
+import { runWorktreeCleanupJob } from '../../core/worktree-cleanup-run.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -601,7 +608,8 @@ export async function commitRepoSelection(
         (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       const availableBots = needsPromptContext
         ? await getAvailableBots(ds.larkAppId, ds.chatId)
         : [];
@@ -620,7 +628,8 @@ export async function commitRepoSelection(
         ds.pendingCodexAppText !== undefined ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       // Nothing to submit at all (session created by a bare `/repo`, i.e. the
       // message IS the command). Boot the CLI idle instead of burning an empty
       // `<user_message>` opening on it, and mark the session so the user's NEXT
@@ -652,6 +661,7 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              groupJoinContext: ds.pendingGroupJoinContext,
               // Repo selection commits the original fresh launch. Restoring
               // the pending card does not turn it into a CLI resume.
               larkToolResume: false,
@@ -699,7 +709,10 @@ export async function commitRepoSelection(
       forkWorker(
         ds,
         prompt,
-        !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+        !emptyStart && !pendingRawInput && pendingTurnId ? {
+          turnId: pendingTurnId,
+          ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
+        } : false,
       );
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
@@ -716,6 +729,8 @@ export async function commitRepoSelection(
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       ds.pendingAttachments = undefined;
       ds.pendingMentions = undefined;
       ds.pendingSubstituteTrigger = undefined;
@@ -1641,6 +1656,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         lastRepoScan,
         getActiveCount: () => activeSessions.size,
       }, larkAppId),
+    };
+  }
+
+  if (value?.action === DISMISS_CLEANUP_WT_ACTION) {
+    const loc = localeForBot(larkAppId);
+    const ids = String(value.job_ids ?? '').split(',');
+    if (!larkAppId || !operatorOpenId || ids.length > 20 || !ids.every(id => /^[a-f0-9]{16}$/.test(id))) {
+      return { toast: { type: 'warning', content: t('cmd.dismiss.cleanup_expired', undefined, loc) } };
+    }
+    if (String(value.invoker_open_id ?? '') !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_not_invoker', undefined, loc) } };
+    }
+    if (!canOperate(larkAppId, undefined, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc) } };
+    }
+    // Same deletion path as `/cleanup-wt <id>`: identity, idleness and the
+    // receipt-time fingerprint are re-proven under the worktree lock.
+    return {
+      card: { type: 'raw', data: buildWorktreeCleanupRunningCard(loc) },
+      afterAck: async () => {
+        const results = [];
+        for (const id of ids) results.push({ id, run: await runWorktreeCleanupJob(larkAppId, id) });
+        const resultCard = buildWorktreeCleanupResultCard(results, loc);
+        if (cardMessageId) await updateMessage(larkAppId, cardMessageId, resultCard);
+        else await sendUserMessage(larkAppId, operatorOpenId, resultCard, 'interactive');
+      },
     };
   }
 

@@ -317,6 +317,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 |------|------|
 | `autoInviteOwnerOnGroupAdd` | 默认开：bot 被拉进新群时自动把 owner（管理员）拉进同一个群，避免 bot 落在 owner 看不到的群里；显式 `false` 关闭（适合告警/oncall 平台批量拉事件群）。仅作用于 bot 被动入群；Dashboard「Bot 默认 → 主动开工」与飞书 `/botconfig set autoInviteOwnerOnGroupAdd off` 均可关，选回开即删键回默认 |
 | `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
+| `autoStartOnGroupJoinGateRequired` | `true` 时，入群自动开工还必须有至少一条匹配的 `chat.bot_added` 同步 Hook 明确放行；配置缺失、无匹配或无效时在创建会话／seed 消息前静默停止。适合只允许动态识别出的群自动开工；默认关闭，原有 `allowedUsers` 行为不变；仅在开启时，首轮才注入 `botmux_group_join` 可信块、邀请人 sender 与 turn caller（关闭时首轮与旧版本逐字一致） |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
 | `groupJoinCommandEnabled` | `true` 且 `groupJoinCommand` 非空时，被拉进**任意**群就直接在本机执行该命令，不起会话、不经模型；与 `autoStartOnGroupJoin` 相互独立（不要求群里有 `allowedUsers`）。同样需要订阅 `im.chat.member.bot.added_v1`。Dashboard「Bot 默认设置 → 主动开工」可编辑 |

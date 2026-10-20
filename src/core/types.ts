@@ -52,6 +52,15 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
   return fc.expanded ? 'screenshot' : 'hidden';
 }
 
+export interface GroupJoinContext {
+  event: 'chat.bot_added';
+  larkAppId: string;
+  chatId: string;
+  turnId: string;
+  operatorOpenId?: string;
+  gateMatched: boolean;
+}
+
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
  *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
@@ -287,6 +296,13 @@ export interface DaemonSession {
   pendingCodexAppMessageContext?: string;
   /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
   pendingChatContext?: ChatContext;
+  /** Host-authored provenance for a real Lark bot-added lifecycle turn. Unlike
+   *  chat metadata this is trusted routing context and cannot be reconstructed
+   *  from group text. In-memory only; cleared with the opening buffers. */
+  pendingGroupJoinContext?: GroupJoinContext;
+  /** Exact host-signed caller paired with pendingGroupJoinContext while repo or
+   *  worktree setup delays the first fork. Never persisted or reconstructed. */
+  pendingTrustedCaller?: TrustedCaller;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a

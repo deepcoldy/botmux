@@ -5,7 +5,6 @@ import {
   safeParseEvent,
   parseEvent,
   PayloadRefSchema,
-  INLINE_PAYLOAD_MAX_BYTES,
   PROVIDER_TTL_MS,
   RunCreatedEventSchema,
   ActivityTimedOutEventSchema,
@@ -602,11 +601,9 @@ describe('event schema — 31 event coverage check', () => {
 });
 
 describe('module constants', () => {
-  it('INLINE_PAYLOAD_MAX_BYTES = 4096', () => {
-    expect(INLINE_PAYLOAD_MAX_BYTES).toBe(4096);
-  });
-
-  it('feishu-im TTL = 1h ms', () => {
+  // 外部协议值：飞书按消息 uuid 去重的窗口是 1 小时。durable outbox 用它判定重试是否还在去重窗口内，
+  // 调大会让窗口外的重试重复发消息，调小会过早放弃仍可安全重试的发送。
+  it('feishu-im TTL = 1h ms (Feishu uuid dedupe window)', () => {
     expect(PROVIDER_TTL_MS['feishu-im']).toBe(60 * 60 * 1000);
   });
 

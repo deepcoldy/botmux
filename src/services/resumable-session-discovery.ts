@@ -152,7 +152,7 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
  *  ordering permutation in BOTMUX_INJECTION_PATTERNS. */
 const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
   'botmux_routing', 'botmux_builtin_skills', 'identity', 'session_id', 'role',
-  'summary_memory', 'botmux_reminder', 'whiteboard', 'chat_context_policy', 'chat_context',
+  'summary_memory', 'botmux_reminder', 'whiteboard', 'botmux_group_join', 'chat_context_policy', 'chat_context',
 ];
 
 /** True when `text` is an UNBROKEN CHAIN of botmux leading blocks followed by a

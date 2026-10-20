@@ -134,6 +134,7 @@ import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
+import { resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import {
   normalizeRemoteRunnerBackendState,
@@ -13986,7 +13987,7 @@ export function forkWorker(
     // the real persistent pane (the stamp is written below; restore reads it via
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
-    backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    backendType: resolvedBackendType,
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
@@ -14003,7 +14004,11 @@ export function forkWorker(
       ? botCfg.remoteRunner
       : botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
         ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
-        : botCfg.riff,
+        // Decide herdr from the resolved backend: it can come from the session
+        // stamp or the daemon-wide BACKEND_TYPE, not only the bot's own field.
+        : resolvedBackendType === 'herdr'
+          ? resolveHerdrBackendConfig(config.daemon.herdr, botCfg.herdr)
+          : botCfg.riff,
     remoteBackendState: ds.session.remoteBackendState,
     ...(remoteResumeMode ? { remoteResumeMode } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,

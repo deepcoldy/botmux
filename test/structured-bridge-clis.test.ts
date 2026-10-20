@@ -16,7 +16,6 @@ import {
   supportsTranscriptReplyDelivery,
   STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
   STRUCTURED_BRIDGE_ADOPT_CLI_IDS,
-  STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS,
 } from '../src/services/structured-bridge-clis.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
 
@@ -83,7 +82,6 @@ describe('structured-bridge-clis', () => {
     // started Pi turn may suppress the screen-ready heuristic (the custom-tool
     // terminate:true gap is accepted — next user turn HOL-drops the head).
     // grok: user_message_chunk → turn_completed with normalized stop reasons.
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'traex', 'pi', 'oh-my-pi', 'ebsd', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('traex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);

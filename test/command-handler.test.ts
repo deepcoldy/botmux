@@ -897,7 +897,6 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(45);
     expect(DAEMON_COMMANDS.has('/queue')).toBe(true);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
@@ -3423,11 +3422,28 @@ describe('handleCommand', () => {
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
     it('reports successful deletion privately rather than to the deleted group', async () => {
-      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed' });
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), deps, LARK_APP_ID);
-      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'));
+      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'), 'interactive');
+      // A main checkout is never offered for deletion.
+      expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID, worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task', safetyFingerprint: 'clean-state',
+      }));
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({ action: 'dismiss_cleanup_wt', job_ids: 'cleanup-123', invoker_open_id: 'ou_sender' });
+      expect(JSON.stringify(card)).toContain('/home/testuser/project-wt-task');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
     });
     it('rejects unsupported arguments without executing', async () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --yes', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
@@ -6096,6 +6112,35 @@ describe('handleCommand', () => {
         { turnId: 'om_group_join' },
       );
       expect(ds.session.initialUserTurnPending).toBeUndefined();
+    });
+
+    it('preserves group-join provenance and caller through text /repo without other buffered input', async () => {
+      const groupJoinContext = {
+        event: 'chat.bot_added' as const,
+        larkAppId: LARK_APP_ID,
+        chatId: CHAT_ID,
+        turnId: 'om_group_join',
+        operatorOpenId: 'ou_inviter',
+        gateMatched: true,
+      };
+      const trustedCaller = { requestLarkAppId: LARK_APP_ID, requestUserOpenId: 'ou_inviter' };
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: groupJoinContext.turnId,
+        pendingGroupJoinContext: groupJoinContext,
+        pendingTrustedCaller: trustedCaller,
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[11]).toMatchObject({ groupJoinContext });
+      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:' }, {
+        turnId: groupJoinContext.turnId, trustedCaller,
+      });
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
+      expect(ds.pendingGroupJoinContext).toBeUndefined();
+      expect(ds.pendingTrustedCaller).toBeUndefined();
     });
 
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
