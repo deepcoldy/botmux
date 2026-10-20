@@ -126,8 +126,13 @@ export async function runAutoCleanupTick<T extends IdleCleanupSessionRow>(
     const residualNote = result.residual > 0 ? `, residual ${result.residual}` : '';
     deps.log(
       `swept idle>${due.hours}h: matched ${result.matched}, closed ${result.closed}, `
-      + `failed ${result.failed}${residualNote}`,
+      + `failed ${result.failed}, Codex archive failed ${result.archiveFailed}${residualNote}`,
     );
+  }
+  for (const row of result.results) {
+    if (row.archiveError) deps.log?.(`session ${row.sessionId}: Codex archive ${
+      row.archiveError === 'codex_archive_target_unverified' || row.archiveError === 'codex_archive_target_invalid'
+        ? row.archiveError : 'rpc_failed'}`);
   }
   return result;
 }

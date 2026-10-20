@@ -1,0 +1,254 @@
+import type { DurableCoordinationStore, OutboxAttempt } from './durable-coordination.js';
+import {
+  createDurableLarkCanonicalDispatch,
+  type DurableLarkCanonicalDispatchOptions,
+} from './durable-lark-canonical-dispatch.js';
+import {
+  startDurableInboxPrimaryConsumer,
+  type DurableInboxPrimaryConsumer,
+  type DurableInboxPrimaryStopResult,
+} from './durable-inbox-primary-consumer.js';
+import {
+  startDurableLarkPrimaryIngress,
+  type DurableLarkIngressLeadership,
+  type DurableLarkPrimaryIngress,
+  type DurableLarkPrimaryIngressStatus,
+  type DurableLarkPrimaryIngressStopResult,
+} from './durable-lark-primary-ingress.js';
+import {
+  startDurableOutboxPump,
+  type DurableOutboxDeliveryResult,
+  type DurableOutboxPump,
+  type DurableOutboxPumpOptions,
+  type DurableOutboxPumpStopResult,
+} from './durable-outbox-pump.js';
+import {
+  createDurableSessionFacade,
+  type DurableSessionFacade,
+  type DurableSessionFacadeStopResult,
+} from './durable-session-facade.js';
+import {
+  createDurableSessionControlDispatch,
+  type DurableSessionControlDispatchOptions,
+} from './durable-session-control-dispatch.js';
+import {
+  startDurableSessionControlConsumer,
+  type DurableSessionControlConsumer,
+  type DurableSessionControlConsumerStopResult,
+} from './durable-session-control-consumer.js';
+
+export interface DurableLarkPrimaryRuntimeOptions {
+  store: DurableCoordinationStore;
+  larkAppId: string;
+  handleCanonical: DurableLarkCanonicalDispatchOptions['handle'];
+  deliverOutbox: DurableOutboxPumpOptions['deliver'];
+  onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
+  onLeadershipLost?: (reason: unknown) => void | Promise<void>;
+  onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
+  onError?: (error: unknown) => void;
+  ingressOwnerId?: string;
+  inboxWorkerId?: string;
+  outboxWorkerId?: string;
+  sessionOwnerId?: string;
+  ingressElectionIntervalMs?: number;
+  inboxIntervalMs?: number;
+  outboxIntervalMs?: number;
+  outboxReservationLeaseMs?: number;
+  outboxAttemptTimeoutMs?: number;
+  shutdownMs?: number;
+  control?: {
+    ownedPartitionKeys(): readonly string[];
+    partitionKeyPrefix?: string;
+    resolve: DurableSessionControlDispatchOptions['resolve'];
+    workerId?: string;
+    intervalMs?: number;
+  };
+}
+
+export interface DurableLarkPrimaryRuntimeStopResult {
+  kind: 'stopped' | 'timed_out';
+  ingress: DurableLarkPrimaryIngressStopResult;
+  inbox: DurableInboxPrimaryStopResult;
+  outbox: DurableOutboxPumpStopResult;
+  control?: DurableSessionControlConsumerStopResult;
+  session: DurableSessionFacadeStopResult;
+}
+
+export interface DurableLarkPrimaryRuntime {
+  readonly ingress: DurableLarkPrimaryIngress;
+  readonly inbox: DurableInboxPrimaryConsumer;
+  readonly outbox: DurableOutboxPump;
+  readonly control?: DurableSessionControlConsumer;
+  readonly session: DurableSessionFacade;
+  ready: Promise<void>;
+  status(): DurableLarkPrimaryIngressStatus;
+  stop(timeoutMs?: number): Promise<DurableLarkPrimaryRuntimeStopResult>;
+  terminate(): void;
+}
+
+function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function primarySessionOwnsLiveRuntime(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.type !== 'botmux.session.primary'
+      || !envelope.session
+      || typeof envelope.session !== 'object'
+      || Array.isArray(envelope.session)) return false;
+  return (envelope.session as Record<string, unknown>).status === 'active';
+}
+
+/** Compose the disabled-state primary data plane under one shutdown budget. */
+export function startDurableLarkPrimaryRuntime(
+  options: DurableLarkPrimaryRuntimeOptions,
+): DurableLarkPrimaryRuntime {
+  const shutdownMs = boundedInteger(options.shutdownMs ?? 10_000, 'shutdownMs', 0, 300_000);
+  const reportError = (error: unknown): void => {
+    try { options.onError?.(error); } catch { /* observers cannot alter reconciliation */ }
+  };
+  const session = createDurableSessionFacade({
+    store: options.store,
+    ...(options.sessionOwnerId ? { ownerId: options.sessionOwnerId } : {}),
+    shutdownMs,
+    keepLeaseAlive: primarySessionOwnsLiveRuntime,
+    onLeaseLost: (sessionKey, error) => {
+      reportError(new Error(
+        `durable active Session lease lost for ${sessionKey}: ${error.message}`,
+      ));
+      try { options.onSessionLeaseLost?.(sessionKey, error); } catch (callbackError) {
+        reportError(callbackError);
+      }
+    },
+  });
+  const dispatch = createDurableLarkCanonicalDispatch({
+    facade: session,
+    store: options.store,
+    handle: options.handleCanonical,
+  });
+  const inbox = startDurableInboxPrimaryConsumer({
+    store: options.store,
+    dispatch,
+    ...(options.inboxWorkerId ? { workerId: options.inboxWorkerId } : {}),
+    ...(options.inboxIntervalMs === undefined ? {} : { intervalMs: options.inboxIntervalMs }),
+    shutdownMs,
+    onError: reportError,
+  });
+  const outbox = startDurableOutboxPump({
+    store: options.store,
+    deliver: options.deliverOutbox,
+    ...(options.outboxWorkerId ? { workerId: options.outboxWorkerId } : {}),
+    ...(options.outboxIntervalMs === undefined ? {} : { intervalMs: options.outboxIntervalMs }),
+    ...(options.outboxReservationLeaseMs === undefined
+      ? {}
+      : { reservationLeaseMs: options.outboxReservationLeaseMs }),
+    ...(options.outboxAttemptTimeoutMs === undefined
+      ? {}
+      : { attemptTimeoutMs: options.outboxAttemptTimeoutMs }),
+    shutdownMs,
+    onError: reportError,
+    onLateResult: (attempt: OutboxAttempt, result: DurableOutboxDeliveryResult | Error) => {
+      // Timeout already committed ambiguous. Only an exact delivered receipt
+      // may reconcile that same attempt; late retry/error outcomes stay closed.
+      if (result instanceof Error || result.kind !== 'delivered') return;
+      void options.store.completeOutboxAttempt({ attempt, receipt: result.receipt }).then(
+        mutation => {
+          if (mutation.kind === 'stale') {
+            reportError(new Error(
+              `durable outbox late receipt lost attempt ${attempt.record.messageId}`,
+            ));
+          }
+        },
+        reportError,
+      );
+    },
+  });
+  const control = options.control
+    ? startDurableSessionControlConsumer({
+        store: options.store,
+        ownedPartitionKeys: options.control.ownedPartitionKeys,
+        ...(options.control.partitionKeyPrefix
+          ? { partitionKeyPrefix: options.control.partitionKeyPrefix }
+          : {}),
+        dispatch: createDurableSessionControlDispatch({
+          store: options.store,
+          sessionOwnerId: session.ownerId,
+          resolve: options.control.resolve,
+        }),
+        ...(options.control.workerId ? { workerId: options.control.workerId } : {}),
+        ...(options.control.intervalMs === undefined
+          ? {}
+          : { intervalMs: options.control.intervalMs }),
+        shutdownMs,
+        onError: reportError,
+      })
+    : undefined;
+  const ingress = startDurableLarkPrimaryIngress({
+    store: options.store,
+    larkAppId: options.larkAppId,
+    ...(options.ingressOwnerId ? { ownerId: options.ingressOwnerId } : {}),
+    ...(options.ingressElectionIntervalMs === undefined
+      ? {}
+      : { electionIntervalMs: options.ingressElectionIntervalMs }),
+    shutdownMs,
+    onLeadershipAcquired: options.onLeadershipAcquired,
+    onLeadershipLost: options.onLeadershipLost,
+    onError: reportError,
+  });
+  let stopPromise: Promise<DurableLarkPrimaryRuntimeStopResult> | undefined;
+  const ready = Promise.all([
+    inbox.ready,
+    outbox.ready,
+    ...(control ? [control.ready] : []),
+    ingress.ready,
+  ]).then(() => undefined);
+  const remaining = (deadline: number): number => Math.max(0, deadline - Date.now());
+
+  return {
+    ingress,
+    inbox,
+    outbox,
+    ...(control ? { control } : {}),
+    session,
+    ready,
+    status: () => ingress.status(),
+    stop: (timeoutMs = shutdownMs) => {
+      if (stopPromise) return stopPromise;
+      const budget = boundedInteger(timeoutMs, 'timeoutMs', 0, 300_000);
+      const deadline = Date.now() + budget;
+      stopPromise = (async () => {
+        const ingressResult = await ingress.stop(remaining(deadline));
+        const inboxResult = await inbox.stop(remaining(deadline));
+        const controlResult = control ? await control.stop(remaining(deadline)) : undefined;
+        const outboxResult = await outbox.stop(remaining(deadline));
+        const sessionResult = await session.stop(remaining(deadline));
+        return {
+          kind: ingressResult.kind === 'stopped'
+            && inboxResult.kind === 'stopped'
+            && (!controlResult || controlResult.kind === 'stopped')
+            && outboxResult.kind === 'stopped'
+            && sessionResult.kind === 'stopped'
+            ? 'stopped'
+            : 'timed_out',
+          ingress: ingressResult,
+          inbox: inboxResult,
+          ...(controlResult ? { control: controlResult } : {}),
+          outbox: outboxResult,
+          session: sessionResult,
+        };
+      })();
+      return stopPromise;
+    },
+    terminate: () => {
+      ingress.terminate();
+      inbox.terminate();
+      control?.terminate();
+      outbox.terminate();
+      session.terminate();
+    },
+  };
+}

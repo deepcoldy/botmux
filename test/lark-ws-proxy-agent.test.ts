@@ -10,7 +10,6 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
-  createLarkWsAgent,
   describeLarkWsProxy,
   describeWsRuntime,
   larkWsAgentFor,
@@ -18,6 +17,9 @@ import {
 } from '../src/im/lark/ws-proxy-agent.js';
 
 const DOMAIN = 'https://open.feishu.cn';
+
+/** resolve + build，与 transport/connection.ts 的生产组合方式一致。 */
+const createLarkWsAgent = (openApiDomain: string) => larkWsAgentFor(resolveLarkWsProxy(openApiDomain));
 const PROXY_ENV_KEYS = [
   'npm_config_https_proxy', 'NPM_CONFIG_HTTPS_PROXY',
   'https_proxy', 'HTTPS_PROXY',

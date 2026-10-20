@@ -10,6 +10,7 @@ const fixture = fileURLToPath(new URL('./fixtures/send-doc-comment-capture.ts', 
 const target = {
   fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test',
   turnId: 'reply_user', replyToOpenId: 'ou_requester',
+  replyId: 'reply_user', reactionType: 'Typing', reactionIdentity: 'tenant' as const,
 };
 
 function runSend(options: {
@@ -98,6 +99,15 @@ function runSend(options: {
   }
 }
 
+const legacyTargetWithoutReactionId = {
+  fileToken: target.fileToken,
+  fileType: target.fileType,
+  commentId: target.commentId,
+  turnId: target.turnId,
+  replyToOpenId: target.replyToOpenId,
+  replyId: target.replyId,
+};
+
 describe('real CLI document-comment reply routing', () => {
   it.each(['codex', 'claude-code'])('recovers %s comment replies after a worker reattach loses the marker turn', cliId => {
     const result = runSend({ cliId });
@@ -109,6 +119,9 @@ describe('real CLI document-comment reply routing', () => {
         { type: 'text_run', text_run: { text: ' ' } },
         { type: 'text_run', text_run: { text: expect.stringContaining('缺少电子表格读取权限') } },
       ] } },
+    }, {
+      method: 'POST', path: '/open-apis/drive/v2/files/doc_test/comments/reaction',
+      body: { action: 'delete', reply_id: 'reply_user', reaction_type: 'Typing' },
     }]);
     expect(result.sends).toEqual([expect.objectContaining({
       messageId: 'doc:comment_test', turnId: 'reply_user', responseKind: 'final',
@@ -119,12 +132,24 @@ describe('real CLI document-comment reply routing', () => {
   it('treats an omitted response kind as the one final document reply', () => {
     const result = runSend({ responseKind: undefined });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.requests).toHaveLength(1);
+    expect(result.requests).toHaveLength(2);
     expect(result.sends).toEqual([expect.objectContaining({
       turnId: target.turnId,
       responseKind: 'final',
     })]);
     expect(result.stdout).toContain('"kind":"doc-comment"');
+  }, 35_000);
+
+  it('cleans a pre-upgrade Typing reaction when the persisted target has no reaction metadata', () => {
+    const result = runSend({
+      session: { docCommentTargets: { [target.turnId]: legacyTargetWithoutReactionId } },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests.at(-1)).toEqual({
+      method: 'POST',
+      path: '/open-apis/drive/v2/files/doc_test/comments/reaction',
+      body: { action: 'delete', reply_id: 'reply_user', reaction_type: 'Typing' },
+    });
   }, 35_000);
 
   it.each(['progress', 'auxiliary'] as const)(
@@ -151,7 +176,7 @@ describe('real CLI document-comment reply routing', () => {
       expect(result.previous?.status).toBe(1);
       expect(String(result.previous?.stderr)).toContain('User Token');
       expect(result.status, result.stderr).toBe(0);
-      expect(result.requests).toHaveLength(1);
+      expect(result.requests).toHaveLength(2);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -175,6 +200,9 @@ describe('real CLI document-comment reply routing', () => {
         { type: 'text_run', text_run: { text: ' ' } },
         { type: 'text_run', text_run: { text: expect.stringContaining('缺少电子表格读取权限') } },
       ] } },
+    }), expect.objectContaining({
+      path: '/open-apis/drive/v2/files/doc_test/comments/reaction',
+      body: { action: 'delete', reply_id: 'reply_user', reaction_type: 'Typing' },
     })]);
     expect(result.sends.map(({ turnId, responseKind }) => ({ turnId, responseKind }))).toEqual([
       { turnId: 'reply_user', responseKind: 'final' },
@@ -220,7 +248,7 @@ describe('real CLI document-comment reply routing', () => {
   it('delivers the permission notice through Drive even when no mention was requested', () => {
     const result = runSend({ mentionBack: false });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.requests).toHaveLength(1);
+    expect(result.requests).toHaveLength(2);
     expect(result.requests[0]?.path).toBe('/open-apis/drive/v1/files/doc_test/comments/comment_test/replies');
     expect(result.requests[0]?.body.content.elements).toEqual([
       { type: 'text_run', text_run: { text: expect.stringContaining('缺少电子表格读取权限') } },
@@ -236,7 +264,7 @@ describe('real CLI document-comment reply routing', () => {
   it('recovers the fixed comment destination while its worker is stopped and the PID marker is absent', () => {
     const result = runSend({ marker: false, mentionBack: false });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.requests).toHaveLength(1);
+    expect(result.requests).toHaveLength(2);
     expect(result.requests[0]?.path).toBe('/open-apis/drive/v1/files/doc_test/comments/comment_test/replies');
     expect(result.sends[0]?.turnId).toBe('reply_user');
   }, 35_000);
@@ -273,13 +301,22 @@ describe('real CLI document-comment reply routing', () => {
     expect(result.sends).toEqual([]);
   }, 35_000);
 
-  it('leaves an ordinary chat on the chat interface even with an older pending comment', () => {
+  it.each([false, true])('leaves an ordinary chat on the chat interface even with an older pending comment (noQuote=%s)', noQuote => {
     const result = runSend({
       markerTurn: 'om_chat_turn', mentionBack: false, session: { chatId: 'oc_chat' },
+      args: noQuote ? ['--no-quote'] : [],
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.requests).toHaveLength(1);
-    expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages');
-    expect(result.requests[0]?.body.receive_id).toBe('oc_chat');
+    if (noQuote) {
+      expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages');
+      expect(result.requests[0]?.body.receive_id).toBe('oc_chat');
+    } else {
+      expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages/om_chat_turn/reply');
+      expect(result.requests[0]?.body.reply_in_thread).not.toBe(true);
+    }
+    expect(result.sends).toEqual([expect.objectContaining({
+      messageId: 'om_sent', turnId: 'om_chat_turn',
+    })]);
   }, 35_000);
 });

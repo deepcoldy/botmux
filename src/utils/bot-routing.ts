@@ -131,25 +131,7 @@ export function hasKnownBotMention(
   return false;
 }
 
-/**
- * Blank out Markdown code spans/blocks so a bot name written *inside code* — an
- * example command in backticks, a fenced snippet, a quoted `@Bot` in an
- * explanation — is NOT mistaken for a real `@Bot` handoff by the prose
- * auto-injection scanner (which would otherwise wake that bot). Only presence
- * detection needs to be code-aware; positions are irrelevant, so each matched
- * region collapses to a single space.
- *
- * Fenced blocks (a run of ≥3 backticks or ≥3 tildes, closed by an equal-length
- * run) are removed first so their fences aren't misread as inline runs; then
- * balanced inline backtick runs (`…`, ``…``) go. `~~strike~~` (double tilde) is
- * NOT a fence and is deliberately left intact — an @Bot inside strikethrough is
- * still a real prose mention. Unbalanced stray backticks are harmless literals.
- */
-export function stripCodeSpans(text: string): string {
-  return text
-    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
-    .replace(/(`+)[\s\S]*?\1/g, ' ');
-}
+export { stripCodeSpans, codeSpanRanges } from './markdown-code.js';
 
 /**
  * Decide who a botmux-generated reply should @ in the footer.

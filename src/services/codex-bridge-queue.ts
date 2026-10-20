@@ -74,6 +74,11 @@ export interface CodexPendingTurn {
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
   markTimeMs?: number;
+  /** Transcript identity and durable byte frontier observed at mark time.
+   * Stored on the turn because the path may not be officially attached yet;
+   * a later checkpoint must not replace this with an attach/post-ingest cursor. */
+  recoveryJsonlPathAtMark?: string;
+  recoveryOffsetAtMark?: number;
   /** Timestamp of the transcript user record that actually started this
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
@@ -258,16 +263,48 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
-  mark(turnId: string, message: string, markTimeMs: number = this.now(), dispatchAttempt?: number): void {
+  mark(
+    turnId: string,
+    message: string,
+    markTimeMs: number = this.now(),
+    dispatchAttempt?: number,
+    recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+  ): void {
     this.queue.push({
       turnId,
       dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
+      recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
+      recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
       unconfirmedAttributionStartedAtMs: markTimeMs,
     });
     this.replayBufferedUnmatched(markTimeMs);
+  }
+
+  /** Restore older marks before input accepted during rollout discovery. Only
+   * valid before the first transcript ingest; preserve current delivery owners
+   * and their confirmation state when a message is already in this queue. */
+  restorePendingTurns(entries: readonly {
+    turnId: string;
+    fingerprint: string;
+    markTimeMs: number;
+    jsonlPath?: string;
+    offsetAtMark?: number;
+  }[]): void {
+    const existing = new Set(this.queue.map(turn => turn.turnId));
+    const restored: CodexPendingTurn[] = [];
+    for (const entry of entries) {
+      if (existing.has(entry.turnId)) continue;
+      existing.add(entry.turnId);
+      restored.push({ turnId: entry.turnId, started: false,
+        contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
+        recoveryJsonlPathAtMark: entry.jsonlPath,
+        recoveryOffsetAtMark: entry.offsetAtMark,
+        unconfirmedAttributionStartedAtMs: entry.markTimeMs });
+    }
+    this.queue.unshift(...restored);
   }
 
   /** Drop all pending turns. Used when the worker decides it can't reliably

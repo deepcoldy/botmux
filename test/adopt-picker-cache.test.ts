@@ -75,12 +75,34 @@ describe('adopt-picker candidates cache', () => {
 
     expect(discovery.tmux).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
     expect(discovery.zellij).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
+    // No live sessions → the live-dedup set is passed, just empty.
     expect(discoverResumable).toHaveBeenCalledWith(
       'codex',
       '/opt/Vendor Codex/vendorCodex',
       expect.any(Map),
       20,
+      new Set(),
     );
+  });
+
+  it('passes the non-empty live session ids to resume discovery so history skips running sessions', async () => {
+    const pane = { panePid: 1000, cliPid: 1001, cliId: 'claude-code', cwd: '/work/demo', paneCols: 80, paneRows: 24 };
+    discovery.tmux.mockReturnValueOnce([
+      { ...pane, source: 'tmux', tmuxTarget: '0:1.0', sessionId: 'sid-tmux' },
+      { ...pane, source: 'herdr', herdrSessionName: 'default', herdrTarget: 'w1:p1', herdrPaneId: 'w1:p1', sessionId: 'sid-herdr' },
+      { ...pane, source: 'tmux', tmuxTarget: '0:2.0' }, // sessionId undefined
+      { ...pane, source: 'tmux', tmuxTarget: '0:3.0', sessionId: '' },
+    ] as any);
+    discovery.zellij.mockReturnValueOnce([
+      { zellijSession: 'demo', zellijPaneId: 'terminal_1', cliPid: 1002, cliId: 'claude-code', cwd: '/work/demo', sessionId: 'sid-zellij' },
+    ] as any);
+    const discoverResumable = vi.fn(async () => []);
+
+    const result = await collectAdoptCandidates('claude-code', undefined, new Map(), discoverResumable, 20);
+
+    expect(result.sessions).toHaveLength(5);
+    expect(discoverResumable).toHaveBeenCalledTimes(1);
+    expect((discoverResumable.mock.calls[0] as unknown[])[4]).toEqual(new Set(['sid-tmux', 'sid-herdr', 'sid-zellij']));
   });
 
   it('keeps the legacy one-argument live discovery calls when no runtime is configured', async () => {

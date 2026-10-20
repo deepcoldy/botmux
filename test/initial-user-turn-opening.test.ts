@@ -324,6 +324,45 @@ describe('empty-started session — first real business turn must use the new-to
     expect(followUp).not.toContain('<identity>');
   });
 
+  it('live resumed legacy worker does not claim a managed lark-cli identity', async () => {
+    const anchor = 'om_live_legacy_lark_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true });
+    ds.initConfig = {
+      type: 'init',
+      sessionId: ds.session.sessionId,
+      chatId: CHAT,
+      rootMessageId: anchor,
+      workingDir: '/tmp',
+      cliId: 'codex',
+      backendType: 'tmux',
+      prompt: '',
+      resume: true,
+      larkAppId: APP,
+      larkAppSecret: 's',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      larkToolBinding: false,
+    };
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      larkToolBinding: false,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleThreadReply(
+      makeEventData('om_legacy_first', 'legacy opening', anchor),
+      makeCtx(anchor, 'om_legacy_first'),
+    );
+
+    const opening = liveInputs()[0]!.content;
+    expect(opening).not.toContain('<botmux_lark_tool>');
+    expect(opening).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+  });
+
   it('live worker: opening carries sender, mentions, available bots and attachments', async () => {
     const anchor = 'om_live_meta_root';
     seedEmptyStarted(anchor);
@@ -663,6 +702,7 @@ describe('empty-started session — first real business turn must use the new-to
       type: 'raw_input',
       content: '/model opus',
       turnId: 'om_model',
+      turnCallerOpenId: 'ou_owner',
       trustedController: {
         senderType: 'user',
         requestLarkAppId: APP,

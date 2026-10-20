@@ -87,7 +87,8 @@ export type RenameChatResult =
   | { ok: true; oldName: string; newName: string; changed: boolean }
   | {
       ok: false;
-      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited';
+      /** `name_changed`: the live name no longer matched `expectedOldName`. */
+      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited' | 'name_changed';
       detail?: string;
       oldName?: string;
       newName?: string;
@@ -110,6 +111,9 @@ export async function renameChat(
     beforeUpdate?: () =>
       | { ok: true }
       | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+    /** Compare-and-set: only rename while the freshly read name is still this
+     *  one (automatic renames must not overwrite a member's manual name). */
+    expectedOldName?: string;
   } = {},
 ): Promise<RenameChatResult> {
   const client = getBotClient(larkAppId);
@@ -132,6 +136,9 @@ export async function renameChat(
     }
     const fetchedOldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
     oldName = fetchedOldName;
+    if (opts.expectedOldName !== undefined && fetchedOldName !== opts.expectedOldName.trim()) {
+      return { ok: false, error: 'name_changed', oldName: fetchedOldName, newName };
+    }
     if (fetchedOldName === newName) return { ok: true, oldName: fetchedOldName, newName, changed: false };
     const gate = opts.beforeUpdate?.();
     if (gate && !gate.ok) return { ...gate, oldName: fetchedOldName, newName };
@@ -377,6 +384,18 @@ export async function deleteChat(
   }
 }
 
+/** Fresh (uncached) chat name; undefined when the lookup fails. */
+export async function getChatName(larkAppId: string, chatId: string): Promise<string | undefined> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0 && res.code !== undefined) return undefined;
+    return typeof res.data?.name === 'string' ? res.data.name.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Fetch the current owner of a chat (open_id by default, optionally union_id).
  * Used by group-creator to
@@ -457,8 +476,8 @@ export async function disbandChat(
   const client = getBotClient(larkAppId);
   try {
     const res: any = await (client as any).im.v1.chat.delete({ path: { chat_id: chatId } });
-    if (res.code !== 0 && res.code !== undefined) {
-      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    if (res?.code !== 0) {
+      return { ok: false, error: `${res?.msg ?? 'missing API success acknowledgement'} (code: ${res?.code})` };
     }
     return { ok: true };
   } catch (e: any) {

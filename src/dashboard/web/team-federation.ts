@@ -134,19 +134,6 @@ export async function joinRemoteTeam(hubUrl: string, inviteCode: string): Promis
   return jpost('/api/team/join-remote', { hubUrl, inviteCode });
 }
 
-export function allTeams(localTeams: Team[], remoteTeams: Team[]): Team[] {
-  return [...localTeams, ...remoteTeams];
-}
-
-export function pickedSet(map: Map<string, Set<string>>, key: string): Set<string> {
-  let s = map.get(key);
-  if (!s) {
-    s = new Set();
-    map.set(key, s);
-  }
-  return s;
-}
-
 export function botMatchesTeamFilters(bot: RosterBot, filters: TeamFilters): boolean {
   const q = filters.query.trim().toLowerCase();
   if (q && !((bot.name || '') + ' ' + (bot.cliId || '') + ' ' + (bot.capability || '')).toLowerCase().includes(q)) {

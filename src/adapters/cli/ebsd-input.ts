@@ -8,12 +8,11 @@
 import type { PtyHandle, SubmitRecheckResult, WriteInputContext } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 
 const EBSD_INPUT_CHUNK_CHARS = 512;
 const EBSD_INPUT_CHUNK_NEWLINES = 9;
 const EBSD_INPUT_THROTTLE_MS = 20;
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
 
 function normalizeEbsdInput(text: string): string {
   return text
@@ -58,7 +57,7 @@ function sendLiteral(pty: PtyHandle, text: string): boolean {
 
 async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<boolean> {
   for (const chunk of chunkEbsdInput(content)) {
-    if (!sendLiteral(pty, `${BRACKETED_PASTE_START}${chunk}${BRACKETED_PASTE_END}`)) return false;
+    if (!sendLiteral(pty, wrapBracketedPaste(chunk))) return false;
     await delay(EBSD_INPUT_THROTTLE_MS);
   }
   return true;

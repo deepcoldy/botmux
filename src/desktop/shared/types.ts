@@ -12,7 +12,6 @@ export interface DesktopPaths {
   botmuxHome: string;
   dataDir: string;
   logsDir: string;
-  pm2Home: string;
 }
 
 export interface DesktopRuntimeState {

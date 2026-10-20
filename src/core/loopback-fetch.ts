@@ -30,7 +30,7 @@
  * `node:http` ignores proxy environment variables entirely, in both Node and Bun,
  * which is the only reliable way to guarantee a loopback dial stays loopback.
  * Related precedent: `platform/platform-http.ts` (deliberately avoids undici) and
- * `dashboard/hd2d-assets.ts` (the reverse case — it WANTS the proxy).
+ * `core/release-download.ts` (the reverse case — it WANTS the proxy).
  */
 
 import { Buffer } from 'node:buffer';

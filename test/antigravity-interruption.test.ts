@@ -44,4 +44,28 @@ describe('Antigravity explicit interruption viewport', () => {
   ])('does not infer cancellation from stale history, a draft, activity or missing evidence (%#)', screen => {
     expect(isAntigravityInterruptedScreen(screen)).toBe(false);
   });
+
+  // agy ≥1.2 renders the active permission mode as a placeholder INSIDE the
+  // empty composer (observed on agy 1.2.13): `> Accept-edits mode: …
+  // (shift+tab to cycle)`. The old bare-`>` check rejected this screen, so a
+  // resumed killed turn was forever misclassified as "db busy" and queued
+  // input never flushed.
+  it.each([
+    '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+    '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+    '> Plan mode: research & plan only (shift+tab to cycle)',
+    '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+  ])('recognizes the interrupted screen when the composer shows the %s mode placeholder', composer => {
+    const screen = interrupted.replace('\n>\n', `\n${composer}\n`);
+    expect(isAntigravityInterruptedScreen(screen)).toBe(true);
+  });
+
+  it('does not mistake a drafted line that merely looks like a mode hint for an empty composer', () => {
+    // Drafted text contains real content after the placeholder suffix.
+    const drafted = interrupted.replace(
+      '\n>\n',
+      '\n> Accept-edits mode: file edits auto-approved (shift+tab to cycle) continue please\n',
+    );
+    expect(isAntigravityInterruptedScreen(drafted)).toBe(false);
+  });
 });

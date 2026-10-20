@@ -13,17 +13,15 @@
  * user messages whose `extra.is_original_user_input === true` so a Lark
  * turn fingerprints against the user's prompt, not injected context.
  */
-import { existsSync, statSync, readdirSync, readlinkSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { platform } from 'node:os';
+import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { cocoCacheRoot } from './coco-paths.js';
 import { scanJsonlFromOffset } from './jsonl-cursor.js';
 import { logger } from '../utils/logger.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 const COCO_SESSIONS_ROOT = join(cocoCacheRoot(), 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IS_LINUX = platform() === 'linux';
 // substring anchor —— 同时匹配 Linux 的 `/.cache/coco/sessions/` 和 macOS 的
 // `/Library/Caches/coco/sessions/` 两种路径形态。anchor 后紧跟一段 UUID 才认
 // 账（matchCocoSessionPath 里 SESSION_UUID_RE 校验），避免误命中。
@@ -65,36 +63,11 @@ export function cocoEventsPathForSession(sessionId: string): string {
 export function findCocoSessionByPid(
   pid: number,
 ): { sessionId: string; eventsPath: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        // procfs 标 deleted 的 fd 跳过 —— 后面 lsof 路径上没这个保护，因
-        // 为 macOS lsof 不给标记；worker 端 sessionDir existsSync 兜底。
-        if (target.endsWith(' (deleted)')) continue;
-        const hit = matchCocoSessionPath(target);
-        if (hit) return hit;
-      }
-      return undefined;
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
+  // procfs 标 deleted 的 fd 跳过；macOS lsof 不给该标记，由 worker 端
+  // sessionDir existsSync 兜底。
+  const targets = listProcessOpenFiles(pid, { skipDeleted: true });
+  if (!targets) return undefined;
+  for (const target of targets) {
     const hit = matchCocoSessionPath(target);
     if (hit) return hit;
   }

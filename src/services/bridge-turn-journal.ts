@@ -31,8 +31,10 @@
  * the pending set is tiny (type-ahead depth, single digits), so this is
  * cheaper and simpler than an append-only log with compaction.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export interface BridgeTurnJournalEntry {
   turnId: string;
@@ -56,6 +58,67 @@ export interface BridgeTurnJournalEntry {
  *  is noise, not recovery. */
 export const BRIDGE_TURN_RESTORE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+/** Restart recovery is a best-effort fallback, not permission to load an
+ * arbitrarily large append-only transcript into one JavaScript string. Keep
+ * the replay window well below V8's platform-dependent MAX_STRING_LENGTH and
+ * let the worker baseline to EOF with an explicit warning when an old journal
+ * cannot provide a sufficiently recent byte offset. */
+export const BRIDGE_TURN_RECOVERY_MAX_BYTES = 64 * 1024 * 1024;
+
+export type BridgeTurnRecoveryPlan =
+  | { kind: 'recover'; fromOffset: number; recoveryBytes: number }
+  | {
+      kind: 'skip';
+      reason: 'no-restorable-turns' | 'invalid-file-size' | 'invalid-offset' | 'range-too-large';
+      fromOffset: number;
+      recoveryBytes: number;
+      maxBytes: number;
+    };
+
+/** Decide whether the worker may safely drain the journal recovery range in
+ * one pass. New journals capture the transcript cursor at mark time, so even a
+ * multi-gigabyte rollout normally replays only the current turn's tail. Old
+ * journals used offset zero; those fail open to an EOF baseline instead of
+ * crashing the worker while converting a >512 MiB Buffer to a V8 string. */
+export function planBridgeTurnRecovery(
+  entries: readonly BridgeTurnJournalEntry[],
+  fileSize: number,
+  maxBytes: number = BRIDGE_TURN_RECOVERY_MAX_BYTES,
+): BridgeTurnRecoveryPlan {
+  const safeFileSize = Number.isSafeInteger(fileSize) && fileSize >= 0 ? fileSize : 0;
+  const safeMaxBytes = Number.isSafeInteger(maxBytes) && maxBytes >= 0
+    ? maxBytes
+    : BRIDGE_TURN_RECOVERY_MAX_BYTES;
+  if (entries.length === 0) {
+    return {
+      kind: 'skip', reason: 'no-restorable-turns', fromOffset: safeFileSize,
+      recoveryBytes: 0, maxBytes: safeMaxBytes,
+    };
+  }
+  if (safeFileSize !== fileSize) {
+    return {
+      kind: 'skip', reason: 'invalid-file-size', fromOffset: safeFileSize,
+      recoveryBytes: 0, maxBytes: safeMaxBytes,
+    };
+  }
+  const offsets = entries.map(entry => entry.offsetAtMark);
+  if (offsets.some(offset => !Number.isSafeInteger(offset) || offset < 0 || offset > fileSize)) {
+    return {
+      kind: 'skip', reason: 'invalid-offset', fromOffset: fileSize,
+      recoveryBytes: 0, maxBytes: safeMaxBytes,
+    };
+  }
+  const fromOffset = Math.min(...offsets);
+  const recoveryBytes = fileSize - fromOffset;
+  if (recoveryBytes > safeMaxBytes) {
+    return {
+      kind: 'skip', reason: 'range-too-large', fromOffset, recoveryBytes,
+      maxBytes: safeMaxBytes,
+    };
+  }
+  return { kind: 'recover', fromOffset, recoveryBytes };
+}
+
 /** Bound on tracked entries — pathological mark storms must not grow the
  *  journal unboundedly. Oldest entries are shed first (they are also the
  *  first to fail the restore age gate). */
@@ -67,23 +130,20 @@ interface BridgeTurnJournalFile {
 }
 
 export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf8');
-  } catch {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(raw) as BridgeTurnJournalFile;
-    if (parsed?.version !== 1 || !Array.isArray(parsed.pending)) return [];
-    return parsed.pending.filter(entry =>
-      typeof entry?.turnId === 'string'
-      && typeof entry?.markTimeMs === 'number'
-      && typeof entry?.jsonlPath === 'string'
-      && typeof entry?.offsetAtMark === 'number');
-  } catch {
-    return [];
-  }
+  // 缺失 / 损坏 / 形状不符 → []。损坏的文件被隔离为 .corrupt-*（而不是被下一次
+  // writeBridgeTurnJournal 覆盖），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<BridgeTurnJournalFile | null>(path, {
+    fallback: () => null,
+    validate: (v): v is BridgeTurnJournalFile =>
+      isJsonObject(v) && v.version === 1 && Array.isArray(v.pending),
+    label: 'bridge-turn-journal',
+  });
+  if (!parsed) return [];
+  return parsed.pending.filter(entry =>
+    typeof entry?.turnId === 'string'
+    && typeof entry?.markTimeMs === 'number'
+    && typeof entry?.jsonlPath === 'string'
+    && typeof entry?.offsetAtMark === 'number');
 }
 
 export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[]): void {
@@ -92,9 +152,7 @@ export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalE
     : pending;
   const payload: BridgeTurnJournalFile = { version: 1, pending: bounded };
   mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
-  renameSync(tmpPath, path);
+  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false });
 }
 
 export function appendBridgeTurnJournalEntry(path: string, entry: BridgeTurnJournalEntry): void {

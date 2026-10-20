@@ -18,6 +18,17 @@ const ds = (session: { cliId?: any; model?: string }, spawnModelOverride?: strin
   ({ session, spawnModelOverride }) as any;
 
 describe('resolveSessionLaunchModel', () => {
+  it('keeps a persisted dispatch launch model above later bot defaults', () => {
+    const subject = ds({ model: 'old' });
+    subject.session.dispatchLaunchSpec = {
+      version: 1, targetLarkAppId: 'cli_target', chatId: 'oc_chat', rootMessageId: 'om_root',
+      requested: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      effective: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      createdAt: '2026-09-21T00:00:00.000Z', expiresAt: '2026-09-21T00:10:00.000Z',
+    };
+    expect(resolveSessionLaunchModel(subject, { cliId: 'codex', model: 'gpt-5.6-sol' }))
+      .toBe('gpt-6-astra');
+  });
   it('uses the live bot model for a session frozen on the same CLI', () => {
     expect(resolveSessionLaunchModel(
       ds({ cliId: 'claude-code' }),

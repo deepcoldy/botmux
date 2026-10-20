@@ -115,79 +115,33 @@ describe('VC meeting daemon-to-daemon auth', () => {
 describe('VC meeting daemon control route wiring', () => {
   const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
-  function between(start: string, end: string): string {
-    const from = source.indexOf(start);
-    const to = source.indexOf(end, from + start.length);
-    expect(from, `missing daemon source marker: ${start}`).toBeGreaterThanOrEqual(0);
-    expect(to, `missing daemon source marker: ${end}`).toBeGreaterThan(from);
+  /** Route body from its registration marker up to the next ipcRoute registration (or its own close). */
+  function routeBody(marker: string): string {
+    const from = source.indexOf(marker);
+    expect(from, `missing daemon route marker: ${marker}`).toBeGreaterThanOrEqual(0);
+    const next = source.indexOf('\nipcRoute(', from + marker.length);
+    const to = next >= 0 ? next : source.indexOf('\n});', from + marker.length);
+    expect(to, `unterminated daemon route: ${marker}`).toBeGreaterThan(from);
     return source.slice(from, to);
   }
 
-  function expectGuardBefore(block: string, protectedOperation: string): void {
-    const guardAt = block.indexOf('guardVcMeetingDaemonControlRoute(req, res)');
-    const operationAt = block.indexOf(protectedOperation);
+  // 源码结构护栏(K2)：这些 daemon 间控制路由在 daemon.ts 顶层直接 ipcRoute 注册，没有可在单测里起的 HTTP seam；
+  // authorizeVcMeetingDaemonControlRequest 本身的判定由本文件上方的行为用例覆盖。这里守的是：每条控制路由都先过
+  // guardVcMeetingDaemonControlRoute，再读请求体、碰接收端状态或改写投递存储——少一处就静默开出一个未鉴权的跨 daemon
+  // 写入口（#470）。只断言 guard 与特权操作的相对顺序，不钉整句写法。
+  it.each([
+    ["for (const path of ['/api/vc-meetings/members/register'", ['readJsonBody', 'registerVcMeetingMember(']],
+    ["ipcRoute('POST', '/api/vc-meetings/deliver'", ['readJsonBody', 'validateVcMeetingDeliveryRequest(', 'receiveVcMeetingDelivery(']],
+    ["ipcRoute('GET', '/api/vc-meetings/deliveries/:deliveryKey'", ['getVcMeetingDeliveryStatus(']],
+    ["ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/retry'", ['retryPoisonedVcMeetingDelivery(']],
+    ["ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon'", ['readJsonBody', 'abandonPoisonedVcMeetingDelivery(']],
+    ["ipcRoute('POST', '/api/vc-meetings/consumer-catch-up'", ['readJsonBody', 'injectVcMeetingConsumerSession(']],
+  ] as const)('authenticates %s before body reads, receiver operations or store mutation', (marker, operations) => {
+    const body = routeBody(marker);
+    const guardAt = body.indexOf('guardVcMeetingDaemonControlRoute(');
     expect(guardAt, 'route is missing VC daemon auth guard').toBeGreaterThanOrEqual(0);
-    expect(operationAt, `route is missing protected operation ${protectedOperation}`).toBeGreaterThan(guardAt);
-  }
-
-  function singleRoute(start: string): string {
-    const from = source.indexOf(start);
-    const to = source.indexOf('\n});', from + start.length);
-    expect(from, `missing daemon route marker: ${start}`).toBeGreaterThanOrEqual(0);
-    expect(to, `unterminated daemon route: ${start}`).toBeGreaterThan(from);
-    return source.slice(from, to + 4);
-  }
-
-  it('authenticates register/update before reading ownerEpoch-bearing JSON', () => {
-    const block = between(
-      "for (const path of ['/api/vc-meetings/members/register'",
-      "ipcRoute('POST', '/api/vc-meetings/deliver'",
-    );
-    expectGuardBefore(block, 'readJsonBody(req)');
-    expect(block).toContain('registerVcMeetingMember(body');
-  });
-
-  it('authenticates deliver before recovery state, body reads, or store mutation', () => {
-    const block = between(
-      "ipcRoute('POST', '/api/vc-meetings/deliver'",
-      "ipcRoute('GET', '/api/vc-meetings/deliveries/:deliveryKey'",
-    );
-    expectGuardBefore(block, 'readJsonBody(req)');
-    expectGuardBefore(block, 'validateVcMeetingDeliveryRequest(body)');
-    expectGuardBefore(block, 'receiveVcMeetingDelivery(body');
-  });
-
-  it('authenticates delivery status, retry and abandon before any receiver operation/body read', () => {
-    const status = between(
-      "ipcRoute('GET', '/api/vc-meetings/deliveries/:deliveryKey'",
-      "ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/retry'",
-    );
-    expectGuardBefore(status, 'getVcMeetingDeliveryStatus(');
-
-    const retry = between(
-      "ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/retry'",
-      "ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon'",
-    );
-    expectGuardBefore(retry, 'retryPoisonedVcMeetingDelivery(');
-
-    const abandon = between(
-      "ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon'",
-      "ipcRoute('POST', '/api/vc-meetings/output-request'",
-    );
-    expectGuardBefore(abandon, 'readJsonBody<Record<string, unknown>>(req)');
-    expectGuardBefore(abandon, 'abandonPoisonedVcMeetingDelivery(');
-  });
-
-  it('adds auth in the shared daemon fetch helper without guarding the agent-facing output route', () => {
-    const fetchHelper = between(
-      'async function fetchVcMeetingDaemonJson(',
-      'async function triggerVcMeetingConsumerTurn(',
-    );
-    expect(fetchHelper).toContain('withVcMeetingDaemonAuthHeader(');
-    const outputRoute = singleRoute("ipcRoute('POST', '/api/vc-meetings/output-request'");
-    expect(outputRoute).not.toContain('guardVcMeetingDaemonControlRoute');
-    const catchUpRoute = singleRoute("ipcRoute('POST', '/api/vc-meetings/consumer-catch-up'");
-    expectGuardBefore(catchUpRoute, 'readJsonBody<Record<string, unknown>>(req)');
-    expectGuardBefore(catchUpRoute, 'injectVcMeetingConsumerSession(');
+    for (const operation of operations) {
+      expect(body.indexOf(operation), `route is missing protected operation ${operation}`).toBeGreaterThan(guardAt);
+    }
   });
 });

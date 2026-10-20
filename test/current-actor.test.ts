@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -100,14 +100,6 @@ describe('current actor client contract', () => {
     }, { comm: 'tmux: server', exe: '/tmp/not-tmux' });
 
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
-  });
-
-  it('republishes the opening turn after the live CLI pid is attested', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const start = worker.indexOf('function publishLocalProcessAttestation');
-    const body = worker.slice(start, worker.indexOf('/** Deliver a terminal IPC', start));
-    expect(body).toContain("type: 'local_process_attestation'");
-    expect(body).toContain('if (currentBotmuxTurnId) publishSandboxRelayCapability()');
   });
 
   it('accepts only the machine-readable current command', () => {

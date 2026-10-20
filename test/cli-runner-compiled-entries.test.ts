@@ -37,10 +37,17 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RUNNER_ENTRIES, runnerArgv0, type BotmuxEntry } from '../src/core/self-spawn.js';
+import {
+  ENTRY_SUBCOMMANDS,
+  entryForSubcommand,
+  RUNNER_ENTRIES,
+  runnerArgv0,
+  type BotmuxEntry,
+} from '../src/core/self-spawn.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -49,11 +56,12 @@ const REAL_ARGV1 = process.argv[1];
 function asCompiledBinary() { process.argv[1] = '/$bunfs/root/cli.js'; }
 afterEach(() => { process.argv[1] = REAL_ARGV1; });
 
-/** The four adapters, each with the runner entry it must launch. */
+/** The runner adapters, each with the runner entry it must launch. */
 const ADAPTERS: ReadonlyArray<{ id: string; entry: BotmuxEntry; make: () => { buildArgs: (o: never) => string[] } }> = [
   { id: 'codex-app', entry: 'codex-app-runner', make: () => createCodexAppAdapter() as never },
   { id: 'dsh', entry: 'dsh-runner', make: () => createDshAdapter() as never },
   { id: 'mira', entry: 'mira-runner', make: () => createMiraAdapter() as never },
+  { id: 'minimax', entry: 'minimax-runner', make: () => createMinimaxAdapter('/bin/true') as never },
   { id: 'mir', entry: 'mir-runner', make: () => createMirAdapter() as never },
 ];
 
@@ -72,27 +80,32 @@ describe('CLI-adapter runners — compiled binary form', () => {
     for (const a of args) expect(a).not.toContain('$bunfs');
   });
 
-  it('every runner entry is wired end to end: token, dispatch branch, dist filename', () => {
-    // Checking one runner and assuming the other three is exactly how three of
-    // four would ship broken. RUNNER_ENTRIES is the single source of truth, so
-    // iterate it and require each one to appear in cli.ts's dispatch.
+  // 源码结构护栏(K1)：`bun build --compile` 只能打包字面量 import specifier，cli.ts 的
+  // `__<runner>` 分发必须为每个 runner 写一条静态 `import('./<entry>.js')`——计算出的 specifier
+  // 在编译态什么也不嵌入，token 会落到 help 横幅并 exit 0（见文件头）。打包行为只有编译出真
+  // 二进制才能观察，单测里只能读 cli.ts 断言这条结构；token → entry 的识别则走真实导出函数。
+  it('every runner entry is wired end to end: token, dispatch branch, static import', () => {
+    // Checking one runner and assuming the rest is exactly how runners ship
+    // broken. RUNNER_ENTRIES is the single source of truth, so iterate it.
     const cliSource = readFileSync(resolve(REPO_ROOT, 'src', 'cli.ts'), 'utf-8');
-    expect(RUNNER_ENTRIES.length).toBe(4);
     for (const entry of RUNNER_ENTRIES) {
       asCompiledBinary();
-      expect(runnerArgv0(entry, '/ignored')).toBe(`__${entry}`);
-      // cli.ts must both recognise the entry and statically import its module —
-      // `--compile` cannot bundle a computed specifier, so a dynamic lookup here
-      // would embed nothing and the token would still print help.
-      expect(cliSource).toContain(`__entrySubcommand === '${entry}'`);
-      expect(cliSource).toContain(`await import('./${entry}.js')`);
+      const token = runnerArgv0(entry, '/ignored');
+      expect(token).toBe(`__${entry}`);
+      expect(ENTRY_SUBCOMMANDS.has(token)).toBe(true);
+      expect(entryForSubcommand(token)).toBe(entry);
+      const escaped = entry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      expect(cliSource).toMatch(new RegExp(`'${escaped}'\\)\\s*\\{?\\s*await import\\('\\./${escaped}\\.js'\\)`));
     }
   });
 
   it('does not mint tokens for non-runner entries', () => {
     // Guards the reverse error: RUNNER_ENTRIES must not quietly grow to include
     // fleet entries, whose launch path is resolveEntrySpawn, not this one.
-    expect([...RUNNER_ENTRIES]).toEqual(['codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner']);
+    expect([...RUNNER_ENTRIES]).toEqual([
+      'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
+      'minimax-runner', 'lark-tool-runner',
+    ]);
   });
 });
 

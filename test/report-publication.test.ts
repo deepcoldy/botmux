@@ -71,6 +71,7 @@ describe('durable report publication', () => {
   it.each([
     { response: { status: 400 } }, { response: { status: 403 } }, { response: { status: 429 } },
     { name: 'MessageWithdrawnError' }, { code: 230002 },
+    { name: 'TopicSendError', code: 'TOPIC_SEND_BLOCKED' },
   ])('allows retry after a definite rejection: %j', async error => {
     const f = fixture(); f.publish.mockRejectedValueOnce(error);
     expect(await deliverPublishedReport(f)).toMatchObject({ status: 422, body: { error: 'report_publication_rejected' } });
@@ -80,7 +81,8 @@ describe('durable report publication', () => {
     expect(f.publish).toHaveBeenCalledTimes(2);
     expect(f.publish.mock.calls[0]).toEqual(f.publish.mock.calls[1]);
   });
-  it.each([{ response: { status: 408 } }, { response: { status: 500 } }, { code: 99999999 }])(
+  it.each([{ response: { status: 408 } }, { response: { status: 500 } }, { code: 99999999 },
+    { name: 'TopicSendError', code: 'TOPIC_SEND_CHECK_FAILED' }])(
     'retains ambiguous publication state: %j', async error => {
       const f = fixture(); f.publish.mockRejectedValueOnce(error);
       expect((await deliverPublishedReport(f)).body.error).toBe('report_publication_unknown');

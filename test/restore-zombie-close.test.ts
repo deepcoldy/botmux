@@ -292,6 +292,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { logger } from '../src/utils/logger.js';
+import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
@@ -337,6 +338,50 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — recovery persistence isolation', () => {
+  it.each(['ordinary', 'readonly'] as const)('isolates a %s recovery attach failure and restores later sessions', async kind => {
+    const broken = makeActivePersistentSession('om_recovery_broken');
+    const healthy = makeActivePersistentSession('om_recovery_healthy');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const attach = kind === 'ordinary' ? ensureOrdinaryTurnRecoveryAttached : ensureReadonlyTaskContinuationAttached;
+    vi.mocked(attach).mockImplementationOnce(() => { throw new Error('disk full during recovery attach'); });
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    expect(map.get(sessionKey('om_recovery_healthy', 'app_test'))?.session.sessionId).toBe(healthy.sessionId);
+    expect(sessionStore.getSession(broken.sessionId)?.status).toBe('active');
+    expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('disk full during recovery attach'));
+  });
+});
+
+describe('restoreActiveSessions — workspace retirement', () => {
+  it.each(['tmux', 'zmx'] as const)('skips and explains a corrupt active retired %s row before registration or spawn', async backend => {
+    const session = makeActivePersistentSession('retired-root', backend);
+    const retirement = { operationId: 'recycle-corrupt', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    // Bypass the write invariant to model historical/corrupt durable data, then reload it.
+    mutatePersistedSessionRow(tempDir, 'app_test', session.sessionId, row => {
+      row.workspaceRetirement = retirement;
+    });
+    sessionStore.init('app_test');
+    expect(sessionStore.getSession(session.sessionId)).toMatchObject({ status: 'active', workspaceRetirement: retirement });
+    vi.mocked(setActiveSessionSafe).mockClear();
+    vi.mocked(forkAdoptWorker).mockClear();
+    vi.mocked(logger.info).mockClear();
+    const active = new Map<string, DaemonSession>();
+    wp.registry = active;
+
+    await restoreActiveSessions(active);
+
+    expect(active.size).toBe(0);
+    expect(setActiveSessionSafe).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(forkAdoptWorker).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`Skipping workspace-retired session ${session.sessionId}`));
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`operationId=${retirement.operationId}`));
+  });
+});
 
 describe('restoreActiveSessions — narrow XPI recovery containment', () => {
   function makePrincipalLaneSession(rootMessageId: string) {
@@ -1451,6 +1496,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     s.sandbox = true; // frozen sandbox decision
     s.title = 'Adopt: proj';
     s.adoptedFrom = { source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/proj' } as any;
+    s.cliConfigDir = '~/.claude-api'; // frozen onto the adopt row by an older build
     sessionStore.updateSession(s);
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -1461,6 +1507,8 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkAdoptWorker).not.toHaveBeenCalled();
     const persisted = sessionStore.getSession(s.sessionId)!;
     expect(persisted.adoptedFrom).toBeUndefined();
+    // the cold start resumes the external transcript on the default data root
+    expect(persisted.cliConfigDir).toBeUndefined();
     expect(persisted.title).not.toMatch(/^Adopt:/);
     // registered as an ordinary restored session (row announced, not closed)
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);

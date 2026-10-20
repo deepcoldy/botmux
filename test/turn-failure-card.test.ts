@@ -28,6 +28,7 @@ import {
   preExecutionErrorCodes,
   buildTurnContinuePrompt,
 } from '../src/services/turn-failure-notice.js';
+import { t } from '../src/i18n/index.js';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 
 let cardTestHome: string;
@@ -471,6 +472,11 @@ describe('buildTurnFailedCard', () => {
 
   it('reports the auto-continuation count when a recovery ladder gave up', () => {
     expect(bodyText(build({ continuations: 2 }))).toContain('2');
+  });
+
+  it.each(['zh', 'en'] as const)('shows capacity recovery count only once (%s)', locale => {
+    const text = bodyText(build({ locale, continuations: 2, reason: t('worker.codex_capacity_recovery_stopped', { cliName: 'Codex' }, locale) }));
+    expect(text.match(/2/g)).toHaveLength(1);
   });
 
   it('omits the continuation line when no continuations ran', () => {

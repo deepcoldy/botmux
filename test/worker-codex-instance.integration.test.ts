@@ -91,6 +91,21 @@ describe('frozen Codex instance through real worker IPC (workflow PTY path)', ()
     }
     expect(existsSync(join(f.root, 'wrong-global-home'))).toBe(false);
   }, 20000);
+  it('launches Codex with the default-on hook-trust bypass and model-nudge suppression', async () => {
+    // Both toggles are live global getters handed to buildArgs by the worker;
+    // dropping either from the spawn wedges headless TUIs on an interactive gate.
+    const f = launch();
+    await until(() => f.messages.some(m => m.type === 'ready'), f.logs);
+    await until(() => existsSync(f.observation), f.logs);
+    const launches = readFileSync(f.observation, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line).argv as string[])
+      .filter(argv => !argv.includes('--version'));
+    expect(launches.length).toBeGreaterThan(0);
+    for (const argv of launches) {
+      expect(argv).toContain('--dangerously-bypass-hook-trust');
+      expect(argv[argv.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('-c');
+    }
+  }, 20000);
   it('fails before spawning any CLI when the frozen home is missing, without global fallback', async () => {
     const f = launch(true);
     await until(() => f.child.exitCode !== null || f.child.signalCode !== null || f.messages.some(m => m.type === 'error'), f.logs);

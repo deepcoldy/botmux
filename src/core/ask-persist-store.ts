@@ -32,20 +32,13 @@
  * prevents an explicit ask from re-claiming a hook ask's card.
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { createHash } from 'node:crypto';
-import { join } from 'node:path';
-
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import type { AskQuestion, AskResult } from './ask-types.js';
+import {
+  createHumanDecisionStore,
+  humanDecisionDispatchUuidForKey,
+  humanDecisionKeyFor,
+} from './human-decision-store.js';
+import type { AskQuestion, AskResult, CreateAskInput } from './ask-types.js';
 
 /** Sentinel file marking a directory as a botmux ask store. teardown/reset only
  *  ever touches a directory that contains this file — a guard against a missing
@@ -76,6 +69,7 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;
@@ -92,7 +86,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
-  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
   selections: ReadonlyArray<ReadonlyArray<string>>;
@@ -134,12 +128,7 @@ export function askKeyFor(
   originKind: string,
   requestId: string,
 ): string {
-  return [larkAppId, sessionId, originKind, requestId]
-    .map((seg) => {
-      const raw = String(seg);
-      return `${raw.length}:${raw}`;
-    })
-    .join('|');
+  return humanDecisionKeyFor(larkAppId, sessionId, originKind, requestId);
 }
 
 /** Feishu IM `uuid` dedupe token (≤50 chars) derived from the FULL scoped ask
@@ -149,7 +138,7 @@ export function askKeyFor(
  *  reusing the same requestId gets a DIFFERENT uuid and so cannot alias the
  *  first session's card. `ask-` + 40 hex = 44 chars, safely under the cap. */
 export function dispatchUuidForKey(askKey: string): string {
-  return `ask-${createHash('sha256').update(`uuid|${askKey}`).digest('hex').slice(0, 40)}`;
+  return humanDecisionDispatchUuidForKey(askKey, 'ask');
 }
 
 export interface AskPersistStore {
@@ -170,30 +159,27 @@ export interface AskPersistStore {
  * touching live data.
  */
 export function createAskPersistStore(dir: string): AskPersistStore {
-  // Filename = SHA-256 of the FULL canonical key (codex P1-1). Hashing (not
-  // truncating) means two production-length keys that share a long prefix but
-  // differ in the requestId tail land on DISTINCT files — the previous
-  // `sanitize(key).slice(0,80)` collapsed them because a 36-char app id + uuid
-  // session pushed the requestId past char 80. Fixed-length hex is also always a
-  // valid path component, so no separate sanitize step is needed.
-  const filePath = (askKey: string): string =>
-    join(dir, `${createHash('sha256').update(askKey).digest('hex')}.json`);
-
-  function ensureDir(): void {
-    mkdirSync(dir, { recursive: true });
-    const sentinel = join(dir, ASK_STORE_SENTINEL);
-    if (!existsSync(sentinel)) {
-      try { writeFileSync(sentinel, 'botmux ask persist store\n', { mode: 0o600 }); } catch { /* best effort */ }
-    }
-  }
+  const decisions = createHumanDecisionStore(dir, { legacySentinels: [ASK_STORE_SENTINEL] });
 
   return {
     dir,
     put(ask: PersistedAsk): void {
       try {
-        ensureDir();
-        atomicWriteFileSync(filePath(ask.askKey), JSON.stringify(ask), { mode: 0o600, durable: true });
+        decisions.put(ask);
       } catch (e) {
+        // A real human ANSWER is a correctness gate: do not acknowledge a click
+        // whose durable handoff could not be committed. settle() performs this
+        // write before ANY state mutation, so the throw leaves the ask pending
+        // and the (catch-wrapped) card click fails closed — the human can click
+        // again once the disk is healthy.
+        //
+        // Timeouts / invalidations carry no human decision and can be persisted
+        // from a bare setTimeout callback (deadline timer, or the remaining=0
+        // timer armed for an expired record on boot) whose throw escapes as
+        // uncaughtException — the daemon installs no trap for that, and explicit
+        // records are exempt from disk reaping below, so it would crash-loop on
+        // every restart until the disk recovered. Those writes stay best-effort.
+        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.
@@ -204,35 +190,19 @@ export function createAskPersistStore(dir: string): AskPersistStore {
     },
     remove(askKey: string): void {
       try {
-        unlinkSync(filePath(askKey));
+        decisions.remove(askKey);
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
         logger.warn?.(
           `ask-persist: failed to remove ${askKey}: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
     },
     list(now: number = Date.now()): PersistedAsk[] {
-      if (!existsSync(dir)) return [];
-      let names: string[];
-      try {
-        names = readdirSync(dir).filter((n) => n.endsWith('.json'));
-      } catch (e) {
-        logger.warn?.(`ask-persist: cannot read ${dir}: ${e instanceof Error ? e.message : String(e)}`);
-        return [];
-      }
       const out: PersistedAsk[] = [];
-      for (const name of names) {
-        const fp = join(dir, name);
-        let parsed: PersistedAsk | undefined;
-        try {
-          parsed = JSON.parse(readFileSync(fp, 'utf-8')) as PersistedAsk;
-        } catch {
-          try { unlinkSync(fp); } catch { /* ignore */ }
-          continue;
-        }
+      for (const raw of decisions.list()) {
+        const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
-          try { unlinkSync(fp); } catch { /* ignore */ }
+          if (parsed?.askKey) decisions.remove(parsed.askKey);
           continue;
         }
         // Reap rules:
@@ -242,16 +212,17 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         //  - never-answered records are dropped once past their deadline.
         if (parsed.answeredResult !== undefined) {
           const stashedAt = typeof parsed.answeredAt === 'number' ? parsed.answeredAt : parsed.createdAt;
-          if (now - stashedAt > HANDOFF_RETENTION_MS) {
-            try { unlinkSync(fp); } catch { /* ignore */ }
+          if (parsed.originKind !== 'host_explicit' && now - stashedAt > HANDOFF_RETENTION_MS) {
+            decisions.remove(parsed.askKey);
             continue;
           }
         } else if (
-          !(parsed.timeoutStartsAfterDelivery === true && !parsed.cardMessageId)
+          parsed.originKind !== 'host_explicit'
+          && !(parsed.timeoutStartsAfterDelivery === true && !parsed.cardMessageId)
           && typeof parsed.deadlineAt === 'number'
           && parsed.deadlineAt <= now
         ) {
-          try { unlinkSync(fp); } catch { /* ignore */ }
+          decisions.remove(parsed.askKey);
           continue;
         }
         out.push(parsed);

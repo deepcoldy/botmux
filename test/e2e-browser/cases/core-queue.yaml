@@ -1,0 +1,6 @@
+# Lane: messages sent while the CLI is still busy are queued, not dropped.
+cases:
+  - name: Consecutive message queue
+    tags: [conversation, message, core]
+    steps:
+      - feishu.runScenario: { scenario: consecutive-messages }

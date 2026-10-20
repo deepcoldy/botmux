@@ -58,6 +58,9 @@ export interface SkillPackRegistryFile {
 
 export interface ResolvedSkill extends SkillPackage {
   priorityReason: string;
+  /** Set when `rootDir` is this session's snapshot copy (core/skills/snapshot.ts):
+   *  the skill's original source root, for diagnostics only — readers use rootDir. */
+  snapshotOf?: string;
 }
 
 export interface SkillDiagnostic {

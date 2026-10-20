@@ -1078,3 +1078,49 @@ describe('Codex App worker replacement durable handoff', () => {
     }
   }, 45_000);
 });
+
+describe('Codex App worker live effort', () => {
+  it.each([
+    ['effort-complete', 'applied', undefined],
+    ['effort-feature-disabled-complete', 'future_only', 'step_model_switching_disabled'],
+  ] as const)('%s delivers the control frame through tmux and preserves the business final', async (behavior, status, reason) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-effort-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const sessionId = replacementSessionId('effort');
+    tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, behavior, logs, messages,
+      (message, child) => {
+        if (message.type === 'codex_app_dispatch_transition') {
+          child.send({ type: 'codex_app_dispatch_persisted', requestId: message.requestId, ok: true } satisfies DaemonToWorker);
+        }
+      });
+    worker.send(replacementInit(sessionId, fakeCodex, 'business task', {
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: behavior },
+      turnId: 'om_effort_business',
+      codexAppDispatchId: 'dispatch-effort-business',
+      promptCodexAppInput: { text: 'business task', clientUserMessageId: 'om_effort_business' },
+    }));
+    await waitFor(worker, logs, () => readRequests(requestLog).some(r => r.method === 'turn/start'));
+    worker.send({ type: 'codex_app_effort', requestId: 'request-effort-worker', effort: 'high' } satisfies DaemonToWorker);
+    await waitFor(worker, logs, () => messages.some(m => m.type === 'codex_app_effort_result'));
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'codex_app_effort_result', requestId: 'request-effort-worker', status }));
+    expect(messages.find(m => m.type === 'codex_app_effort_result')).toMatchObject(reason ? { reason } : { status });
+    await waitFor(worker, logs, () => messages.some(m => m.type === 'final_output'));
+    expect(messages.filter(m => m.type === 'final_output')).toEqual([
+      expect.objectContaining({ turnId: 'om_effort_business', content: expect.stringContaining('fake answer 1'),
+        codexAppSettlement: expect.objectContaining({ dispatchId: 'dispatch-effort-business' }) }),
+    ]);
+    const requests = readRequests(requestLog);
+    expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+    expect(requests.some(r => r.method === 'turn/steer' || r.method === 'turn/interrupt')).toBe(false);
+    expect(requests.filter(r => r.method === 'turn/settings/update').map(r => r.params)).toEqual([
+      { threadId: 'thread-fake', turnId: 'turn-fake-1', effort: 'high' },
+    ]);
+  }, 35_000);
+});

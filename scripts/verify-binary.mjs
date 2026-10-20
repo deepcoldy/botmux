@@ -21,15 +21,16 @@
  * TWO FRICTIONS IT REMOVES, both hit while doing this by hand:
  *
  *   1. HOST TARGET ONLY, enforced. Cross-compiling looks like it works and does
- *      not: `resolveNodePtyNative()` falls back to the local
- *      `build/Release/pty.node` for every linux target, and node-pty ships no
- *      linux prebuild. VERIFIED — `--target bun-linux-arm64` on this x64 box
- *      exits 0 and produces a real aarch64 ELF with the x86-64 `pty.node` baked
- *      in; it fails at PTY spawn, not at build. (And the host cannot even exec
- *      it: qemu-aarch64 is registered but `/lib/ld-linux-aarch64.so.1` is
- *      absent.) musl is worse still — it MUST be compiled on musl or the wrong
- *      libc gets embedded. So this refuses anything but the host target and says
- *      why, instead of handing over a binary that is silently broken.
+ *      not: when no `prebuilds/<plat>-<arch>` matches, `resolveNodePtyNative()`
+ *      falls back to the local `build/Release/pty.node` for every linux target.
+ *      VERIFIED (node-pty 1.1.0, before it shipped linux prebuilds) —
+ *      `--target bun-linux-arm64` on this x64 box exited 0 and produced a real
+ *      aarch64 ELF with the x86-64 `pty.node` baked in; it fails at PTY spawn,
+ *      not at build. (And the host cannot even exec it: qemu-aarch64 is
+ *      registered but `/lib/ld-linux-aarch64.so.1` is absent.) musl MUST be
+ *      compiled on musl or the wrong libc gets embedded (the build script now
+ *      refuses that). So this refuses anything but the host target and says
+ *      why, instead of handing over a binary it cannot smoke.
  *
  *   2. A REAL VERSION. `versionToBake()` reads package.json, which carries the
  *      placeholder `0.0.0` outside a release; the runtime treats that as "not
@@ -65,7 +66,7 @@ if (requested !== hostTarget) {
   console.error(
     `❌ verify:binary only supports the host target (${hostTarget}); refusing ${requested}.\n\n`
     + 'Cross-compiled binaries from this box are silently broken, not merely untested:\n'
-    + '  • node-pty has no linux prebuild, so every linux target embeds THIS machine\'s\n'
+    + '  • without a matching node-pty prebuild a linux target embeds THIS machine\'s\n'
     + `    build/Release/pty.node (${hostArch}) — the mismatch surfaces at PTY spawn, not at build time.\n`
     + '  • a musl binary must be compiled ON musl or it links the wrong libc.\n'
     + '  • the host cannot exec a foreign-arch binary anyway, so smoke could not run.\n\n'

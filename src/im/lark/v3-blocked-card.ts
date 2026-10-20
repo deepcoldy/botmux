@@ -8,8 +8,7 @@
  * 自带 action namespace（`v3_blocked_retry`），不与 gate 卡混用。纯函数，单测友好。
  */
 
-import { config } from '../../config.js';
-import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
+import { short, truncate, escapeMd, v3RunDetailUrl } from './v3-card-common.js';
 
 export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
 /** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
@@ -73,10 +72,6 @@ const DEFAULT_MESSAGE_MAX_CHARS = 500;
  *  attempt 入 nonce —— 重试后旧卡的 nonce 对不上新 attempt，不会误触。 */
 export function v3BlockedCardNonce(runId: string, nodeId: string, attemptId: string): string {
   return `v3blocked:${runId}:${nodeId}:${attemptId}`;
-}
-
-function v3RunDetailUrl(runId: string): string {
-  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3BlockedCard(input: V3BlockedCardInput): string {
@@ -271,16 +266,3 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
   });
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符，防 message 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

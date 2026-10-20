@@ -170,6 +170,77 @@ function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>>
   });
 }
 
+describe('primary coordination local lifecycle gate', () => {
+  it.each([
+    ['delete one', ['delete', 'sess-primary-local']],
+    ['delete all', ['delete', 'all']],
+    ['delete stopped', ['delete', 'stopped']],
+    ['resume', ['resume', 'sess-primary-local']],
+    ['suspend', ['suspend', 'all']],
+  ])('rejects %s before any Pod-local lifecycle mutation', async (_label, args) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-lifecycle-'));
+    const dataDir = join(root, 'must-not-be-created');
+    tempDirs.push(root);
+
+    const result = await runCli(dataDir, args, {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(result.stderr).toContain('PostgreSQL');
+    expect(result.stderr).toContain('本次未做任何修改');
+  });
+
+  it('reads primary mode from ~/.botmux/.env in a standalone shell', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-env-file-'));
+    const homeDir = join(root, 'home');
+    const dataDir = join(root, 'data');
+    const configDir = join(homeDir, '.botmux');
+    tempDirs.push(root);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, '.env'), 'BOTMUX_COORDINATION_MODE=primary\n');
+    const session = makeSession('sess-primary-env-file');
+    writeSessions(dataDir, [session]);
+
+    const result = await runCli(dataDir, ['delete', session.sessionId], {
+      HOME: homeDir,
+      BOTMUX_COORDINATION_MODE: undefined,
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('keeps list read-only and skips local auto-prune in primary mode', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-primary-list-'));
+    tempDirs.push(dataDir);
+    const scratch = makeSession('sess-primary-scratch', { larkAppId: APP_ID });
+    writeSessions(dataDir, [scratch]);
+
+    const result = await runCli(dataDir, ['list', '--plain'], {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('已跳过 1 个本地会话的自动清理');
+    expect(readSessions(dataDir)[scratch.sessionId].status).toBe('active');
+  });
+});
+
 describe('botmux delete — daemon-first close', () => {
   it('delegates a current-session close to the daemon with its rotating capability', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));

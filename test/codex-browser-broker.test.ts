@@ -2,9 +2,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const approvalExec = vi.hoisted(() => vi.fn((...args: any[]) => {
   args.at(-1)(null, JSON.stringify({ answer: 'approve' }), '');
 }));
-vi.mock('node:child_process', async importOriginal => ({
-  ...await importOriginal<typeof import('node:child_process')>(), execFile: approvalExec,
-}));
+vi.mock('node:child_process', async importOriginal => {
+  const original = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
+  // Match execFile's real promisified {stdout, stderr} contract.
+  Object.defineProperty(approvalExec, promisify.custom, { value: (...args: any[]) => new Promise((resolve, reject) => {
+    approvalExec(...args, (error: Error | null, stdout: string, stderr: string) => {
+      if (error) reject(error); else resolve({ stdout, stderr });
+    });
+  }) });
+  return { ...original, execFile: approvalExec };
+});
 import {
   CODEX_BROWSER_TOOL_NAME,
   CodexBrowserBroker,
@@ -503,6 +511,24 @@ describe.sequential('CodexBrowserBroker', () => {
       .resolves.toEqual({ requirements: null });
     expect(readConfig).toHaveBeenCalledWith({ cwd: '/tmp/example', includeLayers: false });
     expect(readConfigRequirements).toHaveBeenCalledOnce();
+  });
+
+  it('passes chat-scoped browser approval to Ask with the worker anchor contract', async () => {
+    for (const [key, value] of Object.entries({
+      BOTMUX_SESSION_ID: 'session-chat', BOTMUX_CHAT_ID: 'oc_chat',
+      BOTMUX_LARK_APP_ID: 'app_chat', BOTMUX_ROOT_MESSAGE_ID: 'oc_chat', BOTMUX_SESSION_SCOPE: 'chat',
+    })) vi.stubEnv(key, value);
+    approvalExec.mockClear();
+    approvalExec.mockImplementationOnce((...args: any[]) => {
+      args.at(-1)(null, JSON.stringify({ selected: 'approve', by: 'ou_user', timedOut: false }), '');
+    });
+    broker = new CodexBrowserBroker({ sessionId: 'session-chat', family: 'chrome', modules: fakeModules().modules });
+    await broker.handleToolCall(call({ operation: 'list_tabs' }));
+    await expect((globalThis as any).nodeRepl.createElicitation({
+      message: 'Allow this operation?', meta: { codex_approval_kind: 'mcp_tool_call' },
+    })).resolves.toMatchObject({ action: 'accept', meta: { approval_channel: 'lark' } });
+    expect(approvalExec).toHaveBeenCalledOnce();
+    expect(approvalExec.mock.calls[0].slice(0, 2)).toEqual(['botmux', expect.arrayContaining(['ask', 'buttons'])]);
   });
 
   it('fails closed for secure browser authentication elicitations', async () => {

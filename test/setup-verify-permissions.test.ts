@@ -47,6 +47,7 @@ import {
   DOC_WATCH_SCOPES,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
+  APP_SLASH_COMMAND_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
 import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
@@ -184,14 +185,14 @@ describe('readCriticalScopesFromApplicationInfo', () => {
 });
 
 describe('checkRequiredScopes (helper, not in main path)', () => {
-  it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
+  it('lists granted scopes and computes missing critical/optional (grant_status 1 OR 2 both granted)', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,
       data: {
         scopes: [
           { scope_name: 'im:message', grant_status: 2 },
-          { scope_name: 'im:resource', grant_status: 1 }, // 已申请未生效, 算 missing
-          { scope_name: 'unrelated:scope', grant_status: 2 },
+          { scope_name: 'im:resource', grant_status: 1 }, // spike: 已开通 scope 返回 1, 算 granted
+          { scope_name: 'unrelated:scope', grant_status: 1 },
         ],
       },
     });
@@ -199,12 +200,30 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.granted).toContain('im:message');
-      expect(r.granted).not.toContain('im:resource');
-      // missingCritical 应该包含 im:resource (critical=true, granted_status!=2)
-      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(true);
-      // im:message 已 granted, 不应该在 missingCritical 里
+      expect(r.granted).toContain('im:resource');
+      // im:message / im:resource 已 granted, 不应该在 missingCritical 里
+      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(false);
       expect(r.missingCritical.some(s => s.name === 'im:message')).toBe(false);
+      // 未出现在 scope.list 里的 critical 项（如 im:chat.members:read）仍算 missing
+      expect(r.missingCritical.some(s => s.name === 'im:chat.members:read')).toBe(true);
     }
+  });
+
+  it('treats grant_status===1 as granted — Lark 国际版真机实证 status=1 的 scope API 直调可用', async () => {
+    // 自建应用已开通的 scope 在 scope.list 返回 grant_status=1（tenant token 直调
+    // im/v1/messages 与 im/v1/chats/{id}/members 均 code 0）。全量 critical scope
+    // 以 status=1 返回时, missingCritical 必须为空, 不能持续误报缺权限。
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: {
+        scopes: BOTMUX_REQUIRED_SCOPES
+          .filter(s => s.critical)
+          .map(s => ({ scope_name: s.name, grant_status: 1 })),
+      },
+    });
+    const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.missingCritical).toEqual([]);
   });
 
   it('treats im:chat.members:write_only as CRITICAL (拉群刚需) so its absence is surfaced', async () => {
@@ -424,6 +443,29 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       'vc:meeting.message:write',
     ]);
     expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('native slash-command scopes are optional feature scopes: never required, never auto-imported', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+    const names = APP_SLASH_COMMAND_FEATURE_SCOPES.map(s => s.name).sort();
+
+    expect(names).toEqual([
+      'application:app_slash_command:read',
+      'application:app_slash_command:write',
+    ]);
+    expect(APP_SLASH_COMMAND_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    // Not in BOTMUX_REQUIRED_SCOPES: the startup self-check would otherwise
+    // silently top them up and publish a new app version for a gated,
+    // Dashboard-only feature.
+    expect(BOTMUX_REQUIRED_SCOPES.filter(s => names.includes(s.name))).toEqual([]);
+    // Not in the default manifest: tenants outside Lark's gated rollout may not
+    // even have these scopes in their catalog.
+    expect(names.filter(name => declared.has(name))).toEqual([]);
   });
 
   it('manifest excludes the scopes the tenant auto-rejects (nothing in botmux calls them)', async () => {

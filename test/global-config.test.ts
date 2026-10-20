@@ -9,6 +9,7 @@ import {
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
+  isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
@@ -26,6 +27,7 @@ describe('global dashboard config', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
@@ -49,6 +51,27 @@ describe('global dashboard config', () => {
       enableLocalCliOpen: true,
       localCliOpenMode: 'resume',
     });
+  });
+
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
   });
 
   it('drops invalid dashboard.localCliOpenMode values', () => {
@@ -132,18 +155,6 @@ describe('global dashboard config', () => {
       enabled: true,
       source: 'owner/repo/subdir',
       ref: 'reviewed-sha',
-    });
-  });
-
-  it('reads the review-only legacy spec as source/ref for compatibility', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({
-      dashboard: { herdrTraexPlugin: { enabled: true, spec: ' owner/repo#tag ' } },
-    }));
-
-    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
-      enabled: true,
-      source: 'owner/repo',
-      ref: 'tag',
     });
   });
 
@@ -289,6 +300,27 @@ describe('global dashboard config', () => {
     expect(isWorkflowFeatureEnabled()).toBe(false);
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
+  });
+
+  it('multi-topic orchestration defaults ON and supports config/env opt-out', () => {
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+
+    mergeGlobalConfig({ multiTopic: { enabled: false } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false });
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'false');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+  });
+
+  it('ignores a non-boolean multiTopic.enabled and preserves the default ON', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ multiTopic: { enabled: 'no' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
   });
 
   it('keeps codexNotifier strictly disabled by default', () => {
@@ -461,15 +493,33 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
-    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
-    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();
     mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
     expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
     // Clearing (null) removes it again.
     mergeGlobalConfig({ httpProxy: null });
     expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
+      maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    });
   });
 
   it('ignores a non-string / blank httpProxy', () => {
@@ -533,6 +583,14 @@ describe('global sessionCleanup config', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
   });
 
   it('reads a full sessionCleanup block', () => {

@@ -20,6 +20,7 @@ export type AttemptTerminalSidecar = {
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../core/sandbox-network-policy.js').SandboxNetworkPolicy;
   logPath?: string;
   startedAt: number;
   updatedAt: number;

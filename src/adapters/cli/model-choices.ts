@@ -3,7 +3,10 @@ import type { CliId } from './types.js';
 /** Static model metadata shared by adapters and the Dashboard.
  * Keep this module free of adapter construction, executable lookup and I/O:
  * option enumeration runs synchronously on the Dashboard request thread. */
-const CODEX_MODEL_CHOICES = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'] as const;
+const CODEX_MODEL_CHOICES = [
+  'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+  'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+] as const;
 const DSH_MODEL_CHOICES = ['deepseek-v4-flash', 'deepseek-v4-pro'] as const;
 
 /** Explicitly account for every CLI; undefined means it has no curated list. */
@@ -87,8 +90,10 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'gpt-5.5-ptu',
   ],
   'minimax': [
-    'MiniMax-M3',
-    'MiniMax-M2.7',
-    'MiniMax-M2.7-highspeed',
+    'minimax/MiniMax-M3.1-Flash-Preview',
+    'minimax/MiniMax-M3',
+    'minimax/MiniMax-M2.7',
+    'minimax/MiniMax-M2.7-highspeed',
   ],
+  'remote-runner': undefined,
 };

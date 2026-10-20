@@ -1,15 +1,37 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
  *  settle + throttle than later writes. Tracked by identity so the warmup state
  *  is shared across adapter instances. Mirrors claude-code's first-write guard. */
 const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
+
+/** botmux ships its built-in skills as a plugin here and injects it per-session via
+ *  `--plugin-dir` (see buildArgs). Kept out of the global `~/.cursor/skills` so a
+ *  user's standalone `cursor-agent` does not see (and mis-fire) them. Single source
+ *  of truth for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
+
+/** Cursor agent-transcripts JSONL. Bridge-active only in adopt mode or zero-prompt
+ *  spawns. The transcript carries no per-event timestamps, so adopt baselines the
+ *  history by byte offset instead of the timestamp-cutoff split-live. */
+export const cursorBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainCursorTranscript(path, offset),
+  locate: {
+    bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
+    byPid: pid => findCursorTranscriptByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', zeroPromptOnly: true },
+  adopt: { attach: 'baseline-skip-tail' },
+};
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -19,9 +41,16 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'cursor',
+    bridgeSpec: cursorBridgeSpec,
+    // Whole ~/.cursor (chats store.db + projects agent-transcripts + skills):
+    // a directory-level readWrite bind under the sandbox, so the host daemon
+    // reads the same transcript the CLI writes (zero-prompt final harvest) and
+    // store.db keeps working fcntl locks. The worker pre-creates the dir at
+    // spawn (bwrap cannot bind a missing source) — see pre-create block.
+    authPaths: ['~/.cursor'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass, skillPluginDir, promptInjection }) {
       // --trust pre-answers the "Workspace Trust Required" startup dialog.
       // Without it, the first spawn in a never-trusted directory (= every
       // fresh-worktree topic) blocks on that dialog; the dialog sits silent,
@@ -40,6 +69,10 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       if (!disableCliBypass) base.push('--force');
       if (model && model.trim()) {
         base.push('--model', model.trim());
+      }
+      if (promptInjection !== 'none') {
+        base.push('--plugin-dir', CURSOR_PLUGIN_DIR);
+        if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {
         if (initialPrompt) base.push(initialPrompt);
@@ -63,10 +96,15 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     },
 
     // Cursor accepts a positional prompt and does not hand it to the TUI until
-    // authentication and startup have completed. Keep the opening turn on that
-    // path: writing it to the PTY after the worker's bounded startup timeout can
-    // otherwise feed the prompt into a still-active browser-login flow.
+    // authentication and startup have completed. Keep short opening turns on
+    // that path: writing them to the PTY after the worker's bounded startup
+    // timeout can otherwise feed the prompt into a still-active browser-login
+    // flow. Over-limit prompts defer to the post-start queue, which waits for
+    // readyPattern (composer mounted) before typing.
     passesInitialPromptViaArgs: true,
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
+
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
 
     buildResumeCommand({ cliSessionId }) {
       // Cursor's chat id is opaque and not derivable from botmux's sessionId;
@@ -134,12 +172,25 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       }
       await delay(200);
       emitEnter();
-      // While Cursor is running a turn, the first Enter parks the text in its
-      // "follow-ups" panel ("enter steer"). A second Enter promotes that item
-      // into the active agent turn. At an idle empty composer the extra Enter
-      // is a no-op, so use the same sequence for serial and type-ahead writes.
-      await delay(200);
-      emitEnter();
+      // Exactly ONE Enter. Idle composer → submits. Busy turn → Cursor parks
+      // the text in its "follow-ups" panel as a QUEUED item, which it submits
+      // by itself as the next turn the moment the current turn ends (verified
+      // on cursor-agent 2026.09.18; the TUI's `chat.queued` processing does
+      // exactly that). That is the same serial queue semantics the worker
+      // already relies on for Claude Code type-ahead.
+      //
+      // Do NOT press Enter a second time (#996 did, #1504 is the fallout):
+      //   - on a queued item, Enter means "steer" — inject into the ACTIVE
+      //     turn. If a shell tool is running, Cursor detaches it into a
+      //     background task; when that task later completes Cursor injects a
+      //     synthetic user turn ("Briefly inform the user about the task
+      //     result…") with no Lark message behind it, and the model dutifully
+      //     `botmux send`s again → the "auto-continue after final" symptom.
+      //   - the second Enter races the follow-ups panel re-render (long
+      //     multi-line prompts, loaded hosts). When it is lost the item sits
+      //     at "enter steer" and the worker believes it was delivered.
+      // A single Enter has no half-state: either it submitted, or the item is
+      // queued and Cursor flushes it at the turn boundary.
     },
 
     completionPattern: undefined,
@@ -161,11 +212,11 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
+    pluginDir: CURSOR_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
     skillsDir: '~/.cursor/skills',
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
     modelChoices: CLI_MODEL_CHOICES['cursor'],
   };
 }
-
-export const create = createCursorAdapter;

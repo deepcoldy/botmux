@@ -69,13 +69,13 @@ const gte = (a: string, b: string) => {
 };
 
 /** First Bun version known to write a valid darwin ad-hoc signature (#39837).
- *  A FLOOR, not the pin: package.json may be ahead (it is — 1.4.2), and this
+ *  A FLOOR, not the pin: package.json may be ahead (it is — 1.4.3), and this
  *  only has to stay at or below it. Deliberately NOT bumped in lockstep, so the
  *  assertion below keeps testing "the pin carries the fix" instead of restating
  *  whatever the pin currently happens to be.
  *  ⚠️ ONLY for the HOST arch — see the build-bun-binary.mjs suite below: 1.4.1
  *  still writes an invalid signature when cross-compiling darwin-x64, and 1.4.2
- *  re-measured identically, so this pin is necessary but NOT sufficient. */
+ *  and 1.4.3 re-measured identically, so this pin is necessary but NOT sufficient. */
 const FIRST_GOOD_BUN = '1.4.1';
 
 describe('release.yml — every darwin binary is codesign-verified before it ships', () => {
@@ -160,13 +160,16 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
    * darwin-arm64" and its test only compiles --target=bun-darwin-arm64; nothing
    * upstream covers x86_64. So bumping the pin again does NOT close this, and
    * these assertions exist so nobody deletes the re-sign after reading
-   * "we're already on 1.4.2".
+   * "we're already on 1.4.3".
    *
    * RE-MEASURED the same way when the pin moved 1.4.1 → 1.4.2 (1.4.0 as a
    * control, so the check is known to discriminate between versions):
    *   1.4.0 → arm64 INVALID (1/15483)      x64 INVALID (2/17124)
    *   1.4.2 → arm64 VALID   (15075/15075)  x64 INVALID (2/16792, incl. slot 0)
    * Identical split to 1.4.1: the x64 cross-compile cell is still broken.
+   * RE-MEASURED again when the pin moved 1.4.2 → 1.4.3 (1.4.2 as the control,
+   * reproducing the numbers above exactly):
+   *   1.4.3 → arm64 VALID   (17167/17167)  x64 INVALID (2/19065, incl. slot 0)
    */
   it('ad-hoc re-signs with codesign --force --sign -', () => {
     // #39764 reports --remove-signature and BUN_NO_CODESIGN_MACHO_BINARY=1 as NOT
@@ -413,6 +416,96 @@ describe('ci.yml — darwin is gated on PRs, not only at release', () => {
     const releaseRunner = releaseDarwin[0].match(/^\s*(macos-[\w.]+)/)?.[1];
     expect(releaseRunner, 'could not read the release darwin runner — re-anchor this test').toBeDefined();
     expect(job).toMatch(new RegExp(`runs-on:\\s*${releaseRunner!.replace(/\./g, '\\.')}`));
+  });
+});
+
+describe('skia native gate — release AND the PR darwin job enforce the same sentinel', () => {
+  /**
+   * v3.40.0 shipped botmux-darwin-x64 without @napi-rs/canvas's skia native: the
+   * two darwin targets are cross-built on one arm64 runner, the x64 canvas
+   * subpackage is not installed there, and Bun only embeds a `.node` it can
+   * statically resolve — so the worker died at module load (`Cannot find native
+   * binding`). The smoke step only executes the HOST arch, so nothing inspected
+   * the x64 file. These two gates grep each darwin binary for a skia-only symbol.
+   *
+   * The sentinel is ONE constant, used verbatim in both workflows, and chosen so
+   * the gate cannot silently self-defeat:
+   *   • `SkBitmap` — measured 3 hits in the pinned skia (darwin-x64/arm64 AND
+   *     linux), 0 in node-pty / rolldown / lightningcss / sharp and the Bun
+   *     runtime. This is the ONLY string that is both present in a stripped
+   *     release .node and absent everywhere else.
+   *   • NOT `Create Custom GC ThreadsafeFunction` — a generic napi-rs runtime
+   *     string that rolldown and lightningcss also carry (1 hit each). Embedding
+   *     any second napi-rs native would make a MISSING skia grep-match anyway,
+   *     turning the gate permanently green.
+   *   • NOT `SkCanvas` / `GrDirectContext` — 0 hits in the published, stripped
+   *     skia.*.node, so the gate would fail forever against a real skia.
+   *
+   * Asserted as parsed text (comments stripped), and anchored to the executed
+   * shell line, so prose ABOUT the gate can neither satisfy nor hide it.
+   */
+  const SENTINEL = 'SkBitmap';
+  const REL_SKIA = step(RELEASE, 'Verify the canvas skia native is embedded in every darwin binary');
+  const CI_SKIA = step(CI, 'Verify the canvas skia native is embedded in every darwin binary');
+
+  /** The `run: |` body, so parity compares what actually executes, not prose. */
+  const runBody = (s: string) => {
+    const i = s.indexOf('run: |');
+    return i < 0 ? '' : s.slice(i + 'run: |'.length);
+  };
+  /** The exact string handed to `grep -aq "…"` (the executed sentinel). */
+  const sentinelOf = (s: string) => s.match(/grep -aq "([^"]+)"/)?.[1];
+
+  it('exists in BOTH release.yml and the ci.yml darwin job (parity, not release-only)', () => {
+    expect(REL_SKIA).not.toBe('');
+    expect(CI_SKIA).not.toBe('');
+  });
+
+  it(`uses the same skia-only sentinel ${SENTINEL} in both files`, () => {
+    // The one constant, verbatim, in the EXECUTED job — not merely somewhere in
+    // the file (the explanatory comments mention the rejected strings too).
+    expect(sentinelOf(REL_SKIA)).toBe(SENTINEL);
+    expect(sentinelOf(CI_SKIA)).toBe(SENTINEL);
+    // Anchored so an `echo`/comment mentioning the string cannot satisfy it.
+    expect(REL_SKIA).toMatch(new RegExp(`^\\s*if ! grep -aq "${SENTINEL}" "\\$f"; then`, 'm'));
+    expect(CI_SKIA).toMatch(new RegExp(`^\\s*if ! grep -aq "${SENTINEL}" "\\$f"; then`, 'm'));
+  });
+
+  it('rejects the shared napi-rs string that would let a non-skia native pass', () => {
+    // If this string (or a SkCanvas/GrDirectContext that stripped skia lacks) is
+    // ever swapped back in, the gate is worthless — so pin it OUT explicitly.
+    for (const s of [REL_SKIA, CI_SKIA]) {
+      expect(s).not.toContain('Create Custom GC ThreadsafeFunction');
+      expect(sentinelOf(s)).not.toBe('SkCanvas');
+      expect(sentinelOf(s)).not.toBe('GrDirectContext');
+    }
+  });
+
+  it('iterates every darwin output with the identical fail-closed body in both', () => {
+    for (const s of [REL_SKIA, CI_SKIA]) {
+      expect(s).toMatch(/for f in dist-bin\/botmux-darwin-\*/);
+      // sourcemap sibling must be skipped or grep would inspect a .map
+      expect(s).toMatch(/\*\.map/);
+      // fail closed: an empty glob is not a pass
+      expect(s).toMatch(/found=0/);
+      expect(s).toMatch(/\[ "\$found" = 0 \][\s\S]*exit 1/);
+      // and a binary missing skia fails the build
+      expect(s).toMatch(/::error::skia native missing from \$f/);
+    }
+    // Byte-for-byte the same executed body, so the PR gate can never be weaker.
+    expect(runBody(CI_SKIA)).toBe(runBody(REL_SKIA));
+  });
+
+  it('runs AFTER the signature check and BEFORE the smoke step in both jobs', () => {
+    for (const src of [RELEASE, CI]) {
+      const skiaIdx = src.indexOf('- name: Verify the canvas skia native is embedded in every darwin binary');
+      expect(skiaIdx).toBeGreaterThan(src.indexOf('- name: Verify Mach-O signatures on every darwin binary'));
+      expect(src.indexOf('- name: Smoke-test the host-arch binary')).toBeGreaterThan(skiaIdx);
+    }
+  });
+
+  it('is scoped to the macOS leg in release.yml (grep over darwin bytes needs the macos leg)', () => {
+    expect(REL_SKIA).toMatch(/runner\.os == 'macOS'/);
   });
 });
 

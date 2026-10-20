@@ -72,7 +72,7 @@ describe('botmux history — rangeHint range guidance', () => {
   });
 
   it('describes an OBSERVABLE trigger, not daemon-side invocations the model never sees', () => {
-    // `/t` (parseForceTopicInvocation) is consumed by the daemon and stripped
+    // `/t` (parseTopicHeader) is consumed by the daemon and stripped
     // before the prompt is built, so the model has never seen that token. Naming
     // it would read as an instruction the model cannot act on. The trigger must
     // be phrased as something visible from inside the session instead.

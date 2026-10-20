@@ -10,7 +10,7 @@
  * Pure functions only — persistence and IPC stay with the daemon/command-handler
  * callers, mirroring the ordinary-turn-recovery split.
  */
-import type { CodexAppTurnInput, FailedTurnRecord } from '../types.js';
+import type { CodexAppTurnInput, FailedTurnRecord, TrustedCaller } from '../types.js';
 
 /** Cooldown between two `/retry` attempts on the same session. */
 export const RETRY_COOLDOWN_MS = 10_000;
@@ -35,7 +35,8 @@ export function shouldRecordFailedTurn(
  *  prompt was wrapped). */
 export function buildFailedTurnRecord(
   terminal: { turnId: string; status: 'failed' | 'ambiguous'; errorCode?: string },
-  sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput },
+  sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
+    trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
   now: Date = new Date(),
 ): FailedTurnRecord | undefined {
   if (!sources.cliInput) return undefined;
@@ -48,6 +49,9 @@ export function buildFailedTurnRecord(
     ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
     status: terminal.status,
     retryCount: 0,
+    ...(sources.silent ? { silent: true } : {}),
+    ...(sources.trustedCaller ? { trustedCaller: { ...sources.trustedCaller } } : {}),
+    ...(sources.originalTurnId ? { originalTurnId: sources.originalTurnId } : {}),
   };
 }
 

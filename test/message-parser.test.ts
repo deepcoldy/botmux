@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -1561,6 +1561,72 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  function parsePostEvent(post: object) {
+    return parseEventMessage({
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_links',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    }).parsed.content;
+  }
+
+  it.each(['unwrapped', 'zh_cn', 'en_us'])('preserves titled MR links in %s posts for API and event messages', (shape) => {
+    // The client can show a resolved MR title even when text === href in the
+    // API. A titled link instead stores its URL only in href.
+    const firstUrl = 'https://example.com/team/service/merge_requests/123';
+    const secondUrl = 'https://example.com/team/client/merge_requests/456?to_version=2';
+    const body = {
+      title: 'Batch review',
+      content: [
+        [{ tag: 'at', user_name: 'Reviewer' }, { tag: 'text', text: ' Review these two MRs.' }],
+        [{ tag: 'a', text: 'fix(api): use configured endpoint · !123', href: firstUrl }],
+        [{ tag: 'a', text: 'fix(client): apply effective thresholds · !456', href: secondUrl }],
+      ],
+    };
+    const post = shape === 'unwrapped' ? body : { [shape]: body };
+    const expected = `Batch review\n@Reviewer Review these two MRs.\nfix(api): use configured endpoint · !123(${firstUrl})\nfix(client): apply effective thresholds · !456(${secondUrl})`;
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+    expect(parsePostEvent(post)).toBe(expected);
+  });
+
+  it.each([
+    { name: 'URL label', node: { text: 'https://example.com/mr/123', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing label', node: { href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'empty label', node: { text: '', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'null label', node: { text: null, href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing URL', node: { text: 'MR title' }, expected: 'MR title' },
+    { name: 'empty URL', node: { text: 'MR title', href: '' }, expected: 'MR title' },
+    { name: 'empty anchor', node: {}, expected: '' },
+  ])('renders $name without losing or duplicating content', ({ node, expected }) => {
+    const post = { content: [[{ tag: 'text', text: 'Before ' }, { tag: 'a', ...node }, { tag: 'text', text: ' after' }]] };
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(`Before ${expected} after`);
+    expect(parsePostEvent(post)).toBe(`Before ${expected} after`);
+  });
+
+  it('retains link destinations in authored text while excluding attachment metadata', () => {
+    const post = {
+      content: [[
+        { tag: 'a', text: 'MR title', href: 'https://example.com/mr/123' },
+        { tag: 'file', file_key: 'file_spec', file_name: 'spec.md' },
+      ]],
+    };
+    expect(extractAuthoredMessageText('post', JSON.stringify(post))).toBe('MR title(https://example.com/mr/123)');
+  });
+
+  it('distinguishes posts with the same link label but different destinations', () => {
+    const canonical = (href: string) => rawPlaceholderText('post', JSON.stringify({
+      content: [[{ tag: 'a', text: 'MR title', href }]],
+    }));
+    expect(canonical('https://example.com/mr/123')).toContain('https://example.com/mr/123');
+    expect(canonical('https://example.com/mr/123')).not.toBe(canonical('https://example.com/mr/456'));
+  });
+
   it('renders post code block with fence boundaries for API and event messages', () => {
     const post = {
       zh_cn: {
@@ -1616,7 +1682,7 @@ describe('Post message parsing', () => {
       },
     };
 
-    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档(https://example.com)@Alice');
   });
 
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {
@@ -2249,5 +2315,150 @@ describe('isPlaceholderOnlyText', () => {
   it('普通文本不受影响', () => {
     expect(isPlaceholderOnlyText('帮我排查数据库连接池')).toBe(false);
     expect(isPlaceholderOnlyText('图片里的报错是什么意思')).toBe(false);
+  });
+});
+
+describe('resolveMentions & card <at id=...> tags', () => {
+  it('resolves <at id=ou_xxx></at> to @Name with exact openId match', () => {
+    const text = '<at id=ou_pure></at> 请看一下这个 PR';
+    const mentions = [{ key: '@_user_1', name: 'Pure(pi)', openId: 'ou_pure' }];
+    expect(resolveMentions(text, mentions)).toBe('@Pure(pi) 请看一下这个 PR');
+  });
+
+  it('resolves <at id=ou_xxx></at> to @Name via positional mention in cross-app card scenarios', () => {
+    // In cross-app card forwarding, the sender wrote <at id=ou_from_sender>,
+    // but receiver gets mentions with its own app-scoped openId.
+    const text = '<at id=ou_sender_view_pure></at> PR #1818 请复审';
+    const mentions = [{ key: '@_user_1', name: 'Pure(pi)', openId: 'ou_receiver_view_pure' }];
+    expect(resolveMentions(text, mentions)).toBe('@Pure(pi) PR #1818 请复审');
+  });
+
+  it('resolves <at id=all></at> to @所有人', () => {
+    expect(resolveMentions('<at id=all></at> 所有人注意')).toBe('@所有人 所有人注意');
+    expect(resolveMentions('<at id="all"></at> 所有人注意')).toBe('@所有人 所有人注意');
+    expect(resolveMentions('<at id=all/> 所有人注意')).toBe('@所有人 所有人注意');
+    expect(resolveMentions('<at user_id="all"></at> 所有人注意')).toBe('@所有人 所有人注意');
+  });
+
+  it('resolves <at id=ou_xxx>Pure(pi)</at> with inner text when no mentions list given', () => {
+    const text = '<at id=ou_pure>Pure(pi)</at> 复审通过';
+    expect(resolveMentions(text)).toBe('@Pure(pi) 复审通过');
+  });
+
+  it('resolves multiple <at ...> tags maintaining order and pairing', () => {
+    const text = '<at id=ou_1></at> 请协助 <at id=ou_2></at> 排查';
+    const mentions = [
+      { key: '@_user_1', name: 'Alice', openId: 'ou_diff_1' },
+      { key: '@_user_2', name: 'Bob', openId: 'ou_diff_2' },
+    ];
+    expect(resolveMentions(text, mentions)).toBe('@Alice 请协助 @Bob 排查');
+  });
+
+  it('resolves interactive card messages with <at id=ou_xxx></at> via parseEventMessage', () => {
+    const card = {
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: '<at id=ou_740c4ee7a9d0118343775f61356f93b2></at> PR #1818 复审提出的意见（P1、P3、测试覆盖）已全部完成整改并已推送到分支，请复审：',
+          },
+        ],
+      },
+    };
+    const eventData = {
+      sender: { sender_id: { open_id: 'ou_sender' }, sender_type: 'bot' },
+      message: {
+        message_id: 'om_card_msg',
+        message_type: 'interactive',
+        content: JSON.stringify(card),
+        chat_id: 'oc_test',
+        chat_type: 'group',
+        create_time: '1791792234000',
+        mentions: [
+          {
+            key: '@_user_1',
+            name: 'Pure(pi)',
+            id: { open_id: 'ou_receiver_scoped_pure' },
+          },
+        ],
+      },
+    };
+    const { parsed } = parseEventMessage(eventData);
+    expect(parsed.content).toBe('@Pure(pi) PR #1818 复审提出的意见（P1、P3、测试覆盖）已全部完成整改并已推送到分支，请复审：');
+    expect(parsed.content).not.toContain('<at id=');
+  });
+
+  it('strips unresolvable <at id=ou_xxx></at> tags when mentions list is empty', () => {
+    const text = '<at id=ou_unknown></at> 没有任何名字信息';
+    expect(resolveMentions(text, [])).toBe('没有任何名字信息');
+  });
+
+  it('does not misattribute unmatched tags that appear before exact-matching tags (P2-1)', () => {
+    const text = '<at id=ou_unmatched></at> 说 <at id=ou_A></at> 好';
+    const mentions = [
+      { key: '@_user_1', name: 'Alice', openId: 'ou_A' },
+      { key: '@_user_2', name: 'Carol', openId: 'ou_C' },
+    ];
+    const result = resolveMentions(text, mentions);
+    expect(result).toBe('说 @Alice 好');
+    expect(result).not.toContain('Carol');
+  });
+
+  it('strips bare <at id=ou_xxx></at> tags in interactive events when mentions key is missing (undefined) (P2-2)', () => {
+    const card = {
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: '<at id=ou_740c4ee7a9d0118343775f61356f93b2></at> PR #1818 请复审',
+          },
+        ],
+      },
+    };
+    // Event where mentions key is completely absent (undefined)
+    const eventData = {
+      sender: { sender_id: { open_id: 'ou_sender' }, sender_type: 'bot' },
+      message: {
+        message_id: 'om_card_msg_no_mentions',
+        message_type: 'interactive',
+        content: JSON.stringify(card),
+        chat_id: 'oc_test',
+        chat_type: 'group',
+        create_time: '1791792234000',
+      },
+    };
+    const { parsed } = parseEventMessage(eventData as any);
+    expect(parsed.content).toBe('PR #1818 请复审');
+    expect(parsed.content).not.toContain('<at id=');
+  });
+
+  it('preserves literal <at id=...> tags when extractCardContent is called without mentions (local validation)', () => {
+    const card = {
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: '<at id=ou_target></at> 测试本地出站卡片',
+          },
+        ],
+      },
+    };
+    const rendered = extractCardContent(JSON.stringify(card));
+    expect(rendered).toContain('<at id=ou_target></at>');
+  });
+
+  it('resolves multiple occurrences of the same mention tag id', () => {
+    const text = '<at id=ou_pure></at> 收到，感谢 <at id=ou_pure></at>';
+    const mentions = [{ key: '@_user_1', name: 'Pure(pi)', openId: 'ou_pure' }];
+    expect(resolveMentions(text, mentions)).toBe('@Pure(pi) 收到，感谢 @Pure(pi)');
+  });
+
+  it('preserves code block indentation when stripping unresolvable tags (P3-2)', () => {
+    const text = '```python\n    def foo():\n        return 42\n```\n<at id=ou_unknown></at>';
+    const result = resolveMentions(text, []);
+    expect(result).toBe('```python\n    def foo():\n        return 42\n```');
   });
 });

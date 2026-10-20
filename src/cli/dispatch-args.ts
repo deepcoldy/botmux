@@ -8,10 +8,14 @@ export interface DispatchArgs {
   briefFile?: string;
   chatId?: string;
   repo?: string;
+  model?: string;
+  reasoningEffort?: string;
   into?: string;
   resultDelivery?: string;
   standby: boolean;
   steer: boolean;
+  delegates?: string[];
+  noDelegates?: string[];
   bots: string[];
   botApps: string[];
 }
@@ -19,14 +23,15 @@ export interface DispatchArgs {
 export type DispatchArgsErrorCode =
   | 'UNKNOWN_OPTION'
   | 'UNEXPECTED_ARGUMENT'
-  | 'OPTION_VALUE_REQUIRED';
+  | 'OPTION_VALUE_REQUIRED'
+  | 'DUPLICATE_OPTION';
 
 export type DispatchArgsResult =
   | { ok: true; value: DispatchArgs }
   | { ok: false; errorCode: DispatchArgsErrorCode; error: string; option?: string };
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
-  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery'
+  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery' | 'model' | 'reasoningEffort'
 >>([
   ['--session-id', 'sessionId'],
   ['--title', 'title'],
@@ -36,12 +41,17 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--repo', 'repo'],
   ['--into', 'into'],
   ['--result-delivery', 'resultDelivery'],
+  ['--model', 'model'],
+  ['--reasoning-effort', 'reasoningEffort'],
 ]);
 
 const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([
   ['--bot', 'bots'],
   ['--bot-app', 'botApps'],
 ]);
+
+const DELEGATE_FLAG = '--delegate';
+const NO_DELEGATE_FLAG = '--no-delegate';
 
 const BOOLEAN_FLAGS = new Map<string, 'standby' | 'steer' | 'help'>([
   ['--standby', 'standby'],
@@ -88,6 +98,16 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
 
     const singletonKey = VALUE_FLAGS.get(flag);
     const repeatableKey = REPEATABLE_VALUE_FLAGS.get(flag);
+    if (flag === DELEGATE_FLAG || flag === NO_DELEGATE_FLAG) {
+      const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
+      if (optionValue === undefined || optionValue === '') {
+        return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
+      }
+      if (equals < 0) index += 1;
+      if (flag === DELEGATE_FLAG) (value.delegates ??= []).push(optionValue);
+      else (value.noDelegates ??= []).push(optionValue);
+      continue;
+    }
     if (singletonKey || repeatableKey) {
       const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
       // Preserve argValue's historical treatment of dash-prefixed values. A
@@ -98,6 +118,10 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
       }
       if (equals < 0) index += 1;
       if (singletonKey) {
+        if ((singletonKey === 'model' || singletonKey === 'reasoningEffort')
+            && value[singletonKey] !== undefined) {
+          return fail('DUPLICATE_OPTION', `${flag} may only be specified once`, flag);
+        }
         // argValue historically returned the first occurrence. Keep that
         // precedence while still consuming and validating every token.
         if (value[singletonKey] === undefined) value[singletonKey] = optionValue;

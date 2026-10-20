@@ -16,13 +16,26 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   return { ...actual, replyMessage: (...a: any[]) => replyMock(...a) };
 });
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseGrantTarget, parseGrantTargets, parseGrantQuota, tryHandleGrantCommand, isGrantTargetOnly } from '../src/im/lark/grant-command.js';
 import { registerBot, getBot, loadBotConfigs } from '../src/bot-registry.js';
 import { addChatGrant } from '../src/services/grant-store.js';
 import * as pending from '../src/im/lark/grant-pending.js';
+import { hasTriggeredMessage, _resetCacheForTest as resetTriggered } from '../src/services/triggered-message-store.js';
+
+let executionDataDir: string;
+beforeEach(() => {
+  executionDataDir = mkdtempSync(join(tmpdir(), 'botmux-grant-execution-'));
+  vi.stubEnv('SESSION_DATA_DIR', executionDataDir);
+  resetTriggered();
+});
+afterEach(() => {
+  resetTriggered();
+  vi.unstubAllEnvs();
+  rmSync(executionDataDir, { recursive: true, force: true });
+});
 
 function findCardCallbackValue(card: any, action: string): any {
   const visit = (node: any): any => {
@@ -258,6 +271,49 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
       durationMs: 8 * 60 * 60 * 1000,
     });
     expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
+  });
+
+  it('dedupes while the first send is in flight and preserves its pending nonce', async () => {
+    let finishSend!: (id: string) => void;
+    replyMock.mockImplementationOnce(() => new Promise<string>(resolve => { finishSend = resolve; }));
+    const first = tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    try {
+      expect(replyMock).toHaveBeenCalledOnce();
+      const value = findCardCallbackValue(JSON.parse(replyMock.mock.calls[0][2]), 'grant_chat');
+      expect(await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner')).toBe(true);
+      expect(replyMock).toHaveBeenCalledOnce();
+      expect(pending.checkNonce('b1', 'oc_1', 'ou_z', value.nonce)).toBe(true);
+    } finally {
+      finishSend('om_reply');
+      await first;
+    }
+  });
+
+  it('keeps the execution claim after a cache reload and an uncertain send failure', async () => {
+    replyMock.mockRejectedValueOnce(new Error('response lost after send'));
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    resetTriggered();
+    expect(hasTriggeredMessage('b1', 'om_x')).toBe(true);
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    expect(replyMock).toHaveBeenCalledOnce();
+  });
+
+  it('allows a distinct command and keeps execution claims scoped to each app', async () => {
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    await tryHandleGrantCommand('b1', { ...grantMessage(), message_id: 'om_next' }, 'ou_owner');
+    const secondBot = registerBot({ larkAppId: 'b_other', larkAppSecret: 's', cliId: 'codex', allowedUsers: ['ou_owner'] });
+    secondBot.botOpenId = 'ou_bot';
+    secondBot.resolvedAllowedUsers = ['ou_owner'];
+    await tryHandleGrantCommand('b_other', grantMessage(), 'ou_owner');
+    expect(replyMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not consume invalid input before the owner corrects it', async () => {
+    const invalid = { ...grantMessage(), content: JSON.stringify({ text: '@_user_1 /grant @_user_2 -1' }) };
+    await tryHandleGrantCommand('b1', invalid, 'ou_owner');
+    expect(hasTriggeredMessage('b1', 'om_x')).toBe(false);
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    expect(replyMock.mock.calls.filter(call => call[3] === 'interactive')).toHaveLength(1);
   });
 
   it('non-admin: replies owner_only, no card', async () => {
@@ -637,9 +693,17 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
   it('owner: bare /revoke removes the whole-chat grant', async () => {
     await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
     expect(getBot('b2').config.allowedChatGroups).toEqual(['oc_room']);
-    const handled = await tryHandleGrantCommand('b2', bareMsg('/revoke'), 'ou_owner');
+    const handled = await tryHandleGrantCommand('b2', { ...bareMsg('/revoke'), message_id: 'om_revoke' }, 'ou_owner');
     expect(handled).toBe(true);
     expect(getBot('b2').config.allowedChatGroups ?? []).toEqual([]);
+  });
+
+  it('does not replay a whole-chat grant after a later revoke', async () => {
+    await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
+    await tryHandleGrantCommand('b2', { ...bareMsg('/revoke'), message_id: 'om_revoke' }, 'ou_owner');
+    await tryHandleGrantCommand('b2', bareMsg('/grant'), 'ou_owner');
+    expect(getBot('b2').config.allowedChatGroups ?? []).toEqual([]);
+    expect(replyMock).toHaveBeenCalledTimes(2);
   });
 
   it('non-owner: bare /grant is rejected, chat not opened', async () => {
@@ -673,5 +737,14 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     expect(content).toContain('张三');
     expect(content).toContain('李四');
     expect(content).not.toContain('{"text"');
+  });
+
+  it('does not replay an old targeted revoke after a subsequent grant', async () => {
+    await addChatGrant('b2', 'oc_room', 'ou_a');
+    await tryHandleGrantCommand('b2', revokeMultiMsg(), 'ou_owner');
+    await addChatGrant('b2', 'oc_room', 'ou_a');
+    await tryHandleGrantCommand('b2', revokeMultiMsg(), 'ou_owner');
+    expect(getBot('b2').config.chatGrants?.oc_room).toContain('ou_a');
+    expect(replyMock).toHaveBeenCalledOnce();
   });
 });

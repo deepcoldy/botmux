@@ -12,8 +12,9 @@
  * to keep them unit-testable.
  */
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { baselineJsonlCursor } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
@@ -70,6 +71,30 @@ export interface TranscriptEvent {
   originalModel?: string;
   fallbackModel?: string;
   apiRefusalCategory?: string;
+  /** Claude Code writes `isMeta:true` on internal user records (tool results,
+   *  slash-command wrappers, compact summaries). Most are NOT real prompts and
+   *  stay filtered by isMeaningfulUserEvent, but the built-in scheduler's fire
+   *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
+   *  real model turn — see {@link isScheduledTurnStartEvent}. */
+  isMeta?: boolean;
+  /** Turn-origin discriminator written by Claude Code ≥2.1.281. The built-in
+   *  CronCreate scheduler fires turns as user records with
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`).
+   *  Older builds (≤2.1.280) omit it; those fires are recognised via
+   *  `promptSource === "system"` — see {@link isScheduledTurnStartEvent}. */
+  turnOrigin?: string;
+  /** Provenance of a user record. Built-in scheduler fire records on older
+   *  Claude Code builds (≤2.1.280) carry `promptSource:"system"` but no
+   *  turnOrigin. NOTE this field is NOT unique to scheduler fires (cross-
+   *  session messages, task_notification on some builds also set it), so it
+   *  is only consulted after the isMeta guard AND with scheduledFireId set. */
+  promptSource?: string;
+  scheduledTaskId?: string;
+  scheduledFireId?: string;
+  /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
+   *  records — both excluded from meaningful turn attribution. */
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -277,38 +302,17 @@ export function readLatestClaudeModelFallback(path: string): {
     return false;
   };
 
-  const floor = Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES);
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
   try {
-    fd = openSync(path, 'r');
-    let end = completeEnd;
-    let carry = Buffer.alloc(0);
-    while (end > floor) {
-      const start = Math.max(floor, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (consider(line)) return emit();
-      }
-      // Drop the leading fragment only at the byte-cap floor (a truncated
-      // historical partial); at true file start it is a complete record.
-      carry = start === floor && floor > 0 ? Buffer.alloc(0) : block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) consider(carry.toString('utf8'));
+    // The leading fragment at the byte-cap floor is a truncated historical
+    // partial and is dropped; at true file start it is a complete record.
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => consider(line.toString('utf8')),
+    });
   } catch {
     return emit();
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
   return emit();
 }
@@ -799,64 +803,23 @@ export function drainTranscript(
   path: string,
   fromOffset: number,
 ): DrainResult {
-  if (!existsSync(path)) {
-    return { events: [], newOffset: 0, pendingTail: '' };
-  }
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return { events: [], newOffset: fromOffset, pendingTail: '' };
-  }
-  let start = fromOffset;
-  if (size < start) {
-    // Truncated/rotated — re-read from the top.
-    start = 0;
-  }
-  if (size === start) {
-    return { events: [], newOffset: start, pendingTail: '' };
-  }
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  let read = 0;
-  const fd = openSync(path, 'r');
-  try {
-    read = readSync(fd, buf, 0, len, start);
-  } finally {
-    closeSync(fd);
-  }
-  const text = buf.subarray(0, read).toString('utf8');
-
-  // Find the last '\n' — anything after it is a partial line we shouldn't
-  // commit yet. Adjust newOffset to exclude the partial tail so the next
-  // drain re-reads it.
-  const lastNl = text.lastIndexOf('\n');
-  let toParse: string;
-  let pendingTail: string;
-  let newOffset: number;
-  if (lastNl < 0) {
-    // No complete line at all — treat the whole buffer as pending.
-    toParse = '';
-    pendingTail = text;
-    newOffset = start;
-  } else {
-    toParse = text.substring(0, lastNl);
-    pendingTail = text.substring(lastNl + 1);
-    newOffset = start + Buffer.byteLength(text.substring(0, lastNl + 1), 'utf8');
-  }
+  // Truncated/rotated (size < fromOffset) re-reads from the top.
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  // Anything after the last '\n' is a partial line we shouldn't commit yet:
+  // it stays out of `newOffset` so the next drain re-reads it.
+  const { completeText, pendingTail, newOffset } = step.window;
 
   const events: TranscriptEvent[] = [];
-  if (toParse) {
-    for (const line of toParse.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
-      } catch {
-        // Malformed line — skip silently. Claude Code's writer is atomic per
-        // line, so this means a debug/non-JSON line snuck in; not our concern.
-      }
+  for (const line of completeText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
+    } catch {
+      // Malformed line — skip silently. Claude Code's writer is atomic per
+      // line, so this means a debug/non-JSON line snuck in; not our concern.
     }
   }
   return { events, newOffset, pendingTail };
@@ -1040,8 +1003,23 @@ function hasToolUseBlock(ev: TranscriptEvent): boolean {
  * never contribute: only uuids in `turnAssistantUuids` are collected.
  * Returns '' for a turn with no text after its last tool_use (nothing worth
  * falling back with — e.g. the turn ended in a `botmux send` call).
+ *
+ * `opts.isHousekeepingToolUse` (transcript-delivery sessions only): Claude
+ * Code's auto-memory step can run AFTER the answer — answer text, memory file
+ * writes, then a short postscript ("I also saved two notes…"). The plain walk
+ * stops at those writes and returns only the postscript, so the answer never
+ * reaches Lark. When the tool calls separating the trailing run from the text
+ * before it are all housekeeping, that earlier run is the answer if it is
+ * substantive and longer than the trailing one; the usual shape — a one-line
+ * "saving memory" note before the writes and the real answer after them —
+ * keeps the trailing run alone. A trailing run that `opts.endsWithSentinel`
+ * flags is returned as is: the model declared its output complete there.
  */
-export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUuids: readonly string[]): string {
+export function trailingAssistantText(
+  events: TranscriptEvent[],
+  turnAssistantUuids: readonly string[],
+  opts: TrailingAnswerOptions = {},
+): string {
   if (turnAssistantUuids.length === 0) return '';
   const uuids = new Set(turnAssistantUuids);
   const lastUuid = turnAssistantUuids[turnAssistantUuids.length - 1];
@@ -1060,23 +1038,127 @@ export function trailingAssistantText(events: TranscriptEvent[], turnAssistantUu
     if (role === 'assistant' && hasToolUseBlock(ev)) return '';
     if (role === 'user' && isMeaningfulUserEvent(ev)) break;
   }
-  const tail: TranscriptEvent[] = [];
+  const { run, boundary } = collectTrailingTextRun(events, end, uuids);
+  const trailing = joinAssistantText(run);
+  if (!opts.isHousekeepingToolUse || !trailing || opts.endsWithSentinel?.(trailing)) return trailing;
+  const answer = textBeforeHousekeeping(events, boundary, uuids, opts.isHousekeepingToolUse);
+  return answer.length >= HOUSEKEEPING_ANSWER_MIN_CHARS && answer.length > trailing.length
+    ? `${answer}\n\n${trailing}`
+    : trailing;
+}
+
+/** Below this the text before housekeeping writes is a narration note
+ *  ("saving memory first"), not an answer. Longer notes exist but precede a
+ *  still longer answer, which the length comparison already keeps alone. */
+const HOUSEKEEPING_ANSWER_MIN_CHARS = 200;
+
+export interface TrailingAnswerOptions {
+  /** tool_use blocks that are bookkeeping rather than work, e.g. Claude Code's
+   *  own memory writes ({@link isClaudeMemoryToolUse}). */
+  isHousekeepingToolUse?: (block: { name?: unknown; input?: unknown }) => boolean;
+  /** The trailing text ends with the nothing-to-send sentinel line. */
+  endsWithSentinel?: (text: string) => boolean;
+}
+
+/** Walk back from `end` over this turn's contiguous assistant-text run.
+ *  `boundary` is the index of the tool_use / user event that ended the walk
+ *  (-1 when it reached the start of the transcript). */
+function collectTrailingTextRun(
+  events: TranscriptEvent[],
+  end: number,
+  uuids: ReadonlySet<string>,
+): { run: TranscriptEvent[]; boundary: number } {
+  const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
     if (!ev || typeof ev !== 'object') continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant') {
-      if (hasToolUseBlock(ev)) break;
-      if (ev.uuid && uuids.has(ev.uuid)) { tail.unshift(ev); continue; }
+      if (hasToolUseBlock(ev)) return { run, boundary: i };
+      if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
       // Thinking-only / non-turn assistant lines: cross unless they belong to
       // a DIFFERENT turn's visible text (then we've walked past our turn).
-      if (pickAssistantTextEvents([ev]).length > 0) break;
+      if (pickAssistantTextEvents([ev]).length > 0) return { run, boundary: i };
       continue;
     }
-    if (role === 'user') break;
+    if (role === 'user') return { run, boundary: i };
     // system / attachment / meta lines (last-prompt, ai-title, …): cross.
   }
-  return joinAssistantText(tail);
+  return { run, boundary: -1 };
+}
+
+/** The turn's text run that directly precedes a run of housekeeping-only tool
+ *  calls ending at `boundary`. '' unless every tool call crossed is
+ *  housekeeping, every tool_result crossed answers one of them, and the run
+ *  belongs to this turn. */
+function textBeforeHousekeeping(
+  events: TranscriptEvent[],
+  boundary: number,
+  uuids: ReadonlySet<string>,
+  isHousekeeping: (block: { name?: unknown; input?: unknown }) => boolean,
+): string {
+  const toolUseIds = new Set<string>();
+  const toolResultIds: string[] = [];
+  let i = boundary;
+  for (; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev || typeof ev !== 'object') continue;
+    const role = ev.message?.role ?? ev.type;
+    const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
+    if (role === 'assistant') {
+      const hasText = pickAssistantTextEvents([ev]).length > 0;
+      const uses = content.filter(b => b?.type === 'tool_use');
+      if (uses.length === 0) {
+        if (hasText) break;
+        continue;
+      }
+      if (hasText || !uses.every(isHousekeeping)) return '';
+      for (const use of uses) if (typeof use.id === 'string') toolUseIds.add(use.id);
+      continue;
+    }
+    if (role === 'user') {
+      if (!isPureToolResultUserEvent(ev.message?.content)) return '';
+      for (const block of content) toolResultIds.push(block.tool_use_id);
+      continue;
+    }
+  }
+  if (i < 0 || toolUseIds.size === 0) return '';
+  if (!toolResultIds.every(id => typeof id === 'string' && toolUseIds.has(id))) return '';
+  if (!events[i].uuid || !uuids.has(events[i].uuid!)) return '';
+  return joinAssistantText(collectTrailingTextRun(events, i, uuids).run);
+}
+
+/**
+ * True when a Claude Code tool_use only maintains the CLI's own auto-memory —
+ * `<dataDir>/projects/<project>/memory/` of the data dir that owns
+ * `transcriptPath` (`<dataDir>/projects/<project>/<session>.jsonl`). The
+ * project slug is not compared: a worktree session keeps its memory under the
+ * main repo's project dir.
+ */
+export function isClaudeMemoryToolUse(
+  block: { name?: unknown; input?: unknown },
+  transcriptPath: string | undefined,
+): boolean {
+  if (!transcriptPath) return false;
+  const marker = '/projects/';
+  const at = transcriptPath.lastIndexOf(marker);
+  if (at === -1) return false;
+  const projectsRoot = transcriptPath.slice(0, at + marker.length);
+  const input = (block.input && typeof block.input === 'object' ? block.input : {}) as Record<string, unknown>;
+  const home = homedir();
+  const roots = [projectsRoot];
+  if (home && projectsRoot.startsWith(`${home}/`)) roots.push(`~${projectsRoot.slice(home.length)}`);
+  const escaped = roots.map(r => r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  if (block.name === 'Write' || block.name === 'Edit' || block.name === 'MultiEdit') {
+    return typeof input.file_path === 'string'
+      && new RegExp(`^(?:${escaped})[^/]+/memory/`).test(input.file_path);
+  }
+  if (block.name === 'Bash') {
+    // e.g. `cd ~/.claude/projects/-repo/memory && printf … >> MEMORY.md`
+    return typeof input.command === 'string'
+      && new RegExp(`(?:${escaped})[^/\\s'"\`]+/memory(?![\\w.-])`).test(input.command);
+  }
+  return false;
 }
 
 /** XML wrappers Claude Code uses for synthetic user events that aren't real
@@ -1115,6 +1197,108 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   return true;
 }
 
+/** Claude Code's built-in CronCreate tool name. Its tool_result ack carries
+ *  the session-scoped job id that later fire records report as
+ *  `scheduledTaskId`. */
+export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
+
+/** Assistant-event tool_use block ids that called the built-in CronCreate.
+ *  The scheduled job id only comes back in the FOLLOWING user tool_result, so
+ *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
+ *  as background Task dispatches. */
+export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && block.name === CLAUDE_CRON_CREATE_TOOL) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Parse the CronCreate success ack. Real Claude Code (2.1.276 / 2.1.284,
+ *  and a scan of 821 local session transcripts) uses DISTINCT nouns:
+ *   - recurring: "Scheduled recurring job 02b077c4 (Every hour at :11) ..."
+ *   - one-shot:  "Scheduled one-shot task bf15f538 (34 18 20 9 *) ..."
+ *  An earlier regex only accepted `job`, so 13/16 real one-shot creates in
+ *  the corpus never paired and their fires routed as unknown tasks. The
+ *  `one-shot job` alternative stays for older builds that printed it. The
+ *  caller gates acceptance on a pending CronCreate tool_use id, so a quoted
+ *  ack inside unrelated output can never register a task; the tight shape
+ *  here is defence in depth. */
+const CRON_CREATE_ACK_TASK_ID_RE =
+  /Scheduled\s+(?:recurring\s+job|one-shot\s+(?:job|task))\s+([0-9A-Za-z_-]{4,})\b/i;
+
+export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
+  Array<{ toolUseId: string; taskId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; taskId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    const m = CRON_CREATE_ACK_TASK_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, taskId: m[1] });
+  }
+  return acks;
+}
+
+/** True when a `type:'user'` event is the fire record of a Claude Code
+ *  **built-in** CronCreate scheduled turn. Two transcript shapes qualify:
+ *
+ *   - Claude Code ≥2.1.281: `isMeta:true` + `turnOrigin:"scheduled"`;
+ *   - Claude Code ≤2.1.280: `isMeta:true` + `promptSource:"system"` with
+ *     NO `turnOrigin`.
+ *
+ *  Both additionally require a non-empty `scheduledFireId`. These records are
+ *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
+ *  machinery, not human typing — but they DO open a genuine model turn whose
+ *  final answer the user expects in the originating Lark thread.
+ *
+ *  The guards are deliberately tight (validated against 820 real session
+ *  transcripts): the isMeta check MUST precede the promptSource fallback —
+ *  many non-scheduler records (incl. task_notification) carry
+ *  `promptSource:"system"` with isMeta NOT true; and scheduledFireId is
+ *  mandatory — cross-session-message records are isMeta:true +
+ *  promptSource:"system" but have no fire id. A future build that drops
+ *  scheduledFireId fails closed (silent bucket, never mis-delivered). A
+ *  present turnOrigin other than "scheduled" (human/sdk/task_notification)
+ *  is rejected outright. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns carry daemon-assigned
+ *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
+export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  // Hard guard: only internal meta records. Must stay ahead of the
+  // promptSource fallback below.
+  if (ev.isMeta !== true) return false;
+  if (ev.turnOrigin !== undefined) {
+    // Newer builds stamp the discriminator explicitly.
+    if (ev.turnOrigin !== 'scheduled') return false;
+  } else {
+    // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
+    // promptSource. isMeta already passed; scheduledFireId still required.
+    if (ev.promptSource !== 'system') return false;
+  }
+  // Require the fire identity: every real CronCreate fire carries it, and it
+  // rules out isMeta + promptSource:'system' lookalikes (cross-session
+  // messages) that happen to lack it.
+  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
+  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
+  return true;
+}
+
 /** True when a `type:'attachment'` line carries a queued-command payload
  *  representing a real submitted prompt. Claude writes one of these when it
  *  dequeues a type-ahead submission (right before the assistant's reply for
@@ -1128,6 +1312,15 @@ export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
+  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
+  // a turn is running, Claude Code logs an attachment(queued_command) rendered
+  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
+  // This is intra-turn context, NOT a new conversation turn boundary.
+  if ((ev as any).renderedRole === 'system') return false;
+  const rendered = (ev as any).rendered;
+  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
+    return false;
+  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;

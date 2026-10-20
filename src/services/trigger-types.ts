@@ -69,6 +69,11 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Permit explicit botmux send for messages authorized by this request in the
+     * existing real group. The caller determines message content and timing.
+     * Final output still returns to the caller. Defaults to false; turn-local.
+     * Cannot be combined with steer, which merges requests into one turn. */
+    allowChatMessages?: boolean;
     timeoutMs?: number;
     /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
      * this loud trigger's turn. The streaming card / start notice still show;
@@ -158,6 +163,7 @@ export interface TriggerResponse {
   };
   message?: string;
   errorCode?: TriggerErrorCode;
+  terminalErrorCode?: string;
   error?: string;
   /** Structured recovery metadata when a v2 definition is no longer runnable. */
   reason?: LegacyWorkflowRetirementReason;
@@ -299,6 +305,12 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (waitForFinalOutput && asyncReturnSessionId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };
+  }
+  if (options.allowChatMessages === true && (target.kind !== 'turn' || !hasSessionId || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless' || options.steer === true)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session without steer' } };
   }
   if (options.timeoutMs !== undefined) {
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {

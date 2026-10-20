@@ -28,18 +28,14 @@
  * Callers still gate on `status === 'active'`.
  */
 import type { Session } from '../types.js';
+import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { isRealManagedSession } from '../cli/session-list-liveness.js';
 
 /** Liveness check for an arbitrary pid without signalling it (signal 0). */
 export function isProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    // EPERM = exists but not ours to signal (still alive); ESRCH = gone.
-    return err?.code === 'EPERM';
-  }
+  // EPERM = exists but not ours to signal (still alive); ESRCH = gone.
+  return pidExistsEpermAlive(pid);
 }
 
 function adoptedCliPid(s: Session): number | undefined {

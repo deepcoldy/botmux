@@ -13,6 +13,12 @@ export function startLarkConnection(
   larkAppSecret: string,
   eventDispatcher: Lark.EventDispatcher,
   brand: Brand = 'feishu',
+  lifecycle: {
+    onReady?: () => void;
+    onReconnecting?: () => void;
+    onReconnected?: () => void;
+    onRestarting?: () => void;
+  } = {},
 ): Lark.WSClient {
   // Start WSClient
   // Proxy for the long connection: resolved once, logged once, and echoed in
@@ -44,12 +50,25 @@ export function startLarkConnection(
     // 重连握手卡死（DNS/代理/NAT）兜底，避免单次握手永久 pending。
     handshakeTimeoutMs: 15_000,
     // 重连过程打日志，便于事后从 `bun run daemon:logs` 复盘（warn 默认看不到这些）。
-    onReconnecting: () => logger.warn(`[ws] ${larkAppId} reconnecting…`),
-    onReconnected: () => logger.info(`[ws] ${larkAppId} reconnected`),
+    onReady: () => lifecycle.onReady?.(),
+    onReconnecting: () => {
+      logger.warn(`[ws] ${larkAppId} reconnecting…`);
+      lifecycle.onReconnecting?.();
+    },
+    onReconnected: () => {
+      logger.info(`[ws] ${larkAppId} reconnected`);
+      lifecycle.onReconnected?.();
+    },
     onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message} (proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`),
   });
 
-  wsClient.start({ eventDispatcher });
+  void Promise.resolve(wsClient.start({ eventDispatcher })).catch(
+    error => logger.error(
+      `[ws] ${larkAppId} initial connection failed: `
+      + `${error instanceof Error ? error.message : String(error)} `
+      + `(proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`,
+    ),
+  );
   logger.info('Daemon WSClient started');
 
   // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并
@@ -62,6 +81,7 @@ export function startLarkConnection(
     if (wsClient.getConnectionStatus().state !== 'failed') return;
     reviving = true;
     logger.warn(`[ws] ${larkAppId} connection failed (reconnect exhausted, proxy=${wsProxyDesc} runtime=${describeWsRuntime()}), restarting WSClient`);
+    lifecycle.onRestarting?.();
     wsClient.start({ eventDispatcher })
       .catch(err => logger.error(`[ws] ${larkAppId} WSClient restart failed: ${err?.message ?? err}`))
       .finally(() => { reviving = false; });

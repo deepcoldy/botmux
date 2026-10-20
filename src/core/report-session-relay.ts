@@ -373,6 +373,8 @@ export async function retryAutomaticDispatchReport(deliver: () => Promise<void>)
 export async function deliverReportSessionRelay(input: {
   decision: Extract<ReportSessionRelayDecision, { ok: true }>;
   triggerMeta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string; publishedMessageId?: string };
+  /** Revalidate the frozen source immediately before each outgoing trigger. */
+  beforeWrite?: () => void | Promise<void>;
   fetchTarget(path: string, init: RequestInit): Promise<ReportRelayHttpResponse>;
   postProjectUpdate(target: { larkAppId: string; sessionId: string }): Promise<{
     projectSynced: boolean;
@@ -380,6 +382,7 @@ export async function deliverReportSessionRelay(input: {
   }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { decision } = input;
+  if (input.beforeWrite) await input.beforeWrite();
   const response = await input.fetchTarget('/api/trigger', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -463,6 +466,7 @@ export async function deliverReportSessionRelay(input: {
     };
   }
 
+  if (input.beforeWrite) await input.beforeWrite();
   const fallbackResponse = await input.fetchTarget('/api/trigger', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

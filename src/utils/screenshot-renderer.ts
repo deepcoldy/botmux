@@ -119,6 +119,11 @@ function ensureFontRegistered(): void {
   if (fontFamilyChain.length === 0) fontFamilyChain.push('monospace');
 }
 
+export function screenshotFontFamilies(): string {
+  ensureFontRegistered();
+  return fontFamilyChain.map(f => `"${f}"`).join(', ') + ', monospace';
+}
+
 function fontSpec(bold: boolean): string {
   const families = fontFamilyChain.map(f => `"${f}"`).join(', ');
   return `${bold ? 'bold ' : ''}${FONT_SIZE}px ${families}, monospace`;

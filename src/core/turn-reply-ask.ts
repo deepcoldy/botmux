@@ -9,7 +9,9 @@ import type { DaemonSession } from './types.js';
 import { replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../im/lark/turn-reply-card.js';
-import { MessageWithdrawnError, replyMessage, sendMessage, updateMessage, uploadFile } from '../im/lark/client.js';
+import { MessageWithdrawnError, replyMessage, sendMessage, uploadFile } from '../im/lark/client.js';
+import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
 /** Only the authenticated, currently running turn can admit an inline Ask.
  * Large forms retain their standalone presentation without truncating choices. */
@@ -33,7 +35,12 @@ export function replyCardAskTarget(
     larkAppId: input.larkAppId, sessionId: input.sessionId, ...target,
   });
   if (!record || record.mode !== 'unified' || record.withdrawn || replyCardIsTerminal(record) || record.finalDelivered) return undefined;
-  return target;
+  const groupContextAuthorOrigin = readGroupContextAuthorOrigin({
+    appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: target.turnId,
+    nativeSessionId: ds.session.cliSessionId, workerGeneration: ds.session.workerGeneration,
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+  });
+  return groupContextAuthorOrigin ? { ...target, groupContextAuthorOrigin } : target;
 }
 
 export function replyCardAskCanAct(ask: PendingAsk, messageId: string | undefined): boolean {
@@ -52,6 +59,7 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
   if (!ask.replyCardTarget) throw new Error('Missing reply-card Ask target');
   const store = new TurnReplyCardStore(config.session.dataDir);
   const key = { larkAppId: ask.larkAppId, sessionId: ask.sessionId, ...ask.replyCardTarget };
+  let groupContextAuthorOrigin: GroupContextDeliveryBinding | undefined;
   const beforeEffect = () => {
     const record = store.read(key);
     if (!record || record.chatId !== ask.chatId || getBot(ask.larkAppId).config.apiOnly) throw new Error('Ask reply-card destination unavailable');
@@ -60,9 +68,11 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
     forcePatch,
     beforeEffect,
     send: (body, uuid) => ask.rootMessageId?.startsWith('om_')
-      ? replyMessage(ask.larkAppId, ask.rootMessageId, body, 'interactive', true, uuid)
-      : sendMessage(ask.larkAppId, ask.chatId, body, 'interactive', uuid),
-    patch: (messageId, body) => updateMessage(ask.larkAppId, messageId, body),
+      ? replyMessage(ask.larkAppId, ask.rootMessageId, body, 'interactive', true, uuid, undefined,
+          groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined)
+      : sendMessage(ask.larkAppId, ask.chatId, body, 'interactive', uuid, undefined,
+          groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined),
+    patch: (messageId, body) => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, body, ask.rootMessageId ?? undefined, groupContextAuthorOrigin),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     sendOverflow: async (text, uuid) => {
       const path = join(store.directory, `${store.id(key)}-reply.md`);
@@ -87,6 +97,12 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
     try {
       const delivered = await store.update(key, () => {
         const latest = getAskSnapshot(ask.askId) ?? ask;
+        const record = store.read(key);
+        // Only a new authored question carries native coverage. User answers,
+        // toggles and recovered terminal cards remain independent revisions.
+        groupContextAuthorOrigin = !latest.cardMessageId && !latest.settled && !latest.result && !result
+          && !confirmEmptyArmed && !forcePatch && record && !record.finalCard && !replyCardIsTerminal(record)
+          ? latest.replyCardTarget?.groupContextAuthorOrigin : undefined;
         return { kind: 'ask', entry: { ask: latest, result: latest.result ?? result,
           confirmEmptyArmed: confirmEmptyArmed && !!latest.selections?.every(keys => keys.length === 0) } };
       }, transport);

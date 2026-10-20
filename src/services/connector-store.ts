@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
@@ -135,21 +137,18 @@ function normalizeStore(raw: unknown): ConnectorStoreFile {
 }
 
 export function readConnectorStore(dataDir: string = config.session.dataDir): ConnectorStoreFile {
-  const fp = storePath(dataDir);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    return normalizeStore(JSON.parse(readFileSync(fp, 'utf-8')));
-  } catch {
-    return emptyStore();
-  }
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 writeConnectorStore 覆盖），见 utils/json-file.ts。
+  return normalizeStore(readJsonFileSoft<Record<string, any>>(storePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'connector-store',
+  }));
 }
 
 function writeConnectorStore(dataDir: string, store: ConnectorStoreFile): void {
   const fp = storePath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { mode: 0o600, followTargetSymlink: false });
 }
 
 export function listConnectors(dataDir: string = config.session.dataDir): ConnectorDefinition[] {

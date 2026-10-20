@@ -28,7 +28,9 @@
 // (.github/workflows/release.yml `bun-binaries`). Windows is excluded — the
 // daemon is Unix-only (PTY/tmux/pm2).
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -46,11 +48,12 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // in `npm help package-json` but live in the wild, e.g. @napi-rs/canvas ships both).
 //
 // ⚠️ A musl binary MUST be compiled on musl: `pty.node` is embedded at build time,
-// and node-pty has no linux prebuild, so the builder compiles it against whatever
-// libc it is running on (verified: glibc box → `NEEDED libc.so.6`, Alpine container
-// → `NEEDED libc.musl-x86_64.so.1`). release.yml therefore runs the musl legs inside
-// an Alpine container — cross-compiling them from a glibc runner would embed the
-// wrong native and fail at PTY spawn, not at build time.
+// node-pty's linux prebuilds are glibc-only, and a from-source compile links against
+// whatever libc the builder runs on (verified: glibc box → `NEEDED libc.so.6`, Alpine
+// container → `NEEDED libc.musl-x86_64.so.1`). release.yml therefore runs the musl
+// legs inside an Alpine container with `npm_config_build_from_source=true`. A glibc
+// native in a musl binary passes the smoke and SIGSEGVs at the first PTY spawn, so
+// `resolveNodePtyNative()` refuses a native whose libc does not match the target.
 const RELEASE_TARGETS = [
   'bun-linux-x64',
   'bun-linux-arm64',
@@ -112,10 +115,22 @@ function versionToBake() {
   return '0.0.0';
 }
 
-/** Resolve node-pty's compiled `pty.node` (+ macOS spawn-helper) for a target.
- *  On linux the local `build/Release/pty.node` is authoritative; darwin ships
- *  prebuilds under `prebuilds/<plat>-<arch>/`. */
-function resolveNodePtyNative(platform, arch) {
+/** Which libc a linux `pty.node` links against, read from the NEEDED names in its
+ *  dynamic string table (`libc.musl-<arch>.so.1` vs `libc.so.6`). */
+function nativeLibc(file) {
+  const bytes = readFileSync(file);
+  if (bytes.includes('libc.musl-')) return 'musl';
+  if (bytes.includes('libc.so.6')) return 'glibc';
+  return null;
+}
+
+/** Resolve node-pty's `pty.node` (+ macOS spawn-helper) for a target.
+ *  `prebuilds/<plat>-<arch>/` wins when present (darwin always; linux unless
+ *  installed with `npm_config_build_from_source=true`, which deletes them), else
+ *  the local `build/Release/pty.node`. For an explicit linux target the native's
+ *  libc must match (`libc` = 'musl' | 'glibc'), since a mismatch only fails at
+ *  PTY spawn on the user's machine. */
+function resolveNodePtyNative(platform, arch, libc) {
   const ptyRoot = dirname(require.resolve('node-pty/package.json'));
   const prebuilt = join(ptyRoot, 'prebuilds', `${platform}-${arch}`, 'pty.node');
   const localBuild = join(ptyRoot, 'build', 'Release', 'pty.node');
@@ -127,10 +142,79 @@ function resolveNodePtyNative(platform, arch) {
       `own runner (where \`bun install\` compiles build/Release/pty.node), as CI does.`,
     );
   }
+  if (libc) {
+    const linked = nativeLibc(ptyNode);
+    if (linked !== libc) {
+      throw new Error(
+        `node-pty native ${ptyNode} links ${linked ?? 'an unknown libc'}, but the ${platform}-${arch} ` +
+        `${libc} target needs a ${libc}-linked one. node-pty's linux prebuilds are glibc-only: build a ` +
+        `musl target ON musl after \`npm_config_build_from_source=true bun install\` (with node-pty ` +
+        `freshly installed), as CI does.`,
+      );
+    }
+  }
   const spawnHelper = platform === 'darwin'
     ? join(ptyRoot, 'prebuilds', `${platform}-${arch}`, 'spawn-helper')
     : null; // linux uses forkpty(), no helper sidecar
   return { ptyNode, spawnHelper: spawnHelper && existsSync(spawnHelper) ? spawnHelper : null };
+}
+
+/**
+ * Resolve the skia native that `@napi-rs/canvas` loads on a darwin target.
+ *
+ * WHY: canvas ships its native per arch as an optionalDependency
+ * (`@napi-rs/canvas-darwin-<arch>`), and the darwin release leg runs ONE
+ * `bun install` on an arm64 runner, which installs only the arm64 package. Bun
+ * embeds a `.node` only when the loader's static `require()` resolves at build
+ * time, so `botmux-darwin-x64` shipped without skia (v3.40.0): the worker died at
+ * module load with `Cannot find native binding`. Here the x64 file is produced
+ * explicitly instead — from the lockfile-pinned tarball, sha512-checked against
+ * `bun.lock` — and handed to the embed plugin.
+ *
+ * Linux is not affected: each linux leg builds on its own arch's runner, where
+ * the matching package is installed, so this stays darwin-only.
+ *
+ * Returns the absolute path to the skia `.node`, or throws (fail closed: a
+ * darwin binary without canvas would silently lose card rendering).
+ */
+async function resolveCanvasSkiaNative(platform, arch) {
+  const pkg = `@napi-rs/canvas-${platform}-${arch}`;
+  const skiaName = `skia.${platform}-${arch}.node`;
+
+  try {
+    const local = join(dirname(require.resolve(`${pkg}/package.json`)), skiaName);
+    if (existsSync(local)) return local;
+  } catch { /* not installed for this arch — fetch the locked tarball below */ }
+
+  // The version and integrity come from bun.lock, not from a live `npm view`,
+  // so the fetched bytes are exactly the ones the lockfile pins.
+  const lock = readFileSync(join(REPO_ROOT, 'bun.lock'), 'utf8');
+  const esc = pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const entry = new RegExp(`"${esc}": \\["${esc}@([^"]+)", "([^"]+)", \\{[^}]*\\}, "(sha512-[^"]+)"\\]`).exec(lock);
+  if (!entry) throw new Error(`${pkg} is not pinned in bun.lock; cannot resolve its skia native for darwin-${arch}.`);
+  const [, version, tarball, integrity] = entry;
+
+  const res = await fetch(tarball);
+  if (!res.ok) throw new Error(`fetching ${pkg}@${version} from ${tarball} failed: HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const digest = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+  if (digest !== integrity) throw new Error(`${pkg}@${version} integrity mismatch: bun.lock ${integrity}, downloaded ${digest}`);
+
+  const dir = mkdtempSync(join(tmpdir(), `botmux-skia-${platform}-${arch}-`));
+  const tgz = join(dir, 'canvas.tgz');
+  writeFileSync(tgz, bytes);
+  const untar = runTool(['tar', '-xzf', tgz, '-C', dir]);
+  if (untar.code !== 0) throw new Error(`extracting ${tgz} failed: ${untar.err}`);
+  const skia = join(dir, 'package', skiaName);
+  if (!existsSync(skia)) throw new Error(`${pkg}@${version} has no ${skiaName} in its tarball`);
+  // NOTE: `dir` is intentionally NOT removed here. The returned path is handed
+  // to makeNativeEmbedPlugin, which reads it during `Bun.build`; deleting it
+  // before the compile finishes would break the embed. A caller that owns the
+  // whole build (buildOne) would have to rm it after Bun.build resolves — not
+  // done today, so each local `--all` darwin target leaves ~30 MB behind (a CI
+  // runner is torn down anyway). TODO: hoist cleanup to buildOne once that
+  // lifecycle is proven on darwin.
+  return skia;
 }
 
 /** Run a tool, returning exit code + stderr instead of throwing on ENOENT. */
@@ -159,14 +243,16 @@ function runTool(argv) {
  * supposed to be fixed by. oven-sh/bun#39837 is titled "compile: fix invalid
  * ad-hoc code signature on darwin-arm64" and its test only compiles
  * `--target=bun-darwin-arm64`; nothing upstream covers x86_64. So bumping bun
- * again does NOT close this — don't read "we're on 1.4.2" as "already fixed".
+ * again does NOT close this — don't read "we're on 1.4.3" as "already fixed".
  *
  * RE-MEASURED when the pin moved 1.4.1 → 1.4.2, by cross-compiling a two-line
  * hello-world from linux and recomputing the CodeDirectory page hashes (no
  * macOS required), with 1.4.0 as a control so the check is known to discriminate:
  *   1.4.0 → darwin-arm64: INVALID (1/15483)   darwin-x64: INVALID (2/17124)
  *   1.4.2 → darwin-arm64: VALID   (15075/15075)  darwin-x64: INVALID (2/16792, incl. slot 0)
- * So 1.4.2 changes nothing for the cross-compiled x64 cell: the arch-specific
+ *   1.4.3 → darwin-arm64: VALID   (17167/17167)  darwin-x64: INVALID (2/19065, incl. slot 0)
+ *          (re-measured when the pin moved 1.4.2 → 1.4.3, 1.4.2 as the control)
+ * So neither 1.4.2 nor 1.4.3 changes anything for the cross-compiled x64 cell: the arch-specific
  * defect is still there and this re-sign is still what makes the shipped
  * darwin-x64 binary runnable.
  * `codesign --force --sign -` is the re-signing fix confirmed in
@@ -213,17 +299,25 @@ function adhocResignDarwin(outfile) {
 
 async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
-  const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
-
+  // Checked FIRST: compiling from dist/ is a hard prerequisite, and
+  // resolveCanvasSkiaNative below may download a ~30 MB tarball for darwin —
+  // failing on a missing dist would otherwise pay that cost to report an error
+  // that is knowable before any network I/O.
   const entry = join(REPO_ROOT, 'dist', 'standalone-entry.js');
   if (!existsSync(entry)) {
     throw new Error('dist/standalone-entry.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
   }
 
+  const libc = platform === 'linux' && target ? (target.includes('-musl') ? 'musl' : 'glibc') : null;
+  const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch, libc);
+  const skiaNode = platform === 'darwin' ? await resolveCanvasSkiaNative(platform, arch) : null;
+
   const outfile = out ?? join(REPO_ROOT, 'dist-bin', target ? target.replace(/^bun-/, 'botmux-') : 'botmux');
   mkdirSync(dirname(outfile), { recursive: true });
 
   const baked = versionToBake();
+  const runtimeBuildId = readFileSync(join(REPO_ROOT, 'dist', '.runtime-build-id'), 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(runtimeBuildId)) throw new Error('Invalid runtime build id; run bun run build first');
   const result = await Bun.build({
     entrypoints: [entry],
     compile: { outfile, ...(target ? { target } : {}) },
@@ -233,15 +327,16 @@ async function buildOne({ target, out }) {
     // `bakedBinaryVersion()` (src/utils/install-info.ts), which is written so the
     // identifier is absent under Node — where the disk read still works — and only
     // this compiled path needs the constant.
-    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked) },
-    plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper })],
+    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked),
+      '__BOTMUX_RUNTIME_BUILD_ID__': JSON.stringify(runtimeBuildId) },
+    plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode })],
   });
   if (!result.success) {
     for (const log of result.logs) console.error(log);
     throw new Error(`bun build failed for ${target ?? 'host'}`);
   }
   if (platform === 'darwin') adhocResignDarwin(outfile);
-  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''})`);
+  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''}${skiaNode ? `, skia=${skiaNode}` : ''})`);
   return outfile;
 }
 

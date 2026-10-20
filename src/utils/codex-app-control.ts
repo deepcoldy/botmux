@@ -16,7 +16,6 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
-  existsSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -32,6 +31,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, win32 } from 'node:path';
 import type { BackendType } from '../adapters/backend/types.js';
+import { procStatStartTime } from './proc-stat.js';
 import type { ScreenStatus } from '../types.js';
 
 /**
@@ -760,12 +760,7 @@ export interface CodexAppPosixOwnerLeaseOptions {
   onReaperRecordPublished?: (directory: string, reaperRecordPath: string) => void | Promise<void>;
 }
 
-function linuxProcessStartToken(raw: string): string | undefined {
-  const closeParen = raw.lastIndexOf(')');
-  if (closeParen < 0) return undefined;
-  const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-  return fields[19] || undefined;
-}
+const linuxProcessStartToken = procStatStartTime;
 
 export function codexAppPosixProcessProbeEnv(
   base: NodeJS.ProcessEnv = process.env,

@@ -1,6 +1,87 @@
-# 文件沙盒（oncall 安全共享）
+# 文件沙盒（oncall 白名单 + scratch 一次性）
 
-把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方只能操作 agent + 一份项目副本，**碰不到你磁盘上的真实文件、密钥、别的会话数据**。
+BotMux 有**两种正交的文件沙盒**，一个开关三档：
+
+| 模式 | 目标 | 可读 | 写 | 平台 |
+|---|---|---|---|---|
+| `off` | — | 全部 | 直达宿主 | 全 |
+| `oncall`（缺省沙盒） | **保密**：分享给半受信任的人 | deny-by-default 白名单 | 白名单内直达宿主、即时落盘 | Linux + macOS |
+| `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | Linux：全部进 COW upper 宿主永不变；mac：$HOME/项目写进 APFS 克隆副本，系统路径只读 | Linux + macOS |
+
+> scratch **不防恶意载荷**（agent 仍能读到磁盘上的密钥并经网络外发）；它防的是「写污染」——破坏性/试验性操作不影响真实机器。需要保密时用 oncall。
+
+## 三模式的配置
+
+- dashboard：bot 默认设置面板「文件沙盒」三选一分段控件（关闭 / oncall / scratch），scratch 下可选存储（内存即焚 / 磁盘可跨重启续跑）。
+- `bots.json`：`"sandbox": true`（=oncall，向后兼容）、`"sandbox": "oncall"`、`"sandbox": "scratch"`、省略/`false`/`"off"`。
+- 环境变量：`BOTMUX_SANDBOX=1`（=oncall，向后兼容）、`BOTMUX_SANDBOX=scratch`；未识别取值**报错拒绝启动**（绝不静默关沙盒）。
+
+scratch 专属字段（均可选）：
+
+```json
+{
+  "sandbox": "scratch",
+  "scratchStorage": "tmpfs",
+  "scratchTmpfsSizeMb": 0,
+  "scratchDenyPaths": []
+}
+```
+
+- `scratchStorage`：`tmpfs`（默认，upper 在内存，关盒/重启即焚）或 `disk`（upper 落盘，daemon 重启可冷恢复续跑，会话结束时删除）。
+- `scratchTmpfsSizeMb`：tmpfs 容量上限（0=内核默认 ≈ 半内存）；大构建可调大或用 disk。
+- `scratchDenyPaths`：在「读全盘」之上额外遮罩的路径（mode-000 空源，同 oncall deny 编译）。botmux 自身传输凭证（bots.json 及 sidecar、dashboard secret、每会话沙盒树）**固定遮罩不可配开**；`~/.ssh`/`~/.aws` 不遮（git ssh/云 CLI 要用），需要时自行加。
+
+### macOS 实现（APFS clonefile 软链农场 + Seatbelt，与 Linux 的语义差异）
+
+macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向」原语。最初尝试整份克隆 \$HOME，在真机（日常 319 万文件账号）上被否：TCC 保护树（Containers/Application Support/CloudDocs）让 `cp` 确定非零退出，`clonefileat(2)` 在 iCloud 在线占位文件上无限挂起。最终用**软链农场 + 选择性 clonefile**：
+
+- 克隆 HOME 里每个顶层条目默认是一条指向真实文件的**符号链接**（读取原生、零拷贝；TCC/iCloud 树永不遍历，挂死/权限问题从根上消失）。
+- 克隆采用**策展制 + 主动降级**（真机 145 万文件点目录实测后定的，避免一个 ~/.gitlog 100 万文件拖 20 分钟）：
+  - **核心 CLI 状态目录必需克隆**（失败 fail-closed）：`.claude`/`.codex`/`.trae`/`.trae-cn`/`.claude-runtime` + 顶层 dotfile（含每次更新的 `.claude.json`）+ 工作项目本身；
+  - 仅 `.config`/`.local` 两个用户配置目录做**短超时（20s）尽力克隆**，超时/TCC 失败同样降级软链+write-deny；
+  - **其它点目录（`.npm`/`.bun`/`.cache`/`.cargo`/`.gradle`/`.konan`/大体积历史目录如 `.gitlog` 等）默认直接软链 + write-seal**（读原生、写 EPERM，CLI 多会自愈重下/重建），不克隆——真机实测这些是几十万文件级、克隆它们就是分钟级 spawn 的主体；需要让某个缓存目录也即焚可后续加配置；
+  - 非点目录（Desktop/Documents/Library/Containers…）与 `.Trash` 一律软链 + write 封口；
+  - 凭证根（\$HOME/.botmux、自定义 BOTMUX_HOME、HOME 下的 data 父目录、用户 deny 命中的顶层目录）**永不克隆**，保持软链。
+- 封口用**三段规则序**（Seatbelt 最后匹配生效，真机 9/9 验证）：① 凭证根先 read+write 广封；② 再重开本会话克隆树/tmp/outbox/shim 的 read+write（所以 dataDir 在 ~/.botmux/data 下也能工作）；③ 文件级凭证（bots.json、sidecar、dashboard secret）read+write 与降级子树/`~/Library/Caches/claude-cli-nodejs` 的 write-deny 放最后。symlink 写操作按解析后真实路径匹配（11 种 symlink/hardlink 变体 + 子进程现造链接真机全拦，硬链接也被 clonefile 切断）。
+- 不再用 statfs 空闲块差值做「是否真 COW」校验（忙主机上正常磁盘活动会误报）：同卷 dev 比对 + `cp` 非零退出已足够，同卷 regular file 上 clonefile 不存在静默字节拷贝。
+- cleanup/teardown 先 `chflags nouchg,noschg` + `chmod -RN`（去 flags/ACL）+ **`chmod -R u+w`**（克隆保留源 555 目录的只读位，不加写位 rm 会 EACCES 留残根）再删。
+- 项目在 \$HOME 外时单独 clonefile 项目目录；跨 APFS 卷 fail-closed（dev 比对，绝不退化成字节拷贝）；每次 `cp` 有 5 分钟超时（云占位挂死不拖垮 worker）+ 按子树逻辑大小校验真 COW（异常大量占盘判失败）。
+- 子进程 `HOME` 指克隆农场，`TMPDIR` 指每会话私有临时；Seatbelt 先全局 `(deny file-write*)`，放行克隆树/私有 tmp/真实 outbox，再放行 Foundation/cfprefsd 无视 HOME 硬写的主机缓存（/private/tmp、/private/var/tmp、/private/var/folders、~/Library/{Caches,Application Support,Logs}），**凭证 read+write deny 放最后保证最终匹配生效**。
+- **与 Linux 的语义差**：① 系统位置（/etc、brew）写直接 EPERM 不进副本；② `~/Library` 与 /private/var/folders 这类经系统守护进程（cfprefsd/Foundation，走 mach 不经文件策略）落盘的缓存/日志/偏好**可能出现在真机**——不属于即焚保证，其中 claude CLI 的 per-project MCP 流量日志（~/Library/Caches/claude-cli-nodejs，含 sessionId/cwd）已专门加最终 write-deny（claude 对该 EPERM 无感知，真机验证不崩）；需要更强保密用 oncall。
+- cleanup 先 `chflags nouchg` + `chmod -RN` 去 flags/ACL 再删（克隆不复制 ACL/flags，残根基本只含软链）；chdirInSandbox 持久化进 meta，reattach 不退化。
+- `scratchStorage` 在 mac 上接受但忽略（APFS COW 本身只占改动量）。真机验收：`node scripts/scratch-sandbox-darwin-probe.mjs`（建议再跑一次真 claude E2E）。
+
+## scratch 工作原理（已在 live 机实测）
+
+```
+host 侧（spawn 前，root 用内核 mount；非 root 用 fuse-overlayfs）:
+  tmpfs 模式: mount -t tmpfs <slot>                          # 独立超级块
+              mount -t overlay lowerdir=/ upper=<slot>/upper work=<slot>/work <dataDir>/sandboxes/<sid>/root
+  disk  模式: mount -t overlay lowerdir=/ upper=<sRoot>/upper work=<sRoot>/work <…>/root
+bwrap:
+  --bind <merged> /            # 容器根 = 全根 COW 视图
+  新鲜 /proc /dev /tmp /run /var/tmp /dev/shm
+  deny masks（固定凭证集 + scratchDenyPaths）
+  outbox /run/sbxbin shim / MCP socket 等穿透 bind（与 oncall 同一套）
+  -- <cli>
+```
+
+关键事实：
+
+1. **子挂载点递归 overlay**：`lowerdir=/` 时 overlayfs **不递归**挂载点（独立数据盘如 `/data00`、bind mount 在 merged 里会变空目录）。scratch 会枚举所有相关子挂载、各挂一层自己的 overlay 再 bind 进主 merged；无法 overlay 的子挂载只读透传，workingDir 落在其上时**硬失败**（绝不把真实项目读写穿透给宿主）。
+2. **宿主零写入**：容器内写任何路径（含 `/etc`、`$HOME`、项目）都 copy-up；host 侧只在 `<merged>/…` 可见，真实路径逐项无变化。探针：`node scripts/scratch-sandbox-probe.mjs [--disk]`，真 CLI 端到端：`node scripts/scratch-real-cli-probe.mjs [--codex]`。
+3. **daemon 侧读改写**：CLI 在容器里写的 transcript/rollout/events，宿主真实路径看不到，daemon/worker 统一从 `<merged>/<绝对路径>` 读（`scratchHostView`；transcript-resolver 按会话冻结的 scratch 状态自动 remap，unmount 时自然 ENOENT，**不回退读宿主真实路径**）。worker 是每会话进程，CODEX_HOME/TRAE_HOME 在进程内重指 merged、对容器子进程经 `--setenv/--unsetenv` 强制保持原生路径。
+4. **resume**：活 pane（tmux 等）跨 daemon 重启 / 话题转移时整棵会话树（overlay、上层、outbox）保留，reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
+5. **生命周期**：正常关闭/sweep 按「子 bind → 子 overlay → 主 overlay → tmpfs 槽」逆序卸载并删目录；daemon 启动与周期 reconciler 调 `sweepOrphanScratchSandboxes`，/proc cmdline 活进程守卫 + 60s grace（沿用 oncall sweep 的事故教训）。
+6. 非 root：自动走 `fuse-overlayfs`（需 /dev/fuse），storage 强制为 disk 语义；依赖缺失自动装失败则**报错不裸跑**。
+
+scratch 与 oncall 共用：`botmux send` outbox 中转（凭证不进沙盒）、seccomp nice 隔离判据、owner env 冻结、proxy/CA env、shim/trusted 命令穿透 bind。互斥项与 oncall 相同（riff 远端、forge-traex、codexBrowser、existingAppServer、Codex instance routing、codexAuthSync: isolated、legacy readIsolation）。
+
+---
+
+# oncall 模式（fs-policy 白名单）详述
+
+把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方只能操作 agent + 白名单内的项目/数据，**碰不到你磁盘上的真实密钥、别的会话数据**。
 
 > 调研与威胁模型见 [`sandbox-oncall-research-20260605.md`](./sandbox-oncall-research-20260605.md)。
 > 当前 scope = **只隔离文件**（Linux）。网络**不**隔离（`npm install` / `git fetch` 照常）；不防内核级容器逃逸——面向半受信任用户，不是面向恶意攻击者。
@@ -126,6 +207,36 @@ worker spawnCli
 
 → **所有飞书密钥全程不进沙盒**。
 
+**沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
+
+- 持久后端（tmux 等）的 worker 退出但不结束 CLI 时——daemon 重启 / 父进程退出 / 看门狗、
+  话题转移、worker 崩溃——pane 仍在运行（Linux 上 outbox 以 inode bind 进 pane，scratch
+  的 COW 根也在这棵树里），目录**保留**，由后继 worker 热重连、重启 outbox watcher 并重新
+  发布 relay capability；只有真正关闭会话才删除。PTY 后端的 CLI 随 worker 一起结束，目录
+  照旧清理（转移除外：替代 worker 会在同一棵树上冷启）。
+- 热重连**绝不重建** outbox：新建的目录是 pane 看不到的另一个 inode。Linux 上原目录已丢失
+  （例如由未含此修复的旧版本在重启时删掉）时不重连，改为 kill + 冷启；macOS scratch 仍按
+  原逻辑原样重连。
+- 全新启动在 pane 建立前失败时回滚目录；pane 一旦建立就立即标记保留，之后的任何失败出口（spawn 内
+  FIFO / pipe-pane 失败、provenance 提交失败、Codex App 代际确认失败）只有在证实 pane 已消失后才回滚：
+  tmux 由同一条服务端命令（`if-shell -F` 同时比较 server pid、会话 id、创建时间）终止本次新建的会话，
+  无法确认终止则保留。
+- 沙盒形态切换（开/关、oncall ↔ scratch ↔ credential-only）跨重启时收敛在一处：读出旧目录记录的形态
+  （`scratch.json` / 挂载 → scratch，shim 与遮罩脚手架 → oncall，仅 outbox → credential-only），旧 pane
+  不会以新形态热重连；证实旧 pane 已消失后先按旧形态拆除（scratch 先卸载），拆不干净则拒绝启动，
+  然后才按新形态准备。同形态（冷启 / 转移）照旧复用。
+- worker 已不在（崩溃后未重连）就关闭会话时，daemon 杀掉 backing pane 并确认消失后，按形态拆除目录：
+  scratch 先卸载（子 bind → 子 overlay → 主 overlay → tmpfs 槽）再删除。
+- daemon 的孤儿目录清扫只回收「会话已不活跃、且没有活进程引用」的目录，被保留的目录属于
+  仍活跃的会话，不会被误删。通用清扫跳过 scratch 树（`scratch.json`，由 scratch 清扫先卸载再删），
+  且任何删除路径遇到目录内（含自身）仍有挂载点一律跳过，绝不递归进挂载点——递归删除不会停在
+  文件系统边界（实测 Bun 的 `rmSync` 会删进挂载点；Node 22 在挂载点 `rmdir` 先得 EBUSY 而止步），
+  对仍挂载的 scratch 树等于遍历整个宿主文件系统。`scratch.json` 以临时文件 + rename 原子写入；
+  旧版本留下的截断标记仍按 scratch 树处理：scratch 清扫在会话不活跃、无活进程引用、超过宽限期后
+  按默认布局先卸载再删除，仍有挂载就保留。
+- 全新启动认领 tmux 会话只认 `new-session -P -F` 在创建时原子打印的身份；重试时撞上的同名会话
+  （`duplicate session`）无法证明归属，一律不认领、不终止。
+
 ### Linux 隔离判据
 
 环境变量只是路由提示，不是安全边界。完整 bwrap 和仅凭据隔离 bwrap 在启动 CLI
@@ -151,6 +262,44 @@ daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正�
 这是受信 CLI 的隔离分类防线，不代替文件和凭据隔离，也不承诺阻止修改 CLI 代码、
 持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
 [Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
+
+### 仅凭据隔离（credential-only）的发送通道与威胁模型
+
+设备已注册、但 Bot 没开完整文件沙盒时，Linux 用仅凭据隔离 bwrap：`/` 整体可读写，
+只把设备凭据目录、`.dashboard-secret*` 等宿主权威文件遮掉。这种形态下 pane 内的
+`botmux send` 走与完整沙盒**同一条 relay**：
+
+- 每个会话有自己的 outbox（`<数据目录>/sandboxes/<会话>/outbox`），以读写 bind
+  挂进 pane；`BOTMUX_SEND_RELAY` 由 bwrap 的 `--setenv` 注入（tmux 后端不会把
+  `BOTMUX*` 变量送进 pane，只靠 worker 的环境变量送不到）。
+- `<数据目录>/sandboxes` 整体被 tmpfs 遮住，只重新挂上本会话的 outbox：每个 outbox
+  里都有该会话的 relay capability，不能让一个 pane 读到兄弟会话的。
+- daemon 重启 / 父进程退出、话题转移、挂起时，持久 pane 仍在运行，outbox 保留；
+  只有真正关闭会话才删除。热重连复用原 outbox 目录并重新发布 capability；原目录
+  已丢失时不重连，改为 kill + 冷启。
+- bwrap 同时注入 `BOTMUX_SEND_RELAY_SCOPE=send`，标明这是 credential-only 的 relay。
+  `botmux send` 总是走 relay；`botmux dispatch` 按形态分流：
+  - `--bot-app` 形态（含 `--into`、`--chat-id`、`--delegate`）继续走 relay：宿主侧
+    持有 `.dashboard-secret`，负责建立 talk-only chat grant（pane 内该文件被遮住）；
+    relay 下的 `--into <om_根消息>` 由宿主侧投递路由核对该根消息确实在目标群里
+    （`dispatch_chat_mismatch`）。
+  - relay 不接受的 `--bot`、`--repo`、`--standby`、`--model`、`--reasoning-effort`
+    走直连：该形态下 `bots.json` 与 managed-origin capability 可读，直连全流程不依赖被
+    遮住的 secret。
+  - `--bot-app` 与上述直连选项混用时直接拒绝（两条路径都无法完成）。
+  - 直连同样受 Codex App 输出 sink 约束：daemon 的种子注册 / 投递路由对 capability 鉴权
+    的调用方（隔离 pane）复用 `/api/send` 的同一判定，本轮输出被限定到 `http_wait` /
+    `http_async` / `suppressed` 时拒绝（`origin_not_sendable`），与 relay 侧一致。
+  - 完整沙盒不注入该标记，dispatch 仍只走 relay。
+- 隔离 pane 标记版本因此升至 17（16 引入 outbox，17 引入 scope 标记），旧 pane 冷启动一次。
+
+**威胁模型 / 已知边界**：设备凭据隔离（包括 credential-only）防的是 agent **无意中
+读到**设备凭据，不是对抗恶意 agent 的代码完整性边界。credential-only pane 对 `/` 可写，
+因此可以改动本机 botmux 的构建产物（如 `dist/cli.js`）及其依赖；宿主侧 outbox watcher
+会在 pane 外以同一份 CLI 重新执行请求，daemon 之后启动 worker / CLI 时同样会执行这些
+文件。也就是说，被篡改的构建产物会在宿主执行——这在引入 relay 之前就成立，relay 没有
+增加新能力。需要防恶意代码时请开启完整文件沙盒（只读挂载 botmux 安装目录），或使用
+远端执行后端。
 
 ## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
 

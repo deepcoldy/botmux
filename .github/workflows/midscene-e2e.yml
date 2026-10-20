@@ -1,0 +1,469 @@
+name: Midscene E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_site_key:
+        description: Published report directory (for example, pr-1512)
+        required: false
+        default: manual
+      feishu_cases:
+        description: "Feishu lanes: core, all, or a comma list of lane file stems (e.g. core-conversation,full-group)"
+        required: false
+        default: core
+      feishu_concurrency:
+        description: Feishu lanes run at the same time
+        required: false
+        default: "4"
+  pull_request:
+    paths:
+      - ".github/workflows/midscene-e2e.yml"
+      - "package.json"
+      - "bun.lock"
+      - "scripts/prepare-midscene-pages.mjs"
+      - "scripts/midscene-report-evidence.mjs"
+      - "scripts/render-midscene-summary.mjs"
+      - "scripts/run-e2e.ts"
+      - "scripts/check-midscene-model.mjs"
+      - "scripts/feishu-live-queue.mjs"
+      - "scripts/publish-gh-pages.sh"
+      - "test/helpers/mock-llm-server/**"
+      - "src/dashboard/**"
+      - "src/index-dashboard.ts"
+      - "test/e2e-browser/**"
+      - "test/midscene/**"
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes its older run. Manual runs
+# never cancel each other.
+concurrency:
+  group: midscene-e2e-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+# The Dashboard suite and the Feishu live suite run as parallel jobs. Every run
+# drives the same Feishu bots, so only one Feishu job may run at a time; the
+# feishu-queue job hands out that slot first come first served
+# (scripts/feishu-live-queue.mjs). A GitHub concurrency group cannot do this:
+# it keeps one pending job and cancels it whenever a newer run arrives.
+# Inside the Feishu job the lanes (test/e2e-browser/cases/*.yaml) run
+# concurrently against one daemon fleet. They cannot be split across runners:
+# Feishu delivers each app's events to only one of its WebSocket connections,
+# so per-runner daemons for the same bots would receive each other's messages.
+
+jobs:
+  dashboard:
+    name: Dashboard Midscene
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      outcome: ${{ steps.dashboard_midscene.outcome }}
+    env:
+      CI: "true"
+      MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+      MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+      MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+      MIDSCENE_MODEL_FAMILY: ${{ secrets.MIDSCENE_MODEL_FAMILY }}
+      MIDSCENE_MODEL_REASONING_ENABLED: ${{ secrets.MIDSCENE_MODEL_REASONING_ENABLED }}
+      MIDSCENE_MODEL_RETRY_COUNT: "3"
+      MIDSCENE_MODEL_RETRY_INTERVAL: "65000"
+      NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Require Midscene model configuration
+        run: |
+          test -n "$MIDSCENE_MODEL_API_KEY"
+          test -n "$MIDSCENE_MODEL_NAME"
+          test -n "$MIDSCENE_MODEL_BASE_URL"
+          test -n "$MIDSCENE_MODEL_FAMILY"
+
+      - name: Check Midscene model connectivity
+        run: node scripts/check-midscene-model.mjs
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate Midscene projects
+        run: |
+          bun run test:midscene:typecheck
+          bun run test:midscene:nodes
+          bun run test -- test/midscene-suite.test.ts test/midscene-lanes.test.ts
+
+      - name: Install Chromium
+        run: |
+          bun x playwright install --with-deps chromium
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Build Botmux
+        run: bun run build
+
+      - name: Run Dashboard Midscene project
+        id: dashboard_midscene
+        env:
+          MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/dashboard
+          BOTMUX_E2E_RECORD_VIDEO: "1"
+        run: bun run test:midscene
+
+      - name: Upload Dashboard Midscene data
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: botmux-midscene-dashboard-data
+          path: |
+            midscene_run/dashboard/
+            test/midscene/midscene_run/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  feishu-queue:
+    # The name is matched by scripts/feishu-live-queue.mjs.
+    name: Wait for the Feishu live slot
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Waiting has its own budget, so it never eats into the Feishu job's.
+    timeout-minutes: 300
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/feishu-live-queue.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Wait until no other run holds or is ahead for the slot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_MAX_WAIT_MINUTES: "290"
+        run: node scripts/feishu-live-queue.mjs
+
+  feishu:
+    # The name is matched by scripts/feishu-live-queue.mjs.
+    name: Feishu live Midscene (parallel lanes)
+    needs: feishu-queue
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # The group-mode lane is serial (one shared group) and alone takes ~2h.
+    timeout-minutes: 350
+    outputs:
+      ready: ${{ steps.feishu_config.outputs.ready }}
+      outcome: ${{ steps.feishu_midscene.outcome }}
+      cases: ${{ steps.feishu_config.outputs.cases }}
+    env:
+      CI: "true"
+      FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
+      FEISHU_TEST_GROUP_CHAT_NAME: ${{ secrets.FEISHU_TEST_GROUP_CHAT_NAME }}
+      MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+      MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+      MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+      MIDSCENE_MODEL_FAMILY: ${{ secrets.MIDSCENE_MODEL_FAMILY }}
+      MIDSCENE_MODEL_REASONING_ENABLED: ${{ secrets.MIDSCENE_MODEL_REASONING_ENABLED }}
+      MIDSCENE_MODEL_RETRY_COUNT: "3"
+      MIDSCENE_MODEL_RETRY_INTERVAL: "65000"
+      NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect Feishu live-test configuration
+        id: feishu_config
+        env:
+          FEISHU_STORAGE_STATE_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_BASE64 }}
+          FEISHU_STORAGE_STATE_GZIP_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_GZIP_BASE64 }}
+          FEISHU_E2E_BOTS_JSON: ${{ secrets.FEISHU_E2E_BOTS_JSON }}
+          DISPATCH_CASES: ${{ inputs.feishu_cases }}
+        run: |
+          echo "cases=${DISPATCH_CASES:-core}" >> "$GITHUB_OUTPUT"
+          missing=()
+          [[ -n "${FEISHU_TEST_GROUP_URL:-}" ]] || missing+=("FEISHU_TEST_GROUP_URL")
+          if [[ -z "${FEISHU_STORAGE_STATE_GZIP_BASE64:-}" && -z "${FEISHU_STORAGE_STATE_BASE64:-}" ]]; then
+            missing+=("FEISHU_STORAGE_STATE_GZIP_BASE64 or FEISHU_STORAGE_STATE_BASE64")
+          fi
+          if (( ${#missing[@]} > 0 )); then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Feishu live cases skipped; unavailable Actions secrets: ${missing[*]}"
+            exit 0
+          fi
+          if [[ -n "${FEISHU_STORAGE_STATE_GZIP_BASE64:-}" ]]; then
+            printf '%s' "$FEISHU_STORAGE_STATE_GZIP_BASE64" | base64 --decode | gzip --decompress > storageState.json
+          else
+            printf '%s' "$FEISHU_STORAGE_STATE_BASE64" | base64 --decode > storageState.json
+          fi
+          node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync('storageState.json','utf8')); if (!Array.isArray(value.cookies) || value.cookies.length === 0) throw new Error('The Feishu Playwright storage state has no cookies')"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "${FEISHU_E2E_BOTS_JSON:-}" ]]; then
+            printf '%s' "$FEISHU_E2E_BOTS_JSON" > test-bots.json
+            echo "has_bots=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_bots=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v6
+        if: steps.feishu_config.outputs.ready == 'true'
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.feishu_config.outputs.ready == 'true'
+        with:
+          bun-version: 1.4.3
+
+      - name: Check Midscene model connectivity
+        if: steps.feishu_config.outputs.ready == 'true'
+        run: node scripts/check-midscene-model.mjs
+
+      - name: Install dependencies
+        if: steps.feishu_config.outputs.ready == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Install Chromium
+        if: steps.feishu_config.outputs.ready == 'true'
+        run: |
+          bun x playwright install --with-deps chromium
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Install CLI runtimes for E2E
+        if: steps.feishu_config.outputs.ready == 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code @openai/codex || sudo npm install -g @anthropic-ai/claude-code @openai/codex
+          mkdir -p ~/.claude
+          echo '{"hasCompletedOnboarding":true,"autoUpdates":false}' > ~/.claude.json
+          echo '{"skipDangerousModePermissionPrompt":true,"permissions":{"defaultMode":"bypassPermissions"}}' > ~/.claude/settings.json
+          mkdir -p ~/.codex
+          printf '[projects."*"]\ntrust_level = "trusted"\n' > ~/.codex/config.toml
+          claude --version
+          codex --version
+
+      - name: Build Botmux
+        if: steps.feishu_config.outputs.ready == 'true'
+        run: bun run build
+
+      - name: Run Feishu Midscene lanes
+        id: feishu_midscene
+        if: steps.feishu_config.outputs.ready == 'true'
+        timeout-minutes: 320
+        env:
+          BOTMUX_MOCK_LLM: "1"
+          BOTMUX_START_DAEMON: ${{ steps.feishu_config.outputs.has_bots }}
+          BOTS_CONFIG: test-bots.json
+          BOTMUX_E2E_RECORD_VIDEO: "1"
+          FEISHU_E2E_CASES: ${{ steps.feishu_config.outputs.cases }}
+          FEISHU_E2E_CONCURRENCY: ${{ inputs.feishu_concurrency || '4' }}
+        run: bun run test:midscene:feishu
+
+      - name: Upload Feishu Midscene data
+        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: botmux-midscene-feishu-data
+          path: |
+            midscene_run/runs/
+            test/e2e-browser/midscene_run/
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+  midscene-report:
+    name: Build Midscene report
+    needs: [dashboard, feishu-queue, feishu]
+    # Failed cases are exactly when the evidence matters, so build the report
+    # whenever at least one producer ran.
+    if: always() && !cancelled() && (needs.dashboard.result != 'skipped' || needs.feishu.result != 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      report-site-key: ${{ steps.report_target.outputs.site-key }}
+      report-site-url: ${{ steps.report_target.outputs.site-url }}
+      publish: ${{ steps.outcomes.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve published report target
+        id: report_target
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_SITE_KEY: ${{ inputs.report_site_key }}
+        run: |
+          if [[ -n "$PR_NUMBER" ]]; then
+            site_key="pr-$PR_NUMBER"
+          else
+            site_key="${DISPATCH_SITE_KEY:-manual}"
+          fi
+          echo "site-key=$site_key" >> "$GITHUB_OUTPUT"
+          echo "site-url=https://deepcoldy.github.io/botmux-midscene/$site_key/" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download Midscene data from both suites
+        uses: actions/download-artifact@v8
+        with:
+          pattern: botmux-midscene-*-data
+          merge-multiple: true
+          path: .
+
+      - name: Resolve suite outcomes
+        id: outcomes
+        env:
+          DASHBOARD_RESULT: ${{ needs.dashboard.result }}
+          DASHBOARD_OUTCOME: ${{ needs.dashboard.outputs.outcome }}
+          FEISHU_RESULT: ${{ needs.feishu.result }}
+          QUEUE_RESULT: ${{ needs.feishu-queue.result }}
+          FEISHU_READY: ${{ needs.feishu.outputs.ready }}
+          FEISHU_OUTCOME: ${{ needs.feishu.outputs.outcome }}
+          FEISHU_CASES: ${{ needs.feishu.outputs.cases }}
+        run: |
+          dashboard="${DASHBOARD_OUTCOME:-not-run}"
+          if [[ "$DASHBOARD_RESULT" == "skipped" ]]; then dashboard="not-run"; fi
+          feishu="${FEISHU_OUTCOME:-not-run}"
+          # Only missing credentials (ready=false) mean skipped. A Feishu job
+          # that never got the slot (the queue timed out or the run was
+          # superseded) or was cancelled before detection is reported as
+          # cancelled, with its cases not run.
+          if [[ "$FEISHU_READY" == "false" ]]; then
+            feishu="skipped"
+          elif [[ "$FEISHU_RESULT" == "cancelled" ]]; then
+            feishu="cancelled"
+          elif [[ "$FEISHU_RESULT" == "skipped" && ( "$QUEUE_RESULT" == "failure" || "$QUEUE_RESULT" == "cancelled" ) ]]; then
+            feishu="cancelled"
+          fi
+          # A Feishu job that never ran has no results;
+          # publishing it would replace this PR's last real report with "not
+          # run" rows. A job killed by its time limit is also cancelled but
+          # keeps per-case results, so only an empty result tree skips publish.
+          publish=true
+          if [[ "$feishu" == "cancelled" ]] && ! find midscene_run/runs -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            publish=false
+            echo "::notice::Feishu job was cancelled before producing results; keeping the previously published report."
+          fi
+          {
+            echo "dashboard=$dashboard"
+            echo "feishu=$feishu"
+            echo "feishu-cases=${FEISHU_CASES:-core}"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare linked Midscene evidence site
+        env:
+          FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
+          FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
+        run: |
+          arguments=(
+            --dashboard-report-root test/midscene/midscene_run
+            --skipped-cases-dir test/e2e-browser/cases
+            --feishu-outcome "$FEISHU_OUTCOME"
+            --feishu-cases "$FEISHU_CASES"
+            --output "$RUNNER_TEMP/midscene-site"
+          )
+          if [[ "$FEISHU_OUTCOME" != "skipped" ]]; then
+            arguments+=(--feishu-report-root test/e2e-browser/midscene_run)
+            arguments+=(--feishu-results-root midscene_run/runs)
+          fi
+          if [[ -d test/e2e-browser/midscene_run/videos ]]; then
+            arguments+=(--videos-dir test/e2e-browser/midscene_run/videos)
+          fi
+          node scripts/prepare-midscene-pages.mjs "${arguments[@]}"
+
+      - name: Write Midscene run summary
+        if: always() && !cancelled()
+        env:
+          TEST_OUTCOME: ${{ steps.outcomes.outputs.dashboard }}
+          FEISHU_OUTCOME: ${{ steps.outcomes.outputs.feishu }}
+          FEISHU_CASES: ${{ steps.outcomes.outputs.feishu-cases }}
+          REPORT_SITE_URL: ${{ steps.report_target.outputs.site-url }}
+        run: |
+          node scripts/render-midscene-summary.mjs \
+            --results midscene_run/dashboard/results \
+            --feishu-results midscene_run/runs \
+            --site-manifest "$RUNNER_TEMP/midscene-site/manifest.json" \
+            --artifact-name "botmux-midscene-dashboard-data / botmux-midscene-feishu-data" \
+            --test-outcome "${TEST_OUTCOME:-not-run}" \
+            --feishu-outcome "$FEISHU_OUTCOME" \
+            --feishu-cases "$FEISHU_CASES" \
+            --skipped-cases-dir test/e2e-browser/cases \
+            --pages-url "$REPORT_SITE_URL" \
+            --output "$GITHUB_STEP_SUMMARY"
+          test -s "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload linked Midscene evidence site
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: botmux-midscene-site
+          path: ${{ runner.temp }}/midscene-site
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  deploy-report:
+    name: Publish Midscene HTML report
+    needs: midscene-report
+    # Runs no longer share one workflow-wide lock; keep gh-pages pushes serial.
+    concurrency:
+      group: midscene-pages-deploy
+      cancel-in-progress: false
+    # Failed cases are exactly when the published screenshots and native replay
+    # are most useful, so publish whenever the producer reached artifact upload.
+    if: always() && !cancelled() && needs.midscene-report.result != 'cancelled' && needs.midscene-report.result != 'skipped' && needs.midscene-report.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/publish-gh-pages.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Download linked evidence site
+        uses: actions/download-artifact@v8
+        with:
+          name: botmux-midscene-site
+          path: ${{ runner.temp }}/midscene-site
+
+      - name: Verify evidence site is complete
+        run: |
+          # The prepare step can fail (e.g. an unreadable report) after copying
+          # a partial directory. Never publish a site without a landing page or
+          # manifest, otherwise the previous good report at this SITE_KEY is
+          # replaced by a broken, partial one.
+          test -f "$RUNNER_TEMP/midscene-site/index.html"
+          test -f "$RUNNER_TEMP/midscene-site/manifest.json"
+
+      - name: Publish report under deepcoldy.github.io
+        env:
+          DEPLOY_KEY: ${{ secrets.PAGES_DEPLOY_KEY }}
+          SITE_KEY: ${{ needs.midscene-report.outputs.report-site-key }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY"
+          test -n "$SITE_KEY"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+          export GIT_AUTHOR_NAME="botmux-midscene-bot" GIT_COMMITTER_NAME="botmux-midscene-bot"
+          export GIT_AUTHOR_EMAIL="midscene-bot@users.noreply.github.com" GIT_COMMITTER_EMAIL="midscene-bot@users.noreply.github.com"
+          # Single-commit publish: gh-pages keeps no history (see the script).
+          PAGES_REMOTE=git@github.com:deepcoldy/deepcoldy.github.io.git \
+            bash scripts/publish-gh-pages.sh "$RUNNER_TEMP/midscene-site" "botmux-midscene/$SITE_KEY" \
+            "test: publish Botmux Midscene report ($SITE_KEY @ ${GITHUB_SHA::7})"

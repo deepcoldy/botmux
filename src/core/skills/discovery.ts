@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
-import { loadSkillPackage } from './package.js';
+import { isPathWithin, loadSkillPackage } from './package.js';
 import type { SkillPackage } from './types.js';
 
 export interface NativeCliSkillGroup {
@@ -26,7 +26,15 @@ function listSkillDirs(root: string): string[] {
   if (!existsSync(root)) return [];
   try {
     return readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => {
+        if (entry.isDirectory()) return true;
+        if (!entry.isSymbolicLink()) return false;
+        try {
+          return statSync(join(root, entry.name)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
       .map((entry) => join(root, entry.name));
   } catch {
     return [];
@@ -126,6 +134,12 @@ export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCl
 }
 
 export function discoverProjectSkills(workingDir: string): SkillPackage[] {
+  let projectRoot: string;
+  try {
+    projectRoot = realpathSync(workingDir);
+  } catch {
+    return [];
+  }
   const roots = [
     join(workingDir, '.agents', 'skills'),
     join(workingDir, '.botmux', 'skills'),
@@ -134,7 +148,9 @@ export function discoverProjectSkills(workingDir: string): SkillPackage[] {
   for (const root of roots) {
     for (const dir of listSkillDirs(root)) {
       try {
-        out.push(loadSkillPackage(dir, { source: { type: 'project', root: dir } }));
+        const skill = loadSkillPackage(dir, { source: { type: 'project', root: dir } });
+        if (!isPathWithin(projectRoot, skill.rootDir)) continue;
+        out.push(skill);
       } catch {
         // Bad project-local skills should surface through diagnostics later, not break spawn.
       }

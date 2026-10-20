@@ -114,6 +114,13 @@ describe('groups-store wrappers', () => {
     ]);
   });
 
+  it('listChats does not project group_message_type (the list API never returns it; topology is probed per chat)', async () => {
+    chatListItems[0].group_message_type = 'thread';
+    const [chat] = await listChats('appA');
+    expect(chat).not.toHaveProperty('groupMessageType');
+    expect(chat.chatMode).toBe('group');
+  });
+
   it('isInChat returns boolean', async () => {
     expect(await isInChat('appA', 'c1')).toBe(true);
   });
@@ -172,6 +179,22 @@ describe('groups-store wrappers', () => {
     });
     expect(beforeUpdate).toHaveBeenCalledOnce();
     expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat compare-and-sets against the freshly read name when expectedOldName is given', async () => {
+    await expect(renameChat('appA', 'c1', 'AI 标题', { expectedOldName: '新会话 10/17 14:30' })).resolves.toEqual({
+      ok: false,
+      error: 'name_changed',
+      oldName: 'one',
+      newName: 'AI 标题',
+    });
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    await expect(renameChat('appA', 'c1', 'AI 标题', { expectedOldName: ' one ' })).resolves.toMatchObject({
+      ok: true,
+      changed: true,
+    });
   });
 
   it('renameChat preserves old/new names and the Lark code on update failure', async () => {

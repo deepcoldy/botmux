@@ -19,6 +19,10 @@ type Journal = {
 export function isDefiniteReportPublicationRejection(error: unknown): boolean {
   const e = error as { name?: string; code?: unknown; response?: { status?: number; data?: { code?: unknown } } } | undefined;
   if (e?.name === 'MessageWithdrawnError') return true;
+  // The opt-in topic policy converts a withdrawn root into TopicSendError with
+  // TOPIC_SEND_BLOCKED — the same deterministic "no message created" outcome.
+  // TOPIC_SEND_CHECK_FAILED (lookup could not run) stays ambiguous on purpose.
+  if (e?.name === 'TopicSendError' && e?.code === 'TOPIC_SEND_BLOCKED') return true;
   const status = e?.response?.status;
   if (typeof status === 'number') return status >= 400 && status < 500 && status !== 408;
   const code = e?.response?.data?.code ?? e?.code;

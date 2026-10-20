@@ -101,6 +101,7 @@ export interface IdleCleanupCloseResult {
   sessionId: string;
   ok: boolean;
   error?: string;
+  archiveError?: string;
   /** Closed locally, but its remote session survived and needs manual cleanup. */
   residual?: ParsedCloseResidual;
 }
@@ -112,6 +113,7 @@ export interface IdleCleanupResult {
   matched: number;
   closed: number;
   failed: number;
+  archiveFailed: number;
   /** Subset of `closed` whose remote session was NOT cancelled. */
   residual: number;
   results: IdleCleanupCloseResult[];
@@ -141,6 +143,7 @@ export async function cleanupIdleSessions<T extends IdleCleanupSessionRow>(
     matched: candidates.length,
     closed,
     failed,
+    archiveFailed: results.filter(r => !!r.archiveError).length,
     residual,
     results,
   };

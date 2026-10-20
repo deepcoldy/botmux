@@ -46,6 +46,63 @@ import {
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
 
+describe('host session scope reaches the pane', () => {
+  it.each(['thread', 'chat', undefined])('passes host scope %s and rejects inherited or configured replacements', (scope) => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-pane-'));
+    try {
+      const result = spawnSync('/bin/sh', [
+        '-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(
+          { BOTMUX_SESSION_ID: 'fresh-session', BOTMUX_SESSION_SCOPE: scope },
+          { BOTMUX_SESSION_SCOPE: 'configured-stale' },
+        ),
+        '/bin/sh', '-c', 'printf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID"',
+      ], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_SCOPE: 'inherited-stale', BOTMUX_SESSION_ID: 'old-session' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(`${scope ?? 'unset'}\nfresh-session\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const hasTmux = !spawnSync('tmux', ['-V']).error;
+  it.skipIf(!hasTmux)('replaces stale server scope for thread and chat panes and clears it for an unscoped pane', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-tmux-'));
+    const socket = `bmx-scope-${process.pid}-${Date.now()}`;
+    const clientEnv = { PATH: process.env.PATH, HOME: dir };
+    const runTmux = (args: string[], env: NodeJS.ProcessEnv = clientEnv) => {
+      const result = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
+      expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
+    };
+    try {
+      runTmux(['-f', '/dev/null', 'new-session', '-d', '-s', 'holder', '/bin/sleep', '60'],
+        { ...clientEnv, BOTMUX_SESSION_SCOPE: 'stale-server' });
+      const probe = join(dir, 'probe');
+      writeFileSync(probe, '#!/bin/sh\nprintf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID" > "$1"\ntmux -L "$2" wait-for -S "$3"\n', { mode: 0o755 });
+      for (const [index, scope] of ['thread', 'chat', undefined].entries()) {
+        const resultPath = join(dir, `result-${index}`);
+        const signal = `done-${index}`;
+        runTmux(['new-session', '-d', '-s', `probe-${index}`,
+          ...shellCommandArgv({ shell: '/bin/sh', flags: [] }, shellWrapperScript(dir), [
+            dir,
+            ...buildBotmuxEnvAssignments({ BOTMUX_SESSION_ID: `session-${index}`, BOTMUX_SESSION_SCOPE: scope }),
+            probe, resultPath, socket, signal,
+          ]),
+        ]);
+        runTmux(['wait-for', signal]);
+        expect(readFileSync(resultPath, 'utf8')).toBe(`${scope ?? 'unset'}\nsession-${index}\n`);
+      }
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server'], { env: clientEnv, timeout: 10_000 });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
 describe('Aiden Codex pane launch', () => {
   it.each(['high', 'xhigh', 'max', 'ultra'])('carries %s through wrapper selection, pane env and the executable shim', (effort) => {
     const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-'));
@@ -67,6 +124,70 @@ describe('Aiden Codex pane launch', () => {
       expect(lines.slice(0, 5)).toEqual(['-c', `model_reasoning_effort="${effort}"`, '--model', 'gpt-5.6-sol', 'shim-env=unset/unset/unset']);
       expect(lines[5]).toMatch(/^path=.+/);
       expect(lines[5]).not.toContain(shimDir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers shell-env config overrides to the real codex through the pane env and shim', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-cfg-'));
+    try {
+      const realBin = join(dir, 'real codex');
+      writeFileSync(realBin, '#!/bin/sh\ni=0\nfor a in "$@"; do printf "argv[%s]=<%s>\\n" "$i" "$a"; i=$((i+1)); done\n',
+        { mode: 0o755 });
+      const shimDir = installAidenCodexShim(join(dir, 'shim'));
+      // Simulate the worker's writeAidenShellConfigs persistence callback.
+      const cfgFile = join(shimDir, 'shell-configs');
+      writeFileSync(cfgFile, [
+        'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+        'shell_environment_policy.set.ZDOTDIR="/data/x/shell"',
+        'shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh"',
+      ].join('\n') + '\n', { mode: 0o600 });
+      const fakeAiden = join(dir, 'aiden');
+      writeFileSync(fakeAiden, '#!/bin/sh\nshift 2\nexec codex "$@"\n', { mode: 0o755 });
+      const launch = buildWrappedLaunch(
+        'aiden x codex',
+        [
+          '--no-alt-screen',
+          '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+          '-c', 'shell_environment_policy.set.ZDOTDIR="/data/x/shell"',
+          '-c', 'shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh"',
+          'resume', 'cid',
+        ],
+        b => b === 'aiden' ? fakeAiden : b,
+        {
+          aidenCodexRealBin: realBin,
+          aidenCodexShimDir: shimDir,
+          writeAidenShellConfigs: () => cfgFile,
+        },
+      );
+      // The config file PATH rides the same pane-env allowlist as the other
+      // shim settings.
+      const assigns = buildBotmuxEnvAssignments(launch.env)
+        .filter(a => a.startsWith('BOTMUX_AIDEN_CODEX_'));
+      expect(assigns.some(a => a.startsWith('BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE='))).toBe(true);
+      const result = spawnSync('/bin/sh', ['-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(launch.env), launch.bin, ...launch.args], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const lines = result.stdout.trim().split('\n');
+      // All -c overrides are prepanded ahead of the resume subcommand; order of
+      // the distinct keys is reversed by the prepend but irrelevant to codex.
+      expect(lines.slice(0, 6)).toEqual([
+        'argv[0]=<-c>',
+        'argv[1]=<shell_environment_policy.set.BASH_ENV="/data/x/bash_env.sh">',
+        'argv[2]=<-c>',
+        'argv[3]=<shell_environment_policy.set.ZDOTDIR="/data/x/shell">',
+        'argv[4]=<-c>',
+        'argv[5]=<shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x">',
+      ]);
+      expect(lines.slice(6)).toEqual([
+        'argv[6]=<--no-alt-screen>',
+        'argv[7]=<resume>',
+        'argv[8]=<cid>',
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

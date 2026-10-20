@@ -14,6 +14,11 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+const archiveRpc = vi.hoisted(() => vi.fn());
+vi.mock('../src/services/codex-app-threads.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/codex-app-threads.js')>(),
+  setCodexAppThreadArchived: archiveRpc,
+}));
 let tempDir: string;
 const daemonConfig = vi.hoisted(() => ({ backendType: 'pty' as 'pty' | 'tmux' }));
 
@@ -128,6 +133,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: 'claude-code',
       workingDir: '~',
       workingDirs: ['~'],
+      remoteRunner: { requiredCapabilities: ['turn_recovery'] },
       get backendType() { return daemonConfig.backendType === 'tmux' ? 'tmux' : undefined; },
     },
     botName: 'TestBot',
@@ -174,16 +180,22 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
+import {
+  restoreActiveSessions,
+  resumeSession,
+  takeOverDurableActiveRemoteSession,
+} from '../src/core/session-manager.js';
 import {
   closeSession,
   ensureOrdinaryTurnRecoveryAttached,
+  forkWorker,
   forkAdoptWorker,
   killStalePids,
   promoteQueuedActivationTail,
   restoreUsageLimitRuntimeState,
   setActiveSessionSafe,
   setActiveSessionIfActive,
+  withActiveSessionKeyLock,
 } from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -193,10 +205,13 @@ import type { DaemonSession } from '../src/core/types.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-resume-test-'));
+  archiveRpc.mockReset();
+  archiveRpc.mockResolvedValue(undefined);
   daemonConfig.backendType = 'pty';
   sessionStore.init('app_test');
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(forkWorker).mockReset();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
@@ -207,7 +222,7 @@ afterEach(() => {
 });
 
 function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.createSession>[0]> & {
-  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any;
+  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any; backendType?: any;
 } = {}): ReturnType<typeof sessionStore.createSession> {
   const s = sessionStore.createSession(
     overrides.chatId ?? 'oc_chat1',
@@ -218,13 +233,137 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
   s.larkAppId = overrides.larkAppId ?? 'app_test';
   s.workingDir = overrides.workingDir ?? '/tmp/proj';
   s.cliId = overrides.cliId ?? 'claude-code';
+  s.backendType = overrides.backendType;
   s.scope = overrides.scope ?? 'thread';
   sessionStore.updateSession(s);
   sessionStore.closeSession(s.sessionId);
   return s;
 }
 
+function activeRemoteCanonical(overrides: Record<string, unknown> = {}) {
+  return {
+    sessionId: 'session-remote-takeover',
+    chatId: 'oc_remote',
+    chatType: 'group' as const,
+    rootMessageId: 'om_remote_root',
+    title: 'Remote takeover',
+    status: 'active' as const,
+    scope: 'thread' as const,
+    createdAt: '2026-10-16T00:00:00.000Z',
+    lastMessageAt: '2026-10-16T00:01:00.000Z',
+    larkAppId: 'app_test',
+    cliId: 'remote-runner' as const,
+    backendType: 'remote-runner' as const,
+    pid: 777,
+    webPort: 6789,
+    workerGeneration: 4,
+    remoteBackendState: {
+      version: 1 as const,
+      provider: 'takeover-provider',
+      generation: 7,
+      remoteSessionId: 'remote-session-7',
+      agentThreadId: 'remote-thread',
+    },
+    ...overrides,
+  };
+}
+
+describe('takeOverDurableActiveRemoteSession', () => {
+  it('materializes only the claimed canonical snapshot and reattaches before routing', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+      expect(prompt).toBe('');
+      expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await takeOverDurableActiveRemoteSession(canonical, map);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.ds.session).toMatchObject({
+        sessionId: canonical.sessionId,
+        status: 'active',
+        workerGeneration: 4,
+        remoteBackendState: { generation: 7, remoteSessionId: 'remote-session-7' },
+      });
+      expect(result.ds.session.pid).toBeUndefined();
+      expect(result.ds.session.webPort).toBeUndefined();
+      expect(result.ds.suppressRecoveryCard).toBe(true);
+    }
+    expect(forkWorker).toHaveBeenCalledOnce();
+    expect(map.get(sessionKey('om_remote_root', 'app_test'))?.session.sessionId)
+      .toBe(canonical.sessionId);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.status).toBe('active');
+  });
+
+  it('rejects non-remote or incomplete canonical state before materialization', async () => {
+    await expect(takeOverDurableActiveRemoteSession(
+      activeRemoteCanonical({ remoteBackendState: undefined }),
+      new Map(),
+    )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and unregisters when no takeover worker is admitted', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      map,
+    )).resolves.toMatchObject({ ok: false, error: 'worker_start_failed' });
+    expect(map.size).toBe(0);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+    });
+  });
+
+  it('does not overwrite an unregistered active local row', async () => {
+    const canonical = activeRemoteCanonical();
+    sessionStore.updateSession({
+      ...canonical,
+      pid: 123,
+      remoteBackendState: {
+        ...canonical.remoteBackendState,
+        remoteSessionId: 'possibly-live-local-remote',
+      },
+    });
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      new Map(),
+    )).resolves.toMatchObject({
+      ok: false,
+      error: 'materialization_failed',
+      detail: expect.stringContaining('unregistered active local Session'),
+    });
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.pid).toBe(123);
+  });
+});
+
 describe('resumeSession', () => {
+  it('rechecks retirement after waiting for the active-session lock', async () => {
+    const closed = makeClosedSession();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(withActiveSessionKeyLock).mockImplementationOnce(async (_map, _key, action) => {
+      sessionStore.closeSession(closed.sessionId, {
+        workspaceRetirement: { operationId: 'recycle-lock', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+      });
+      return action();
+    });
+    expect(await resumeSession(closed.sessionId, map)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    expect(map.size).toBe(0);
+  });
   describe('error branches', () => {
     it('returns not_found for an unknown session id', async () => {
       const r = await resumeSession('no-such-id', new Map());
@@ -268,6 +407,129 @@ describe('resumeSession', () => {
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it.each([
+      ['remote CLI id', { cliId: 'remote-runner' }],
+      ['remote backend stamp', { cliId: 'codex', backendType: 'remote-runner' }],
+    ])('starts provider recovery immediately for a closed %s', async (_name, identity) => {
+      const closed = makeClosedSession(identity);
+      const map = new Map<string, DaemonSession>();
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        expect(prompt).toBe('');
+        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.recoveryPending).toBe(true);
+        expect(result.ds.suppressRecoveryCard).toBe(true);
+      }
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('rolls a remote resume back to closed when no provider process is admitted', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_start_failed',
+      });
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+    });
+
+    it('returns an admitted remote resume to closed when the worker exits before ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onPreReadyExit: (() => void) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onPreReadyExit = opts?.onPreReadyExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onPreReadyExit).toBeTypeOf('function');
+      onPreReadyExit?.();
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('returns an admitted remote resume to closed when the backend exits after worker ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onRemoteBackendStartupExit: (() => boolean) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onRemoteBackendStartupExit).toBeTypeOf('function');
+      expect(onRemoteBackendStartupExit?.()).toBe(true);
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'replacement',
+        };
+        sessionStore.updateSession(ds.session);
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_reconciliation_required',
+      });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
     });
 
     it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {
@@ -1253,3 +1515,35 @@ describe('resumeSession', () => {
 // promotion failure registers a visible quarantined owner and sets the
 // `quarantinedActivationTailPromotion` flag the guard keys on (see the
 // 'registers a visible quarantined owner …' test above).
+
+
+describe('resuming cleanup-archived Codex rows', () => {
+  function archivedRow() {
+    const row = makeClosedSession({ cliId: 'codex', backendType: 'pty' });
+    const stored = sessionStore.getSession(row.sessionId)!;
+    stored.cliSessionId = 'native';
+    stored.codexCleanupTarget = { threadId: 'native', codexHome: '/tmp/codex-home', codexBin: '/tmp/fake-codex' };
+    stored.codexCleanupArchive = { threadId: 'native', state: 'archived' };
+    sessionStore.updateSession(stored);
+    return stored;
+  }
+  it('unarchives before reactivating the durable row', async () => {
+    const row = archivedRow();
+    archiveRpc.mockImplementation(async () => {
+      expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    });
+    const result = await resumeSession(row.sessionId, new Map());
+    expect(result.ok).toBe(true);
+    expect(archiveRpc).toHaveBeenCalledWith(expect.objectContaining({ archived: false, threadId: 'native' }));
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive).toBeUndefined();
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('active');
+  });
+  it('keeps the row closed and recoverable if unarchive fails', async () => {
+    const row = archivedRow(); const map = new Map<string, DaemonSession>();
+    archiveRpc.mockRejectedValue(new Error('RPC failed'));
+    expect(await resumeSession(row.sessionId, map)).toEqual({ ok: false, error: 'codex_unarchive_failed' });
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive?.state).toBe('archived');
+    expect(map.size).toBe(0);
+  });
+});

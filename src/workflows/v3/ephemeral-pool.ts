@@ -7,6 +7,8 @@
  * determined later by validating BOTMUX_GOAL_MANIFEST_PATH.
  */
 
+import { buildBotWorkerEnv } from '../../core/env-policy.js';
+import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -23,6 +25,8 @@ import {
   type WorkerProcessFactory,
 } from '../shared/worker-process.js';
 import {
+  GOAL_COMMAND,
+  GOAL_COMMAND_OBJECTIVE,
   GOAL_ENV,
   type RunNode,
   type RunNodeRequest,
@@ -31,6 +35,7 @@ import {
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
+import { removeSessionSkillRuntime } from '../../core/skills/snapshot.js';
 import {
   armV3AttemptWorkerFence,
   bindV3AttemptWorkerFence,
@@ -42,7 +47,7 @@ import {
 
 type WorkerEvent = WorkerToDaemon;
 
-export const GOAL_COMMAND = '/goal';
+export { GOAL_COMMAND } from './contract.js';
 
 export interface EphemeralPoolDeps {
   /**
@@ -50,6 +55,8 @@ export interface EphemeralPoolDeps {
    * secret by the frozen larkAppId at spawn time.
    */
   resolveLarkAppSecret(larkAppId: string): string | undefined | Promise<string | undefined>;
+  /** Resolve configured values at spawn time; never persist them in snapshots. */
+  resolveBotEnv?: (larkAppId: string) => Record<string, string> | undefined;
   factory?: WorkerProcessFactory;
   workerPath?: string;
   quiesceMs?: number;
@@ -79,7 +86,7 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 }
 
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
-  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret'>;
+  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret' | 'resolveBotEnv'>;
 
 async function runNodeImpl(
   req: RunNodeRequest,
@@ -137,25 +144,29 @@ async function runNodeImpl(
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
+  const workerEnv: Record<string, string | undefined> = {
+    // v3 ephemeral workers fork straight from the daemon here (not via
+    // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
+    // "only daemon/dashboard carry the marker" invariant — harmless today
+    // (the worker doesn't read the graceful helper and its CLI children go
+    // through redactChildEnv), but this keeps the boundary honest.
+    ...stripPm2GracefulExitMarker(buildBotWorkerEnv(process.env, req.botSnapshot.envPolicy)),
+    ...req.env,
+    [GOAL_ENV.V3_MARKER]: '1',
+    BOTMUX_WORKFLOW: '1',
+    BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
+    BOTMUX_WORKFLOW_RUN_ID: req.runId,
+    BOTMUX_WORKFLOW_NODE_ID: req.node.id,
+  };
+  // Where the worker writes this attempt's skill manifest + snapshot (its own
+  // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
+  const workerDataDir = workerEnv.SESSION_DATA_DIR || config.session.dataDir;
   let worker: WorkerHandle;
   try {
     worker = deps.factory.spawn({
       workerPath: deps.workerPath,
       cwd,
-      env: {
-        // v3 ephemeral workers fork straight from the daemon here (not via
-        // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
-        // "only daemon/dashboard carry the marker" invariant — harmless today
-        // (the worker doesn't read the graceful helper and its CLI children go
-        // through redactChildEnv), but this keeps the boundary honest.
-        ...stripPm2GracefulExitMarker(process.env),
-        ...req.env,
-        [GOAL_ENV.V3_MARKER]: '1',
-        BOTMUX_WORKFLOW: '1',
-        BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
-        BOTMUX_WORKFLOW_RUN_ID: req.runId,
-        BOTMUX_WORKFLOW_NODE_ID: req.node.id,
-      },
+      env: workerEnv,
     });
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'spawn_threw');
@@ -172,6 +183,12 @@ async function runNodeImpl(
     resolveOuterClose = resolve;
     worker.on('close', () => {
       outerCloseSeen = true;
+      // The attempt's synthetic session has no persistent row, so
+      // sessionStore.closeSession() never runs for it: reclaim its skill
+      // manifest + runtime-skills snapshot here, once the worker process
+      // (and with it the CLI that read them) has actually exited — on every
+      // outcome (ok / fail / timeout / cancelled / bind failure).
+      try { removeSessionSkillRuntime(sessionId, workerDataDir); } catch { /* best effort */ }
       resolve();
     });
   });
@@ -244,7 +261,11 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
+    envPolicy: req.botSnapshot.envPolicy,
+    env: deps.resolveBotEnv ? deps.resolveBotEnv(req.botSnapshot.larkAppId)
+      : (() => { try { return getBot(req.botSnapshot.larkAppId).config.env; } catch { return undefined; } })(),
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,
@@ -492,8 +513,7 @@ async function runNodeImpl(
 }
 
 export function buildGoalCommand(req: RunNodeRequest): string {
-  const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  return `${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`;
 }
 
 /**

@@ -20,6 +20,8 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Command assertions use the bare name whether or not this host has herdr on PATH.
+vi.mock('../src/utils/herdr-executable.js', () => ({ herdrExecutable: () => 'herdr' }));
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
   spawn: vi.fn(),
@@ -31,7 +33,7 @@ vi.mock('node-pty', () => ({
 
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
-import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe } from '../src/adapters/backend/herdr-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -178,6 +180,7 @@ function setManagedLaunchResponses(kind: string, overrides: HerdrResponseHandler
 }
 
 beforeEach(() => {
+  __testOnly_resetHerdrAgentWaitProbe();
   mockedExecFileSync.mockReset();
   mockedSpawn.mockReset();
   mockedPtySpawn.mockReset();
@@ -189,6 +192,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 // ─── Backend connection surface ────────────────────────────────────────────
@@ -675,6 +679,7 @@ describe('HerdrBackend.spawn', () => {
   });
 
   it('keeps the machine-wide shared server credential-neutral while passing env to its agent', () => {
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) vi.stubEnv(key, '/session/scratch');
     let listCount = 0;
     setHerdrResponses([
       {
@@ -697,16 +702,18 @@ describe('HerdrBackend.spawn', () => {
     });
     be.spawn('claude', [], {
       cwd: '/work', cols: 80, rows: 24,
-      env: { BOTMUX_SESSION_ID: 'topic1' },
+      env: { BOTMUX_SESSION_ID: 'topic1', TMPDIR: '/session/scratch', TMP: '/session/scratch', TEMP: '/session/scratch' },
       injectEnv: { ANTHROPIC_AUTH_TOKEN: 'bot-secret' },
     });
 
     const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
     expect(serverSpawn?.[2].env.BOTMUX_SESSION_ID).toBeUndefined();
     expect(serverSpawn?.[2].env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(serverSpawn?.[2].env[key]).toBeUndefined();
     const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
     expect(startOpts?.env?.BOTMUX_SESSION_ID).toBe('topic1');
     expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('bot-secret');
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(startOpts?.env?.[key]).toBe('/session/scratch');
     be.kill();
   });
 
@@ -810,6 +817,37 @@ describe('HerdrBackend.spawn', () => {
     be.spawn('claude', ['--resume', 'x'], { cwd: '/work', cols: 80, rows: 24, env: {} });
     expect(herdrCall('agent', 'start', 'botmux')).toBeDefined();
     be.kill();
+  });
+
+  it('launchedNewCli is true only when spawn() launched the CLI itself', () => {
+    // The worker's startup guard keys on this: a freshly launched CLI may be
+    // reported idle while still booting, but a re-attached or adopted CLI was
+    // already running, so its first Herdr status stays authoritative.
+    setManagedLaunchResponses('claude');
+    const fresh = new HerdrBackend(SESSION);
+    expect(fresh.launchedNewCli).toBe(false);
+    fresh.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(fresh.launchedNewCli).toBe(true);
+    fresh.kill();
+
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const reattached = new HerdrBackend(SESSION, { isReattach: true });
+    reattached.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(reattached.isReattach).toBe(true);
+    expect(reattached.launchedNewCli).toBe(false);
+    reattached.kill();
+
+    const adopted = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    adopted.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(adopted.launchedNewCli).toBe(false);
+    adopted.kill();
   });
 
   it('external target adopt: uses externalTarget paneId, never spawns server or agent', () => {
@@ -1009,6 +1047,179 @@ describe('HerdrBackend web terminal sizing', () => {
     expect(be.resizeWebTerminal(viewer, 150, 42)).toBeNull();
     expect(be.releaseWebTerminal(viewer)).toBeNull();
     expect(mockedPtySpawn).not.toHaveBeenCalled();
+    be.kill();
+  });
+});
+
+// ─── Adopted pane grid ─────────────────────────────────────────────────────
+
+describe('HerdrBackend adopted pane grid', () => {
+  const PANE = 'w9:p3W';
+
+  /** Route herdr + the PTY probe (`ps -o tty=` / `stty size`). */
+  function setAdoptResponses(state: { sttySize: string | null; psTty?: string }) {
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      const argv = args as string[];
+      if (cmd === 'ps') return `${state.psTty ?? 'pts/263'}\n` as any;
+      if (cmd === 'stty') {
+        if (state.sttySize === null) throw new Error('stty failed');
+        return `${state.sttySize}\n` as any;
+      }
+      if (cmd !== 'herdr') return '' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('agent') && argv.includes('list')) {
+        return JSON.stringify({ result: { agents: [{ agent: 'claude', pane_id: PANE }] } }) as any;
+      }
+      if (argv.includes('process-info')) {
+        return JSON.stringify({ result: { process_info: { pane_id: PANE, shell_pid: 4242 } } }) as any;
+      }
+      if (argv.includes('read')) return PANE_READ_REPLY('adopted screen') as any;
+      return '' as any;
+    }) as any);
+  }
+
+  function spawnAdopted(): HerdrBackend {
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: PANE, paneId: PANE },
+    });
+    // Discovery's guess; the user's pane is actually 213x58.
+    be.spawn('', [], { cwd: '/work', cols: 200, rows: 50, env: {} });
+    return be;
+  }
+
+  function execCount(cmd: string): number {
+    return mockedExecFileSync.mock.calls.filter(call => call[0] === cmd).length;
+  }
+
+  it('reports the pane PTY grid and ignores browser resizes', () => {
+    setAdoptResponses({ sttySize: '58 213' });
+    const be = spawnAdopted();
+
+    // The web terminal's resize handler forwards the browser grid here.
+    be.resize(90, 30);
+    expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+    expect(herdrCall('pane', 'process-info', '--pane', PANE)).toBeDefined();
+    expect(findCall(args => args[0] === '-o' && args[1] === 'tty=' && args.at(-1) === '4242')).toBeDefined();
+
+    // Screenshot capture reads exactly the pane's visible rows.
+    be.captureViewport();
+    const visibleRead = herdrCall('agent', 'read', '--source', 'visible');
+    expect(visibleRead![visibleRead!.indexOf('--lines') + 1]).toBe('58');
+    be.kill();
+  });
+
+  it('caches the grid briefly, then follows a resized pane without re-resolving the device', () => {
+    const state = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const be = spawnAdopted();
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      const sttyCalls = execCount('stty');
+      const psCalls = execCount('ps');
+
+      state.sttySize = '40 150';
+      nowSpy.mockReturnValue(1_001_000);
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      expect(execCount('stty')).toBe(sttyCalls);
+
+      nowSpy.mockReturnValue(1_002_500);
+      expect(be.getPaneSize()).toEqual({ cols: 150, rows: 40 });
+      expect(execCount('ps')).toBe(psCalls);
+      be.kill();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps the last known grid when a probe fails and re-resolves the device next time', () => {
+    const state: { sttySize: string | null } = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const be = spawnAdopted();
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      const psCalls = execCount('ps');
+
+      state.sttySize = null;
+      nowSpy.mockReturnValue(1_003_000);
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      expect(execCount('ps')).toBe(psCalls + 1);
+      be.kill();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('re-emits the unchanged frame once a poll sees the pane grid change', () => {
+    const state = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    vi.useFakeTimers();
+    const be = spawnAdopted();
+    const snapshots: string[] = [];
+    const deltas: string[] = [];
+    const grids: Array<{ cols: number; rows: number }> = [];
+    be.onSnapshot(frame => snapshots.push(frame));
+    be.onData(delta => deltas.push(delta));
+    be.onPaneGridChange(grid => grids.push(grid));
+
+    vi.advanceTimersByTime(6_000);
+    expect(snapshots).toEqual([]);
+    expect(grids).toEqual([]);
+
+    // The user resizes the pane; its text stays identical.
+    state.sttySize = '40 150';
+    vi.advanceTimersByTime(6_000);
+    expect(grids).toEqual([{ cols: 150, rows: 40 }]);
+    expect(snapshots).toEqual(['adopted screen']);
+    expect(deltas).toEqual([]);
+    expect(be.getPaneSize()).toEqual({ cols: 150, rows: 40 });
+
+    vi.advanceTimersByTime(6_000);
+    expect(snapshots).toHaveLength(1);
+    expect(grids).toHaveLength(1);
+    be.kill();
+  });
+
+  it('treats a first successful probe after a fallback as a grid change', () => {
+    // Viewers connected while the probe failed were pinned to the spawn grid.
+    const state: { sttySize: string | null } = { sttySize: null };
+    setAdoptResponses(state);
+    vi.useFakeTimers();
+    const be = spawnAdopted();
+    const snapshots: string[] = [];
+    const grids: Array<{ cols: number; rows: number }> = [];
+    be.onSnapshot(frame => snapshots.push(frame));
+    be.onPaneGridChange(grid => grids.push(grid));
+    expect(be.getPaneSize()).toEqual({ cols: 200, rows: 50 });
+
+    state.sttySize = '58 213';
+    vi.advanceTimersByTime(6_000);
+    expect(grids).toEqual([{ cols: 213, rows: 58 }]);
+    expect(snapshots).toEqual(['adopted screen']);
+    be.kill();
+  });
+
+  it('falls back to the spawn grid when the pane PTY was never readable', () => {
+    setAdoptResponses({ sttySize: null, psTty: '?' });
+    const be = spawnAdopted();
+    be.resize(90, 30);
+    expect(be.getPaneSize()).toEqual({ cols: 200, rows: 50 });
+    expect(execCount('stty')).toBe(0);
+    be.kill();
+  });
+
+  it('leaves a managed pane sized by its web terminal grid', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('pane-managed') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    be.resize(120, 36);
+    expect(be.getPaneSize()).toEqual({ cols: 120, rows: 36 });
+    expect(herdrCall('process-info')).toBeUndefined();
     be.kill();
   });
 });
@@ -1223,6 +1434,49 @@ describe('HerdrBackend callbacks', () => {
     be.kill();
   });
 
+  it('backs an unchanged pane off to 5 s and returns to 500 ms on new output or input', () => {
+    let paneText = 'idle';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    be.onData(d => seen.push(d));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const reads = () => mockedExecFileSync.mock.calls.filter(call => (call[1] as string[]).includes('read')).length;
+
+    // Six unchanged polls at 500 ms, then 1 s, 2 s, 4 s and a 5 s cap.
+    const start = reads();
+    vi.advanceTimersByTime(3_000);
+    expect(reads() - start).toBe(6);
+    vi.advanceTimersByTime(1_000 + 2_000 + 4_000 + 5_000);
+    expect(reads() - start).toBe(10);
+    vi.advanceTimersByTime(10_000);
+    expect(reads() - start).toBe(12);
+
+    // Output that appears while backed off arrives within one capped interval,
+    // and the cadence is fast again right after it.
+    paneText = 'idle!';
+    vi.advanceTimersByTime(5_000);
+    expect(seen).toEqual(['!']);
+    const afterOutput = reads();
+    vi.advanceTimersByTime(1_000);
+    expect(reads() - afterOutput).toBe(2);
+
+    // Input pulls a backed-off poll in to 500 ms.
+    vi.advanceTimersByTime(30_000);
+    const beforeInput = reads();
+    be.write('hi');
+    vi.advanceTimersByTime(500);
+    expect(reads() - beforeInput).toBe(1);
+
+    be.kill();
+  });
+
   it('onData fresh-spawn baseline: lastText starts empty so listeners see initial output', () => {
     // Counterpart to the reattach test: a fresh spawn keeps lastText='' so
     // listeners attached *before* spawn don't miss output the agent emitted
@@ -1276,6 +1530,164 @@ describe('HerdrBackend callbacks', () => {
     agentAlive = false;
     vi.advanceTimersByTime(600);
     expect(exits).toEqual([[0, null]]);
+  });
+
+  it('agent list probe failures do NOT report an exit while the herdr session still exists', () => {
+    // A busy shared herdr server (several daemons polling in bursts) can fail
+    // `agent list` a few polls in a row; that says nothing about the CLI
+    // process. Reporting an exit on probe failures alone killed healthy
+    // first-turn launches right after spawn (the spawn's own detection/rename
+    // `agent list` calls contend with the very first polls).
+    let listBroken = false;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (listBroken) throw new Error('agent_list_failed');
+          return AGENT_LIST_REPLY('1-1');
+        },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    listBroken = true;
+    vi.advanceTimersByTime(20_000);
+    expect(exits).toEqual([]);
+    be.kill();
+  });
+
+  it('agent list probe failures DO report an exit once the herdr session itself is gone', () => {
+    let listBroken = false;
+    let sessionGone = false;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => (sessionGone ? EMPTY_SESSIONS_REPLY : EXISTING_SESSION_REPLY) },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (listBroken) throw new Error('agent_list_failed');
+          return AGENT_LIST_REPLY('1-1');
+        },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    listBroken = true;
+    // First threshold (t≈1.5s) probes immediately → session still exists →
+    // keep-alive, and arms the SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS backoff.
+    vi.advanceTimersByTime(3_000);
+    expect(exits).toEqual([]);
+    sessionGone = true;
+    // Next confirmation is only due at t≈6.5s; the threshold crossing at
+    // t≈7.5s is the first one allowed through after that — the bounded
+    // exit-detection delay the keep-alive trade-off accepts.
+    vi.advanceTimersByTime(8_000);
+    expect(exits).toEqual([[0, null]]);
+  });
+
+  it('agent list AND session list both failing (probe unknown) never reports an exit; recovery reports it via row absence', () => {
+    // Total outage: `agent list` fails AND the `session list` confirmation
+    // fails, so probeSession() yields 'unknown' — which must NOT be collapsed
+    // into 'missing'. The CLI stays alive; once herdr recovers and the agent
+    // row is genuinely gone, the ordinary row-absence path reports the exit.
+    let listBroken = false;
+    let sessionListBroken = false;
+    let agentAlive = true;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => {
+          if (sessionListBroken) throw new Error('session_list_failed');
+          return EXISTING_SESSION_REPLY;
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (listBroken) throw new Error('agent_list_failed');
+          return agentAlive ? AGENT_LIST_REPLY('1-1') : JSON.stringify({ result: { agents: [] } });
+        },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    // Both commands down for a long stretch — every confirmation probe comes
+    // back unknown, so the keep-alive branch must hold, not exit.
+    listBroken = true;
+    sessionListBroken = true;
+    vi.advanceTimersByTime(20_000);
+    expect(exits).toEqual([]);
+
+    // herdr fully recovers AND the agent row really vanished → the first
+    // successful `agent list` reports the exit through row absence.
+    listBroken = false;
+    sessionListBroken = false;
+    agentAlive = false;
+    vi.advanceTimersByTime(600);
+    expect(exits).toEqual([[0, null]]);
+    be.kill();
+  });
+
+  it('throttles the keep-alive session-list confirmation during sustained agent-list failures', () => {
+    // 60 failed polls over 30s → 20 threshold crossings. Without the backoff
+    // every crossing fires a `session list` (20 calls) — extra load on the
+    // already-struggling shared herdr host. With the 5s confirmation window
+    // only the crossings at t≈1.5s/7.5s/13.5s/19.5s/25.5s probe → 5 calls.
+    let listBroken = false;
+    let sessionListCalls = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => {
+          sessionListCalls++;
+          return EXISTING_SESSION_REPLY;
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (listBroken) throw new Error('agent_list_failed');
+          return AGENT_LIST_REPLY('1-1');
+        },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const spawnPhaseSessionLists = sessionListCalls;
+
+    listBroken = true;
+    vi.advanceTimersByTime(30_000);
+    const confirmations = sessionListCalls - spawnPhaseSessionLists;
+    expect(confirmations).toBe(5);
+    expect(exits).toEqual([]);
+    be.kill();
   });
 
   it('onExit fires when the agent stays in list with running:false (v0.6.6 tombstone)', () => {
@@ -1374,6 +1786,155 @@ describe('HerdrBackend callbacks', () => {
     for (const w of thirdCohort) expect(w.child.killed).toBe(true);
   });
 
+  // Herdr 0.9 dropped `wait agent-status`; `agent wait --until …` replaces it.
+  const AGENT_WAIT_HELP = 'Usage: herdr agent wait <TARGET> [OPTIONS]\n      --until <STATUS>\n      --timeout <MS>\n';
+  class FakeAgentWait extends FakeChild {
+    readonly stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+    finish(code: number, status?: string): void {
+      if (status) this.stdout.emit('data', JSON.stringify({ result: { agent: { agent_status: status } } }));
+      this.emit('close', code, null);
+    }
+  }
+  function captureAgentWaits(): Array<{ until: string[]; child: FakeAgentWait }> {
+    const waits: Array<{ until: string[]; child: FakeAgentWait }> = [];
+    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
+      const argv = args as string[];
+      if (argv.includes('agent') && argv.includes('wait')) {
+        const child = new FakeAgentWait();
+        waits.push({ until: argv.flatMap((arg, i) => argv[i - 1] === '--until' ? [arg] : []).sort(), child });
+        return child;
+      }
+      if (argv.includes('agent-status')) throw new Error('legacy `wait agent-status` must not be used when `agent wait` exists');
+      return makeFakeChild();
+    }) as any);
+    return waits;
+  }
+
+  it('status watcher (agent wait): one child watches every other status and re-arms without the matched one', () => {
+    const waits = captureAgentWaits();
+    let paneText = 'baseline';
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    const statuses: string[] = [];
+    be.onData(d => seen.push(d));
+    be.onAgentStatus(status => statuses.push(status));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    expect(waits.map(w => w.until)).toEqual([['blocked', 'done', 'idle', 'working']]);
+
+    paneText = 'baseline result';
+    waits[0]!.child.finish(0, 'done');
+    expect(seen).toEqual([' result']);
+    expect(statuses).toEqual(['done']);
+    expect(waits.map(w => w.until)).toEqual([
+      ['blocked', 'done', 'idle', 'working'],
+      ['blocked', 'idle', 'working'],
+    ]);
+
+    waits[1]!.child.finish(0, 'working');
+    expect(statuses).toEqual(['done', 'working']);
+    expect(waits[2]!.until).toEqual(['blocked', 'done', 'idle']);
+
+    be.kill();
+    expect(waits[2]!.child.killed).toBe(true);
+  });
+
+  it('status watcher (agent wait): a wait that resolves because the CLI died reports the exit, not idle', () => {
+    // Herdr resolves the wait with the dead CLI's last idle/done state before
+    // dropping its row. Announcing idle would release queued Lark input into
+    // the bare shell left in the pane.
+    const waits = captureAgentWaits();
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    const exits: Array<[number | null, string | null]> = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentGone = true;
+    waits[0]!.child.finish(0, 'idle');
+    expect(statuses).toEqual([]);
+    expect(exits).toEqual([[0, null]]);
+    expect(waits).toHaveLength(1);
+    be.kill();
+  });
+
+  it('status watcher (agent wait): an unconfirmed status is re-checked instead of announced', () => {
+    vi.useFakeTimers();
+    const waits = captureAgentWaits();
+    let listFails = true;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => { if (listFails) throw new Error('busy'); return AGENT_LIST_REPLY('1-1'); },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    waits[0]!.child.finish(0, 'idle');
+    expect(statuses).toEqual([]);
+    expect(waits).toHaveLength(1);
+
+    // The previous status is re-armed, so Herdr returns idle again for a second check.
+    listFails = false;
+    vi.advanceTimersByTime(500);
+    expect(waits.map(w => w.until)).toEqual([
+      ['blocked', 'done', 'idle', 'working'],
+      ['blocked', 'done', 'idle', 'working'],
+    ]);
+    waits[1]!.child.finish(0, 'idle');
+    expect(statuses).toEqual(['idle']);
+    expect(waits[2]!.until).toEqual(['blocked', 'done', 'working']);
+    be.kill();
+  });
+
+  it('status watcher (agent wait): a timed-out or failed wait reports no status; a vanished agent emits onExit', () => {
+    const waits = captureAgentWaits();
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    const exits: Array<[number | null, string | null]> = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentGone = true;
+    waits[0]!.child.finish(1);
+    expect(statuses).toEqual([]);
+    expect(exits).toEqual([[0, null]]);
+    expect(waits).toHaveLength(1);
+    be.kill();
+  });
+
   it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {
     // Regression for the re-arm storm: on herdr v0.6.6 a `herdr wait
     // agent-status` against a dead pane returns code 1 IMMEDIATELY. The old
@@ -1420,5 +1981,52 @@ describe('HerdrBackend callbacks', () => {
     expect(nextCohort.length).toBe(0);
 
     be.kill();
+  });
+});
+
+
+describe('HERDR CLI process identity', () => {
+  it.each(['claude', 'codex'])('resolves %s in an existing pane and retries missing/ambiguous results', cli => {
+    let processes: any[] = [];
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: processes } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: cli });
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 20, argv: ['/bin/helper', cli] }, { pid: 21, argv: ['/bin/' + cli] }, { pid: 22, argv0: cli }];
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 10, argv0: cli }, { pid: 21, argv: ['/bin/' + cli] }, { pid: 20, argv: ['/bin/helper', cli] }];
+    expect(be.getChildPid()).toBe(21);
+    expect(herdrCall('process-info')).toEqual(['--session', SESSION, 'pane', 'process-info', '--pane', 'exact-pane']);
+    be.kill();
+  });
+});
+
+
+describe('HERDR spawn publishes a usable CLI PID', () => {
+  it.each(['claude', 'codex'])('resolves freshly launched %s', cli => {
+    setManagedLaunchResponses(cli, [{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 21, argv: ['/native/' + cli] }] } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    try {
+      be.spawn('/native/' + cli, [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(be.getChildPid()).toBe(21);
+    } finally { be.kill(); }
+  });
+  it.each(['claude', 'codex'])('resolves reattached %s', cli => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('existing-pane') },
+      { match: a => a.includes('process-info'), reply: () => JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 21, argv0: cli }] } },
+      }) },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    try {
+      be.spawn(cli, [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(be.getChildPid()).toBe(21);
+    } finally { be.kill(); }
   });
 });

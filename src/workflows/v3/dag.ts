@@ -887,15 +887,6 @@ function parseUniqueStringList(
   return problems.some((p) => p.startsWith(where)) ? undefined : values;
 }
 
-function normStringArray(v: unknown, where: string, problems: string[]): string[] {
-  if (v === undefined) return [];
-  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
-    problems.push(`${where} must be an array of strings`);
-    return [];
-  }
-  return v as string[];
-}
-
 /** An edge predicate parked during the per-node pass: validated against the
  *  SOURCE node's resultSchema in the cross-node pass, then written back into
  *  `ref.when`. */

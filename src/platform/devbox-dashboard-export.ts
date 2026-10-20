@@ -1,10 +1,11 @@
-import { accessSync, constants, readFileSync } from 'node:fs';
+import { accessSync, constants, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { parse as parseDotEnv } from 'dotenv';
 
+import { logger } from '../utils/logger.js';
 import {
   readSecureHostFileSync,
   writeSecureHostFileSync,
@@ -19,11 +20,18 @@ const DASHBOARD_PORT_PATH = join(CONFIG_DIR, '.dashboard-port');
 const DEFAULT_DASHBOARD_PORT = 7891;
 const EXPORT_TIMEOUT_MS = 5_000;
 const AUTO_EXPORT_ENV_KEY = 'BOTMUX_DEVBOX_AUTO_EXPORT';
-/** Read-side memo TTL: `devboxDashboardBaseUrl()` sits on the CSRF hot path
- *  (every control request / WS upgrade), and each miss costs a secure-file read
- *  plus a `.dashboard-port` read. Short enough that a `botmux dashboard`
- *  re-export is picked up within seconds without a restart. */
-const BASE_URL_MEMO_TTL_MS = 5_000;
+/** Read-side memo max age. `devboxDashboardBaseUrl()` sits on the CSRF hot path
+ *  (every control request / WS upgrade). File fingerprints let a cross-process
+ *  export or port rebind show up on the very next call, but a fingerprint can in
+ *  principle collide; this caps how long ONE full read may be served regardless,
+ *  so staleness is bounded instead of lasting until the next write. */
+const BASE_URL_MEMO_MAX_AGE_MS = 5_000;
+/** A file changed this close to the moment its fingerprint was taken may change
+ *  again without changing the fingerprint: mtime/ctime have filesystem
+ *  granularity (~1ms on ext4 — measured 227/300 collisions for same-size
+ *  in-place rewrites — and 1–2s elsewhere). Such a fingerprint cannot prove
+ *  freshness, so the entry is not reused (the "racy git" rule). */
+const FINGERPRINT_RACY_WINDOW_MS = 2_000;
 /** Negative cache for a failed export: `merlin-cli` hanging must not make every
  *  later call in the same process pay the full timeout again. */
 const EXPORT_FAILURE_TTL_MS = 60_000;
@@ -34,15 +42,25 @@ interface DevboxDashboardExportCache {
   shortUrl: string;
 }
 
+export interface DevboxExportStreams {
+  stdout: string;
+  stderr: string;
+}
+
+export type DevboxEnvFileMode = 'read' | 'ignore';
+
 export interface EnsureDevboxDashboardExportOptions {
   port: number;
   remoteBaseConfigured: boolean;
   env?: NodeJS.ProcessEnv;
   cachePath?: string;
+  /** Defaults to `read`, even when `env` is injected. Tests/callers that need
+   * a hermetic environment must opt out explicitly. */
+  envFileMode?: DevboxEnvFileMode;
   envFilePath?: string;
   timeoutMs?: number;
   merlinCliPath?: string;
-  runExport?: (binary: string, port: number, timeoutMs: number) => Promise<string>;
+  runExport?: (binary: string, port: number, timeoutMs: number) => Promise<DevboxExportStreams>;
 }
 
 export interface DevboxDashboardBaseUrlOptions {
@@ -51,16 +69,30 @@ export interface DevboxDashboardBaseUrlOptions {
   port?: number;
   cachePath?: string;
   env?: NodeJS.ProcessEnv;
+  envFileMode?: DevboxEnvFileMode;
   envFilePath?: string;
   portFilePath?: string;
 }
 
-let baseUrlMemo: { key: string; at: number; url: string | null } | null = null;
+interface BaseUrlMemo {
+  /** Inputs that cost no syscall: port, env values, paths. */
+  key: string;
+  /** Metadata of the files the URL was computed from, taken BEFORE reading them. */
+  fingerprint: string;
+  /** When the URL was last computed from the files. Only a full recompute sets
+   *  it — never a memo hit — so even a continuously busy process re-reads. */
+  computedAt: number;
+  /** False when a fingerprinted file was changed inside the racy window. */
+  reusable: boolean;
+  url: string | null;
+}
+
+let baseUrlMemo: BaseUrlMemo | null = null;
 let exportFailure: { key: string; at: number } | null = null;
 
-/** Drop the in-process read-side memo and the export negative cache. Called
- *  after a successful export (so the fresh short link is visible immediately)
- *  and by tests, which otherwise observe a previous case's memo. */
+/** Drop the in-process read-side memo and the export negative cache. A successful
+ *  same-process export calls this directly; cross-process writes are detected by
+ *  the file fingerprints checked in {@link devboxDashboardBaseUrl}. */
 export function resetDevboxDashboardExportCaches(): void {
   baseUrlMemo = null;
   exportFailure = null;
@@ -86,10 +118,11 @@ export function resetDevboxDashboardExportCaches(): void {
  */
 function autoExportSetting(
   env: NodeJS.ProcessEnv,
-  envFilePath = ENV_FILE_PATH,
+  envFilePath: string | null,
 ): string | undefined {
   const inline = env[AUTO_EXPORT_ENV_KEY];
   if (inline !== undefined) return inline;
+  if (envFilePath === null) return undefined;
   try {
     return parseDotEnv(readFileSync(envFilePath, 'utf8'))[AUTO_EXPORT_ENV_KEY];
   } catch {
@@ -98,7 +131,15 @@ function autoExportSetting(
   }
 }
 
-function enabled(env: NodeJS.ProcessEnv, envFilePath?: string): boolean {
+function resolveEnvFilePath(
+  envFileMode: DevboxEnvFileMode | undefined,
+  envFilePath: string | undefined,
+): string | null {
+  if (envFileMode === 'ignore') return null;
+  return envFilePath ?? ENV_FILE_PATH;
+}
+
+function enabled(env: NodeJS.ProcessEnv, envFilePath: string | null): boolean {
   const raw = (autoExportSetting(env, envFilePath) ?? '1').trim().toLowerCase();
   return raw !== '0' && raw !== 'false';
 }
@@ -160,6 +201,7 @@ function readCache(path = CACHE_PATH): DevboxDashboardExportCache | null {
 
 function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): string | null {
   const env = opts.env ?? process.env;
+  const envFilePath = resolveEnvFilePath(opts.envFileMode, opts.envFilePath);
   const workspaceId = env.ARNOLD_WORKSPACE_ID?.trim();
   // Devbox gates FIRST, switch second. `enabled()` may read ~/.botmux/.env (the
   // CLI has no dotenv step of its own), while these two only read env vars — and
@@ -167,7 +209,7 @@ function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): str
   // reached constantly from the CSRF hot path and must cost zero syscalls there.
   // All three are side-effect-free reads, so the AND is commutative.
   if (!workspaceId || !env.PORT_LIST) return null;
-  if (!enabled(env, opts.envFilePath)) return null;
+  if (!enabled(env, envFilePath)) return null;
   const port = opts.port ?? resolveDashboardPort(env, opts.portFilePath);
   if (port === null) return null;
   const cached = readCache(opts.cachePath ?? CACHE_PATH);
@@ -180,6 +222,59 @@ function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): str
   return cached.shortUrl;
 }
 
+interface FilesFingerprint {
+  text: string;
+  /** Latest mtime/ctime among the files that exist; -Infinity when none do. */
+  newestChangeMs: number;
+}
+
+/** Cheap metadata fingerprint used to validate the hot-path memo without
+ * reopening and reparsing secure files on every control request. Atomic writes
+ * change the inode; in-place writes change size/mtime/ctime — except within the
+ * timestamp granularity, which is why the newest change time is reported too
+ * (see FINGERPRINT_RACY_WINDOW_MS). A missing file has its own stable
+ * fingerprint and is invalidated as soon as the file appears. */
+function filesFingerprint(paths: ReadonlyArray<string | null>): FilesFingerprint {
+  const parts: string[] = [];
+  let newestChangeMs = -Infinity;
+  for (const path of paths) {
+    if (path === null) { parts.push('-'); continue; }
+    try {
+      const stat = statSync(path);
+      parts.push(`${path}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`);
+      newestChangeMs = Math.max(newestChangeMs, stat.mtimeMs, stat.ctimeMs);
+    } catch {
+      parts.push(`${path}:missing`);
+    }
+  }
+  return { text: JSON.stringify(parts), newestChangeMs };
+}
+
+function baseUrlMemoKey(opts: DevboxDashboardBaseUrlOptions): string {
+  const env = opts.env ?? process.env;
+  return JSON.stringify([
+    opts.port ?? null,
+    env.ARNOLD_WORKSPACE_ID ?? null,
+    env.PORT_LIST ?? null,
+    env.BOTMUX_DASHBOARD_PORT ?? null,
+    env[AUTO_EXPORT_ENV_KEY] ?? null,
+    opts.cachePath ?? null,
+    opts.portFilePath ?? null,
+    opts.envFileMode ?? null,
+    opts.envFilePath ?? null,
+  ]);
+}
+
+function baseUrlFingerprint(opts: DevboxDashboardBaseUrlOptions): FilesFingerprint {
+  const env = opts.env ?? process.env;
+  const envFilePath = resolveEnvFilePath(opts.envFileMode, opts.envFilePath);
+  return filesFingerprint([
+    opts.cachePath ?? CACHE_PATH,
+    opts.port === undefined ? opts.portFilePath ?? DASHBOARD_PORT_PATH : null,
+    env[AUTO_EXPORT_ENV_KEY] === undefined ? envFilePath : null,
+  ]);
+}
+
 /**
  * The Devbox private short link to use as this host's public base, or null.
  *
@@ -187,16 +282,42 @@ function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): str
  * pass it; the rest resolve it from `~/.botmux/.dashboard-port`.
  */
 export function devboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions = {}): string | null {
-  // Only the production shape (real cache/env/settings paths) is memoized;
-  // callers that inject paths — tests — always recompute.
-  const memoizable = opts.cachePath === undefined && opts.env === undefined
-    && opts.envFilePath === undefined && opts.portFilePath === undefined;
-  const key = String(opts.port ?? '');
+  const env = opts.env ?? process.env;
+  const workspaceId = env.ARNOLD_WORKSPACE_ID?.trim();
+  const inlineSetting = env[AUTO_EXPORT_ENV_KEY]?.trim().toLowerCase();
+  // Ordinary hosts are the overwhelmingly common case. These values come
+  // only from the process environment, so reject them before fingerprinting
+  // any files on the synchronous CSRF/control-request path.
+  if (!workspaceId || !env.PORT_LIST || inlineSetting === '0' || inlineSetting === 'false') {
+    return null;
+  }
+  // Fingerprint-checked on EVERY call (≤3 stats), not just after a TTL: the
+  // CLI exports in its own process and then immediately re-reads
+  // `/__cli/current` from the dashboard, so an entry served blindly for a TTL
+  // would hand that re-read the pre-export answer. The expensive part — the
+  // secure-file read and JSON parse — is what the memo keeps off the hot path.
+  // Taken BEFORE the read: a write racing the read then leaves a mismatching
+  // fingerprint behind (re-read next call) rather than a matching stale one.
+  const key = baseUrlMemoKey(opts);
   const now = Date.now();
-  if (memoizable && baseUrlMemo && baseUrlMemo.key === key
-    && now - baseUrlMemo.at < BASE_URL_MEMO_TTL_MS) return baseUrlMemo.url;
+  const fingerprint = baseUrlFingerprint(opts);
+  if (baseUrlMemo
+    && baseUrlMemo.reusable
+    && baseUrlMemo.key === key
+    && baseUrlMemo.fingerprint === fingerprint.text
+    && now - baseUrlMemo.computedAt < BASE_URL_MEMO_MAX_AGE_MS) {
+    return baseUrlMemo.url;
+  }
   const url = computeDevboxDashboardBaseUrl(opts);
-  if (memoizable) baseUrlMemo = { key, at: now, url };
+  baseUrlMemo = {
+    key,
+    fingerprint: fingerprint.text,
+    computedAt: now,
+    // A change at/after `now - window` (including a clock-skewed future mtime)
+    // could be followed by another one the fingerprint cannot see.
+    reusable: fingerprint.newestChangeMs < now - FINGERPRINT_RACY_WINDOW_MS,
+    url,
+  };
   return url;
 }
 
@@ -215,7 +336,11 @@ function findMerlinCli(): string {
   return 'merlin-cli';
 }
 
-async function runMerlinExport(binary: string, port: number, timeoutMs: number): Promise<string> {
+async function runMerlinExport(
+  binary: string,
+  port: number,
+  timeoutMs: number,
+): Promise<DevboxExportStreams> {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, ['cpu-devbox', 'export', '--port', String(port)], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -235,10 +360,7 @@ async function runMerlinExport(binary: string, port: number, timeoutMs: number):
     });
     child.once('close', code => {
       clearTimeout(timer);
-      // stdout first: the result object is the payload, stderr only carries
-      // warnings/log lines. parseExportOutput scans both, but ordering makes
-      // the intended source win when a warning happens to be JSON too.
-      if (code === 0) resolve(`${stdout}\n${stderr}`);
+      if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`merlin-cli exited ${code}`));
     });
   });
@@ -247,60 +369,242 @@ async function runMerlinExport(binary: string, port: number, timeoutMs: number):
 /**
  * Every top-level `{...}` region in `output`, brace-balanced and string-aware.
  *
- * `merlin-cli`'s exact output shape is outside this repo's control and its
- * stderr is mixed in, so slicing from the first `{` to the last `}` broke on any
- * warning containing braces (`Warning: config {legacy} deprecated`) or on a JSON
- * log line. Scanning candidates instead keeps the parse working around noise.
+ * `merlin-cli`'s exact output shape is outside this repo's control and a stream
+ * can carry log lines next to the result, so slicing from the first `{` to the
+ * last `}` broke on any warning containing braces
+ * (`Warning: config {legacy} deprecated`) or on a JSON log line. Scanning
+ * candidates instead keeps the parse working around noise.
  */
-function* jsonObjectCandidates(output: string): Generator<string> {
-  for (let i = 0; i < output.length; i++) {
-    if (output[i] !== '{') continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let j = i; j < output.length; j++) {
-      const ch = output[j];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === '\\') escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') { inString = true; continue; }
-      if (ch === '{') depth++;
-      else if (ch === '}' && --depth === 0) {
-        yield output.slice(i, j + 1);
-        i = j; // Nested objects are part of this candidate, not candidates too.
-        break;
-      }
-    }
-  }
+interface JsonObjectCandidate {
+  text: string;
+  start: number;
+  /** Exclusive end; null means the opening brace was never closed. */
+  end: number | null;
 }
 
-function parseExportOutput(output: string): { shortUrl: string; isPublic: boolean } | null {
+function* jsonObjectCandidates(output: string): Generator<JsonObjectCandidate> {
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < output.length; i++) {
+    const ch = output[i];
+    if (start < 0) {
+      if (ch === '{') {
+        start = i;
+        depth = 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) {
+      yield { text: output.slice(start, i + 1), start, end: i + 1 };
+      start = -1;
+    }
+  }
+  // Once a result-shaped object has been seen, silently ignoring a truncated
+  // suffix can turn a later public verdict into a fail-open private result.
+  // Report the malformed tail to the caller, which rejects the entire output
+  // whenever that tail might be a truncated verdict.
+  if (start >= 0) yield { text: output.slice(start), start, end: null };
+}
+
+/** Count security-relevant JSON property names before JSON.parse discards
+ * duplicate keys. This also sees nested keys, so a second result-shaped object
+ * embedded inside the first candidate is treated as ambiguous. */
+function securityPropertyKeyCounts(json: string): { shortUrl: number; isPublic: number } {
+  const counts = { shortUrl: 0, isPublic: 0 };
+  for (let i = 0; i < json.length; i++) {
+    if (json[i] !== '"') continue;
+    const start = i;
+    let escaped = false;
+    for (i++; i < json.length; i++) {
+      const ch = json[i];
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') break;
+    }
+    let next = i + 1;
+    while (/\s/.test(json[next] ?? '')) next++;
+    if (json[next] !== ':') continue;
+    try {
+      const propertyName: unknown = JSON.parse(json.slice(start, i + 1));
+      if (propertyName === 'short_url') counts.shortUrl++;
+      else if (propertyName === 'is_public') counts.isPublic++;
+    } catch {
+      // The enclosing JSON parse will reject this candidate too.
+    }
+  }
+  return counts;
+}
+
+function canonicalSecurityMarkerCounts(parsed: object): { shortUrl: number; isPublic: number } {
+  const canonical = JSON.stringify(parsed);
+  return {
+    shortUrl: canonical.match(/\bshort_url\b/gu)?.length ?? 0,
+    isPublic: canonical.match(/\bis_public\b/gu)?.length ?? 0,
+  };
+}
+
+/** Matches a double-quoted property name followed by `:` — the shape of a JSON
+ * object key, even when the rest of the candidate is not valid JSON. */
+const QUOTED_PROPERTY_KEY = /"[^"]*"\s*:/u;
+
+/**
+ * Must an unparseable (or unterminated) candidate fail the whole stream closed?
+ *
+ * Such a candidate cannot be read, so the question is only whether it MIGHT be
+ * the real verdict. If it might, skipping it would let a neighbouring
+ * private-looking log record become the sole result (fail-open): the
+ * multiple-candidate rejection only sees candidates it can parse.
+ *
+ * Two independent signals, each closing a different hole:
+ *  - a security marker spelled in any dialect. `\uXXXX` escapes are decoded and
+ *    compatibility forms folded (NFKD: fullwidth `ｓ` → `s`), then EVERY
+ *    non-alphanumeric character is stripped before looking for `shorturl` /
+ *    `ispublic`. Stripping instead of allow-listing separators is deliberate:
+ *    `short[-_]?url` still let `short.url`, `short__url`, `short/url` and
+ *    `short:url` through, because the separator set is open.
+ *  - a double-quoted key followed by `:`. This keeps a JSON-shaped verdict whose
+ *    key does not survive the marker search (e.g. a Cyrillic `ѕ` homoglyph next
+ *    to Python's `True`) failing closed, as the old blanket colon check did.
+ *
+ * What stays skippable is brace noise with neither signal — `{legacy}`,
+ * `{attempt: 3}`, `{'legacy': true}`, Go `%v` structs such as
+ * `{Port:9001 Public:false}`, an unmatched trailing `{`. The old blanket
+ * `includes(':')` rejected all of those whenever they shared a stream with the
+ * result, silently disabling the feature for otherwise valid output.
+ */
+function malformedCandidateMustFailClosed(text: string): boolean {
+  if (QUOTED_PROPERTY_KEY.test(text)) return true;
+  const decoded = text.replace(/\\u([0-9a-fA-F]{4})/gu, (_m, hex: string) =>
+    String.fromCharCode(parseInt(hex, 16)));
+  const letters = decoded.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/gu, '');
+  return letters.includes('shorturl') || letters.includes('ispublic');
+}
+
+type ParsedExportResult = { shortUrl: string; isPublic: false };
+
+function rejectExportOutput(source: 'stdout' | 'stderr', reason: string): null {
+  // Deliberately omit candidate text and URLs: DEBUG=1 should explain the
+  // parser decision without copying a possibly credential-bearing payload.
+  logger.debug(`[devbox-export] rejected ${source} output: ${reason}`);
+  return null;
+}
+
+/** Strict three-state parse: result / rejected null / no result shape undefined. */
+function parseExportOutput(
+  output: string,
+  source: 'stdout' | 'stderr',
+): ParsedExportResult | null | undefined {
+  let found: ParsedExportResult | null = null;
+  let scannedThrough = 0;
+  const containsRawSecurityField = (text: string) => /\b(?:short_url|is_public)\b/u.test(text);
   for (const candidate of jsonObjectCandidates(output)) {
+    // A result can also be rendered as key=value/plaintext. Treat security
+    // fields outside JSON candidates as result-shaped ambiguity, otherwise a
+    // public stdout verdict could be misclassified as "no result" and fall
+    // through to a private-looking stderr object.
+    if (containsRawSecurityField(output.slice(scannedThrough, candidate.start))) {
+      return rejectExportOutput(source, 'result fields outside a JSON candidate');
+    }
+    if (candidate.end === null) {
+      // A marker-free unclosed brace (`Tip: diagnostic context {`) carries no
+      // verdict, so on its own it must not poison the whole stream. Anything
+      // that might be a truncated verdict still fails closed, and raw markers
+      // in the tail are caught again by the trailing scan below
+      // (`scannedThrough` is deliberately not advanced past this candidate).
+      if (malformedCandidateMustFailClosed(candidate.text)
+        || containsRawSecurityField(candidate.text)) {
+        return rejectExportOutput(source, 'unterminated result-shaped candidate');
+      }
+      continue;
+    }
+    scannedThrough = candidate.end;
+    const candidateText = candidate.text;
+    // Inspect security keys before parsing: JSON syntax errors must not make a
+    // public/result-shaped candidate disappear while a neighbouring private
+    // candidate remains eligible. Malformed brace warnings without these keys
+    // are still harmless noise and remain skippable.
+    const keyCounts = securityPropertyKeyCounts(candidateText);
     let parsed: unknown;
-    try { parsed = JSON.parse(candidate); } catch { continue; }
+    try {
+      parsed = JSON.parse(candidateText);
+    } catch {
+      // An unparseable candidate that might be the verdict (any spelling of a
+      // security marker, or a JSON-style quoted key) is rejected instead of
+      // being allowed to disappear beside a private one. Brace noise without
+      // either signal — prose, Python/Go/JS-style log objects — stays harmless,
+      // even when it shares a stream with the result.
+      if (malformedCandidateMustFailClosed(candidateText)
+        || containsRawSecurityField(candidateText)
+        || keyCounts.shortUrl > 0
+        || keyCounts.isPublic > 0) {
+        return rejectExportOutput(source, 'malformed object-shaped candidate');
+      }
+      continue;
+    }
     if (!parsed || typeof parsed !== 'object') continue;
     const result = parsed as { short_url?: unknown; is_public?: unknown };
+    // JSON loggers can wrap a plaintext verdict in a string value. Re-encoding
+    // the parsed object canonicalizes Unicode escapes, then comparing all
+    // markers with actual property-key counts exposes any marker hidden in a
+    // value without penalizing escaped spellings of the real keys.
+    const canonicalMarkerCounts = canonicalSecurityMarkerCounts(parsed);
+    if (canonicalMarkerCounts.shortUrl > keyCounts.shortUrl
+      || canonicalMarkerCounts.isPublic > keyCounts.isPublic) {
+      return rejectExportOutput(source, 'result fields inside a JSON value');
+    }
     // A candidate without `short_url` is noise (a warning/log object) — skip it.
-    // One that HAS it is the export result and decides the outcome here: a
-    // public or credentialed URL fails closed instead of letting a later object
-    // in the stream override the verdict.
-    if (!('short_url' in result)) continue;
+    if (keyCounts.shortUrl === 0) continue;
+    // Exactly one top-level result is accepted. Duplicate/nested security keys
+    // are ambiguous, and JSON.parse's last-key-wins behavior must not be able
+    // to hide a preceding public verdict.
+    if (keyCounts.shortUrl !== 1
+      || keyCounts.isPublic !== 1
+      || !Object.prototype.hasOwnProperty.call(result, 'short_url')
+      || !Object.prototype.hasOwnProperty.call(result, 'is_public')) {
+      return rejectExportOutput(source, 'ambiguous or nested result fields');
+    }
+    // Multiple result-shaped objects are ambiguous. In particular, a private-
+    // looking log record followed by the real public verdict must never make a
+    // public link eligible merely because it appeared first.
+    if (found) return rejectExportOutput(source, 'multiple result candidates');
     const shortUrl = validPrivateShortUrl(result.short_url);
-    if (!shortUrl || result.is_public !== false) return null;
-    return { shortUrl, isPublic: false };
+    if (!shortUrl || result.is_public !== false) {
+      return rejectExportOutput(source, 'invalid URL or non-private export verdict');
+    }
+    found = { shortUrl, isPublic: false };
   }
-  return null;
+  if (containsRawSecurityField(output.slice(scannedThrough))) {
+    return rejectExportOutput(source, 'result fields outside a JSON candidate');
+  }
+  return found ?? undefined;
+}
+
+/** stdout is authoritative when it contains either a valid result or a
+ * rejection. Only a truly result-free stdout may fall back to stderr. */
+function parseMerlinExportStreams(output: DevboxExportStreams): ParsedExportResult | null {
+  const stdoutResult = parseExportOutput(output.stdout, 'stdout');
+  if (stdoutResult === null) return null;
+  if (stdoutResult !== undefined) return stdoutResult;
+  return parseExportOutput(output.stderr, 'stderr') ?? null;
 }
 
 export async function ensureDevboxDashboardExport(
   opts: EnsureDevboxDashboardExportOptions,
 ): Promise<string | null> {
   const env = opts.env ?? process.env;
+  const envFilePath = resolveEnvFilePath(opts.envFileMode, opts.envFilePath);
   const workspaceId = env.ARNOLD_WORKSPACE_ID?.trim();
-  if (!enabled(env, opts.envFilePath) || opts.remoteBaseConfigured || !workspaceId
+  if (!enabled(env, envFilePath) || opts.remoteBaseConfigured || !workspaceId
     || !env.PORT_LIST || !isExportablePort(opts.port, env)) {
     return null;
   }
@@ -316,7 +620,7 @@ export async function ensureDevboxDashboardExport(
   const binary = opts.merlinCliPath ?? findMerlinCli();
   try {
     const output = await (opts.runExport ?? runMerlinExport)(binary, opts.port, opts.timeoutMs ?? EXPORT_TIMEOUT_MS);
-    const result = parseExportOutput(output);
+    const result = parseMerlinExportStreams(output);
     if (!result) {
       exportFailure = { key: failureKey, at: Date.now() };
       return null;

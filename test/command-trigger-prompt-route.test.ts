@@ -236,7 +236,7 @@ describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
   });
 
   // 复审补充的两类：MULTILINE_COMMANDS（/schedule /role /fork，parser 对它们接受
-  // 多行）与 /t /topic（parseForceTopicInvocation 的正则吃 [\s\S]*，多行挡不住）。
+  // 多行）与 /t /topic（parseTopicHeader 把分隔符之后的正文整段收下，多行挡不住）。
   // 车道分离对它们同样成立——所有解析器读的都是 cmdContent。
   it.each([
     ['/schedule'], ['/role'], ['/fork'],

@@ -19,7 +19,8 @@ import {
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
@@ -28,6 +29,7 @@ import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForF
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -89,6 +91,28 @@ export function chunkTextByUtf8Bytes(
 export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   return join(dataDir, 'projects', projectHash, `${sessionId}.jsonl`);
+}
+
+/** Resolve the actual jsonl path, handling Claude's long-cwd truncation: for a
+ *  >200-char slug the project dir is `slug[0:200]-<opaque6>`, so glob by the
+ *  session UUID (collision-free) instead of guessing the hash. Returns the
+ *  exact slug path when it exists (normal case), the unique glob hit for long
+ *  slugs, or null when absent/ambiguous. */
+export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+  if (existsSync(exact)) return exact;
+  const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+  if (projectHash.length <= 200) return null;
+  const projectsDir = join(dataDir, 'projects');
+  const target = `${sessionId}.jsonl`;
+  let entries: string[];
+  try { entries = readdirSync(projectsDir); } catch { return null; }
+  const prefix = projectHash.slice(0, 200);
+  const hits = entries
+    .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
+    .map(name => join(projectsDir, name, target))
+    .filter(p => existsSync(p));
+  return hits.length === 1 ? hits[0]! : null;
 }
 
 /** The `<dataDir>/projects/<cwd-hash>` dir holding this cwd's transcripts (and its
@@ -449,6 +473,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'botmux_skill_help',
   'identity',
   'botmux_credentials',
+  'botmux_lark_tool',
   'session_id',
   'role',
   'summary_memory',
@@ -961,14 +986,47 @@ export interface ClaudeFamilyVariant {
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
   readonly reliableTurnTerminal?: boolean;
+  /** Whether this variant supports the Program Status Protocol (OSC 7501). */
+  readonly supportsProgramStatus?: boolean;
   /** True when this variant's CLI accepts `--effort <level>` (Claude Code
    *  2.1.x). Forks and gateway variants whose flag surface is not Claude's
    *  own leave it undefined, so `reasoningEffort` is silently ignored for
    *  them rather than producing an unknown-flag launch. */
   readonly supportsEffortFlag?: boolean;
+  /** Env the user must prefix to `resumeBin` to resume by hand. Only set when the
+   *  data root is a non-default profile a bare binary would not resolve on its own
+   *  (relay/seed pin their own default, so they need none). */
+  readonly resumeEnv?: Readonly<Record<string, string>>;
 }
 
-export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
+/**
+ * Claude Code launched against a non-default config profile (`cliConfigDir`):
+ * the same binary with `CLAUDE_CONFIG_DIR=<dir>`, so settings.json / login /
+ * transcripts all come from that dir and the global `~/.claude/settings.json`
+ * (whose `env` and `model` outrank process env) is never read.
+ *
+ * Built through the same Claude-family variant seam relay/seed use, so every
+ * path botmux derives from the data root — hook install target, transcripts,
+ * pid state, `.claude.json` folder trust, MCP gateway entry — follows the
+ * profile instead of silently pointing at `~/.claude`.
+ */
+export function claudeConfigProfileVariant(configDir: string): Pick<ClaudeFamilyVariant, 'dataDir' | 'stateJsonPath' | 'spawnEnv' | 'authPaths' | 'resumeEnv'> {
+  const dataDir = resolve(expandHomePath(configDir));
+  return {
+    dataDir,
+    // With CLAUDE_CONFIG_DIR set, Claude keeps `.claude.json` INSIDE the dir.
+    stateJsonPath: join(dataDir, '.claude.json'),
+    spawnEnv: { CLAUDE_CONFIG_DIR: dataDir },
+    authPaths: [join(dataDir, '.credentials.json')],
+    resumeEnv: { CLAUDE_CONFIG_DIR: dataDir },
+  };
+}
+
+function expandHomePath(p: string): string {
+  return p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
+}
+
+export function createClaudeCodeAdapter(pathOverride?: string, configDir?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
     // Claude Code JSONL carries authoritative final boundaries: final
@@ -976,12 +1034,14 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // refuses durable submits unless it has first installed an attributable
     // bridge mark, and failure/exit paths share the same terminal deduper.
     reliableTurnTerminal: true,
+    supportsProgramStatus: true,
     // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
     supportsEffortFlag: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
+    ...(configDir ? claudeConfigProfileVariant(configDir) : {}),
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
     // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
@@ -1003,6 +1063,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
     // --settings sandbox is NOT used: it only sandboxes Bash (main process
@@ -1058,7 +1119,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Claude resumes by reading <id>.jsonl, so we need the most recently
       // observed CLI-native id (rotation can happen mid-run); fall back to the
       // botmux sessionId for the first-turn case where they coincide.
-      return `${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
+      const envPrefix = Object.entries(variant.resumeEnv ?? {})
+        .map(([key, value]) => `${key}=${shellQuote(value)} `)
+        .join('');
+      return `${envPrefix}${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
     },
 
     /** Import path: scan this variant's data root (`<dataDir>/projects/<hash>/<id>.jsonl`)
@@ -1068,7 +1132,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1181,7 +1245,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
       return args;
     },
 
@@ -1299,7 +1363,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
+        pty.write(wrapBracketedPaste(sanitizedContent));
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1533,5 +1597,3 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     asksViaHook: true,
   };
 }
-
-export const create = createClaudeCodeAdapter;

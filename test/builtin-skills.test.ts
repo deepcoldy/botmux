@@ -25,6 +25,7 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('只有 `--card-json` / `--card-file` 的卡片输入才按 JSON 解析');
     expect(skill!.content).toContain('JSON.stringify');
     expect(skill!.content).toContain('外层工具协议会自行编码命令字符串');
+    expect(skill!.content).toContain('字面量 `\\n\\n` 还原为段落空行');
     expect(skill!.content).toContain('字面量 `\\n` 反解成换行');
   });
 

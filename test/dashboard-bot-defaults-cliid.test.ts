@@ -7,6 +7,7 @@ import {
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
@@ -177,6 +178,52 @@ describe('Codex-compatible runtime editor', () => {
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
   });
 
+
+  it.each([
+    ['codex', 'codex', 'codex --profile withhooks'],
+    ['claude-code', 'claude-code', 'custom-launcher claude'],
+    ['codex', 'ttadk-x-codex', 'ttadk codex'],
+  ])('sends replacement intent only after explicitly selecting the launch option for %s', async (cliId, key, wrapperCli) => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (init?.method !== 'PUT') return { ok: true, status: 200, json: async () => ({ models: [], source: 'static', profiles: [] }) } as any;
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({
+        ok: true, cliId, selectionKey: key, model: body.model,
+        wrapperCli: body.replaceCliSelection ? null : wrapperCli,
+      }) } as any;
+    });
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    try {
+      const rendered = renderAgent({ cliId, wrapperCli, agentSelectionKey: key });
+      renderer = rendered.renderer;
+      const { root, patchBot } = rendered;
+      const save = async () => { await act(async () => { root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); }); };
+      await save();
+      expect(requests[0]).not.toHaveProperty('replaceCliSelection');
+      expect(requests[0]).not.toHaveProperty('wrapperCli');
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli }));
+      act(() => root.findByProps({ dataInput: 'agentModel' }).props.onChange('new-model'));
+      await save();
+      expect(requests[1]).toMatchObject({ model: 'new-model' });
+      expect(requests[1]).not.toHaveProperty('replaceCliSelection');
+      // The picker can deliberately choose the same key. This is distinguishable
+      // from an untouched fallback key even for an unregistered Codex wrapper.
+      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
+        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      await save();
+      expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
+      await save();
+      expect(requests[3]).not.toHaveProperty('replaceCliSelection');
+    } finally {
+      if (renderer) act(() => renderer!.unmount());
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   it('shows and saves the configured Codex reasoning effort', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
@@ -206,6 +253,153 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('sends Codex serviceTier only after the field is edited', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      if (String(_url).includes('/api/dsh/profiles')) {
+        return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, ...body, selectionKey: 'codex' }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6.1-sol', serviceTier: 'priority' });
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.value).toBe('priority');
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: '' }]);
+
+      act(() => picker.props.onChange('default'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests.at(-1)).toEqual({
+        cliId: 'codex',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: '',
+        serviceTier: 'default',
+      });
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('renders service tier options from the selected model capabilities and keeps a saved value', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: ['gpt-6-astra'],
+            source: 'live',
+            modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority', 'experimental'] }],
+          }),
+        } as any;
+      }
+      return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'ultrafast' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default', 'priority', 'ultrafast']);
+      expect(picker.props.options.map((option: any) => option.label)).toContain('Fast');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('falls back to inherit and standard when the selected model is absent from the capabilities', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'unknown-model' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default']);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('refetches model capabilities whenever the saved bot row identity changes', async () => {
+    const previousFetch = globalThis.fetch;
+    const modelFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    globalThis.fetch = modelFetch;
+    try {
+      const bot = { larkAppId: 'cli_runtime', cliId: 'codex', model: 'gpt-6-astra' };
+      const { renderer } = renderAgent(bot);
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(1);
+
+      renderer.update(React.createElement(BotAgentSection, {
+        bot: { ...bot, env: '', envKeys: ['OPENAI_API_KEY'] },
+        sessionFallback: 'codex',
+        cliState,
+        patchBot: vi.fn(),
+      }));
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(2);
+      expect(modelFetch.mock.calls[1]?.[0]).toBe('/api/cli-options/models?key=codex&bot=cli_runtime');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('omits ultrafast when the selected model catalog only proves priority', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-sol'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-sol', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-sol' });
+      await flushEffects();
+      const options = root.findByProps({ dataInput: 'agentServiceTier' }).props.options;
+      expect(options.map((option: any) => option.value)).toEqual(['', 'default', 'priority']);
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 
@@ -664,7 +858,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       expect(requests).toEqual([{
-        cliId: 'traex',
+        cliId: 'traex', replaceCliSelection: true,
         model: 'GPT-5.6-Terra',
         reasoningEffort: 'xhigh',
         modelBackendVariant: '',
@@ -880,7 +1074,7 @@ describe('Codex-compatible runtime editor', () => {
         value => value === 1,
       );
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null }]);
       await waitForObserved(
         () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
         text => text.includes('已保存'),
@@ -1618,7 +1812,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -2265,5 +2459,67 @@ describe('card behavior defaults', () => {
       await pending;
     });
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
+    act(() => renderer.unmount());
   });
 });

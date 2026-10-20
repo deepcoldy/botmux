@@ -17,8 +17,24 @@ import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-/** 评论触发范围：仅 @bot 的评论触发 / 该文档所有新评论都触发。 */
-export type CommentTriggerMode = 'mention-only' | 'all';
+/**
+ * 评论触发范围：
+ * - mention-only：仅评论里 @ 了本机器人时触发（靠飞书 WS 推送，飞书只推 @bot 的评论）。
+ * - owner-mention：仅评论里 @ 了**订阅负责人**（sub.ownerOpenId）时触发，类似替身：
+ *   别人在文档里 @ 负责人，bot 代为响应。飞书不会把「@ 了别人、没 @bot」的评论推给
+ *   应用，所以本模式与 all 一样靠应用身份**轮询**，只是投递前多一道 owner 提及过滤。
+ * - all：该文档所有新评论都触发（同样走轮询）。
+ */
+export type CommentTriggerMode = 'mention-only' | 'owner-mention' | 'all';
+
+/**
+ * 哪些模式需要应用身份**轮询**评论列表（而非只等飞书 WS 推送）。
+ * mention-only 只覆盖 @bot（WS 已推送）；owner-mention 与 all 都要靠轮询才能读到
+ * 「没 @bot」的评论，因此共用轮询游标与基线。切进/切出这组模式时基线语义一致。
+ */
+export function isPollingDocTriggerMode(mode: CommentTriggerMode | undefined): boolean {
+  return mode === 'all' || mode === 'owner-mention';
+}
 
 /** 已通过 WS 的 @/审计门、但 daemon 尚未接纳的评论投递。 */
 export interface PendingDocCommentDelivery {
@@ -71,7 +87,67 @@ export interface DocSubscription {
   /** WS 已 ACK 但 worker 尚未接纳的评论；daemon 轮询周期负责持久重试。 */
   pendingDocCommentDeliveries?: PendingDocCommentDelivery[];
   createdAt: number;
+
+  // ─── 运行态可观测（只读展示，不参与任何路由/授权判定） ──────────────────
+  // 游标/pending 是**功能状态**（丢了会重放/漏评论），这一组是**诊断快照**
+  // （丢了只是看不见），所以写入规则刻意不同：诊断写失败一律 best-effort 咽掉。
+  // 全部 optional：旧记录没有这些字段，读到 undefined 是正常态，UI 显示「—」。
+
+  /** 最近一次评论事件/轮询**尝试**处理该文档的时刻（ms）。是尝试，不是成功。 */
+  lastActivityAt?: number;
+  /** 最近一次尝试的结局，取值与 processCommentEvent 各出口 / poller 对应。 */
+  lastOutcome?: DocWatchOutcome;
+  /** `lastOutcome` 的补充说明（异常 message）。仅诊断，不参与判定。 */
+  lastError?: string;
+  /** 最近一次真正投递给会话（lastOutcome==='dispatched'）的时刻（ms）。 */
+  lastDispatchAt?: number;
+  /** 累计投递成功次数：分辨「配好了没触发过」与「一直在用」。 */
+  dispatchCount?: number;
+
+  // ─── auto-sub 溯源（这条是不是「陌生人 @ 一下自动建出来的」） ────────
+  /** true = 由文档里的 @bot 自动创建（非 owner 主动登记）。 */
+  autoCreated?: boolean;
+  /** 触发 auto-sub 的人的 open_id（即 parsed.operatorOpenId）。 */
+  autoCreatedBy?: string;
+  /** auto-sub 创建时刻（ms）。 */
+  autoCreatedAt?: number;
 }
+
+/** 见 {@link DocSubscription.lastOutcome}。 */
+export type DocWatchOutcome =
+  | 'dispatched'
+  | 'no-comment'
+  | 'trigger-missing'
+  | 'empty-text'
+  | 'not-mentioned'
+  | 'self-authored'
+  | 'audit-rejected'
+  | 'poll-failed';
+
+const DOC_WATCH_OUTCOMES: ReadonlySet<string> = new Set<DocWatchOutcome>([
+  'dispatched', 'no-comment', 'trigger-missing', 'empty-text',
+  'not-mentioned', 'self-authored', 'audit-rejected', 'poll-failed',
+]);
+
+/** 收窄未知字符串到 `DocWatchOutcome`。读旧文件/跨版本时用。 */
+export function asDocWatchOutcome(raw: unknown): DocWatchOutcome | undefined {
+  return typeof raw === 'string' && DOC_WATCH_OUTCOMES.has(raw)
+    ? raw as DocWatchOutcome
+    : undefined;
+}
+
+/** `lastError` 落盘上限，避免一条长报错把订阅表撑大。 */
+export const DOC_WATCH_LAST_ERROR_MAX = 300;
+
+/**
+ * 运行态诊断字段（{@link recordDocWatchActivity} 写的那一组）。描述**这篇文档的
+ * 投递历史**，重新登记（换绑定/改模式/改目录）时应延续。刻意**不含** autoCreated*
+ * 溯源三字段——那三个描述「这一行怎么产生」，重新登记可能改变它（owner 接管后
+ * 不再是 auto-sub），必须由写入方显式决定，不能盲目继承。
+ */
+const RUNTIME_DIAGNOSTIC_KEYS = [
+  'lastActivityAt', 'lastOutcome', 'lastError', 'lastDispatchAt', 'dispatchCount',
+] as const satisfies ReadonlyArray<keyof DocSubscription>;
 
 export function docWatchAnchor(fileToken: string): string {
   return `doc:${fileToken}:watch`;
@@ -129,19 +205,99 @@ function writeFile(dataDir: string, larkAppId: string, data: FileShape): void {
  * 新增 / 覆盖一条订阅（fileToken 主键）。显式绑定模式下会覆盖旧会话绑定；
  * 文档原生 watch 模式下只覆盖文档级监听配置。返回旧订阅供调用方提示。
  */
+/**
+ * 新增 / 覆盖一条订阅（fileToken 主键）。显式绑定模式下会覆盖旧会话绑定；
+ * 文档原生 watch 模式下只覆盖文档级监听配置。返回旧订阅供调用方提示。
+ *
+ * 默认整行覆盖（只额外保住未决 WS 投递，那是功能状态不能丢）。
+ * `inheritRuntime: true` 时再把上一行的**运行态诊断字段**补进新行（仅当新行未
+ * 显式给出）——「重新登记同一篇文档」的路径用它，换绑定不代表投递历史归零。
+ * 溯源三字段（autoCreated*）刻意不在此列，由写入方自己传。
+ */
 export function putDocSubscription(
   dataDir: string,
   larkAppId: string,
   sub: DocSubscription,
+  opts?: { inheritRuntime?: boolean },
 ): { previous?: DocSubscription } {
   const data = readFile(dataDir, larkAppId);
   const previous = data[sub.fileToken];
-  data[sub.fileToken] = previous?.pendingDocCommentDeliveries
-    && sub.pendingDocCommentDeliveries === undefined
-    ? { ...sub, pendingDocCommentDeliveries: previous.pendingDocCommentDeliveries }
-    : sub;
+  const next: DocSubscription = { ...sub };
+  // 未决 WS 投递是功能状态：调用方没显式带时一律保住，不能因一次重写而丢重试队列。
+  if (previous?.pendingDocCommentDeliveries && next.pendingDocCommentDeliveries === undefined) {
+    next.pendingDocCommentDeliveries = previous.pendingDocCommentDeliveries;
+  }
+  if (opts?.inheritRuntime && previous) {
+    for (const key of RUNTIME_DIAGNOSTIC_KEYS) {
+      if (next[key] === undefined && previous[key] !== undefined) {
+        (next as unknown as Record<string, unknown>)[key] = previous[key];
+      }
+    }
+  }
+  data[sub.fileToken] = next;
   writeFile(dataDir, larkAppId, data);
   return { previous };
+}
+
+/**
+ * 记一条运行态诊断快照。**绝不抛、绝不影响调用方控制流**：调用点全在评论事件 /
+ * poller 热路径，这些字段只是给人看，「记不下诊断」不能升级成一条真实评论投递
+ * 失败。读后写而非接受整条 sub，避免调用方的旧快照覆盖掉别处刚推进的游标/pending/
+ * mode。订阅已被删除（退订/auto-sub 回滚）时直接不写，不复活不存在的行。
+ */
+export function recordDocWatchActivity(
+  dataDir: string,
+  larkAppId: string,
+  fileToken: string,
+  patch: {
+    outcome: DocWatchOutcome;
+    at?: number;
+    error?: string;
+  },
+): boolean {
+  try {
+    const data = readFile(dataDir, larkAppId);
+    const sub = data[fileToken];
+    if (!sub) return false;
+    const at = patch.at ?? Date.now();
+    sub.lastActivityAt = at;
+    sub.lastOutcome = patch.outcome;
+    if (patch.error) {
+      sub.lastError = patch.error.slice(0, DOC_WATCH_LAST_ERROR_MAX);
+    } else {
+      // 成功/正常丢弃时清掉旧报错，否则一条早已修好的错误会永远挂在界面上。
+      delete sub.lastError;
+    }
+    if (patch.outcome === 'dispatched') {
+      sub.lastDispatchAt = at;
+      sub.dispatchCount = (sub.dispatchCount ?? 0) + 1;
+    }
+    writeFile(dataDir, larkAppId, data);
+    return true;
+  } catch {
+    return false; // 诊断字段，写不进去就算了，绝不影响评论投递
+  }
+}
+
+/** 补记文档标题快照（best-effort）。标题没变时不写盘，避免每条评论都重写文件。 */
+export function setDocTitle(
+  dataDir: string,
+  larkAppId: string,
+  fileToken: string,
+  title: string,
+): boolean {
+  const trimmed = title.trim();
+  if (!trimmed) return false;
+  try {
+    const data = readFile(dataDir, larkAppId);
+    const sub = data[fileToken];
+    if (!sub || sub.docTitle === trimmed) return false;
+    sub.docTitle = trimmed;
+    writeFile(dataDir, larkAppId, data);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 取某文档的订阅（评论事件来后据 fileToken 定位会话）。无则 null。 */

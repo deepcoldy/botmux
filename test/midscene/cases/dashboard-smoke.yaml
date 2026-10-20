@@ -1,0 +1,43 @@
+cases:
+  - name: Navigate the core read-only Dashboard pages
+    tags: [dashboard, smoke]
+    steps:
+      - aiAssert:
+          prompt: The Botmux Dashboard has loaded. The left navigation contains Workbench, Session Control, and Monitoring Board, and the main area shows the Workbench overview.
+          message: The Dashboard workbench or navigation is missing
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: In the left sidebar under COLLABORATION, click the navigation item labeled Session Control. Do not click anything in the main content area.
+          $:
+            timeout: 60_000
+      - aiWaitFor:
+          prompt: The main content heading is Session Control.
+          options:
+            timeoutMs: 30_000
+            checkIntervalMs: 2_000
+      - aiAssert:
+          prompt: The current page is Botmux Session Control. It contains a session-related heading, filters, or an empty state instead of the Workbench overview.
+          message: Session Control did not open
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: In the left sidebar under ANALYTICS, click the navigation item labeled Monitoring Board.
+          $:
+            timeout: 60_000
+      - aiWaitFor:
+          prompt: The main content heading is Monitoring Board.
+          options:
+            timeoutMs: 30_000
+            checkIntervalMs: 2_000
+      - aiAssert:
+          prompt: The current page is the Botmux Monitoring Board and contains runtime health, resource pressure, or session pressure information.
+          message: Monitoring Board did not open
+          $:
+            timeout: 60_000
+
+afterAll:
+  - recordToReport:
+      title: Botmux Dashboard smoke test
+      options:
+        content: The real Dashboard bundle displayed the Workbench, Session Control, and Monitor pages and allowed navigation between them.

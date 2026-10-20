@@ -1,3 +1,4 @@
+import { buildProjectGroupStartedNoticeCard } from '../src/im/lark/project-group-card.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,6 +33,7 @@ function fixture() {
     unpinMessage: vi.fn(async () => true),
     resolveThreadId: vi.fn(async (_appId, root) => root === 'om_subtask' ? 'omt_topic' : null),
     isMessageWithdrawn: error => error instanceof Error && error.message === 'withdrawn',
+    isMessageUpdateExpired: error => error instanceof Error && error.name === 'MessageUpdateExpiredError',
     brand: () => 'feishu',
   };
   return {
@@ -77,7 +79,15 @@ describe('project group mode', () => {
       'om_card_1',
       expect.stringContaining('引导卡切换验收'),
     );
-    expect(f.cards.at(-1)).toContain('引导卡切换验收');
+    expect(f.transport.updateCard).toHaveBeenCalledWith(
+      'cli_coordinator', 'om_card_1', expect.stringContaining('项目已启动'),
+    );
+    const retiredGuide = vi.mocked(f.transport.updateCard).mock.calls
+      .filter(call => call[1] === 'om_card_1').at(-1)![2];
+    expect(JSON.parse(retiredGuide).header.title.content).toBe('项目已启动');
+    expect(JSON.parse(retiredGuide).config.summary.content).toBe('项目已启动，请查看项目进度卡');
+    expect(retiredGuide).not.toContain('待启动');
+    expect(retiredGuide).not.toContain('直接执行');
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
@@ -111,6 +121,69 @@ describe('project group mode', () => {
     );
     expect(f.transport.unpinMessage).toHaveBeenCalledTimes(2);
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it('keeps the guide reference when updating its obsolete text fails and retries on refresh', async () => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error('temporary_update_failure'));
+    await expect(f.coordinator.run(f.context, {
+      action: 'init', title: '启动测试', goal: '保留重试入口',
+    })).resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.messageId).toBe('om_card_2');
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard?.messageId).toBe('om_card_1');
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it.each(['withdrawn', 'temporary_unpin_failure'])('keeps project startup successful when guide retirement hits %s', async reason => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId, workerAppIds: [],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    if (reason === 'withdrawn') vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error(reason));
+    else vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(false);
+    await expect(f.coordinator.run(f.context, { action: 'init', title: 'Project', goal: 'Start' }))
+      .resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it.each([true, false])('retires an expired guide and retries a failed unpin (first unpin=%s)', async unpinned => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId, workerAppIds: [],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_app, id) => {
+      if (id === 'om_card_1') throw Object.assign(new Error('expired'), { name: 'MessageUpdateExpiredError' });
+    });
+    vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(unpinned);
+    await f.coordinator.run(f.context, { action: 'init', title: 'Project', goal: 'Start' });
+    expect(f.transport.unpinMessage).toHaveBeenCalledWith('cli_coordinator', 'om_card_1');
+    expect(!!readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBe(!unpinned);
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+    const retiredAttempts = vi.mocked(f.transport.updateCard).mock.calls.filter(call => call[1] === 'om_card_1').length;
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(vi.mocked(f.transport.updateCard).mock.calls.filter(call => call[1] === 'om_card_1')).toHaveLength(retiredAttempts);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders the started notice in the requested locale without assuming pin success', () => {
+    const english = JSON.stringify(buildProjectGroupStartedNoticeCard('en'));
+    expect(JSON.parse(english).header.title.content).toBe('Project started');
+    expect(JSON.parse(english).config.summary.content).toBe('Project started. See the project progress card.');
+    expect(english).toContain('do not need to send the start command again');
+    expect(english).not.toContain('pinned');
+    expect(JSON.stringify(buildProjectGroupStartedNoticeCard('zh'))).toContain('无需再次发送启动指令');
   });
 
   it('unpins and clears an unused onboarding guide when project mode is disabled', async () => {

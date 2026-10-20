@@ -24,7 +24,6 @@ import {
   V3DistillationCompileError,
   fieldCategoryForV3DistillationPath,
   isAllowedV3DistillationDagPath,
-  isAllowedV3DistillationSpecPath,
   parseV3DistillationCompiledBody,
   parseV3DistillationSuggestion,
   type DistilledReplacementV1,

@@ -178,16 +178,4 @@ describe('updateSessionTitle', () => {
     expect(normalizeSessionTitleSource('agent', 'dashboard')).toBe('agent');
     expect(normalizeSessionTitleSource('spoofed', 'dashboard')).toBe('dashboard');
   });
-
-  it('keeps the canonical dashboard title separate from temporary TUI prompt labels', async () => {
-    const { readFileSync } = await import('node:fs');
-    const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    const start = workerPoolSource.indexOf("case 'tui_prompt':");
-    const end = workerPoolSource.indexOf("case 'tui_prompt_resolved':", start);
-    const region = workerPoolSource.slice(start, end);
-
-    expect(region).toContain('ds.currentTurnTitle = msg.description');
-    expect(region).not.toContain('patch: { title:');
-    expect(region).not.toContain('patch: {\n                title:');
-  });
 });

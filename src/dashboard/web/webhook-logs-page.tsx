@@ -2,7 +2,6 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget } from './dashboard-api.js';
-import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 
@@ -408,8 +407,4 @@ export function WebhookLogsContent(props: { embedded?: boolean } = {}): React.JS
   return props.embedded
     ? <section className="webhook-logs-content webhook-logs-panel">{body}</section>
     : <section className="page webhook-logs-content webhook-logs-page">{body}</section>;
-}
-
-export function renderWebhookLogsPage(root: HTMLElement): PageDisposer {
-  return mountReactPage(root, <WebhookLogsContent />);
 }
