@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu, type CodexEffortMenuIO } from '../src/utils/codex-effort-menu.js';
+import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu, sameModelIdentity, type CodexEffortMenuIO } from '../src/utils/codex-effort-menu.js';
 
 const idle = 'Working\n› Ask Codex to do anything\nGPT-6-Astra high';
 function picker(title: string, labels: string[], selected: number, session = true): string {
@@ -7,19 +7,36 @@ function picker(title: string, labels: string[], selected: number, session = tru
     ? 'enter select · esc back' : session ? 'enter default · s session · esc back' : 'enter select · esc back'}`;
 }
 
-function fixture(opts: { session?: boolean; receipt?: boolean; frozen?: boolean } = {}) {
+interface FixtureOpts {
+  session?: boolean;
+  receipt?: boolean;
+  frozen?: boolean;
+  /** Configured slug handed to the controller (turn_context preserves it verbatim). */
+  model?: string;
+  /** Model-page rows, in picker order. */
+  modelRows?: string[];
+  /** Initially highlighted model-page row. */
+  modelSelected?: number;
+  /** Model name the native thread_settings receipt records after `s`. */
+  receiptModel?: string;
+}
+
+function fixture(opts: FixtureOpts = {}) {
   let page = 'idle';
-  let selected = 1;
+  let selected = opts.modelSelected ?? 1;
   let time = 0;
   let applied = false;
   let current = true;
+  const model = opts.model ?? 'gpt-6-astra';
+  const modelRows = opts.modelRows ?? ['GPT-6-Sol', 'GPT-6-Astra (current)'];
+  const receiptModel = opts.receiptModel ?? 'gpt-6-astra';
   const abort = new AbortController();
   const keys: string[] = [];
   const io: CodexEffortMenuIO = {
     signal: abort.signal, deadline: 2000, now: () => time,
     delay: async ms => { time += ms; }, isCurrent: () => current,
     screen: async () => page === 'idle' ? idle
-      : page === 'model' ? picker('Select Model and Effort', ['GPT-6-Sol', 'GPT-6-Astra (current)'], 1)
+      : page === 'model' ? picker('Select Model and Effort', modelRows, selected)
       : page === 'effort' ? picker('Select Reasoning Level for GPT-6-Astra', ['Low', 'High (current)', 'More reasoning…'], selected, opts.session)
       : picker('Advanced Reasoning', ['Max', 'Ultra'], selected, opts.session),
     command: vi.fn(async () => { page = 'model'; }),
@@ -34,9 +51,9 @@ function fixture(opts: { session?: boolean; receipt?: boolean; frozen?: boolean 
       else if (key === 's') { applied = true; page = 'idle'; }
       else throw new Error('Unexpected key: ' + key);
     },
-    settings: () => applied && opts.receipt !== false ? { model: 'gpt-6-astra', reasoningEffort: 'max', serviceTier: 'default' } : undefined,
+    settings: () => applied && opts.receipt !== false ? { model: receiptModel, reasoningEffort: 'max', serviceTier: 'default' } : undefined,
   };
-  return { io, keys, abort, replace: () => { current = false; } };
+  return { io, keys, abort, replace: () => { current = false; }, model };
 }
 
 describe('Codex CLI effort menu', () => {
@@ -91,6 +108,39 @@ describe('Codex CLI effort menu', () => {
     const { io } = fixture();
     io.settings = () => ({ model: 'other-model', reasoningEffort: 'max', serviceTier: 'default' });
     expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toEqual({ status: 'error' });
+  });
+
+  it('finds the configured model row without a (current) marker when the slug casing differs (Codex 0.162)', async () => {
+    // Lowercase config slug: the picker renders no (current) marker at all and
+    // the native receipt records the catalog's canonical mixed-case slug.
+    const { io, keys, model } = fixture({
+      model: 'gpt-6.1-sol',
+      modelRows: ['GPT-6-Sol', 'GPT-6.1 Sol'],
+      modelSelected: 0,
+      receiptModel: 'GPT-6.1-Sol',
+    });
+    expect(await applyCodexEffortMenu(io, model, 'max')).toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(keys).toEqual(['Down', 'Enter', 'Down', 'Enter', 's']);
+  });
+
+  it('still refuses a model page without either a (current) marker or a matching row name', async () => {
+    const { io, keys } = fixture({
+      model: 'gpt-6.1-sol',
+      modelRows: ['GPT-6-Sol', 'GPT-7-Ultra'],
+      modelSelected: 0,
+    });
+    expect(await applyCodexEffortMenu(io, 'gpt-6.1-sol', 'max')).toMatchObject({ status: 'invalid' });
+    // No navigation keys: only the cleanup Escape that dismisses the opened model page.
+    expect(keys).toEqual(['Escape']);
+  });
+
+  it('normalizes model identity across casing and display spacing, keeping dots significant', () => {
+    expect(sameModelIdentity('gpt-6.1-sol', 'GPT-6.1-Sol')).toBe(true);
+    expect(sameModelIdentity('gpt-6.1-sol', 'GPT-6.1 Sol')).toBe(true);
+    expect(sameModelIdentity('gpt-6-astra', 'GPT 6 Astra')).toBe(true);
+    expect(sameModelIdentity('gpt-6.1-sol', 'gpt-61-sol')).toBe(false);
+    expect(sameModelIdentity('gpt-6-astra', 'gpt-6-sol')).toBe(false);
+    expect(sameModelIdentity(undefined, 'gpt-6-astra')).toBe(false);
   });
 
   it('does not parse old picker text followed by a live composer as an active menu', () => {

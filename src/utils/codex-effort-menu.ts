@@ -8,6 +8,26 @@ const LABELS: Record<string, RegExp> = {
   xhigh: /^(Extra high|Very high)\b/i, max: /^Max\b/i, ultra: /^Ultra\b/i,
 };
 
+/** Model-identity key shared by row matching and receipt verification.
+ *  The startup config slug is preserved verbatim by `turn_context`, while the
+ *  picker renders display spacing (`GPT-6.1 Sol` vs slug `GPT-6.1-Sol`) and
+ *  `models_cache.json` keeps mixed casing (`GPT-6.1-Sol` vs `gpt-6-astra`):
+ *  compare case-insensitively and ignore hyphen/space differences. Dots stay
+ *  significant (6.1 is not 61). */
+function modelIdentityKey(value: string): string {
+  return value.toLowerCase().replace(/[\s-]+/g, '');
+}
+
+export function sameModelIdentity(a: string | undefined, b: string | undefined): boolean {
+  return !!a && !!b && modelIdentityKey(a) === modelIdentityKey(b);
+}
+
+/** Picker rows carry trailing markers like `(current)` / `(default)`; drop
+ *  the whole trailing run before comparing the display name to the slug. */
+function modelRowName(label: string): string {
+  return label.replace(/(?:\s*\([^)]*\))+\s*$/, '').trim();
+}
+
 /** Only recognize the native picker with its footer, never prose in scrollback. */
 export function parseCodexEffortMenu(screen: string): Menu | undefined {
   const lines = screen.split(/\r?\n/);
@@ -71,7 +91,7 @@ export async function applyCodexEffortMenu(
     opened = true;
     while (alive()) {
       const settings = io.settings();
-      if (selected && settings?.model === model && settings.reasoningEffort === effort) {
+      if (selected && settings?.model && sameModelIdentity(settings.model, model) && settings.reasoningEffort === effort) {
         confirmed = true;
         return { status: 'future_only', reason: 'cli_next_turn' };
       }
@@ -80,8 +100,15 @@ export async function applyCodexEffortMenu(
       const menu = parseCodexEffortMenu(screen);
       if (menu && !selected) {
         const current = menu.rows.findIndex(row => row.selected);
+        // The `(current)` marker is primary. Codex 0.162 omits it entirely
+        // when the config slug casing differs from the catalog (e.g.
+        // `gpt-6.1-sol` vs `GPT-6.1-Sol`); fall back to the row whose display
+        // name matches the configured model, so the current model is still
+        // kept instead of failing with an empty choice list.
+        const isCurrentModelRow = (label: string): boolean => /\(current\)/i.test(label)
+          || sameModelIdentity(modelRowName(label), model);
         let target = menu.rows.findIndex(row => menu.kind === 'model'
-          ? /\(current\)/i.test(row.label) : LABELS[effort]!.test(row.label));
+          ? isCurrentModelRow(row.label) : LABELS[effort]!.test(row.label));
         if (target < 0 && menu.kind === 'effort' && ['max', 'ultra'].includes(effort)) {
           target = menu.rows.findIndex(row => /^More reasoning(?:…|\.\.\.)/.test(row.label));
         }
