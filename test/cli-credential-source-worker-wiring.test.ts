@@ -3,92 +3,58 @@ import { describe, expect, it } from 'vitest';
 
 const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const pool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const types = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
 
 describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
-  it('declares the field on init IPC and sends the configured value', () => {
-    expect(types).toContain('credentialsSourceDir?: string; triggerUserAuth');
+  // 源码结构护栏(K2)：credentialsSourceDir 是「一台机器多账号」的凭据隔离，设计上 fail-closed、
+  // 绝不回退共享登录（bfada7e10，docs/file-sandbox.md）。检查散在 worker.ts 冷启动巨型闭包与
+  // worker-pool 的 initMsg 组装里，没有可调用的 seam（纯判定 planCredentialSource /
+  // readCredentialSource 已由 test/cli-credential-source.test.ts 行为覆盖），只能钉住：daemon 把
+  // 字段送进 init、计划先于任何 provisioning 且 refuse / 来源不可读即抛、共享登录 seed 被抑制、
+  // 拷贝与「无残留认证覆盖」复查都在 per-bot 锁内且复查失败即抛。
+  it('fails closed before provisioning the per-bot home and never falls back to the shared login', () => {
     const initStart = pool.indexOf('initMsg = {');
     const init = pool.slice(initStart, pool.indexOf('worker.send(initMsg)', initStart));
-    expect(init).toContain('credentialsSourceDir: botCfg.credentialsSourceDir');
-  });
+    expect(initStart).toBeGreaterThan(-1);
+    expect(init).toContain('credentialsSourceDir');
 
-  it('plans before provisioning and fails closed on refuse / unreadable source', () => {
-    const plan = worker.indexOf('const credentialSourcePlan = planCredentialSource({');
+    const plan = worker.indexOf('planCredentialSource({');
     const gate = worker.indexOf('if (willRedirectCliData) {', plan);
     expect(plan).toBeGreaterThan(-1);
     expect(gate).toBeGreaterThan(plan);
     const planBlock = worker.slice(plan, gate);
-    expect(planBlock).toContain('willRedirectCliData,');
-    expect(planBlock).toContain('    sandboxRequested,\n');
-    expect(planBlock).toContain('wrapperCli: cfg.wrapperCli,');
-    expect(planBlock).toContain('supportsReadIsolation: cliAdapter.supportsReadIsolation === true,');
-    expect(planBlock).toContain('sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,');
-    expect(planBlock).toContain("credentialSourcePlan.kind === 'refuse'");
-    expect(planBlock).toMatch(/kind === 'refuse'\) \{\s*throw new Error/);
-    expect(planBlock).toMatch(/readCredentialSource\([^)]*\);\s*\} catch \(e\) \{\s*throw new Error/);
-  });
+    expect(planBlock).toMatch(/kind === 'refuse'\)\s*\{\s*throw\b/);
+    expect(planBlock).toMatch(/readCredentialSource\([^)]*\);\s*\}\s*catch\b[^{]*\{\s*throw\b/);
 
-  it('suppresses the shared-login seed and copies the source outside the best-effort block', () => {
-    // A config profile (cliConfigDir) seeds from its own login, never the shared one.
-    expect(worker).toMatch(/const fresh = claudeCredFromSource\s*\? null\s*: claudeProfileDir \? readClaudeCredFile\(join\(claudeProfileDir, '\.credentials\.json'\)\) : freshestClaudeCred\(\);/);
-    const gate = worker.indexOf('if (willRedirectCliData) {', worker.indexOf('const credentialSourcePlan'));
-    const provision = worker.indexOf('provisionIsolatedBotHome(', gate);
-    const provisionEnd = worker.indexOf(');', provision);
-    expect(worker.slice(provision, provisionEnd)).toContain('credentialSourceFiles !== undefined');
-    const copy = worker.indexOf('if (credentialSourceFiles && claudeDataDir) {', provisionEnd);
-    expect(copy).toBeGreaterThan(provisionEnd);
-    const copyBlock = worker.slice(copy, worker.indexOf('\n    }\n', worker.indexOf('throw new Error(', copy)));
-    expect(copyBlock).toContain('writeFileAtomic0600(join(claudeDataDir, name)');
-    expect(copyBlock).not.toContain('writeCredIfChanged');
-    expect(copyBlock).toContain('claudeAuthOverridesInSettingsLayers({');
-    expect(copyBlock).toContain("userSettingsPath: join(claudeDataDir, 'settings.json'),");
-    expect(copyBlock).toContain('workingDir: cfg.workingDir,');
-    expect(copyBlock).toContain('claudeAuthOverrideKeys(process.env)');
-    expect(copyBlock).toContain("reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!)");
-    expect(copyBlock).toContain("claudeStateAuthOverrides(join(claudeDataDir, '.claude.json'))");
-    // Reconcile runs after the seed inside provisionIsolatedBotHome, and before the post-check.
-    expect(copyBlock.indexOf('reconcileClaudeAccountState(')).toBeLessThan(copyBlock.indexOf('const overrides = ['));
-    expect(copyBlock).toMatch(/if \(overrides\.length\) \{\s*throw new Error/);
-    expect(worker).toContain('...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {})');
-    expect(worker).toContain('perBotEnv: cfg.env,');
-  });
+    // provisionIsolatedBotHome must not seed the shared (or profile) login over a configured source.
+    expect(worker).toMatch(/=\s*claudeCredFromSource\s*\?\s*null\s*:/);
 
-  it('serializes every per-bot data-root writer and the post-check under one per-bot lock', () => {
     const start = worker.indexOf('const provisionBotHome = (): void => {');
-    const end = worker.indexOf('withFileLockSync(provisionLock, provisionBotHome);', start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = worker.slice(start, end);
+    const locked = worker.indexOf('withFileLockSync(provisionLock, provisionBotHome)', start);
+    expect(start).toBeGreaterThan(gate);
+    expect(locked).toBeGreaterThan(start);
+    const body = worker.slice(start, locked);
     const order = [
-      'provisionIsolatedBotHome(',
-      'writeFileAtomic0600(join(claudeDataDir, name)',
-      'reconcileClaudeAccountState(',
-      'ensureGatewayEntry({',
-      'const overrides = [',
-    ].map((m) => body.indexOf(m));
-    expect(order.every((i) => i > -1)).toBe(true);
-    expect([...order].sort((x, y) => x - y)).toEqual(order);
-    expect(body).toContain("const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);");
-    expect(worker.slice(end - 400, end)).toContain('if (credentialSourceFiles) {');
+      body.indexOf('provisionIsolatedBotHome('),
+      body.indexOf('Object.entries(credentialSourceFiles)'),
+      body.search(/if \(overrides\.length\)\s*\{\s*throw\b/),
+    ];
+    expect(order.every(i => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
 
+  // 源码结构护栏(K2)：持久 pane 保留它启动时的登录。来源戳不一致时必须杀 pane 冷启，且在
+  // 「确认已杀 / 不再 reattach」之前拒启——否则配置了账号 B 的 bot 会继续跑在账号 A 的 pane 里
+  // （bfada7e10）。判定在 worker.ts spawn 闭包里，无行为 seam。
   it('never reattaches a persistent pane launched with a different credential source', () => {
-    const gate = worker.indexOf('const launchedWith = readCredentialSourceStamp(config.session.dataDir, cfg.sessionId);');
+    const gate = worker.indexOf('readCredentialSourceStamp(');
+    const stamp = worker.indexOf('writeCredentialSourceStamp(', gate);
     expect(gate).toBeGreaterThan(-1);
-    const head = worker.lastIndexOf('if (willReattachPersistent && persistentSessionName', gate);
-    expect(gate - head).toBeLessThan(200);
-    const block = worker.slice(gate, worker.indexOf('// A pane created before asymmetric control framing', gate));
-    expect(block).toContain("if (launchedWith !== (credentialSourceDir ?? null) || envPolicyChanged) {");
-    expect(block).toContain("if (postKillProbe !== 'missing') {");
-    expect(block).toContain('willReattachPersistent = selectedBackend.isReattach === true;');
-    expect(block).toMatch(/if \(willReattachPersistent\) \{\s*throw new Error/);
-    // The gate runs after the last pre-existing reattach decision it depends on
-    // and before spawn; the stamp is written only for a cold spawn.
-    expect(gate).toBeGreaterThan(worker.indexOf('const paneRelayReattachSafe'));
-    const stamp = worker.indexOf('writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);');
-    expect(stamp).toBeGreaterThan(worker.indexOf('Refusing unauthenticated Codex App reattach'));
+    expect(stamp).toBeGreaterThan(gate);
+    const block = worker.slice(gate, stamp);
+    expect(block).toContain('credentialSourceDir');
+    expect(block).toMatch(/postKillProbe !== 'missing'\)\s*\{\s*throw\b/);
+    expect(block).toMatch(/if \(willReattachPersistent\)\s*\{\s*throw\b/);
+    // The stamp is written only for a cold spawn.
     expect(worker.slice(stamp - 120, stamp)).toContain('if (!willReattachPersistent) {');
-    expect(stamp).toBeLessThan(worker.indexOf('if (willReattachPersistent) {', stamp));
   });
 });

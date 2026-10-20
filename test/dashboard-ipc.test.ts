@@ -216,6 +216,9 @@ afterEach(async () => {
   else process.env.BOTMUX_COORDINATION_MODE = ORIGINAL_COORDINATION_MODE;
   setTurnResultRuntime(undefined);
   clearMessageListenerRunPreviewStore();
+  // Restart attempts live in a module-level coordinator; never let one test's
+  // in-flight attempt make a later restart of the same session id "join".
+  workerPool.__testOnly_resetRestartCoordinator();
 });
 
 describe('dashboard IPC server', () => {
@@ -3069,6 +3072,68 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
   });
 });
 
+describe('PUT /api/bot-card-prefs — senderTagHideEmail (<sender> 注入开关)', () => {
+  it('defaults off and persists hiding independently of the master switch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sender-tag-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-sender-tag-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }, { larkAppId: 'email-other-app', larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ senderTagHideEmail: false });
+
+      const enabled = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ senderTagHideEmail: true }),
+      });
+      expect(enabled.status).toBe(200);
+      expect(await enabled.json()).toMatchObject({ ok: true, senderTagHideEmail: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ senderTagHideEmail: true });
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ senderTagHideEmail: true });
+
+      expect(getBot(appId).config.senderTagHideEmail).toBe(true);
+      expect(loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+      expect(getBot('email-other-app').config.senderTagHideEmail).toBeUndefined();
+      expect(loadBotConfigs()[1].senderTagHideEmail).toBeUndefined();
+      for (const senderTag of [false, true]) {
+        const response = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ senderTag }),
+        });
+        expect(await response.json()).toMatchObject({ senderTag, senderTagHideEmail: true });
+      }
+
+      const disabled = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ senderTagHideEmail: false }),
+      });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ ok: true, senderTagHideEmail: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].senderTagHideEmail).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-p2p-open-'));
@@ -4087,9 +4152,6 @@ describe('GET /api/sessions', () => {
   });
 
   it('does not scan transcripts while composing the bulk sessions list', async () => {
-    const ipcSource = readFileSync(join(process.cwd(), 'src/core/dashboard-ipc-server.ts'), 'utf8');
-    expect(ipcSource).toContain('composeDashboardSessionRows({ includeTokenUsage: false })');
-
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-token-list-'));
     const prevConfigDataDir = config.session.dataDir;
     const usageSpy = vi.spyOn(costCalculator, 'getSessionTokenUsage').mockImplementation(() => {
@@ -4649,7 +4711,9 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
-    expect(send).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
+    // Correlated through the restart coordinator (#1863): the attemptId-matched
+    // restart_result is what lifts the workerReady fence after the respawn.
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'operator' });
     findSpy.mockRestore();
   });
 
@@ -6511,13 +6575,6 @@ describe('GET /api/schedules/:id/logs', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-
-  it('keeps the central proxy owner-routed and preserves the complete query string', () => {
-    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(source).toContain("url.pathname.match(/^\\/api\\/schedules\\/([^/]+)\\/logs$/)");
-    expect(source).toContain('const owner = resolveScheduleOwner(id);');
-    expect(source).toContain('`/api/schedules/${encodeURIComponent(id)}/logs${url.search}`');
-  });
 });
 
 describe('POST /api/schedules/precondition/test', () => {
@@ -6613,13 +6670,6 @@ describe('POST /api/schedules/precondition/test', () => {
       scheduleStore.setScheduleScope('cli_ipc_test_bot001');
       rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  it('keeps the central proxy management-only and routes by larkAppId without a task id', () => {
-    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(source).toContain("url.pathname === '/api/schedules/precondition/test'");
-    expect(source).toContain("proxyToDaemon(larkAppId, '/api/schedules/precondition/test'");
-    expect(source).toContain("if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });");
   });
 });
 
@@ -11924,5 +11974,60 @@ describe('host interaction context observation', () => {
       expect((await query()).json.context.canTalk).toBe(false);
       expect(permitted.bodyText).not.toContain('forged');
     } finally { workerPool.setActiveSessionsRegistry(previous ?? new Map()); }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — reply footer master and blocks', () => {
+  it('validates booleans and preserves saved blocks while the master is disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-footer-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-footer-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', brandLabel: 'KEEP', replyFooterModel: false }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const disabled = await save({ replyFooterEnabled: false, replyFooterUsage: false, showReplyTiming: true });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ ok: true, replyFooterEnabled: false, replyFooterModel: false, replyFooterUsage: false, showReplyTiming: true });
+      const invalid = await save({ replyFooterEnabled: 'true', replyFooterModel: true });
+      expect(invalid.status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ replyFooterEnabled: false, replyFooterModel: false });
+      const enabled = await save({ replyFooterEnabled: true });
+      expect(enabled.status).toBe(200);
+      const readback = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(readback).toMatchObject({ replyFooterModel: false, replyFooterUsage: false, showReplyTiming: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ replyFooterModel: false, replyFooterUsage: false, brandLabel: 'KEEP' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('GET /api/sessions/:sessionId/reply-render-snapshot', () => {
+  it('passes exact turn and attempt to the independent render snapshot contract', async () => {
+    const ds = { session: { sessionId: 's-render' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const snapshot = { usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: false }, timing: { executionDurationMs: 4000, executionInProgress: true } };
+    const renderSpy = vi.spyOn(workerPool, 'getDaemonReplyCardRenderSnapshot').mockReturnValue(snapshot);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}/api/sessions/s-render/reply-render-snapshot`;
+      const response = await fetch(`${base}?turnId=om_exact&dispatchAttempt=2`);
+      expect(await response.json()).toEqual({ snapshot });
+      expect(renderSpy).toHaveBeenCalledWith(ds, { turnId: 'om_exact', dispatchAttempt: 2 });
+      const invalid = await fetch(`${base}?turnId=om_exact&dispatchAttempt=NaN`);
+      expect(invalid.status).toBe(400);
+      findSpy.mockReturnValue(undefined);
+      expect((await fetch(base)).status).toBe(404);
+    } finally { findSpy.mockRestore(); renderSpy.mockRestore(); }
   });
 });

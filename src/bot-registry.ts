@@ -1,3 +1,4 @@
+import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -1647,6 +1648,8 @@ export interface BotConfig {
    * discoverable together.
    */
   senderTag?: boolean;
+  /** Omit only email from prompt sender tags; keep daemon identity intact. Default false. */
+  senderTagHideEmail?: boolean;
   /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
@@ -1682,9 +1685,12 @@ export interface BotConfig {
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
    * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
-   * `bytedcli` run as the person who sent the current message, and a sender who
-   * has not authorized gets the bot's own tenant identity (or a failure, per
-   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   * `bytedcli` run as the person who sent the current message; a sender who has
+   * not authorized gets a refusal carrying an authorization link — never the
+   * bot's, the owner's or anyone else's login. `credentialSource` picks where
+   * that person's credentials come from (central platform / this machine); on a
+   * platform-bound machine the link points at the platform and no machine-local
+   * device login is started. See services/trigger-user-auth.ts.
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
@@ -2082,6 +2088,13 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  replyFooterEnabled?: boolean;
+  replyFooterBrand?: boolean;
+  replyFooterModel?: boolean;
+  replyFooterUsage?: boolean;
+  replyFooterRecipients?: boolean;
+  replyFooterVoice?: boolean;
+
   /** Show per-turn waiting and native execution time on final reply cards. Default off. */
   showReplyTiming?: boolean;
   tuiSlashAllow?: string[];
@@ -4105,6 +4118,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
@@ -4117,6 +4131,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
+      senderTagHideEmail: entry.senderTagHideEmail === true ? true : undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
         ? (() => {
           const filtered = entry.noPinStreamingCardChats
@@ -4273,4 +4288,24 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
  */
 export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
   return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
+}
+
+/** Live registry first, disk second, own-bot spawn snapshot for isolated sends. */
+export function resolveReplyFooterPreferences(larkAppId: string): ReplyFooterPreferences {
+  const registered = bots.get(larkAppId);
+  if (registered) return normalizeReplyFooter(registered.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const entries = JSON.parse(readFileSync(path, 'utf-8'));
+      if (Array.isArray(entries)) {
+        const entry = entries.find(e => e?.larkAppId === larkAppId);
+        if (entry) return normalizeReplyFooter(entry);
+      }
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId) {
+    return parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER);
+  }
+  return {};
 }

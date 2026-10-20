@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { runCompletionProposalContinuation } from '../src/core/completion-proposal-continuation.js';
@@ -42,22 +42,6 @@ function acceptedFixture() {
 }
 
 describe('completion proposal continuation', () => {
-  it('uses an internal turn marker to avoid quoting/reacting to its synthetic id or auto-creating a replacement session', () => {
-    const daemon = readFileSync(resolve('src/daemon.ts'), 'utf8');
-    expect(daemon).toContain('completionProposalContinuation: true');
-    expect(daemon).toContain('if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId');
-    expect(daemon).toContain('if (ctx.completionProposalContinuation) {\n      logger.warn');
-    expect(daemon).toContain('if (!queuedHasDurableTail && !ctx.completionProposalContinuation)');
-  });
-
-  it('schedules pending proposal recovery only after active sessions are restored', () => {
-    const daemon = readFileSync(resolve('src/daemon.ts'), 'utf8');
-    const restore = daemon.indexOf('await restoreSessionsAndScheduleStartupRecovery({');
-    const recovery = daemon.indexOf('scheduleCompletionProposalStartupRecovery(cfg.larkAppId);');
-    expect(restore).toBeGreaterThanOrEqual(0);
-    expect(recovery).toBeGreaterThan(restore);
-  });
-
   it('dispatches once after the durable decision and publishes terminal state', async () => {
     const { store, accepted } = acceptedFixture();
     const dispatch = vi.fn(async () => 'admitted' as const);

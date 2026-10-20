@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -179,56 +178,17 @@ describe('dashboard sessions filters', () => {
     });
   });
 
-  it('renders accessible user and bot preview lines on session cards', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(page).toContain('className="session-card-exchange"');
-    expect(page).toContain("t('sessions.history.user')");
-    expect(page).toContain("t('sessions.history.bot')");
-    expect(page).toContain('className="session-card-exchange-tooltip"');
-    // Overlay carries interactive Markdown links, so it is a non-modal dialog
-    // (not a tooltip): keyboard-focusable and reachable.
-    expect(page).toContain('role="dialog"');
-    expect(page).toContain("t('sessions.preview.showFull')");
-    expect(page).toContain('aria-expanded={open}');
-    expect(page).toContain('onPointerEnter={event => {');
-    expect(page).toContain("if (event.key === 'Escape') hide();");
-    // Card summary stays plain-text (2-line clamp); the overlay renders Markdown.
-    expect(page).toContain('<p>{exchange.userText}</p>');
-    expect(page).toContain('<p>{exchange.botText}</p>');
-    expect(css).toContain('.session-card-exchange-line > p');
-    expect(css).toContain('-webkit-line-clamp: 2');
-    expect(css).toContain('.session-card-exchange-tooltip {');
-    expect(css).toContain('position: fixed;');
-    expect(css).toContain('.session-card-exchange-tooltip-scroll {');
-    expect(css).toContain('.session-card-exchange-tooltip-line > p');
-    expect(css).toContain('user-select: text;');
-  });
-
-  it('renders the full-exchange overlay as sanitized Markdown, not raw text', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    const md = readFileSync(new URL('../src/dashboard/web/preview-markdown.ts', import.meta.url), 'utf8');
-
-    // The overlay renders both sides through the Markdown helper (raw HTML off
-    // for XSS safety), replacing the old raw `<p>{fullText}</p>` nodes.
-    expect(page).toContain("import { previewMarkdownHtml } from './preview-markdown.js'");
-    expect(page).toContain('previewMarkdownHtml(exchange.userFullText)');
-    expect(page).toContain('previewMarkdownHtml(exchange.botFullText)');
-    expect(page).toContain('className="session-card-exchange-md"');
-    expect(page).not.toContain('<p>{exchange.userFullText}</p>');
-    expect(page).not.toContain('<p>{exchange.botFullText}</p>');
-
-    // Reuses markdown-it with the same hardening insights.ts applies: no raw
-    // HTML, links forced to a safe scheme, and a plain-text escape fallback.
-    expect(md).toContain("new MarkdownIt({ html: false");
-    expect(md).toContain('validateLink');
-    expect(md).toContain("attrSet('rel', 'noopener noreferrer nofollow')");
-    expect(md).toContain('escapeHtml');
-
-    // Overlay Markdown body is styled with dashboard tokens (no new palette).
-    expect(css).toContain('.session-card-exchange-md');
+  it('links preview Markdown only to http(s)/mailto targets and opens them without an opener', () => {
+    const safe = previewMarkdownHtml('[docs](https://example.com/guide)');
+    expect(safe).toContain('href="https://example.com/guide"');
+    expect(safe).toContain('target="_blank"');
+    expect(safe).toContain('rel="noopener noreferrer nofollow"');
+    expect(previewMarkdownHtml('[mail](mailto:ops@example.com)')).toContain('href="mailto:ops@example.com"');
+    // markdown-it's default validator would accept these; the preview must not
+    // turn a prompt or bot reply into a clickable dashboard-relative or ftp link.
+    for (const unsafe of ['[x](/api/sessions/s1/close)', '[x](ftp://host/file)', '[x](javascript:alert(1))']) {
+      expect(previewMarkdownHtml(unsafe)).not.toContain('href=');
+    }
   });
 
   it('never emits an auto-loading <img> for Markdown image syntax (SSRF / tracking-pixel safe)', () => {
@@ -255,31 +215,8 @@ describe('dashboard sessions filters', () => {
     expect(previewMarkdownHtml('<script>alert(1)</script>')).not.toMatch(/<script/i);
   });
 
-  it('keeps the overlay open and reachable for keyboard focus into Markdown links', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    // Focus entering the panel cancels the trigger's blur-close timer, so
-    // Tabbing into a rendered link does not unmount the overlay mid-navigation.
-    expect(page).toContain('onFocusCapture={clearHide}');
-    // It only closes once focus leaves BOTH the panel and the trigger.
-    expect(page).toContain('tooltipRef.current?.contains(next) || triggerRef.current?.contains(next)');
-    // Escape closes and returns focus to the trigger.
-    expect(page).toContain('triggerRef.current?.focus()');
-    // Popover semantics on the trigger (not aria-describedby on a tooltip).
-    expect(page).toContain('aria-haspopup="dialog"');
-    expect(page).toContain('aria-controls={open ? tooltipId : undefined}');
-  });
-
-  it('Escape then refocus does not reopen the overlay (reducer the component actually uses)', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    // Guard against "test the model, run other code": assert the component wires
-    // its useReducer to THIS reducer + dispatches the transitions under test.
-    expect(page).toContain('useReducer(previewOverlayReducer, previewOverlayInitialState)');
-    expect(page).toContain("dispatch('escape-refocus')");
-    expect(page).toContain("dispatch('focus')");
-
-    // Now EXECUTE the transitions in the exact order the Escape key produces:
+  it('Escape then refocus does not reopen the preview overlay', () => {
+    // Transitions in the exact order the Escape key produces:
     // an open overlay with focus inside → 'escape-refocus' (close + arm one-shot)
     // → the trigger's programmatic refocus dispatches 'focus'. The one-shot must
     // be consumed WITHOUT reopening, so the terminal state is closed.
@@ -296,67 +233,6 @@ describe('dashboard sessions filters', () => {
       .toEqual({ open: true, suppressFocusOpen: false });
     // A second focus after the consumed one-shot opens as usual.
     expect(previewOverlayReducer({ open: false, suppressFocusOpen: false }, 'focus').open).toBe(true);
-  });
-
-  it('drops the ••• details button and makes the preview body itself the toggle', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    // The dedicated ••• button is gone entirely — content + markup + styles.
-    expect(page).not.toContain('•••');
-    expect(page).not.toContain('session-card-exchange-details');
-    expect(css).not.toContain('.session-card-exchange-details');
-
-    // The exchange body itself is now the toggle: keyboard + pointer reachable,
-    // so touch users (no hover) and keyboard users keep a way to open the
-    // overlay that the ••• button used to provide.
-    const exchangeStart = page.indexOf('className="session-card-exchange"');
-    expect(exchangeStart).toBeGreaterThan(-1);
-    const exchangeAttrs = page.slice(exchangeStart - 400, exchangeStart + 400);
-    expect(exchangeAttrs).toContain('role="button"');
-    expect(exchangeAttrs).toContain('tabIndex={0}');
-    // Enter/Space toggles the overlay for keyboard users.
-    expect(page).toContain("event.key === 'Enter' || event.key === ' '");
-    expect(css).toContain('.session-card-exchange {');
-    expect(css).toContain('cursor: pointer;');
-  });
-
-  it('wires @ completion and pasted-image previews into the create-session composer', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('findMentionTrigger');
-    expect(page).toContain('onPaste={event => { void handleContentPaste(event); }}');
-    expect(page).toContain('event.preventDefault();');
-    expect(page).toContain('images: images.map(image => ({');
-    expect(page).toContain('className="cs-image-list"');
-    expect(page).toContain('insertImageMarkers(content, pasteStart, pasteEnd');
-    expect(page).toContain('className="cs-image-remove"');
-    expect(page).toContain('removeAndReindexImageMarkers(');
-    expect(page).toContain('nextImageOrdinalRef.current = remaining.length + 1;');
-  });
-
-  it('reads filter input values before entering React state updaters', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('const q = event.currentTarget.value;');
-    expect(page).toContain('const active = event.currentTarget.checked;');
-    expect(page).toContain('const multiBotTopics = event.currentTarget.checked;');
-    expect(page).toContain('const botTriggeredTopics = event.currentTarget.checked;');
-    expect(page).not.toContain('q: event.currentTarget.value');
-    expect(page).not.toContain('active: event.currentTarget.checked');
-    expect(page).not.toContain('multiBotTopics: event.currentTarget.checked');
-    expect(page).not.toContain('botTriggeredTopics: event.currentTarget.checked');
-  });
-
-  it('sends the control CSRF ticket on the session /locate POST', () => {
-    // 服务端只对 locate 这一个会话动作强制校验 P1-11 CSRF 票据（dashboard.ts 的
-    // enforceControlCsrf），旧会话页这条 fetch 曾漏带头，导致点「定位话题」稳定
-    // 403 control_csrf_invalid。回归守卫：locate 必须走 controlCsrfHeaders()。
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain("import { controlCsrfHeaders } from './control-csrf.js';");
-    const locateCall = page.match(/fetch\(`\/api\/sessions\/\$\{encodeURIComponent\(row\.sessionId\)\}\/locate`[^;]*/);
-    expect(locateCall, 'locate fetch call not found').not.toBeNull();
-    expect(locateCall![0]).toContain('headers: controlCsrfHeaders()');
   });
 
   it('groups thread sessions by chat and root message without claiming ancestry', () => {

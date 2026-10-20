@@ -255,6 +255,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | Field | Description |
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
+| `senderTagHideEmail` | Boolean, default `false` (off). Omits only the `email` attribute from newly built `<sender>` tags, retaining name, ID and type. Saved independently of `senderTag`; does not change identity caches, authorization or `--mention-back`, nor scrub queued inputs, history or message text. Hot-update with `/botconfig set senderTagHideEmail on\|off` |
 | `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
 
 ### `replyDelivery: "transcript"`
@@ -478,3 +479,22 @@ Strict mode covers Botmux-owned PTY, tmux, tmux-pipe, zellij, zmx, local Codex/T
 Herdr, Riff, Mojo, Forge launch mode, adopted processes and externally owned App Servers cannot currently establish this boundary, so strict mode refuses those paths. Shells/profiles deliberately invoked by a CLI, credential/config files, OS file permissions and cloud identities remain outside this feature. Per-bot CODEX_HOME, codexAuthSync and file sandbox behavior remain independent.
 
 Dashboard reads only configured names. Its env form is write-only: saving replaces the complete map and saving blank clears it. Strict sessions do not return credential-bearing reproduction commands. Diagnostics show names/policy only. Explicit bot values are still plaintext in bots.json and process environments; this is not a secret vault.
+
+
+## Reply card footer
+
+Dashboard → Bot configuration → Message cards exposes a Footer master switch and independent block switches. They are also available through `/botconfig set <field> on|off`.
+
+| Field | Default | Scope |
+| --- | --- | --- |
+| `replyFooterEnabled` | `true` | Entire reply footer, including divider and voice button |
+| `replyFooterBrand` | `true` | Brand signature, still subject to the global brand switch and `brandLabel` |
+| `replyFooterModel` | `true` | Model, reasoning effort and backend variant |
+| `replyFooterUsage` | `true` | Footer usage, only when `usageDisplay` is `"footer"` |
+| `replyFooterRecipients` | `true` | Footer recipients and their @ notifications; explicit body mentions remain unchanged |
+| `replyFooterVoice` | `true` | Voice summary button when voice is configured |
+| `showReplyTiming` | `false` | Waiting time plus execution until reply for normal sends, or final execution duration for terminal fallback; unknown measurements are omitted |
+
+The master takes precedence without clearing block settings or signature text. Blocks remain editable while disabled; re-enabling restores the last saved choices. When all available blocks are hidden or empty and there is no voice button, the footer and divider are omitted. Status cards, accounting and model execution parameters are unchanged. User-authored custom card content remains intact; only Botmux-generated footers are controlled.
+
+Dashboard and `/botconfig` changes apply to subsequent new replies without restarting. Existing cards are not rewritten; final-output retries keep their first-render settings snapshot. Isolated or remote env-only sends without config or daemon access use the session spawn snapshot; recreate those sessions to refresh it. Restart after manually editing `bots.json` to synchronize the daemon.

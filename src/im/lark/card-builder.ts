@@ -2796,10 +2796,10 @@ export interface AdoptPickerEntry {
   cliId?: CliId;
   cliDisplayName?: string;
   /** resume: the CLI's native title when the transcript has one, else the
-   *  first real user prompt (see ResumableSession.title); live: backend
-   *  display name (herdr pane label / Claude terminal title, see
-   *  AdoptableSession.title), else project (cwd basename). zellij always uses
-   *  project. */
+   *  first real user prompt (see ResumableSession.title); live: backend /
+   *  CLI display name (herdr pane label / Claude terminal title / TraeX native
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title), else
+   *  project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2857,7 +2857,7 @@ export function buildAdoptEntries(
       kind: 'live' as const,
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: (!zellij && s.title) || project,
+      title: s.title || project,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,

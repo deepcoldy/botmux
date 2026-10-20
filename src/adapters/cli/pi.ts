@@ -379,6 +379,10 @@ export function createPiAdapter(
     supportsProgramStatus: true,
     systemHints: [],
     altScreen: true,
+    // Pi >= 1.0 defaults to fullscreen mode, where Pi owns the transcript and
+    // xterm/tmux have no usable scrollback. Let read-only Web Terminal viewers
+    // use the worker's validated, rate-limited SGR wheel-only path.
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.pi/agent/skills',
   };
 }

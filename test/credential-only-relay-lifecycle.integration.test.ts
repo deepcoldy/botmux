@@ -55,6 +55,10 @@ function createLab(opts: LabOptions) {
   writeFileSync(bots, JSON.stringify([{ larkAppId: 'app_probe', larkAppSecret: '', apiOnly: true, cliId: opts.cliId }]));
   const report = join(dir, 'report.jsonl');
   const script = join(dir, 'fake-cli');
+  // Pin the extensionless script to CommonJS: a stray ancestor package.json
+  // with "type": "module" (e.g. another process's file in /tmp) would
+  // otherwise flip it to ESM and the CLI would die on `require`.
+  writeFileSync(join(dir, 'package.json'), '{"type":"commonjs"}\n');
   writeFileSync(script, `#!/usr/bin/env node
 const fs = require('node:fs');
 if (process.argv.includes('--version')) { console.log(${JSON.stringify(opts.version)}); process.exit(); }
@@ -135,6 +139,8 @@ console.log('Ready >'); setInterval(() => {}, 1 << 30);
       return { worker, logs: () => logs };
     },
     async stop(worker: ChildProcess, how: 'SIGTERM' | 'close'): Promise<void> {
+      // A worker that already exited (e.g. a failed launch) has no IPC channel.
+      if (worker.exitCode !== null || worker.signalCode !== null) { workers.delete(worker); return; }
       const exited = once(worker, 'exit');
       if (how === 'close') worker.send({ type: 'close' });
       else worker.kill('SIGTERM');

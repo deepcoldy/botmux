@@ -12,7 +12,8 @@
  *
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import {
   beginReplyTargetTurn,
   buildTurnParticipantsFrom,
@@ -28,7 +29,6 @@ import {
   resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
-import { readFileSync } from 'node:fs';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -615,33 +615,37 @@ describe('cron task reply anchors (daemon-side mirror)', () => {
     expect(shuffled.anchors.jobB.createdAtMs).toBe(1000);
   });
 
-  it('worker-pool wires the snapshot IPC into reconcile + persistence (source contract)', () => {
-    // Pins the daemon half of the round-4 wiring: the IPC case must reconcile
-    // the worker snapshot onto the session and persist it, so subsequent
-    // beginReplyTargetTurn prunes see the exemptions.
-    const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    const caseStart = source.indexOf("case 'cron_task_anchors_sync'");
-    expect(caseStart).toBeGreaterThan(0);
-    const caseBody = source.slice(caseStart, source.indexOf('case ', caseStart + 10));
-    expect(caseBody).toContain('reconcileCronTaskReplyAnchors');
-    expect(caseBody).toContain('cronTaskReplyAnchors');
-    expect(caseBody).toContain('sessionStore.updateSession(ds.session)');
-    // The union member exists with the full-snapshot shape.
-    const types = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
-    expect(types).toMatch(/cron_task_anchors_sync';\s*anchors:\s*Array<\{\s*taskId:\s*string;\s*turnId:\s*string\s*\|\s*null\s*\}>/);
-    // Session carries the persisted mirror.
-    expect(types).toMatch(/cronTaskReplyAnchors\?:\s*Record<string,\s*\{\s*turnId:\s*string\s*\|\s*null;\s*createdAtMs:\s*number\s*\}>/);
-  });
-
-  it('worker sends the snapshot on ack and after disk restore (source contract)', () => {
-    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    expect(source).toMatch(/function syncCronTaskAnchorsToDaemon\(\): void \{[\s\S]*?send\(\{\s*type: 'cron_task_anchors_sync'/);
-    // The one-shot restore must re-assert pins even when the file is empty.
-    const restoreFn = source.slice(
-      source.indexOf('function restoreScheduledTaskAnchorsOnce('),
-      source.indexOf('function journalBridgeTurnMark('),
-    );
-    expect(restoreFn).toContain('syncCronTaskAnchorsToDaemon()');
+  it('the daemon mirrors a worker anchor snapshot onto the session and persists it', async () => {
+    const { __testOnly_setupWorkerHandlers, initWorkerPool } = await import('../src/core/worker-pool.js');
+    const sessionStore = await import('../src/services/session-store.js');
+    const { registerBot, __testOnly_resetBotRegistry } = await import('../src/bot-registry.js');
+    registerBot({ larkAppId: 'cli_anchor', larkAppSecret: 'secret', cliId: 'claude-code' });
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_card'), getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const persisted: unknown[] = [];
+    const persist = vi.spyOn(sessionStore, 'updateSession')
+      .mockImplementation(session => { persisted.push(structuredClone(session.cronTaskReplyAnchors)); });
+    try {
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false, send: vi.fn(), kill: vi.fn(), pid: 4242, stdout: new EventEmitter(), stderr: new EventEmitter(),
+      });
+      const ds = {
+        session: { sessionId: 'cron-anchor-sync', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group' },
+        worker, larkAppId: 'cli_anchor', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
+      } as unknown as DaemonSession;
+      __testOnly_setupWorkerHandlers(ds, worker as any);
+      worker.emit('message', { type: 'cron_task_anchors_sync',
+        anchors: [{ taskId: 'jobA', turnId: 'om_A' }, { taskId: 'jobB', turnId: null }, { bogus: true }] });
+      const expected = {
+        jobA: { turnId: 'om_A', createdAtMs: expect.any(Number) },
+        jobB: { turnId: null, createdAtMs: expect.any(Number) },
+      };
+      expect(ds.session.cronTaskReplyAnchors).toEqual(expected);
+      expect(persisted.at(-1)).toEqual(expected);
+    } finally {
+      persist.mockRestore();
+      __testOnly_resetBotRegistry();
+    }
   });
 });
 

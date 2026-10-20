@@ -435,6 +435,16 @@ function linuxBaseline(h: string): FsRule[] {
   ];
 }
 
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
+}
+
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**

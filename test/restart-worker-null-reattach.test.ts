@@ -13,27 +13,42 @@
  *       destroySession()/kill() (neither clears the callback nor awaits the
  *       in-flight fetch). The worker's onTaskDone hook must therefore drop a
  *       callback from a superseded backend generation. This asserts the
- *       backend-side hazard (callback fires post-kill) and the worker-side
- *       generation fence wiring.
+ *       backend-side hazard (callback fires post-kill).
  *
- * worker.ts installs process-wide IPC/services at import time, so its wiring is
- * pinned by source-structure assertions (same approach as
- * worker-restart-race.test.ts / worker-app-runner-control-wiring.test.ts). The
- * P1 adopt decision is exercised as a pure predicate.
+ * The P1 restart is driven through the real requestSessionRestart with the
+ * persistent-backend primitives stubbed; the P2 hazard is reproduced on a real
+ * RiffBackend. (The worker-side generation fence lives in worker.ts and has no
+ * unit seam.)
  *
  * Run:  pnpm vitest run test/restart-worker-null-reattach.test.ts
  */
-import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+// The no-worker restart branch: observe the pane teardown through the
+// persistent-backend primitives and the fork attempt at forkWorker's first
+// external call (the device-isolation spawn gate), which defers instead of
+// spawning a real worker process.
+const paneEvents: string[] = [];
+const paneTarget: { current: unknown } = { current: undefined };
+const paneMocks = vi.hoisted(() => ({ kill: vi.fn(), probe: vi.fn(), deferSpawn: vi.fn() }));
+vi.mock('../src/core/persistent-backend.js', async (importOriginal) => ({
+  ...(await importOriginal() as object),
+  persistentBackendTargetForSession: () => paneTarget.current,
+  killPersistentBackendTarget: paneMocks.kill,
+  probePersistentBackendTarget: paneMocks.probe,
+}));
+vi.mock('../src/core/device-isolation-activation.js', async (importOriginal) => ({
+  ...(await importOriginal() as object),
+  currentDeviceIsolationFreezeLease: () => null,
+  deferWorkerSpawnDuringDeviceIsolation: paneMocks.deferSpawn,
+}));
+
 import { RiffBackend } from '../src/adapters/backend/riff-backend.js';
 
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
 
 // ─── P1: pure adopt-skip decision ───────────────────────────────────────────
 
@@ -76,88 +91,65 @@ describe('P1 shouldDestroyPaneBeforeRestart (pure decision)', () => {
   });
 });
 
-// ─── P1: worker-pool wiring (kill BEFORE fork, no-worker branch only) ─────────
+// ─── P1: no-worker restart tears the pane down BEFORE forking (behavioral) ────
 
-describe('P1 requestSessionRestart wiring', () => {
-  it('destroys the live pane before forking in the no-worker branch', () => {
-    const fn = workerPoolSource.indexOf('export function requestSessionRestart');
-    expect(fn).toBeGreaterThanOrEqual(0);
-    const body = workerPoolSource.slice(fn, workerPoolSource.indexOf('\n}', fn) + 2);
+describe('P1 requestSessionRestart without a live worker', () => {
+  const target = { backendType: 'tmux', sessionName: 'bmx-null-reattach' };
+  let probes: string[];
 
-    // Live-worker branch still sends the in-worker restart IPC — now also
-    // carrying the latest per-bot env AND model (config edits apply on /restart).
-    expect(body).toContain(
-      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) }",
-    );
-
-    // No-worker branch: pane teardown MUST precede forkWorker.
-    const destroy = body.indexOf('destroyLivePaneBeforeRestart(ds)');
-    const fork = body.indexOf('forkWorker(ds');
-    expect(destroy).toBeGreaterThan(0);
-    expect(fork).toBeGreaterThan(destroy);
+  beforeEach(() => {
+    paneEvents.length = 0;
+    probes = [];
+    paneTarget.current = target;
+    paneMocks.kill.mockReset().mockImplementation(() => { paneEvents.push('kill'); });
+    paneMocks.probe.mockReset().mockImplementation(() => {
+      paneEvents.push('probe');
+      return probes.shift() ?? 'missing';
+    });
+    paneMocks.deferSpawn.mockReset().mockImplementation(() => { paneEvents.push('fork'); return true; });
   });
 
-  it('destroyLivePaneBeforeRestart kills a resolved persistent target and probe-retries on survival', () => {
-    const fn = workerPoolSource.indexOf('function destroyLivePaneBeforeRestart');
-    expect(fn).toBeGreaterThanOrEqual(0);
-    const body = workerPoolSource.slice(fn, fn + 2800);
-    expect(body).toContain('shouldDestroyPaneBeforeRestart(ds)');
-    expect(body).toContain('persistentBackendTargetForSession(ds)');
-    expect(body).toContain('killPersistentBackendTarget(target, ds.session.sessionId)');
-    // No target (e.g. PTY/riff/legacy-unstamped) → no-op, never throws.
-    expect(body).toContain('if (!target) return;');
+  async function restartWithoutWorker(extra: Record<string, unknown> = {}) {
+    const { requestSessionRestart, __testOnly_resetRestartCoordinator } = await import('../src/core/worker-pool.js');
+    __testOnly_resetRestartCoordinator();
+    const ds: any = { session: { sessionId: `null-reattach-${Math.random()}` }, larkAppId: 'cli_app', hasHistory: true, ...extra };
+    const result = requestSessionRestart(ds, { source: 'slash', notify: vi.fn(async () => {}) } as any);
+    __testOnly_resetRestartCoordinator();
+    return result;
+  }
 
-    // Fail-safe (codex 复审): the kill primitives swallow their own failures, so
-    // a bare try/catch can't detect a failed kill. Must PROBE after killing.
-    expect(body).toContain('probePersistentBackendTarget(target)');
-    // A confirmed survivor after retry escalates to a loud error (not silent).
-    expect(body).toContain('logger.error');
-    expect(body).toMatch(/STILL alive after retry/);
-
-    // Monotonic single-probe (codex 复审): the retry re-probe happens ONLY
-    // inside the `exists` branch, so an 'unknown' first probe is never
-    // mislabelled as a post-retry survivor. Guard against reintroducing an
-    // unconditional second probe: exactly two probe calls, the second nested in
-    // the exists branch.
-    const probeCalls = body.match(/probePersistentBackendTarget\(target\)/g) ?? [];
-    expect(probeCalls.length).toBe(2);
-    const existsBranch = body.indexOf("if (probe === 'exists') {");
-    const retryProbe = body.indexOf('probe = probePersistentBackendTarget(target);', existsBranch);
-    const secondExistsCheck = body.indexOf("if (probe === 'exists') {", existsBranch + 1);
-    expect(existsBranch).toBeGreaterThan(0);
-    expect(retryProbe).toBeGreaterThan(existsBranch);
-    // The re-probe is assigned before the second exists check evaluates it.
-    expect(secondExistsCheck).toBeGreaterThan(retryProbe);
-
-    // Three-state diagnostic (codex 复审): the terminal log must NOT lump
-    // 'unknown' in with 'missing' — 'missing' promises a relaunch, 'unknown'
-    // must only warn that a reattach is still possible, 'exists' errors. This
-    // keeps the diagnostic from lying (the whole point of the fix).
-    expect(body).toContain("} else if (probe === 'unknown') {");
-    expect(body).toMatch(/kill outcome indeterminate/);
-    expect(body).toMatch(/pane missing after kill — CLI will physically relaunch/);
-    // Ordering: error(exists) → warn(unknown) → info(missing).
-    const errIdx = body.indexOf('logger.error');
-    const warnIndeterminate = body.indexOf('kill outcome indeterminate');
-    const infoMissing = body.indexOf('pane missing after kill');
-    expect(errIdx).toBeGreaterThan(0);
-    expect(warnIndeterminate).toBeGreaterThan(errIdx);
-    expect(infoMissing).toBeGreaterThan(warnIndeterminate);
+  it('kills and confirms the live pane gone before the fresh fork', async () => {
+    const result = await restartWithoutWorker();
+    expect(result?.startFailure).toBeUndefined();
+    expect(paneEvents).toEqual(['kill', 'probe', 'fork']);
+    expect(paneMocks.kill).toHaveBeenCalledWith(target, expect.stringMatching(/^null-reattach-/));
   });
 
-  it('probe survival does NOT block the refork (stranding is worse than the guarded bug)', () => {
-    // The helper only logs on a surviving pane — it never returns early in a way
-    // that would skip forkWorker. requestSessionRestart always reaches forkWorker
-    // after destroyLivePaneBeforeRestart regardless of probe outcome.
-    const fn = workerPoolSource.indexOf('export function requestSessionRestart');
-    const body = workerPoolSource.slice(fn, workerPoolSource.indexOf('\n}', fn) + 2);
-    const destroy = body.indexOf('destroyLivePaneBeforeRestart(ds)');
-    const fork = body.indexOf('forkWorker(ds');
-    expect(destroy).toBeGreaterThan(0);
-    expect(fork).toBeGreaterThan(destroy);
-    // No conditional/throw between them that could skip the fork.
-    const between = body.slice(destroy, fork);
-    expect(between).not.toMatch(/\breturn\b|\bthrow\b|if\s*\(/);
+  it('retries the kill once when the pane survives, and only then', async () => {
+    probes = ['exists', 'missing'];
+    await restartWithoutWorker();
+    expect(paneEvents).toEqual(['kill', 'probe', 'kill', 'probe', 'fork']);
+
+    // An indeterminate probe is not a confirmed survivor: no retry.
+    paneEvents.length = 0;
+    probes = ['unknown'];
+    await restartWithoutWorker();
+    expect(paneEvents).toEqual(['kill', 'probe', 'fork']);
+  });
+
+  it('still reforks when the pane survives the retry (stranding is worse than the guarded bug)', async () => {
+    probes = ['exists', 'exists'];
+    await restartWithoutWorker();
+    expect(paneEvents).toEqual(['kill', 'probe', 'kill', 'probe', 'fork']);
+  });
+
+  it('never kills an adopted pane or a session without a persistent target', async () => {
+    await restartWithoutWorker({ adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'claude-code', cwd: '/tmp' } });
+    expect(paneEvents).toEqual(['fork']);
+    paneEvents.length = 0;
+    paneTarget.current = undefined;
+    await restartWithoutWorker();
+    expect(paneEvents).toEqual(['fork']);
   });
 });
 
@@ -221,79 +213,5 @@ describe('P2 RiffBackend stale taskDoneCb hazard', () => {
     // Without the worker's `backend !== observedBackend` fence this would reach
     // markPromptReady() and emit a premature restart success.
     expect(killedWhenDoneFired).toBe(true);
-  });
-});
-
-// ─── P2: worker-side generation fence + defensive success receipt (wiring) ───
-
-describe('P2 worker onTaskDone generation fence', () => {
-  it('onTaskDone drops callbacks from a superseded backend generation', () => {
-    const hook = workerSource.indexOf('backend.onTaskDone?.(()');
-    expect(hook).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(hook, hook + 900);
-    // Same fence pattern as onAgentStatus / onExit siblings.
-    expect(body).toContain('if (backend !== observedBackend) return;');
-    // The generation check must precede the markPromptReady() re-arm. Match the
-    // actual call (with semicolon) so the prose "markPromptReady()" in the
-    // rationale comment above the fence isn't mistaken for it.
-    const fence = body.indexOf('if (backend !== observedBackend) return;');
-    const mark = body.indexOf('markPromptReady();');
-    expect(mark).toBeGreaterThan(fence);
-  });
-
-  it('every async backend ready/exit callback in setupBackendHandlers carries the generation fence', () => {
-    // Within setupBackendHandlers the herdr onAgentStatus, the riff/mojo
-    // onTaskDone, the mojo onTurnFinal and the backend onExit all guard on
-    // `backend !== observedBackend` so a superseded generation can neither
-    // re-arm prompt-ready, post into the current turn, nor tear down the
-    // replacement. Anchored on the setupBackendHandlers occurrences (the adopt
-    // observe-paths use a different, non-fenced onExit by design).
-    const setup = workerSource.indexOf('const observedBackend = backend;');
-    const handlersStart = workerSource.indexOf(
-      'observedBackend.onData((data) =>',
-      setup,
-    );
-    expect(setup).toBeGreaterThanOrEqual(0);
-    expect(handlersStart).toBeGreaterThan(setup);
-    // The merged worker now carries both upstream strict-env/network handlers
-    // and Remote Runner outbound/final/recovered-turn settlement before the shared onExit.
-    // Keep the source contract bounded, but large enough to cover that handler.
-    const region = workerSource.slice(setup, setup + 15_000);
-
-    const agentStatus = region.indexOf('.onAgentStatus((status)');
-    const taskDone = region.indexOf('backend.onTaskDone?.(()');
-    const turnFinal = region.indexOf('backend.onTurnFinal?.((text, turnId)');
-    const turnRecovered = region.indexOf('backend.onTurnRecovered?.((turn)');
-    const onExit = region.indexOf('backend.onExit((code, signal)');
-    expect(agentStatus, 'onAgentStatus').toBeGreaterThanOrEqual(0);
-    expect(taskDone, 'onTaskDone').toBeGreaterThanOrEqual(0);
-    expect(turnFinal, 'onTurnFinal').toBeGreaterThanOrEqual(0);
-    expect(turnRecovered, 'onTurnRecovered').toBeGreaterThanOrEqual(0);
-    expect(onExit, 'onExit').toBeGreaterThanOrEqual(0);
-
-    for (const [name, start] of [
-      ['onAgentStatus', agentStatus],
-      ['onTaskDone', taskDone],
-      ['onTurnFinal', turnFinal],
-      ['onTurnRecovered', turnRecovered],
-      ['onExit', onExit],
-    ] as const) {
-      // Keep enough source after each callback anchor to include its rationale
-      // comments and the actual generation fence.
-      expect(region.slice(start, start + 1400), name)
-        .toContain('backend !== observedBackend');
-    }
-  });
-
-  it('markPromptReady defers the restart success receipt when no backend is installed', () => {
-    const guard = workerSource.indexOf('if (activeRestartAttemptId) {');
-    expect(guard).toBeGreaterThanOrEqual(0);
-    const body = workerSource.slice(guard, guard + 700);
-    // Success is only reported behind a live-backend check; otherwise the
-    // attempt id is preserved for the real replacement / coordinator timeout.
-    const backendCheck = body.indexOf('if (backend) {');
-    const succeeded = body.indexOf("status: 'succeeded'");
-    expect(backendCheck).toBeGreaterThan(0);
-    expect(succeeded).toBeGreaterThan(backendCheck);
   });
 });

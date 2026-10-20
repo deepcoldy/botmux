@@ -35,6 +35,7 @@ import { join, resolve } from 'node:path';
 import { execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -227,10 +228,10 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: {
-        ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      env: privateTmuxEnv(root, {
+        SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
         ...(scenario.workflow ? { BOTMUX_WORKFLOW: '1' } : {}),
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
     child = spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
@@ -263,7 +264,7 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
     }
     rmSync(root, { recursive: true, force: true });
   }

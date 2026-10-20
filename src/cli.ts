@@ -6317,6 +6317,29 @@ async function readCardUsageSnapshotForSend(
   }
 }
 
+/** A render snapshot owns display policy and timing independently from usage. */
+async function readReplyCardRenderSnapshotForSend(
+  session: SessionData, larkAppId: string, turnId?: string, dispatchAttempt?: number,
+): Promise<ReplyCardRenderSnapshot> {
+  try {
+    const port = findDaemon(larkAppId)?.ipcPort ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (port) {
+      const query = new URLSearchParams();
+      if (turnId) query.set('turnId', turnId);
+      if (dispatchAttempt !== undefined) query.set('dispatchAttempt', String(dispatchAttempt));
+      const response = await fetchDaemonIpc(port, `/api/sessions/${encodeURIComponent(session.sessionId)}/reply-render-snapshot?${query}`, {
+        method: 'GET', signal: AbortSignal.timeout(1_500),
+      });
+      if (response.ok) {
+        const body = await response.json() as { snapshot?: unknown };
+        const snapshot = normalizeReplyCardRenderSnapshot(body.snapshot);
+        if (snapshot) return snapshot;
+      }
+    }
+  } catch { /* old/offline/isolated: retain local policy, omit unknown timing */ }
+  return { usage: await readCardUsageSnapshotForSend(session, larkAppId), footerPreferences: resolveReplyFooterPreferences(larkAppId) };
+}
+
 /**
  * Authenticate the human who opened this exact turn against the target run,
  * then return the only daemon app that may receive the mutation. Inherited
@@ -8775,12 +8798,15 @@ function withCustomCardMentionFooter(
   card: Record<string, unknown>,
   mentionOpenIds: readonly string[],
   locale?: Locale,
+  presentation?: ReplyCardPresentation,
 ): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
   if (mentionOpenIds.length === 0) return { ok: true, card };
   const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  if (!buildReplyCardFooterElements({ brand: '', recipientOpenIds: deduped, presentation, locale }).length) return { ok: true, card };
   const cloned = appendReplyCardFooterToV2Card(card, {
     brand: '',
     recipientOpenIds: deduped,
+    presentation,
     locale,
   });
   if (!cloned) {
@@ -8798,7 +8824,7 @@ function withCustomCardMentionFooter(
 import {
   appendReplyCardFooterToV2Card,
   buildImageCardElements,
-  buildReplyCardFooter,
+  buildReplyCardFooterElements,
   buildCardBodyElements,
   CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
@@ -8839,7 +8865,11 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveReplyFooterPreferences,
 } from './bot-registry.js';
+import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
+import { normalizeReplyCardRenderSnapshot } from './cli/reply-card-render-normalize.js';
+import { parseReplyFooterEnv } from './services/reply-footer.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { loadCompanionSecret } from './dashboard/companion-api.js';
@@ -9409,6 +9439,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    ...resolveReplyFooterPreferences(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -9495,6 +9526,8 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     allowedUsers: [],
     feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    // This env-only session belongs to the host. Warm sandbox config may be stale.
+    ...parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -12292,6 +12325,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    let replyRenderSnapshot: ReplyCardRenderSnapshot | undefined;
+    const readReplyRenderSnapshot = async () => replyRenderSnapshot ??= await readReplyCardRenderSnapshotForSend(s, appId, currentTurnId, originDispatchAttempt);
     let customCardUsedIds = new Set<string>();
     if (customCard) {
       const inlineResult = applyInlineMentionsToCard(customCard, mentions);
@@ -12307,6 +12342,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         customCard,
         mentionFooter,
         localeForBot(appId),
+        { footerPreferences: (await readReplyRenderSnapshot()).footerPreferences },
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
       customCard = withFooter.card;
@@ -12472,68 +12508,32 @@ async function cmdSend(rest: string[]): Promise<void> {
         cc: footerAddressing.cc,
         inlinedIds: usedIds,
       });
-      const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const renderSnapshot = await readReplyRenderSnapshot();
+      const usageSnapshot = renderSnapshot.usage;
       const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
       const footerBrand = shouldRenderBrand
         ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
         : '';
-      const footer = buildReplyCardFooter({
-        brand: footerBrand,
-        recipientOpenIds: footerRecipients,
-        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
-        locale: localeForBot(appId),
-      });
-      // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
-      // share ONE row: footer text on the left (weighted, fills), button pinned
-      // to the far right (auto width). When voice isn't configured the footer
-      // renders alone, as before. Button only on a reply (not --top-level).
-      // v2 cards put buttons inside column_set/column — never the 1.x
-      // `tag:'action'` container (Feishu rejects it, error 200861).
-      let voiceOn = false;
-      // A managed receiver card has no callback controls: a voice-summary
-      // button would open a second, unledgered model/output action when clicked.
+      // The caller supplies voice capability; the shared composer owns visibility.
+      let voiceButton: Record<string, unknown> | undefined;
       if (!sendTopLevel && !vcMeetingManagedSendOrigin) {
         try {
           const { isVoiceConfigured } = await import('./services/voice/index.js');
-          voiceOn = isVoiceConfigured(appId);
-        } catch { /* voice module/config unavailable → no button */ }
+          if (isVoiceConfigured(appId)) {
+            const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+            voiceButton = {
+              tag: 'button', text: { tag: 'plain_text', content: '🔊 语音总结' }, type: 'default',
+              behaviors: [{ type: 'callback', value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId } }],
+            };
+          }
+        } catch { /* voice module/config unavailable */ }
       }
-      const footerContent = footer?.content ?? '';
-      if (footerContent || voiceOn) {
-        elements.push({ tag: 'hr' });
-        if (voiceOn) {
-          const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
-          elements.push({
-            tag: 'column_set',
-            flex_mode: 'none',
-            horizontal_spacing: 'default',
-            columns: [
-              {
-                tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [footer?.element ?? {
-                  tag: 'markdown',
-                  text_size: 'notation',
-                  content: ' ',
-                }],
-              },
-              {
-                tag: 'column', width: 'auto', vertical_align: 'center',
-                elements: [{
-                  tag: 'button',
-                  text: { tag: 'plain_text', content: '🔊 语音总结' },
-                  type: 'default',
-                  behaviors: [{
-                    type: 'callback',
-                    value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId },
-                  }],
-                }],
-              },
-            ],
-          });
-        } else {
-          if (footer) elements.push(footer.element);
-        }
-      }
+      elements.push(...buildReplyCardFooterElements({
+        brand: footerBrand, recipientOpenIds: footerRecipients,
+        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
+        presentation: shouldRenderBrand ? renderSnapshot : { ...renderSnapshot, timing: undefined },
+        locale: localeForBot(appId), voiceButton,
+      }));
 
       // Preserve caller-owned layout/header/config; only the host sections and
       // multi-user updates join the canonical lifecycle. Never flatten to Markdown.

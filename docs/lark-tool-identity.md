@@ -19,6 +19,25 @@ Botmux 提供的短期 bot token。
 | 关闭 | 关闭（默认） | 沿用宿主机默认凭证及用户 profile 切换 |
 | 关闭 | 开启（含 `lark-cli`） | 遵循按触发人鉴权（以当轮触发人身份运行，未授权直接拒绝并提示授权，不降级为机器账号） |
 
+## 凭据来源：中心化平台（`triggerUserAuth.credentialSource`）
+
+按触发人鉴权开启后，该人的凭据可以来自两处：本机的按人 HOME（扫码一次、只在本机有效），或**中心化平台**（在平台凭据页授权一次，平台保管刷新凭据并按轮次向绑定的机器签发短期票，所有机器通用、可集中查看与撤销）。`bots.json` 的 `triggerUserAuth.credentialSource` 决定取法：
+
+| 机器状态 | `auto`（默认） | `platform` | `local` |
+|---|---|---|---|
+| 未绑定平台 | 等同今天的本机扫码 | 一律拒绝，提示执行 `botmux bind` | 等同今天 |
+| 已绑定，平台签发成功 | 用平台短期票 | 用平台短期票 | 忽略平台，用本机 HOME |
+| 已绑定，该人未在平台授权 | 本机已有 HOME 则用，否则拒绝并附平台凭据页链接 | 拒绝并附平台链接 | 本机已有 HOME 则用，否则本机扫码 |
+| 已绑定，平台不可达 | 本机已有 HOME 则用，否则按「暂时不可用」拒绝，不自动发起本机扫码 | 拒绝 | 不受影响 |
+
+要点：
+- **用谁的授权由 botmux 决定，模型只能在角色内选择。** daemon 从飞书事件的发送人解析 union_id 后向平台请求，CLI 侧没有任何参数能改变它；模型只能用 `--as user` / `--as bot` 这类角色开关切换，不能指名任何人。委派与定时任务用已验签的原请求人。
+- 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
+- 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
+- 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
+- **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
+- 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
+
 ## 使用
 
 ```sh

@@ -3938,6 +3938,29 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it('drops a doc-watch prewarm whose session was closed during the owner lookup', async () => {
+    const sub = { ...docSub(`doc-prewarm-stale-${Date.now()}`), ownerOpenId: OWNER };
+    const ds = seedThreadSession(sub.sessionAnchor, 'prewarm stale');
+    const priorLastMessageAt = ds.lastMessageAt;
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.forkWorker.mockClear();
+
+    const prewarm = prewarmDocCommentSession(ds, sub);
+    await vi.waitFor(() => expect(mocks.resolveSender).toHaveBeenCalled());
+    ds.session.status = 'closed';
+    gate.resolve();
+
+    await expect(prewarm).rejects.toThrow('routing generation changed');
+    expect(ds.lastMessageAt).toBe(priorLastMessageAt);
+    expect(ds.currentTurnTitle).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
   it('durably queues live doc-watch prewarm behind activation without worker IPC', async () => {
     const sub = docSub(`doc-prewarm-live-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'prewarm live');
@@ -3960,6 +3983,22 @@ describe('document comment canonical ownership and single-flight delivery', () =
       }),
     ]);
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it('hands concurrent replies on one new comment thread to a single auto-created session', async () => {
+    const fileToken = `doc-same-thread-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+
+    await expect(Promise.all([
+      handleDocComment({ ...docCtx(sub, 'first'), commentId: 'comment-shared' }),
+      handleDocComment({ ...docCtx(sub, 'second'), commentId: 'comment-shared' }),
+    ])).resolves.toEqual([true, true]);
+
+    const owner = activeSessions.get(sessionKey(`doc:${fileToken}:comment-shared`, APP))!;
+    expect(owner).toBeDefined();
+    expect([...activeSessions.values()].filter(ds => ds.chatId === `doc:${fileToken}:comment-shared`)).toEqual([owner]);
+    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-first', 'reply-second']);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
 
   it('isolates concurrent document comment threads and reuses one thread after restart', async () => {

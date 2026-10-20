@@ -3,7 +3,8 @@ import { basename, extname, join } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
 import { listChatMessagesUntil, listThreadMessagesWithContext, listMessagesByThreadId, downloadMessageResource } from '../im/lark/client.js';
 import { parseApiMessage, createImgNumberer, extractResources, cardContentHasUpgradeFallback, resolveMergedCardContent, structuredMentionRefs, rawPlaceholderText, postMentionRefs } from '../im/lark/message-parser.js';
-import { projectGroupContextCard, GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
+import { GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
+import { projectObservedGroupContextCard } from './group-context-card-source.js';
 import { getAttachmentsDir } from '../core/attachment-path.js';
 import { normalizeImageAttachment } from '../core/attachment-image-format.js';
 import { getGroupContextSettings } from './group-context-settings-store.js';
@@ -56,7 +57,7 @@ function normalizeHistoryMessage(appId: string, chatId: string, message: any, hi
   const isBot = message.sender?.sender_type === 'app' || message.sender?.sender_type === 'bot';
   const deleted = message.deleted === true || message.is_recalled === true;
   const projection = !deleted && isBot && message.msg_type === 'interactive'
-    ? projectGroupContextCard(message.body?.content ?? '') : undefined;
+    ? projectObservedGroupContextCard(message.body?.content ?? '', appId, message.sender?.id ?? '') : undefined;
   if (projection?.kind === 'runtime') return undefined;
   if (projection?.kind === 'conversation') message = { ...message, body: { ...message.body, content: projection.content } };
   const numberer = createImgNumberer();
@@ -219,7 +220,8 @@ async function backfill(request: GroupContextTurnRequest, signal: AbortSignal) {
             const enriched = await resolveMergedCardContent(request.appId, normalized.messageId, createImgNumberer());
             if (signal.aborted || enrichmentClosed) return;
             if (!enriched || cardContentHasUpgradeFallback(enriched.text)) { incomplete = true; return; }
-            const projection = normalized.senderType === 'bot' ? projectGroupContextCard(enriched.structuredContent) : undefined;
+            const projection = normalized.senderType === 'bot'
+              ? projectObservedGroupContextCard(enriched.structuredContent, request.appId, normalized.senderId) : undefined;
             if (projection?.kind === 'runtime') { resolvedCards++; return; }
             if (projection?.kind === 'unresolved') { incomplete = true; return; }
             if (projection?.kind === 'conversation') {

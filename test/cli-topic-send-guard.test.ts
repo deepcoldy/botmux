@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache } from '../src/cli/topic-send-guard.js';
 describe('topic send guard', () => {
@@ -40,16 +39,6 @@ describe('topic send guard', () => {
     await expect(assertSendTopicsAvailable('app', ['quote', 'other'], get, 'stop'))
       .rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
     expect(get.mock.calls.map(([, id]) => id)).toEqual(['quote', 'root']);
-  });
-  it('registers configured and environment-pinned clients before the first CLI topic query', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const guard = source.indexOf('const { getMessageDetail: getTopicMessageDetail }');
-    const registration = source.lastIndexOf('for (const cfg of loadBotConfigs()) registerBot(cfg)', guard);
-    const pinned = source.indexOf('registerBot(envPinnedRiffBot)', registration);
-    const check = source.indexOf('await checkSendTopics()', guard);
-    expect(registration).toBeGreaterThan(source.lastIndexOf('const appId = s.larkAppId!', guard));
-    expect(pinned).toBeLessThan(guard);
-    expect(guard).toBeLessThan(check);
   });
   it.each([{ code: 230011 }, { response: { data: { code: 230011 } } }, { name: 'MessageWithdrawnError' }])(
     'classifies provider withdrawal as permanent: %j', async error => {

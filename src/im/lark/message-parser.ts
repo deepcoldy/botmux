@@ -9,7 +9,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
-import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -1381,7 +1381,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
                 ? stripTrailingGroupContextCardPurposeMarker(node.text)
                 : node.text;
               if (visibleText !== node.text
-                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
                 if (visibleText) textNodes.push(visibleText);
                 continue;
               }
@@ -1866,7 +1867,7 @@ function extractCardHeaderTagTexts(header: unknown): string[] {
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
   const text = nestedCardText(value);
-  return (text ?? '')
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
@@ -2053,7 +2054,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
     if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 

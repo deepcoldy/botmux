@@ -3853,6 +3853,12 @@ describe('altScreen property', () => {
     expect(createPiAdapter('/bin/pi').altScreen).toBe(true);
   });
 
+  it('pi read-only viewers may forward wheel-only scroll', () => {
+    // Pi >= 1.0 defaults to fullscreen mode, so its transcript lives inside
+    // the TUI rather than xterm/tmux scrollback.
+    expect(createPiAdapter('/bin/pi').readOnlyRemoteScroll).toBe(true);
+  });
+
   it('copilot uses alt screen (Ink TUI)', () => {
     expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
   });

@@ -20,6 +20,8 @@ import { promises as fs, createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { basename, join } from 'node:path';
 import type { ResumableSession } from '../adapters/cli/types.js';
+import { isInternalCodexSessionMeta } from './codex-session-meta.js';
+import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 
 const TITLE_MAX = 80;
 
@@ -505,37 +507,246 @@ function rolloutResponseItemText(payload: Record<string, unknown>): string {
   return parts.join('').trim();
 }
 
-/** Parse one Codex/TRAE rollout. `session_meta` carries the resume id + cwd.
- *  Title preference: the first `event_msg`/`user_message` (legacy format); when
- *  absent (Codex >=0.147), the first non-synthetic `response_item` role:user
- *  message — skipping the startup preamble and botmux-injected turns (which mark
- *  the whole session botmux-origin, same as the user_message path). Streamed
- *  line by line, stopping once id + cwd + title are found. */
+/** Raw model-visible user items of one TraeX `history_mutation` (append or
+ *  compaction `replace`). WEAK source only: TraeX also writes runtime
+ *  injections (context reminders, warnings) here as `role: user`, so these
+ *  never decide origin on their own — see parseRolloutTranscript. */
+function rolloutHistoryMutationUserTexts(payload: Record<string, unknown>): string[] {
+  if ((payload.operation !== 'append' && payload.operation !== 'replace')
+    || !Array.isArray(payload.items)) return [];
+  const texts: string[] = [];
+  for (const item of payload.items) {
+    const message = asRecord(item);
+    if (message?.type !== 'message' || message.role !== 'user') continue;
+    const text = rolloutResponseItemText(message);
+    if (text) texts.push(text);
+  }
+  return texts;
+}
+
+/** TraeX ≥0.208 opens every conversation with a user-role item that is one
+ *  whole `<system-reminder>…</system-reminder>` block carrying its own context
+ *  (gitStatus / currentDate), ahead of the real prompt. Not a user turn. */
+function isTraexContextReminder(text: string): boolean {
+  return /^<system-reminder>[\s\S]*<\/system-reminder>$/.test(text);
+}
+
+export interface RolloutSessionMetadata {
+  /** Display title only — never decides origin. */
+  title?: string;
+  /** The thread's ORIGINAL first input from the native index (TraeX:
+   *  `threads.preview`). Decides origin and the inferred title outright, like a
+   *  canonical record seen before any other; absent → the rollout decides. */
+  firstUserMessage?: string;
+  /** The native index already proved botmux spawned this session. */
+  botmuxOrigin?: boolean;
+  cwd?: string;
+  lastActivityAt?: number;
+  /** Rollout the native index points at (TraeX: the current resume segment). */
+  rolloutPath?: string;
+}
+
+export interface RolloutDiscoveryOptions {
+  /** `traex` enables the TraeX rules below; the default is Codex's parser. */
+  dialect?: 'codex' | 'traex';
+  /** Native index metadata keyed by session id. TraeX's state DB title wins
+   *  over a title inferred from the first prompt, preserving /rename — but only
+   *  for a session that has a real, non-botmux first prompt: the native title
+   *  decorates an origin-checked session, it never admits one on its own. */
+  metadataById?: ReadonlyMap<string, RolloutSessionMetadata>;
+  /** TraeX: batch-load the prompt-derived metadata (title / first prompt /
+   *  origin) for these ids, merged over `metadataById`. Called only for the
+   *  threads discovery is about to parse, so the per-/adopt cost no longer
+   *  scales with every prompt in the store. */
+  loadSessionDetails?: (ids: readonly string[]) => ReadonlyMap<string, RolloutSessionMetadata>;
+  /** Verified user input carried by one record (TraeX: validated
+   *  `display_completions[].UserMessage` and the 0.201.4 item_completed
+   *  mirror). These decide origin; raw model `items` are only a weak fallback. */
+  userInputTexts?: (rec: Record<string, unknown>, sourceSessionId: string | undefined) => string[];
+  /** Stable thread id from a rollout filename. TraeX resume segments share it,
+   *  which lets discovery order threads by native activity and skip sibling
+   *  segments without reading them. */
+  sessionIdFromPath?: (path: string) => string | undefined;
+}
+
+/** `session`: a candidate. `rejected`: this thread id is out for good
+ *  (botmux-origin, internal helper, live/excluded) — sibling segments of the
+ *  same thread must not resurrect it. `skip`: inconclusive (unreadable, no
+ *  session_meta, no real user turn); another segment may still qualify. */
+type RolloutParse =
+  | { kind: 'session'; session: ResumableSession }
+  | { kind: 'rejected'; cliSessionId: string }
+  | { kind: 'skip' };
+
+/** Parse one Codex/TRAE rollout. session_meta carries the resume id + cwd.
+ *  Codex: the first event_msg/user_message, else the first non-synthetic
+ *  response_item role:user, decides origin and title.
+ *  TraeX: internal helper sessions (guardian/subagent) are rejected up front,
+ *  a native index first prompt decides outright, botmux v3's own `/goal`
+ *  objective counts as botmux-origin, and everything else follows the
+ *  first-turn rule below.
+ *
+ *  ── TraeX first-turn rule (one state machine; keep this table and the
+ *     table-driven test "TraeX first-turn rule" in sync) ──────────────────
+ *  Records, each with an optional native turn id:
+ *    W  weak user item   response_item role:user, raw history_mutation item
+ *                        (TraeX also writes runtime injections there)
+ *    C  canonical input  verified display completion / item_completed
+ *                        (options.userInputTexts), event_msg user_message
+ *    T  terminal         event_msg task_complete / turn_aborted
+ *  Synthetic preambles / context reminders never count as W or C.
+ *  "Same turn" for ids a, b: a === b when both are known; true when either is
+ *  unknown (legacy turn-less shapes — the T rule below keeps them inside the
+ *  first turn).
+ *
+ *    phase  record  effect
+ *    open   W       the first one fixes the WEAK verdict (its text: title, or
+ *                   botmux) and the first turn's id (may be unknown) → weak
+ *    open   C       decides origin outright (botmux → reject; clean → title)
+ *    open   T       ignored — there is no verdict to close
+ *    weak   W / C   LATE BINDING: same text as the verdict, carrying a turn id
+ *                   while the first turn's id is unknown → that id becomes the
+ *                   first turn's (a mirror of the same input revealed it)
+ *    weak   W       otherwise ignored: the first weak item already decided
+ *    weak   C       same turn as the first turn → overrides the weak verdict
+ *                   (botmux → reject; clean → title); a different, known turn
+ *                   (steer / type-ahead of the next turn) → ignored
+ *    weak   T       same turn → the first turn is over: the weak verdict is
+ *                   final and scanning stops; a different, known turn (a
+ *                   replayed terminal in a resumed rollout) → ignored
+ *  End of scan in phase weak: a botmux weak verdict rejects the thread; a
+ *  clean one titles it. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
   exclude?: ReadonlySet<string>,
-): Promise<ResumableSession | null> {
+  options: RolloutDiscoveryOptions = {},
+  lookupMetadata: (id: string) => RolloutSessionMetadata | undefined = id => options.metadataById?.get(id),
+): Promise<RolloutParse> {
+  const traex = options.dialect === 'traex';
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string; fallbackTitle: string; botmux: boolean } = {
-    id: null, cwd: null, title: '', fallbackTitle: '', botmux: false,
+  const acc: {
+    id: string | null;
+    cwd: string | null;
+    title: string;
+    fallbackTitle: string;
+    weakTitle: string;
+    botmux: boolean;
+    /** TraeX: the session is out for good (internal / botmux / excluded). */
+    rejected: boolean;
+    /** TraeX: the first non-synthetic weak user item already fixed the weak
+     *  origin/title; later weak items must not re-decide it. */
+    weakDecided: boolean;
+    /** TraeX: that first weak item was botmux. Rejects the thread at the end
+     *  of the first turn unless a canonical record in it says otherwise. */
+    weakBotmux: boolean;
+    /** TraeX: native turn id of that first weak item, when it carries one.
+     *  Only canonical records of this same turn may override the weak verdict:
+     *  steer / type-ahead input of the NEXT turn can land before this turn's
+     *  terminal record. */
+    weakTurnId: string | undefined;
+    /** TraeX: text of that first weak item, to recognise its mirrors. */
+    weakText: string;
+  } = {
+    id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false,
+    rejected: false, weakDecided: false, weakBotmux: false, weakTurnId: undefined, weakText: '',
   };
   let excluded = false;
+  let nativeMetadata: RolloutSessionMetadata | undefined;
+  const pathSessionId = options.sessionIdFromPath?.(path);
+  // TraeX also runs botmux v3 goal workers, whose first input is botmux's own
+  // `/goal` objective rather than a Lark envelope.
+  const isBotmuxTurn = (text: string): boolean =>
+    isBotmuxInjected(text) || (traex && isBotmuxGoalObjective(text));
+  const recordCanonicalUserText = (text: string): boolean | undefined => {
+    if (!text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
+    if (isBotmuxTurn(text)) {
+      acc.botmux = true;
+      return true;
+    }
+    if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+    return Boolean(acc.id && acc.cwd && acc.fallbackTitle);
+  };
+  const isUserTurnText = (text: string): boolean =>
+    Boolean(text) && !isSyntheticPreamble(text) && !isTraexContextReminder(text);
+  // First-turn rule (see the table above). Weak verdict = phase "weak".
+  const inFirstTurn = (turnId: string | undefined): boolean =>
+    !acc.weakDecided || acc.weakTurnId === undefined || turnId === undefined || turnId === acc.weakTurnId;
+  const bindFirstTurnMirror = (text: string, turnId: string | undefined): void => {
+    if (acc.weakDecided && acc.weakTurnId === undefined && turnId !== undefined && text === acc.weakText) {
+      acc.weakTurnId = turnId;
+    }
+  };
+  const recordWeakUserText = (text: string, turnId: string | undefined): void => {
+    if (!isUserTurnText(text)) return;
+    if (acc.weakDecided) { bindFirstTurnMirror(text, turnId); return; }
+    acc.weakDecided = true;
+    acc.weakTurnId = turnId;
+    acc.weakText = text;
+    // A botmux first turn leaves no weak title and marks the thread botmux
+    // unless a canonical record of the same turn supplies a clean prompt.
+    if (isBotmuxTurn(text)) acc.weakBotmux = true;
+    else acc.weakTitle = truncateTitle(text);
+  };
+  /** A canonical input under the first-turn rule; true → stop scanning. */
+  const recordFirstTurnCanonical = (rawText: string, turnId: string | undefined): boolean => {
+    const text = rawText.trim();
+    if (!isUserTurnText(text)) return false;
+    bindFirstTurnMirror(text, turnId);
+    if (!inFirstTurn(turnId)) return false;
+    return recordCanonicalUserText(text) === true;
+  };
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
+    const turnId = typeof payload?.turn_id === 'string' && payload.turn_id ? payload.turn_id : undefined;
     if (rec.type === 'session_meta' && payload) {
       if (typeof payload.id === 'string') {
         acc.id = payload.id;
         // The resume id lives on the very first line; bail immediately on a
         // live session so excluded rollouts cost a single line read.
         if (exclude?.has(payload.id)) { excluded = true; return true; }
+        // Guardian / subagent helpers are not the user's task, whatever their
+        // user records say — reject before trusting any metadata (same rule as
+        // the pid lookup's rollout classification).
+        if (traex && isInternalCodexSessionMeta(payload)) { acc.rejected = true; return true; }
+        nativeMetadata = lookupMetadata(payload.id);
+        if (nativeMetadata?.botmuxOrigin) { acc.botmux = true; return true; } // botmux-origin → drop
       }
       if (typeof payload.cwd === 'string') acc.cwd = payload.cwd;
+      if (nativeMetadata?.firstUserMessage) {
+        const stop = recordCanonicalUserText(nativeMetadata.firstUserMessage.trim());
+        if (stop) return true;
+      }
+    } else if (traex && rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
+      // TraeX canonical input (C) under the first-turn rule.
+      if (recordFirstTurnCanonical(payload.message, turnId)) return true;
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
-      if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (isBotmuxTurn(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
+    } else if (traex) {
+      if (rec.type === 'event_msg' && payload?.type === 'thread_goal_updated') {
+        const objective = asRecord(payload.goal)?.objective;
+        if (typeof objective === 'string' && isBotmuxGoalObjective(objective)) {
+          acc.botmux = true; // a botmux v3 goal worker → drop
+          return true;
+        }
+      }
+      for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
+        if (recordFirstTurnCanonical(text, turnId)) return true; // C
+      }
+      if (rec.type === 'history_mutation' && payload) {
+        for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text, turnId); // W
+      } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+        recordWeakUserText(rolloutResponseItemText(payload), turnId); // W
+      } else if (rec.type === 'event_msg' && acc.weakDecided && inFirstTurn(turnId)
+        && (payload?.type === 'task_complete' || payload?.type === 'turn_aborted')) {
+        // T of the first turn (the two terminal records the TraeX bridge
+        // recognises): the weak verdict is final; don't read the rest of a
+        // possibly huge rollout.
+        return true;
+      }
     } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
       // New-format (>=0.147) fallback title source. The first meaningful user
       // turn determines origin, mirroring parseClaudeTranscript: a synthetic
@@ -546,24 +757,78 @@ async function parseRolloutTranscript(
       if (!text) return; // empty / non-text content — not a title candidate
       if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
       if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
-      if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+      if (!acc.weakTitle) acc.weakTitle = truncateTitle(text);
       // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
       // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
       // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
       // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
-      if (acc.id && acc.cwd && acc.fallbackTitle) return true;
+      if (acc.id && acc.cwd && acc.weakTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  const title = acc.title || acc.fallbackTitle;
-  if (excluded || acc.botmux || !acc.id || !acc.cwd || !title) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title, lastActivityAt: mtimeMs };
+  const weakBotmux = acc.weakBotmux && !acc.title && !acc.fallbackTitle;
+  if (acc.id && (excluded || acc.botmux || acc.rejected || weakBotmux)) {
+    return { kind: 'rejected', cliSessionId: acc.id };
+  }
+  const inferredTitle = acc.title || acc.fallbackTitle || acc.weakTitle;
+  // No real user turn → nothing was origin-checked (and nothing to resume): a
+  // native title alone must not admit the session.
+  if (!acc.id || !acc.cwd || !inferredTitle) return { kind: 'skip' };
+  return {
+    kind: 'session',
+    session: {
+      cliSessionId: acc.id,
+      cwd: nativeMetadata?.cwd || acc.cwd,
+      title: truncateTitle(nativeMetadata?.title ?? inferredTitle) || inferredTitle,
+      lastActivityAt: nativeMetadata?.lastActivityAt ?? mtimeMs,
+    },
+  };
+}
+
+/** Extra threads whose prompt metadata is prefetched beyond the ones still
+ *  needed to fill `limit` (covers a few rejections without another query). */
+const DETAILS_PREFETCH_MARGIN = 8;
+
+interface RolloutCandidate extends FileEntry {
+  /** Stable thread id from the filename, when the dialect can tell. */
+  sessionId?: string;
+}
+
+/** TraeX: order rollout files by the activity the picker will REPORT — the
+ *  native `updated_at` when the index has the thread, else the file mtime —
+ *  instead of raw mtime, so `limit` keeps the most recently active threads.
+ *  Within one thread (resume segments share the filename id) the segment the
+ *  index points at goes first, then the newest. Pure in-memory reorder of the
+ *  already-stat'ed list: no extra I/O. */
+function orderTraexRolloutCandidates(
+  files: FileEntry[],
+  options: RolloutDiscoveryOptions,
+): RolloutCandidate[] {
+  const sessionIdFromPath = options.sessionIdFromPath;
+  if (!sessionIdFromPath) return files;
+  return files
+    .map((file, index) => {
+      const sessionId = sessionIdFromPath(file.path);
+      const metadata = sessionId ? options.metadataById?.get(sessionId) : undefined;
+      return {
+        ...file,
+        ...(sessionId ? { sessionId } : {}),
+        activityMs: metadata?.lastActivityAt ?? file.mtimeMs,
+        indexed: metadata?.rolloutPath === file.path,
+        index,
+      };
+    })
+    .sort((a, b) => b.activityMs - a.activityMs
+      || Number(b.indexed) - Number(a.indexed)
+      || a.index - b.index)
+    .map(({ path, mtimeMs, sessionId }) => ({ path, mtimeMs, ...(sessionId ? { sessionId } : {}) }));
 }
 
 export async function discoverRolloutSessions(
   sessionsRoot: string,
   limit: number,
   exclude?: ReadonlySet<string>,
+  options: RolloutDiscoveryOptions = {},
 ): Promise<ResumableSession[]> {
   // The resume id is inside the file (not the filename), so we can't pre-filter
   // by name. Instead walk most-recent-first and parse until `limit` non-excluded
@@ -571,10 +836,63 @@ export async function discoverRolloutSessions(
   // host with many live sessions doesn't starve the picker.
   const files = await collectRecentJsonl(sessionsRoot, Number.MAX_SAFE_INTEGER, 5);
   const out: ResumableSession[] = [];
-  for (const f of files) {
+  if (options.dialect !== 'traex') {
+    for (const f of files) {
+      if (out.length >= limit) break;
+      const parsed = await parseRolloutTranscript(f.path, f.mtimeMs, exclude, options);
+      if (parsed.kind === 'session') out.push(parsed.session);
+    }
+    return out;
+  }
+  // TraeX: one candidate per thread. A thread id is decided by its first
+  // conclusive segment (in the activity order above); sibling segments are
+  // then skipped by filename id without being read, and a rejected id is never
+  // resurrected by another segment. Parse count stays bounded exactly as for
+  // Codex — files are read until `limit` threads are collected.
+  const decided = new Set<string>();
+  const candidates = orderTraexRolloutCandidates(files, options);
+  // Prompt-derived metadata is loaded per id on demand and prefetched in
+  // batches of (threads still needed + DETAILS_PREFETCH_MARGIN) along the
+  // activity order, so only threads that are actually parsed — plus a small
+  // look-ahead — ever have their prompt columns read.
+  const metadata = new Map(options.metadataById);
+  const detailsLoaded = new Set<string>();
+  const loadDetails = (ids: readonly string[]): void => {
+    const missing = options.loadSessionDetails ? ids.filter(id => !detailsLoaded.has(id)) : [];
+    if (missing.length === 0) return;
+    for (const id of missing) detailsLoaded.add(id);
+    for (const [id, details] of options.loadSessionDetails!(missing)) {
+      metadata.set(id, { ...metadata.get(id), ...details });
+    }
+  };
+  const lookupMetadata = (id: string): RolloutSessionMetadata | undefined => {
+    loadDetails([id]);
+    return metadata.get(id);
+  };
+  for (let i = 0; i < candidates.length; i++) {
+    const f = candidates[i]!;
     if (out.length >= limit) break;
-    const s = await parseRolloutTranscript(f.path, f.mtimeMs, exclude);
-    if (s) out.push(s);
+    if (f.sessionId && decided.has(f.sessionId)) continue;
+    // A live / excluded thread is rejected at its session_meta anyway; skip it
+    // before it can trigger a prefetch (its own details are never loaded, so
+    // every excluded candidate would otherwise start a fresh look-ahead).
+    if (f.sessionId && exclude?.has(f.sessionId)) { decided.add(f.sessionId); continue; }
+    if (f.sessionId && options.loadSessionDetails && !detailsLoaded.has(f.sessionId)) {
+      const want = limit - out.length + DETAILS_PREFETCH_MARGIN;
+      const batch = new Set<string>();
+      for (let j = i; j < candidates.length && batch.size < want; j++) {
+        const sid = candidates[j]!.sessionId;
+        if (sid && !decided.has(sid) && !detailsLoaded.has(sid) && !exclude?.has(sid)) batch.add(sid);
+      }
+      loadDetails([...batch]);
+    }
+    const parsed = await parseRolloutTranscript(f.path, f.mtimeMs, exclude, options, lookupMetadata);
+    if (parsed.kind === 'rejected') {
+      decided.add(parsed.cliSessionId);
+    } else if (parsed.kind === 'session' && !decided.has(parsed.session.cliSessionId)) {
+      decided.add(parsed.session.cliSessionId);
+      out.push(parsed.session);
+    }
   }
   return out;
 }

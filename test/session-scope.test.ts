@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import {
   probeSessionScopeCapabilities,
+  sessionScopePayloadPid,
   sessionScopeUnitName,
   stopSessionScope,
   userSystemdBusEnv,
@@ -12,6 +17,60 @@ function result(status: number, stdout = '', stderr = ''): any {
 }
 
 describe('owned session systemd scope', () => {
+  it('resolves only the fixed supervisor with one observable foreground child', () => {
+    const wrapped = wrapCommandInSessionScope('probe', 'cli', [], undefined,
+      { cleanupSupported: true, memoryControllerSupported: false }, {});
+    const commandLine = wrapped.args.join('\0') + '\0';
+    const resolve = (argv = commandLine, children = '123 ') => sessionScopePayloadPid(99, {
+      platform: 'linux',
+      readFile: path => path.endsWith('/cmdline') ? argv : children,
+    });
+    expect(resolve()).toBe(123);
+    // A copied label is not evidence: arbitrary shells must retain their input
+    // guard even while they have a foreground child (e.g. an rcfile command).
+    expect(resolve('/bin/sh\0-c\0sleep 300\0botmux-session-scope\0')).toBe(99);
+    expect(resolve(commandLine.replace('"$@"; status=$?; exit "$status"', 'exec "$@"'))).toBe(99);
+    for (const children of ['', '123 124 ', 'bad', '0', '1', '99']) {
+      expect(resolve(commandLine, children)).toBe(99);
+    }
+    expect(sessionScopePayloadPid(99, {
+      platform: 'linux', readFile: () => { throw new Error('process gone'); },
+    })).toBe(99);
+    expect(sessionScopePayloadPid(99, {
+      platform: 'darwin', readFile: () => { throw new Error('must not inspect proc'); },
+    })).toBe(99);
+  });
+
+  it.skipIf(process.platform === 'win32')('keeps a parent outside the scope while preserving stdin, argv and exit status', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-scope-parent-'));
+    try {
+      // Model systemd-run --scope's exec: the payload keeps its PID. A tmux
+      // server may migrate its original pane PID after this exec has happened.
+      writeFileSync(join(dir, 'systemd-run'), '#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n', { mode: 0o755 });
+      const argument = 'literal spaces; $(must-not-run)';
+      const wrapped = wrapCommandInSessionScope('parent-boundary', '/bin/sh', [
+        '-c', 'IFS= read -r line; printf "%s\\n%s\\n%s\\n" "$$" "$line" "$1"; exit 7', '_', argument,
+      ], undefined, { cleanupSupported: true, memoryControllerSupported: false }, {});
+      const child = spawnSync(wrapped.bin, wrapped.args, {
+        env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ''}` },
+        input: 'interactive input\n', encoding: 'utf8', timeout: 5_000,
+      });
+      expect(child.status, child.stderr).toBe(7);
+      const [payloadPid, input, receivedArgument] = child.stdout.trimEnd().split('\n');
+      expect(Number(payloadPid)).toBeGreaterThan(1);
+      expect(Number(payloadPid)).not.toBe(child.pid);
+      expect(input).toBe('interactive input');
+      expect(receivedArgument).toBe(argument);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('leaves commands unchanged when session scopes are unavailable', () => {
+    const capabilities = { cleanupSupported: false, memoryControllerSupported: false };
+    expect(wrapCommandInSessionScope('plain', 'cli', ['argument'], undefined, capabilities)).toEqual({
+      bin: 'cli', args: ['argument'], capabilities,
+    });
+  });
+
   it('derives the canonical user bus environment from a verified socket', () => {
     const isSocket = vi.fn((path: string) => path === '/run/user/1001/bus');
     expect(userSystemdBusEnv({ platform: 'linux', uid: 1001, isSocket })).toEqual({
@@ -75,11 +134,11 @@ describe('owned session systemd scope', () => {
       },
     );
     expect(wrapped.bin).toBe('/usr/bin/env');
-    expect(wrapped.args.slice(0, 3)).toEqual([
+    expect(wrapped.args.slice(0, 2)).toEqual([
       'XDG_RUNTIME_DIR=/run/user/1001',
       'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus',
-      'systemd-run',
     ]);
+    expect(wrapped.args).toContain('systemd-run');
     expect(wrapped.args).toContain('--property=MemoryMax=5000000');
     expect(wrapped.args.slice(-3)).toEqual(['--', '/usr/bin/node', 'cli.js']);
     expect(wrapped.unitName).toBe('botmux-session-abc-123.scope');

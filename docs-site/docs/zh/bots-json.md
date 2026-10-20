@@ -262,6 +262,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 | 字段 | 说明 |
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+| `senderTagHideEmail` | 布尔，默认 `false`（关）。开启后仅在新构造的 `<sender>` 中省略 `email` 属性，保留姓名、ID 和类型。与 `senderTag` 独立保存；不修改身份缓存、鉴权或 `--mention-back`，不清理已排队输入、历史或正文中的邮箱。可用 `/botconfig set senderTagHideEmail on\|off` 热更新 |
 | `replyDelivery` | `"transcript"` 或 `"send"`，**所有 CLI 缺省都是 `send`**（与上游行为一致），`transcript` 需显式开启。最终回复怎么送到飞书：`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，系统提示不再提及 `botmux send`；`send` = 模型必须自己 `botmux send`（历史行为）。显式写 `"send"` 才让 claude-code 退回旧行为；`send` / `transcript` 都会写盘，`unset` 回各 CLI 默认 |
 
 ### `replyDelivery: "transcript"`
@@ -499,3 +500,22 @@ Dashboard 的“会议角色预设”提供本地内置模板库，当前包含�
 Herdr、Riff、Mojo、Forge 启动模式、adopt 外部进程和外部 App Server 尚不能建立同一启动边界，显式严格模式会拒绝这些路径。用户主动执行的 shell/profile、CLI 自己读取的配置和凭证文件、全局文件权限与云端账号不在环境继承策略的隔离范围内。`codexAuthSync`、per-bot `CODEX_HOME` 与文件沙箱维持独立行为；严格模式不替代它们。
 
 Dashboard 只回读已配置的变量名；`env` 是只写表单，保存会替换整个 map，空白保存会清除。严格会话的「复现命令」不返回包含认证环境的命令；日志和策略诊断只展示名称/模式。`bots.json` 与进程环境仍可能以明文持有本 bot 明确配置的值，这不是秘密保险箱。
+
+
+## 回复卡片页脚
+
+Dashboard → Bot 配置 → 消息卡片中，可设置 Footer 总开关及各信息块独立开关，也可通过 `/botconfig set <字段> on|off` 配置。
+
+| 字段 | 缺省 | 控制范围 |
+| --- | --- | --- |
+| `replyFooterEnabled` | `true` | 整个回复 Footer，包括分隔线和语音按钮 |
+| `replyFooterBrand` | `true` | 品牌签名，仍受全局品牌开关和 `brandLabel` 限制 |
+| `replyFooterModel` | `true` | 模型名、推理强度与后端规格 |
+| `replyFooterUsage` | `true` | 页脚用量；只有 `usageDisplay: "footer"` 时显示 |
+| `replyFooterRecipients` | `true` | 页脚收件人及其 @ 通知；正文显式 @ 不受影响 |
+| `replyFooterVoice` | `true` | 已配置语音服务时的语音总结按钮 |
+| `showReplyTiming` | `false` | 等待时间；普通发送显示“执行至回复”，原生回合结束后的兜底显示最终执行耗时；缺少可靠计时则省略 |
+
+总开关优先于各信息块；关闭不会清空子项配置或签名文本，关闭期间仍可编辑子项，重新开启后恢复最后保存的选择。所有可展示信息块均关闭或无内容且没有语音按钮时，整个 Footer 与分隔线自动省略。任务状态卡、用量记账和模型执行参数不受影响。自定义卡片中的用户自定义内容不由该开关移除，仅控制 Botmux 自动追加的页脚。
+
+Dashboard 与 `/botconfig` 修改对后续新回复生效，无需重启；已发出的卡片不追溯修改，最终回复重试保留首次生成时的配置快照。仅依赖环境变量、无法访问配置或 daemon 的隔离/远程发送使用会话启动快照，需重建相应会话以刷新。直接编辑 `bots.json` 后重启以同步 daemon。

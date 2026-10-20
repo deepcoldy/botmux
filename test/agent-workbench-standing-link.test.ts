@@ -187,14 +187,25 @@ describe('常驻链接弹层', () => {
 // ─── 默认复制实现（navigator.clipboard → execCommand 降级） ────────────────
 
 describe('默认复制实现', () => {
-  it('弹层默认用 web/clipboard.ts 的 copyText：先 navigator.clipboard，失败降级 execCommand', async () => {
-    const source = await import('node:fs').then(fs =>
-      fs.readFileSync('src/dashboard/web/agent-workbench-appearance-menu.tsx', 'utf8'));
-    expect(source).toContain("from './clipboard.js'");
-    const clipboard = await import('node:fs').then(fs =>
-      fs.readFileSync('src/dashboard/web/clipboard.ts', 'utf8'));
-    expect(clipboard).toContain('navigator.clipboard');
-    expect(clipboard).toContain("document.execCommand('copy')");
+  // execCommand 降级那一半由 test/dashboard-clipboard.test.ts 逐路径验证；这里验的是弹层
+  // 不注入 copy 时真的接到那份实现上。
+  it('弹层不注入复制实现时，走默认的 navigator.clipboard.writeText 并给出「已复制」', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    try {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(WorkbenchStandingLinkPanel, { api, onClose: () => {} }));
+      });
+      await act(async () => {});
+      const button = byClass(renderer, 'wb-standing-link-copy')[0];
+      await act(async () => { await button.props.onClick(); });
+      expect(writeText).toHaveBeenCalledWith(STANDING_URL);
+      expect(textOf(byClass(renderer, 'wb-standing-link-copy')[0])).toBe('已复制');
+      act(() => renderer.unmount());
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

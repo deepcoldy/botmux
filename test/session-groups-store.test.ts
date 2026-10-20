@@ -262,6 +262,16 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
     expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
   });
 
+  it('pins claude-code to dontAsk so a bypassPermissions profile cannot leak in', () => {
+    const argv = ONE_SHOT_ARGV['claude-code'];
+    expect(argv).toEqual(['claude', '-p', '--permission-mode', 'dontAsk']);
+    // Wrappers forward the pin to the underlying claude.
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, argv).argv)
+      .toEqual(['aiden', 'x', 'claude', '-p', '--permission-mode', 'dontAsk']);
+    expect(resolveOneShotCommand({ cliPathOverride: '/opt/claude' }, argv).argv)
+      .toEqual(['/opt/claude', '-p', '--permission-mode', 'dontAsk']);
+  });
+
   it('supports antigravity in ONE_SHOT_ARGV with agy -p', () => {
     expect(ONE_SHOT_ARGV.antigravity).toEqual(['agy', '-p']);
     expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.antigravity)).toEqual({ argv: ['agy', '-p'] });

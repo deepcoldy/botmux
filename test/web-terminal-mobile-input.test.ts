@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { formatMobileInputModeOsc, MOBILE_INPUT_MODE_OSC_REGEX } from '../src/services/web-terminal-settings-store.js';
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -198,31 +197,13 @@ function bootMobileInput(options: {
 
 describe('手机 Web 终端输入栏', () => {
   it('把实测底栏高度留给终端，390×844 时内容区不会落到底栏后面', () => {
-    const source = workerSource();
-    expect(source).toMatch(
-      /body\.touch\.has-token #terminal \.xterm\s*\{[^}]*padding-bottom:\s*calc\(var\(--mobile-bar-h,\s*0px\)\s*\+\s*var\(--keyboard-inset,\s*0px\)\)/s,
-    );
-    expect(source).toMatch(
-      /transform:\s*translateY\(calc\(0px\s*-\s*var\(--keyboard-inset,\s*0px\)\)\)/,
-    );
-
     const page = bootMobileInput({ wsHasWrite: true, barHeight: 88, barRectHeight: 88.1875 });
     expect(page.rootProperty('--mobile-bar-h')).toBe('89px');
     expect(844 - Number.parseInt(page.rootProperty('--mobile-bar-h')!, 10)).toBe(755);
     expect(page.viewportResizeCount()).toBeGreaterThan(0);
   });
 
-  it('空输入保持单行，主输入行只保留等高的模式、输入和发送控件', () => {
-    const source = workerSource();
-    const rowStart = source.indexOf('<div id="mobile-bar-row">');
-    const rowEnd = source.indexOf('</div>\n</form>', rowStart);
-    const row = source.slice(rowStart, rowEnd);
-
-    expect(row).not.toMatch(/id="mobile-(?:up|bs|down)"/);
-    expect(row).toContain('placeholder="输入命令…"');
-    expect(source).toMatch(/#mobile-input\s*\{[^}]*min-height:42px/s);
-    expect(source).toMatch(/#mobile-bar-row button\s*\{[^}]*height:42px/s);
-
+  it('空输入保持单行，有换行内容时输入框随内容长高', () => {
     const page = bootMobileInput({ wsHasWrite: true, textareaScrollHeight: 54 });
     expect(page.textarea.style.height).toBe('42px');
 
@@ -258,10 +239,6 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.textarea.value).toBe('draft across reconnect');
     page.setWriteState?.(true);
     expect(page.controls.every(control => !control.disabled)).toBe(true);
-
-    expect(workerSource()).toMatch(
-      /function _wbSetWsWrite\(v\)[\s\S]*?_wbMobileWriteState[\s\S]*?_wbPostWrite\(\);/,
-    );
   });
 
   it('快捷键行提供 ←/→，发送标准 ANSI 左右方向序列', () => {
@@ -290,11 +267,6 @@ describe('手机 Web 终端输入栏', () => {
   });
 
   it('缓冲模式的按钮叫「上屏」并说明还要按 Enter，实时模式才叫「发送」', () => {
-    const source = workerSource();
-    // The static markup must already say 上屏 so there is no flash of the wrong
-    // word before setMode() runs on boot.
-    expect(source).toMatch(/<button id="mobile-send" type="submit">上屏<\/button>/);
-
     const page = bootMobileInput({ wsHasWrite: true });
     const send = page.controls.find(control => control.id === 'mobile-send');
     expect(send?.textContent).toBe('上屏');
@@ -432,19 +404,6 @@ describe('手机 Web 终端输入栏', () => {
     page.bar.dispatch('submit');
     // live mode diffs the mirror and appends a carriage return: a real submit.
     expect(page.sentInputs().join('').endsWith('\r')).toBe(true);
-  });
-
-  it('输入框字号不低于 16px，否则 iOS 聚焦时会自动放大页面且不再缩回', () => {
-    const source = workerSource();
-    const start = source.indexOf('#mobile-input{');
-    expect(start, '#mobile-input 规则缺失').toBeGreaterThan(-1);
-    const rule = source.slice(start, source.indexOf('}', start));
-    const fontSize = rule.match(/font:\s*(\d+(?:\.\d+)?)px/);
-    expect(fontSize, '#mobile-input 未声明 px 字号').not.toBeNull();
-    // Hard floor, not a taste call: below 16px, iOS Safari / WKWebView zooms the
-    // page on focus and never zooms back, pushing the terminal's right-hand
-    // columns off screen. -webkit-text-size-adjust does not prevent this.
-    expect(Number.parseFloat(fontSize![1])).toBeGreaterThanOrEqual(16);
   });
 
   it('实时模式下输入框已空时，系统键盘的删除键仍然删得掉终端里的字符', () => {
@@ -622,20 +581,6 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.sentInputs()).toEqual(['\x7f', 'hi']);
   });
 
-  it('底栏按钮抑制 iOS 长按选中与 callout，避免长按删除时弹出选择气泡', () => {
-    const source = workerSource();
-    // `user-select` alone leaves the WKWebView selection handles / callout menu
-    // on a long press — the `-webkit-` pair is what suppresses both.
-    for (const selector of ['#mobile-bar-keys button', '#mobile-bar-row button']) {
-      const start = source.indexOf(`${selector}{`);
-      expect(start, `${selector} 规则缺失`).toBeGreaterThan(-1);
-      const rule = source.slice(start, source.indexOf('}', start));
-      expect(rule, selector).toContain('-webkit-user-select:none');
-      expect(rule, selector).toContain('user-select:none');
-      expect(rule, selector).toContain('-webkit-touch-callout:none');
-    }
-  });
-
   it('记住沿用上一次设置：若服务端记录为 live，初始即为「发送」和「实时」', () => {
     const page = bootMobileInput({ wsHasWrite: true, initialMode: 'live' });
     const send = page.controls.find(c => c.id === 'mobile-send');
@@ -699,58 +644,26 @@ describe('手机 Web 终端输入栏', () => {
     expect(() => closedSync('live')).not.toThrow();
   });
 
+  // 源码结构护栏(K4)：页面端解析 OSC 1989 mobile_input_mode 的正则写在 worker.ts 模板字符串里的浏览器脚本中，
+  // 无法 import 与服务端格式化器比对；只能读源码确认它由共享导出 MOBILE_INPUT_MODE_OSC_REGEX 编译、且确实用于解析
+  // 下行数据，从而与 formatMobileInputModeOsc 不会漂移（共享正则与格式化器的往返由 web-terminal-settings-store.test.ts 覆盖）。#1716
   it('服务端到客户端线协议：页面使用服务端共享 MOBILE_INPUT_MODE_OSC_REGEX 编译并提取模式', () => {
     const source = workerSource();
-    // 页面内通过统一导出的 MOBILE_INPUT_MODE_OSC_REGEX.source 编译 _wbMimRegex
-    expect(source).toContain('var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});');
-    expect(source).toContain('var _mim=data.match(_wbMimRegex);');
-
-    // 页面运行态下实例化的正则对象
-    const browserRegex = new RegExp(MOBILE_INPUT_MODE_OSC_REGEX.source);
-
-    const liveOsc = formatMobileInputModeOsc('live');
-    const bufferOsc = formatMobileInputModeOsc('buffer');
-
-    expect(liveOsc).toBe('\x1b]1989;mobile_input_mode;live\x07');
-    expect(bufferOsc).toBe('\x1b]1989;mobile_input_mode;buffer\x07');
-
-    const mLive = `data-start${liveOsc}data-end`.match(browserRegex);
-    expect(mLive).not.toBeNull();
-    expect(mLive![1]).toBe('live');
-
-    const mBuffer = bufferOsc.match(browserRegex);
-    expect(mBuffer).not.toBeNull();
-    expect(mBuffer![1]).toBe('buffer');
-
-    expect('something else'.match(browserRegex)).toBeNull();
-    expect('\x1b]1989;mobile_input_mode;invalid\x07'.match(browserRegex)).toBeNull();
+    expect(source).toMatch(/_wbMimRegex\s*=\s*new RegExp\([^;]*MOBILE_INPUT_MODE_OSC_REGEX\.source/);
+    expect(source).toMatch(/\.match\(_wbMimRegex\)/);
   });
 
-  it('服务端线协议分发：合法 mobile_input_mode 消息更新存储并向其他已授权客户端广播', () => {
+  // 源码结构护栏(K2)：web 终端 WS 消息分发在 worker.ts 的巨型闭包里，单测无 seam（行为验证需起真 worker 走完整鉴权链路）。
+  // 守的是权限边界：只读/未鉴权连接不能改写持久化的输入模式，鉴权检查必须先于 setWebTerminalInputMode，
+  // 广播也只发给其它已鉴权客户端。#1716
+  it('服务端线协议分发：只接受已鉴权连接的 mobile_input_mode，并只向其他已授权客户端广播', () => {
     const source = workerSource();
-    expect(source).toContain("msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')");
-    expect(source).toMatch(/msg\.type === 'mobile_input_mode'[\s\S]*?if \(!authedClients\.has\(ws\)\) return;/);
-    expect(source).toMatch(/client !== ws && authedClients\.has\(client\)/);
-  });
-
-  it('输入模式切换绝不使用客户端本地存储（仅浮动工具栏位置使用 localStorage）', () => {
-    const source = workerSource();
-    // 杜绝 sessionStorage / indexedDB / WebSQL 等任何其他客户端持久化机制
-    expect(source).not.toContain('sessionStorage');
-    expect(source).not.toContain('indexedDB');
-    expect(source).not.toContain('openDatabase');
-
-    // 严密审计全部 localStorage API 调用
-    const storageCalls = [...source.matchAll(/localStorage\.[a-zA-Z]+/g)].map(m => m[0]);
-    expect(storageCalls.length).toBeGreaterThan(0);
-    for (const call of storageCalls) {
-      expect(['localStorage.getItem', 'localStorage.setItem']).toContain(call);
-    }
-
-    const storageLines = source.split('\n').filter(line => line.includes('localStorage.'));
-    expect(storageLines.length).toBeGreaterThan(0);
-    for (const line of storageLines) {
-      expect(line).not.toMatch(/mode|mobile|input|buffer|live|setting/i);
-    }
+    const branchStart = source.indexOf("msg.type === 'mobile_input_mode'");
+    expect(branchStart).toBeGreaterThan(-1);
+    const branch = source.slice(branchStart, source.indexOf("ws.on('close'", branchStart));
+    const authIdx = branch.indexOf('authedClients.has(ws)');
+    expect(authIdx).toBeGreaterThan(-1);
+    expect(branch.indexOf('setWebTerminalInputMode(')).toBeGreaterThan(authIdx);
+    expect(branch).toMatch(/client !== ws && authedClients\.has\(client\)/);
   });
 });

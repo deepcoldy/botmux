@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -7,12 +6,12 @@ import {
   buildOrchestratorReportTrigger,
   deliverReportSessionRelay,
   isReportRelayOriginalSessionUnavailable,
-  REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
   resolveReportRelayFallbackTarget,
   type ReportSessionRelaySessionView,
 } from '../src/core/report-session-relay.js';
-import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
+import { createDispatchReportBinding, DISPATCH_REPORT_REGISTER_ROUTE } from '../src/core/dispatch-report-binding.js';
+import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
 
 const CAPABILITY = 'c'.repeat(64);
 const BINDING_SECRET = 'binding-secret';
@@ -604,39 +603,19 @@ describe('report session relay delivery', () => {
   });
 });
 
-describe('report session relay wiring', () => {
-  const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-  const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-  const ipcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
-
-  it('admits only the report relay route through the narrow capability gate', () => {
-    expect(REPORT_SESSION_RELAY_ROUTE).toBe('/api/report-relay');
-    expect(ipcSource).toContain("pathname === REPORT_SESSION_RELAY_ROUTE");
-  });
-
-  it('admits the daemon-owned dispatch registration route through the same narrow gate', () => {
-    expect(ipcSource).toContain("pathname === DISPATCH_REPORT_REGISTER_ROUTE");
-  });
-
-  it('falls back to the source daemon relay when the host secret is masked', () => {
-    // Must be the proxy-immune loopback client, not the global fetch: under Bun the
-    // latter routes 127.0.0.1 through $http_proxy whenever no_proxy does not name
-    // that literal address, and the corporate proxy answers an HTML 403.
-    expect(cliSource).toContain("loopbackFetch(`http://127.0.0.1:${port}${input.path}`");
-    expect(cliSource).not.toContain("await fetch(`http://127.0.0.1:${port}${input.path}`");
-    expect(cliSource).toContain('originCapability: originClaim?.capability');
-  });
-
-  it('registers a daemon-side relay that signs the final orchestrator trigger', () => {
-    expect(REPORT_SESSION_RELAY_MAX_BYTES).toBe(256 * 1024);
-    expect(daemonSource).toContain("ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE");
-    expect(daemonSource).toContain(
-      'raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);',
-    );
-    expect(daemonSource).toContain('if (error instanceof JsonBodyTooLargeError)');
-  });
+describe('report session relay IPC aperture', () => {
+  // A sandboxed `botmux report` cannot read the host secret, so its two daemon
+  // routes must pass the outer IPC gate and reach the handlers' own capability
+  // checks (authorizeReportSessionRelayRequest above) — POST only.
+  it.each([REPORT_SESSION_RELAY_ROUTE, DISPATCH_REPORT_REGISTER_ROUTE])(
+    'admits POST %s through the narrow capability gate, and nothing else on it',
+    route => {
+      expect(routeHasNarrowUntrustedAuth('POST', route)).toBe(true);
+      expect(routeHasNarrowUntrustedAuth('GET', route)).toBe(false);
+      expect(routeHasNarrowUntrustedAuth('POST', `${route}/x`)).toBe(false);
+    },
+  );
 });
-
 
 describe('automatic zero-injection dispatch report', () => {
   it('returns to the signed lead session without assuming task completion', () => {

@@ -172,6 +172,34 @@ export interface ScopedCommand {
   capabilities: SessionScopeCapabilities;
 }
 
+const SCOPE_PARENT_SCRIPT = '"$@"; status=$?; exit "$status"';
+const SCOPE_PARENT_NAME = 'botmux-session-scope';
+
+/** Resolve only our fixed scope supervisor, never an arbitrary interactive
+ * shell. Its single foreground child execs systemd-run and then the payload.
+ * A missing/ambiguous child retains the shell identity and the input guard. */
+export function sessionScopePayloadPid(panePid: number, options: {
+  platform?: NodeJS.Platform;
+  readFile?: (path: string) => string;
+} = {}): number {
+  if ((options.platform ?? process.platform) !== 'linux') return panePid;
+  const read = options.readFile ?? (path => readFileSync(path, 'utf8'));
+  try {
+    const argv = read(`/proc/${panePid}/cmdline`).split('\0');
+    if (argv[0] !== '/bin/sh' || argv[1] !== '-c'
+      || argv[2] !== SCOPE_PARENT_SCRIPT || argv[3] !== SCOPE_PARENT_NAME
+      || argv[4] !== 'systemd-run' || argv[5] !== '--user' || argv[6] !== '--scope'
+      || argv[7] !== '--quiet' || argv[8] !== '--collect'
+      || !/^--unit=botmux-session-[a-z0-9_.-]+\.scope$/.test(argv[9] ?? '')) return panePid;
+    const children = read(`/proc/${panePid}/task/${panePid}/children`).trim().split(/\s+/);
+    if (children.length !== 1 || !/^[1-9]\d*$/.test(children[0])) return panePid;
+    const child = Number(children[0]);
+    return Number.isSafeInteger(child) && child > 1 && child !== panePid ? child : panePid;
+  } catch {
+    return panePid;
+  }
+}
+
 export function wrapCommandInSessionScope(
   sessionId: string,
   bin: string,
@@ -202,7 +230,13 @@ export function wrapCommandInSessionScope(
     // all forward arbitrary caller env keys, and a long-lived tmux server may
     // have started before the login bus existed.
     bin: '/usr/bin/env',
-    args: [...envArgs, 'systemd-run', ...scopeArgs],
+    // Keep the pane PID outside the owned scope. Some tmux versions move that
+    // PID into their own cgroup from the server after fork; an exec-only wrapper
+    // lets that late move steal the CLI from our scope. The post-command status
+    // handling prevents sh from execing systemd-run, while preserving foreground
+    // stdin and the payload's exit status (an async shell list would lose stdin).
+    args: [...envArgs, '/bin/sh', '-c', SCOPE_PARENT_SCRIPT,
+      SCOPE_PARENT_NAME, 'systemd-run', ...scopeArgs],
     unitName,
     capabilities,
   };

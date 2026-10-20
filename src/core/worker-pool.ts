@@ -19,7 +19,7 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
-import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
+import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
@@ -140,8 +140,11 @@ import {
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
+import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
@@ -155,7 +158,7 @@ import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-but
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import type { BotConfig } from '../bot-registry.js';
-import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
+import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
@@ -486,6 +489,25 @@ export function getDaemonReplyCardUsageSnapshot(
     : { context: null, tokens: null }, effectiveCliId);
 }
 
+/** Presentation and timing have their own IPC/snapshot contract, separate from /usage. */
+export function getDaemonReplyCardRenderSnapshot(
+  ds: DaemonSession,
+  options: { turnId?: string; dispatchAttempt?: number; finalTiming?: { durationMs?: number; executionStartedAtMs?: number } } = {},
+  effectiveCliId?: CliId,
+): ReplyCardRenderSnapshot {
+  let cfg: { showReplyTiming?: boolean } = {};
+  try { cfg = getBot(ds.larkAppId).config; } catch { /* offline defaults */ }
+  const observation = options.turnId ? ds.replyExecutionStarts?.get(JSON.stringify([options.turnId, options.dispatchAttempt ?? null])) : undefined;
+  const startedAtMs = options.finalTiming ? options.finalTiming.executionStartedAtMs
+    : observation?.workerGeneration === ds.workerGeneration ? observation?.startedAtMs : undefined;
+  const timing = cfg.showReplyTiming === true ? measureReplyTiming({
+    startedAtMs,
+    receivedAtMs: options.dispatchAttempt === undefined && options.turnId ? ds.turnReceivedAtMs?.get(options.turnId) : undefined,
+    durationMs: options.finalTiming?.durationMs, completed: options.finalTiming !== undefined, nowMs: Date.now(),
+  }) : undefined;
+  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg), ...(timing ? { timing } : {}) };
+}
+
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend
  * on transcript availability. Hidden metrics must not trigger transcript I/O. */
 export function getDaemonStreamingCardUsageSnapshot(
@@ -739,6 +761,7 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
+import { truncateUtf16WellFormed } from '../utils/unicode.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -771,6 +794,8 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 // the leader already reported failure (split-brain; see the busy-refuse comment
 // in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// Claude Code `/btw` answers are capped before rendering (see 'btw_answer').
+const BTW_ANSWER_MAX_CHARS = 6_000;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -6132,10 +6157,11 @@ export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, str
   }
   // Record what this generation is being handed BEFORE the restart is sent.
   //
-  // This is the single choke point all four restart senders share (dashboard-ipc
-  // operator + working-dir, requestSessionRestart, cli_crash auto-restart), so
-  // recording here cannot be missed by adding a fifth caller — which is exactly
-  // how the device-isolation proof lost track of the env the running child had
+  // This is the single choke point every restart sender shares (all of them —
+  // IM /restart, card button, dashboard operator + working-dir move, cli_crash
+  // auto-restart — now go through requestSessionRestart), so recording here
+  // cannot be missed by adding another caller — which is exactly how the
+  // device-isolation proof lost track of the env the running child had
   // actually been given.
   //
   // Accumulate, never replace: the restart may fail or be coalesced, so a later
@@ -6249,33 +6275,97 @@ export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | nu
   }
 }
 
-/** Join or start one correlated physical restart for a session. */
+export interface SessionRestartOptions {
+  /**
+   * Role-switch cwd move: the worker converges `lastInitConfig.workingDir` to
+   * this path before respawning (`restart.updateWorkingDir`). The caller must
+   * already have repinned the session record — the record is the source of
+   * truth, the respawn only makes the live CLI catch up — and must have
+   * refused while another restart was in flight (a join would not deliver it).
+   */
+  updateWorkingDir?: string;
+}
+
+export interface SessionRestartRequest {
+  attemptId: string;
+  joined: boolean;
+  /**
+   * The restart could not be handed to the worker (e.g. the IPC channel is
+   * already closed). A fresh attempt has already settled `failed`, so the
+   * workerReady fence stays down; callers that must not leave a half-applied
+   * mutation behind (cwd move) react to this synchronously.
+   */
+  startFailure?: { error: unknown };
+}
+
+/**
+ * Audit label carried on the restart IPC so an operator / crash-recovery
+ * restart stays distinguishable from IM `/restart` in the worker's message.
+ * The worker does not branch on it.
+ */
+function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' } {
+  if (source === 'cli_crash') return { reason: 'cli_crash' };
+  if (source === 'dashboard') return { reason: 'operator' };
+  return {};
+}
+
+/** A correlated restart attempt for this session is still in flight. */
+export function isSessionRestartInFlight(ds: DaemonSession): boolean {
+  return restartCoordinator.activeAttemptId(ds.session.sessionId) !== undefined;
+}
+
+/**
+ * Join or start one correlated physical restart for a session.
+ *
+ * This is the ONLY daemon-side sender of the in-worker `restart` IPC. The
+ * live-worker branch clears `ds.workerReady` (the lifecycle fence), and the
+ * worker's in-place respawn never re-emits the process-level `ready`, so the
+ * attemptId-matched `restart_result: succeeded` is the sole edge that lifts the
+ * fence again. A restart sent without an attemptId gets no receipt and leaves
+ * fork / relay / dashboard lifecycle operations `worker_busy` forever (#1863).
+ *
+ * Joining an in-flight attempt sends nothing: the worker is already
+ * respawning on the launch snapshot that attempt carried. Callers whose
+ * request CHANGES that snapshot (dashboard operator restart after a config
+ * edit, role-switch cwd move) must not join — they check
+ * isSessionRestartInFlight() first (before any side effect) and refuse.
+ */
 export function requestSessionRestart(
   ds: DaemonSession,
   observer: RestartObserver,
-): { attemptId: string; joined: boolean } | undefined {
+  opts: SessionRestartOptions = {},
+): SessionRestartRequest | undefined {
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Restart refused while routing transfer is in progress`);
     return undefined;
   }
-  return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
-    if (ds.worker && !ds.worker.killed) {
-      ds.workerReady = false;
-      // In-worker respawn: the next prompt belongs to a NEW CLI generation.
-      ds.cliReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
-      return;
+  const start: { failure?: { error: unknown } } = {};
+  const cwdMove = opts.updateWorkingDir ? { updateWorkingDir: opts.updateWorkingDir } : {};
+  const result = restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+    try {
+      if (ds.worker && !ds.worker.killed) {
+        ds.workerReady = false;
+        // In-worker respawn: the next prompt belongs to a NEW CLI generation.
+        ds.cliReady = false;
+        ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
+        return;
+      }
+      // No live worker but the persistent pane may still be alive (e.g. after a
+      // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
+      // fresh CLI instead of reattaching the old one and falsely reporting a
+      // successful restart.
+      destroyLivePaneBeforeRestart(ds);
+      forkWorker(ds, '', {
+        resume: ds.hasHistory,
+        restartAttemptId: attemptId,
+      });
+    } catch (error) {
+      start.failure = { error };
+      // Rethrow: the coordinator settles this fresh attempt as `failed`.
+      throw error;
     }
-    // No live worker but the persistent pane may still be alive (e.g. after a
-    // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
-    // fresh CLI instead of reattaching the old one and falsely reporting a
-    // successful restart.
-    destroyLivePaneBeforeRestart(ds);
-    forkWorker(ds, '', {
-      resume: ds.hasHistory,
-      restartAttemptId: attemptId,
-    });
   });
+  return start.failure ? { ...result, startFailure: start.failure } : result;
 }
 
 export function __testOnly_resetRestartCoordinator(): void {
@@ -6444,11 +6534,40 @@ function destroyOrphanedBackingSession(
   }
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
+  const target = persistentBackendTargetForSession(ds)!;
   try {
-    killPersistentBackendTarget(persistentBackendTargetForSession(ds)!, ds.session.sessionId);
+    killPersistentBackendTarget(target, ds.session.sessionId);
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
+    return;
+  }
+  retireOrphanedSandboxTree(ds, target);
+}
+
+/**
+ * A worker whose persistent pane outlived it (crash, daemon restart) keeps the
+ * session's sandbox tree for a successor. With no worker left to run the
+ * close-time cleanup a live worker would have run, tear the tree down here —
+ * with each flavour's own teardown (a scratch tree is UNMOUNTED first; a blind
+ * recursive rm of a still-mounted full-root COW view walks the whole host).
+ * Only once the pane is proven gone: a possibly-live pane still runs against
+ * the tree, and the periodic sweep reclaims it once the session is inactive.
+ */
+function retireOrphanedSandboxTree(ds: DaemonSession, target: PersistentBackendTarget): void {
+  const sessionId = ds.session.sessionId;
+  try { lstatSync(join(config.session.dataDir, 'sandboxes', sessionId)); } catch { return; } // never sandboxed
+  let probe: string;
+  try { probe = probePersistentBackendTarget(target); } catch (err) { probe = `unknown (${err})`; }
+  if (probe !== 'missing') {
+    logger.warn(`[${tag(ds)}] killWorker: keeping the sandbox tree — backing session not proven gone (probe: ${probe})`);
+    return;
+  }
+  try {
+    teardownSessionSandboxTree(sessionId, config.session.dataDir);
+    logger.info(`[${tag(ds)}] killWorker: tore down the orphaned sandbox tree`);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] killWorker: sandbox tree teardown failed: ${err}`);
   }
 }
 
@@ -14618,6 +14737,17 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'turn_execution_started': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration || !msg.turnId
+          || !Number.isFinite(msg.startedAtMs) || msg.startedAtMs < 0 || msg.startedAtMs > Date.now()) break;
+        const starts = ds.replyExecutionStarts ??= new Map();
+        const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
+        starts.delete(key);
+        starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration });
+        if (starts.size > 512) starts.delete(starts.keys().next().value!);
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -16607,10 +16737,32 @@ function setupWorkerHandlers(
         // Auto-restart CLI within the same worker. 捎带最新 per-bot env：崩溃
         // 往往正是旧 env 配的错（如过期 token / 失效 proxy），用户改完 env 后
         // 下一轮 auto-restart 直接用新值恢复，不必再手工 /close。
+        //
+        // Through the restart coordinator, never a bare restart IPC: the
+        // in-worker respawn emits no second process-level `ready`, so only the
+        // attemptId-matched `restart_result` can lift the workerReady fence
+        // requestSessionRestart lowers. A bare restart left fork / relay /
+        // dashboard lifecycle ops `worker_busy` until a manual /restart (#1863).
+        // The crash-loop budget above is unchanged: every failed respawn reports
+        // `restart_result: failed` (settling its attempt) BEFORE its own
+        // claude_exit, so each crash lands here again and mints a new attempt.
+        // A crash while another restart attempt is still in flight joins it
+        // instead of stacking a second respawn on top.
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
-          ds.workerReady = false;
-          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
+          const restart = requestSessionRestart(ds, {
+            source: 'cli_crash',
+            notify: status => {
+              if (status === 'failed' || status === 'timed_out') {
+                logger.warn(`[${t}] CLI crash auto-restart ${status}`);
+              }
+            },
+          });
+          if (!restart) {
+            ds.managedTurnOrigin = undefined;
+          } else if (restart.joined) {
+            logger.info(`[${t}] Crash auto-restart joined in-flight restart attempt ${restart.attemptId}`);
+          }
         } else {
           ds.managedTurnOrigin = undefined;
         }
@@ -18197,6 +18349,36 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'btw_answer': {
+        // Claude Code `/btw` side answer captured from its overlay. Rendered
+        // like the adopt preamble (question + Markdown answer) and replied
+        // under the `/btw` turn.
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        if (!msg.answer.trim()) break;
+        const loc = localeForBot(ds.larkAppId);
+        // Feishu cards cap at ~30KB; a side answer is short, so a plain
+        // character cap (CJK is 3 bytes) is enough instead of a file fallback.
+        let btwAnswer = msg.answer.length > BTW_ANSWER_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+          : msg.answer;
+        if (msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        const cardJson = buildContextualReplyCard({
+          title: tr('card.btw_answer', undefined, loc),
+          userText: msg.question,
+          assistantText: repairReplyMarkdown(btwAnswer),
+          assistantLabel: sessionCliDisplayName(ds, botCfg),
+          recipientOpenId,
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          locale: loc,
+          workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+        });
+        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: unknown) => {
+          logger.error(`[${t}] Failed to deliver /btw answer: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        break;
+      }
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
         // from the adopted CLI session so the Lark thread has context to
@@ -18214,6 +18396,9 @@ function setupWorkerHandlers(
         const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
         if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        // This is a historical exchange, so carry the current display policy
+        // without attributing the active turn's execution timing to it.
+        const renderSnapshot = getDaemonReplyCardRenderSnapshot(ds, {}, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
@@ -18224,7 +18409,8 @@ function setupWorkerHandlers(
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
-          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
+          usage: renderSnapshot.usage,
+          presentation: renderSnapshot,
         });
         replyWithImageFallback(cardJson, 'interactive', content => {
           if (!ownsLifecycleMutation()) return Promise.reject(new Error('Adopt worker ownership changed'));
@@ -18908,7 +19094,7 @@ function deliverFinalOutput(
   onComplete?: (owned: boolean, messageId?: string) => void,
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
-  frozenUsage?: CardUsageSnapshot,
+  frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
   imageFallback: ReplyImageState = { omitImages: false },
 ): void {
@@ -18916,7 +19102,7 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
-  let cardUsage = frozenUsage;
+  let renderSnapshot = frozenRenderSnapshot;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
     && sessionPromptInjection(ds) === 'none';
@@ -19357,19 +19543,15 @@ function deliverFinalOutput(
         && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
         ? { policy: feedbackPolicy }
         : undefined;
-      cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      renderSnapshot ??= getDaemonReplyCardRenderSnapshot(ds, {
+        turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+        finalTiming: { durationMs: msg.durationMs ?? msg.codexAppSettlement?.durationMs, executionStartedAtMs: msg.executionStartedAtMs },
+      }, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
-      const executionDurationMs = getBot(ds.larkAppId).config.showReplyTiming === true
-        ? msg.durationMs ?? msg.codexAppSettlement?.durationMs
-        : undefined;
-      const receivedAtMs = ds.turnReceivedAtMs?.get(msg.turnId);
-      const waitingDurationMs = executionDurationMs !== undefined && msg.dispatchAttempt === undefined
-        && receivedAtMs !== undefined && msg.executionStartedAtMs !== undefined
-        ? msg.executionStartedAtMs - receivedAtMs : undefined;
       let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
@@ -19381,9 +19563,8 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
@@ -19394,9 +19575,8 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
           });
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
@@ -19776,7 +19956,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -353,6 +353,48 @@ describe('prepareDirectSandbox tmux argument transport', () => {
 });
 
 
+describe('sandbox tree across a detach-style worker exit', () => {
+  it('outlives the worker only for a persistent pane that owns a tree', () => {
+    for (const backendType of ['tmux', 'zellij', 'herdr', 'zmx']) {
+      expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType, persistentSessionName: 'bmx-1' })).toBe(true);
+    }
+    // PTY owns its CLI: it dies with the worker, so its tree is cleaned up.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'pty', persistentSessionName: 'bmx-1' })).toBe(false);
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'tmux', persistentSessionName: undefined })).toBe(false);
+    // Unsandboxed: nothing to keep.
+    expect(sandboxTreeSurvivesWorkerExit({ ownsTree: false, backendType: 'tmux', persistentSessionName: 'bmx-1' })).toBe(false);
+  });
+
+  it('re-serves the outbox a live pane bound and never recreates a lost one', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-reattach-'));
+    const sessionId = 'live-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const outbox = join(sessionRoot, 'outbox');
+    try {
+      // Tree without its outbox (the pane's bind source is gone): a new
+      // directory would be an inode the pane can never see.
+      mkdirSync(join(sessionRoot, 'empties'), { recursive: true });
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      expect(existsSync(outbox)).toBe(false);
+      // A symlinked outbox is not the directory the pane bound either.
+      const elsewhere = join(root, 'elsewhere');
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, outbox);
+      expect(attachSandboxOutbox({ sessionId, dataDir: root })).toBeNull();
+      rmSync(outbox);
+      // The preserved outbox is handed back as-is.
+      mkdirSync(outbox);
+      const inode = statSync(outbox).ino;
+      const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+      expect(plan?.outbox).toBe(join(realpathSync(root), 'sandboxes', sessionId, 'outbox'));
+      expect(statSync(plan!.outbox).ino).toBe(inode);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
+
 describe('sandbox tree cleanup', () => {
   it.each(['reattach', 'sweep'] as const)('removes a mode-000 mask during %s cleanup', method => {
     if (process.platform !== 'linux') return;
@@ -361,6 +403,7 @@ describe('sandbox tree cleanup', () => {
     const sessionRoot = join(root, 'sandboxes', sessionId);
     const empty = join(sessionRoot, 'empty');
     mkdirSync(empty, { recursive: true });
+    mkdirSync(join(sessionRoot, 'outbox'));
     chmodSync(empty, 0o000);
     try {
       if (method === 'reattach') {
@@ -408,7 +451,7 @@ describe('sandbox tree cleanup', () => {
     const sessionId = 'closed-session';
     const sessionRoot = join(root, 'sandboxes', sessionId);
     const outside = join(root, 'outside');
-    mkdirSync(sessionRoot, { recursive: true });
+    mkdirSync(join(sessionRoot, 'outbox'), { recursive: true });
     mkdirSync(outside);
     writeFileSync(join(outside, 'keep'), 'host data');
     symlinkSync(outside, join(sessionRoot, 'empty'));

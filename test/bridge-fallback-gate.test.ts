@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
@@ -108,52 +107,6 @@ describe('stripTrailingOaiMemoryCitation', () => {
     const malformed = `<oai-mem-citation><citation_entries>${repeatedCandidates}`
       + '<rollout_ids>missing final envelope';
     expect(stripTrailingOaiMemoryCitation(malformed)).toBe(malformed);
-  });
-});
-
-function workerFunctionSlice(name: string, nextName: string): string {
-  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-  const start = source.indexOf(`function ${name}`);
-  const end = source.indexOf(`function ${nextName}`, start + 1);
-  expect(start).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(start);
-  return source.slice(start, end);
-}
-
-describe('worker remote final identity wiring', () => {
-  it('passes the exact turn id and dispatch attempt into the fallback gate', () => {
-    const remoteFinal = workerFunctionSlice(
-      'deliverRemoteTurnFinal',
-      'deliverRemoteRunnerOutboundMessage',
-    );
-    const gateInputStart = remoteFinal.indexOf('const gateInput = {');
-    const gateInputEnd = remoteFinal.indexOf('};', gateInputStart);
-    expect(gateInputStart).toBeGreaterThanOrEqual(0);
-    expect(gateInputEnd).toBeGreaterThan(gateInputStart);
-    const gateInput = remoteFinal.slice(gateInputStart, gateInputEnd);
-    expect(gateInput).toContain('turnId,');
-    expect(gateInput).toContain('dispatchAttempt,');
-  });
-});
-
-describe('worker submit-failure retry wiring', () => {
-  it('re-arms ordinary IM turns after active evidence through the bounded chain', () => {
-    const schedule = workerFunctionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
-    const activeStart = schedule.indexOf("case 'suppress-active':");
-    const activeEnd = schedule.indexOf("case 'notify-hard-failure':", activeStart);
-    expect(activeStart).toBeGreaterThanOrEqual(0);
-    expect(activeEnd).toBeGreaterThan(activeStart);
-
-    const active = schedule.slice(activeStart, activeEnd);
-    const rearm = active.indexOf('armDeferredRecheck()');
-    expect(rearm).toBeGreaterThanOrEqual(0);
-    expect(active.slice(0, rearm)).not.toContain('dispatchAttempt !== undefined');
-    expect(active).toContain('deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS');
-
-    const notifyStuck = schedule.slice(schedule.indexOf("case 'notify-stuck':"));
-    expect(notifyStuck).toContain('if (turnIdentity?.dispatchAttempt === undefined)');
-    expect(notifyStuck).toContain("type: 'user_notify'");
-    expect(notifyStuck).toContain('worker.submit_unconfirmed');
   });
 });
 

@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { discoverExternalRuntimeCandidate, selectExternalRuntimeCandidate } from '../../src/desktop/main/external-runtime.js';
 
@@ -10,17 +8,6 @@ const paths = {
 };
 
 describe('desktop external CLI runtime discovery', () => {
-  it('wires the bundled runtime into the production Desktop service', () => {
-    const mainSource = readFileSync(
-      fileURLToPath(new URL('../../src/desktop/main.ts', import.meta.url)),
-      'utf-8',
-    );
-
-    expect(mainSource).toContain('resolveBundledRuntimeCandidate');
-    expect(mainSource).toContain('bundledRuntime,');
-    expect(mainSource).not.toContain('discoverExternalRuntime:');
-  });
-
   it('selects an npm-installed botmux runtime outside the bundled app', () => {
     const files = new Map([
       ['/usr/local/lib/node_modules/botmux/package.json', JSON.stringify({ name: 'botmux', version: '2.9.0' })],

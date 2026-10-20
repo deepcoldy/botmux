@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
@@ -176,7 +177,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, latestLarkToolBindingForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -436,7 +437,8 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
-import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -1739,6 +1741,20 @@ ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
   jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
 });
 
+/** Reply rendering owns policy and timing; native /usage stays data-only. */
+ipcRoute('GET', '/api/sessions/:sessionId/reply-render-snapshot', (req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { error: 'not_found' });
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const turnId = query.get('turnId') ?? undefined;
+  const rawAttempt = query.get('dispatchAttempt');
+  const dispatchAttempt = rawAttempt === null ? undefined : Number(rawAttempt);
+  if (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt < 1)) {
+    return jsonRes(res, 400, { error: 'invalid_dispatch_attempt' });
+  }
+  jsonRes(res, 200, { snapshot: getDaemonReplyCardRenderSnapshot(ds, { turnId, dispatchAttempt }) });
+});
+
 /** Session-bound single-message delivery through the primary durable outbox.
  * The short-lived CLI never receives store credentials or a lease proof. */
 ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, params) => {
@@ -2321,20 +2337,42 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     });
   }
   if (rejectProtectedSessionMutation(res, [ds])) return;
+  // A correlated restart (IM /restart, card, crash auto-restart, an earlier
+  // click) is still in flight. Joining it would silently drop what this click
+  // is for — the operator usually just saved env / model / tool binding, and
+  // the in-flight attempt carries the snapshot from before that edit — while
+  // a second physical restart would race the first. Refuse; the operator
+  // retries once the session is back. (Before #1863 this sent an uncorrelated
+  // restart that left the session `worker_busy` until a manual /restart.)
+  if (isSessionRestartInFlight(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'restart_in_progress',
+      message: t('cmd.restart.busy', undefined, localeForBot(ds.larkAppId)),
+    });
+  }
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
     // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
     // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
-    try {
-      ds.workerReady = false;
-      // In-worker respawn: the next prompt belongs to a NEW CLI generation.
-      ds.cliReady = false;
-      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
-    } catch (err) {
-      return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+    // Correlated through the restart coordinator like IM /restart: the
+    // in-worker respawn emits no second `ready`, so only the attemptId-matched
+    // restart_result lifts the workerReady fence (#1863).
+    const sessionId = params.sessionId;
+    const restart = requestSessionRestart(ds, {
+      source: 'dashboard',
+      notify: status => {
+        if (status === 'failed' || status === 'timed_out') {
+          logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
+        }
+      },
+    });
+    if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+    if (restart.startFailure) {
+      return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
     }
     postRestartNotice(ds, false);
-    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: false });
+    return jsonRes(res, 200, { ok: true, sessionId, cliId, revived: false });
   }
   // Worker is gone but the session is still active — idle-suspended (over the
   // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
@@ -3391,6 +3429,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
       message: t('cmd.cd.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
+  // A correlated restart is already in flight: its respawn was requested on the
+  // OLD cwd, and joining it would not deliver the new one. Refuse BEFORE the
+  // repin below so the record never points at a directory the CLI is not
+  // moving to; the caller retries once the restart settles.
+  if (isSessionRestartInFlight(ds)) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'restart_in_progress',
+      message: t('cmd.restart.busy', undefined, localeForBot(ds.larkAppId)),
+    });
+  }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
   // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
@@ -3419,12 +3468,22 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.worker && !ds.worker.killed) {
     // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
     // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
-    try {
-      ds.workerReady = false;
-      // In-worker respawn: the next prompt belongs to a NEW CLI generation.
-      ds.cliReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
-    } catch {
+    // 经 restart coordinator 发（与 /restart 同一条关联链路）：in-worker respawn 不会
+    // 再发进程级 ready，只有带 attemptId 的 restart_result 才能放开 workerReady 栅栏，
+    // 裸 restart 会让 fork/relay 永久 worker_busy（#1863）。已有重启在飞的情况在上面
+    // 落盘之前就已 409 拒绝，这里必是新 attempt。
+    const sessionId = params.sessionId;
+    const restart = requestSessionRestart(ds, {
+      source: 'cwd_move',
+      notify: status => {
+        if (status === 'failed' || status === 'timed_out') {
+          logger.warn(`[restart] cwd-move respawn of ${sessionId} → ${v.resolvedPath} ${status}`);
+        }
+      },
+    }, { updateWorkingDir: v.resolvedPath });
+    // 上面已同步检查过 transferring，到这里之间没有 await，不可达；防御性兜底。
+    if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+    if (restart.startFailure) {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
       // 进程仍在旧目录」的分裂状态。杀掉 worker 让下一条消息冷启动进新目录。
@@ -7404,6 +7463,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
     // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
     defaultBackendType: config.daemon.backendType,
+    ...normalizeReplyFooter(cardPrefs),
+    showReplyTiming: cardPrefs.showReplyTiming,
     usageDisplay: cardPrefs.usageDisplay,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
@@ -7420,6 +7481,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
+    senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -7553,6 +7615,13 @@ ipcRoute('PUT', '/api/bot-quota-fallback', requireBoundBot(async (req, res) => {
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{
+    replyFooterEnabled?: unknown;
+    replyFooterBrand?: unknown;
+    replyFooterModel?: unknown;
+    replyFooterUsage?: unknown;
+    replyFooterRecipients?: unknown;
+    replyFooterVoice?: unknown;
+    showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
@@ -7563,10 +7632,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    senderTagHideEmail?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
-  const patch: {
+  const patch: ReplyFooterPreferences & {
+    showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
@@ -7578,7 +7649,14 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    senderTagHideEmail?: boolean;
   } = {};
+  for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
+    if (body[key] !== undefined) {
+      if (typeof body[key] !== 'boolean') return jsonRes(res, 400, { ok: false, error: `invalid_${key}` });
+      patch[key] = body[key];
+    }
+  }
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (body.replyCardMode !== undefined) {
     if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {
@@ -7614,6 +7692,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
@@ -8925,7 +9004,7 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
 //   • parser 从未被调用，`fallback:'device'` 这类被刻意禁止的值也会 200 落盘；
 //   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
 //     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
-const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback']);
+const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback', 'credentialSource']);
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
   let body: { triggerUserAuth?: unknown };
@@ -8992,10 +9071,16 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
     // can still read shared token stores.
     const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    // Platform-backed source: tell the UI whether this machine is bound so the
+    // picker can say what `auto` / `platform` will actually do here.
+    const platformUrl = platformCredentialsUrl();
     jsonRes(res, 200, {
       ok: true,
       policy,
       authorizedCount,
+      credentialSource: credentialSourceOf(policy),
+      platformBound: platformUrl !== null,
+      ...(platformUrl ? { platformCredentialsUrl: platformUrl } : {}),
       tokenStoreEnforced: protection.enforced,
       ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
       ...(mcpAdvisory ? { mcpAdvisory } : {}),

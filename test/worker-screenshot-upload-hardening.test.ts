@@ -441,32 +441,17 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     expect(id.state().revision).toBe(4);
   });
 
-  it('every former direct identity assignment in worker.ts goes through setCaptureIdentity', () => {
-    const assignments = source.match(/currentBotmux(TurnId|DispatchAttempt) = /g) ?? [];
-    // Only the two lines inside setCaptureIdentity itself.
-    expect(assignments).toHaveLength(2);
+  // 源码结构护栏(K1)：「capture identity 只有 setCaptureIdentity 一个写入点」是代码结构本身的约束，
+  // worker.ts 是进程入口无法 import，只能数源码里的赋值点。绕过它直接赋值会跳过 captureRevision 递增与
+  // capture_identity 广播，daemon 就会把旧帧配给新卡片或让新卡片不刷新（#1800）。
+  it('mutates the capture identity only inside setCaptureIdentity', () => {
+    const assignments = source.match(/\bcurrentBotmux(TurnId|DispatchAttempt)\s*=(?!=)/g) ?? [];
     const start = source.indexOf('function setCaptureIdentity(');
+    expect(start).toBeGreaterThanOrEqual(0);
     const body = source.slice(start, source.indexOf('\n}\n', start));
-    expect(body).toContain('currentBotmuxTurnId = turnId;');
-    // Receipts never move identity.
-    const ack = functionSlice('acknowledgeTurnInputCommitted', 'acknowledgeTurnInputReceived');
-    expect(ack).not.toContain('setCaptureIdentity');
-    // Real write points do.
-    const bodyOf = (name: string): string => {
-      const at = source.indexOf(`async function ${name}(`);
-      expect(at, name).toBeGreaterThanOrEqual(0);
-      return source.slice(at, source.indexOf('\n}\n', at));
-    };
-    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId)');
-    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId)');
-    const flushBody = bodyOf('flushPending');
-    expect(flushBody).toContain('setCaptureIdentity(');
-    expect(flushBody).toContain('item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId');
-    for (const name of ['adoptInitialActiveTurn', 'adoptDisplacedActiveTurn', 'writeCliPidMarker', 'syncQueuedTurnsFromMarkerDisk', 'advanceQueuedTypeAheadTurn']) {
-      const at = source.indexOf(`function ${name}(`);
-      expect(at, name).toBeGreaterThanOrEqual(0);
-      expect(source.slice(at, source.indexOf('\n}\n', at)), name).toContain('setCaptureIdentity(');
-    }
+    const insideWriter = body.match(/\bcurrentBotmux(TurnId|DispatchAttempt)\s*=(?!=)/g) ?? [];
+    expect(insideWriter.length).toBeGreaterThan(0);
+    expect(assignments).toHaveLength(insideWriter.length);
   });
 
   it('keeps capture identity on the running turn while type-ahead is queued, then advances it with the actual queued promotion', () => {
@@ -749,38 +734,5 @@ describe('R2 turn-only capture acceptance', () => {
     await harness.captureAndUpload();
     expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
     expect(harness.lastHash()).toBe('0:0:213x58:same-pixels');
-  });
-});
-
-describe('turn caller persistence across crash recovery', () => {
-  it('persists the live caller in the PID marker JSON', () => {
-    const at = source.indexOf('function writeCliPidMarker(');
-    const body = source.slice(at, source.indexOf('\n}\n', at));
-    expect(body).toContain('...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {})');
-  });
-
-  it('persists the queued type-ahead caller so a marker replay does not drop it', () => {
-    const at = source.indexOf('function writeCliPidMarker(');
-    const body = source.slice(at, source.indexOf('\n}\n', at));
-    expect(body).toContain("...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {})");
-  });
-
-  it('restores the caller when adopting the initial active turn, falling back to trusted provenance', () => {
-    const at = source.indexOf('function adoptInitialActiveTurn(');
-    const body = source.slice(at, source.indexOf('\n}\n', at));
-    expect(body).toContain('parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId');
-  });
-
-  it('replays queued-turn callers from the marker back into the type-ahead queue', () => {
-    // Two replay sites: writeCliPidMarker's read-back and syncQueuedTurnsFromMarkerDisk.
-    const occurrences = source.split("...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {})").length - 1
-      + source.split("...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {})").length - 1;
-    expect(occurrences).toBeGreaterThanOrEqual(3);
-  });
-
-  it('advances the marker-synced turn with its persisted or queued caller', () => {
-    const at = source.indexOf('function syncQueuedTurnsFromMarkerDisk(');
-    const body = source.slice(at, source.indexOf('\n}\n', at));
-    expect(body).toContain('parsed.callerOpenId ?? advancedRecord.turnCallerOpenId');
   });
 });

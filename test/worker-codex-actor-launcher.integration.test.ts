@@ -12,6 +12,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
 const tmuxAvailable = process.platform === 'linux' && probeTmuxFunctional().ok;
 
@@ -96,7 +97,7 @@ exec '${node}' '${launcherScript}'
   try {
     worker = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
-      env: { ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId },
+      env: privateTmuxEnv(root, { SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     worker.on('message', m => messages.push(m as WorkerToDaemon));
@@ -169,7 +170,7 @@ exec '${node}' '${launcherScript}'
     }
     stopSessionScope(sessionId);
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
     }
     rmSync(root, { recursive: true, force: true });
   }
