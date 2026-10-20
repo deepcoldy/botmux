@@ -290,7 +290,11 @@ export function resolveManagedSkillSource(
 const O_NOFOLLOW_ANY_DARWIN = 0x20000000;
 const IS_LINUX = process.platform === 'linux';
 const IS_DARWIN = process.platform === 'darwin';
-const NOFOLLOW = IS_DARWIN ? (fsConstants.O_NOFOLLOW | O_NOFOLLOW_ANY_DARWIN) : fsConstants.O_NOFOLLOW;
+// Resolved on use, not at module load: this module sits in widely imported
+// graphs (session-skill-runtime, the v3 ephemeral pool), and a test that
+// partially mocks node:fs without `constants` must still be able to import them.
+const nofollow = (): number =>
+  IS_DARWIN ? (fsConstants.O_NOFOLLOW | O_NOFOLLOW_ANY_DARWIN) : fsConstants.O_NOFOLLOW;
 
 /** An open directory plus the path used for diagnostics / darwin lookups. */
 interface Dir { fd: number; path: string }
@@ -305,13 +309,13 @@ function childPath(dir: Dir, name: string): string {
 
 function openDirNoSymlinks(absPath: string): Dir {
   if (IS_DARWIN) {
-    return { fd: openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NOFOLLOW), path: absPath };
+    return { fd: openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow()), path: absPath };
   }
   if (!IS_LINUX) throw new Error('skill snapshots are supported on Linux and macOS only');
   let fd = openSync('/', fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
   try {
     for (const part of absPath.split('/').filter(Boolean)) {
-      const next = openSync(`/proc/self/fd/${fd}/${part}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NOFOLLOW);
+      const next = openSync(`/proc/self/fd/${fd}/${part}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow());
       closeSync(fd);
       fd = next;
     }
@@ -328,7 +332,7 @@ function listDir(dir: Dir): string[] {
 
 function openSubdir(parent: Dir, name: string): Dir {
   return {
-    fd: openSync(childPath(parent, name), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | NOFOLLOW),
+    fd: openSync(childPath(parent, name), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | nofollow()),
     path: join(parent.path, name),
   };
 }
@@ -348,7 +352,7 @@ function copyManagedTree(rootReal: string, dst: Dir, limits: SkillSnapshotLimits
   const stats: CopyStats = { entries: 0, dirs: 0, files: 0, bytes: 0, skipped: [] };
 
   const copyFile = (src: Dir, name: string, rel: string, out: Dir): void => {
-    const fd = openSync(childPath(src, name), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | NOFOLLOW);
+    const fd = openSync(childPath(src, name), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | nofollow());
     try {
       const st = fstatSync(fd);
       if (!st.isFile()) { stats.skipped.push(`${rel} (not a regular file)`); return; }
@@ -365,7 +369,7 @@ function copyManagedTree(rootReal: string, dst: Dir, limits: SkillSnapshotLimits
         off += n;
       }
       const outFd = openSync(childPath(out, name),
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NOFOLLOW,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | nofollow(),
         (st.mode & 0o111) ? 0o755 : 0o644);
       try { writeSync(outFd, buf, 0, off); } finally { closeSync(outFd); }
     } finally {
