@@ -48,6 +48,7 @@ vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
 }));
 
 import {
+  managedHerdrAgentName,
   selectSessionBackend,
   retireSupersededRecordedHerdrTarget,
 } from '../src/adapters/backend/session-backend-selector.js';
@@ -167,6 +168,34 @@ describe('selectSessionBackend with Herdr placement config', () => {
       },
     });
     expect(mockHerdrState.killedAgents).toHaveLength(0);
+  });
+
+  describe('an isolated restart whose recorded agent is already its own', () => {
+    // Sandbox/MCP incarnations disable shared reuse, so retirement runs; when
+    // the recorded pane is exactly the agent this session would launch in the
+    // configured host, it is the live pane to resume, not one to retire.
+    const sessionId = '12345678-1234-1234-1234-123456789012';
+    const ownershipScope = '/tmp/botmux-herdr-scope';
+    const agentName = managedHerdrAgentName(sessionId, ownershipScope);
+    const retire = (herdrConfig?: { sessionName: string }) => retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      herdrConfig,
+      persistentBackendTarget: { backendType: 'herdr', sessionName: 'default', agentName },
+    });
+
+    it('keeps the live pane when it sits in the configured session', () => {
+      mockHerdrState.agents.add(`default/${agentName}`);
+      retire({ sessionName: 'default' });
+      expect(mockHerdrState.killedAgents).toHaveLength(0);
+    });
+
+    it('retires it once the configured session is the default host instead', () => {
+      mockHerdrState.agents.add(`default/${agentName}`);
+      retire(undefined);
+      expect(mockHerdrState.killedAgents).toEqual([{ session: 'default', agent: agentName }]);
+    });
   });
 });
 
