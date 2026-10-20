@@ -1,18 +1,19 @@
-import { createHash } from 'node:crypto';
-import { codexSessionIdFromRolloutPath, drainCodexRollout, type CodexBridgeEvent } from './codex-transcript.js';
+import { codexGenerationSessionIdFromRolloutPath, drainCodexRollout, type CodexBridgeEvent } from './codex-transcript.js';
 
-/** A resumed rollout can copy the entire conversation to a new filename.
- * Scope event identities to the native session and persisted event content,
- * so the bridge queue recognizes copies even when their byte offsets differ.
- * Other readers keep the drainer's path/offset cursor contract unchanged. */
+/** A resumed rollout can copy the entire conversation to a new generation
+ *  file. Scope event identities to the native session plus the originating
+ *  raw record, so the bridge queue recognizes copied lines even when their
+ *  byte offsets differ. Identity must NOT depend on parsed fallbacks such as
+ *  the Date.now() timestamp used for missing/invalid timestamps — one
+ *  persisted record would otherwise hash differently on every drain and be
+ *  replayed as a fresh local turn. Events without a backing record keep
+ *  their path/offset uuid (intra-file stability only). */
 export function codexEventsWithStableIds(path: string, events: CodexBridgeEvent[]): CodexBridgeEvent[] {
-  const sid = codexSessionIdFromRolloutPath(path)?.toLowerCase();
+  const sid = codexGenerationSessionIdFromRolloutPath(path)?.toLowerCase();
   if (!sid) return events;
-  return events.map(event => {
-    const { uuid: _uuid, ...content } = event;
-    const hash = createHash('sha256').update(JSON.stringify(content)).digest('hex');
-    return { ...event, uuid: `codex:${sid}:${hash}` };
-  });
+  return events.map(event => (event.rawId
+    ? { ...event, uuid: `codex:${sid}:${event.rawId}` }
+    : event));
 }
 
 /** Baseline attaches skip parsing history. Before rotating, register just the

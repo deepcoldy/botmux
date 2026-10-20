@@ -49,6 +49,7 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { codexHome, codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -65,11 +66,52 @@ const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
  *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
  *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
  *  contains its own dashes that would otherwise let a greedy match swallow
- *  parts of the sid. An optional `_UUID` identifies a file generation, not a
- *  different session. Returns undefined for paths that don't match. */
+ *  parts of the sid.
+ *
+ *  This is deliberately STRICT: the canonical Codex name is
+ *  `rollout-<ts>-<sid>.jsonl`. The byte-identical `-<sid>_<uuid>.jsonl`
+ *  shape means a resumed SEGMENT for TRAE X; a shared parser accepting that
+ *  suffix could let TRAE pid-probe adopt persist the wrong native session
+ *  id (#1854). Codex resumed GENERATION files use that shape too, but are
+ *  read only through Codex-scoped paths (a Codex pid's open fds /
+ *  CODEX_HOME index+scan / an already-bound Codex bridge) — those use
+ *  {@link codexGenerationSessionIdFromRolloutPath}, never this shared one.
+ *  Returns undefined for paths that don't match. */
 export function codexSessionIdFromRolloutPath(path: string): string | undefined {
-  const m = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i.exec(basename(path));
-  return m ? m[1] : undefined;
+  return CODEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
+}
+
+const CODEX_ROLLOUT_SESSION_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+/** Codex-scoped parser that also accepts a resumed-generation suffix
+ *  (`rollout-<ts>-<sid>_<generation>.jsonl`), always returning the original
+ *  session id, never the generation id. Call ONLY on paths already scoped to
+ *  a Codex process or CODEX_HOME — not on a shared/ambiguous path where the
+ *  same suffix could be a TRAE segment. */
+export function codexGenerationSessionIdFromRolloutPath(path: string): string | undefined {
+  return CODEX_GENERATION_ROLLOUT_SESSION_RE.exec(basename(path))?.[1];
+}
+
+const CODEX_GENERATION_ROLLOUT_SESSION_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
+
+/** True for a resumed-generation filename (`-<sid>_<generation>.jsonl`).
+ *  Generation candidates need session_meta header verification because more
+ *  than one can exist for one session; the plain `-<sid>.jsonl` name keeps
+ *  its historical suffix contract for any sid shape. */
+export function codexRolloutNameHasGeneration(name: string): boolean {
+  return /_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i.test(name);
+}
+
+/** Stable identity of one persisted rollout record: a hash of the record's
+ *  raw line (its UTF-8 text; rollout JSON is valid UTF-8). Independent of
+ *  parse-time fallbacks (missing/invalid timestamps become Date.now() and
+ *  must NOT enter event identity) and of the file/offset, so a line copied
+ *  verbatim into a resumed generation file hashes identically whether it was
+ *  seen by the forward reader or a backward scan, while two same-text
+ *  records at different timestamps differ (the timestamp lives in the
+ *  persisted line). */
+export function codexRolloutLineId(line: string | Buffer): string {
+  return createHash('sha256').update(line.toString('utf8')).digest('hex');
 }
 
 type CodexRolloutRef = { path: string; cliSessionId: string };
@@ -151,15 +193,25 @@ function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   // env-independent structural shape: a `sessions/` path segment plus the
   // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
   if (!/(^|\/)sessions\//.test(target)) return undefined;
-  const sid = codexSessionIdFromRolloutPath(target);
+  // These fds belong to a Codex process, so a resumed-generation suffix is a
+  // real Codex rollout, not the same-shaped TRAE segment (#1854 keeps the
+  // shared strict parser used by ambiguous/non-Codex callers).
+  const sid = codexGenerationSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
 }
 
 export interface CodexBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start.
-   *  Stable across re-drains because rollout files are append-only. */
+   *  Stable across re-drains because rollout files are append-only. The
+   *  cross-generation bridge rewrites this to a content id (see
+   *  codex-rollout-replay) using {@link rawId}. */
   uuid: string;
+  /** Hash of the originating raw rollout line. Identical for a record
+   *  copied verbatim into a resumed generation file, independent of byte
+   *  offset and of parse-time timestamp fallbacks. Absent only for events
+   *  synthesized without a single backing record. */
+  rawId?: string;
   /** Wall-clock ms parsed from the event's `timestamp` field. Falls back
    *  to Date.now() if missing/unparseable so the gate's window math still
    *  has something to compare against. */
@@ -885,20 +937,53 @@ export function runtimeFromTurnContext(obj: any): RolloutRuntimeSnapshot | undef
   };
 }
 
-/** Inspect the first session_meta line within a bounded header read. */
-function rolloutHeaderSessionId(path: string, noFollow = false): string | undefined {
+/** A session_meta header can carry large base_instructions; read the first
+ *  line in chunks up to this cap rather than a fixed 64 KiB window. */
+const SESSION_META_HEADER_MAX_BYTES = 1024 * 1024;
+
+/** Result of inspecting a rollout's first line:
+ *  - verified + sid: first line is a session_meta row with that id
+ *  - verified + null: first line is fully readable but is not a session_meta id
+ *  - unverified: no complete first line could be read (missing, being
+ *    written, larger than the cap, symlink refusal, IO/parse error). Callers
+ *    that need positive identification must treat unverified as untrusted. */
+type RolloutHeaderCheck = { verified: true; sid: string | null } | { verified: false };
+
+function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));
-    if (!fstatSync(fd).isFile()) return undefined;
-    const bytes = Buffer.alloc(64 * 1024);
-    const count = readSync(fd, bytes, 0, bytes.length, 0);
-    const end = bytes.subarray(0, count).indexOf(0x0a);
-    if (end < 0) return undefined;
-    const row = JSON.parse(bytes.subarray(0, end).toString('utf8'));
-    return row?.type === 'session_meta' && typeof row.payload?.id === 'string'
-      ? row.payload.id : undefined;
-  } catch { return undefined; }
+    if (!fstatSync(fd).isFile()) return { verified: false };
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let complete = false;
+    while (total < SESSION_META_HEADER_MAX_BYTES) {
+      const chunk = Buffer.alloc(64 * 1024);
+      const count = readSync(fd, chunk, 0, chunk.length, total);
+      if (count === 0) break;
+      const nl = chunk.subarray(0, count).indexOf(0x0a);
+      if (nl >= 0) {
+        chunks.push(chunk.subarray(0, nl));
+        complete = true;
+        break;
+      }
+      chunks.push(chunk.subarray(0, count));
+      total += count;
+      if (count < chunk.length) break; // EOF
+    }
+    // Codex records are newline-terminated; a file without a complete first
+    // line is still being written (or exceeds the cap) — unverifiable, not an
+    // absent meta row.
+    if (!complete) return { verified: false };
+    let row: any;
+    try { row = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return { verified: false }; }
+    return {
+      verified: true,
+      sid: row?.type === 'session_meta' && typeof row.payload?.id === 'string'
+        ? row.payload.id
+        : null,
+    };
+  } catch { return { verified: false }; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
 
@@ -911,10 +996,15 @@ function indexedCodexRollout(home: string, sessionsRoot: string, sid: string): s
     const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(sid) as { rollout_path?: unknown } | undefined;
     const path = row?.rollout_path;
     if (typeof path !== 'string' || !isAbsolute(path)
-      || codexSessionIdFromRolloutPath(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
+      || codexGenerationSessionIdFromRolloutPath(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
     const rel = relative(realpathSync(sessionsRoot), realpathSync(path));
     if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
-    if (!statSync(path).isFile() || rolloutHeaderSessionId(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
+    if (!statSync(path).isFile()) return undefined;
+    // The index is only trusted when the pointed file positively identifies
+    // the session: a missing/partial/oversized first line is unverifiable and
+    // fails closed, same as a readable foreign session_meta id.
+    const header = rolloutHeaderCheck(path);
+    if (!header.verified || header.sid?.toLowerCase() !== sid.toLowerCase()) return undefined;
     return path;
   } catch { return undefined; }
   finally { db.close(); }
@@ -982,12 +1072,30 @@ export function findCodexRolloutBySessionId(
           if (!opts?.noFollow || depth < UNTRUSTED_SESSION_SCAN_MAX_DEPTH) {
             stack.push({ dir: full, depth: depth + 1 });
           }
-        } else if (isFile && codexSessionIdFromRolloutPath(entry.name)?.toLowerCase() === cliSessionId.toLowerCase()) {
+        } else if (isFile) {
+          // Keep the historical suffix contract for the canonical
+          // `-<sid>.jsonl` name (any sid shape, not only UUIDs); generation
+          // files (`-<sid>_<gen>.jsonl`) match through the UUID parser.
+          const canonicalSuffix = entry.name.endsWith(`-${cliSessionId}.jsonl`);
+          const sidInName = codexGenerationSessionIdFromRolloutPath(entry.name)?.toLowerCase() === cliSessionId.toLowerCase();
+          if (!canonicalSuffix && !sidInName) continue;
           try {
             const fileStat = opts?.noFollow ? lstatSync(full) : statSync(full);
             if (!fileStat.isFile()) continue;
-            const headerSid = rolloutHeaderSessionId(full, opts?.noFollow);
-            if (headerSid && headerSid.toLowerCase() !== cliSessionId.toLowerCase()) continue;
+            const header = rolloutHeaderCheck(full, opts?.noFollow);
+            if (header.verified) {
+              // A readable, positively foreign first line rejects the file
+              // whatever its name says. A readable non-meta first line is
+              // neutral: the name remains the evidence (fixtures and
+              // mid-creation files may not start with session_meta).
+              if (header.sid && header.sid.toLowerCase() !== cliSessionId.toLowerCase()) continue;
+            } else if (codexRolloutNameHasGeneration(entry.name)) {
+              // Several generations can share one sid; a candidate whose
+              // session_meta cannot be verified (missing/oversized first
+              // line, no-follow symlink) must not be selected. The canonical
+              // suffix name predates generations and stays name-trusted.
+              continue;
+            }
             if (!newest || entry.name > basename(newest)) newest = full;
           } catch {
             continue;
@@ -1392,7 +1500,7 @@ function wrapperContainsCommand(input: string, command: string): boolean {
  * outer exec wrappers so native CommandExecution can replace only the exact
  * exec_command it represents. Non-command tools and unmatched commands are
  * restored at the terminal boundary. */
-type TerminalExecEntry = { offset: number; timestampMs: number; payload: any; type: string };
+type TerminalExecEntry = { offset: number; timestampMs: number; payload: any; type: string; rawId: string };
 
 function terminalExecFallbacks(
   path: string,
@@ -1416,7 +1524,7 @@ function terminalExecFallbacks(
           ))
             || (obj?.type === 'event_msg' && p?.type === 'item_completed')) {
             const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-            relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
+            relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type, rawId: codexRolloutLineId(line) });
           }
         },
       });
@@ -1426,7 +1534,7 @@ function terminalExecFallbacks(
   }
 
   const calls: Array<{
-    id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number;
+    id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number; outputRawId?: string;
   }> = [];
   const nativeCommands: Array<{ id?: string; candidates: string[] }> = [];
   const orderedRelevant = knownRelevant ? relevant : relevant.reverse();
@@ -1446,6 +1554,7 @@ function terminalExecFallbacks(
         call.output = stringifyCodexToolOutput(p.output);
         call.outputOffset = entry.offset;
         call.outputTimestampMs = entry.timestampMs;
+        call.outputRawId = entry.rawId;
       }
     } else if (entry.type === 'event_msg' && p.type === 'item_completed') {
       if (p.item?.type === 'CommandExecution') {
@@ -1491,7 +1600,7 @@ function terminalExecFallbacks(
       },
     ]);
     return [{
-      uuid: `${path}:${call.outputOffset}`, timestampMs: call.outputTimestampMs ?? Date.now(),
+      uuid: `${path}:${call.outputOffset}`, rawId: call.outputRawId, timestampMs: call.outputTimestampMs ?? Date.now(),
       kind: 'cot' as const, text: '', cotEntries,
     }];
   });
@@ -1565,6 +1674,7 @@ export function drainCodexRollout(
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    const lineId = codexRolloutLineId(line);
     const subagentThreadId = spawnedSubagentThreadId(obj);
     if (subagentThreadId) spawnedSubagents.push({ threadId: subagentThreadId, startedAtMs: timestampMs });
     // Codex can persist task_started well before the matching response_item
@@ -1581,6 +1691,7 @@ export function drainCodexRollout(
         kind: 'turn_started',
         text: '',
         sourceTurnId: p.turn_id,
+        rawId: lineId,
       });
       continue;
     }
@@ -1588,7 +1699,7 @@ export function drainCodexRollout(
       p.type === 'custom_tool_call' || p.type === 'custom_tool_call_output'
       || p.type === 'function_call' || p.type === 'function_call_output'
     )) || (obj.type === 'event_msg' && p.type === 'item_completed')) {
-      turnExecEntries.push({ offset: lineStart, timestampMs, payload: p, type: obj.type });
+      turnExecEntries.push({ offset: lineStart, timestampMs, payload: p, type: obj.type, rawId: lineId });
     }
     // User turn-start: response_item message role=user. Stable across every
     // codex version, and the ONLY event the RPC rollout-match probe reads
@@ -1598,7 +1709,7 @@ export function drainCodexRollout(
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text });
       continue;
     }
     // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
@@ -1623,7 +1734,7 @@ export function drainCodexRollout(
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
-        events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+        events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
         continue;
       }
     }
@@ -1642,7 +1753,7 @@ export function drainCodexRollout(
         .join('\n');
       const output = formatted || aggregated || streams;
       cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
       continue;
     }
     // Turn terminal: event_msg `task_complete` carries the final visible text
@@ -1672,6 +1783,7 @@ export function drainCodexRollout(
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
+        rawId: lineId,
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
@@ -1707,6 +1819,7 @@ export function drainCodexRollout(
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
+        rawId: lineId,
         timestampMs,
         kind: 'assistant_final',
         text: '',

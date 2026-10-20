@@ -272,7 +272,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
@@ -8088,7 +8088,7 @@ function codexBridgeStartTimer(): void {
         const codexAttachGated = structuredBridgeIs('codex') && lastInitConfig?.adoptMode && path && currentCodexObservedPid();
         const traexAttachGated = structuredBridgeIs('traex') && lastInitConfig?.adoptMode && path && currentTraexObservedPid();
         const attachOk = codexAttachGated
-          ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
+          ? (() => { const sid = codexGenerationSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
           : traexAttachGated
             ? (() => { const sid = traexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
             : true;
@@ -8096,7 +8096,7 @@ function codexBridgeStartTimer(): void {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = structuredBridgeIs('traex')
               ? traexSessionIdFromRolloutPath(path)
-              : codexSessionIdFromRolloutPath(path);
+              : codexGenerationSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
           codexBridgePendingSessionId = undefined;
@@ -8754,7 +8754,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // is submitted — so there is no post-ingest window in which a legitimate
     // terminal is appended to the old path and lost.
     if (structuredBridgeIs('codex')) {
-      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      const currentSid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
       if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) {
         maybeFollowCodexRolloutRotation(true);
         return;
@@ -9082,14 +9082,14 @@ function maybeFollowCodexRolloutRotation(fresh = false): void {
   const now = Date.now();
   if (!fresh && now - codexRolloutLastCheckedAtMs < 5_000) return;
   codexRolloutLastCheckedAtMs = now;
-  const sid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const sid = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
   if (!sid) return;
   const next = resolveFileBridgePath('codex', { sessionId: sid });
   if (!next || next === codexBridgeRolloutPath) return;
   // Reuse only the already-bound sid. Its initial/different-session ownership
   // gates still apply; a shared App-Server may hold the new fd instead of the
   // observed frontend, so do not demand a new frontend fd for this same sid.
-  if (codexSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()) return;
+  if (codexGenerationSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()) return;
   codexBridgeIngest();
   codexBridgeQueue.absorb(codexConsumedRolloutEvents(codexBridgeRolloutPath, codexBridgeOffset));
   log(`Codex rollout rotated for ${sid}: ${codexBridgeRolloutPath} → ${next}`);

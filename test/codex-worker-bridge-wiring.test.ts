@@ -31,6 +31,38 @@ describe('Codex worker structured-bridge ownership gate', () => {
   });
 });
 
+describe('Codex same-session rollout generation rotation', () => {
+  // 源码结构护栏：resume 会把同一 native session 写进带 generation 后缀的
+  // 新文件，worker 必须主动跟随（定时器 + 同 sid 通知两条路径），且只复用
+  // 已绑定的 sid、不重新要求 pid fd 属主（共享 App Server 可能持有新 fd）。
+  // 切换的去重/保队列语义由 codex-rollout-generation.test.ts 行为覆盖。
+  it('follows same-session generations from both the ticker and session notifications', () => {
+    const timer = workerSource.slice(workerSource.indexOf('function codexBridgeStartTimer'), workerSource.indexOf('function hermesBridgeAttach'));
+    expect(timer).toContain('maybeFollowCodexRolloutRotation();');
+    const notifyStart = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
+    const notify = workerSource.slice(notifyStart, workerSource.indexOf('\n}\n', notifyStart));
+    expect(notify).toContain('maybeFollowCodexRolloutRotation(true);');
+
+    const start = workerSource.indexOf('function maybeFollowCodexRolloutRotation');
+    expect(start).toBeGreaterThan(-1);
+    const rotation = workerSource.slice(start, workerSource.indexOf('\nfunction codexBridgeIngest', start));
+    expect(rotation).toContain("structuredBridgeIs('codex')");
+    expect(rotation).toContain('rpcTranscriptIngestBlockedByAwaitingActivation');
+    expect(rotation).toContain('codexGenerationSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()');
+    expect(rotation).not.toContain('codexHistorySidOwnedByCurrentPid(');
+    expect(rotation).toContain('codexBridgeQueue.absorb(codexConsumedRolloutEvents(');
+    expect(rotation).toContain("codexBridgeAttach(next, 'fresh-empty')");
+  });
+
+  it('rewrites codex drain event uuids to content-stable ids inside the shared ingest path', () => {
+    const start = workerSource.indexOf('function structuredBridgeIngestPath');
+    expect(start).toBeGreaterThan(-1);
+    const fn = workerSource.slice(start, workerSource.indexOf('\nfunction codexBridgeStartTimer', start));
+    expect(fn).toContain("structuredBridgeIs('codex')");
+    expect(fn).toContain('result.events = codexEventsWithStableIds(path, result.events);');
+  });
+});
+
 describe('zero-prompt capability under the machine-wide sandbox switch', () => {
   it('refuses a zero-prompt Cursor spawn when BOTMUX_SANDBOX=scratch resolves the sandbox, before launching the CLI', async () => {
     // BOTMUX_SANDBOX never reaches cfg, so only the spawn-time re-check can see

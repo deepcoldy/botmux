@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
+import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from '../src/services/codex-rollout-replay.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -42,9 +42,15 @@ function index(path: string): void {
 describe('Codex rollout generations', () => {
   it('extracts the original session id from a suffixed filename, never the generation id', () => {
     const path = rollout('30', `_${GENERATION}`);
-    expect(codexSessionIdFromRolloutPath(path)).toBe(SID);
-    expect(codexSessionIdFromRolloutPath(path.replace('.jsonl', '_bad.jsonl'))).toBeUndefined();
-    expect(codexSessionIdFromRolloutPath(join(path, 'unrelated.jsonl'))).toBeUndefined();
+    // The Codex-scoped parser accepts the resumed-generation suffix and keeps
+    // the original session id.
+    expect(codexGenerationSessionIdFromRolloutPath(path)).toBe(SID);
+    // The shared strict parser must keep rejecting the suffix: the identical
+    // shape is a resumed TRAE segment (#1854), so non-Codex-scoped callers may
+    // never interpret it as a Codex session.
+    expect(codexSessionIdFromRolloutPath(path)).toBeUndefined();
+    expect(codexGenerationSessionIdFromRolloutPath(path.replace('.jsonl', '_bad.jsonl'))).toBeUndefined();
+    expect(codexGenerationSessionIdFromRolloutPath(join(path, 'unrelated.jsonl'))).toBeUndefined();
     expect(findCodexRolloutBySessionId(GENERATION, { codexHome: home })).toBeUndefined();
   });
 
@@ -112,6 +118,23 @@ describe('Codex rollout generations', () => {
     index(old);
     expect(findCodexRolloutBySessionId(SID, { codexHome: home, noFollow: true })).toBe(active);
   });
+
+  it.each([false, true])(
+    'never selects a generation whose session_meta cannot be verified (noFollow=%s)', noFollow => {
+      // A generation candidate with a first line larger than the reader cap
+      // cannot identify its session: the index path must refuse it and the
+      // scan must skip it, rather than trust the filename.
+      const owned = rollout('29');
+      const oversized = rollout('30', `_${GENERATION}`, SID, metaWithByteLength(SID, 1024 * 1024 + 256));
+      index(oversized);
+      expect(findCodexRolloutBySessionId(SID, { codexHome: home, noFollow })).toBe(owned);
+
+      // A still-being-written generation (complete first line, no newline)
+      // is likewise unverifiable.
+      writeFileSync(oversized, metaWithByteLength(SID, 70 * 1024).replace(/\n$/, ''));
+      expect(findCodexRolloutBySessionId(SID, { codexHome: home, noFollow })).toBe(owned);
+    },
+  );
 });
 
 const start = (turn: string, timestamp: string) => line({ timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: turn } });
@@ -223,5 +246,31 @@ describe('Codex bridge replay across file generations', () => {
     q.ingest(codexEventsWithStableIds(next, drainCodexRollout(next, 0).events));
     expect(q.drainEmittable()).toEqual([]);
     expect(q.peek()).toEqual([]);
+  });
+
+  it('gives one tool-output record the same raw id from the forward reader and the backward scan', () => {
+    // The rotation absorb drains forward (string lines); a mid-turn late
+    // attach synthesizes the same cot event from a backward byte scan. The
+    // two identities must match, including non-ASCII output bytes.
+    const execCall = line({ timestamp: T0, type: 'response_item', payload: {
+      type: 'custom_tool_call', name: 'exec', call_id: 'outer-x',
+      input: 'await tools.exec_command({ cmd: "echo 你好" })',
+    } });
+    const execOutput = line({ timestamp: T1, type: 'response_item', payload: {
+      type: 'custom_tool_call_output', call_id: 'outer-x',
+      output: JSON.stringify({ output: '结果：完成 ✅' }),
+    } });
+    const file = rollout('29', '', SID, '');
+    appendFileSync(file, meta() + user('run', T0) + execCall + execOutput);
+    const splitAt = statSync(file).size;
+    appendFileSync(file, final('native-turn-x', 'done', T2));
+
+    const forwardCots = drainCodexRollout(file, 0).events.filter(e => e.kind === 'cot');
+    expect(forwardCots.length).toBeGreaterThan(0);
+    const lateDrain = drainCodexRollout(file, splitAt);
+    const backwardCots = lateDrain.events.filter(e => e.kind === 'cot');
+    expect(backwardCots.length).toBeGreaterThan(0);
+    expect(backwardCots.map(e => e.rawId).sort()).toEqual(forwardCots.map(e => e.rawId).sort());
+    expect(forwardCots.every(e => typeof e.rawId === 'string' && e.rawId.length === 64)).toBe(true);
   });
 });
