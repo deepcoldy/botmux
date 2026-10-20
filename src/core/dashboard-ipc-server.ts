@@ -3100,6 +3100,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
   if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // intentionally left ungated so an admin can always remove the manager / inspect
+  // state even after turning the switch off — the switch gates activation, not removal.
+  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
+    return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
+  }
   const { getMessageDetail } = await import('../im/lark/client.js');
   const { effectiveBotDisplayName } = await import('../bot-registry.js');
   const human = await authorizeHumanManager({
@@ -7521,6 +7527,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
+    chatManagerEnabled: cardPrefs.chatManagerEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
     groupJoinCommand: cardPrefs.groupJoinCommand,
@@ -7660,6 +7667,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
+    chatManagerEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
   }>(req, res);
@@ -7676,6 +7684,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
+    chatManagerEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
   } = {};
@@ -7748,6 +7757,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
+  if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auto_start_excluded_chats' });

@@ -752,6 +752,7 @@ export const messages: Record<string, string> = {
   'config.label.privateCard': 'Private snapshot card',
   'config.label.autoStartOnGroupJoin': 'Auto-start on join',
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
+  'config.label.chatManagerEnabled': 'Group manager (default responder)',
   'config.label.disableCliBypass': 'Disable bypass · safer',
   'config.label.restrictGrantCommands': 'Grantees chat-only',
   'config.label.p2pOpen': 'Open DMs',

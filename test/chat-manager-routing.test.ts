@@ -21,9 +21,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { registerBot } from '../src/bot-registry.js';
+import { registerBot, getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { checkGroupMessageAccess, canOperate, __resetChatStatsForTest } from '../src/im/lark/event-dispatcher.js';
+import { readManagerClaim } from '../src/services/chat-manager-state.js';
 
 const APP = 'cli_manager';
 const CHAT = 'oc_managed';
@@ -54,7 +55,7 @@ describe('chat manager addressing through the real permission gate', () => {
     remote.mode = 'group'; remote.fail = false; remote.reads = 0;
     __resetChatStatsForTest();
     for (const app of [APP, 'cli_other']) {
-      const bot = registerBot({ larkAppId: app, larkAppSecret: 'test', cliId: 'codex', allowedUsers: [OWNER] });
+      const bot = registerBot({ larkAppId: app, larkAppSecret: 'test', cliId: 'codex', allowedUsers: [OWNER], chatManagerEnabled: true });
       bot.botOpenId = `ou_${app}`;
       bot.resolvedAllowedUsers = [OWNER];
     }
@@ -109,5 +110,16 @@ describe('chat manager addressing through the real permission gate', () => {
 
   it('does not change another group', async () => {
     expect(await checkGroupMessageAccess(APP, message(), 'oc_other_group', OWNER)).toBe('ignore');
+  });
+
+  it('does not answer un-@ once the per-bot switch is turned off (marker left intact)', async () => {
+    record(APP, CHAT, true);
+    expect(await checkGroupMessageAccess(APP, message(), CHAT, OWNER)).toBe('allowed');
+    getBot(APP).config.chatManagerEnabled = false;
+    expect(await checkGroupMessageAccess(APP, message(), CHAT, OWNER)).toBe('ignore');
+    // Local opt-in and remote marker are untouched by the switch — no destructive teardown.
+    expect(readManagerClaim(APP, CHAT)?.enabled).toBe(true);
+    getBot(APP).config.chatManagerEnabled = true;
+    expect(await checkGroupMessageAccess(APP, message(), CHAT, OWNER)).toBe('allowed');
   });
 });

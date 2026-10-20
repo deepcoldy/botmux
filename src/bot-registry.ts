@@ -2259,6 +2259,14 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /**
+   * 群负责人（默认接待者）总开关。仅当显式为 true 时：
+   *   - 本 bot 在普通群顶层可凭群负责人身份免 @ 接话；
+   *   - 会话内才向模型提供 `botmux-chat-manager` skill，并允许 `manager set`。
+   * 默认（undefined/false）= 关闭，老用户行为完全不变。`manager clear`/`status`
+   * 不被此开关阻断（拆除与只读始终允许）。
+   */
+  chatManagerEnabled?: boolean;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -4176,6 +4184,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()

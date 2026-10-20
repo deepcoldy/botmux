@@ -2482,7 +2482,10 @@ export async function checkGroupMessageAccess(
 
   // An owner-selected manager adds top-level addressing only, not permissions
   // or ownership of independent topics. Explicit mentions keep their usual path.
-  if (isAllowed && message.chat_type === 'group' && !message.root_id && !message.thread_id
+  // Gated per bot by `chatManagerEnabled` (default off): a disabled bot stops
+  // answering un-@ messages as manager without touching the group name/marker.
+  if (isAllowed && getBot(larkAppId).config.chatManagerEnabled === true
+    && message.chat_type === 'group' && !message.root_id && !message.thread_id
     && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId)) {
     return 'allowed';
   }

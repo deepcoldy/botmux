@@ -22,7 +22,7 @@ import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -5592,6 +5592,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
     const pluginSkillsDir = join(adapter.pluginDir, 'skills');
     // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
     ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
+    // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
+    // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
+    ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
     // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
     // 关闭时删除已装的三个 skill，下一个会话即生效。
     ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
@@ -5632,6 +5635,8 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
   //    绝不碰用户自定义 skill。
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
+  // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
+  ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
   // Workflow skill 家族：仅 global 模式落全局盘，且跟随机器级 workflow 开关。
   // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
   ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());

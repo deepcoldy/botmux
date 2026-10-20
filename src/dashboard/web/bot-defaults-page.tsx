@@ -5396,6 +5396,8 @@ function SessionModeSection(props: {
   const [regularStatus, setRegularStatus] = useState<StatusMessage>(null);
   const [mentionStatus, setMentionStatus] = useState<StatusMessage>(null);
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
+  const [chatManager, setChatManager] = useState(props.bot.chatManagerEnabled === true);
+  const [chatManagerStatus, setChatManagerStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
     setP2p(normalizeP2pMode(props.bot.p2pMode));
@@ -5408,6 +5410,9 @@ function SessionModeSection(props: {
     props.bot.regularGroupMentionMode,
     props.bot.regularGroupReplyMode,
   ]);
+  useEffect(() => {
+    setChatManager(props.bot.chatManagerEnabled === true);
+  }, [props.bot.chatManagerEnabled]);
 
   async function saveP2p(next: string): Promise<void> {
     const mode = normalizeP2pMode(next);
@@ -5571,6 +5576,19 @@ function SessionModeSection(props: {
       >
         <div className="bd-mode-group-side"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
       </ModeOptionGroup>
+
+      <ToggleRow
+        checked={chatManager}
+        disabled={busy === 'chatManager'}
+        dataAction="toggle-chat-manager"
+        title={tr('botDefaults.chatManagerTitle')}
+        help={tr('botDefaults.chatManagerHelp')}
+        onChange={checked => {
+          setChatManager(checked);
+          void saveCardMode('chatManager', { chatManagerEnabled: checked }, setChatManagerStatus);
+        }}
+      />
+      <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerStatus} attr={{ 'data-chat-manager-status': '' }} /></div>
 
       <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
 

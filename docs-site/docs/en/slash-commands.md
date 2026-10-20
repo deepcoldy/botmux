@@ -90,6 +90,8 @@ Codex capacity recovery is **off by default**. Administrators can enable it with
 
 In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
 
+**Off by default, enabled per bot**: turn on "Group manager (default responder)" under Dashboard, bot configuration, session & mention policy (or `/botconfig set chatManagerEnabled on`). Only then does the bot expose the in-session tool and allow `set`. Turning it off stops un-@ answering and blocks `set`, but it never changes the group name or description; `clear` and `status` stay available and the saved manager record is kept (re-enabling restores it).
+
 Mutations require the current human sender to explicitly authorize the action and belong to the target bot's administrator allowlist. A session owner, bot, scheduled task or stale turn is not a substitute. Only the current regular group is supported, excluding automatically managed session groups.
 
 Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.

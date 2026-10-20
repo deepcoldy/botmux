@@ -1374,7 +1374,12 @@ function buildNewTopicBlocks(
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
       // the catalog as a compact trigger for complex delivery and safety rules.
-      const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
+      const entries = builtinSkillEntries({
+        asksViaHook: adapter.asksViaHook,
+        whiteboardEnabled: whiteboardEnabled(),
+        chatManagerEnabled: opts?.larkAppId ? getBot(opts.larkAppId).config.chatManagerEnabled === true : false,
+        excludeRoutingCovered: true,
+      });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale);

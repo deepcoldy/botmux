@@ -749,6 +749,7 @@ export const messages: Record<string, string> = {
   'config.label.privateCard': '私有快照卡',
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
+  'config.label.chatManagerEnabled': '群负责人（默认接待者）',
   'config.label.disableCliBypass': '关绕过·更安全',
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'config.label.p2pOpen': '私聊全开',

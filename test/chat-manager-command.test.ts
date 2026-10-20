@@ -26,7 +26,7 @@ beforeEach(async () => {
   config.session.dataDir = mkdtempSync(join(root, 'manager-ipc-'));
   remote = { name: 'Group', description: '', chat_mode: 'group' }; writes = 0;
   const bot = registry.registerBot({ larkAppId: APP, larkAppSecret: 'test', cliId: 'codex',
-    displayName: 'Manager', allowedUsers: ['ou_owner'] });
+    displayName: 'Manager', allowedUsers: ['ou_owner'], chatManagerEnabled: true });
   bot.resolvedAllowedUsers = ['ou_owner']; bot.botOpenId = 'ou_bot';
   ds = { session: { sessionId: 's-manager', ownerOpenId: 'ou_owner' },
     larkAppId: APP, chatId: CHAT, chatType: 'group',
@@ -100,5 +100,21 @@ describe('manager session IPC', () => {
     message.mentions[0].id = 'ou_bot';
     expect((await post('clear')).status).toBe(403);
     expect((await post('set')).status).toBe(200);
+  });
+  it('gates set behind the per-bot switch but leaves clear/status usable to remove it', async () => {
+    // Switch ON (fixture default): set works.
+    expect((await post('set')).status).toBe(200);
+    expect(await isChatManager(APP, CHAT)).toBe(true);
+    // Switch OFF at runtime: no new activation, but teardown/inspection stay open.
+    registry.getBot(APP).config.chatManagerEnabled = false;
+    expect((await post('set')).status).toBe(409);
+    expect((await (await post('set')).json()).error).toBe('chat_manager_disabled');
+    expect(writes).toBe(1); // the earlier set only; blocked set wrote nothing
+    expect((await post('status')).status).toBe(200);
+    message.body.content = JSON.stringify({ text: '执行 botmux manager clear' });
+    expect((await post('clear')).status).toBe(200); // removal must not be trapped by the switch
+    expect(await isChatManager(APP, CHAT)).toBe(false);
+    expect(remote.name).toBe('Group');
+    registry.getBot(APP).config.chatManagerEnabled = true;
   });
 });

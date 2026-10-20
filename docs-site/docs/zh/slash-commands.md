@@ -90,6 +90,8 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 
 在普通群里 @ 目标机器人说“执行 botmux manager set”即可设置负责人；取消用“执行 botmux manager clear”，查询可让机器人运行 `botmux manager status`。这不是 daemon 的 `/manager` 斜杠命令，而是内置 `botmux-chat-manager` skill 调用会话 IPC。
 
+**默认关闭，按机器人单独开启**：在 Dashboard「机器人配置 → 会话与 @ 策略」里打开「群负责人（默认接待者）」（或 `/botconfig set chatManagerEnabled on`）后，该机器人才会在会话内提供这个工具、并允许 `set`。关闭后该机器人不再免 @ 接话、也不能 `set`；但不会自动改群名或群描述，`clear` 与 `status` 仍可用，已保存的负责人记录保留（重新打开即恢复）。
+
 设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
 
 负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
