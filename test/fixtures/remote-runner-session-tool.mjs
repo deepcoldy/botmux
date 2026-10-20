@@ -22,6 +22,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   if (command.type === 'hello') {
     const capabilities = ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'];
     if (!command.sessionId.includes('no-session-tool')) capabilities.push('session_tool');
+    if (!command.sessionId.includes('no-schedule-capability')) {
+      capabilities.push('session_tool_schedule');
+    }
+    if (!command.sessionId.includes('no-actor-capability')) {
+      capabilities.push('session_tool_schedule_actor');
+    }
     emit({
       type: 'hello', requestId: command.requestId, provider: 'session-tool-test',
       capabilities,
@@ -42,7 +48,16 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       operationId: 'session-tool-1',
       turnId: command.turnId,
       generation: command.content === 'future-generation' ? 2 : 1,
-      request: { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
+      ...(['schedule-actor', 'schedule-actor-mutate'].includes(command.content)
+        ? { controllerOpenId: 'ou_developer' }
+        : {}),
+      request: command.content === 'schedule-tool'
+        ? { tool: 'schedule.list' }
+        : command.content === 'schedule-actor'
+          ? { tool: 'schedule.add', schedule: '10m', prompt: 'check' }
+        : command.content === 'schedule-actor-mutate'
+          ? { tool: 'schedule.remove', taskId: 'a1b2c3d4' }
+        : { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
     });
     return;
   }

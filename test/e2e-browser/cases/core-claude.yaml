@@ -1,0 +1,28 @@
+# Lane: Claude private chat — new topic, streaming card, ACK reply bubble.
+# Split into phases so each keeps its own Midscene snapshots. Claude waits for
+# the ACK bubble rather than 「等待输入」. openAndSend may first wait for
+# the Claude DM lease while a DM-mode case has switched the bot's mode.
+cases:
+  - name: Claude basic bot flow
+    tags: [bot, smoke, core]
+    steps:
+      - feishu.openAndSend:
+          scenario: bot-claude-basic
+          $:
+            timeout: 1_800_000
+      - feishu.waitForStreamingCard:
+          scenario: bot-claude-basic
+          $:
+            timeout: 300_000
+      - feishu.waitForBotResponse:
+          scenario: bot-claude-basic
+          $:
+            timeout: 300_000
+      - feishu.showStreamingOutput:
+          scenario: bot-claude-basic
+          $:
+            timeout: 180_000
+      - feishu.close:
+          scenario: bot-claude-basic
+          $:
+            timeout: 60_000

@@ -20,7 +20,7 @@
 
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 import type { V3Dag } from './dag.js';

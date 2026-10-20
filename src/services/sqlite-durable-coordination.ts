@@ -14,6 +14,7 @@ import type {
   CompleteOutboxAttemptInput,
   ControlOperationAttempt,
   ControlOperationMutationResult,
+  DurableAuxiliaryStateRecord,
   DurableCoordinationStore,
   DurableControlOperationRecord,
   DurableInboxEvent,
@@ -43,10 +44,13 @@ import type {
   SessionLeaseAcquisition,
   WriteSessionInput,
   WriteSessionResult,
+  WriteAuxiliaryStateInput,
+  WriteAuxiliaryStateResult,
 } from './durable-coordination.js';
 import { DURABLE_INBOX_LANE_LARK_MESSAGE } from './durable-coordination.js';
+import { durableInboxPayloadsAreEquivalent } from './durable-inbox-idempotency.js';
 
-export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 3;
+export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 4;
 
 export interface SqliteDurableCoordinationOptions {
   /** 测试 seam；生产默认使用当前进程时钟。 */
@@ -69,6 +73,13 @@ CREATE TABLE IF NOT EXISTS durable_session_leases (
 
 CREATE TABLE IF NOT EXISTS durable_sessions (
   session_key TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  value_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS durable_auxiliary_state (
+  state_key TEXT PRIMARY KEY,
   revision INTEGER NOT NULL CHECK(revision >= 1),
   value_json TEXT NOT NULL,
   updated_at INTEGER NOT NULL
@@ -158,6 +169,13 @@ type LeaseRow = {
 
 type SessionRow = {
   session_key: string;
+  revision: number;
+  value_json: string;
+  updated_at: number;
+};
+
+type AuxiliaryStateRow = {
+  state_key: string;
   revision: number;
   value_json: string;
   updated_at: number;
@@ -262,6 +280,15 @@ function sessionRecord(row: SessionRow): DurableSessionRecord {
   };
 }
 
+function auxiliaryStateRecord(row: AuxiliaryStateRow): DurableAuxiliaryStateRecord {
+  return {
+    stateKey: row.state_key,
+    revision: Number(row.revision),
+    value: parseJson(row.value_json),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
 function inboxClaim(row: InboxRow): InboxClaim {
   if (!row.claim_owner || row.claim_until === null) throw new Error(`claimed inbox row ${row.event_id} has no owner/deadline`);
   return {
@@ -355,6 +382,15 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
         ).run(3);
       });
       schemaVersion = 3;
+    }
+    if (schemaVersion === 3) {
+      // v4 把非 Session 的共享状态移出 durable_sessions；幂等 DDL 已建表。
+      this.transaction(() => {
+        this.db.prepare(
+          'UPDATE durable_coordination_meta SET schema_version = ? WHERE singleton = 1',
+        ).run(4);
+      });
+      schemaVersion = 4;
     }
     if (schemaVersion !== undefined && schemaVersion !== SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION) {
       throw new Error(`unsupported durable coordination schema version ${schemaVersion}`);
@@ -471,6 +507,33 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     return row ? sessionRecord(row) : undefined;
   }
 
+  async listSessions(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{ records: DurableSessionRecord[]; nextSessionKey?: string }> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+      throw new Error('limit must be an integer between 1 and 1000');
+    }
+    const afterSessionKey = input.afterSessionKey === undefined
+      ? undefined
+      : nonempty(input.afterSessionKey, 'afterSessionKey');
+    const rows = (afterSessionKey
+      ? this.db.prepare(
+          'SELECT session_key, revision, value_json, updated_at FROM durable_sessions '
+          + 'WHERE session_key > ? ORDER BY session_key LIMIT ?',
+        ).all(afterSessionKey, input.limit + 1)
+      : this.db.prepare(
+          'SELECT session_key, revision, value_json, updated_at FROM durable_sessions '
+          + 'ORDER BY session_key LIMIT ?',
+        ).all(input.limit + 1)) as SessionRow[];
+    const hasMore = rows.length > input.limit;
+    const page = rows.slice(0, input.limit).map(sessionRecord);
+    return {
+      records: page,
+      ...(hasMore && page.length > 0 ? { nextSessionKey: page.at(-1)!.sessionKey } : {}),
+    };
+  }
+
   async writeSession(input: WriteSessionInput): Promise<WriteSessionResult> {
     const now = this.now();
     if (input.expectedRevision !== null
@@ -499,43 +562,101 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     });
   }
 
+  async readAuxiliaryState(stateKey: string): Promise<DurableAuxiliaryStateRecord | undefined> {
+    const row = this.db.prepare(
+      'SELECT state_key, revision, value_json, updated_at FROM durable_auxiliary_state WHERE state_key = ?',
+    ).get(nonempty(stateKey, 'stateKey')) as AuxiliaryStateRow | undefined;
+    return row ? auxiliaryStateRecord(row) : undefined;
+  }
+
+  async writeAuxiliaryState(input: WriteAuxiliaryStateInput): Promise<WriteAuxiliaryStateResult> {
+    const now = this.now();
+    if (input.expectedRevision !== null
+        && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1)) {
+      throw new Error('expectedRevision must be null or a positive safe integer');
+    }
+    const valueJson = canonicalJson(input.value);
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      const row = this.db.prepare(
+        'SELECT state_key, revision, value_json, updated_at FROM durable_auxiliary_state WHERE state_key = ?',
+      ).get(input.lease.sessionKey) as AuxiliaryStateRow | undefined;
+      if (input.expectedRevision === null ? !!row : !row || Number(row.revision) !== input.expectedRevision) {
+        return { kind: 'conflict' as const, ...(row ? { current: auxiliaryStateRecord(row) } : {}) };
+      }
+      const revision = row ? Number(row.revision) + 1 : 1;
+      this.db.prepare(
+        'INSERT INTO durable_auxiliary_state(state_key, revision, value_json, updated_at) VALUES(?, ?, ?, ?) '
+        + 'ON CONFLICT(state_key) DO UPDATE SET revision = excluded.revision, '
+        + 'value_json = excluded.value_json, updated_at = excluded.updated_at',
+      ).run(input.lease.sessionKey, revision, valueJson, now);
+      return {
+        kind: 'written' as const,
+        record: { stateKey: input.lease.sessionKey, revision, value: input.value, updatedAt: now },
+      };
+    });
+  }
+
   async enqueueInbox(event: DurableInboxEvent): Promise<DurableInsertResult> {
+    return this.transaction(() => this.enqueueInboxUnlocked(event));
+  }
+
+  async enqueueInboxWithLease(input: {
+    lease: SessionLease;
+    event: DurableInboxEvent;
+  }): Promise<DurableInsertResult | { kind: 'stale_lease' }> {
+    const now = this.now();
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      return this.enqueueInboxUnlocked(input.event);
+    });
+  }
+
+  private enqueueInboxUnlocked(event: DurableInboxEvent): DurableInsertResult {
     nonempty(event.eventId, 'eventId');
     const lane = nonempty(event.lane ?? DURABLE_INBOX_LANE_LARK_MESSAGE, 'lane');
     nonempty(event.partitionKey, 'partitionKey');
     timestamp(event.visibleAt, 'visibleAt');
     timestamp(event.createdAt, 'createdAt');
     const payload = encoded(event.payload);
-    return this.transaction(() => {
-      const inserted = this.db.prepare(
-        'INSERT INTO durable_inbox(event_id, lane, partition_key, payload_json, payload_hash, state, '
-        + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, \'queued\', ?, ?, ?) '
-        + 'ON CONFLICT(event_id) DO NOTHING',
-      ).run(
-        event.eventId,
-        lane,
-        event.partitionKey,
-        payload.json,
-        payload.hash,
-        event.visibleAt,
-        event.createdAt,
-        event.createdAt,
-      );
-      if (Number(inserted.changes) === 1) {
-        this.db.prepare(
-          'INSERT INTO durable_inbox_order(event_id) VALUES(?)',
-        ).run(event.eventId);
-        return { kind: 'inserted' as const };
-      }
-      const current = this.db.prepare(
-        'SELECT lane, partition_key, payload_hash FROM durable_inbox WHERE event_id = ?',
-      ).get(event.eventId) as { lane: string; partition_key: string; payload_hash: string };
-      return current.lane === lane
-        && current.partition_key === event.partitionKey
-        && current.payload_hash === payload.hash
-        ? { kind: 'duplicate' as const }
-        : { kind: 'conflict' as const };
-    });
+    const inserted = this.db.prepare(
+      'INSERT INTO durable_inbox(event_id, lane, partition_key, payload_json, payload_hash, state, '
+      + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, \'queued\', ?, ?, ?) '
+      + 'ON CONFLICT(event_id) DO NOTHING',
+    ).run(
+      event.eventId,
+      lane,
+      event.partitionKey,
+      payload.json,
+      payload.hash,
+      event.visibleAt,
+      event.createdAt,
+      event.createdAt,
+    );
+    if (Number(inserted.changes) === 1) {
+      this.db.prepare(
+        'INSERT INTO durable_inbox_order(event_id) VALUES(?)',
+      ).run(event.eventId);
+      return { kind: 'inserted' as const };
+    }
+    const current = this.db.prepare(
+      'SELECT lane, partition_key, payload_json, payload_hash FROM durable_inbox WHERE event_id = ?',
+    ).get(event.eventId) as {
+      lane: string;
+      partition_key: string;
+      payload_json: string;
+      payload_hash: string;
+    };
+    return current.lane === lane
+      && current.partition_key === event.partitionKey
+      && (current.payload_hash === payload.hash || durableInboxPayloadsAreEquivalent({
+        eventId: event.eventId,
+        lane: current.lane,
+        partitionKey: current.partition_key,
+        payload: parseJson(current.payload_json),
+      }, event))
+      ? { kind: 'duplicate' as const }
+      : { kind: 'conflict' as const };
   }
 
   async claimNextInbox(input: ClaimInboxInput): Promise<InboxClaim | undefined> {
@@ -544,12 +665,18 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     if (input.partitionKeys !== undefined && !Array.isArray(input.partitionKeys)) {
       throw new Error('partitionKeys must be an array');
     }
+    if (input.partitionKeys !== undefined && input.partitionKeyPrefix !== undefined) {
+      throw new Error('partitionKeys and partitionKeyPrefix are mutually exclusive');
+    }
     const partitionKeys = input.partitionKeys === undefined
       ? undefined
       : [...new Set(input.partitionKeys.map(key => {
         if (typeof key !== 'string') throw new Error('partitionKey must be text');
         return nonempty(key, 'partitionKey');
       }))];
+    const partitionKeyPrefix = input.partitionKeyPrefix === undefined
+      ? undefined
+      : nonempty(input.partitionKeyPrefix, 'partitionKeyPrefix');
     if (partitionKeys && partitionKeys.length > 256) {
       throw new Error('partitionKeys must contain at most 256 unique values');
     }
@@ -559,7 +686,12 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     return this.transaction(() => {
       const partitionFilter = partitionKeys
         ? `AND i.partition_key IN (${partitionKeys.map(() => '?').join(', ')})`
-        : '';
+        : partitionKeyPrefix
+          ? 'AND substr(i.partition_key, 1, length(?)) = ?'
+          : '';
+      const partitionArgs = partitionKeys ?? (partitionKeyPrefix
+        ? [partitionKeyPrefix, partitionKeyPrefix]
+        : []);
       const candidate = this.db.prepare(
         `SELECT i.event_id
            FROM durable_inbox i
@@ -585,7 +717,7 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
             )
           ORDER BY i.visible_at, io.sequence
           LIMIT 1`,
-      ).get(lane, ...(partitionKeys ?? []), now, now, now) as { event_id: string } | undefined;
+      ).get(lane, ...partitionArgs, now, now, now) as { event_id: string } | undefined;
       if (!candidate) return undefined;
       this.db.prepare(
         `UPDATE durable_inbox

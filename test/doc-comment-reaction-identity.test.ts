@@ -44,7 +44,11 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
 }));
 
-import { addCommentReaction, addCommentReactionChecked } from '../src/im/lark/doc-comment.js';
+import {
+  addCommentReaction,
+  addCommentReactionChecked,
+  removeCommentReaction,
+} from '../src/im/lark/doc-comment.js';
 
 const FILE = { fileToken: 'DocToken1234567890123456', fileType: 'docx' };
 const COMMENT_ID = '7681622822925421500';
@@ -275,14 +279,13 @@ describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
   it('code=0 但响应体不带 reaction_id ⇒ ok=true（官方 schema 就是空对象）', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: {} });
     const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
-    expect(res.ok).toBe(true);
-    expect(res.reactionId).toBeUndefined();
+    expect(res).toEqual({ ok: true, reactionId: undefined, identity: 'tenant' });
   });
 
   it('code=0 且带 reaction_id ⇒ ok=true 并透出 id', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-9' } });
     const res = await addCommentReactionChecked('app-test', FILE, COMMENT_ID, REPLY_ID, 'ERROR', { tenantOnly: true });
-    expect(res).toEqual({ ok: true, reactionId: 'r-9' });
+    expect(res).toEqual({ ok: true, reactionId: 'r-9', identity: 'tenant' });
   });
 
   it('请求抛错 ⇒ ok=false（tenantOnly 下 code!=0 也会抛）', async () => {
@@ -294,5 +297,76 @@ describe('addCommentReactionChecked: ok 反映真实服务端结果', () => {
   it('旧签名 addCommentReaction 行为不变（仍返回 reactionId | undefined）', async () => {
     mocks.tenantRequest.mockResolvedValue({ code: 0, data: { reaction_id: 'r-legacy' } });
     await expect(addCommentReaction('app-test', FILE, COMMENT_ID, REPLY_ID, 'Typing')).resolves.toBe('r-legacy');
+  });
+});
+
+describe('removeCommentReaction: 用 update_reaction 的 delete 语义清理', () => {
+  beforeEach(() => {
+    mocks.tenantRequest.mockReset().mockResolvedValue({ code: 0, data: {} });
+    mocks.getTenantAccessToken.mockReset().mockResolvedValue('tenant-token-live');
+    mocks.resolveUserToken.mockReset().mockResolvedValue('u-token-live');
+    vi.unstubAllGlobals();
+  });
+
+  it('tenant 创建的 Typing 用同一身份和 reaction_type 撤回，不依赖 reaction_id', async () => {
+    await removeCommentReaction(
+      'app-test',
+      FILE,
+      COMMENT_ID,
+      REPLY_ID,
+      'Typing',
+      { identity: 'tenant' },
+    );
+
+    expect(mocks.tenantRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: `/open-apis/drive/v2/files/${FILE.fileToken}/comments/reaction`,
+        params: { file_type: FILE.fileType },
+        data: { action: 'delete', reply_id: REPLY_ID, reaction_type: 'Typing' },
+      }),
+      undefined,
+    );
+  });
+
+  it('user fallback 创建的 Typing 用 user 身份撤回', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ code: 0, data: {} }),
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeCommentReaction(
+      'app-test',
+      FILE,
+      COMMENT_ID,
+      REPLY_ID,
+      'Typing',
+      { identity: 'user' },
+    );
+
+    expect(mocks.tenantRequest).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`/open-apis/drive/v2/files/${FILE.fileToken}/comments/reaction?file_type=docx`),
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ action: 'delete', reply_id: REPLY_ID, reaction_type: 'Typing' }),
+      }),
+    );
+  });
+
+  it('旧持久化目标没有身份时同时清理 tenant 和 user，避免遗留表情', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ code: 0, data: {} }),
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeCommentReaction('app-test', FILE, COMMENT_ID, REPLY_ID, 'Typing');
+
+    expect(mocks.tenantRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

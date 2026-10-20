@@ -7,10 +7,10 @@
  * Async (execFile) on purpose: a `git fetch` can take many seconds and this
  * runs inside the daemon's event loop.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readlinkSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -381,9 +381,15 @@ export async function pushWorktreeBranch(worktreePath: string, branch: string): 
 
 
 export interface WorktreeSafetyStatus {
+  /** True when either ordinary Git changes or ignored local content exists. */
   dirty: boolean;
+  /** Aggregate count/list retained for deletion gates and existing callers. */
   dirtyCount: number;
   dirtyFiles: string[];
+  uncommittedCount: number;
+  uncommittedFiles: string[];
+  ignoredCount: number;
+  ignoredFiles: string[];
   ahead: number;
   unpushedCommits: string[];
   /** Stable snapshot used to reject stale destructive confirmation cards. */
@@ -400,40 +406,182 @@ interface SafetyStatusEntry {
   localPath: string;
 }
 
-/** Parse porcelain v1's NUL form. Unlike the line form, paths are never
- * C-quoted, so non-ASCII, tabs and newlines remain exact filesystem names. */
-function parsePorcelainZ(raw: string, repoDir: string, prefix = ''): SafetyStatusEntry[] {
-  const records = raw.split('\0');
-  const entries: SafetyStatusEntry[] = [];
-  for (let i = 0; i < records.length; i++) {
-    const record = records[i];
-    if (record.length < 4) continue;
-    const status = record.slice(0, 2);
-    const localPath = record.slice(3);
-    entries.push({ status, localPath, repoDir, path: prefix ? `${prefix}/${localPath}` : localPath });
-    // In porcelain v1 -z, rename/copy destinations are followed by the source
-    // path as a second NUL record. The destination above is the path that exists.
-    if (/[RC]/.test(status)) i++;
-  }
-  return entries;
+/** Stream porcelain v1's NUL form so a large ignored directory cannot exceed
+ * execFile's 1 MiB stdout buffer. Paths are never C-quoted in this form. */
+function gitPorcelainZ(
+  args: string[],
+  repoDir: string,
+  prefix = '',
+  timeoutMs = 10_000,
+): Promise<SafetyStatusEntry[]> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('git', args, { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    const entries: SafetyStatusEntry[] = [];
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderr = '';
+    let skipRenameSource = false;
+    let settled = false;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise(entries);
+    };
+    const consume = (record: string) => {
+      if (skipRenameSource) {
+        skipRenameSource = false;
+        return;
+      }
+      if (record.length < 4) return;
+      const status = record.slice(0, 2);
+      const localPath = record.slice(3);
+      entries.push({ status, localPath, repoDir, path: prefix ? `${prefix}/${localPath}` : localPath });
+      // Rename/copy destinations are followed by the source path as a second
+      // NUL record. Only the destination above exists in the worktree.
+      skipRenameSource = /[RC]/.test(status);
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      let nul = pending.indexOf(0);
+      while (nul >= 0) {
+        consume(pending.subarray(0, nul).toString('utf8'));
+        pending = pending.subarray(nul + 1);
+        nul = pending.indexOf(0);
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (stderr.length < 65_536) stderr += chunk.toString('utf8');
+    });
+    child.on('error', error => finish(error));
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (settled) return;
+      if (pending.length) consume(pending.toString('utf8'));
+      if (timedOut) {
+        finish(new Error(`git status timed out after ${timeoutMs}ms`));
+      } else if (code !== 0) {
+        finish(new Error(stderr.trim() || `git status exited with code ${code ?? signal ?? 'unknown'}`));
+      } else {
+        finish();
+      }
+    });
+    timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+  });
 }
 
 async function safetyStatusEntries(dir: string): Promise<SafetyStatusEntry[]> {
-  const status = await gitRaw([
+  const entries = await gitPorcelainZ([
     'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
-  ], dir, 10_000);
-  const entries = parsePorcelainZ(status, dir);
+  ], dir, '', 10_000);
   const submodules = await gitRaw([
     'submodule', 'foreach', '--quiet', '--recursive', 'printf "%s\\0" "$displaypath"',
   ], dir, 10_000);
   for (const path of submodules.split('\0').filter(Boolean)) {
     const submoduleDir = join(dir, path);
-    const nested = await gitRaw([
+    entries.push(...await gitPorcelainZ([
       'status', '--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal',
-    ], submoduleDir, 10_000);
-    entries.push(...parsePorcelainZ(nested, submoduleDir, path));
+    ], submoduleDir, path, 10_000));
   }
   return entries;
+}
+
+interface SafetyContentEntry {
+  path: string;
+  repoDir: string;
+  localPath: string;
+}
+
+const SAFETY_HASH_BATCH_PATHS = 500;
+const SAFETY_HASH_BATCH_BYTES = 64 * 1024;
+
+function safetyHashBatches<T extends { localPath: string }>(entries: T[]): T[][] {
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const entryBytes = Buffer.byteLength(entry.localPath) + 1;
+    if (batch.length && (batch.length >= SAFETY_HASH_BATCH_PATHS || bytes + entryBytes > SAFETY_HASH_BATCH_BYTES)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(entry);
+    bytes += entryBytes;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+async function safetyContentRows(entries: SafetyContentEntry[]): Promise<string[]> {
+  const rows = new Array<string>(entries.length);
+  const regularByRepo = new Map<string, Array<SafetyContentEntry & { index: number }>>();
+  for (const [index, entry] of entries.entries()) {
+    const absolute = join(entry.repoDir, entry.localPath.replace(/\/$/, ''));
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        rows[index] = `${entry.path}\0<missing>`;
+        continue;
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      // Hash the link itself. Never let an ignored dependency link pull an
+      // external/shared directory into this worktree's confirmation snapshot.
+      const digest = createHash('sha256')
+        .update('symlink\0')
+        .update(readlinkSync(absolute))
+        .digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    if (stat.isDirectory()) {
+      // Expanded porcelain records carry descendant content separately; the
+      // path/status row already fingerprints the directory marker itself.
+      const digest = createHash('sha256').update('directory\0').digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    if (!stat.isFile()) {
+      const digest = createHash('sha256')
+        .update(`special\0${stat.mode}\0${stat.size}\0${stat.mtimeMs}`)
+        .digest('hex');
+      rows[index] = `${entry.path}\0${digest}`;
+      continue;
+    }
+    const group = regularByRepo.get(entry.repoDir) ?? [];
+    group.push({ ...entry, index });
+    regularByRepo.set(entry.repoDir, group);
+  }
+
+  // Batch ordinary files to avoid one git process per ignored dependency.
+  // argv preserves every filename (including newlines) and `--` protects paths
+  // beginning with a dash; output order matches input order.
+  for (const [repoDir, regularEntries] of regularByRepo) {
+    for (const batch of safetyHashBatches(regularEntries)) {
+      const output = await gitRaw([
+        'hash-object', '--no-filters', '--', ...batch.map(entry => entry.localPath),
+      ], repoDir, 30_000);
+      const hashes = output ? output.split('\n') : [];
+      if (hashes.length !== batch.length) {
+        throw new Error(`git hash-object returned ${hashes.length} hashes for ${batch.length} paths`);
+      }
+      for (let i = 0; i < batch.length; i++) {
+        rows[batch[i].index] = `${batch[i].path}\0${hashes[i]}`;
+      }
+    }
+  }
+  return rows;
 }
 
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
@@ -442,6 +590,10 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   const status = statusEntries.map(entry => `${entry.status} ${entry.path}`).join('\n');
   const allDirtyFiles = statusEntries.map(entry => entry.path);
   const dirtyFiles = allDirtyFiles.slice(0, 20);
+  const uncommittedEntries = statusEntries.filter(entry => entry.status !== '!!');
+  const ignoredEntries = statusEntries.filter(entry => entry.status === '!!');
+  const uncommittedFiles = uncommittedEntries.map(entry => entry.path).slice(0, 20);
+  const ignoredFiles = ignoredEntries.map(entry => entry.path).slice(0, 20);
   let ahead = 0;
   let unpushedCommits: string[] = [];
   const head = await tryGit(['rev-parse', '--verify', 'HEAD'], dir, 5_000) ?? '';
@@ -468,44 +620,37 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   }
   // `git status` records paths and states, not bytes. Hash the current worktree
   // content for every dirty entry so an already-dirty file changing between the
-  // confirmation card and deletion invalidates the confirmation. `git hash-object`
-  // handles regular files, symlinks and paths inside initialized submodules; a
-  // directory marker is expanded with the traditional ignored view so ignored
+  // confirmation card and deletion invalidates the confirmation. Regular files
+  // use `git hash-object`; symlinks hash their link text without dereferencing;
+  // a directory marker is expanded with the traditional ignored view so ignored
   // directory contents participate without changing the compact display list.
-  const contentRows: string[] = [];
+  const contentEntries: SafetyContentEntry[] = [];
+  const expandedByRepo = new Map<string, Promise<SafetyStatusEntry[]>>();
   for (const entry of statusEntries) {
     const path = entry.path;
     const localPath = entry.localPath;
-    const absolute = join(entry.repoDir, localPath.replace(/\/$/, ''));
     if (localPath.endsWith('/')) {
-      const nestedRaw = await gitRaw([
-        'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
-      ], entry.repoDir, 10_000);
-      for (const nestedEntry of parsePorcelainZ(nestedRaw, entry.repoDir)) {
+      let expanded = expandedByRepo.get(entry.repoDir);
+      if (!expanded) {
+        expanded = gitPorcelainZ([
+          'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
+        ], entry.repoDir, '', 10_000);
+        expandedByRepo.set(entry.repoDir, expanded);
+      }
+      for (const nestedEntry of await expanded) {
         if (!nestedEntry.localPath.startsWith(localPath)) continue;
-        const digest = await git(['hash-object', '--no-filters', join(entry.repoDir, nestedEntry.localPath)], entry.repoDir, 10_000);
         const displayPath = path.slice(0, path.length - localPath.length) + nestedEntry.localPath;
-        contentRows.push(`${displayPath}\0${digest}`);
+        contentEntries.push({
+          path: displayPath,
+          repoDir: entry.repoDir,
+          localPath: nestedEntry.localPath,
+        });
       }
       continue;
     }
-    let digest: string;
-    if (!existsSync(absolute)) {
-      // A tracked deletion is expected dirty state, not a scan failure.
-      digest = '<missing>';
-    } else {
-      const stat = lstatSync(absolute);
-      if (stat.isDirectory()) {
-        const nested = await gitRaw([
-          'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
-        ], absolute, 10_000);
-        digest = createHash('sha256').update(nested).digest('hex');
-      } else {
-        digest = await git(['hash-object', '--no-filters', absolute], entry.repoDir, 10_000);
-      }
-    }
-    contentRows.push(`${path}\0${digest}`);
+    contentEntries.push({ path, repoDir: entry.repoDir, localPath });
   }
+  const contentRows = await safetyContentRows(contentEntries);
   // `write-tree` rejects unresolved conflicts. `ls-files --stage` serializes
   // every index entry (including stages 1/2/3), so it remains content-sensitive
   // for both ordinary staged changes and conflicted indexes.
@@ -525,7 +670,18 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   const fingerprint = createHash('sha256')
     .update(JSON.stringify({ head, upstream: upstream ?? '', indexTree, submoduleIndexes, status, contentRows, ahead, unpushedCommits }))
     .digest('hex');
-  return { dirty: status.length > 0, dirtyCount: allDirtyFiles.length, dirtyFiles, ahead, unpushedCommits, fingerprint };
+  return {
+    dirty: statusEntries.length > 0,
+    dirtyCount: allDirtyFiles.length,
+    dirtyFiles,
+    uncommittedCount: uncommittedEntries.length,
+    uncommittedFiles,
+    ignoredCount: ignoredEntries.length,
+    ignoredFiles,
+    ahead,
+    unpushedCommits,
+    fingerprint,
+  };
 }
 
 export async function mainWorktreeFor(dir: string): Promise<string> {

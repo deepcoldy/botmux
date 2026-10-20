@@ -268,10 +268,6 @@ export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.
 }
 
 export const config = {
-  lark: {
-    appId: process.env.LARK_APP_ID ?? '',
-    appSecret: process.env.LARK_APP_SECRET ?? '',
-  },
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
     // Writable for back-compat: callers/tests historically assigned
@@ -288,7 +284,6 @@ export const config = {
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
-    cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as BackendType,
     /** Auto-recovery throttle: on restart every surviving persistent-backend
      *  session is eagerly re-forked to re-attach its pane. With dozens of
@@ -301,7 +296,6 @@ export const config = {
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
-    allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
@@ -395,7 +389,6 @@ export const config = {
   // cached) on each access so a Settings change takes effect without a daemon
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
-  get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
   // sessions without a daemon restart. The daemon ORs this with each bot's own
@@ -433,17 +426,6 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
-  // Live getter: machine-wide switch for the reply-card footer brand signature
-  // (default botmux link / per-bot custom brandLabel). Default ON (absent ⇒
-  // shown); an explicit stored false suppresses the brand segment on EVERY bot's
-  // final/broadcast cards (usage/duration/recipient lines are unaffected). Read
-  // live (readGlobalConfig has a 2s TTL) so a Dashboard Settings flip applies to
-  // the next card render without restarting the daemon. Resolved in
-  // bot-registry.resolveBrandLabel, which is the single choke point all card
-  // builders feed; sandboxed one-shot `botmux send` children receive the value
-  // via the worker's env bridge.
-  get cardBrandLabelEnabled(): boolean { return readGlobalConfig().dashboard?.cardBrandLabel !== false; },
 };
 
-// allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
 export type Config = typeof config;

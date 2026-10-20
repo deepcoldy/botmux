@@ -1,6 +1,6 @@
 # Core-only（apiOnly）API 控制
 
-> 把 botmux 当作一个**受控的 HTTP 服务嵌入**你自己的系统：一个进程、固定端口、绑定 `127.0.0.1`、**不需要任何飞书凭证 / bots.json / pm2 / dashboard**。你的编排器（任务 runner、CI、后端服务、沙箱）通过 HTTP 驱动它跑 CLI（codex / claude-code 等）、轮询结果、按需拿到可写 Web 终端。
+> 把 botmux 当作一个**受控的 HTTP 服务嵌入**你自己的系统：一个进程、固定端口、绑定 `127.0.0.1`、**不需要任何飞书凭证 / bots.json / supervisor / dashboard**。你的编排器（任务 runner、CI、后端服务、沙箱）通过 HTTP 驱动它跑 CLI（codex / claude-code 等）、轮询结果、按需拿到可写 Web 终端。
 
 本文面向**把 botmux 嵌入自己产品**的集成方（例如在沙箱里内嵌一个 botmux 跑 codex）。如果你只是想让外部系统触发一个**已在飞书群里运行的普通机器人**，请看 [API 编程式触发任务](/api-task-trigger)——那篇讲的是触发/轮询/取消的四态契约，本文与之互补：**同一套 trigger/poll 契约在 core-only 下同样适用**，本文只讲 core-only 特有的启动、鉴权、路由分界、可写终端与安全边界。
 
@@ -10,7 +10,7 @@
 
 | | 普通 `botmux start`（fleet） | `botmux serve --api-only`（core-only） |
 |---|---|---|
-| 进程模型 | pm2 + dashboard + 每个 bot 一个 daemon | **单进程**，前台运行，进程存活即服务存活 |
+| 进程模型 | 内置 supervisor + dashboard + 每个 bot 一个 daemon | **单进程**，前台运行，进程存活即服务存活 |
 | 飞书凭证 | 需要 `larkAppSecret`，缺则启动失败 | **完全不需要**，也不构造飞书 Client |
 | bot 身份/配置来源 | `~/.botmux/bots.json` / `BOTS_CONFIG` | **忽略 bots.json 与 `BOTS_CONFIG`**，合成唯一一个 apiOnly bot（仍会读全局 `~/.botmux/.env` 与全局配置） |
 | 出站通道 | 回复发到飞书话题群 | **无飞书出站**（no-transport），结果只经 HTTP 取回 |

@@ -98,6 +98,11 @@ vi.mock('../src/core/worker-pool.js', () => {
   deliverEphemeralOrReply: vi.fn(),
   closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
+  // Simulate the real freeze: record the decision on the session so
+  // runAutoWorktreeCommit's sandboxSnapshot ctx carries the snapshot.
+  freezeSessionSandboxDecision: vi.fn((ds: any, botCfg: any) => {
+    if (ds.session.sandbox === undefined) ds.session.sandbox = botCfg.sandbox === true || botCfg.readIsolation === true;
+  }),
   CARD_POSTING_SENTINEL: '__posting__',
   };
 });
@@ -143,9 +148,18 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
-vi.mock('../src/services/default-worktree.js', () => ({
-  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
-}));
+vi.mock('../src/services/default-worktree.js', () => {
+  class AutoWorktreeFailClosedError extends Error {
+    constructor(public readonly reason: string) {
+      super(reason);
+      this.name = 'AutoWorktreeFailClosedError';
+    }
+  }
+  return {
+    maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
+    AutoWorktreeFailClosedError,
+  };
+});
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
@@ -157,15 +171,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, freezeSessionSandboxDecision } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
-import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
+import { maybeCreateDefaultWorktree, AutoWorktreeFailClosedError } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -1282,6 +1297,245 @@ describe('repo select card — worktree open', () => {
     expect(ds.worktreeCreating).toBe(false);
   });
 
+  it('runAutoWorktreeCommit fail-closes when the sandbox is on and the worktree cannot be created', async () => {
+    // The oncall file sandbox binds workingDir read-write to the real host dir, so a
+    // fallback to the real default dir on a worktree failure would be a sandbox
+    // escape. The session must be REFUSED (closed), not degraded to the real dir.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(
+      new AutoWorktreeFailClosedError('默认目录不是 git 仓库（或暂时无法确认）'),
+    );
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // No spawn in the real default dir.
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    // The never-started pending session was closed and removed from the map.
+    expect(ds.pendingRepo).toBe(false);
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBeUndefined();
+    expect(closeSession).toHaveBeenCalledWith('uuid-old');
+    // The user got a fail-closed notice naming the dir and the reason — not a
+    // "fell back to the default dir" notice.
+    expect(notify).toHaveBeenCalledTimes(1);
+    const notice = notify.mock.calls[0]![0] as string;
+    expect(notice).toContain('文件沙盒已开启');
+    expect(notice).toContain('/repos/alpha');
+    expect(notice).not.toContain('已回退');
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit fail-closed does NOT close a session whose pendingRepo was consumed mid-build (takeover)', async () => {
+    // Same mid-build takeover window as the success-path bail test, but with a
+    // FAIL-CLOSED rejection: a notifier adoption consumes pendingRepo and starts
+    // its own live session while the (slow, failing) worktree build runs. The
+    // late refusal must NOT closeSession / publishClosedSessionPatch the freshly
+    // adopted session — that would kill a live session the user just started.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    const d = deferred<never>();
+    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(
+      d.promise.then(() => { throw new AutoWorktreeFailClosedError('git fetch failed'); }) as any,
+    );
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+
+    // Simulate the takeover consuming pendingRepo and owning the session.
+    ds.pendingRepo = false;
+    d.resolve(undefined as never);
+    await run;
+
+    // The adopted session is untouched: not closed, still in the map, no
+    // refusal notice (the adopted session IS running — "session refused" would
+    // be a lie), no fork/kill from this path.
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
+    expect(notify).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit fail-closed does NOT close a session taken over WHILE the refusal notice is in flight', async () => {
+    // P2 review: the refusal cleanup used to run AFTER `await notify()`. The
+    // pendingRepo guard only proved ownership when the notice STARTED — a notifier
+    // adoption can consume pendingRepo while the network notice is in flight and
+    // start its own live session on this same ds. The post-await cleanup then
+    // deleted the freshly-adopted session from activeSessions and marked its
+    // durable record closed, orphaning the adopted worker (the exact race the
+    // preceding guard exists to prevent). The cleanup must re-check pendingRepo
+    // after the await — the cleanup itself is synchronous, so the recheck makes
+    // refusal+cleanup atomic with respect to the takeover.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const notice = deferred<unknown>();
+    const notify = vi.fn(() => notice.promise);
+    vi.mocked(maybeCreateDefaultWorktree).mockRejectedValueOnce(
+      new AutoWorktreeFailClosedError('默认目录不是 git 仓库（或暂时无法确认）'),
+    );
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // Wait until the refusal notice is IN FLIGHT (ownership held, cleanup not yet run).
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+
+    // Simulate the notifier adoption consuming pendingRepo while the notice is
+    // in flight, then let the notice settle.
+    ds.pendingRepo = false;
+    notice.resolve(undefined);
+    await run;
+
+    // The adopted session is untouched: not closed, still in the map, no closed
+    // patch — the recheck after the await caught the takeover.
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
+    expect(publishClosedSessionPatch).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit freezes the sandbox decision BEFORE the worktree build and hands the snapshot to the gate', async () => {
+    // R2: the fail-closed gate and the later fork must consume ONE sandbox
+    // snapshot. runAutoWorktreeCommit freezes the decision on the session
+    // (freezeSessionSandboxDecision) before any git/notice await, and passes
+    // the frozen values to maybeCreateDefaultWorktree via sandboxSnapshot.
+    // A dashboard sandbox toggle landing during the build then changes neither.
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    const gateCtx: any = {};
+    vi.mocked(maybeCreateDefaultWorktree).mockImplementationOnce(async (_app, _dir, ctx) => {
+      Object.assign(gateCtx, ctx);
+      return { dir: '/repos/alpha-wt' };
+    });
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // The freeze ran and recorded the decision on the session.
+    expect(freezeSessionSandboxDecision).toHaveBeenCalledTimes(1);
+    expect(ds.session.sandbox).toBe(true);
+    // The gate received the FROZEN snapshot (not a live-config re-read).
+    expect(gateCtx.sandboxSnapshot).toEqual({ sandbox: true, cliId: ds.session.cliId, backendType: ds.session.backendType });
+    // The freeze happened BEFORE the gate (no live-config window between them).
+    const freezeOrder = vi.mocked(freezeSessionSandboxDecision).mock.invocationCallOrder[0]!;
+    const gateOrder = vi.mocked(maybeCreateDefaultWorktree).mock.invocationCallOrder[0]!;
+    expect(freezeOrder).toBeLessThan(gateOrder);
+  });
+
+  it('runAutoWorktreeCommit: sandbox off→on flip while the worktree build/notice is in flight cannot sandbox the degraded real dir', async () => {
+    // Regression for the fail-open window: freeze OFF → the gate degrades to the
+    // real default dir → a dashboard PUT /api/bot-sandbox flips the LIVE config
+    // ON mid-build. The fork must still see the frozen OFF decision; otherwise
+    // the worker would start the oncall sandbox (workingDir bound read-write)
+    // on the real default dir the gate degraded to.
+    let liveSandbox = false;
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: liveSandbox },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    let snapshotSeen: any;
+    vi.mocked(maybeCreateDefaultWorktree).mockImplementationOnce(async (_app, baseDir, ctx: any) => {
+      snapshotSeen = { ...ctx.sandboxSnapshot };
+      liveSandbox = true;                 // toggle lands while the build/notice is in flight
+      return { dir: baseDir };            // degraded (the gate judged on the frozen OFF value)
+    });
+    let sandboxAtFork: unknown = 'not-forked';
+    vi.mocked(forkWorker).mockImplementationOnce(((forked: DaemonSession) => {
+      // forkWorker re-runs the (idempotent) freeze with the LIVE config first.
+      freezeSessionSandboxDecision(forked, getBot(APP_ID).config as any);
+      sandboxAtFork = forked.session.sandbox;
+      return true;
+    }) as any);
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify: vi.fn(),
+    });
+
+    expect(snapshotSeen.sandbox).toBe(false);
+    expect(getBot(APP_ID).config.sandbox).toBe(true); // the flip really happened
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(sandboxAtFork).toBe(false);                // fork consumed the SAME frozen snapshot
+  });
+
+  it('runAutoWorktreeCommit records the degrade verdict on the session (persisted) BEFORE the fork', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(maybeCreateDefaultWorktree).mockImplementationOnce(async (_app, baseDir) => ({ dir: baseDir }));
+    let markerAtFork: unknown;
+    vi.mocked(forkWorker).mockImplementationOnce(((forked: DaemonSession) => {
+      markerAtFork = forked.session.autoWorktreeFallbackDir;
+      return true;
+    }) as any);
+
+    await runAutoWorktreeCommit({
+      ds, anchor: ROOT_ID, larkAppId: APP_ID, baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions, notify: vi.fn(),
+    });
+
+    expect(markerAtFork).toBe('/repos/alpha');
+    expect(updateSession).toHaveBeenCalledWith(expect.objectContaining({ autoWorktreeFallbackDir: '/repos/alpha' }));
+  });
+
+  it('runAutoWorktreeCommit does NOT mark a session that got a real worktree', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    await runAutoWorktreeCommit({
+      ds, anchor: ROOT_ID, larkAppId: APP_ID, baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions, notify: vi.fn(),
+    });
+    expect(ds.session.autoWorktreeFallbackDir).toBeUndefined();
+  });
+
   it('double click starts ONE background creation and commits once', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
@@ -1924,6 +2178,39 @@ describe('repo select card — worktree open', () => {
     expect(res?.toast?.content).toContain('发起本次确认');
     expect(closeWorkerPoolSession).not.toHaveBeenCalled();
     expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
+  it('close_worktree_confirm fails closed in durable primary before local close or worktree deletion', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      const res = await handleCardAction({
+        operator: { open_id: OWNER },
+        action: { value: {
+          action: 'close_worktree_confirm',
+          root_id: ROOT_ID,
+          session_id: ds.session.sessionId,
+          invoker_open_id: OWNER,
+          confirmation_state: 'unsafe',
+        } },
+        context: { open_message_id: 'om_card' },
+      }, deps, APP_ID);
+
+      expect(res?.toast?.type).toBe('success');
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已拒绝本地关闭'),
+        undefined,
+        APP_ID,
+        'om_card',
+      );
+    } finally {
+      delete process.env.BOTMUX_COORDINATION_MODE;
+    }
   });
 
   it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {

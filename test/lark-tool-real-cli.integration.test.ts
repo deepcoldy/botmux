@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { findRealToolBinary } from '../src/core/cli-identity.js';
 import { larkToolBindingPath, larkToolChildEnv, prepareLarkToolEnv, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { parseLarkToolInvocation, larkToolExecutionArgs } from '../src/core/lark-tool-command.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
@@ -21,8 +22,9 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     credentialTypeOverride = undefined;
     binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
     server = createServer(async (req, res) => {
-      let raw = ''; for await (const chunk of req) raw += chunk;
-      const mode = JSON.parse(raw).mode; requests.push(mode);
+      const parsed = await readRequestBodyJson<{ mode: string }>(req);
+      if (!parsed) { res.writeHead(400).end(); return; }
+      const mode = parsed.mode; requests.push(mode);
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ ok: true, appId: binding.appId, mode,
         credentialType: credentialTypeOverride ?? (mode === 'bot' ? 'tenant_access_token' : 'user_access_token'),

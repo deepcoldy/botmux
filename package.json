@@ -73,7 +73,6 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",
     "croner": "^10.0.1",
     "dotenv": "^17.3.1",
@@ -84,7 +83,6 @@
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "smol-toml": "^1.9.0",
     "ws": "^8.19.0",
     "yaml": "^2.9.0",
     "zod": "^3.23.0"
@@ -104,11 +102,16 @@
     "@types/react-dom": "^19.2.3",
     "@types/react-test-renderer": "19.1.0",
     "@types/ws": "^8.18.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
     "electron": "^37.0.0",
     "electron-builder": "^26.0.0",
     "esbuild": "^0.28.0",
     "memfs": "^4.57.1",
-    "node-pty": "^1.1.0",
+    "node-pty": "1.2.0-beta.15",
     "playwright": "^1.58.2",
     "react-test-renderer": "19.2.7",
     "tsx": "^4.20.5",
@@ -118,7 +121,7 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "bun@1.4.2",
+  "packageManager": "bun@1.4.3",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/deepcoldy/botmux.git"

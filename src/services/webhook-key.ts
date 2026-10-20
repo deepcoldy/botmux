@@ -3,12 +3,13 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 const MASTER_KEY_FILE = 'webhook-master.key';
 const SECRETS_FILE = 'webhook-secrets.json';
@@ -51,32 +52,26 @@ function readOrCreateMasterKey(dataDir: string): Buffer {
   return key;
 }
 
-function emptyStore(): SecretStoreFile {
-  return { version: 1, secrets: {} };
-}
-
 function readStore(dataDir: string): SecretStoreFile {
-  const fp = secretStorePath(dataDir);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const secrets = (parsed as any).secrets;
-      return {
-        version: 1,
-        secrets: secrets && typeof secrets === 'object' && !Array.isArray(secrets) ? secrets : {},
-      };
-    }
-  } catch { /* corrupt store falls through to empty */ }
-  return emptyStore();
+  // 损坏的密文库被隔离为 .corrupt-*（而不是被下一次 setWebhookSecret 覆盖，
+  // 把所有已存密文一并抹掉），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<Record<string, any>>(secretStorePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'webhook-key',
+  });
+  const secrets = parsed.secrets;
+  return { version: 1, secrets: isJsonObject(secrets) ? secrets : {} };
 }
 
 function writeStore(dataDir: string, store: SecretStoreFile): void {
   const fp = secretStorePath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ version: 1, secrets: store.secrets }, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  renameSync(tmp, fp);
+  // 凭证类文件：不跟随叶子 symlink（与原 tmp+rename 替换叶子的行为一致）。
+  atomicWriteFileSync(fp, JSON.stringify({ version: 1, secrets: store.secrets }, null, 2) + '\n', {
+    mode: 0o600,
+    followTargetSymlink: false,
+  });
 }
 
 function encryptSecret(plaintext: string, key: Buffer): Pick<WebhookSecretRecord, 'alg' | 'iv' | 'tag' | 'ciphertext'> {

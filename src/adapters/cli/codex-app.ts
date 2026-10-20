@@ -1,30 +1,11 @@
-import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
-import type { DebugModelCapabilities } from './model-catalog-json.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
 import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
-
-function runnerPath(): string {
-  // Source-level worker integration tests execute through tsx and need the
-  // matching source runner rather than a possibly absent/stale ignored dist
-  // tree. Keep the override strictly test-scoped so production launch
-  // resolution remains canonical and cannot be redirected by ambient env.
-  const testOverride = process.env.NODE_ENV === 'test'
-    ? process.env.BOTMUX_TEST_CODEX_APP_RUNNER_PATH
-    : undefined;
-  if (testOverride) return resolve(testOverride);
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiledSibling = resolve(here, '..', '..', 'codex-app-runner.js');
-  if (existsSync(compiledSibling)) return compiledSibling;
-  const builtFromSourceTree = resolve(here, '..', '..', '..', 'dist', 'codex-app-runner.js');
-  if (existsSync(builtFromSourceTree)) return builtFromSourceTree;
-  return compiledSibling;
-}
+import { resolveRunnerPath } from './runner-path.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -37,6 +18,18 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   // resolveCommand. resolvedBin is the node runner, not codex itself.
   const rawCodexBin = pathOverride ?? 'codex';
   let cachedCodexBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      // Shares `cachedCodexBin` with the launch call sites, so discovery and
+      // the app-server always use the same resolved binary.
+      const codexBin = (cachedCodexBin ??= resolveCommandReal(rawCodexBin));
+      return await loadCodexServiceTierCatalog({ cliBin: codexBin, env: options?.env });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex-app',
     // Whole ~/.codex kept REAL (see codex.ts): under the deny-by-default file
@@ -64,7 +57,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, serviceTier, codexBrowser }) {
       const args = [
-        runnerArgv0('codex-app-runner', runnerPath()),
+        runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
         // Canonical for the same reason as sandboxExtraExecPaths above — the runner
         // hands this straight to spawn().
@@ -87,24 +80,13 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     },
 
     // 与 codex CLI 同一模型目录（app-server 后端就是 codex binary）：静态列表是
-    // `codex debug models` visibility=list 的快照，live 探测补充目录增量。
+    // `codex debug models` visibility=list 的快照；live 成功时只使用 live 目录。
     modelChoices: CLI_MODEL_CHOICES['codex-app'],
     // resolvedBin 是 runner；能力探测使用其实际启动的 Codex binary。
-    async detectModelCapabilities(options?: { env?: NodeJS.ProcessEnv }): Promise<readonly DebugModelCapabilities[] | null> {
-      try {
-        // Shares `cachedCodexBin` with the two call sites above, so it must use the
-        // same resolver or whichever runs first would decide the cached value and
-        // silently change what the other two get. It also execs the binary itself.
-        const codexBin = (cachedCodexBin ??= resolveCommandReal(rawCodexBin));
-        return await loadCodexServiceTierCatalog({ cliBin: codexBin, env: options?.env });
-      } catch {
-        return null;
-      }
-    },
+    detectModelCapabilities,
 
     async detectModels(): Promise<readonly string[] | null> {
-      const catalog = await this.detectModelCapabilities?.();
-      return catalog?.map(model => model.slug) ?? null;
+      return capabilitySlugs(await detectModelCapabilities());
     },
 
     buildResumeCommand() {
@@ -152,5 +134,3 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createCodexAppAdapter;

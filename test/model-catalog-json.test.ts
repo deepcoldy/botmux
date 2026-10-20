@@ -19,6 +19,12 @@ const capabilityEntry = (slug: string, tiers: string[]) => ({
   service_tiers: tiers.map(id => ({ id, name: id })),
 });
 
+const reasoningEntry = (slug: string, levels: string[], defaultLevel: string) => ({
+  ...modelEntry(slug),
+  supported_reasoning_levels: levels.map(effort => ({ effort })),
+  default_reasoning_level: defaultLevel,
+});
+
 describe('parseDebugModelsJson', () => {
   it('真实 shape：两个 visibility=list 模型 → 按原顺序返回 slug', () => {
     const out = parseDebugModelsJson(
@@ -86,5 +92,16 @@ describe('parseDebugModelCapabilitiesJson', () => {
       { slug: 'gpt-6-astra', serviceTiers: ['priority', 'ultrafast'] },
       { slug: 'legacy', serviceTiers: [] },
     ]);
+  });
+
+  it('同一次解析保留 reasoning levels，并过滤未知档位', () => {
+    expect(parseDebugModelCapabilitiesJson(REAL_SHAPE([
+      reasoningEntry('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'future'], 'medium'),
+    ]))).toEqual([{
+      slug: 'gpt-6.1-sol',
+      serviceTiers: [],
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      defaultReasoningEffort: 'medium',
+    }]);
   });
 });

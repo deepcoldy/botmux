@@ -52,6 +52,7 @@ botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --top
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
+非静默 \`--new-topic\` / \`task\` 的 \`--topic-title\` 支持触发时模板：\`{{date}}\` 是定时任务时区的自然日，\`{{date:-1d}}\` / \`{{date:+2d}}\` 按自然日偏移，\`{{owner}}\` 是任务创建人的真实飞书 mention。模板仅在每次触发时渲染，保存的任务配置保持不变；silent 延迟建根仅支持静态标题，动态模板会在创建或更新时被拒绝。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
 执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
@@ -82,9 +83,22 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
-委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
-\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+真人当前回合创建的 direct 任务，以及宿主显式启用了 self-management 的委托任务，
+在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
+\`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
+如果任务需要先发送最终结果再删除自身，必须把两个动作合并到同一次发送：
+
+\`\`\`bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+\`\`\`
+
+该命令先确认 final 已成功投递并落账，再让 daemon 删除当前精确 task，最后才推进排队
+turn。不要先发 final、再单独执行 \`schedule remove self\`；final 可能已经把长驻 CLI
+切到下一排队 turn，后续命令会因身份过期而被安全拒绝。如果结构化结果里的
+\`scheduleSelfCleanup.removed\` 为 \`false\`，原样重试同一命令；BotMux 会复用已投递的
+final，只补做自删，不会重复发消息。
 
 ## 典型用法
 
@@ -550,6 +564,8 @@ EOF
 
 \`--card-file <path>\` 或 \`--card-json '<json>'\` 直接发送 interactive card JSON。输入既可以是直接卡片对象（如 \`{"schema":"2.0",...}\`），也可以是 webhook/openapi 形态 \`{"msg_type":"interactive","card":{...}}\` 或 \`{"msg_type":"interactive","content":"{...}"}\`。
 
+**自定义卡片作为最终答复**：当前会话内用 \`botmux send --card-file "$TMPDIR/card.json" --response-kind final --mention-back\`。必须是 schema 2.0、包含 body.elements；保留原卡头、多列、折叠区等排版，宿主在**同一张卡**上添加最终签名及已配置的反馈控件，复用本轮回复卡和最终交付记录。不要再补一条普通 final 收尾消息。卡片不能占用 \`botmux_\` 前缀元素 ID；不支持与跨群/顶层发送或 \`--completion-proposal-file\` 混用。普通进度卡仍不加最终签名/反馈；宿主托管的 final 卡不要用 \`card patch\` 覆盖，以免破坏反馈与轮次状态。
+
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
@@ -596,6 +612,44 @@ botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 如果同一任务需要跟随较新的用户输入，先用当前完整卡片内容发出新卡，再调用 \`stream reanchor --stream-id <旧流> --message-id <新卡>\`。Botmux 会在新流就绪后拒绝旧流的迟到写入、迁移已绑定的运行状态，并尽力撤回旧消息。成功输出会返回新的 \`messageId\` / \`streamId\`，调用方必须立即更新自己的持久化状态。是否跟随新输入由调用 Skill 决定，Core 不自动撤回任意卡片。
 
 多行内容也可用 \`--content-file -\` 从 stdin 读取。核心命令只负责 transport、会话归属、顺序与幂等；阶段、公开工作摘要、工具事件和 UI 语义应由机器人自己的 Skill 决定。不要把模型私有原始 CoT 写进卡片，只展示可公开、可验证的工作摘要。
+
+### 完成卡附一个受约束的可选后续
+
+当任务已经结束、但存在一个值得让原请求者决定是否继续的独立后续时，可以把一份 Completion Proposal 附在**同一张标准 final 卡**上。它适合“是否创建修复 MR”“是否把已验证结论沉淀为规范”这类非阻塞二选一；它不是通用 callback，也不能替代需要当场等待答案的 \`botmux ask\`。
+
+先做无副作用的能力探测：
+
+\`\`\`bash
+botmux capabilities --json
+\`\`\`
+
+只有 \`.capabilities.completion_proposal_v1 == true\` 时才传文件。文件必须是 UTF-8 JSON，且只允许 4 个会展示给用户的字符串字段：
+
+\`\`\`json
+{
+  "title": "是否创建修复 MR？",
+  "body": "会整理本次已验证的修复，创建独立分支和 MR；不会自动合并。",
+  "acceptLabel": "创建 MR",
+  "dismissLabel": "暂不创建"
+}
+\`\`\`
+
+\`\`\`bash
+botmux send --response-kind final \\
+  --completion-proposal-file /absolute/task-tmp/completion-proposal.json \\
+  --mention-back <<'EOF'
+修复已完成并通过测试。
+EOF
+\`\`\`
+
+硬边界：
+
+- 只支持当前会话、标准正文 final 卡；不能和自定义卡、语音、跨群、顶层发送等特殊 sink 混用。
+- Core 固定 24 小时有效期，并把提案绑定到本次任务的精确 requester；其他人点击会被拒绝，重复点击按 first-decision-wins 幂等处理。
+- 四个字段是全部授权快照。不要写 prompt、命令、绝对路径、凭证、隐藏 payload 或 URL；点击接受只授权继续处理卡片上可见的内容，Agent 仍会在新 turn 里重跑 Skill、目标、权限和审批检查。
+- 接受会在 ACK 后启动一个新的普通 turn；跳过不会启动 Agent。满意度反馈是任务质量评价，Proposal 是有副作用的后续授权，两者独立并可同时出现在 final 卡。
+- 如果精确 requester、origin turn 或可跨重启恢复的 backend 不可证明，Core 会把内容降级成静态提示，不留下一个以后点不动的按钮。旧 Core 无该 capability 时，调用方应省略参数，并在正文里给静态提示。
+- 自定义 \`--card-file/--card-json\` 永远不能伪造这个回调；需要自定义业务交互时仍应走专门受审计的 Core 能力。
 
 ### @mention 其他机器人协作
 
@@ -689,9 +743,9 @@ botmux dispatch --chat-id oc_xxxxxxxxxxxx --bot-app cli_xxxxxxxxxxxx \\
   --title "子任务" --brief "任务内容"
 \`\`\`
 
-sandbox dispatch 暂不支持
-\`--into\`；需要追加既有话题时由宿主侧会话执行，避免把已校验群与实际
-\`om_\` 线程拆成两个独立授权目标。
+sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加：宿主侧会
+重新查询该根消息实际所在的群，必须与目标群（默认当前会话群，或
+\`--chat-id\` 指定的群）一致才会投递，否则返回 \`dispatch_chat_mismatch\`。
 
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 
@@ -708,6 +762,9 @@ sandbox dispatch 暂不支持
 | \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
 | \`--card-file <path>\` | 直接发送 interactive card JSON 文件（纯展示 + open_url，交互控件被拒） |
 | \`--card-json <json>\` | 直接发送 interactive card JSON 字符串（纯展示 + open_url，交互控件被拒） |
+| \`--response-kind final\` | 声明当前标准回复是最终答案，允许 Core 挂反馈与受约束完成后续 |
+| \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
+| \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |

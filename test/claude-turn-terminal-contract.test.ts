@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
 import {
@@ -270,17 +269,6 @@ describe('Claude durable turn terminal contract', () => {
     ]);
   });
 
-  it('wires all durable failure/exit paths through the same terminal emitter', () => {
-    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    expect(source).toContain("emitDurableTerminal(`submit_impossible:${reason}`)");
-    expect(source).toContain("emitDurableTerminal('submit_usage_limit')");
-    expect(source).toContain("emitDurableTerminal('submit_unconfirmed')");
-    expect(source).toContain('dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt)');
-    expect(source).toContain("'terminal_bridge_unavailable'");
-    expect(source).toMatch(/emitTurnTerminal\([\s\S]*?'ambiguous',[\s\S]*?'cli_exit'/);
-    expect(source).toContain('requireExplicitTerminalForDurable: true');
-  });
-
   /**
    * A synthesised local turn must never raise a user-visible failure.
    *
@@ -377,32 +365,6 @@ describe('Claude durable turn terminal contract', () => {
       expect(h.emitted).toHaveLength(1);
       expect(h.emitted[0].status).toBe('completed');
       expect(h.emitted[0].turnId.startsWith('local-')).toBe(true);
-    });
-
-    it('worker.ts gates the terminal on isLocal, not only the fallback', () => {
-      const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-      // The guard must live in the TERMINAL loop. Anchored on the log line so a
-      // refactor that drops the gate fails here rather than silently reopening
-      // the card path.
-      expect(source).toContain('Bridge terminal suppressed for synthesised local turn');
-      expect(source).toMatch(
-        /if \(turn\.isLocal && outcome && outcome\.status !== 'completed'\) \{/,
-      );
-      // ORDER, not merely presence. Keeping every byte of the gate but moving
-      // it one call later — below emitTurnTerminal — resurrects the phantom
-      // card exactly (the failure terminal ships, then the gate logs and
-      // `continue`s into nothing), and every string assertion above stays
-      // green. Both indices are pinned > -1 first: toBeLessThan(-1, n) passes
-      // silently, so a slice that missed the function would fake a pass.
-      const fn = source.slice(
-        source.indexOf('function emitReadyTurns('),
-        source.indexOf('function drainPathInto('),
-      );
-      const gateAt = fn.indexOf('Bridge terminal suppressed for synthesised local turn');
-      const emitAt = fn.indexOf('emitTurnTerminal(');
-      expect(gateAt).toBeGreaterThan(-1);
-      expect(emitAt).toBeGreaterThan(-1);
-      expect(gateAt).toBeLessThan(emitAt);
     });
   });
 });

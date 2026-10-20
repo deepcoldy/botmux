@@ -549,6 +549,30 @@ describe('botmuxScheduleExecutor invoke()', () => {
       { ...freshTopic, silent: true },
       Date.now(),
     )).toEqual({ ok: true });
+    const dynamicFreshTopic = parseScheduleInput({
+      ...base,
+      schedule: 'every 30m',
+      executionPosition: 'new-topic',
+      topicTitle: '{{date}} {{owner}}',
+      ownerOpenId: 'ou_owner123',
+    });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(dynamicFreshTopic, Date.now())).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      { ...dynamicFreshTopic, silent: true },
+      Date.now(),
+    )).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+      message: 'topic_title_template_silent_unsupported',
+    });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      { ...dynamicFreshTopic, ownerOpenId: undefined },
+      Date.now(),
+    )).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+      message: 'topic_title_owner_unavailable',
+    });
     expect(botmuxScheduleExecutor.validateBeforeIntent!(
       parseScheduleInput({ ...base, schedule: 'every 30m', executionPosition: 'topic' }),
       Date.now(),

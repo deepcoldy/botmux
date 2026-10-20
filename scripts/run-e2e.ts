@@ -149,6 +149,15 @@ if (startDaemon) {
             b.p2pMode = 'thread';
             changed = true;
           }
+          // DM group-mode cases find the session group by name. The default
+          // AI title would rename it (and ask the mock model for one).
+          if (b.sessionGroup?.naming?.mode !== 'truncate') {
+            b.sessionGroup = {
+              ...(b.sessionGroup ?? {}),
+              naming: { ...(b.sessionGroup?.naming ?? {}), mode: 'truncate' },
+            };
+            changed = true;
+          }
           if (useMockLlm && mockServerBaseUrl) {
             b.env = b.env || {};
             if (b.cliId === 'claude-code' || b.cliId === 'claude' || b.cliId === 'aiden') {

@@ -3,6 +3,7 @@ import type {
   RoleProfileEntryLike,
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
+import { readJson } from './dashboard-api.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -70,8 +71,16 @@ export interface MessageListenerData {
   contentPolicy?: {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
+    resolveDocumentTitles?: boolean;
   };
   replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+}
+
+export function mergeListenerContentPolicy(
+  current: MessageListenerData['contentPolicy'],
+  patch: NonNullable<MessageListenerData['contentPolicy']>,
+): NonNullable<MessageListenerData['contentPolicy']> {
+  return { ...(current ?? {}), ...patch };
 }
 
 export interface MessageListenerPreviewItem {
@@ -203,10 +212,6 @@ export function botInChatCount(group: GroupInfo): number {
   return group.memberBots.filter(bot => bot.inChat).length;
 }
 
-export function profileHasEntry(profile: RoleProfileSummary, larkAppId: string): boolean {
-  return (profile.botEntries ?? []).some(entry => entry.larkAppId === larkAppId && entry.hasEntry);
-}
-
 export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | null): RoleProfileEntry | undefined {
   return larkAppId ? entries.find(entry => entry.larkAppId === larkAppId) : undefined;
 }
@@ -226,10 +231,6 @@ export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo
 export function filterRoleProfiles(profiles: RoleProfileSummary[], filter: string): RoleProfileSummary[] {
   const q = filter.toLowerCase();
   return profiles.filter(profile => !q || profile.profileId.toLowerCase().includes(q));
-}
-
-async function readJson(r: Response): Promise<any> {
-  return r.json().catch(() => ({}));
 }
 
 export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: DashboardBot[] }> {

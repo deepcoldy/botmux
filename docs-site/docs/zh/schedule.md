@@ -17,6 +17,8 @@ botmux schedule add "每日18:00" "检查部署状态" --topic
 
 `--topic` 可从当前话题会话推断锚点，也可用 `--root-msg-id <om_...>` 指定目标话题。
 
+真人管理员直接在当前对话中要求创建或管理任务，不依赖 `scheduleDelegation.createEnabled`。daemon 从当前有效回合的发送者证据确定操作者；即使 CLI 就绪时清除了忙闲状态中的临时 caller，也只恢复同一条真人消息的身份，并继续校验实时回合授权。会话 Owner、历史消息、机器人发送者和复制上下文的自动续跑不能代替本轮真人授权。
+
 ## 跨 Bot 委托创建
 
 当真人在 Bot A 的当前回合中明确要求 Bot B 建立定时任务时，A 必须在受管派发中显式请求：
@@ -69,7 +71,15 @@ scheduled turn 不从未受管工具继承机器登录态，目标 Bot 必须同
 
 `runScopes` 默认空；配置为 `["bytedcli"]` 后，委托任务可在未来每次触发时使用原真人的 bytedcli 授权。来源 Bot 和目标 Bot 都必须启用 `triggerUserAuth`，且目标 Bot 应让 `lark-cli`、`bytedcli` 都经过隔离 wrapper，以保证复用会话不会继承历史身份；否则创建或执行会 fail-closed。该能力不会让 scheduled turn 变成通用真人 current actor，也不会持久化 lark-cli 权限。
 
-`selfManageEnabled:true` 允许 delegated scheduled turn 用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回对应的持久权限。
+真人当前回合创建的 direct 任务，其 scheduled turn 可用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务。跨 Bot delegated 任务仍需 `selfManageEnabled:true`。两类任务都只能管理当前精确 task，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回 delegated task 的对应持久权限。
+
+需要先发送最终结果再删除自身时，使用一个单一收口命令：
+
+```bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+```
+
+BotMux 会先确认 final 已成功投递并落账，再通过 owning daemon 删除当前 scheduled task，最后推进长驻 CLI 的排队 turn。不要拆成“先发 final、再执行 `schedule remove self`”，因为 final 之后当前进程可能已经切到下一排队 turn，旧身份会被安全拒绝。该 flag 只接受当前 scheduled turn 的标准 final，task ID 由 daemon 绑定的 turn 推导，调用方不能指定或删除其他任务。若结构化结果中的 `scheduleSelfCleanup.removed` 为 `false`，原样重试同一命令即可：BotMux 会复用已投递的 final，只补做自删，不会重复发消息。
 
 任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
 

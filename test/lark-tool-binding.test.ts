@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
 
@@ -11,23 +12,71 @@ beforeEach(() => { dir = realpathSync(mkdtempSync(join(tmpdir(), 'lark-tool-bind
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const defaults = { appId: 'cli_current', defaultAs: 'bot' as const };
 const parseLarkToolInvocation = (args: string[], binding: { appId: string; defaultAs: 'bot' | 'user' }) => {
-  const { args: output, mode, offline } = parseInvocation(args, binding, readLarkToolHelp);
-  return { args: output, mode, offline };
+  const { args: output, mode, offline, passthroughProfile } = parseInvocation(args, binding, readLarkToolHelp);
+  return { args: output, mode, offline, passthroughProfile };
 };
 
 describe('managed lark-cli binding', () => {
-  it('binds new standard sessions and leaves old/adopt/remote sessions alone', () => {
+  it('is default ON unless explicitly disabled (larkToolBinding: false); leaves adopt/remote/workflow alone', () => {
     const config = { sessionId: 'session-a', larkAppId: 'cli_current', chatId: 'oc_chat', backendType: 'pty' as const };
+    // Default on
     expect(usesLarkToolBinding(config, dir)).toBe(true);
-    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(false);
-    expect(usesLarkToolBinding({ ...config, resume: true, forkSession: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+
+    // Explicit off
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: false }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: false, resume: true }, dir)).toBe(false);
+
+    // Filtered backends / modes
     expect(usesLarkToolBinding({ ...config, adoptMode: true }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
     expect(usesLarkToolBinding(config, dir, true)).toBe(false);
-    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: config.sessionId, appId: config.larkAppId });
-    expect(hasLarkToolBinding(dir, config.sessionId)).toBe(true);
-    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+  });
+
+  it('cleans up binding files and managed wrapper when turned off, leaving trigger-user wrappers intact', () => {
+    const sessionId = 'session-cleanup';
+    const env = { PATH: '/usr/bin:/bin' };
+    prepareLarkToolEnv({ env, dataDir: dir, sessionId, appId: defaults.appId });
+    expect(hasLarkToolBinding(dir, sessionId)).toBe(true);
+    const binDir = sessionIdentityBinDir(dir, sessionId);
+    const wrapper = join(binDir, 'lark-cli');
+    expect(readFileSync(wrapper, 'utf8')).toContain('# botmux managed lark-cli');
+
+    // Clean up
+    cleanupLarkToolBinding(dir, sessionId);
+    expect(hasLarkToolBinding(dir, sessionId)).toBe(false);
+    expect(() => readFileSync(wrapper, 'utf8')).toThrow();
+
+    // Trigger-user wrapper must be preserved
+    writeFileSync(wrapper, '#!/bin/sh\n# botmux trigger-user identity wrapper — generated, do not edit.\nexec real "$@"\n');
+    cleanupLarkToolBinding(dir, sessionId);
+    expect(readFileSync(wrapper, 'utf8')).toContain('# botmux trigger-user identity wrapper');
+  });
+
+  it('cleans up delegations even when dataDir is a symlink alias', async () => {
+    const { rememberLarkToolDelegation, getLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    const { isLarkToolBound } = await import('../src/core/lark-tool-binding.js');
+    const realDir = join(dir, 'real-data');
+    mkdirSync(realDir, { recursive: true });
+    const symDir = join(dir, 'sym-data');
+    symlinkSync(realDir, symDir);
+
+    const sessionId = 'session-symlink';
+    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: symDir, sessionId, appId: defaults.appId });
+    expect(isLarkToolBound({ larkToolBinding: true }, symDir, sessionId)).toBe(true);
+    expect(isLarkToolBound({ larkToolBinding: false }, symDir, sessionId)).toBe(false);
+
+    rememberLarkToolDelegation(symDir, sessionId, 'turn-1', { tools: ['lark-cli'] });
+    expect(getLarkToolDelegation(symDir, sessionId, 'turn-1')).toBeDefined();
+    expect(getLarkToolDelegation(realDir, sessionId, 'turn-1')).toBeDefined();
+
+    // Cleaning up using the real path must also clear delegations accessed via the symlink
+    cleanupLarkToolBinding(realDir, sessionId);
+    expect(getLarkToolDelegation(symDir, sessionId, 'turn-1')).toBeUndefined();
+    expect(getLarkToolDelegation(realDir, sessionId, 'turn-1')).toBeUndefined();
+    expect(isLarkToolBound({ larkToolBinding: true }, symDir, sessionId)).toBe(false);
   });
   it('defaults to this bot and selects user without changing the app', () => {
     expect(parseLarkToolInvocation(['docs', '+fetch', '--doc', 'doc-token'], defaults)).toEqual({
@@ -39,11 +88,16 @@ describe('managed lark-cli binding', () => {
     expect(parseLarkToolInvocation(['docs', '+fetch'], { ...defaults, defaultAs: 'user' }).mode).toBe('user');
   });
   it.each([
-    ['--profile', 'cli_other'], ['--profile='], ['--as='], ['--as', 'owner'],
+    ['--profile='], ['--as='], ['--as', 'owner'],
     ['--as', 'bot', '--as=user'], ['--profile=cli_current', '--profile=cli_current'],
     ['profile', 'use', 'other'], ['config', 'init'], ['auth', 'login'], ['update'],
   ].map(args => ({ args })))('refuses account changes or conflicting selectors: $args', ({ args }) => {
     expect(() => parseLarkToolInvocation(args, defaults)).toThrow();
+  });
+  it('allows switching to other profiles via --profile as passthrough', () => {
+    const parsed = parseLarkToolInvocation(['docs', '+fetch', '--profile', 'cli_other'], defaults);
+    expect(parsed.passthroughProfile).toBe('cli_other');
+    expect(parsed.args).toEqual(['docs', '+fetch', '--profile', 'cli_other']);
   });
   it('preserves literal payloads and permits credential-free help/schema', () => {
     const args = ['im', '+send', '--text', 'literal --as user', '--', '--profile=other'];

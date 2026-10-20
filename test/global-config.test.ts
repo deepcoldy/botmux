@@ -53,6 +53,27 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
+  });
+
   it('drops invalid dashboard.localCliOpenMode values', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: {
@@ -134,18 +155,6 @@ describe('global dashboard config', () => {
       enabled: true,
       source: 'owner/repo/subdir',
       ref: 'reviewed-sha',
-    });
-  });
-
-  it('reads the review-only legacy spec as source/ref for compatibility', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({
-      dashboard: { herdrTraexPlugin: { enabled: true, spec: ' owner/repo#tag ' } },
-    }));
-
-    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
-      enabled: true,
-      source: 'owner/repo',
-      ref: 'tag',
     });
   });
 
@@ -484,9 +493,9 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
-    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
-    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();
     mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
     expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
@@ -574,6 +583,14 @@ describe('global sessionCleanup config', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
   });
 
   it('reads a full sessionCleanup block', () => {

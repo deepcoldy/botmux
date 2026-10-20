@@ -96,6 +96,14 @@ export function replyTargetKey(target: FrozenSessionReplyTarget): string {
     : `${target.mode}:${target.rootMessageId}`;
 }
 
+/** Lark chat ids (`oc_…`) are never a valid reply/thread root. Chat-scope
+ * card buttons carry the chat id as their `root_id`; letting one through as a
+ * reply root freezes `{ mode: 'thread', rootMessageId: oc_… }` and every later
+ * rootless post fails with 230001 (invalid message_id). Treat it as "no root". */
+function isLarkChatId(id: string | undefined): id is string {
+  return !!id && id.startsWith('oc_');
+}
+
 /** Freeze the visible Lark destination for one inbound turn before any
  * lifecycle mutation can replace or remove its session. `replyRootId` is
  * supplied only for a real chat-scope thread fold-back; quote-only turns keep
@@ -108,7 +116,7 @@ export function resolveInboundReplyTarget(args: {
   quoteOnly?: boolean;
 }): SessionReplyTarget {
   if (args.scope === 'chat') {
-    if (args.replyRootId) {
+    if (args.replyRootId && !isLarkChatId(args.replyRootId)) {
       return args.quoteOnly
         ? { mode: 'quote', rootMessageId: args.replyRootId }
         : { mode: 'thread', rootMessageId: args.replyRootId };
@@ -288,13 +296,13 @@ export function resolveSessionReplyTarget(
     // Exact per-turn anchor first: survives a later turn overwriting the
     // single slot while this turn is still executing/queued.
     const turnEntry = turnId ? ds.session.replyTargets?.[turnId] : undefined;
-    if (turnEntry?.rootMessageId) {
+    if (turnEntry?.rootMessageId && !isLarkChatId(turnEntry.rootMessageId)) {
       return turnEntry.quoteOnly
         ? { mode: 'quote', rootMessageId: turnEntry.rootMessageId }
         : { mode: 'thread', rootMessageId: turnEntry.rootMessageId };
     }
     const target = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
-    if (target?.rootMessageId && !!turnId && target.turnId === turnId) {
+    if (target?.rootMessageId && !isLarkChatId(target.rootMessageId) && !!turnId && target.turnId === turnId) {
       return target.quoteOnly
         ? { mode: 'quote', rootMessageId: target.rootMessageId }
         : { mode: 'thread', rootMessageId: target.rootMessageId };
@@ -333,8 +341,9 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
 ): void {
+  if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
   // mention-back participant record below; both are written per turn.
@@ -350,6 +359,8 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
+    ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
+      ? { sourceMessageId: opts.sourceMessageId } : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
@@ -443,6 +454,11 @@ export function frozenReplyContextForTurn(
   turnId?: string,
 ): FrozenSessionReplyContext {
   const frozen = turnId ? ds.session.turnReplyContexts?.[turnId] : undefined;
+  // Heal contexts persisted before chat ids were rejected as reply roots.
+  if (frozen && ds.scope === 'chat' && frozen.target.mode !== 'plain'
+    && isLarkChatId(frozen.target.rootMessageId)) {
+    return { ...frozen, target: { mode: 'plain', chatId: ds.chatId } };
+  }
   return frozen ?? { target: resolveSessionReplyTarget(ds, turnId) };
 }
 

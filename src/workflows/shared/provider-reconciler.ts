@@ -7,8 +7,6 @@
  * the caller owns durable state transitions and retry policy.
  */
 
-import type { ProviderReconciler } from '../v3/runtime-host-contract.js';
-
 export type {
   IdempotentSubmitResult,
   ProviderReconciler,

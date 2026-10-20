@@ -137,6 +137,23 @@ export function getClaudeSessionJsonlPath(
   return null;
 }
 
+/** Claude Code data root for one session: its frozen config profile, else ~/.claude.
+ *  Only trusted when the stored session belongs to the queried bot. */
+function claudeSessionDataRoot(q: TranscriptPathQuery): string {
+  // Best-effort: this path never depended on the session store before profiles
+  // existed, so an unavailable store must degrade to ~/.claude, not throw.
+  let session: ReturnType<typeof getSession>;
+  try { session = getSession(q.sessionId); } catch { session = undefined; }
+  // Adopted sessions wrap an external CLI on the default data root; an older
+  // build may have frozen the bot profile onto such a row, so ignore it there.
+  const profile = session?.cliConfigDir
+    && !session.adoptedFrom
+    && (!q.larkAppId || q.larkAppId === session.larkAppId)
+    ? session.cliConfigDir
+    : undefined;
+  return profile ? resolve(expandHome(profile)) : join(homedir(), '.claude');
+}
+
 /** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker
  *  does, so usage/insight reads hit the same transcript the CLI wrote. */
 const claudeForkDataDirCache = new Map<string, string>();
@@ -343,7 +360,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return existsSync(path) ? { path, kind: 'minimax' } : null;
     }
     case 'claude-code': {
-      const homeRoot = v(join(homedir(), '.claude'));
+      // A session launched on a config profile (`cliConfigDir`, frozen on the
+      // session) wrote its transcript under that profile, not ~/.claude.
+      const dataRoot = claudeSessionDataRoot(q);
+      const homeRoot = v(dataRoot);
       // cwd must be remapped too: on macOS Claude runs with the CLONE path as
       // cwd and keys its project dir by that slug; passing the host cwd here
       // yields a slug that never matches. (Linux identity-maps, so v() is a
@@ -352,7 +372,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
       const path = svMappings
         ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
-        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
+        : claudeJsonlWithBotHomeFallback(sid, sq, dataRoot);
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {

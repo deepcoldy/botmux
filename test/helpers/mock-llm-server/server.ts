@@ -4,6 +4,8 @@ import { TapeRecorder } from './recorder.js';
 import {
   extractMarkerFromMessages,
   buildBotmuxSendCommand,
+  buildMockReplyLine,
+  MOCK_CODEX_REPLY_PREFIX,
 } from './marker-extractor.js';
 import {
   buildAnthropicToolUseEvents,
@@ -192,7 +194,8 @@ export class MockLlmServer {
       console.log(`[mock-llm-server] /responses model=${model}, marker=${marker}`);
     }
 
-    const replyText = `【MOCK-REPLY】已收到指令并完成操作：${marker}`;
+    const replyLine = Array.isArray(body?.input) ? buildMockReplyLine(body.input, marker) : marker;
+    const replyText = `${MOCK_CODEX_REPLY_PREFIX}${replyLine}`;
     const events = buildOpenAiResponsesTextEvents({
       model,
       text: replyText,
@@ -243,7 +246,7 @@ export class MockLlmServer {
     }
 
     // Phase 1: Call Bash tool to send botmux reply
-    const cmd = buildBotmuxSendCommand(marker, true);
+    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = buildAnthropicToolUseEvents({
       model,
       toolName,
@@ -254,7 +257,6 @@ export class MockLlmServer {
 
   private async handleOpenAiChat(body: any, res: ServerResponse): Promise<void> {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    const lastMsg = messages[messages.length - 1];
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
 
     const lastNonSystemMsg = [...messages].reverse().find((m: any) => m?.role !== 'system');
@@ -269,7 +271,7 @@ export class MockLlmServer {
       return;
     }
 
-    const cmd = buildBotmuxSendCommand(marker, true);
+    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = buildOpenAiToolCallEvents({
       model: body?.model,
       command: cmd,

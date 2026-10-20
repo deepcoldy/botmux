@@ -8,17 +8,17 @@ cd botmux
 bun install --frozen-lockfile
 bun run build
 
-# Run directly (no PM2)
+# Run directly (foreground)
 bun run daemon
 
-# Or with PM2
+# Or under the built-in supervisor
 bun run daemon:start
 bun run daemon:logs
 ```
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.2`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.3`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without

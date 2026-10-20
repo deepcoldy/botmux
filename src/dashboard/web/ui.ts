@@ -51,6 +51,9 @@ class DashboardUiState {
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;
+  // 「终端」页（宿主 shell）只对本机 legacy 管理身份开放——比 `authed` 窄：平台协管者
+  // authed 但不能拿宿主 shell。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
+  hostTerminal = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;

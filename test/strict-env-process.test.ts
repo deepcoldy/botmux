@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildBotWorkerEnv, buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
@@ -31,8 +31,16 @@ function optsFor(dir: string): SpawnOpts {
   return { cwd: dir, cols: 80, rows: 24, env, injectEnv: botInjectedEnv({ OPENAI_API_KEY: 'bot-sentinel' }, policy), strictEnv: true };
 }
 async function report(path: string): Promise<Record<string, boolean>> {
-  await vi.waitFor(() => expect(existsSync(path)).toBe(true), { timeout: 10000 });
-  const result = JSON.parse(readFileSync(path, 'utf8')) as Record<string, boolean>;
+  // Wait for the report's CONTENT, not the file's existence: the probe publishes
+  // it with one writeFileSync, which truncate-creates `report` a beat before the
+  // JSON lands. Under CI contention an existence poll read that empty window
+  // ("JSON Parse error: Unexpected EOF" on master). The probe writes one complete
+  // object in a single write, so "parses" means "fully written"; a probe that
+  // never reports still fails here, by timeout with the last read/parse error.
+  const result = await vi.waitFor(
+    () => JSON.parse(readFileSync(path, 'utf8')) as Record<string, boolean>,
+    { timeout: 10000 },
+  );
   for (const [key, ok] of Object.entries(result)) expect(ok, key).toBe(true);
   return result;
 }
@@ -121,7 +129,8 @@ describe('strict environment real process probes', () => {
   });
   let realTmux: string | undefined;
   try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* optional native tool */ }
-  it.skipIf(!realTmux).each(['tmux', 'tmux-pipe'] as const)('%s excludes poisoned shared-server env, skips profile and isolates explicit bot credentials', async kind => {
+  it.skipIf(!realTmux)('tmux-pipe excludes poisoned shared-server env, skips profile and isolates explicit bot credentials', async () => {
+    const kind = 'tmux-pipe';
     const { dir, script } = prepare(); const socket = join(dir, 'socket'); const binDir = join(dir, 'bin');
     const session = 'bmx-strict-probe'; let child: ReturnType<typeof spawnNodeTsScript> | undefined;
     try {

@@ -30,15 +30,19 @@ import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  CODEX_CAPACITY_ERROR_CODE,
+  isCodexCapacityError,
   isExactCodexOutputLimitError,
 } from './services/codex-transcript.js';
 import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
+import { pidIsSignalable } from './utils/process-alive.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
 
 function rpcTurnErrorCode(error: unknown, fallback = 'rpc_turn_failed'): string {
+  if (isCodexCapacityError(error)) return CODEX_CAPACITY_ERROR_CODE;
   if (isExactCodexOutputLimitError(error)) return CODEX_OUTPUT_LIMIT_ERROR_CODE;
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;
@@ -63,9 +67,7 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+const isAlive = pidIsSignalable;
 
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
@@ -568,18 +570,40 @@ export class CodexRpcEngine {
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
-    if (pid) {
+    if (pid && this.child?.exitCode == null && this.child?.signalCode == null) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
       try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
+      const child = this.child!;
+      const t = setTimeout(() => {
+        if (child.exitCode == null && child.signalCode == null && isAlive(pid)) {
+          try { killGroup(pid, 'SIGKILL'); } catch { /* */ }
+        }
+      }, 2000);
+      child.once('exit', () => clearTimeout(t));
       t.unref?.();
     } else {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+  }
+
+  /** Keep this owner alive until the actual native child exit is observed.
+   * stop() remains synchronous for restart callers; explicit close awaits this. */
+  async stopAndWait(timeoutMs = 3_500): Promise<boolean> {
+    const child = this.child;
+    if (!child) { this.stop(); return false; }
+    const exited = child.exitCode != null || child.signalCode != null;
+    if (exited) { this.stop(); return true; }
+    return new Promise<boolean>(resolve => {
+      const done = (ok: boolean) => { clearTimeout(timer); child.off('exit', onExit); resolve(ok); };
+      const onExit = () => done(true);
+      const timer = setTimeout(() => done(false), timeoutMs);
+      child.once('exit', onExit);
+      this.stop();
+    });
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------

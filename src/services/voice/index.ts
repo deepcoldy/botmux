@@ -18,7 +18,7 @@ import {
 import type { ResolvedAsrConfig } from './asr.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { loadBotConfigs } from '../../bot-registry.js';
-import type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
+import type { VoiceConfig, VoiceAsrConfig } from './types.js';
 
 export type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
 export type { ResolvedAsrConfig } from './asr.js';

@@ -151,6 +151,24 @@ export const VC_MEETING_REALTIME_VOICE_SCOPES: RequiredScope[] = [
   { name: 'vc:meeting.bot.realtime:write', desc: '会议智能体实时语音发言', critical: false },
 ];
 
+/**
+ * Dashboard「飞书原生命令面板」（应用级 Slash 命令注册）专用的**可选**权限。
+ *
+ * 刻意**不在** {@link BOTMUX_REQUIRED_SCOPES}、也**不在** lark-scopes.json 默认 manifest：
+ * - 该能力在飞书侧仍处于灰度（需 FG 白名单 + 7.70+ PC 端），部分租户的权限目录里可能
+ *   根本没有这两个 scope；放进 manifest 会让新建应用的导入多一个不可识别项。
+ * - 放进 BOTMUX_REQUIRED_SCOPES 时，启动自检会把 non-critical 缺失项静默补进应用并
+ *   **发布新版本**（event-dispatcher 的 optional top-up）——为一个用户可能永远不用、
+ *   且可能不可用的 Dashboard 功能去改应用版本，违背「可选」。
+ * 缺失时只有 Dashboard 的该面板降级为「不可用 + 开通深链」，不影响 daemon 启动与其它功能。
+ */
+export const APP_SLASH_COMMAND_READ_SCOPE = 'application:app_slash_command:read';
+export const APP_SLASH_COMMAND_WRITE_SCOPE = 'application:app_slash_command:write';
+export const APP_SLASH_COMMAND_FEATURE_SCOPES: RequiredScope[] = [
+  { name: APP_SLASH_COMMAND_READ_SCOPE, desc: '读取应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
+  { name: APP_SLASH_COMMAND_WRITE_SCOPE, desc: '注册 / 更新 / 删除应用 Slash 命令（Dashboard 原生命令面板，可选）', critical: false },
+];
+
 /** VC bot push 事件。开放平台当前没有公开 API 可列出已订阅事件，只能给管理员检查清单。 */
 export const VC_MEETING_BOT_EVENTS = [
   'vc.bot.meeting_invited_v1',

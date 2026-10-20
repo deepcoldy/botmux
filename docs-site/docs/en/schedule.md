@@ -70,7 +70,15 @@ Use `--no-delegate schedule:create` to opt out for one dispatch.
 
 `runScopes` is empty by default. Setting it to `["bytedcli"]` lets delegated tasks use the original human's bytedcli authorization on each future fire. Both source and target bots must enable `triggerUserAuth`, and the target must govern both `lark-cli` and `bytedcli`, so a reused session cannot inherit an earlier identity; creation or execution otherwise fails closed. This does not turn the scheduled turn into a general human current actor and never persists lark-cli authority.
 
-With `selfManageEnabled:true`, a delegated scheduled turn may stop its current task using `botmux schedule pause self` or `botmux schedule remove self`. It cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes those persistent capabilities independently.
+A direct task created from the current human turn may stop itself with `botmux schedule pause self` or `botmux schedule remove self`. Cross-bot delegated tasks still require `selfManageEnabled:true`. Both forms are limited to the exact current task: they cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes the delegated task capabilities independently.
+
+When a task must deliver its final result and then remove itself, use one terminal operation:
+
+```bash
+botmux send --response-kind final --schedule-remove-self --no-mention "Task completed"
+```
+
+BotMux first confirms that the final answer was delivered and journaled, then asks the owning daemon to remove the exact scheduled task, and only then advances the long-lived CLI to its next queued turn. Do not split this into “send final, then run `schedule remove self`”: after final delivery the process may already represent the next queued turn, so the stale identity is correctly rejected. The flag accepts only a standard final from the current scheduled turn; the task ID is derived from daemon-bound turn identity and cannot target another task. If the structured result reports `scheduleSelfCleanup.removed: false`, retry the same command unchanged: BotMux reuses the delivered final and retries only the cleanup without posting another message.
 
 The host SQLite store is authoritative for task definitions, grants, pause/completion state, and run claims; `schedules.json` is a rebuildable projection. The first upgraded start records the then-existing task inventory once as legacy. Later JSON additions, copies, or edits gain no execution authority. This boundary protects managed CLIs and the file sandbox; it does not claim to defend against a process running as the same OS user with unrestricted access to host keys and authority databases.
 

@@ -25,6 +25,12 @@ function modeFromEnv(env: NodeJS.ProcessEnv): DurableCoordinationMode {
   return mode;
 }
 
+/** Lightweight probe for code paths that must not mutate lifecycle state outside
+ *  the durable primary commit path (e.g. typed `/resume`). Never throws. */
+export function coordinationModeIsPrimary(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.BOTMUX_COORDINATION_MODE?.trim() === 'primary';
+}
+
 function optionalTimeout(value: string | undefined, name: string): number | undefined {
   if (value === undefined || !value.trim()) return undefined;
   const parsed = Number(value);

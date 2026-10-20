@@ -715,6 +715,22 @@ describe('TmuxPipeBackend managed session', () => {
     }
   });
 
+  it('keeps the POSIX launch argv unchanged for sh-compatible shells', () => {
+    const be = new TmuxPipeBackend('bmx-posix-pipe', { createSession: true, ownsSession: true });
+    be.spawn('/bin/echo', ['hello'], {
+      ...spawnOpts(),
+      env: { PATH: '/usr/bin:/bin' },
+      launchShell: '/bin/sh',
+    });
+
+    const args = newSessionArgs();
+    const cIdx = scriptIndex(args);
+    const script = args[cIdx + 1] ?? '';
+    expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', script, '_', '/tmp']);
+    expect(script).toContain('cd -- "$1" && shift');
+    expect(script).toContain('exec /usr/bin/env "$@"');
+  });
+
   it('resizes owned tmux sessions and only records adopted pane resize', () => {
     const owned = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
     owned.resize(120, 40);

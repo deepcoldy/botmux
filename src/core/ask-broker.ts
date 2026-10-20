@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { logger } from '../utils/logger.js';
+import { gateHumanDecisionAttempt } from './human-decision-store.js';
 import {
   askKeyFor,
   dispatchUuidForKey,
@@ -119,7 +120,12 @@ export function _setHandoffRetentionForTest(ms: number): void {
  *  dispatcher gate / quota recheck (bot → evaluateBotTalk, human → evaluateTalk
  *  with the teamMember union leg). Without this, a cross-deployment team bot or a
  *  platform teamMember human answering by text is wrongly rejected. */
+const answerActors = new WeakMap<AskResult, AskAnswerActor>();
+/** In-process attribution, deliberately absent from the public AskResult JSON. */
+export function askAnswerActorFor(result: AskResult): AskAnswerActor | undefined { return answerActors.get(result); }
+
 export interface AskAnswerActor {
+  senderType?: 'user' | 'bot';
   /** Feishu-stamped bot sender (sender_type ∈ app|bot, or a cross-ref sibling). */
   botSender?: boolean;
   /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
@@ -151,7 +157,21 @@ export function setCanTalkChecker(
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
-  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
+  if (ask.deliveryTarget && (ask.deliveryTarget.openId !== by || actor?.botSender)) return false;
+  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
+}
+
+function gateAskDecision(
+  ask: InternalPending | undefined,
+  input: { nonce?: string; by: string; actor?: AskAnswerActor },
+): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
+  const gate = gateHumanDecisionAttempt({
+    exists: !!ask,
+    nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
+    settled: ask?.settled ?? false,
+    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, input.actor),
+  });
+  return gate === 'expired' ? 'stale' : gate;
 }
 
 /** Window during which a settled ask is still queryable so race-losers get a
@@ -288,6 +308,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
       createdAt,
@@ -358,6 +379,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
+    JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -447,6 +469,7 @@ function sendCardForAsk(ask: InternalPending): void {
         );
         settle(ask.askId, {
           kind: 'invalidated', reason: `card dispatch failed: ${msg}`,
+          failureCode: 'card_delivery_failed',
           selected: null, by: null, comment: null, timedOut: false,
         });
         return;
@@ -536,6 +559,7 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
@@ -570,10 +594,9 @@ export function toggleAsk(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.nonce !== args.nonce) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -621,10 +644,9 @@ export function submitAsk(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.nonce !== args.nonce) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -704,19 +726,21 @@ export function submitCustomReply(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { by: args.by, actor: args.actor });
+  if (gate !== 'ready') return gate;
   if (!ask) return 'stale';
-  if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
 
-  settle(args.askId, {
+  const result: AskResult = {
     kind: 'answered',
     answers: ask.questions.map(() => []),
     by: args.by,
     comment: text,
     timedOut: false,
-  });
+  };
+  if (args.actor) answerActors.set(result, { ...args.actor });
+  settle(args.askId, result);
   return 'accepted';
 }
 
@@ -745,6 +769,32 @@ export function findPendingAskByAnchor(args: {
     if (matches) return snapshot(ask);
   }
   return undefined;
+}
+
+/** Snapshot all live candidates, without changing the legacy first-match API. */
+export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: string; anchor: string }): PendingAsk[] {
+  return [...pending.values()].filter(ask => !ask.settled
+    && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
+    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor)).map(snapshot);
+}
+
+/** A DM answer must quote the exact document card. Never consume unrelated
+ * private messages (or guess between simultaneous asks from different docs). */
+export function submitDocumentAskReply(args: {
+  larkAppId: string;
+  chatType: 'group' | 'p2p';
+  parentMessageId?: string;
+  by: string;
+  text: string;
+}): boolean {
+  if (args.chatType !== 'p2p' || !args.parentMessageId?.startsWith('om_')
+    || !args.text.trim() || args.text.trimStart().startsWith('/')) return false;
+  for (const ask of pending.values()) {
+    if (ask.settled || !ask.deliveryTarget || ask.larkAppId !== args.larkAppId
+      || ask.cardMessageId !== args.parentMessageId || ask.deliveryTarget.openId !== args.by) continue;
+    return submitCustomReply({ askId: ask.askId, by: args.by, text: args.text }) === 'accepted';
+  }
+  return false;
 }
 
 /** Resolve attempt from a card-button click. Returns one of the §10 outcomes;
@@ -865,6 +915,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
@@ -1028,6 +1079,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    ...(ask.deliveryTarget ? { deliveryTarget: { ...ask.deliveryTarget } } : {}),
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded

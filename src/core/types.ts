@@ -412,6 +412,8 @@ export interface DaemonSession {
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
+  /** Native write observations, scoped to the worker generation and exact attempt. */
+  replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -427,6 +429,11 @@ export interface DaemonSession {
    * captured it). Trusted only while `imageKey === currentImageKey`; a cache
    * restored from disk has no provenance and is treated as legacy. */
   currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** Read-only preview shown while the card's own turn is waiting for the
+   * previous turn to finish. It is deliberately separate from currentImageKey:
+   * never persisted, never treated as this card turn's frame, and cleared as
+   * soon as the target turn activates or the worker generation changes. */
+  waitingTurnPreview?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
   /** The worker's actual screenshot capture identity, from capture_identity
    * events emitted at real CLI write points (never from input ACKs). Scoped to
    * one worker generation: once a generation announced it, that generation's
@@ -813,7 +820,7 @@ export interface DaemonSession {
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string }>;
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   /** Last scoped dedupe key emitted via the bridge final_output pipeline.
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */

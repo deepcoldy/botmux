@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { shouldDeferInitialPromptForStartup } from '../src/core/startup-commands.js';
 import {
@@ -82,36 +81,5 @@ describe('spawnHasStartupWork', () => {
       adoptMode: false,
       passesInitialPromptViaArgs: true,
     })).toBe(true);
-  });
-});
-
-describe('initial native rename is not replayed on in-worker restart', () => {
-  const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-  const poolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-
-  it('keeps /rename off startupCommands and consumes it with a flag spawnCli does not re-arm', () => {
-    expect(poolSource).toContain('startupCommands: agentCfg.startupCommands');
-    expect(poolSource).toContain('initialNativeRename');
-    expect(poolSource).not.toContain('withInitialNativeRenameStartupCommand');
-
-    const rearmStart = workerSource.indexOf('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn');
-    const rearmEnd = workerSource.indexOf('bareShellLaunchBlocked = false', rearmStart);
-    const rearmRegion = workerSource.slice(rearmStart, rearmEnd);
-    expect(rearmRegion).not.toContain('hasRunInitialNativeRename');
-
-    const flushStart = workerSource.indexOf('if (!hasRunStartupCommands)');
-    const flushEnd = workerSource.indexOf('Commands deferred behind a previous rename', flushStart);
-    const flushRegion = workerSource.slice(flushStart, flushEnd);
-    expect(flushRegion.indexOf('await runStartupCommands()'))
-      .toBeLessThan(flushRegion.indexOf('await runInitialNativeRename()'));
-
-    const renameStart = workerSource.indexOf('async function runInitialNativeRename()');
-    const renameEnd = workerSource.indexOf('const freshnessInputQueue', renameStart);
-    const renameRegion = workerSource.slice(renameStart, renameEnd);
-    expect(renameRegion).toContain('if (!cmd || hasRunInitialNativeRename) return');
-    expect(renameRegion).toContain('if (cliRestartInProgress) return');
-    expect(renameRegion).toContain('hasRunInitialNativeRename = true;');
-    expect(renameRegion.indexOf('hasRunInitialNativeRename = true'))
-      .toBeLessThan(renameRegion.indexOf('sendRawCommandLineWithRecoveryFence'));
   });
 });

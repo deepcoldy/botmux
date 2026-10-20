@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { FixtureTape, SseEvent } from './types.js';
-import { extractMarker, extractMarkerFromMessages } from './marker-extractor.js';
+import { extractMarker } from './marker-extractor.js';
 
 export class TapeRecorder {
   private fixturesDir: string;

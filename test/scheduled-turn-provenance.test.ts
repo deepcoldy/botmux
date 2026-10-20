@@ -336,6 +336,7 @@ describe('trustedCallerForScheduledTask', () => {
       requestUserOpenId: 'ou_owner',
       requestUserUnionId: 'on_owner',
       requestLarkAppId: 'cli_creator',
+      senderType: 'user',
       source: 'schedule_creator',
       taskId: TASK_ID,
     });

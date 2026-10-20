@@ -48,31 +48,16 @@ describe('dashboard sidebar nav grouping', () => {
     return ids;
   };
 
-  it('keeps the customization tab in the sidebar menu', () => {
-    // 直接钉住本次回归：customization 必须出现在某个分组里。
-    expect(groupedIds()).toContain('customization');
-  });
-
-  it('assigns every NAV_ITEMS entry to a NAV_GROUPS section', () => {
-    const grouped = new Set(groupedIds());
-    const orphans = navItemIds().filter(
-      id => !grouped.has(id) && !INTENTIONALLY_UNGROUPED.has(id),
-    );
-    expect(orphans, `nav items missing from the sidebar menu: ${orphans.join(', ')}`).toEqual([]);
-  });
-
-  it('references only real NAV_ITEMS ids from NAV_GROUPS', () => {
+  // 源码结构护栏(K4)：NAV_ITEMS 与 NAV_GROUPS 是 app.tsx 的模块私有常量，app.tsx 一经 import
+  // 就有 DOM 副作用，无法在单测里拿到真值比较，只能解析源码做集合差集；守的不变量是「两份
+  // 清单互相一致」——漏进分组的项会静默从侧边栏消失（a69e5cb38b 补回 customization tab）。
+  it('keeps NAV_ITEMS and NAV_GROUPS in sync so no nav item silently drops out of the sidebar', () => {
     const ids = new Set(navItemIds());
-    const ghosts = groupedIds().filter(id => !ids.has(id));
+    const grouped = new Set(groupedIds());
+    expect(ids.size, 'NAV_ITEMS anchor parsed no ids').toBeGreaterThan(0);
+    const orphans = [...ids].filter(id => !grouped.has(id) && !INTENTIONALLY_UNGROUPED.has(id));
+    expect(orphans, `nav items missing from the sidebar menu: ${orphans.join(', ')}`).toEqual([]);
+    const ghosts = [...grouped].filter(id => !ids.has(id));
     expect(ghosts, `NAV_GROUPS references unknown ids: ${ghosts.join(', ')}`).toEqual([]);
-  });
-
-  it('keeps message-listener styles within the workbench radius contract', () => {
-    const style = readFileSync(
-      fileURLToPath(new URL('../src/dashboard/web/style.css', import.meta.url)),
-      'utf8',
-    );
-    const listenerStyles = style.slice(style.indexOf('.message-listener-page'));
-    expect(listenerStyles).not.toContain('var(--radius-xl)');
   });
 });

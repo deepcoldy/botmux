@@ -1051,6 +1051,179 @@ describe('HerdrBackend web terminal sizing', () => {
   });
 });
 
+// ─── Adopted pane grid ─────────────────────────────────────────────────────
+
+describe('HerdrBackend adopted pane grid', () => {
+  const PANE = 'w9:p3W';
+
+  /** Route herdr + the PTY probe (`ps -o tty=` / `stty size`). */
+  function setAdoptResponses(state: { sttySize: string | null; psTty?: string }) {
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      const argv = args as string[];
+      if (cmd === 'ps') return `${state.psTty ?? 'pts/263'}\n` as any;
+      if (cmd === 'stty') {
+        if (state.sttySize === null) throw new Error('stty failed');
+        return `${state.sttySize}\n` as any;
+      }
+      if (cmd !== 'herdr') return '' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('agent') && argv.includes('list')) {
+        return JSON.stringify({ result: { agents: [{ agent: 'claude', pane_id: PANE }] } }) as any;
+      }
+      if (argv.includes('process-info')) {
+        return JSON.stringify({ result: { process_info: { pane_id: PANE, shell_pid: 4242 } } }) as any;
+      }
+      if (argv.includes('read')) return PANE_READ_REPLY('adopted screen') as any;
+      return '' as any;
+    }) as any);
+  }
+
+  function spawnAdopted(): HerdrBackend {
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: PANE, paneId: PANE },
+    });
+    // Discovery's guess; the user's pane is actually 213x58.
+    be.spawn('', [], { cwd: '/work', cols: 200, rows: 50, env: {} });
+    return be;
+  }
+
+  function execCount(cmd: string): number {
+    return mockedExecFileSync.mock.calls.filter(call => call[0] === cmd).length;
+  }
+
+  it('reports the pane PTY grid and ignores browser resizes', () => {
+    setAdoptResponses({ sttySize: '58 213' });
+    const be = spawnAdopted();
+
+    // The web terminal's resize handler forwards the browser grid here.
+    be.resize(90, 30);
+    expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+    expect(herdrCall('pane', 'process-info', '--pane', PANE)).toBeDefined();
+    expect(findCall(args => args[0] === '-o' && args[1] === 'tty=' && args.at(-1) === '4242')).toBeDefined();
+
+    // Screenshot capture reads exactly the pane's visible rows.
+    be.captureViewport();
+    const visibleRead = herdrCall('agent', 'read', '--source', 'visible');
+    expect(visibleRead![visibleRead!.indexOf('--lines') + 1]).toBe('58');
+    be.kill();
+  });
+
+  it('caches the grid briefly, then follows a resized pane without re-resolving the device', () => {
+    const state = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const be = spawnAdopted();
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      const sttyCalls = execCount('stty');
+      const psCalls = execCount('ps');
+
+      state.sttySize = '40 150';
+      nowSpy.mockReturnValue(1_001_000);
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      expect(execCount('stty')).toBe(sttyCalls);
+
+      nowSpy.mockReturnValue(1_002_500);
+      expect(be.getPaneSize()).toEqual({ cols: 150, rows: 40 });
+      expect(execCount('ps')).toBe(psCalls);
+      be.kill();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps the last known grid when a probe fails and re-resolves the device next time', () => {
+    const state: { sttySize: string | null } = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const be = spawnAdopted();
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      const psCalls = execCount('ps');
+
+      state.sttySize = null;
+      nowSpy.mockReturnValue(1_003_000);
+      expect(be.getPaneSize()).toEqual({ cols: 213, rows: 58 });
+      expect(execCount('ps')).toBe(psCalls + 1);
+      be.kill();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('re-emits the unchanged frame once a poll sees the pane grid change', () => {
+    const state = { sttySize: '58 213' };
+    setAdoptResponses(state);
+    vi.useFakeTimers();
+    const be = spawnAdopted();
+    const snapshots: string[] = [];
+    const deltas: string[] = [];
+    const grids: Array<{ cols: number; rows: number }> = [];
+    be.onSnapshot(frame => snapshots.push(frame));
+    be.onData(delta => deltas.push(delta));
+    be.onPaneGridChange(grid => grids.push(grid));
+
+    vi.advanceTimersByTime(6_000);
+    expect(snapshots).toEqual([]);
+    expect(grids).toEqual([]);
+
+    // The user resizes the pane; its text stays identical.
+    state.sttySize = '40 150';
+    vi.advanceTimersByTime(6_000);
+    expect(grids).toEqual([{ cols: 150, rows: 40 }]);
+    expect(snapshots).toEqual(['adopted screen']);
+    expect(deltas).toEqual([]);
+    expect(be.getPaneSize()).toEqual({ cols: 150, rows: 40 });
+
+    vi.advanceTimersByTime(6_000);
+    expect(snapshots).toHaveLength(1);
+    expect(grids).toHaveLength(1);
+    be.kill();
+  });
+
+  it('treats a first successful probe after a fallback as a grid change', () => {
+    // Viewers connected while the probe failed were pinned to the spawn grid.
+    const state: { sttySize: string | null } = { sttySize: null };
+    setAdoptResponses(state);
+    vi.useFakeTimers();
+    const be = spawnAdopted();
+    const snapshots: string[] = [];
+    const grids: Array<{ cols: number; rows: number }> = [];
+    be.onSnapshot(frame => snapshots.push(frame));
+    be.onPaneGridChange(grid => grids.push(grid));
+    expect(be.getPaneSize()).toEqual({ cols: 200, rows: 50 });
+
+    state.sttySize = '58 213';
+    vi.advanceTimersByTime(6_000);
+    expect(grids).toEqual([{ cols: 213, rows: 58 }]);
+    expect(snapshots).toEqual(['adopted screen']);
+    be.kill();
+  });
+
+  it('falls back to the spawn grid when the pane PTY was never readable', () => {
+    setAdoptResponses({ sttySize: null, psTty: '?' });
+    const be = spawnAdopted();
+    be.resize(90, 30);
+    expect(be.getPaneSize()).toEqual({ cols: 200, rows: 50 });
+    expect(execCount('stty')).toBe(0);
+    be.kill();
+  });
+
+  it('leaves a managed pane sized by its web terminal grid', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('pane-managed') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    be.resize(120, 36);
+    expect(be.getPaneSize()).toEqual({ cols: 120, rows: 36 });
+    expect(herdrCall('process-info')).toBeUndefined();
+    be.kill();
+  });
+});
+
 // ─── Env propagation ───────────────────────────────────────────────────────
 
 describe('HerdrBackend env propagation', () => {

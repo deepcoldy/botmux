@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildGrantCard, buildGrantResultCard, buildGrantNotifyCard, buildGrantRequesterNoticeCard, buildQuotaExhaustedCard } from '../src/im/lark/card-builder.js';
+import { buildGrantCard, buildGrantResultCard, buildGrantRequesterNoticeCard, buildQuotaExhaustedCard } from '../src/im/lark/card-builder.js';
 import { normalizeGrantQuotaOption } from '../src/services/grant-policy.js';
 
 function deepFind(node: any, predicate: (value: any) => boolean): any[] {
@@ -117,30 +117,9 @@ describe('buildGrantCard', () => {
     expect(normalizeGrantQuotaOption(quota.default_value)).toBe(1000);
   });
 
-  it('buildGrantNotifyCard @-mentions every granted target (legacy string[] = humans)', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', ['ou_a', 'ou_b'], 'zh'));
-    const flat = JSON.stringify(card);
-    expect(flat).toContain('<at id=ou_a></at>');
-    expect(flat).toContain('<at id=ou_b></at>');
-  });
-
-  // 混合规则：bot grantee 有名字 → 纯文本（不 <at>，避免唤醒对方 bot 的 daemon 误拉空会话）；
-  // 真人 grantee → @ 点名（真人被 @ 不会自动开会话）。
-  it('buildGrantNotifyCard renders known-name bot grantees as PLAIN name (no <at>), humans as @', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', [
-      { openId: 'ou_human', name: '张三', isBot: false },
-      { openId: 'ou_codex', name: 'Codex', isBot: true },
-    ], 'zh'));
-    const flat = JSON.stringify(card);
-    expect(flat).toContain('<at id=ou_human></at>');   // 真人 → @
-    expect(flat).not.toContain('<at id=ou_codex');     // 有名字的 bot → 无 <at>
-    expect(flat).toContain('Codex');                   // 有名字的 bot → 纯文本名字
-  });
-
   // 名字缺失才退回 @ 兜底：飞书据 open_id 展示身份（远比裸 open_id 可读），代价=可能偶尔一次空会话（可接受）。
-  it('buildGrantNotifyCard bot grantee WITHOUT name falls back to @mention (no bare open_id)', () => {
-    const card = JSON.parse(buildGrantNotifyCard('chat', [{ openId: 'ou_codex', isBot: true }], 'zh'));
-    const flat = JSON.stringify(card);
+  it('buildGrantResultCard bot grantee WITHOUT name falls back to @mention (no bare open_id)', () => {
+    const flat = buildGrantResultCard('chat', 'zh', undefined, undefined, [{ openId: 'ou_codex', isBot: true }]);
     expect(flat).toContain('<at id=ou_codex></at>');   // 无名字 → @ 兜底
   });
 

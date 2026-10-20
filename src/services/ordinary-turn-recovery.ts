@@ -119,11 +119,17 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   schedule: (delayMs: number, run: () => void) => TTimer;
   cancel: (timer: TTimer) => void;
   persist: (state: OrdinaryTurnRecoveryState) => void;
+  /** Keep a fail-closed process-local fence when an admitted user action could
+   * not be saved. Persistence must not resurrect the superseded recovery. */
+  retain?: (state: OrdinaryTurnRecoveryState) => void;
   /** Complete asynchronous, turn-bound setup before the continuation can be
    * enqueued. The coordinator re-checks ownership after this await. */
   prepare?: (dispatch: OrdinaryTurnRecoveryDispatch) => void | Promise<void>;
   enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => boolean;
   warn: (state: OrdinaryTurnRecoveryState) => void;
+  /** Async dispatch failures do not pass through the host's timer try/catch.
+   * Report them while retaining the persisted handoff fence (never replay). */
+  onError?: (error: unknown) => void;
   /** Identity for the next continuation of `logicalTurnId`. Return undefined
    *  to keep the default `bmx-recovery-<random>` id. The daemon uses this to
    *  keep a scheduled turn's `schedule:<taskId>:<uuid>` provenance on its
@@ -132,6 +138,14 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   now?: () => number;
   randomId?: () => string;
   backoffMs?: readonly number[];
+  /** A narrow CLI may continue only these explicit failure codes. Other
+   * terminals settle bookkeeping silently and keep their normal UI path. */
+  recoverableErrorCodes?: readonly string[];
+  /** Codex newer input supersedes the old recovery even during execution. */
+  supersedeOnUserInput?: boolean;
+  /** A newer user action may have failed to persist before the old process
+   * exited. Without durable proof of ownership, do not rearm its backoff. */
+  resumeRecoveryOnRestore?: boolean;
 }
 
 export interface OrdinaryTurnRecoverySession {
@@ -144,6 +158,7 @@ export interface OrdinaryTurnRecoverySession {
 type AttachedRecovery = {
   session: OrdinaryTurnRecoverySession;
   coordinator: OrdinaryTurnRecoveryCoordinator<any>;
+  cancelActive: boolean;
   dispose: () => void;
 };
 
@@ -154,6 +169,7 @@ const attachedRecoveries = new Map<string, AttachedRecovery>();
 export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   private state: OrdinaryTurnRecoveryState | undefined;
   private timer: TTimer | undefined;
+  private restoredRunningWithoutRecoveryAuthority = false;
   private readonly now: () => number;
   private readonly randomId: () => string;
   private readonly backoffMs: readonly number[];
@@ -167,6 +183,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   restore(state: OrdinaryTurnRecoveryState): void {
     this.cancelTimer();
     this.state = { ...state };
+    // Observe an already admitted execution, including its successful result,
+    // but the old durable row cannot authorise another continuation after
+    // cancellation/new-input persistence may have failed in the old process.
+    this.restoredRunningWithoutRecoveryAuthority = state.status === 'running'
+      && this.deps.resumeRecoveryOnRestore === false;
     if (this.state.status === 'backoff') this.armBackoff();
   }
 
@@ -177,7 +198,8 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     // terminal has no recovery consumer. Once the current turn has actually
     // entered backoff (or reached a terminal state), a fresh admitted user turn
     // may replace it as before.
-    if (this.state?.status === 'running' || this.state?.status === 'dispatching') {
+    if (!this.deps.supersedeOnUserInput
+      && (this.state?.status === 'running' || this.state?.status === 'dispatching')) {
       // Remember the successor without disturbing the live owner. A persist
       // failure here degrades to the old behaviour (successor not tracked).
       const live = this.state;
@@ -199,14 +221,24 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     const wasBackoff = this.state?.status === 'backoff';
     this.cancelTimer();
     try {
-      return this.commit({
+      const begun = this.commit({
         logicalTurnId,
         currentTurnId: logicalTurnId,
         continuationsStarted: 0,
         status: 'running',
         ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
       });
+      this.restoredRunningWithoutRecoveryAuthority = false;
+      return begun;
     } catch (err) {
+      if (this.deps.supersedeOnUserInput) {
+        this.retain({
+          logicalTurnId, currentTurnId: logicalTurnId, continuationsStarted: 0,
+          status: 'cancelled', cancelledByTurnId: logicalTurnId,
+          lastErrorCode: 'recovery_persist_failed',
+        });
+        throw err;
+      }
       if (wasBackoff) this.armBackoff();
       throw err;
     }
@@ -256,8 +288,18 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         ...(current.silentLogicalTurnIds ? { silentLogicalTurnIds: current.silentLogicalTurnIds } : {}),
       }, rest));
     }
+    if (this.deps.recoverableErrorCodes
+      && (terminal.status !== 'failed'
+        || !this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? ''))) {
+      return this.commit({ ...current, status: 'cancelled', nextAttemptAt: undefined });
+    }
     if (terminal.errorCode === 'provider_rate_limited') return current;
-    if (terminal.status !== 'failed' || terminal.retryable !== true) {
+    if (this.restoredRunningWithoutRecoveryAuthority) {
+      return this.requireAttention(current, 'recovery_restart_unverified');
+    }
+    if (terminal.status !== 'failed'
+      || terminal.retryable === false
+      || (!this.deps.recoverableErrorCodes && terminal.retryable !== true)) {
       const next = {
         ...current,
         status: 'attention_required' as const,
@@ -329,6 +371,16 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         cancelledByTurnId: turnId,
       });
     } catch (err) {
+      if (this.deps.supersedeOnUserInput) {
+        // The stop/new input is real even if its storage outcome is unknown.
+        // Retain the cancellation locally and still let the host send Ctrl+C.
+        const cancelled = {
+          ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
+          cancelledByTurnId: turnId, lastErrorCode: 'recovery_persist_failed',
+        };
+        this.retain(cancelled);
+        return cancelled;
+      }
       if (wasBackoff) this.armBackoff();
       throw err;
     }
@@ -396,7 +448,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       try {
         const preparation = this.deps.prepare?.(dispatch);
         if (preparation && typeof (preparation as Promise<void>).then === 'function') {
-          void Promise.resolve(preparation).then(finish, failPreparation);
+          void Promise.resolve(preparation).then(finish, failPreparation).catch(error => {
+            // The input may already have been accepted. Keep the exact durable
+            // dispatching identity; the host stops recovery and raises attention.
+            try { this.deps.onError?.(error); } catch { /* reporting must not reject */ }
+          });
         } else {
           finish();
         }
@@ -430,6 +486,11 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     return next;
   }
 
+  private retain(state: OrdinaryTurnRecoveryState): void {
+    this.state = pruneSilentLogicalTurnIds({ ...state });
+    this.deps.retain?.(this.state);
+  }
+
   private cancelTimer(): void {
     if (this.timer !== undefined) this.deps.cancel(this.timer);
     this.timer = undefined;
@@ -437,6 +498,28 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
 
   dispose(): void {
     this.cancelTimer();
+  }
+
+  handlesTerminal(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
+    if (!this.deps.recoverableErrorCodes) return true;
+    // RPC can report the terminal before its rollout fallback appears. Keep
+    // owning that same failure during backoff/exhaustion so the late diagnostic
+    // cannot duplicate the coordinator's notice. New input/cancellation fences
+    // the old identity out through the registry below.
+    // A dispatched continuation proves the logical turn's capacity failure
+    // was already consumed. Its delayed rollout diagnostic remains obsolete
+    // even after successful recovery; a cancelled recovery keeps normal UI.
+    const recoveredPredecessor = this.handlesRecoveredPredecessor(terminal, current);
+    return current.status !== 'cancelled'
+      && (current.status !== 'completed' || recoveredPredecessor)
+      && terminal.status === 'failed'
+      && this.deps.recoverableErrorCodes.includes(terminal.errorCode ?? '');
+  }
+
+  handlesRecoveredPredecessor(terminal: OrdinaryTurnRecoveryTerminal, current: OrdinaryTurnRecoveryState): boolean {
+    return terminal.status === 'failed'
+      && this.deps.recoverableErrorCodes?.includes(terminal.errorCode ?? '') === true
+      && current.continuationsStarted > 0 && terminal.turnId === current.logicalTurnId;
   }
 }
 
@@ -452,6 +535,10 @@ export function attachOrdinaryTurnRecovery<TTimer>(
   let coordinator!: OrdinaryTurnRecoveryCoordinator<TTimer>;
   const wrapped: OrdinaryTurnRecoveryDeps<TTimer> = {
     ...deps,
+    retain: state => {
+      session.ordinaryTurnRecovery = structuredClone(state);
+      deps.retain?.(state);
+    },
     persist: state => {
       const prior = session.ordinaryTurnRecovery;
       session.ordinaryTurnRecovery = structuredClone(state);
@@ -493,15 +580,18 @@ export function attachOrdinaryTurnRecovery<TTimer>(
   attachedRecoveries.set(session.sessionId, {
     session,
     coordinator,
+    cancelActive: deps.supersedeOnUserInput === true,
     dispose: () => coordinator.dispose(),
   });
   if (session.ordinaryTurnRecovery) {
-    if (session.ordinaryTurnRecovery.status === 'dispatching') {
+    if (session.ordinaryTurnRecovery.status === 'dispatching'
+      || (session.ordinaryTurnRecovery.status === 'backoff' && deps.resumeRecoveryOnRestore === false)) {
+      const pendingBackoff = session.ordinaryTurnRecovery.status === 'backoff';
       const wasAlreadyDispatched = session.ordinaryTurnRecovery.warningDispatched === true;
       const interrupted = {
         ...session.ordinaryTurnRecovery,
         status: 'attention_required' as const,
-        lastErrorCode: 'recovery_dispatch_interrupted',
+        lastErrorCode: pendingBackoff ? 'recovery_restart_unverified' : 'recovery_dispatch_interrupted',
         alertSentAt: session.ordinaryTurnRecovery.alertSentAt ?? Date.now(),
         warningDispatched: true,
       };
@@ -541,7 +631,9 @@ export function ordinaryTurnRecoveryHandlesTerminal(
 ): boolean {
   const current = session.ordinaryTurnRecovery;
   if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
+  if (!attachedRecoveries.get(session.sessionId)!.coordinator.handlesTerminal(terminal, current)) return false;
   if (current.currentTurnId === terminal.turnId) return true;
+  if (attachedRecoveries.get(session.sessionId)!.coordinator.handlesRecoveredPredecessor(terminal, current)) return true;
   // A queued type-ahead successor is adopted by onTerminal only while the
   // original owner itself is still running (no continuation dispatched); in any
   // other state its terminal is merely forgotten and the fallback notice must
@@ -572,8 +664,10 @@ export function cancelOrdinaryTurnRecoveryForUserInput(
 ): OrdinaryTurnRecoveryState | undefined {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached || !session.ordinaryTurnRecovery
-    || !['backoff', 'exhausted', 'attention_required']
-      .includes(session.ordinaryTurnRecovery.status)) return session.ordinaryTurnRecovery;
+    || (!['backoff', 'exhausted', 'attention_required'].includes(session.ordinaryTurnRecovery.status)
+      && !(attached.cancelActive && ['running', 'dispatching'].includes(session.ordinaryTurnRecovery.status)))) {
+    return session.ordinaryTurnRecovery;
+  }
   return attached.coordinator.cancelForUserInput(turnId);
 }
 

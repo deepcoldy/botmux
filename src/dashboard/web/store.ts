@@ -180,28 +180,38 @@ async function fetchSchedulesSnapshot(): Promise<SchedulesSnapshot | null> {
   }
 }
 
+// ─── `/events` 的连接寿命 ─────────────────────────────────────────────────────
+//
+// 经中心化平台访问时，浏览器↔平台目前只协商到 HTTP/1.1，浏览器对同一 host 最多并发
+// 6 条连接，而同一台机器的所有标签页共用一个机器子域。每个标签页常驻一条
+// `/events`，开到第 7 个页面，它的 HTML / API 就全在浏览器里排队——表现为「新开的
+// dashboard 连不上，关掉旧页才好」。下面两条规则让一个标签页只在「流确实活着、
+// 确实有人在看」时才占着这条连接。
+
+/**
+ * 服务端每 15s 推一帧 `heartbeat`（dashboard.ts 的 `/events`）。OPEN 状态下连续
+ * 这么久一帧都没有，就是僵尸流：连接还挂着，上游早没了。典型来源是 daemon 重启时
+ * 平台反代没把上游中断传给浏览器——EventSource 自己看不出来，永远不会重连，页面
+ * 停在旧数据上，还白占一条连接。
+ */
+export const SSE_STALE_MS = 45_000;
+const SSE_WATCHDOG_TICK_MS = 5_000;
+/** 标签页在后台待满这么久就关掉 `/events`；回到前台立即重连并重拉快照。 */
+export const SSE_HIDDEN_SUSPEND_MS = 60_000;
+/** `EventSource.OPEN`。不读静态常量，测试替身不必实现它。 */
+const EVENT_SOURCE_OPEN = 1;
+
 export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   const canReadSchedules = options.canReadSchedules ?? (() => true);
   // Establish SSE before fetching snapshots, then buffer events while each
   // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
   let snapshotReady = false;
-  const es = new EventSource('/events');
   const types = [
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
-    'schedule.fired', 'schedule.timezone', 'bots.changed', 'heartbeat',
+    'schedule.fired', 'schedule.timezone', 'bots.changed', 'bots.roster', 'heartbeat',
   ];
-  for (const type of types) {
-    es.addEventListener(type, e => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data);
-        const body = data.body ?? data;
-        if (snapshotReady) store.applySse(type, body);
-        else buffered.push({ type, body });
-      } catch { /* skip malformed */ }
-    });
-  }
 
   let syncInFlight: Promise<void> | null = null;
   let requestedReconcile = 0;
@@ -240,19 +250,153 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
     return syncInFlight;
   };
 
-  es.onerror = () => store.setOnline(false);
-  es.onopen = () => {
-    store.setOnline(true);
-    // Reconcile on EVERY open, first one included. Constructing an EventSource
-    // does not mean the server-side listener exists yet, so a snapshot taken
-    // before this point can miss whatever happened in that window; a reconnect
-    // can additionally miss deletes, which only a fresh snapshot converges.
-    // reconcileSnapshot coalesces, so overlapping calls collapse into one extra
-    // round instead of a fetch per event.
+  // 当前这条流及其活性记录；后台挂起期间为 null。流被替换后，旧流迟到的回调一律按
+  // `live !== stream` 丢弃，免得已关掉的连接再改在线状态、往 store 里写帧。
+  interface LiveStream {
+    source: EventSource;
+    /** 恢复出来的连接（看门狗判死 / 回到前台 / EventSource 原生重试），区别于页面打开时的首连。 */
+    recovery: boolean;
+    opened: boolean;
+    lastFrameAt: number;
+    lastHeartbeat: { ts: number; at: number } | null;
+    /**
+     * 看门狗只守**已证明逐帧实时**的流。判据是 dashboard 自己的相邻两帧心跳：到达间隔
+     * 与服务端时间戳间隔相当，才说明链路在逐帧转发。缓冲型反代要么一帧不给（永不上岗），
+     * 要么攒一批一起放——同一批里相邻心跳到达间隔≈0、时间戳却差 15s，判为非实时并撤岗，
+     * 批次之间的静默就不会被当成僵尸。每条流各自重新证明，不继承上一条的结论：换了一条
+     * 连接，链路行为未必相同。
+     */
+    realtime: boolean;
+  }
+  let live: LiveStream | null = null;
+  // 最近一次得知的 Bot 名册摘要（`bots.roster` / `bots.changed` 带来）；null = 还没收到过。
+  let rosterDigest: string | null = null;
+
+  const deliver = (type: string, body: any): void => {
+    if (snapshotReady) store.applySse(type, body);
+    else buffered.push({ type, body });
+  };
+
+  const onFrame = (stream: LiveStream, type: string, body: any): void => {
+    if (type === 'heartbeat') {
+      // 只看 dashboard 自己的心跳：daemon 的心跳也经 aggregator 转发进来，几条挤在同一刻
+      // 到达很正常，拿它们比节奏会把实时链路误判成「攒批」。
+      const ts = body?.ts;
+      if (body?.source === 'dashboard' && typeof ts === 'number') {
+        const at = Date.now();
+        const prev = stream.lastHeartbeat;
+        if (prev && ts > prev.ts) stream.realtime = (at - prev.at) * 2 >= ts - prev.ts;
+        stream.lastHeartbeat = { ts, at };
+      }
+    } else if (type === 'bots.roster') {
+      // 服务端每次建流先推一份对账摘要（phase: connect）。Bot 名册不在快照里，断线 /
+      // 后台挂起期间漏掉的 `bots.changed` 只能靠比对它补发；没变就不发——Bot 配置页重拉
+      // 会卸掉编辑器、丢掉未保存的草稿。恢复时手里还没有基线（首份摘要没赶在断开前到达），
+      // 就当它变了。连接期间的 live 摘要只同步基线，不触发刷新。
+      const digest = body?.digest;
+      if (typeof digest !== 'string') return;
+      const changed = body?.phase === 'connect'
+        && (rosterDigest === null ? stream.recovery : digest !== rosterDigest);
+      rosterDigest = digest;
+      if (changed) deliver('bots.changed', body);
+      return;
+    } else if (type === 'bots.changed' && typeof body?.digest === 'string') {
+      rosterDigest = body.digest;
+    }
+    deliver(type, body);
+  };
+
+  const connect = (recovery: boolean): void => {
+    const source = new EventSource('/events');
+    const stream: LiveStream = {
+      source, recovery, opened: false, lastFrameAt: Date.now(), lastHeartbeat: null, realtime: false,
+    };
+    live = stream;
+    for (const type of types) {
+      source.addEventListener(type, e => {
+        if (live !== stream) return;
+        stream.lastFrameAt = Date.now();
+        try {
+          const data = JSON.parse((e as MessageEvent).data);
+          onFrame(stream, type, data.body ?? data);
+        } catch { /* skip malformed */ }
+      });
+    }
+    source.onerror = () => {
+      if (live === stream) store.setOnline(false);
+    };
+    source.onopen = () => {
+      if (live !== stream) return;
+      // EventSource 原生重试复用同一个对象、再触发一次 open：这是一次新的 HTTP 响应，
+      // 活性证据得从头来过，不能拿上一次响应的心跳当证明；名册补发也按恢复处理。
+      if (stream.opened) stream.recovery = true;
+      stream.opened = true;
+      stream.realtime = false;
+      stream.lastHeartbeat = null;
+      stream.lastFrameAt = Date.now();
+      store.setOnline(true);
+      // Reconcile on EVERY open, first one included. Constructing an EventSource
+      // does not mean the server-side listener exists yet, so a snapshot taken
+      // before this point can miss whatever happened in that window; a reconnect
+      // can additionally miss deletes, which only a fresh snapshot converges.
+      // reconcileSnapshot coalesces, so overlapping calls collapse into one extra
+      // round instead of a fetch per event.
+      void reconcileSnapshot().catch(() => {
+        // The live stream remains useful; the next open retries the snapshot.
+      });
+    };
+  };
+  const disconnect = (): void => {
+    const stream = live;
+    live = null;
+    stream?.source.close();
+  };
+  // 重新建流（看门狗判死 / 回到前台）。快照不等新流 open：缓冲型反代可以把 open 一直
+  // 压着，挂起或僵尸期间漏掉的变化得马上补拉；open 之后那一轮对齐照旧，兜住订阅建立
+  // 之前的竞态。
+  const reconnect = (): void => {
+    connect(true);
     void reconcileSnapshot().catch(() => {
-      // The live stream remains useful; the next open retries the snapshot.
+      // The next open retries the snapshot.
     });
   };
+
+  connect(false);
+
+  setInterval(() => {
+    const stream = live;
+    if (!stream || !stream.realtime || stream.source.readyState !== EVENT_SOURCE_OPEN) return;
+    if (Date.now() - stream.lastFrameAt < SSE_STALE_MS) return;
+    // close() 会中止那条挂死的请求、把连接还给浏览器。
+    disconnect();
+    store.setOnline(false);
+    reconnect();
+  }, SSE_WATCHDOG_TICK_MS);
+
+  if (typeof document !== 'undefined') {
+    let suspendTimer: ReturnType<typeof setTimeout> | null = null;
+    const onVisibilityChange = (): void => {
+      if (document.hidden) {
+        if (live && !suspendTimer) {
+          suspendTimer = setTimeout(() => {
+            suspendTimer = null;
+            // 挂起是主动的，不翻 online：后台页没人看，回前台立刻重连，翻了
+            // 只会在切回来的那一下闪一次「离线」。重连失败自有 onerror 去翻。
+            if (document.hidden) disconnect();
+          }, SSE_HIDDEN_SUSPEND_MS);
+        }
+        return;
+      }
+      if (suspendTimer) {
+        clearTimeout(suspendTimer);
+        suspendTimer = null;
+      }
+      if (!live) reconnect();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    // 在后台打开的标签页（中键 / 恢复会话）同样要计时。
+    onVisibilityChange();
+  }
 
   // Never gate the first snapshot on `onopen`: a buffering reverse proxy can
   // delay the stream indefinitely, and a board with slightly stale rows beats

@@ -502,7 +502,7 @@ describe('会话群出生：workingDir 绑定没落地必须回退', () => {
 
 /** Dismissal retries must not resurrect the already-closed session before command routing. */
 describe('session-group dismissal ingress', () => {
-  it('keeps same-group resume for ordinary conversation messages', async () => {
+  it('starts a fresh session for ordinary messages after the group session closed (no auto-resume)', async () => {
     registerSessionGroup(BORN_GROUP, { ownerOpenId: OWNER, lastSessionId: 'closed-target' });
     mocks.getSession.mockReturnValue({ sessionId: 'closed-target', status: 'closed', chatId: BORN_GROUP, scope: 'chat' });
     const data = dmEvent('continue this task', 'om_continue');
@@ -513,7 +513,8 @@ describe('session-group dismissal ingress', () => {
       larkAppId: APP, chatId: BORN_GROUP, messageId: 'om_continue',
       chatType: 'group', scope: 'chat', anchor: BORN_GROUP,
     });
-    expect(mocks.resumeSession).toHaveBeenCalledWith('closed-target', activeSessions);
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+    expect(mocks.createSession).toHaveBeenCalled();
     expect(mocks.dismissSessionGroup).not.toHaveBeenCalled();
   });
   it.each([

@@ -20,6 +20,8 @@
   <a href="README.en.md">English</a>
 </p>
 
+https://github.com/user-attachments/assets/2cd97623-6b92-42ea-a9e9-75c6f5434db6
+
 ---
 
 Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**20+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。
@@ -78,7 +80,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 ## 按 Bot 设置零注入
 
-在 Dashboard → 自定义中心 →「按 Bot 设置零注入」勾选一个或多个 bot，批量开启或恢复原配置；支持搜索与全选当前结果，每个 bot 独立保存，失败项会保留勾选供重试。也可在对应 `bots.json` 条目设置 `"promptInjection": "none"`。适合 lead-bot 派活、sub-bot 专注执行的场景。`default` / 删除字段恢复原行为，既有 prompt、角色和技能配置不会被清空。
+在 Dashboard →「Bot 配置」→ 选中 Bot →「高级」→「零注入」打开开关；需要统一管理多个 Bot 时，在「Agent 配置」里开启「零注入」分组，关联的 Bot 会随同步一起切换（此时 Bot 配置页的开关锁定）。也可在对应 `bots.json` 条目设置 `"promptInjection": "none"`。适合 lead-bot 派活、sub-bot 专注执行的场景。`default` / 删除字段恢复原行为，既有 prompt、角色和技能配置不会被清空。当前 CLI、终端后端或沙盒组合不支持时开关置灰并说明原因。
 
 此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
 
@@ -197,3 +199,5 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 <p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
 [建群参数与默认配置](docs/guide/group-creation.md)
+
+编译单文件二进制前须先执行 `bun run build`，生成用于内嵌的 `dist/.runtime-build-id`；编译版不在运行时读取此文件。

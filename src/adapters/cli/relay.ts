@@ -62,5 +62,3 @@ export function createRelayAdapter(pathOverride?: string): CliAdapter {
     modelChoices: undefined,
   }, bin);
 }
-
-export const create = createRelayAdapter;

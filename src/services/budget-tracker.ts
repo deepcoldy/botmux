@@ -21,8 +21,10 @@
  * 升级注意：升级前的 ledger 记录没有 costCny，状态丢失重建时一律计 0——
  * 预算统计从升级后开始累加，不回溯历史花费。
  */
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readJsonFileSoft } from '../utils/json-file.js';
 import { logger } from '../utils/logger.js';
 import { defaultLedgerDir } from './usage-ledger.js';
 
@@ -183,37 +185,35 @@ function loadState(dir: string, larkAppId: string, month: string): BudgetState {
       // Cache hit — still apply lazy rollover on the way out.
       return cached.state.month === month ? cached.state : freshState(month);
     }
-    try {
-      const state = normalizeState(JSON.parse(readFileSync(path, 'utf8')), month);
-      if (state) {
-        stateCache.set(path, { mtimeMs: fileMtime, state });
-        return state;
-      }
-      // Unparseable shape: fall through to fresh. Do NOT cache — the next
-      // successful save overwrites the file.
-    } catch {
-      // Corrupt JSON: same, fall through.
+    // A corrupt or wrongly-shaped state file is quarantined rather than
+    // treated as a zero-spend month: returning a fresh state here used to let
+    // the next save overwrite the file, silently re-opening the budget gate.
+    const parsed = readJsonFileSoft<unknown>(path, {
+      fallback: () => undefined,
+      validate: (v): v is unknown => normalizeState(v, month) !== null,
+      label: 'budget-tracker',
+    });
+    const state = parsed === undefined ? null : normalizeState(parsed, month);
+    if (state) {
+      stateCache.set(path, { mtimeMs: fileMtime, state });
+      return state;
     }
-  } else {
-    // State file missing (or externally deleted): rebuild once from the
-    // current month's ledger so a lost state file doesn't lose the month's
-    // accumulated spend.
-    const rebuilt = rebuildBudgetStateFromLedger(dir, larkAppId, month);
-    if (rebuilt.spentCny > 0) persistState(dir, larkAppId, rebuilt);
-    return rebuilt;
   }
-  return freshState(month);
+  // State file missing, externally deleted, or just quarantined: rebuild once
+  // from the current month's ledger so a lost state file doesn't lose the
+  // month's accumulated spend.
+  const rebuilt = rebuildBudgetStateFromLedger(dir, larkAppId, month);
+  if (rebuilt.spentCny > 0) persistState(dir, larkAppId, rebuilt);
+  return rebuilt;
 }
 
 function persistState(dir: string, larkAppId: string, state: BudgetState): void {
   mkdirSync(dir, { recursive: true });
   const target = statePath(dir, larkAppId);
-  // temp+rename keeps a crash from truncating state; the pid suffix keeps
-  // concurrent daemons from stomping each other's tmp file (same scheme as
-  // the ledger's state-<appId>.json).
-  const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state));
-  renameSync(tmp, target);
+  // atomicWriteFileSync: temp+rename keeps a crash from truncating state, and
+  // its unique tmp name keeps concurrent daemons from stomping each other's
+  // (same scheme as the ledger's state-<appId>.json).
+  atomicWriteFileSync(target, JSON.stringify(state), { followTargetSymlink: false });
   try {
     stateCache.set(target, { mtimeMs: statSync(target).mtimeMs, state });
   } catch { /* mtime refresh is best-effort */ }

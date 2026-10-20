@@ -375,6 +375,73 @@ export async function consumeQuota(
 }
 
 /**
+ * Atomically charge one dispatch launch at most once. The durable receipt and
+ * quota increment share the bots.json RMW lock, closing the crash window
+ * between an irreversible charge and admission-store commit.
+ */
+export async function consumeDispatchLaunchQuotaOnce(
+  input: { larkAppId: string; quotaKey: string; receiptId: string; sourceOpenId: string; grantChatId?: string },
+): Promise<{ allow: boolean }> {
+  const { larkAppId, quotaKey, receiptId, sourceOpenId, grantChatId } = input;
+  const bot = getBot(larkAppId);
+  const chargedAt = new Date().toISOString();
+  const r = await rmwBotEntry<{ allow: boolean; receipts: Record<string, { allow: boolean; chargedAt: string }>; quota?: QuotaRec }>(
+    larkAppId,
+    (entry) => {
+      const receipts = entry.dispatchLaunchQuotaReceipts
+        && typeof entry.dispatchLaunchQuotaReceipts === 'object'
+        && !Array.isArray(entry.dispatchLaunchQuotaReceipts)
+        ? { ...entry.dispatchLaunchQuotaReceipts }
+        : {};
+      const existing = receipts[receiptId];
+      if (existing && typeof existing.allow === 'boolean') {
+        return { write: false, result: { allow: existing.allow, receipts } };
+      }
+      const rec = getQuotaMap(entry)?.[quotaKey];
+      const chatGrantMatches = grantChatId !== undefined
+        && quotaKey === chatQuotaKey(grantChatId, sourceOpenId)
+        && Array.isArray(entry.chatGrants?.[grantChatId])
+        && entry.chatGrants[grantChatId].includes(sourceOpenId);
+      const globalGrantMatches = grantChatId === undefined
+        && quotaKey === globalQuotaKey(sourceOpenId)
+        && Array.isArray(entry.globalGrants)
+        && entry.globalGrants.includes(sourceOpenId);
+      const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
+      let quota: QuotaRec | undefined;
+      if (allow && rec) {
+        quota = { limit: rec.limit, used: rec.used + 1 };
+        entry.quotaState = { ...(getQuotaMap(entry) ?? {}), [quotaKey]: quota };
+        if (quota.used >= quota.limit) {
+          if (quotaKey.startsWith('chat:') && grantChatId && Array.isArray(entry.chatGrants?.[grantChatId])) {
+            entry.chatGrants[grantChatId] = entry.chatGrants[grantChatId].filter((id: string) => id !== sourceOpenId);
+            if (entry.chatGrants[grantChatId].length === 0) delete entry.chatGrants[grantChatId];
+          } else if (quotaKey.startsWith('global:') && Array.isArray(entry.globalGrants)) {
+            entry.globalGrants = entry.globalGrants.filter((id: string) => id !== sourceOpenId);
+          }
+          setQuotaRecord(entry, quotaKey, null);
+          setExpiryRecord(entry, quotaKey, null);
+        }
+      }
+      receipts[receiptId] = { allow, chargedAt };
+      entry.dispatchLaunchQuotaReceipts = receipts;
+      return { write: true, result: { allow, receipts, ...(quota ? { quota } : {}) } };
+    },
+  );
+  if (!r.ok) throw new Error(`dispatch launch quota RMW failed: ${r.reason}`);
+  bot.config.dispatchLaunchQuotaReceipts = r.result.receipts;
+  if (r.result.quota && r.result.quota.used === r.result.quota.limit) {
+    setQuotaRecord(bot.config, quotaKey, null);
+    setExpiryRecord(bot.config, quotaKey, null);
+    if (quotaKey.startsWith('chat:') && grantChatId && bot.config.chatGrants?.[grantChatId]) {
+      bot.config.chatGrants[grantChatId] = bot.config.chatGrants[grantChatId].filter(id => id !== sourceOpenId);
+    } else if (quotaKey.startsWith('global:')) {
+      bot.config.globalGrants = bot.config.globalGrants?.filter(id => id !== sourceOpenId);
+    }
+  } else if (r.result.quota) setQuotaRecord(bot.config, quotaKey, r.result.quota);
+  return { allow: r.result.allow };
+}
+
+/**
  * 整群 talk 授权：把 chatId 加入 allowedChatGroups（"talk-open 的 chat_id 列表"）。
  * 命中后该 chat 任何成员都过 canTalk（见 event-dispatcher.canTalk），不授 canOperate。
  */

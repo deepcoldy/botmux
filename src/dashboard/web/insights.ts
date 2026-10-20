@@ -171,36 +171,6 @@ export function suggestionTitle(s: Pick<SafeInsightSuggestion, 'id' | 'title'> |
   return translatedOrFallback(`insights.suggestion.${s.id}.title`, s.title);
 }
 
-export function suggestionAction(s: Pick<SafeInsightSuggestion, 'id' | 'action'> | Pick<SafeInsightOverviewSuggestion, 'id' | 'action'>): string {
-  return translatedOrFallback(`insights.suggestion.${s.id}.action`, s.action);
-}
-
-export function localizeEvidence(text: string): string {
-  let m = text.match(/^(\d+) failed spans$/);
-  if (m) return t('insights.evidence.failedSpans', { count: m[1] });
-  m = text.match(/^(.+) failed (\d+) times$/);
-  if (m) return t('insights.evidence.toolFailedTimes', { tool: m[1], count: m[2] });
-  if (text === 'multiple tools failed') return t('insights.evidence.multipleToolsFailed');
-  m = text.match(/^(.+) ran for (\d+)s$/);
-  if (m) return t('insights.evidence.toolRanSeconds', { tool: m[1], seconds: m[2] });
-  m = text.match(/^read\/write ratio ([\d.]+)$/);
-  if (m) return t('insights.evidence.readWriteRatio', { ratio: m[1] });
-  m = text.match(/^compactions (\d+)$/);
-  if (m) return t('insights.evidence.compactions', { count: m[1] });
-  m = text.match(/^(\d+) spans analyzed$/);
-  if (m) return t('insights.evidence.spansAnalyzed', { count: m[1] });
-  return text;
-}
-
-export function localizeReason(reason: string): string {
-  return reason
-    .split(/\s*[;；]\s*/)
-    .map(c => c.trim().replace(/[.。]\s*$/, ''))
-    .filter(Boolean)
-    .map(localizeEvidence)
-    .join('；');
-}
-
 export function phaseLabel(phase: string): string {
   const key = `insights.phase.${phase}`;
   const out = t(key);

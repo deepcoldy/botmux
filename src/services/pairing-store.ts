@@ -22,9 +22,11 @@
  * Storage: `{dataDir}/pairings.json` (shared across the web + daemon processes),
  * atomic writes.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 /** Unambiguous alphabet (no 0/O/1/I) for the human-entered code. */
@@ -58,21 +60,17 @@ function filePath(dataDir: string): string {
 }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as FileShape;
-  } catch { /* corrupt — fall through */ }
-  return {};
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  return readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'pairing-store',
+  });
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** Drop expired entries; returns the live map. */

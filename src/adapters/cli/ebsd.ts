@@ -4,7 +4,8 @@ import { join } from 'node:path';
 
 import { createEbsdInputWriter } from './ebsd-input.js';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter } from './types.js';
+import { drainEbsdTranscript, type EbsdTranscriptState } from '../../services/ebsd-transcript.js';
+import type { CliAdapter, StructuredBridgeSpec } from './types.js';
 
 function validateSessionId(sessionId: string): string {
   if (
@@ -46,12 +47,29 @@ export function ebsdBotmuxTranscriptPath(sessionId: string): string | null {
   return candidates[0]?.path ?? null;
 }
 
+/** ebsd isolated-session JSONL, addressed only by the botmux adapter session id. Same
+ *  file-tail shape as OMP but with a versioned custom terminal instead of the
+ *  provisional-stop hold. */
+export const ebsdBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainEbsdTranscript(
+    path,
+    offset,
+    (ctx.state as EbsdTranscriptState | undefined) ?? {},
+  ),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => ebsdBotmuxTranscriptPath(sessionId) ?? undefined,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+};
+
 export function createEbsdAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'ebsd';
   let cachedBin: string | undefined;
   const writeInput = createEbsdInputWriter();
   return {
     id: 'ebsd',
+    bridgeSpec: ebsdBridgeSpec,
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     authPaths: ['~/.ebsd'],
     sandboxReadonlyPaths(env = process.env) {
@@ -97,5 +115,3 @@ export function createEbsdAdapter(pathOverride?: string): CliAdapter {
     altScreen: true,
   };
 }
-
-export const create = createEbsdAdapter;

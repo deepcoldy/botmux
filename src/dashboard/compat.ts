@@ -26,7 +26,6 @@ const DASHBOARD_MODULE_SPECS = {
   insights: { supported: true, route: '#/insights', capabilities: ['insights.read'] },
   schedules: { supported: true, route: '#/schedules', capabilities: ['schedules.read', 'schedules.manage'] },
   whiteboards: { supported: true, route: '#/whiteboards', capabilities: ['whiteboards.read', 'whiteboards.manage'] },
-  office: { supported: true, route: '#/office', capabilities: ['office.read'] },
   bots: { supported: true, route: '#/bot-defaults', capabilities: ['bots.read', 'bots.configure'] },
   skills: { supported: true, route: '#/skills', capabilities: ['skills.read', 'skills.manage'] },
   plugins: { supported: true, route: '#/plugins', capabilities: ['plugins.read', 'plugins.manage'] },

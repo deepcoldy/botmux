@@ -12,7 +12,7 @@
  * import cycle with each other.
  */
 import { getBot } from '../bot-registry.js';
-import { isRemoteBackendId } from './remote-cli-ids.js';
+import { isRemoteBackendId, reconcilePairedBackendId } from './remote-cli-ids.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
@@ -130,13 +130,10 @@ export function reconcileRiffBackendType(
   resolved: BackendType,
   defaultType: BackendType,
 ): BackendType {
-  // A remote CLI dictates its own backend (same name by construction).
-  if (isRemoteBackendId(cliId)) return cliId as BackendType;
+  // A remote CLI dictates its own backend (same name by construction);
   // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
-  if (isRemoteBackendType(resolved)) {
-    return !isRemoteBackendType(defaultType) ? defaultType : 'pty';
-  }
-  return resolved;
+  // 规则本体在无依赖的 remote-cli-ids，Dashboard 判断零注入时复用同一份。
+  return reconcilePairedBackendId(cliId, resolved, defaultType) as BackendType;
 }
 
 /** Resolve the frozen/live/default backend precedence and then enforce the

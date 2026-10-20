@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from '../../core/group-default-models.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { useT } from './react-hooks.js';
-import { DropdownField, ModelPickerField } from './bot-defaults-page.js';
+import { DropdownField, ModelPickerField } from './field-controls.js';
 import { fetchCliOptions, fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption, selectedCliOption } from './bot-defaults.js';
 
 type Props = {
@@ -40,14 +40,14 @@ function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
   }, [props.models, props.cliId]);
   useEffect(() => {
     let stale = false;
-    Promise.all([fetchCliOptions(), fetchDetectedModels(props.cliId)]).then(([catalog, detected]) => {
+    Promise.all([fetchCliOptions(), fetchDetectedModels(props.cliId, props.appId)]).then(([catalog, detected]) => {
       if (stale) return;
       setOptions(mergeModelCandidates(modelSuggestionsForOption(selectedCliOption(catalog.options, props.cliId), catalog), detected?.models ?? null));
       setDetectedCount(detected?.source === 'live' ? detected.models.length : 0);
       setDetecting(false);
     });
     return () => { stale = true; };
-  }, [props.cliId]);
+  }, [props.cliId, props.appId]);
 
   const efforts = reasoningEffortsForCliModel(props.cliId, settings.model || props.botModel);
   function changeModel(model: string) {

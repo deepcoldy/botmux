@@ -81,7 +81,10 @@ const ZERO_PROMPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ZERO_PROM
 
 /** Drivers whose transcript contract exposes every terminal edge needed for a
  *  strong started-turn status gate. Codex has final_answer plus explicit
- *  turn_aborted parsing. Pi's drainPiTranscript closes a turn on
+ *  turn_aborted parsing. TRAE has task_complete (including error) and
+ *  turn_aborted; intermediate assistant messages are not terminal records.
+ *  Keep its caller authority alive through quiet tool/model waits too.
+ *  Pi's drainPiTranscript closes a turn on
  *  stop/length-without-toolcall and on the hard error/aborted edges (verified
  *  against pi 0.84.2: `terminate:true` is still not persisted and the newer
  *  pending/deferred StopReasons never reach the session JSONL), so a started
@@ -103,6 +106,7 @@ const ZERO_PROMPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ZERO_PROM
  *  yet complete enough to let a started turn suppress screen-ready forever. */
 export const STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS = [
   'codex',
+  'traex',
   'pi',
   'oh-my-pi',
   'ebsd',

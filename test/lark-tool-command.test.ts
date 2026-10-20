@@ -54,4 +54,23 @@ describe('lark-cli argv metadata', () => {
     const invocation = parse(['docs', '+fetch', '--keyword', '--', '--', '--as=user']);
     expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--keyword', '--', '--as', 'bot', '--', '--as=user']);
   });
+  it('supports --profile switching to another profile as passthrough', () => {
+    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
+    expect(invocation.passthroughProfile).toBe('cli_other');
+    expect(invocation.args).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
+    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other']);
+  });
+  it('supports --profile with explicit --as user preserved', () => {
+    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']);
+    expect(invocation.passthroughProfile).toBe('cli_other');
+    expect(invocation.mode).toBe('user');
+    expect(invocation.sawAs).toBe(true);
+    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as', 'user']);
+  });
+  it('strips --profile when it matches the bound appId and uses managed bot identity', () => {
+    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_current']);
+    expect(invocation.passthroughProfile).toBeUndefined();
+    expect(invocation.args).toEqual(['docs', '+fetch', '--doc', 'doc-1']);
+    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--as', 'bot']);
+  });
 });

@@ -5,15 +5,11 @@
  * closes a turn only on `ebsd.botmux.turn_completed.v1`, which ebsd writes
  * after its hidden diagnosis finalizer has completed.
  */
-import {
-  closeSync,
-  existsSync,
-  openSync,
-  readSync,
-  statSync,
-} from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import { iterateJsonlLines, readJsonlWindow } from './jsonl-cursor.js';
+import { entryTimestampMs as timestampMs, messageContentText as messageText } from './pi-family-content.js';
 
 const EBSD_TERMINAL_CUSTOM_TYPE = 'ebsd.botmux.turn_completed.v1';
 
@@ -27,31 +23,6 @@ export interface EbsdDrainResult {
   newOffset: number;
   pendingTail: string;
   state: EbsdTranscriptState;
-}
-
-function messageText(content: unknown): string {
-  if (typeof content === 'string') return content.trim();
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const item of content) {
-    if (!item || typeof item !== 'object') continue;
-    if ((item as { type?: unknown }).type === 'text'
-      && typeof (item as { text?: unknown }).text === 'string') {
-      parts.push((item as { text: string }).text);
-    }
-  }
-  return parts.join('\n').trim();
-}
-
-function timestampMs(entry: Record<string, unknown>, message?: Record<string, unknown>): number {
-  if (typeof entry.timestamp === 'string') {
-    const parsed = Date.parse(entry.timestamp);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (typeof message?.timestamp === 'number' && Number.isFinite(message.timestamp)) {
-    return message.timestamp;
-  }
-  return Date.now();
 }
 
 function eventUuid(path: string, generation: number, lineStart: number): string {
@@ -125,34 +96,9 @@ export function drainEbsdTranscript(
   const state: EbsdTranscriptState = { generation, fileId };
   const start = reset ? 0 : fromOffset;
   const events: CodexBridgeEvent[] = [];
-  let completeText = '';
-  let pendingTail = '';
-  let newOffset = start;
-  if (size > start) {
-    const length = size - start;
-    const buffer = Buffer.alloc(length);
-    const fd = openSync(path, 'r');
-    try {
-      readSync(fd, buffer, 0, length, start);
-    } finally {
-      closeSync(fd);
-    }
-    const text = buffer.toString('utf8');
-    const lastNewline = text.lastIndexOf('\n');
-    completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : '';
-    pendingTail = lastNewline >= 0 ? text.slice(lastNewline + 1) : text;
-    newOffset = start + Buffer.byteLength(completeText, 'utf8');
-  }
+  const { completeText, pendingTail, newOffset } = readJsonlWindow(path, start, size);
 
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;
-      continue;
-    }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let entry: Record<string, unknown>;
     try {
       const parsed = JSON.parse(line);

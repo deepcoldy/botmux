@@ -22,9 +22,10 @@
  * file, so there is no cross-bot lost-update window. Same rationale as the
  * per-bot team-role files in role-resolver.ts.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 /** A capability label longer than this is almost certainly a full role, not a tag. */
 const MAX_CAPABILITY_CHARS = 120;
@@ -53,29 +54,24 @@ function profilePath(dataDir: string, larkAppId: string): string {
 }
 
 function readProfile(dataDir: string, larkAppId: string): BotProfile | null {
-  const fp = profilePath(dataDir, larkAppId);
-  if (!existsSync(fp)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const p = parsed as BotProfile;
-      // Normalize specialties on read so a hand-edited / legacy file can never
-      // leak a dirty value (non-array, dupes, over-long) to the platform. Only
-      // materialize the field when the file actually had one.
-      if ('specialties' in p) p.specialties = normalizeSpecialties(p.specialties);
-      return p;
-    }
-  } catch { /* corrupt — treat as absent */ }
-  return null;
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 set* 覆盖），视同不存在，见 utils/json-file.ts。
+  const p = readJsonFileSoft<BotProfile | null>(profilePath(dataDir, larkAppId), {
+    fallback: () => null,
+    validate: (v): v is BotProfile => isJsonObject(v),
+    label: 'bot-profile-store',
+  });
+  if (!p) return null;
+  // Normalize specialties on read so a hand-edited / legacy file can never
+  // leak a dirty value (non-array, dupes, over-long) to the platform. Only
+  // materialize the field when the file actually had one.
+  if ('specialties' in p) p.specialties = normalizeSpecialties(p.specialties);
+  return p;
 }
 
 function writeProfileAtomic(dataDir: string, larkAppId: string, profile: BotProfile): void {
   const dir = profilesDir(dataDir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const fp = profilePath(dataDir, larkAppId);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(profile, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(profilePath(dataDir, larkAppId), JSON.stringify(profile, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** Full profile for a bot, or null if none recorded. */

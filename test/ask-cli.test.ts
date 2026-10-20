@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -65,9 +66,8 @@ describe('botmux ask — CLI boundary', () => {
     tempDirs.push(dataDir);
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body);
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
     });
@@ -103,8 +103,8 @@ describe('botmux ask — CLI boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'ask-sigint-')); tempDirs.push(dataDir);
     let child: ChildProcessWithoutNullStreams;
     const server = createServer(async (req, res) => {
-      let body = ''; for await (const chunk of req) body += chunk;
-      const request = JSON.parse(body);
+      const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (!request) { res.writeHead(400).end(); return; }
       if (!request.acknowledge) child.kill('SIGINT');
       setTimeout(() => {
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -130,8 +130,9 @@ describe('botmux ask — CLI boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'ask-reconnect-')); tempDirs.push(dataDir);
     const requests: Record<string, unknown>[] = [];
     const server = createServer(async (req, res) => {
-      let body = ''; for await (const chunk of req) body += chunk;
-      requests.push(JSON.parse(body));
+      const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (!parsed) { res.writeHead(400).end(); return; }
+      requests.push(parsed);
       if (requests.length === 1) { req.socket.destroy(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'human', comment: null, timedOut: false }));
@@ -155,9 +156,9 @@ describe('botmux ask — CLI boundary', () => {
     let requestBody: Record<string, unknown> | undefined;
 
     const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
+      const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (!parsed) { res.writeHead(400).end(); return; }
+      requestBody = parsed;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered',
@@ -207,9 +208,7 @@ describe('botmux ask — CLI boundary', () => {
     tempDirs.push(dataDir);
 
     const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      JSON.parse(body);
+      if (await readRequestBodyJson(req, { strict: true }) === undefined) { res.writeHead(400).end(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered',
@@ -286,6 +285,52 @@ describe('botmux ask — CLI boundary', () => {
       });
     }
   });
+
+  it('--json 完整输出超出 pipe 容量的文字作答', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
+    tempDirs.push(dataDir);
+    const comment = 'x'.repeat(500_000);
+
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        kind: 'answered',
+        answers: [[]],
+        by: 'ou_test',
+        comment,
+        timedOut: false,
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(
+        join(registryDir, 'cli_test.json'),
+        JSON.stringify({ larkAppId: 'cli_test', ipcPort: port, lastHeartbeat: Date.now() }),
+      );
+
+      const result = await runAsk(dataDir, [
+        'ask', 'buttons', '--json', '--options', 'yes,no', '请作答',
+      ]);
+      expect(result.status).toBe(0);
+      expect(Buffer.byteLength(result.stdout)).toBeGreaterThan(400_000);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        selected: null,
+        answers: [[]],
+        by: 'ou_test',
+        comment,
+        timedOut: false,
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => err ? reject(err) : resolve());
+      });
+    }
+  }, 30_000);
 });
 
 describe('question file CLI', () => {
@@ -298,7 +343,9 @@ describe('question file CLI', () => {
     const file = join(dataDir, 'round.json'); writeFileSync(file, JSON.stringify(questions));
     let body: any;
     const server = createServer(async (req, res) => {
-      let raw = ''; for await (const chunk of req) raw += chunk; body = JSON.parse(raw);
+      const parsed = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (!parsed) { res.writeHead(400).end(); return; }
+      body = parsed;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ kind: 'answered', answers: [['b'], ['x']], by: 'ou_test', comment: null, timedOut: false }));
     });

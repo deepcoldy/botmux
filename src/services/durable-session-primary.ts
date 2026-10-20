@@ -55,6 +55,7 @@ export interface DurablePrimarySessionControl {
   sessionId: string;
   operatorOpenId: string;
   cardMessageId: string;
+  source?: 'lark-command' | 'trusted-host';
   result: DurableJson;
 }
 
@@ -70,6 +71,15 @@ export type DurableLarkSessionAdmissionResult =
 export type DurableLarkSessionControlCommitResult =
   | {
       kind: 'committed';
+      lease: SessionLease;
+      record: DurableSessionRecord;
+    }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
+export type DurableLarkActiveSessionClaimResult =
+  | {
+      kind: 'claimed';
+      session: Session;
       lease: SessionLease;
       record: DurableSessionRecord;
     }
@@ -156,6 +166,9 @@ function parseControl(
     sessionId: boundedText(raw.sessionId, 'durable control sessionId', 256),
     operatorOpenId: boundedText(raw.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(raw.cardMessageId, 'durable control cardMessageId', 256),
+    ...(raw.source === 'lark-command' || raw.source === 'trusted-host'
+      ? { source: raw.source }
+      : {}),
     result: JSON.parse(JSON.stringify(result)) as DurableJson,
   };
 }
@@ -263,6 +276,31 @@ export function parseDurablePrimarySessionRecord(record: DurableSessionRecord): 
   return { session, admission, admissions, controls };
 }
 
+/**
+ * Project a storage page for read-only management views. A single malformed
+ * legacy/corrupt primary row must remain quarantined instead of taking the
+ * whole Dashboard offline; mutation paths still use the strict parser above
+ * and therefore continue to fail closed for that row.
+ */
+export function listValidDurablePrimarySessions(
+  records: readonly DurableSessionRecord[],
+  larkAppId: string,
+  onInvalid?: (record: DurableSessionRecord, error: unknown) => void,
+): Session[] {
+  const sessions: Session[] = [];
+  for (const record of records) {
+    const value = object(record.value);
+    if (value?.type !== 'botmux.session.primary') continue;
+    try {
+      const session = parseDurablePrimarySessionRecord(record).session;
+      if (session.larkAppId === larkAppId) sessions.push(session);
+    } catch (error) {
+      onInvalid?.(record, error);
+    }
+  }
+  return sessions;
+}
+
 function mergePrimaryProjection(
   current: DurableSessionRecord | undefined,
   next: DurablePrimarySessionProjection,
@@ -276,8 +314,21 @@ function mergePrimaryProjection(
     // envelopes remain fail-closed instead of being silently replaced.
     if (currentValue?.type === 'botmux.session.primary') {
       const parsed = parseDurablePrimarySessionRecord(current);
-      previousAdmissions = parsed.admissions;
-      previousControls = parsed.controls;
+      const nextSession = object(next.session) as unknown as Session | undefined;
+      if (!nextSession) {
+        throw new Error(`durable primary Session ${current.sessionKey} has an invalid next snapshot`);
+      }
+      if (parsed.session.sessionId === nextSession.sessionId) {
+        previousAdmissions = parsed.admissions;
+        previousControls = parsed.controls;
+      } else if (parsed.session.status === 'active') {
+        throw new Error(
+          `durable primary active canonical Session ${current.sessionKey} cannot be replaced`,
+        );
+      }
+      // A deliberately closed Session may be followed by a brand-new logical
+      // Session at the same conversation anchor. Its admission/control history
+      // belongs to the retired sessionId and must not leak into the successor.
     }
   }
   const admissions = [
@@ -313,6 +364,9 @@ export async function commitDurableLarkSessionControl(input: {
     sessionId: input.control.sessionId,
     operatorOpenId: boundedText(input.control.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(input.control.cardMessageId, 'durable control cardMessageId', 256),
+    ...(input.control.source === 'lark-command' || input.control.source === 'trusted-host'
+      ? { source: input.control.source }
+      : {}),
     result: JSON.parse(JSON.stringify(input.result)) as DurableJson,
   };
   const sessionValue = cloneSession(input.session);
@@ -370,6 +424,59 @@ export async function admitDurableLarkSession(input: {
       lease: written.lease,
       record: written.record,
     }),
+    lease: written.lease,
+    record: written.record,
+  };
+}
+
+/**
+ * Acquire the canonical Session lease without changing its logical snapshot.
+ *
+ * Active-session materialization is a local side effect, so a replacement
+ * replica must cross the distributed fencing boundary first.  The exact
+ * same-value write deliberately advances the canonical revision: it proves
+ * that the caller acquired the current owner epoch and prevents an expired
+ * owner from presenting an old revision as fresh authority.
+ */
+export async function claimDurableLarkActiveSession(input: {
+  facade: DurableSessionFacade;
+  sessionKey: string;
+  expectedSessionId: string;
+  expectedLarkAppId: string;
+}): Promise<DurableLarkActiveSessionClaimResult> {
+  const expectedSessionId = boundedText(
+    input.expectedSessionId,
+    'durable active takeover sessionId',
+    256,
+  );
+  const expectedLarkAppId = boundedText(
+    input.expectedLarkAppId,
+    'durable active takeover larkAppId',
+    256,
+  );
+  const written = await input.facade.writeExactFromCurrent(input.sessionKey, current => {
+    if (!current) throw new Error('durable active takeover canonical Session is missing');
+    const parsed = parseDurablePrimarySessionRecord(current);
+    if (parsed.session.sessionId !== expectedSessionId
+        || parsed.session.larkAppId !== expectedLarkAppId
+        || parsed.session.status !== 'active') {
+      throw new Error('durable active takeover canonical Session changed before claim');
+    }
+    return current.value;
+  });
+  if (written.kind !== 'written' && written.kind !== 'unchanged') return written;
+  if (written.coalescedCount !== 1) {
+    throw new Error('durable active takeover claim was unexpectedly coalesced');
+  }
+  const claimed = parseDurablePrimarySessionRecord(written.record).session;
+  if (claimed.sessionId !== expectedSessionId
+      || claimed.larkAppId !== expectedLarkAppId
+      || claimed.status !== 'active') {
+    throw new Error('durable active takeover claim returned a mismatched Session');
+  }
+  return {
+    kind: 'claimed',
+    session: claimed,
     lease: written.lease,
     record: written.record,
   };

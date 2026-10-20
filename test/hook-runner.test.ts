@@ -221,7 +221,7 @@ describe('prepareHookPayload', () => {
   });
 
   it('truncates long text/label in the real optionsPreview field too', () => {
-    // Mirror the path actually emitted by worker-pool.ts tui_prompt
+    // Mirror the shape the retired worker-pool.ts tui_prompt path emitted
     // (`optionsPreview: ...`) — the previous fix only covered the synthetic
     // `options` alias, leaving the production emit shape unredacted.
     const longText = 'p'.repeat(700);

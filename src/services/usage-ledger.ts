@@ -15,10 +15,12 @@
  * callerOpenId, cumulative totals) so a single excerpted line self-validates
  * without joining back to sessions.json.
  */
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 import { logger } from '../utils/logger.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from '../core/cost-calculator.js';
 import { estimateCostCny, type ResolvedModelPricing } from './model-pricing.js';
@@ -275,13 +277,15 @@ function statePath(dir: string, larkAppId?: string): string {
 }
 
 function loadState(dir: string, larkAppId?: string): LedgerState {
-  try {
-    const parsed = JSON.parse(readFileSync(statePath(dir, larkAppId), 'utf8'));
-    if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
-      return { v: 2, sessions: parsed.sessions };
-    }
-  } catch { /* first run or corrupt state — start fresh */ }
-  return { v: 2, sessions: {} };
+  // First run → fresh. A corrupt baseline file is quarantined as .corrupt-*
+  // (instead of being overwritten by the next saveState), see utils/json-file.ts.
+  const parsed = readJsonFileSoft<Pick<LedgerState, 'sessions'>>(statePath(dir, larkAppId), {
+    fallback: () => ({ sessions: {} }),
+    validate: (v): v is Pick<LedgerState, 'sessions'> =>
+      isJsonObject(v) && !!v.sessions && typeof v.sessions === 'object',
+    label: 'usage-ledger',
+  });
+  return { v: 2, sessions: parsed.sessions };
 }
 
 function saveState(dir: string, larkAppId: string | undefined, state: LedgerState, now: Date): void {
@@ -291,12 +295,9 @@ function saveState(dir: string, larkAppId: string | undefined, state: LedgerStat
       delete state.sessions[sessionId];
     }
   }
-  // temp+rename keeps a crash from truncating state; the pid suffix keeps
-  // concurrent daemons from stomping each other's tmp file.
-  const target = statePath(dir, larkAppId);
-  const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state));
-  renameSync(tmp, target);
+  // atomicWriteFileSync: temp+rename keeps a crash from truncating state, and
+  // its unique tmp name keeps concurrent daemons from stomping each other's.
+  atomicWriteFileSync(statePath(dir, larkAppId), JSON.stringify(state), { followTargetSymlink: false });
 }
 
 /** Deterministic id for one baseline→snapshot transition: a crash-replay of

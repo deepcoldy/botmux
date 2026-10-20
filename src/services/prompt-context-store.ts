@@ -25,9 +25,10 @@
  * claim 走 daemon IPC，任何读失败/未命中 → undefined（调用方空输出，fail-open）。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { normaliseForFingerprint } from './claude-transcript.js';
 
 /** sidecar 保留上限：超出按 mtime 淘汰最旧的。 */
@@ -70,7 +71,6 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
     const dir = sessionDir(sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const file = join(dir, `${fingerprintPromptText(ptyText)}.${turnIdKey(turnId)}.json`);
-    const tmp = `${file}.tmp-${process.pid}`;
     const payload = JSON.stringify({
       version: 3,
       envelope,
@@ -79,8 +79,7 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
       turnId,
       createdAt: Date.now(),
     }) + '\n';
-    writeFileSync(tmp, payload, { mode: 0o600 });
-    renameSync(tmp, file);
+    atomicWriteFileSync(file, payload, { mode: 0o600, followTargetSymlink: false });
     pruneSidecars(dir, file);
   } catch { /* best-effort */ }
 }
@@ -104,13 +103,11 @@ export function rekeyPromptContext(sessionId: string, turnId: string, previousPt
     const parsed = JSON.parse(readFileSync(candidates[0], 'utf8'));
     if (typeof parsed?.envelope !== 'string' || parsed.turnId !== turnId) return false;
     const next = join(dir, `${fingerprintPromptText(nextPtyText)}.${key}.json`);
-    const tmp = `${next}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify({
+    atomicWriteFileSync(next, JSON.stringify({
       ...parsed,
       prefix: prefixOf(nextPtyText),
       fingerprint: fingerprintPromptText(nextPtyText),
-    }) + '\n', { mode: 0o600 });
-    renameSync(tmp, next);
+    }) + '\n', { mode: 0o600, followTargetSymlink: false });
     if (candidates[0] !== next) unlinkSync(candidates[0]);
     return true;
   } catch {

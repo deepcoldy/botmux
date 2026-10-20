@@ -51,13 +51,15 @@ export function parseSlashCommandInvocation(content: string): SlashCommandInvoca
   const cmd = cmdRaw?.toLowerCase();
   if (!cmd) return null;
 
+  // Explicit payload commands keep their entire body, including examples.
+  const literalBody = commandSpec(cmd)?.literalBody === true;
   // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (/<[^>\r\n]+>/.test(firstLine)) return null;
+  if (!literalBody && /<[^>\r\n]+>/.test(firstLine)) return null;
 
   const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
-    if (restNonBlank.some(l => l.startsWith('/'))) return null;
+    if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
     if (!MULTILINE_COMMANDS.has(cmd)) return null;
   }
 
@@ -94,6 +96,11 @@ export interface SlashRouteInput {
   cascadeCapable?: boolean;
   /** 消息带附件时不切级联（附件跟正文走一条路），整条按今天转发。 */
   hasAttachments?: boolean;
+  /** 现有会话只是命令预建的空壳（见 worker-pool 的 isResumeRecoveryPlaceholder：只认持久化的
+   *  对话历史与已接纳工作，刻意忽略 `cliId` / `cliLaunchSnapshot` 这类「选择而非启动」的标记，
+   *  与 isDisposableCommandScratch 不同）。只影响「仅无会话时认领」的命令（`/resume`）：空壳不算
+   *  会话。缺省 = 不是空壳。 */
+  sessionIsCommandScratch?: boolean;
 }
 
 /** runtime 级联的一项：透传命令行，或最后的正文。 */
@@ -182,6 +189,12 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
 
   const spec = commandSpec(cmd);
   const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
+  // 「仅无会话时认领」的命令（`/resume`）：无会话（或只有命令空壳，如关闭后发过 /help）
+  // → 先于透传闸认领（没有 CLI 可透传）；
+  // 有会话 → 落到下面的透传闸 / 未知命令转发，与改造前逐字一致（它不在 DAEMON_COMMANDS 里）。
+  if (spec?.claimWithoutSessionOnly && (input.phase === 'none' || input.phase === 'closed' || input.sessionIsCommandScratch)) {
+    return { kind: 'daemon', cmd, content, sessionPolicy: 'sessionless' };
+  }
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
   if (!cliCommand && input.passthrough.has(cmd)) {

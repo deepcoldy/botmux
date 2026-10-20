@@ -5,20 +5,12 @@
  * the worker timer + notify paths. Does NOT own attach mode, watchers, or
  * SQLite bridges (hermes/mtr) — those stay on dedicated worker paths.
  *
- * Lookup order: sessionId (when provided) first, then pid. Returns the first
- * existing path, or undefined.
+ * Discovery is declared by each adapter (`CliAdapter.bridgeSpec.locate`,
+ * resolved statelessly through `bridgeSpecFor`); this module only owns the
+ * shared lookup order: sessionId (when provided) first, then pid. Returns the
+ * first existing path, or undefined.
  */
-import { existsSync } from 'node:fs';
-import { findCodexRolloutByPid, findCodexRolloutBySessionId } from './codex-transcript.js';
-import { findTraexRolloutByPid, findTraexRolloutBySessionId } from './traex-transcript.js';
-import { cocoEventsPathForSession, findCocoSessionByPid } from './coco-transcript.js';
-import { findPiTranscriptByPid, findPiTranscriptBySessionId } from './pi-transcript.js';
-import { findGrokSessionByPid, findGrokUpdatesBySessionId } from './grok-transcript.js';
-import { findCursorTranscriptByChatId, findCursorTranscriptByPid } from './cursor-transcript.js';
-import { findAntigravityConversationIdByPid } from './antigravity-discovery.js';
-import { antigravityTranscriptPath } from './antigravity-transcript.js';
-import { ompTranscriptPath } from '../adapters/cli/oh-my-pi.js';
-import { ebsdBotmuxTranscriptPath } from '../adapters/cli/ebsd.js';
+import { bridgeSpecFor } from '../adapters/cli/registry.js';
 
 export interface FileBridgePathOpts {
   sessionId?: string;
@@ -31,72 +23,16 @@ export function resolveFileBridgePath(
   cliId: string | undefined,
   opts: FileBridgePathOpts,
 ): string | undefined {
-  if (!cliId) return undefined;
+  const spec = bridgeSpecFor(cliId);
+  if (!spec) return undefined;
   const { sessionId, cwd, pid } = opts;
 
   if (sessionId) {
-    const bySid = resolveBySessionId(cliId, sessionId, cwd);
+    const bySid = spec.locate.bySessionId(sessionId, cwd);
     if (bySid) return bySid;
   }
   if (pid != null && Number.isInteger(pid) && pid > 0) {
-    return resolveByPid(cliId, pid);
+    return spec.locate.byPid?.(pid);
   }
   return undefined;
-}
-
-function resolveBySessionId(cliId: string, sessionId: string, cwd?: string): string | undefined {
-  switch (cliId) {
-    case 'coco': {
-      const p = cocoEventsPathForSession(sessionId);
-      return existsSync(p) ? p : undefined;
-    }
-    case 'pi':
-      return findPiTranscriptBySessionId(sessionId, cwd);
-    case 'oh-my-pi':
-      return ompTranscriptPath(sessionId) ?? undefined;
-    case 'ebsd':
-      return ebsdBotmuxTranscriptPath(sessionId) ?? undefined;
-    case 'grok':
-      return findGrokUpdatesBySessionId(sessionId, cwd);
-    case 'traex':
-      return findTraexRolloutBySessionId(sessionId);
-    case 'cursor':
-      return findCursorTranscriptByChatId(sessionId);
-    case 'antigravity': {
-      const p = antigravityTranscriptPath(sessionId);
-      return p && existsSync(p) ? p : undefined;
-    }
-    case 'codex':
-      return findCodexRolloutBySessionId(sessionId);
-    default:
-      return undefined;
-  }
-}
-
-function resolveByPid(cliId: string, pid: number): string | undefined {
-  switch (cliId) {
-    case 'coco': {
-      const probed = findCocoSessionByPid(pid);
-      return probed && existsSync(probed.eventsPath) ? probed.eventsPath : undefined;
-    }
-    case 'pi':
-      return findPiTranscriptByPid(pid)?.path;
-    case 'grok': {
-      const probed = findGrokSessionByPid(pid);
-      return probed && existsSync(probed.updatesPath) ? probed.updatesPath : undefined;
-    }
-    case 'traex':
-      return findTraexRolloutByPid(pid)?.path;
-    case 'cursor':
-      return findCursorTranscriptByPid(pid)?.path;
-    case 'antigravity': {
-      const conversationId = findAntigravityConversationIdByPid(pid);
-      const p = conversationId ? antigravityTranscriptPath(conversationId) : null;
-      return p && existsSync(p) ? p : undefined;
-    }
-    case 'codex':
-      return findCodexRolloutByPid(pid)?.path;
-    default:
-      return undefined;
-  }
 }

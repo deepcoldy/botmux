@@ -14,9 +14,11 @@
 | `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/queue <消息>` | Codex App 活会话：将文字消息作为独立一轮排队，等当前任务结束后执行；空闲时直接开始。支持多行纯文本，暂不支持富文本和附件；需命令操作权限（可通过 canTalkDaemonCommands 授权）。无会话、尚未就绪或其它 CLI 会明确拒绝 开启 trigger-user 按人凭证时会在接纳前刷新本轮身份；但后续消息可覆盖单槽凭证，等待轮的 bytedcli/lark-cli 仍可能被 turn-mismatch 拒绝，需要重试。 |
 | `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
-| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
+| `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
+| `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
 | `/dismiss` | 专属会话群顶层专用：二次确认后关闭会话并解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
@@ -82,6 +84,8 @@ botmux 日常运维
 - 头部的 `/repo wt` 不接受编号形式（编号只在选仓卡片上有意义）；会话内的 `/repo wt <编号|项目名> [分支]` 仍可用。
 - 会话中途单独发的 `/repo` 仍然吃整行，与头部里的单 token 规则不同。
 
+Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set codexCapacityRecovery on` 开启，`/botconfig set codexCapacityRecovery off` 关闭。开启后，Botmux 管理的 Codex 飞书会话遇到明确的模型容量错误（`server_overloaded`）时，会在 15 秒、45 秒后各自动续跑一次。每次续跑会向原生会话追加一条恢复提示（每个任务最多两条），可能保留在模型上下文中，关闭开关不会删除已有历史。关闭时若存在待执行的恢复，会保存取消状态并只提示一次；重新开启或重启不会自动恢复这条旧任务。这不是只针对 modelhub 的识别，也不保证错误会在短时间内恢复。续跑沿用当前会话进度，不重发原始任务；新消息、`/stop` 或关闭会话会停止旧轮恢复。进程重启后，尚未执行的恢复与交接结果未知的恢复均停止并提示人工继续；已在执行的任务仍可正常交付成功结果，但晚到的容量失败不会再自动续跑，避免重放未能保存的取消操作。两次仍未恢复时显示失败卡，可稍后点击重试继续。普通 503、断流、鉴权和限额错误不进入这条恢复链，外部 adopt、HTTP 和会议接收会话也不受影响。
+
 ## 💬 回复模式（`/reply-mode`）
 
 控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改需 `canOperate`，仅查看需 `canTalk`。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
@@ -93,7 +97,7 @@ botmux 日常运维
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
 | `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话，同一 DM 的消息共用一个会话（**默认**） |
 | `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程；同一已有 thread 内的回复继续该 thread 会话 |
-| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名、回群续聊自动恢复上下文；详见私聊会话模式 `p2pMode=group`） |
+| `/reply-mode group` | 每条**顶层** DM 自动创建一个「你+bot」专属会话群并把会话落在群里（AI 自动命名；会话关闭后回群再说话会开新会话，要接着聊点关闭卡「恢复会话」或发 `/resume`；详见私聊会话模式 `p2pMode=group`） |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
@@ -101,13 +105,14 @@ botmux 日常运维
 
 | 命令 | 说明 |
 |------|------|
-| `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode` `/reply-mode status` | 查看当前群回复模式，并标明来源（继承 Bot 默认 / 本群覆盖） |
+| `/reply-mode inherit` | 清除本群覆盖，恢复跟随 Bot 默认（别名 `default` / `reset` / `clear`） |
 | `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
 | `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
 | `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
 | `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
 
-群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值；显式设置即使与当前默认相同也会保留为覆盖（之后改 Bot 默认不影响本群），要重新跟随默认请用 `/reply-mode inherit`。也可以在 dashboard「群组 → 管理」里按机器人逐个选择。设置新模式需要确认当前是普通群；查看与清除覆盖不受此限制。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
 
@@ -185,6 +190,10 @@ step_model_switching = true
 
 权限同 `/help`，不占用会话槽位。
 
+Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可选的「飞书原生命令面板」：把 botmux 自有命令（含别名，直接从命令注册表推导）作为候选项，标出每一项在飞书后台是已同步、待新增还是待更新；是否注册由用户通过每行的「同步」按钮决定。飞书后台额外存在的命令也会列出，可逐条删除。「全部同步到飞书」是显式批量操作，只新增缺失命令并更新说明，不会隐式删除。CLI 透传命令（`/compact`、`/model` 等）因不同 CLI 与输入后端的支持并不一致，暂不进入候选。
+
+该面板需要可选权限 `application:app_slash_command:read` / `application:app_slash_command:write`，它们**不在**默认权限清单里，也不会被启动自检自动补开；未开通或租户未进飞书灰度（需 7.70+ PC 端及 FG 白名单）时，面板只显示「暂不可用」与开通链接，Bot 的其它功能不受影响。飞书客户端的原生 `/` 面板可能需要约 5 分钟刷新。按工作目录发现的 `.claude` 命令、skill、插件和 MCP prompt 不是应用级稳定能力，因此仍只在 `/slash` 卡片里展示，不会注册到飞书后台。
+
 ## 📡 会话接入
 
 | 命令 | 说明 |
@@ -198,7 +207,7 @@ step_model_switching = true
 | 命令 | 说明 |
 |------|------|
 | `/login` | 飞书基础用户授权：消息读取、资源访问和授权续期；不默认申请云文档、通讯录或日历权限 |
-| `/login --scope <权限名> [更多权限名]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly` |
+| `/login --scope <权限名>... [--force]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly`；加 `--force` 跳过本地目录校验（仅做语法校验）以支持未收录新权限 |
 | `/login status` | 查看授权状态 |
 | `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
@@ -258,6 +267,8 @@ step_model_switching = true
 ## 🆕 一键新建会话群
 
 `/group <群名>`（别名 `/g`）：自动新建飞书群、邀请你进群、转让群主，整个群作为一个独立 CLI 会话。`@botA @botB /g <群名>` 可把多个机器人一并拉进新群。
+
+新群默认像群聊模式的会话群一样用渐变 logo 头像；不写群名时会在第一条消息后按内容自动改群名。
 
 加上 `--role-profile <profile>` 可以在新群里自动 bootstrap 一套按 bot 区分的角色：
 

@@ -36,7 +36,7 @@
  * so it participates in the dashboard settings surface; this store owns the rest.
  */
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, rmSync, cpSync, statSync,
+  existsSync, mkdirSync, readFileSync, rmSync, cpSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';

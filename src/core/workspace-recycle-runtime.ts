@@ -17,7 +17,6 @@ import {
 } from './workspace-recycle-journal.js';
 import {
   captureRecycleResources, rereadRecycleResources, resourceResiduals,
-  type RecycleResources,
 } from './workspace-recycle-resources.js';
 
 export interface WorkspaceRecycleRuntimeDeps {

@@ -21,18 +21,19 @@ async function revalidateController(
   authority: ScheduleAuthorityRecord,
   deps: Pick<DelegatedScheduleRuntimeDependencies,
     'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'>,
+  targetChatId: string = task.chatId,
 ): Promise<string> {
   if (!authority.controlOpenId || !authority.controlUnionId
     || !deps.adminOpenIds.includes(authority.controlOpenId)) {
-    throw new Error('delegated schedule controller is no longer an allowed bot operator');
+    throw new Error('schedule controller is no longer an allowed bot operator');
   }
   const currentOpenId = await deps.resolveTargetOpenId(authority.controlUnionId);
   if (currentOpenId !== authority.controlOpenId) {
-    throw new Error('delegated schedule controller identity is no longer resolvable');
+    throw new Error('schedule controller identity is no longer resolvable');
   }
-  const members = await deps.listChatMemberOpenIds(task.chatId);
+  const members = await deps.listChatMemberOpenIds(targetChatId);
   if (!members.includes(authority.controlOpenId)) {
-    throw new Error('delegated schedule controller is no longer a target chat member');
+    throw new Error('schedule controller is no longer a target chat member');
   }
   return currentOpenId;
 }
@@ -63,16 +64,27 @@ export async function authorizeDelegatedScheduleRun(
   return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
 }
 
-export async function authorizeDelegatedScheduleSelfManage(
+export async function authorizeScheduleSelfManage(
   authority: ScheduleAuthorityRecord,
   deps: Pick<DelegatedScheduleRuntimeDependencies,
     'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'> & {
       selfManageEnabled: boolean;
+      targetChatId: string;
     },
 ): Promise<void> {
-  if (authority.kind !== 'delegated' || authority.state !== 'active'
-    || !authority.selfManage || !deps.selfManageEnabled) {
-    throw new Error('delegated schedule self-management is not allowed');
+  const completedRunStillLive = authority.state === 'completed'
+    && authority.task.enabled === false
+    && authority.task.disabledReason === 'once_completed';
+  if (authority.state !== 'active' && !completedRunStillLive) {
+    throw new Error(`schedule authority state is ${authority.state}`);
   }
-  await revalidateController(authority.task, authority, deps);
+  if (authority.kind === 'direct') {
+    await revalidateController(authority.task, authority, deps, deps.targetChatId);
+    return;
+  }
+  if (authority.kind !== 'delegated'
+    || !authority.selfManage || !deps.selfManageEnabled) {
+    throw new Error('schedule self-management is not allowed');
+  }
+  await revalidateController(authority.task, authority, deps, deps.targetChatId);
 }

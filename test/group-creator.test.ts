@@ -63,6 +63,8 @@ const mockNameAvatar = vi.fn();
 const mockPersonalTag = vi.fn();
 vi.mock('../src/services/group-name-avatar.js', () => ({ applyGroupNameAvatar: (...args: any[]) => mockNameAvatar(...args) }));
 vi.mock('../src/services/feed-group-tagger.js', () => ({ addCreatedChatToFeedGroup: (...args: any[]) => mockPersonalTag(...args) }));
+const mockLogoAvatar = vi.fn();
+vi.mock('../src/services/session-group-avatar.js', () => ({ applyLogoGroupAvatar: (...args: any[]) => mockLogoAvatar(...args) }));
 
 import { createGroupWithBots, transferGroupOwner } from '../src/services/group-creator.js';
 
@@ -132,6 +134,30 @@ describe('createGroupWithBots', () => {
     expect(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
     expect(mockPersonalTag).toHaveBeenCalledWith(CREATOR, 'oc_custom', USER_OPEN_ID, 'Work');
     expect(mockCreateChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies the logo avatar (not the name renderer) before transfer and reports its failure', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_logo', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockLogoAvatar.mockReset();
+    mockNameAvatar.mockReset();
+    mockLogoAvatar.mockResolvedValueOnce('glacier');
+    const ok = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: '新会话 10/17 14:30', transferOwnerTo: USER_OPEN_ID,
+      customization: { avatar: 'logo', userOpenId: USER_OPEN_ID },
+    });
+    expect(ok.customization).toEqual({});
+    expect(mockLogoAvatar).toHaveBeenCalledWith(CREATOR, 'oc_logo');
+    expect(mockNameAvatar).not.toHaveBeenCalled();
+    expect(mockLogoAvatar.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!);
+
+    mockLogoAvatar.mockRejectedValueOnce(new Error('avatar upload failed (glacier)'));
+    const failed = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: 'X', transferOwnerTo: USER_OPEN_ID,
+      customization: { avatar: 'logo', userOpenId: USER_OPEN_ID },
+    });
+    expect(failed.chatId).toBe('oc_logo');
+    expect(failed.customization).toEqual({ avatarError: 'avatar upload failed (glacier)' });
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {

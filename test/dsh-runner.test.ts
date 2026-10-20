@@ -504,11 +504,14 @@ records:
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
   });
 
+  // 源码结构护栏(K1)：`bun build --compile` 只打包能静态解析的依赖；经 createRequire 得到的
+  // `req('yaml')` 在编译态单文件二进制里解析不到，曾因此退回手写 fallback 解析器。源码态
+  // node_modules 在盘上照样能跑，行为测试测不出来。来历：#1220 改回静态 import，并在编译态二进制
+  // 实测凭据解析。
   it('keeps yaml as a static import so bun --compile bundles the real parser', () => {
     const source = readFileSync(RUNNER_PATH, 'utf8');
-    expect(source).toContain("from 'yaml'");
-    expect(source).not.toContain("req('yaml')");
-    expect(source).not.toContain('parseMinimalYaml');
+    expect(source).toMatch(/^import\s[^;]*\bfrom\s+['"]yaml['"]/m);
+    expect(source).not.toMatch(/\b(?:req|require)\(\s*['"]yaml['"]\s*\)/);
   });
 
   it('lets ambient credentials override the versioned credential file', async () => {

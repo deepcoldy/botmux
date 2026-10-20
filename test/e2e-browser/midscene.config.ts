@@ -1,6 +1,8 @@
 import { defineNode, z } from '@midscene/test';
 import { defineTestProject } from '@midscene/test/config';
-import { setE2EVideoLabel } from './e2e-video.js';
+import { runWithE2EVideoLabel } from './e2e-video.js';
+import { runWithReportScope, type ReportScopeContext } from './report-scope.js';
+import { laneProject, selectedCaseFiles } from './lanes.js';
 import {
   FEISHU_PHASE_SCENARIOS,
   closeFeishuPhase,
@@ -25,8 +27,17 @@ const runScenario = defineNode({
     scenario: z.enum(FEISHU_SCENARIOS),
   }),
   async execute(ctx) {
-    if (ctx.scope === 'case') setE2EVideoLabel(ctx.case.name, ctx.input.scenario);
-    await runFeishuScenario(ctx.input.scenario);
+    if (ctx.scope !== 'case') {
+      await runFeishuScenario(ctx.input.scenario);
+      return;
+    }
+    // The report scope gives the Pages index and Summary this step's
+    // screenshots and deep link; the video label names its recording.
+    await runWithReportScope(ctx as ReportScopeContext, () =>
+      runWithE2EVideoLabel(ctx.case.name, ctx.input.scenario, () =>
+        runFeishuScenario(ctx.input.scenario),
+      ),
+    );
   },
 });
 
@@ -75,32 +86,42 @@ const closeNode = defineNode({
   },
 });
 
+// Every cases/*.yaml file is one lane: its own Midscene project. Midscene runs
+// projects concurrently (up to test.maxConcurrency) and the cases inside one
+// project serially, so a lane groups cases that must not overlap — e.g. the
+// group-chat routing cases assert that *no* bot answered — while lanes that
+// talk to different topics run side by side against the same daemon fleet.
+//
+// Parallelism stays inside this one process on purpose: Feishu delivers each
+// app's events to only one of its WebSocket connections, so two CI jobs with
+// their own daemons for the same bots would receive each other's messages.
+//
+// Lane selection (FEISHU_E2E_CASES) lives in lanes.ts; `--project
+// feishu-<stem>` also works through `bun run test:e2e-browser`.
+//
+// Each lane holds one Chromium context and polls the vision model; 4 keeps a
+// 4-vCPU runner and a rate-limited model endpoint comfortable.
+const concurrency = Number.parseInt(process.env.FEISHU_E2E_CONCURRENCY ?? '', 10);
+
 export default defineTestProject({
   test: {
-    maxConcurrency: 1,
-    testTimeout: 15 * 60_000,
+    maxConcurrency: Number.isInteger(concurrency) && concurrency > 0 ? concurrency : 4,
+    // Mode cases may wait for a chat lease (chat-lease.ts) before they start.
+    testTimeout: 30 * 60_000,
   },
-  projects: [
-    {
-      name: 'feishu-browser',
-      retry: process.env.CI ? 1 : 0,
-      // CI runs the stable Claude/Codex core set (single-chat bot flows). Set
-      // FEISHU_E2E_CASES=all (or run locally) to select every migrated case
-      // in cases/bot-flows.yaml + cases/messaging.yaml.
-      files: {
-        include:
-          process.env.FEISHU_E2E_CASES === 'all'
-            ? ['cases/**/*.yaml']
-            : ['cases/ci-claude-codex.yaml'],
-      },
-      nodes: [
-        runScenario,
-        openAndSendNode,
-        waitForStreamingCardNode,
-        waitForBotResponseNode,
-        showStreamingOutputNode,
-        closeNode,
-      ],
-    },
+  nodes: [
+    runScenario,
+    openAndSendNode,
+    waitForStreamingCardNode,
+    waitForBotResponseNode,
+    showStreamingOutputNode,
+    closeNode,
   ],
+  projects: selectedCaseFiles(process.env.FEISHU_E2E_CASES).map((file) => ({
+    name: laneProject(file),
+    // The group-mode lane runs 16 cases one after another in one shared group;
+    // a retry there doubles the slowest lane, so it reports first attempts.
+    retry: process.env.CI && !file.includes('group-modes') ? 1 : 0,
+    files: { include: [file] },
+  })),
 });

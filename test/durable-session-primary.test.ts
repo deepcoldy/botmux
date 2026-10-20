@@ -12,8 +12,10 @@ import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shad
 import type { DurableLarkSessionControlClaim } from '../src/services/durable-lark-session-control.js';
 import {
   admitDurableLarkSession,
+  claimDurableLarkActiveSession,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
+  listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from '../src/services/durable-session-primary.js';
 
@@ -105,7 +107,15 @@ function fakeStore() {
 
 describe('durable primary Session admission', () => {
   it('round-trips the full persisted Session and its canonical admission identity', () => {
-    const projected = durablePrimarySessionProjection(session(), message('om_current'));
+    const projected = durablePrimarySessionProjection(session({
+      durablePrimaryInputCommits: [{
+        version: 1,
+        turnId: 'om_current',
+        workerGeneration: 3,
+        dispatchAttempt: 2,
+        committedAt: '2026-10-05T00:00:45.000Z',
+      }],
+    }), message('om_current'));
     const record: DurableSessionRecord = {
       sessionKey: projected.sessionKey,
       revision: 1,
@@ -120,6 +130,11 @@ describe('durable primary Session admission', () => {
         ownerOpenId: 'ou_owner',
         workingDir: '/shared/project',
         dispatchInputReceipts: { om_previous: { workerGeneration: 2 } },
+        durablePrimaryInputCommits: [{
+          turnId: 'om_current',
+          workerGeneration: 3,
+          dispatchAttempt: 2,
+        }],
       },
       admission: {
         eventId: 'im.message.receive_v1:cli_test:om_current',
@@ -228,6 +243,54 @@ describe('durable primary Session admission', () => {
     await facade.stop();
   });
 
+  it('refuses to replace an active canonical Session with a different session id', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-owner-fence' });
+    await admitDurableLarkSession({ facade, message: message('om_1'), session: session() });
+
+    await expect(admitDurableLarkSession({
+      facade,
+      message: message('om_2'),
+      session: session({ sessionId: 'session-2' }),
+    })).rejects.toThrow(/active canonical Session/);
+
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-1', status: 'active' },
+      admissions: [{ messageId: 'om_1' }],
+      controls: [],
+    });
+    await facade.stop();
+  });
+
+  it('starts a clean canonical history when a closed Session is replaced at the same anchor', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-closed-successor' });
+    await admitDurableLarkSession({
+      facade,
+      message: message('om_old'),
+      session: session({ status: 'closed', closedAt: '2026-10-05T00:02:00.000Z' }),
+    });
+    await commitDurableLarkSessionControl({
+      facade,
+      control: control('card.action.trigger:cli_test:evt_close_old', 'close'),
+      session: session({ status: 'closed', closedAt: '2026-10-05T00:02:00.000Z' }),
+      result: { status: 'closed' },
+    });
+
+    await expect(admitDurableLarkSession({
+      facade,
+      message: message('om_new'),
+      session: session({ sessionId: 'session-2' }),
+    })).resolves.toMatchObject({ kind: 'committed' });
+
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-2', status: 'active' },
+      admissions: [{ messageId: 'om_new' }],
+      controls: [],
+    });
+    await facade.stop();
+  });
+
   it('bounds admission history while retaining the newest 64 turns', async () => {
     const { store, records } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'primary-bounded-boot' });
@@ -281,6 +344,73 @@ describe('durable primary Session admission', () => {
     await facade.stop();
   });
 
+  it('claims an unchanged active canonical Session under a fresh exact revision', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-owner' });
+    await admitDurableLarkSession({ facade, message: message('om_initial'), session: session() });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).resolves.toMatchObject({
+      kind: 'claimed',
+      session: { sessionId: 'session-1', status: 'active' },
+      record: { revision: 2 },
+      lease: { ownerId: 'takeover-owner' },
+    });
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-1', status: 'active' },
+      admissions: [{ messageId: 'om_initial' }],
+    });
+    await facade.stop();
+  });
+
+  it('does not materialize ownership when another owner still holds the Session lease', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-contender' });
+    vi.mocked(store.acquireSessionLease).mockResolvedValueOnce({
+      kind: 'occupied',
+      ownerId: 'live-owner',
+      epoch: 4,
+      leaseUntil: 90_000,
+    });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).resolves.toEqual({
+      kind: 'occupied',
+      ownerId: 'live-owner',
+      epoch: 4,
+      leaseUntil: 90_000,
+      coalescedCount: 1,
+    });
+    expect(store.readSession).not.toHaveBeenCalled();
+    expect(store.writeSession).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
+  it('fails closed when the canonical Session changed before takeover claim', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-stale-reader' });
+    await admitDurableLarkSession({ facade, message: message('om_closed'), session: session({
+      status: 'closed',
+      closedAt: '2026-10-05T00:02:00.000Z',
+    }) });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).rejects.toThrow(/changed before claim/);
+    await facade.stop();
+  });
+
   it('rejects mismatched app and corrupted restore identities', () => {
     expect(() => durablePrimarySessionProjection(
       session({ larkAppId: 'cli_other' }),
@@ -294,5 +424,27 @@ describe('durable primary Session admission', () => {
       value: projected.value,
       updatedAt: 1,
     })).toThrow(/mismatched routing identity/);
+  });
+
+  it('quarantines a malformed legacy row without hiding valid Dashboard rows', () => {
+    const projected = durablePrimarySessionProjection(session(), message('om_current'));
+    const valid: DurableSessionRecord = {
+      sessionKey: projected.sessionKey,
+      revision: 1,
+      value: projected.value,
+      updatedAt: 1,
+    };
+    const invalid: DurableSessionRecord = {
+      ...valid,
+      sessionKey: 'om_stale_legacy::cli_test',
+    };
+    const onInvalid = vi.fn();
+
+    expect(listValidDurablePrimarySessions(
+      [invalid, valid],
+      'cli_test',
+      onInvalid,
+    )).toEqual([expect.objectContaining({ sessionId: 'session-1' })]);
+    expect(onInvalid).toHaveBeenCalledWith(invalid, expect.any(Error));
   });
 });

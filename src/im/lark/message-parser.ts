@@ -9,7 +9,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
-import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -708,6 +708,32 @@ export function resolvePostBody(parsed: any): { title: string; content: any[] } 
   return { title: '', content: [] };
 }
 
+/** Narrow rich-post projection for keyword listeners. It intentionally keeps
+ * only visible title/text/link content so listener matching does not inherit
+ * unrelated mention, file, image, or code-rendering semantics. */
+export function extractPostListenerText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') return '';
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs: string[] = [];
+  for (const paragraph of content) {
+    const parts: string[] = [];
+    for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+      if (!node || typeof node !== 'object') continue;
+      if (node.tag === 'text' && typeof node.text === 'string') {
+        parts.push(node.text);
+      } else if (node.tag === 'a') {
+        const label = typeof node.text === 'string' ? node.text.trim() : '';
+        const href = typeof node.href === 'string' ? node.href.trim() : '';
+        if (label) parts.push(label);
+        if (href && href !== label) parts.push(label ? ` (${href})` : href);
+      }
+    }
+    const text = parts.join('').trim();
+    if (text) paragraphs.push(text);
+  }
+  return [typeof title === 'string' ? title.trim() : '', ...paragraphs].filter(Boolean).join('\n');
+}
+
 /** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
  *  （openId/appId 已解析）与飞书事件里的原始 `message.mentions[]`（id/id_type）。 */
 type LooseMention = {
@@ -1355,7 +1381,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
                 ? stripTrailingGroupContextCardPurposeMarker(node.text)
                 : node.text;
               if (visibleText !== node.text
-                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
                 if (visibleText) textNodes.push(visibleText);
                 continue;
               }
@@ -1840,7 +1867,7 @@ function extractCardHeaderTagTexts(header: unknown): string[] {
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
   const text = nestedCardText(value);
-  return (text ?? '')
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
@@ -2027,7 +2054,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
     if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 

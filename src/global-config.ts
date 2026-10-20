@@ -14,12 +14,13 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -161,6 +162,8 @@ export const SESSION_CLEANUP_DEFAULT_INTERVAL_MINUTES = 60;
 export const SESSION_CLEANUP_DEFAULT_HOURS: SessionCleanupHours = 168;
 
 export interface SessionCleanupGlobalConfig {
+  /** 手动关闭或手动/定时清理时归档有明确归属的 Codex 会话；默认关闭。 */
+  archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
   /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
@@ -234,7 +237,7 @@ export interface GlobalConfig {
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
-   *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
+   *  binary self-update release asset). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;
@@ -404,7 +407,7 @@ export interface DashboardGlobalConfig {
    *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
    *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
-   *  Live 读取（见 config.ts `cardBrandLabelEnabled`），Settings 翻转后无需重启。 */
+   *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
 }
 
@@ -521,13 +524,6 @@ function readHerdrTraexPlugin(raw: unknown): HerdrTraexPluginConfig | undefined 
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled;
   if (typeof r.source === 'string' && r.source.trim()) out.source = r.source.trim();
   if (typeof r.ref === 'string' && r.ref.trim()) out.ref = r.ref.trim();
-  // Migrate the unmerged review schema in-memory without rewriting config.json.
-  if (!out.source && typeof r.spec === 'string' && r.spec.trim()) {
-    const legacy = r.spec.trim();
-    const hash = legacy.lastIndexOf('#');
-    out.source = hash > 0 ? legacy.slice(0, hash) : legacy;
-    if (!out.ref && hash > 0 && hash < legacy.length - 1) out.ref = legacy.slice(hash + 1);
-  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -561,7 +557,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
   // Round-trip an explicit boolean either way. Absent stays absent — the live
-  // getter (config.ts `cardBrandLabelEnabled`) treats absent as ON, so a stored
+  // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   return Object.keys(out).length > 0 ? out : undefined;
@@ -688,6 +684,7 @@ function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefine
   const value = raw as Record<string, unknown>;
   const out: SessionCleanupGlobalConfig = {};
   if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.archiveCodex === 'boolean') out.archiveCodex = value.archiveCodex;
   if (
     typeof value.olderThanHours === 'number'
     && (SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(value.olderThanHours)
@@ -783,6 +780,11 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
 }
 
 export function globalConfigPath(): string {
+  const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) throw new Error('BOTMUX_GLOBAL_CONFIG_FILE must be absolute');
+    return configured;
+  }
   return join(homedir(), '.botmux', 'config.json');
 }
 
@@ -1049,6 +1051,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  the file (and parent dir) on first write. Use `null` to explicitly delete
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
+  assertDurableConfigMutationAllowed('global');
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

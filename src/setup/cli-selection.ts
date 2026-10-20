@@ -25,6 +25,7 @@ import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { CODEX_REASONING_EFFORTS } from '../services/codex-reasoning-effort.js';
+import { AIDEN_CODEX_SHELL_CONFIG_FILE_ENV } from '../services/aiden-codex-shim.shared.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
@@ -269,6 +270,25 @@ export function selectionKeyForBot(cliId: string, wrapperCli?: string, cliLaunch
 }
 
 /**
+ * Strictly reverse-map a persisted launch shape to a registered option.
+ * Unlike {@link selectionKeyForBot}, this never falls back to the bare cliId:
+ * an unknown wrapper or launch mode is a distinct, untrusted shape.
+ */
+export function lookupCliSelectionForBotShape(
+  cliId: string,
+  wrapperCli?: string | null,
+  cliLaunchMode?: CliLaunchMode | null,
+): CliSelectOption | undefined {
+  const normalizedWrapper = wrapperCli?.trim() || undefined;
+  const normalizedLaunchMode = cliLaunchMode ?? undefined;
+  return CLI_SELECT_OPTIONS.find(option =>
+    option.cliId === cliId
+    && option.wrapperCli === normalizedWrapper
+    && option.cliLaunchMode === normalizedLaunchMode,
+  );
+}
+
+/**
  * 把选择键解析成可落盘的 bot 配置片段（纯映射，无副作用）。非法 key 抛错。
  */
 export function resolveCliSelection(key: string): ResolvedCliSelection {
@@ -311,11 +331,65 @@ function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'cjadk';
 }
 
+/**
+ * Botmux 注入的 `shell_environment_policy.*` 覆盖前缀——把会话/身份变量带进
+ * Codex **执行命令的 shell**（Codex 默认不向 shell 子进程透传进程环境）。
+ * 两类：
+ *  - `shell_environment_policy.set.BOTMUX_*`（BOTMUX_SESSION_ID / BOTMUX_IDENTITY_BIN /
+ *    BOTMUX_LARK_TOOL_BINDING / BOTMUX_DAEMON_IPC_PORT 等全部会话变量）；
+ *  - 少量非 BOTMUX_ 前缀键（触发者身份的 SESSION_DATA_DIR / ZDOTDIR / BASH_ENV /
+ *    GIT_ASKPASS）与读隔离的 inherit / ignore_default_excludes。
+ * 这是 aiden（经 shim 回注）与 cjadk（改 --config 透传）两条 wrapper 路径共用的
+ * 单一事实源，避免再出现"只识别 BOTMUX_ 前缀、漏掉非前缀身份键"的漂移。
+ */
+const BOTMUX_CODEX_SHELL_ENV_PREFIXES = [
+  'shell_environment_policy.set.BOTMUX_',
+  'shell_environment_policy.set.SESSION_DATA_DIR=',
+  'shell_environment_policy.set.ZDOTDIR=',
+  'shell_environment_policy.set.BASH_ENV=',
+  'shell_environment_policy.set.GIT_ASKPASS=',
+  'shell_environment_policy.inherit=',
+  'shell_environment_policy.ignore_default_excludes=',
+];
+
+/** 是否为 botmux 注入、必须到达 Codex shell 子进程的 shell_environment_policy 覆盖。 */
+function isBotmuxCodexShellEnvConfigValue(value: string | undefined): boolean {
+  return !!value && BOTMUX_CODEX_SHELL_ENV_PREFIXES.some((prefix) => value.startsWith(prefix));
+}
+
+/**
+ * codex 适配器实际发射的 `service_tier` 覆盖（`-c service_tier=${JSON.stringify(tier)}`，
+ * 见 codex.ts buildArgs）。精确锚定三个合法档位，避免误伤用户自带的 `-c service_tier=…`。
+ * 注意 `'default'` 也会到达这里：sessionServiceTier 只消隐 undefined/inherit，显式
+ * default 照常注入（用于覆盖 Codex 原生加速配置），所以它同样必须被转运。
+ */
+const BOTMUX_CODEX_SERVICE_TIER_RE = /^service_tier="(?:default|priority|ultrafast)"$/;
+
+/** codex 适配器实际发射的 `tui.auto_recap` 覆盖（quietResume/自动升级 restoring 路径，
+ * 值只可能是 true/false）。与 effort 正则同风格锚定，避免误伤用户自带 `-c`。 */
+const BOTMUX_CODEX_AUTO_RECAP_RE = /^tui\.auto_recap=(?:true|false)$/;
+
+/**
+ * 是否为 botmux 注入、必须**转运**到真 Codex 的 root config 覆盖：
+ *  - `shell_environment_policy.*` 会话/身份/读隔离覆盖（aiden 经 shim 文件回注，cjadk 改 --config）；
+ *  - `service_tier` / `tui.auto_recap` 两条进程级 root 覆盖（aiden 网关拒收裸 `-c`，同样走 shim
+ *    文件；cjadk 的 `code` 子命令会把裸 `-c` 吞成 `--command`，同样要改 `--config`）。
+ * 与「可直接丢弃」的 botmux `-c`（更新检查/nudge/cwd 信任）分开：这两类丢掉了会静默
+ * 关掉用户选的加速档或恢复期弹窗抑制，故一律转运。
+ */
+function isBotmuxCodexTransportedConfigValue(value: string | undefined): boolean {
+  return !!value && (
+    isBotmuxCodexShellEnvConfigValue(value)
+    || BOTMUX_CODEX_SERVICE_TIER_RE.test(value)
+    || BOTMUX_CODEX_AUTO_RECAP_RE.test(value)
+  );
+}
+
 /** 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
  * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。 */
 function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
-    value.startsWith('shell_environment_policy.set.BOTMUX_')
+    isBotmuxCodexTransportedConfigValue(value)
     || value === 'check_for_update_on_startup=false'
     // 关闭 codex 低额度切 luna 的模型 nudge 弹窗（见 codex 适配器 buildArgs），
     // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
@@ -357,10 +431,12 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  *     `error: the argument '--dangerously-bypass-hook-trust' cannot be used multiple times`
  *     直接启动失败。故经 aiden 网关时一律剥掉这份冗余副本（bare flag，无值）；aiden x claude
  *     路径底层 claude 从不注入此 flag，剥除是 no-op。
- * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
- * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
- * 通道。关闭启动更新和额度换模型提醒的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
+ * 这些参数里，更新/额度提醒的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
  * worker 会在极少数仍出现选择器的启动中自动选择非升级项，host 侧仍会做每日只读检查。
+ * session 环境的 shell_environment_policy 覆盖不能一剥了之——Codex 默认不把进程 env
+ * 透传给它 spawn 的工具 shell，这条 -c 是唯一通道；`aiden x codex` 由
+ * {@link rewriteAidenCodexArgs} 单遍分类并经 PATH shim 回注（见该函数），本函数仍用于
+ * `aiden x claude` 等不经过该分类器的形态。
  * `-c` 按 botmux 注入白名单精确识别，用户自带的
  * `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
  * 整体剥离（复用 {@link stripSettingsArgs}，不区分来源）。原生启动及 ttadk 等「裸透传」网关
@@ -394,30 +470,52 @@ const AIDEN_CODEX_REASONING_CONFIG = new RegExp(
 
 /**
  * Aiden owns the Codex provider configuration and rejects passthrough `-c`.
- * Extract only the exact reasoning config emitted by Botmux's Codex adapter so
- * the launch builder can route it through the Codex shim. Unrelated user-owned
- * `-c` values retain their existing behavior.
+ * Single-pass classification of the codex argv for `aiden x codex`:
+ *  - the exact Botmux reasoning config → extracted for the shim env;
+ *  - shell_environment_policy overrides (BOTMUX_* session vars, identity
+ *    ZDOTDIR/BASH_ENV/SESSION_DATA_DIR, read-isolation inherit) AND the
+ *    service_tier / tui.auto_recap root overrides → extracted for the shim
+ *    config FILE so they still reach the REAL codex (tool shells, or the
+ *    process config itself);
+ *  - other Botmux-injected `-c` (update/nudge suppressions, cwd-trust) and
+ *    `--dangerously-bypass-hook-trust` / `--settings` → dropped (Aiden cannot
+ *    carry them and has its own handling/fallbacks);
+ *  - everything else (including any user-owned `-c key=val`) → forwarded as-is.
+ * Unrelated user-owned `-c` values retain their existing behavior.
  */
 export function rewriteAidenCodexArgs(args: ReadonlyArray<string>): {
   reasoningEffort?: string;
+  shellConfigs: string[];
   forwardedArgs: string[];
 } {
-  const stripped = stripWrapperUnsafeArgs(args);
+  const afterSettings = stripSettingsArgs(args);
   let reasoningEffort: string | undefined;
+  const shellConfigs: string[] = [];
   const forwardedArgs: string[] = [];
-  for (let i = 0; i < stripped.length; i++) {
-    const arg = stripped[i]!;
+  for (let i = 0; i < afterSettings.length; i++) {
+    const arg = afterSettings[i]!;
+    if (arg === '--dangerously-bypass-hook-trust') continue;
     if (arg === '-c') {
-      const match = stripped[i + 1]?.match(AIDEN_CODEX_REASONING_CONFIG);
-      if (match) {
-        reasoningEffort = match[1]!;
+      const next = afterSettings[i + 1];
+      const effortMatch = next?.match(AIDEN_CODEX_REASONING_CONFIG);
+      if (effortMatch) {
+        reasoningEffort = effortMatch[1]!;
         i++;
         continue;
       }
+      // MUST precede the generic botmux-config check: the transported overrides
+      // are a subset of isBotmuxCodexConfigValue, and their channel on the
+      // aiden path is the shim rather than drop.
+      if (isBotmuxCodexTransportedConfigValue(next)) {
+        shellConfigs.push(next!);
+        i++;
+        continue;
+      }
+      if (isBotmuxCodexConfigValue(next)) { i++; continue; }
     }
     forwardedArgs.push(arg);
   }
-  return { reasoningEffort, forwardedArgs };
+  return { reasoningEffort, shellConfigs, forwardedArgs };
 }
 
 /**
@@ -475,8 +573,26 @@ export interface WrappedLaunchOptions {
   readonly childPath?: string;
   /** Resolved underlying Codex executable, used by the Aiden reasoning shim. */
   readonly aidenCodexRealBin?: string;
-  /** Directory containing Botmux's `codex` shim. */
+  /** Directory containing Botmux's `codex` PATH shim. */
   readonly aidenCodexShimDir?: string;
+  /**
+   * Fail closed when the shim cannot deliver a session-identity launch: set by
+   * the worker when trigger-user auth / Lark tool binding injects non-prefixed
+   * identity keys that have NO channel other than the shim. Without it, a
+   * missing shim degrades to a stripped launch (WARN) — which silently runs
+   * tool shells as the machine owner.
+   */
+  readonly requireAidenCodexShim?: boolean;
+  /**
+   * Receives the transported config overrides extracted from the codex argv
+   * (one complete key=value per item), persists them wherever the caller
+   * chooses (the worker writes a file in the session identity dir) and
+   * returns the path handed to the shim via the corresponding env var.
+   * Required to route shell-environment/root overrides through the shim;
+   * without it they are stripped like before and the session-env forwarding
+   * (or the chosen service tier / recap suppression) is lost.
+   */
+  readonly writeAidenShellConfigs?: (configs: readonly string[]) => string;
   /** Platform PATH delimiter supplied by the server-side caller. */
   readonly pathDelimiter?: string;
 }
@@ -535,7 +651,9 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - bin = 前缀首 token（经 binResolver 走 PATH 解析）
  *   - args = 前缀其余 token + CLI 参数（aiden `aiden x <cli>` 形态会先经
  *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`；
- *     `aiden x codex` 的 reasoning 配置由 PATH shim 在 Aiden 生成网关参数后注入；
+ *     `aiden x codex` 由 {@link rewriteAidenCodexArgs} 单遍分类：reasoning 与
+ *     shell_environment_policy 会话/身份覆盖抽出后经 PATH shim（Aiden 内部 exec 真
+ *     Codex 那一跳）回注，其余 botmux `-c` 丢弃，用户 `-c` 原样透传；
  *     cjadk `cjadk <agent>` 形态走 {@link rewriteCjadkCodexConfigArgs} 把 codex 注入的 `-c`
  *     改写成 cjadk 不会吞掉的 `--config`）
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
@@ -564,22 +682,52 @@ export function buildWrappedLaunch(
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
   if (tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'codex') {
-    const { reasoningEffort, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
-    if (!reasoningEffort) {
+    const { reasoningEffort, shellConfigs, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
+    // The PATH shim is required whenever something must reach the REAL codex
+    // past Aiden's argv gate: a per-session reasoning effort, or shell-env
+    // config overrides (trigger-user identity / lark tool binding / read
+    // isolation). Aiden's `--env` only sets codex's own process env, which
+    // codex does not forward to the shells it spawns, so it cannot replace
+    // the shell_environment_policy channel.
+    if (!reasoningEffort && shellConfigs.length === 0) {
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
     }
     const realCodexBin = opts.aidenCodexRealBin ?? binResolver('codex');
     const shimDir = opts.aidenCodexShimDir;
     if (!shimDir) {
+      if (opts.requireAidenCodexShim) {
+        throw new Error(
+          'aiden x codex launch refused: session identity (trigger-user auth / Lark tool '
+          + 'binding) requires the PATH shim to forward shell_environment_policy overrides, '
+          + 'but the shim is unavailable',
+        );
+      }
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+    }
+    const shimEnv: Record<string, string> = {
+      BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
+    };
+    if (reasoningEffort) shimEnv.BOTMUX_AIDEN_CODEX_REASONING_EFFORT = reasoningEffort;
+    if (shellConfigs.length > 0) {
+      if (!opts.writeAidenShellConfigs) {
+        // No persistence hook (should not happen in the worker path): do not
+        // pretend the overrides were delivered — fall back to the stripped
+        // launch and let the caller log the degraded case. Identity-bearing
+        // launches must not degrade, so fail closed there instead.
+        if (opts.requireAidenCodexShim) {
+          throw new Error(
+            'aiden x codex launch refused: session identity requires the shim config-file '
+            + 'persistence hook, but none was supplied',
+          );
+        }
+        return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+      }
+      shimEnv[AIDEN_CODEX_SHELL_CONFIG_FILE_ENV] = opts.writeAidenShellConfigs(shellConfigs);
     }
     return {
       bin: `${shimDir}/launch`,
       args: [binResolver(tokens[0]), ...tokens.slice(1), ...forwardedArgs],
-      env: {
-        BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
-        BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort,
-      },
+      env: shimEnv,
     };
   }
   let forwarded: string[];

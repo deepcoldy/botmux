@@ -50,6 +50,17 @@ export type DashboardCommandExecution =
 const LEGACY_ENSURE_TOKEN_GATE_PREFIX =
   '401 <h1>Token expired</h1><p>Run <code>botmux dashboard</code>';
 
+const MIN_DASHBOARD_EXPORT_BUDGET_MS = 500;
+const MAX_DASHBOARD_EXPORT_TIMEOUT_MS = 5_000;
+
+/** Bound the best-effort export to the caller's remaining startup budget.
+ * Returning null below 500ms avoids a predictably doomed spawn and its
+ * process-local failure cache. */
+export function dashboardExportTimeoutForBudget(remainingMs: number): number | null {
+  if (!Number.isFinite(remainingMs) || remainingMs < MIN_DASHBOARD_EXPORT_BUDGET_MS) return null;
+  return Math.min(MAX_DASHBOARD_EXPORT_TIMEOUT_MS, Math.floor(remainingMs));
+}
+
 function legacyEnsureRouteMissing(result: DashboardResult): boolean {
   if (result.ok) return false;
   if (result.reason === 'wrong-service') return true;
@@ -287,6 +298,88 @@ export function formatDashboardFallbackFailure(
 }
 
 /**
+ * Refresh a successful dashboard response after the CLI has created/reused a
+ * Devbox export. The first endpoint call is deliberately outside this helper:
+ * it proves the dashboard is live and lets callDashboard() repair a stale
+ * `.dashboard-port` before merlin-cli is allowed to export anything. A second
+ * non-mutating current read is needed because the first response was rendered
+ * before the export cache existed. If export/refresh fails, retain the already
+ * usable local response rather than turning a best-effort enhancement fatal.
+ */
+export async function refreshDashboardResultAfterExport(
+  result: Extract<DashboardResult, { ok: true }>,
+  ensureExport: () => Promise<string | null>,
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+): Promise<Extract<DashboardResult, { ok: true }>> {
+  let exported: string | null;
+  try {
+    exported = await ensureExport();
+  } catch {
+    return result;
+  }
+  if (!exported) return result;
+  try {
+    const refreshed = await callEndpoint('/__cli/current');
+    return refreshed.ok ? refreshed : result;
+  } catch {
+    return result;
+  }
+}
+
+/**
+ * Run the best-effort Devbox export once the dashboard has ANSWERED on its
+ * port, then — when the answer is a usable link — re-read `/__cli/current`.
+ *
+ * "Answered" deliberately includes `no-active-token`: the HMAC-gated
+ * `/__cli/current` route replied, so the port is proven (callDashboard() has
+ * healed `.dashboard-port` if it had to) and the dashboard merely has no login
+ * token yet. That is the normal state of a fresh Devbox install where nobody has
+ * run `botmux dashboard`, and the export must still happen there: the tunnel
+ * cache is what `devboxDashboardBaseUrl()` reads for every web-terminal link
+ * (`buildTerminalUrl`, shared by the PTY and tmux backends) and for the CSRF
+ * authority — none of which needs a dashboard token. Gating on a usable link
+ * left those links local until the owner happened to run `botmux dashboard`.
+ * This branch never mints or rotates a token: with no link to refresh, it makes
+ * no endpoint call at all.
+ *
+ * Any other failure proves nothing about which service owns the port, so it
+ * never exports. `ensureExport === null` means the caller has no budget left.
+ */
+export async function exportAfterDashboardAnswer(
+  result: DashboardResult,
+  ensureExport: (() => Promise<string | null>) | null,
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+): Promise<DashboardResult> {
+  if (!ensureExport) return result;
+  if (result.ok) return refreshDashboardResultAfterExport(result, ensureExport, callEndpoint);
+  if (result.reason !== 'no-active-token') return result;
+  try {
+    await ensureExport();
+  } catch {
+    // Best effort, exactly like the usable-link branch: keep the answer.
+  }
+  return result;
+}
+
+/** Execute the user-facing command first, then add the Devbox export as a
+ * post-answer enhancement (see {@link exportAfterDashboardAnswer}). Keeping that
+ * order in one tested helper prevents a future refactor from exporting the
+ * configured/stale port before endpoint discovery has identified the live
+ * dashboard. */
+export async function executeDashboardCommandWithExportRefresh(
+  args: readonly string[],
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+  ensureExport: () => Promise<string | null>,
+): Promise<DashboardCommandExecution> {
+  const execution = await executeDashboardCommand(args, callEndpoint);
+  if (execution.kind !== 'endpoint') return execution;
+  return {
+    ...execution,
+    result: await exportAfterDashboardAnswer(execution.result, ensureExport, callEndpoint),
+  };
+}
+
+/**
  * Parse and dispatch the dashboard subcommand without touching process-global
  * output or credentials. Keeping the endpoint call injected makes the safety
  * property executable in tests: help/invalid invocations cannot accidentally
@@ -368,11 +461,20 @@ export async function executeDashboardCommand(
  * human command, so at worst it scans the probe range once per invocation. The
  * 500ms readiness poll must keep the default (false) or it would scan every tick.
  *
+ * When `ensureExport` is given (the real CLI always passes it), the Devbox export
+ * runs through {@link executeDashboardCommandWithExportRefresh}: only after the
+ * dashboard answered on its port, and the post-export re-read carries the same
+ * opt-in as every other call this wrapper makes.
+ *
  * @param callEndpoint the raw endpoint caller; this wrapper is what adds the opt-in
  */
 export async function executeDashboardCliCommand(
   args: readonly string[],
   callEndpoint: (path: DashboardEndpoint, opts: { rescanWhenUnreachable: boolean }) => Promise<DashboardResult>,
+  ensureExport?: () => Promise<string | null>,
 ): Promise<DashboardCommandExecution> {
-  return executeDashboardCommand(args, (path) => callEndpoint(path, { rescanWhenUnreachable: true }));
+  const optedIn = (path: DashboardEndpoint) => callEndpoint(path, { rescanWhenUnreachable: true });
+  return ensureExport
+    ? executeDashboardCommandWithExportRefresh(args, optedIn, ensureExport)
+    : executeDashboardCommand(args, optedIn);
 }

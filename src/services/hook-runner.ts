@@ -270,9 +270,9 @@ export function prepareHookPayload(hook: HookConfig, rawPayload: HookPayload): H
     payload[truncatedKey] = true;
   }
 
-  // Redact nested option text/label. session.requires_attention emits this
-  // as `optionsPreview` (see worker-pool.ts tui_prompt case); keep `options`
-  // as an alias so callers using either name get the same treatment.
+  // Redact nested option text/label. session.requires_attention used to emit
+  // this as `optionsPreview` (the retired TUI-prompt card path); keep both
+  // names redacted so any payload carrying option text gets the same treatment.
   for (const arrayField of ['optionsPreview', 'options'] as const) {
     const arrayValue = payload[arrayField];
     if (!Array.isArray(arrayValue)) continue;

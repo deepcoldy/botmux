@@ -255,6 +255,7 @@ setInterval(() => {
       () => messages.some(message => message.type === 'prompt_ready'),
       logs,
       'initial prompt readiness',
+      30_000,
     );
     const initialReadyCount = messages.filter(message => message.type === 'prompt_ready').length;
 

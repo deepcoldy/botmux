@@ -4,6 +4,7 @@ import type {
   RemoteRunnerOutboundMessageResult,
   RemoteRunnerSessionToolOperation,
   RemoteRunnerSessionToolResult,
+  RemoteRunnerRecoveredTurn,
   RemoteRunnerTrustedCaller,
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
@@ -14,6 +15,7 @@ export interface BackendTurnInput {
   content: string;
   turnId: string;
   replyTurnId?: string;
+  dispatchAttempt?: number;
   trustedCaller?: RemoteRunnerTrustedCaller;
 }
 
@@ -226,18 +228,23 @@ export interface SessionBackend {
   onTurnFinal?(cb: (text: string, turnId?: string) => void): void;
   /** Exact provider-reported terminal failure for a submitted turn. */
   onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
-  /** Provider-requested, non-terminal chat output for the active turn. The
-   * worker remains the trusted routing and delivery authority; providers never
-   * receive a destination override or platform credential. */
+  /** Provider-requested chat output for the active turn. A negotiated final
+   * may own terminal delivery; the worker remains the trusted routing and
+   * delivery authority, and providers never receive a destination override or
+   * platform credential. */
   onOutboundMessage?(
     cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void;
-  /** Provider-requested, read-only access to the current BotMux session's
-   * allowlisted helper surface.  The worker freezes session and turn authority
-   * before executing anything on the host. */
+  /** Provider-requested access to the current BotMux session's allowlisted
+   * helper surface. The worker freezes session and turn authority before
+   * executing anything on the host; schedule mutations still cross daemon
+   * authorization. */
   onSessionTool?(
     cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
+  /** A provider-owned turn survived the host/worker process and is now being
+   * observed without resubmitting its prompt. */
+  onTurnRecovered?(cb: (turn: RemoteRunnerRecoveredTurn) => void): void;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
   /** Durable, provider-neutral lineage/runtime state changed. */

@@ -1,78 +1,17 @@
 import { getBot } from '../bot-registry.js';
+import { config } from '../config.js';
+import { resolvePairedBackendId } from './remote-cli-ids.js';
 import type { LarkAttachment } from '../types.js';
-import { supportsTranscriptReplyDelivery, supportsZeroPromptStructuredBridge } from '../services/structured-bridge-clis.js';
 import type { DaemonSession } from './types.js';
 
 export type PromptInjection = 'default' | 'none';
 
-export type ZeroPromptSandboxValue = boolean | 'off' | 'oncall' | 'scratch';
-
-/** Whether a spawn runs in the full-root COW scratch sandbox (as opposed to
- *  the deny-by-default oncall bwrap). Scratch bind-mounts a merged overlay as
- *  the container root and does NOT honor the adapter authPaths directory
- *  binds, so transcripts written under it live in the upper/merged tree. */
-export function isScratchSandbox(opts?: {
-  sandbox?: ZeroPromptSandboxValue;
-  readIsolation?: boolean;
-}): boolean {
-  return opts?.sandbox === 'scratch';
-}
-
-/** Reuse the final-reply capability, rather than maintaining a second CLI
- * allowlist. Remote backends have their own prompt/decorate contracts.
- *
- * Two harvest channels qualify:
- *  - the ordinary transcript-reply CLIs (claude-code via its own bridge + the
- *    structured ALWAYS set), which deliver finals in every injection mode;
- *  - the zero-prompt-only structured CLIs (cursor / antigravity), whose bridge
- *    activates ONLY while promptInjection:'none' — default mode they answer via
- *    `botmux send` instead.
- *
- * Sandbox: cursor/antigravity are supported under the oncall bwrap sandbox
- * (and read isolation / the BOTMUX_SANDBOX switch) — their adapters declare
- * the whole `~/.cursor` / `~/.gemini` tree as readWrite authPaths, which
- * bind-mount the REAL host directories, so the daemon tails the same files the
- * CLI writes (this also keeps cursor's store.db fcntl locks working).
- *
- * The full-root COW `sandbox: 'scratch'` mode is rejected for these two for
- * now: it bind-mounts a merged overlay as / and ignores authPaths, so their
- * transcripts land in the upper tree the host-side structured bridge does not
- * resolve yet (the existing structured bridges codex/grok have the same open
- * gap). Fail loudly here rather than silently dropping every reply.
- *
- * This capability predicate only sees the CONFIG/session value, so the
- * machine-wide `BOTMUX_SANDBOX=scratch` switch (which is not materialised into
- * cfg) is enforced separately by an authoritative throw in spawnCli after it
- * resolves the real mode via resolveSandboxMode.
- *
- * Backend: antigravity additionally rejects the `zmx` backend. Its held
- * provisional final is released only by the quiet-tick viewport gate, and
- * screen evidence is deliberately non-authoritative under zmx
- * (backendScreenEvidenceIsAuthoritativeForMutation) — the final would then be
- * held until the next user turn at best. cursor is unaffected (it emits the
- * final immediately rather than through that gate). */
-const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
-
-export function supportsZeroPromptInjection(cliId: string | undefined, opts?: {
-  backendType?: string; codexRpcInput?: boolean;
-  sandbox?: ZeroPromptSandboxValue;
-  readIsolation?: boolean;
-}): boolean {
-  const localTranscript = supportsTranscriptReplyDelivery(cliId)
-    || supportsZeroPromptStructuredBridge(cliId);
-  if (!localTranscript) return false;
-  if (opts?.backendType
-    && !ZERO_PROMPT_LOCAL_BACKENDS.includes(opts.backendType as typeof ZERO_PROMPT_LOCAL_BACKENDS[number])) {
-    return false;
-  }
-  if ((cliId === 'cursor' || cliId === 'antigravity') && isScratchSandbox(opts)) {
-    return false;
-  }
-  if (cliId === 'antigravity' && opts?.backendType === 'zmx') {
-    return false;
-  }
-  return true;
-}
+export {
+  isScratchSandbox,
+  supportsZeroPromptInjection,
+  type ZeroPromptSandboxValue,
+} from './zero-prompt-support.js';
+import { supportsZeroPromptInjection } from './zero-prompt-support.js';
 
 export function sessionPromptInjection(ds: Pick<DaemonSession, 'session' | 'initConfig'>): PromptInjection {
   // Historical/adopted sessions predate this setting and retain their original
@@ -80,12 +19,27 @@ export function sessionPromptInjection(ds: Pick<DaemonSession, 'session' | 'init
   return ds.session.promptInjection ?? ds.initConfig?.promptInjection ?? 'default';
 }
 
+/**
+ * 按 Bot 配置判断零注入能否成立。后端按新会话 spawn 时的**生效值**：覆盖值，否则 daemon
+ * 默认后端，再按 CLI 配对（本地 CLI 落在远端后端上会回落到本地后端）——与 bot-config-store
+ * 的写入校验、spawnCli 的强制校验同一口径，避免「写入接受、提示词构造却按未开启处理」。
+ */
+export function supportsZeroPromptInjectionForBot(
+  cliId: string | undefined,
+  cfg: NonNullable<Parameters<typeof supportsZeroPromptInjection>[1]>,
+): boolean {
+  return supportsZeroPromptInjection(cliId, {
+    ...cfg,
+    backendType: resolvePairedBackendId(cliId, cfg.backendType, config.daemon.backendType),
+  });
+}
+
 export function zeroPromptInjectionForBot(larkAppId?: string, cliId?: string, frozen?: PromptInjection): boolean {
   if (frozen !== undefined) return frozen === 'none';
   if (!larkAppId) return false;
   try {
     const cfg = getBot(larkAppId).config;
-    return cfg.promptInjection === 'none' && supportsZeroPromptInjection(cliId ?? cfg.cliId, cfg);
+    return cfg.promptInjection === 'none' && supportsZeroPromptInjectionForBot(cliId ?? cfg.cliId, cfg);
   } catch {
     return false;
   }

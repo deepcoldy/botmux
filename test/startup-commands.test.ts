@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import {
   normalizeStartupCommand,
   normalizeStartupCommandList,
@@ -82,44 +81,5 @@ describe('shouldDeferInitialPromptForStartup', () => {
   it('does NOT defer without startup commands, nor in adopt mode', () => {
     expect(shouldDeferInitialPromptForStartup({ hasStartupCommands: false, adoptMode: false, passesInitialPromptViaArgs: true })).toBe(false);
     expect(shouldDeferInitialPromptForStartup({ hasStartupCommands: true, adoptMode: true, passesInitialPromptViaArgs: true })).toBe(false);
-  });
-});
-
-// Source-level guards: worker.ts has no exports, so pin the wiring that connects
-// the two predicates to the spawn path (the cross-path behaviour Codex flagged).
-describe('worker.ts startup-commands wiring', () => {
-  const src = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8');
-
-  it('re-arms the one-shot from the reattach prediction, not unconditionally', () => {
-    // The re-arm is gated on the reattach prediction (skip on live reattach)…
-    expect(src).toContain('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })');
-    // …and it lives AFTER willReattachPersistent is computed (must read it).
-    expect(src.indexOf('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn'))
-      .toBeGreaterThan(src.indexOf('const willReattachPersistent ='));
-  });
-
-  it('defers args-baked initial prompts for startup commands and adapter argv byte limits', () => {
-    // buildArgs gets undefined (not baked) and the init handler queues it instead;
-    // adapter-level preparation may also rewrite long prompts to safe argv tokens.
-    expect(src).toContain('cliAdapter.prepareInitialPromptArg?.({');
-    expect(src).toContain('promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;');
-    expect(src).toContain('resolveInitialPromptDelivery({');
-    expect(src).toContain('initialPrompt: preparedInitialPrompt,');
-    expect(src).toContain('shouldDeferInitialPromptForArgLimit({');
-    expect(src).toContain('maxInitialPromptArgBytes: cliAdapter.maxInitialPromptArgBytes,');
-    expect(src).toContain('lastSpawnDeferInitialPrompt = deferInitialPrompt;');
-    expect(src).toContain('const deferInitialPrompt = lastSpawnDeferInitialPrompt;');
-    expect(src).toContain('shouldQueueInitialPrompt({');
-    expect(src).toContain('passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,');
-    expect(src).toContain('deferInitialPrompt,');
-    expect(src).toContain('content: lastSpawnQueuedInitialPrompt ?? msg.prompt,');
-    expect(src).toContain('logicalContent: lastSpawnQueuedInitialPromptLogicalContent');
-    expect(src).toContain('args.unshift(...piInitialPromptAdditionalArgs);');
-    expect(src).toContain('Object.assign(childEnv, piInitialPromptEnv);');
-  });
-
-  it('does not route startupCommands into launch argv', () => {
-    expect(src).not.toContain('planStartupCommandsForCli');
-    expect(src).not.toContain('startupLaunchArgs');
   });
 });

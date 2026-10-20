@@ -19,7 +19,8 @@ import {
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
@@ -28,6 +29,7 @@ import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForF
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -991,9 +993,40 @@ export interface ClaudeFamilyVariant {
    *  own leave it undefined, so `reasoningEffort` is silently ignored for
    *  them rather than producing an unknown-flag launch. */
   readonly supportsEffortFlag?: boolean;
+  /** Env the user must prefix to `resumeBin` to resume by hand. Only set when the
+   *  data root is a non-default profile a bare binary would not resolve on its own
+   *  (relay/seed pin their own default, so they need none). */
+  readonly resumeEnv?: Readonly<Record<string, string>>;
 }
 
-export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
+/**
+ * Claude Code launched against a non-default config profile (`cliConfigDir`):
+ * the same binary with `CLAUDE_CONFIG_DIR=<dir>`, so settings.json / login /
+ * transcripts all come from that dir and the global `~/.claude/settings.json`
+ * (whose `env` and `model` outrank process env) is never read.
+ *
+ * Built through the same Claude-family variant seam relay/seed use, so every
+ * path botmux derives from the data root — hook install target, transcripts,
+ * pid state, `.claude.json` folder trust, MCP gateway entry — follows the
+ * profile instead of silently pointing at `~/.claude`.
+ */
+export function claudeConfigProfileVariant(configDir: string): Pick<ClaudeFamilyVariant, 'dataDir' | 'stateJsonPath' | 'spawnEnv' | 'authPaths' | 'resumeEnv'> {
+  const dataDir = resolve(expandHomePath(configDir));
+  return {
+    dataDir,
+    // With CLAUDE_CONFIG_DIR set, Claude keeps `.claude.json` INSIDE the dir.
+    stateJsonPath: join(dataDir, '.claude.json'),
+    spawnEnv: { CLAUDE_CONFIG_DIR: dataDir },
+    authPaths: [join(dataDir, '.credentials.json')],
+    resumeEnv: { CLAUDE_CONFIG_DIR: dataDir },
+  };
+}
+
+function expandHomePath(p: string): string {
+  return p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
+}
+
+export function createClaudeCodeAdapter(pathOverride?: string, configDir?: string): CliAdapter {
   return createClaudeFamilyAdapter({
     id: 'claude-code',
     // Claude Code JSONL carries authoritative final boundaries: final
@@ -1008,6 +1041,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
+    ...(configDir ? claudeConfigProfileVariant(configDir) : {}),
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
     // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
@@ -1085,7 +1119,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Claude resumes by reading <id>.jsonl, so we need the most recently
       // observed CLI-native id (rotation can happen mid-run); fall back to the
       // botmux sessionId for the first-turn case where they coincide.
-      return `${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
+      const envPrefix = Object.entries(variant.resumeEnv ?? {})
+        .map(([key, value]) => `${key}=${shellQuote(value)} `)
+        .join('');
+      return `${envPrefix}${variant.resumeBin} --resume ${cliSessionId ?? sessionId}`;
     },
 
     /** Import path: scan this variant's data root (`<dataDir>/projects/<hash>/<id>.jsonl`)
@@ -1326,7 +1363,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
+        pty.write(wrapBracketedPaste(sanitizedContent));
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1560,5 +1597,3 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     asksViaHook: true,
   };
 }
-
-export const create = createClaudeCodeAdapter;

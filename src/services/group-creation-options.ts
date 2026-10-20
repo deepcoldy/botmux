@@ -1,9 +1,14 @@
+export type GroupAvatarMode = 'name' | 'logo' | 'off';
+
 /** Opt-in team defaults for /g; mentions retain creator election and invitations. */
 export interface GroupCreationDefaults {
   agents?: string[];
   tag?: string;
-  avatar?: 'name' | 'off';
+  /** `name` renders the group name; `logo` reuses the session-group logo gradient. */
+  avatar?: GroupAvatarMode;
 }
+
+const AVATAR_MODES: readonly GroupAvatarMode[] = ['name', 'logo', 'off'];
 
 export function parseGroupCreationDefaults(value: unknown): GroupCreationDefaults {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('groupCreation must be an object');
@@ -24,8 +29,8 @@ export function parseGroupCreationDefaults(value: unknown): GroupCreationDefault
     if (trimmed) out.tag = trimmed;
   }
   if (v.avatar !== undefined) {
-    if (v.avatar !== 'name' && v.avatar !== 'off') throw new Error('avatar must be name or off');
-    out.avatar = v.avatar;
+    if (!AVATAR_MODES.includes(v.avatar as GroupAvatarMode)) throw new Error('avatar must be name, logo or off');
+    out.avatar = v.avatar as GroupAvatarMode;
   }
   return out;
 }
@@ -99,9 +104,7 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
 
   let m: RegExpExecArray | null;
   while ((m = scanner.exec(raw)) !== null) {
-    const lead = m[1] ?? '';
     const name = m[2];
-    const flagStart = m.index + lead.length;
     const nameEnd = scanner.lastIndex;
     const next = raw.charAt(nameEnd);
 
@@ -171,6 +174,46 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
   const roleProfileId = typeof bag.roleProfileId === 'string' ? bag.roleProfileId : undefined;
   delete bag.roleProfileId;
   return { ...parseGroupCreationDefaults(bag), name: firstLine, roleProfileId };
+}
+
+/** What /g should do beyond creating the chat, derived from the parsed args. */
+export interface GroupDecorations {
+  /** Avatar to apply at creation; undefined = leave Feishu's default. */
+  avatar?: 'name' | 'logo';
+  /** Rename the chat from its first substantive message (session-group style). */
+  autoTitle: boolean;
+}
+
+/**
+ * /g chats get the session-group treatment by default: the logo-gradient
+ * avatar, and — when unnamed — a placeholder AI-titled from the first
+ * substantive message (an explicit name always wins). `--avatar name` is
+ * re-rendered once that title lands; `--avatar off` keeps Feishu's default.
+ */
+export function resolveGroupDecorations(args: GroupCreationArgs): GroupDecorations {
+  const avatar = args.avatar ?? 'logo';
+  return {
+    avatar: avatar === 'off' ? undefined : avatar,
+    autoTitle: !args.name,
+  };
+}
+
+const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
+
+/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
+ *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
+ *  iterating by code point keeps that limit without slicing an emoji's
+ *  surrogate pair. */
+export function formatSlashGroupName(name: string, prefix = ''): string {
+  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
+  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
+
+  let truncated = '';
+  for (const character of prefixed) {
+    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
+    truncated += character;
+  }
+  return `${truncated}…`;
 }
 
 /** Config is authoritative for membership/transport; probe cache only supplies names. */

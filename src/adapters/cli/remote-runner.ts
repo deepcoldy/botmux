@@ -32,5 +32,3 @@ export function createRemoteRunnerAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createRemoteRunnerAdapter;

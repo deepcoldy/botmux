@@ -8,8 +8,12 @@ import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 
 it.each([
-  { resume: false, daemonTool: true }, { resume: false, daemonTool: false }, { resume: true, daemonTool: true },
-])('a real worker resolves the configured PATH (resume=$resume, daemonTool=$daemonTool)', async ({ resume, daemonTool }) => {
+  { resume: false, daemonTool: true, larkToolBinding: undefined },
+  { resume: false, daemonTool: true, larkToolBinding: true },
+  { resume: false, daemonTool: false, larkToolBinding: true },
+  { resume: true, daemonTool: true, larkToolBinding: true },
+  { resume: false, daemonTool: true, larkToolBinding: false },
+])('a real worker resolves the configured PATH (resume=$resume, daemonTool=$daemonTool, larkToolBinding=$larkToolBinding)', async ({ resume, daemonTool, larkToolBinding }) => {
   const root = mkdtempSync(join(tmpdir(), 'worker-lark-binding-'));
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
   const output = join(root, 'tool-result.json');
@@ -37,15 +41,16 @@ setInterval(()=>{},1000);
     child.send!({ type: 'init', sessionId: randomUUID(), chatId: 'oc_test', rootMessageId: 'om_root',
       resume,
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret',
+      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', larkToolBinding,
       env: { PATH: `${botBin}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
     const deadline = Date.now() + 25_000;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const result = JSON.parse(readFileSync(output, 'utf8'));
     expect(result.status, result.err).toBe(0);
-    expect(result.out).toBe(resume ? 'cli_wrong' : 'cli_current_app');
-    expect(result.path.split(':')[0].includes('cli-identity')).toBe(!resume);
+    const isBound = larkToolBinding !== false;
+    expect(result.out).toBe(isBound ? 'cli_current_app' : 'cli_wrong');
+    expect(result.path.split(':')[0].includes('cli-identity')).toBe(isBound);
   } finally {
     if (child.connected) child.send!({ type: 'close' });
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
@@ -74,7 +79,7 @@ setInterval(()=>{},1000);
   try {
     child.send!({ type: 'init', sessionId: randomUUID(), chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', locale: 'zh',
+      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', locale: 'zh', larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
       env: { PATH: `${botBin}:${process.env.PATH}` } });
     const deadline = Date.now() + 25_000;
@@ -130,7 +135,7 @@ process.stdout.write('Ready\\n'); setInterval(()=>{},1000);
   try {
     child.send!({ type: 'init', sessionId: 'sandbox-binding', chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: join(root, 'work'), cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', sandbox: true,
+      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', sandbox: true, larkToolBinding: true,
       sandboxPaths: { readOnly: [join(root, 'bot-bin')] },
       env: { PATH: `${join(root, 'bot-bin')}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
     const deadline = Date.now() + 25_000;

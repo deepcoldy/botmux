@@ -169,3 +169,13 @@ export function nativeSubagentRuntimeHookCommand(
 ): string {
   return `"${resolveNativeSubagentRuntimeHookWrapperPath(env, platform)}"`;
 }
+
+/** Cursor stop callback: same Node/standalone dispatch contract as other hooks. */
+export function cursorUsageHookCommand(platform: NodeJS.Platform = process.platform): string {
+  const command = renderShellCommand(undefined, '__cursor-usage-v1');
+  // A user-level Cursor hook also sees standalone sessions. Skip before even
+  // launching Botmux, including after the installation path has been removed.
+  return platform === 'win32'
+    ? `if defined BOTMUX_SESSION_ID if defined SESSION_DATA_DIR ${command}`
+    : `[ -z "$BOTMUX_SESSION_ID" ] || [ -z "$SESSION_DATA_DIR" ] || ${command}`;
+}

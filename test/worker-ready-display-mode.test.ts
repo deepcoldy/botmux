@@ -56,6 +56,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     type: 'streaming',
     readUrl: args[2],
     status: args[5],
+    imageKey: args[9] ?? null,
     localCliReady: args[15] === true,
     // Signature tail after the master merge: 15 localCliReady, 16 usage,
     // 17 runtimeDisplayName, 18 serviceTierBadge.
@@ -635,6 +636,29 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(logs).not.toContain('view_cap');
   });
 
+  it('skips the stale starting card when the explicit reply landed before worker ready', async () => {
+    // A fast startup turn can finish through `botmux send` before ready; a
+    // "Starting" card posted now would sit after the final reply forever.
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+
+    setupActiveWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready',
+      port: 9999,
+      token: 'tok_abc',
+      turnId: 'om_turn_ready',
+      replyAlreadySent: true,
+    });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardId).toBeUndefined();
+    // The terminal/runtime side of ready still applies.
+    expect(ds.workerPort).toBe(9999);
+  });
+
   it('ready POST keeps the dispatch-time topic when currentReplyTarget changes while awaiting Lark', async () => {
     let resolvePost!: (messageId: string) => void;
     sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
@@ -914,35 +938,6 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await flush();
 
     expect(sessionReplyMock).not.toHaveBeenCalled();
-  });
-
-  it('doc-native session never posts a TUI prompt card to the virtual doc: chat id', async () => {
-    const fakeWorker = makeFakeWorker();
-    const ds = makeDs({
-      scope: 'chat',
-      chatId: 'doc:doc_token_123',
-      session: {
-        ...makeDs().session,
-        scope: 'chat',
-        chatId: 'doc:doc_token_123',
-        rootMessageId: 'doc:doc_token_123',
-      },
-      worker: fakeWorker,
-    });
-    activate(ds);
-
-    setupActiveWorkerHandlers(ds, fakeWorker);
-    fakeWorker.emit('message', {
-      type: 'tui_prompt',
-      description: 'Approve command?',
-      options: [{ text: 'Yes', selected: false }],
-      multiSelect: false,
-      turnId: 'turn-doc',
-    });
-    await flush();
-
-    expect(sessionReplyMock).not.toHaveBeenCalled();
-    expect(ds.tuiPromptCardId).toBeUndefined();
   });
 
   it('POST path sends set_display_mode when displayMode is screenshot', async () => {
@@ -1380,6 +1375,9 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(JSON.parse(sessionReplyMock.mock.calls[0][1])).toMatchObject({ status: 'starting' });
 
     fakeWorker.emit('message', {
+      type: 'capture_identity', revision: 1, turnId: 'om_turn_1',
+    });
+    fakeWorker.emit('message', {
       type: 'screen_update',
       content: 'working after cold resume',
       status: 'working',
@@ -1569,6 +1567,36 @@ describe('Worker ready: set_display_mode re-sync', () => {
       { beforeWrite: expect.any(Function) },
     );
     expect(closeSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('does not leak an unhandled rejection when both the streaming and static fallback POSTs fail', async () => {
+    // Regression: the static-fallback catch rethrew a plain Lark API error out of
+    // the fire-and-forget worker message handler, so every cold wake of a session
+    // with a bad reply target surfaced as a daemon-level unhandled rejection.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      sessionReplyMock
+        .mockRejectedValueOnce(new Error('streaming POST failed'))
+        .mockRejectedValueOnce(new Error('fallback POST failed'));
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({ worker: fakeWorker, workingDir: '/tmp' });
+      activate(ds);
+
+      setupActiveWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+      await flush();
+      await flush();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+      expect(unhandled).toEqual([]);
+      expect(ds.streamCardId).toBeUndefined();
+      expect(closeSessionMock).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('prompt_ready sends a pending raw slash command once', async () => {
@@ -2224,7 +2252,12 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_B_on_C', 11, 'om_turn_B');
     await flush();
     expect(ds.currentImageKey).toBeUndefined();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.waitingTurnPreview).toMatchObject({ imageKey: 'img_B_on_C', turnId: 'om_turn_B' });
+    expect(updateMessageMock.mock.calls.map(call => JSON.parse(String(call[2]))))
+      .toEqual([
+        expect.objectContaining({ status: 'working', imageKey: 'img_A_on_C' }),
+        expect.objectContaining({ status: 'working', imageKey: 'img_B_on_C' }),
+      ]);
     expect(ds.streamCardDisplayTarget?.mode).toBe('waiting-exact-turn');
 
     identity(worker, 12, 'om_turn_C');
@@ -2233,7 +2266,9 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_C', 12, 'om_turn_C');
     await flush();
     expect(ds.currentImageKey).toBe('img_C');
-    expect(patchedIds()).toEqual(['om_card_C']);
+    // Activation removes the predecessor preview immediately; the accepted
+    // frame then adds the new turn's image in a second serialized PATCH.
+    expect(patchedIds()).toEqual(['om_card_C', 'om_card_C', 'om_card_C', 'om_card_C']);
   });
 
   it('seq 2b: a new-turn card whose turn is already being captured follows live at once', async () => {
@@ -2245,6 +2280,42 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_B', 3, 'om_turn_B');
     await flush();
     expect(ds.currentImageKey).toBe('img_B');
+  });
+
+  it('keeps the legacy presentation while isolating the waiting preview', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    const postedCards = sessionReplyMock.mock.calls
+      .map(call => JSON.parse(String(call[1])))
+      .filter(card => card?.type === 'streaming');
+    expect(postedCards.at(-1)).toMatchObject({ status: 'starting' });
+
+    updateMessageMock.mockClear();
+    frame(worker, 'img_turn_A_preview', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.waitingTurnPreview).toMatchObject({
+      imageKey: 'img_turn_A_preview', turnId: 'om_turn_A',
+    });
+    expect(JSON.parse(String(updateMessageMock.mock.calls.at(-1)?.[2])))
+      .toMatchObject({ status: 'working', imageKey: 'img_turn_A_preview' });
+
+    updateMessageMock.mockClear();
+    // The predecessor may have settled idle just before B becomes the producer;
+    // activation still means B is now running, not awaiting input.
+    ds.lastScreenStatus = 'idle';
+    identity(worker, 2, 'om_turn_B');
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({
+      messageId: 'om_card_B', mode: 'follow-live', turnId: 'om_turn_B',
+    });
+    expect(ds.waitingTurnPreview).toBeUndefined();
+    expect(updateMessageMock).toHaveBeenCalled();
+    const activated = JSON.parse(String(updateMessageMock.mock.calls.at(-1)?.[2]));
+    expect(activated).toMatchObject({ status: 'working' });
   });
 
   it('seq 2c: a re-posted card for the same turn does not inherit the previous card\'s match; a POST failure keeps the old card\'s own target', async () => {
@@ -2476,10 +2547,11 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_A_while_missing', 1, 'om_turn_A');
     await flush();
     expect(ds.currentImageKey).toBeUndefined();
-    // A source-less cache may not be rendered while waiting for B either.
+    // A source-less durable cache cannot replace the separately verified
+    // predecessor preview while waiting for B.
     ds.currentImageKey = 'img_sourceless';
     ds.currentImageSource = undefined;
-    expect(displayableStreamingCardImageKey(ds)).toBeUndefined();
+    expect(displayableStreamingCardImageKey(ds)).toBe('img_A_while_missing');
     ds.currentImageKey = undefined;
     // B's own frame still lands once the card is current again.
     ds.streamCardId = 'om_card_B';

@@ -23,6 +23,12 @@ Throughout the whole process, all you need to do is: **state the requirement →
 
 For whichever bots you want to take part in the collaboration, first add them to this group and make sure they can be @-mentioned (see [multi-bot collaboration](/en/multi-bot)). Everything else — which repository to work in, how to open topics and assign tasks — is handled automatically by the main bot, so you don't need to configure anything in advance (no need to enable On-Call or anything like that).
 
+## User identity in dispatch
+
+With `triggerUserAuth` enabled, `botmux dispatch --bot-app` establishes the message-bound identity delegation through the current human turn; the receiver still validates the target app's user mapping, group membership, and tool authorization. An ordinary Bot message never gains human permissions.
+
+A TRAE session ends a started turn at the structured `task_complete` (success or failure) or `turn_aborted` record. A transiently idle terminal while tools run does not revoke the current user identity. If the source turn is stale, a protected dispatch returns `dispatch_turn_unproven` instead of reporting an identity-less task as sent; the session Owner or a historical sender can never substitute for the current initiator.
+
 ## Disabling the feature
 
 Multi-topic collaboration is enabled by default. If a machine does not need it, turn off "Enable multi-topic collaboration" under **Settings → Multi-topic collaboration** in the Dashboard. The change takes effect from the next session, no restart required.
