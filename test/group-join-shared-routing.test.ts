@@ -259,17 +259,18 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(firstTurn.content).toContain('<name>【Pippit】【BUG】测试群</name>');
     expect(firstTurn.content).toContain('issue/detail/123');
     expect(firstTurn.content).not.toContain('<chat_mode>');
-    expect(firstTurn.content).toContain('<botmux_group_join source="lark" trusted="true" event="chat.bot_added" gate_matched="false">');
-    expect(firstTurn.content).toContain('<turn_id>om_join_seed</turn_id>');
-    expect(firstTurn.content).toContain('<sender type="user" open_id="ou_owner"');
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({
-      turnId: seedId,
-      trustedCaller: {
-        requestUserOpenId: 'ou_owner',
-        requestLarkAppId: appId,
-      },
-    });
-    expect(mocks.forkWorker.mock.calls[0]?.[2].trustedCaller).not.toHaveProperty('senderType');
+    // Legacy toggle (no gateRequired): the opening turn is byte-identical to
+    // pre-feature behaviour — no lifecycle block, no sender tag, no caller, and
+    // no identity-cache contact lookup.
+    expect(firstTurn.content).not.toContain('<botmux_group_join');
+    expect(firstTurn.content).not.toContain('<sender ');
+    expect(firstTurn.content).not.toContain('<turn_id>om_join_seed</turn_id>');
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: seedId });
+    // The option key is present-but-undefined exactly as on pre-feature master
+    // (forkReservedInitialSession lists it unconditionally); no caller means no
+    // managed-turn authority is established.
+    expect(mocks.forkWorker.mock.calls[0]?.[2].trustedCaller).toBeUndefined();
+    expect(ds?.activeInteractiveTurn).toBeUndefined();
     expect(modules.identities.getIdentity(appId, 'ou_owner')).toBeUndefined();
     expect(ds?.pendingChatContext).toBeUndefined();
 
@@ -301,8 +302,13 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     registry.registerBot({
       larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
       allowedUsers: [operator], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
       defaultWorkingDir: tempDir(`repo-bot-${evidence}`), regularGroupReplyMode: 'shared',
     });
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
 
     await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
 
@@ -325,9 +331,14 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const appId = 'app_join_no_operator';
     const chatId = 'oc_join_no_operator';
     mocks.forkWorker.mockReturnValueOnce(true);
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
     registry.registerBot({
       larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
       allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
       defaultWorkingDir: tempDir('repo-no-operator'), regularGroupReplyMode: 'shared',
     });
 
@@ -350,9 +361,14 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const appId = 'app_join_cached_user';
     identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'mention', name: 'Owner' });
     const before = identities.getIdentity(appId, 'ou_owner');
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
     registry.registerBot({
       larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
       allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
       defaultWorkingDir: tempDir('repo-cached-user'), regularGroupReplyMode: 'shared',
     });
 

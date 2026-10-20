@@ -24356,36 +24356,46 @@ async function handleBotAdded(
       }
       groupJoinGateMatched = groupJoinGate.matched === true;
 
-      // bot.added supplies an operator ID, not a platform sender_type. Read
-      // independent bot evidence before resolving any display name: even an
-      // undefined senderType makes resolveSender write "user" into the cache.
-      const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
-      const operatorIsBot: true | undefined = operatorOpenId
-        && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
-          || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
-        ? true : undefined;
-      if (operatorOpenId) {
-        let name = cachedOperator?.name;
-        if (operatorIsBot) {
-          const resolved = await resolveSender(larkAppId, operatorOpenId, 'app').catch(() => undefined);
-          name = resolved?.name ?? name;
+      // Provenance injection (identity resolution, opening caller, and the
+      // <botmux_group_join> prompt block) is opt-in: it happens only for bots
+      // that explicitly require the lifecycle gate. A bot with the legacy
+      // autoStartOnGroupJoin toggle keeps a byte-identical opening turn — no
+      // extra contact lookup, no injected block, no turn caller (zero
+      // breakchange for existing deployments, per the gate's default-off
+      // contract). When gateRequired is true this branch is reached only after
+      // a matching sync hook allowed, so gateMatched is necessarily true here.
+      if (botCfg.autoStartOnGroupJoinGateRequired === true) {
+        // bot.added supplies an operator ID, not a platform sender_type. Read
+        // independent bot evidence before resolving any display name: even an
+        // undefined senderType makes resolveSender write "user" into the cache.
+        const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
+        const operatorIsBot: true | undefined = operatorOpenId
+          && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
+            || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
+          ? true : undefined;
+        if (operatorOpenId) {
+          let name = cachedOperator?.name;
+          if (operatorIsBot) {
+            const resolved = await resolveSender(larkAppId, operatorOpenId, 'app').catch(() => undefined);
+            name = resolved?.name ?? name;
+          }
+          // Preserve the display vocabulary, but never use this model-facing
+          // default as evidence that the operator is an authenticated human.
+          groupJoinSender = {
+            openId: operatorOpenId,
+            type: operatorIsBot ? 'bot' : 'user',
+            ...(name ? { name } : {}),
+          };
         }
-        // Preserve the display vocabulary, but never use this model-facing
-        // default as evidence that the operator is an authenticated human.
-        groupJoinSender = {
-          openId: operatorOpenId,
-          type: operatorIsBot ? 'bot' : 'user',
-          ...(name ? { name } : {}),
-        };
+        // Without bot evidence, caller deliberately has no senderType; it cannot
+        // match a later platform-authenticated user via sameTrustedPrincipal.
+        // Owner continuity instead relies on trustedSessionController's separate
+        // user-typed owner, even for app operators. Turn privileges read caller,
+        // not controller; tightening the latter also requires migrating owner checks.
+        groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
+          ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
+          : undefined;
       }
-      // Without bot evidence, caller deliberately has no senderType; it cannot
-      // match a later platform-authenticated user via sameTrustedPrincipal.
-      // Owner continuity instead relies on trustedSessionController's separate
-      // user-typed owner, even for app operators. Turn privileges read caller,
-      // not controller; tightening the latter also requires migrating owner checks.
-      groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
-        ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
-        : undefined;
     }
 
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
@@ -24466,7 +24476,7 @@ async function handleBotAdded(
       // 新建话题：session 刚创建、尚无 cliId / cliLaunchSnapshot（`/cli use` 只能在之后触发），bot 配置是唯一来源。
       pendingCodexAppText: isCodexAppCliId(botCfg.cliId) ? codexAppText : undefined,
       pendingChatContext: chatContext,
-      ...(!forced ? {
+      ...(!forced && botCfg.autoStartOnGroupJoinGateRequired === true ? {
         pendingGroupJoinContext: {
           event: 'chat.bot_added' as const,
           larkAppId,

@@ -109,6 +109,8 @@ tail -f /tmp/botmux-hook.log
 
 `chat.bot_added` 可用 `filter.larkAppId`、`filter.chatId` 限定范围；邀请人判断应在 gate 命令内读取 `operatorOpenId`。不要用 `filter.senderOpenId` 过滤入群事件：它不会匹配邀请人，且在 `autoStartOnGroupJoinGateRequired: true` 时会使自动开工静默停止。
 
+`<botmux_group_join>` 块、邀请人 `<sender>` 与首轮可信 caller **仅在 `autoStartOnGroupJoinGateRequired: true` 时注入**；未开启该开关时，入群首轮与历史行为逐字一致（同步 gate 的放行/拒绝仍按配置生效）。
+
 可信 `botmux_group_join` 块只证明宿主观察到的入群生命周期、opening 上下文及 turn 归属，**不证明首轮 caller 已认证为真人**。没有平台 bot 证据时，首轮 caller 不带 `senderType`，因此不会获得要求 user caller 的自动续跑租约、用户级派发、失败恢复及 `schedule:create` 直连等特权。下游仍须在需要时独立核验身份和授权；一次 contact 查询不能替代这些 turn 级检查。事件缺少 `operatorOpenId` 时，只要 gate 放行仍可自动开工，但 opening 不含 `<sender>`、`operator_open_id`，也没有可信 caller。
 
 独立的会话 controller 仍按用户 owner 语义登记 operator（既有 `trustedSessionController` 行为），operator 是应用时也不例外；这不是对首轮 caller 的真人认证。显式开启实验性 `crossPrincipalInterruption`（默认关闭）后，该应用后续以 bot 身份发言不会匹配用户型 owner，会进入跨主体处理。基于 owner 的展示与确认行为也保留既有 user 语义；入群 gate 不收紧这套独立机制。
