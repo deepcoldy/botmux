@@ -14,7 +14,7 @@
  * Shape mirrors `team-agents-client.ts`: binding + http are injectable so the
  * client is testable without a platform.
  */
-import { getJson, postJson } from './platform-http.js';
+import { postJson } from './platform-http.js';
 import { readPlatformBinding } from './binding.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
@@ -59,7 +59,7 @@ export type CredentialGrantResult = { ok: true; value: CredentialGrant } | Crede
 export interface CredentialGrantClientOptions {
   binding?: { platformUrl: string; machineToken: string; machineId: string } | null;
   timeoutMs?: number;
-  http?: { post: typeof postJson; get: typeof getJson };
+  http?: { post: typeof postJson };
 }
 
 /** Env keys a grant may carry, per tool. Anything else is rejected: the
@@ -77,6 +77,10 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
 
 /** Default per-call budget: a grant sits on the turn's critical path. */
 const DEFAULT_TIMEOUT_MS = 6_000;
+/** Defense in depth: a grant is a per-turn token. Whatever the platform says,
+ *  never treat one as valid for longer than this. */
+const MAX_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
+const UNION_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
 export const CREDENTIAL_GRANT_PATH = '/v1/machine/credential-grant';
 /** Settings page on the platform where a person authorizes / consents. */
 export const PLATFORM_CREDENTIALS_PAGE = '/credentials';
@@ -118,18 +122,33 @@ function pickVariables(tool: TriggerUserAuthTool, raw: unknown): Record<string, 
   return out;
 }
 
-function classify(status: number, json: unknown): CredentialGrantFailure {
+/** Only a link on the bound platform itself is relayed to the person; anything
+ *  else (a tampered or misconfigured platform) falls back to the known page. */
+function sameOriginUrl(platformUrl: string, candidate: unknown): string | undefined {
+  if (typeof candidate !== 'string') return undefined;
+  try {
+    const a = new URL(candidate);
+    const b = new URL(platformUrl);
+    return a.protocol === 'https:' && a.origin === b.origin ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function classify(status: number, json: unknown, platformUrl: string): CredentialGrantFailure {
   const rec = (json && typeof json === 'object' ? json : {}) as Record<string, unknown>;
   const error = typeof rec.error === 'string' ? rec.error : '';
-  const authorizeUrl = typeof rec.authorizeUrl === 'string' ? rec.authorizeUrl : undefined;
+  const authorizeUrl = sameOriginUrl(platformUrl, rec.authorizeUrl);
   if (status === 429) {
     const retryAfterMs = typeof rec.retryAfterMs === 'number' ? rec.retryAfterMs : undefined;
     return { ok: false, reason: 'rate_limited', status, error: error || 'rate_limited', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
   }
-  if (status === 404 && !error) return { ok: false, reason: 'not_deployed', status };
   if (status === 404 && error === 'credential_not_found') {
     return { ok: false, reason: 'not_authorized', error, ...(authorizeUrl ? { authorizeUrl } : {}) };
   }
+  // Any other 404 is a platform without this endpoint (older build, generic
+  // router 404 body or not) — not a verdict about the person.
+  if (status === 404) return { ok: false, reason: 'not_deployed', status };
   if (status === 409 && error === 'credential_reauth_required') {
     return { ok: false, reason: 'not_authorized', error, ...(authorizeUrl ? { authorizeUrl } : {}) };
   }
@@ -138,7 +157,7 @@ function classify(status: number, json: unknown): CredentialGrantFailure {
   }
   if (status === 403 && error === 'not_teammate') return { ok: false, reason: 'not_teammate', error };
   if (status === 401 || status === 403) return { ok: false, reason: 'forbidden', status, error: error || `http_${status}` };
-  if (status >= 500 || status === 502) return { ok: false, reason: 'unavailable', status, error: error || `http_${status}` };
+  if (status >= 500) return { ok: false, reason: 'unavailable', status, error: error || `http_${status}` };
   return { ok: false, reason: 'client', status, error: error || `http_${status}` };
 }
 
@@ -149,9 +168,28 @@ export async function requestCredentialGrant(
   req: CredentialGrantRequest,
   opts: CredentialGrantClientOptions = {},
 ): Promise<CredentialGrantResult> {
+  try {
+    return await requestCredentialGrantInner(req, opts);
+  } catch (e) {
+    // Honour "never throws": a broken binding file or an unexpected shape must
+    // surface as a withheld identity, not take the turn down.
+    return { ok: false, reason: 'network', error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function requestCredentialGrantInner(
+  req: CredentialGrantRequest,
+  opts: CredentialGrantClientOptions,
+): Promise<CredentialGrantResult> {
   const binding = resolveBinding(opts);
   if (!binding) return { ok: false, reason: 'unbound' };
-  const http = opts.http ?? { post: postJson, get: getJson };
+  if (!UNION_ID_RE.test(req.unionId)) {
+    return { ok: false, reason: 'client', status: 0, error: 'invalid_union_id' };
+  }
+  if (!GRANT_VARIABLE_KEYS[req.tool]) {
+    return { ok: false, reason: 'client', status: 0, error: 'unsupported_tool' };
+  }
+  const http = opts.http ?? { post: postJson };
   const url = `${binding.platformUrl.replace(/\/+$/, '')}${CREDENTIAL_GRANT_PATH}`;
   let status: number;
   let json: unknown;
@@ -173,15 +211,17 @@ export async function requestCredentialGrant(
   } catch (e) {
     return { ok: false, reason: 'network', error: e instanceof Error ? e.message : String(e) };
   }
-  if (status < 200 || status >= 300) return classify(status, json);
+  if (status < 200 || status >= 300) return classify(status, json, binding.platformUrl);
   const rec = (json && typeof json === 'object' ? json : {}) as Record<string, unknown>;
   if (rec.ok !== true) return { ok: false, reason: 'invalid_response', error: 'ok flag missing' };
   if (rec.tool !== req.tool) return { ok: false, reason: 'invalid_response', error: 'tool mismatch' };
   if (rec.unionId !== req.unionId) return { ok: false, reason: 'invalid_response', error: 'unionId mismatch' };
-  const expiresAt = typeof rec.expiresAt === 'number' && Number.isFinite(rec.expiresAt) ? rec.expiresAt : NaN;
-  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+  const now = Date.now();
+  const rawExpiresAt = typeof rec.expiresAt === 'number' && Number.isFinite(rec.expiresAt) ? rec.expiresAt : NaN;
+  if (!Number.isFinite(rawExpiresAt) || rawExpiresAt <= now) {
     return { ok: false, reason: 'invalid_response', error: 'expiresAt missing or already past' };
   }
+  const expiresAt = Math.min(rawExpiresAt, now + MAX_GRANT_TTL_MS);
   const variables = pickVariables(req.tool, rec.variables);
   if (typeof variables === 'string') return { ok: false, reason: 'invalid_response', error: variables };
   return { ok: true, value: { tool: req.tool, unionId: req.unionId, variables, expiresAt } };

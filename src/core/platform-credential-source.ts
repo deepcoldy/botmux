@@ -77,6 +77,9 @@ export function __setPlatformCredentialDepsForTest(override: Partial<Deps> | nul
  *  grant costs one round trip, not two. Negative answers are not cached: a
  *  contact-API blip must not pin a person as "unresolvable" for a day. */
 const UNION_ID_TTL_MS = 24 * 60 * 60 * 1000;
+/** Feishu union ids are `on_` + hex today; the bound keeps a path-safe shape
+ *  without pinning the exact format. */
+const UNION_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
 const unionIdCache = new Map<string, { unionId: string; at: number }>();
 
 async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
@@ -85,26 +88,33 @@ async function unionIdFor(larkAppId: string, openId: string): Promise<string | n
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) return hit.unionId;
   let unionId: string | null = null;
   try { unionId = await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
-  if (unionId && /^[A-Za-z0-9_-]{4,128}$/.test(unionId)) {
+  if (unionId && UNION_ID_RE.test(unionId)) {
     unionIdCache.set(key, { unionId, at: deps.now() });
     return unionId;
   }
   return null;
 }
 
-function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity {
+/**
+ * Grant variables → identity. The client already enforces the per-tool
+ * allow-list, but the identity file is the last stop before a wrapper execs a
+ * tool, so re-check presence here and never publish a half-formed identity.
+ *
+ * Note `LARKSUITE_CLI_APP_ID` is the PLATFORM's Feishu app (the issuer of the
+ * user token), deliberately not this bot's app id — the two differ by design.
+ */
+function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | null {
+  const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
-    return {
-      tool,
-      appId: variables.LARKSUITE_CLI_APP_ID!,
-      userAccessToken: variables.LARKSUITE_CLI_USER_ACCESS_TOKEN!,
-    };
+    const appId = variables.LARKSUITE_CLI_APP_ID;
+    const userAccessToken = variables.LARKSUITE_CLI_USER_ACCESS_TOKEN;
+    if (!nonEmpty(appId) || !nonEmpty(userAccessToken)) return null;
+    return { tool, appId, userAccessToken };
   }
-  return {
-    tool,
-    cloudJwt: variables.BYTEDCLI_USER_CLOUD_JWT!,
-    ...(variables.BYTEDCLI_USER_CODE_JWT ? { codeJwt: variables.BYTEDCLI_USER_CODE_JWT } : {}),
-  };
+  const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
+  if (!nonEmpty(cloudJwt)) return null;
+  const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
+  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
 }
 
 /** The platform page a refused person should open (null when unbound). */
@@ -135,7 +145,12 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   }, { binding });
 
   if (result.ok) {
-    return { state: 'granted', identity: toIdentity(args.tool, result.value.variables), expiresAt: result.value.expiresAt };
+    const identity = toIdentity(args.tool, result.value.variables);
+    if (!identity) {
+      logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
+      return { state: 'unavailable', detail: 'malformed grant' };
+    }
+    return { state: 'granted', identity, expiresAt: result.value.expiresAt };
   }
   const detail = describeCredentialGrantFailure(result);
   const pageUrl = platformCredentialsUrl({ binding }) ?? undefined;

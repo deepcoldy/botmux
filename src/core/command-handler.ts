@@ -3810,8 +3810,14 @@ export async function handleCommand(
         const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
-        if (platformCredsUrl && (subCmd === ''
-          || (credSource === 'platform' && (subCmd === 'lark' || subCmd === 'bytedcli')))) {
+        const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
+        if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
+          && (subCmd === '' || explicitGoverned)) {
+          await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
+          break;
+        }
+        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
             : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'

@@ -24,7 +24,6 @@ function fakeHttp(responses: Array<{ status: number; json: unknown } | Error>) {
       if (next instanceof Error) throw next;
       return next;
     },
-    get: async () => ({ status: 404, json: {} }),
   };
   return { calls, http };
 }
@@ -90,9 +89,9 @@ describe('requestCredentialGrant', () => {
   });
 
   it.each([
-    [404, { error: 'credential_not_found', authorizeUrl: 'https://p/credentials' }, 'not_authorized'],
+    [404, { error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }, 'not_authorized'],
     [409, { error: 'credential_reauth_required' }, 'not_authorized'],
-    [403, { error: 'consent_missing', authorizeUrl: 'https://p/credentials' }, 'consent_missing'],
+    [403, { error: 'consent_missing', authorizeUrl: 'https://platform.example.test/credentials' }, 'consent_missing'],
     [403, { error: 'not_teammate' }, 'not_teammate'],
     [403, { error: 'machine_ownership_mismatch' }, 'forbidden'],
     [401, { error: 'invalid_machine_token' }, 'forbidden'],
@@ -109,6 +108,35 @@ describe('requestCredentialGrant', () => {
     if (!r.ok && (r.reason === 'not_authorized' || r.reason === 'consent_missing') && (json as any).authorizeUrl) {
       expect(r.authorizeUrl).toBe((json as any).authorizeUrl);
     }
+  });
+
+  it('classifies any other 404 (older platform, generic router body) as not_deployed', async () => {
+    const { http } = fakeHttp([{ status: 404, json: { error: 'Not Found', message: 'Route POST:/v1/machine/credential-grant not found' } }]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(!r.ok && r.reason).toBe('not_deployed');
+  });
+
+  it('relays authorizeUrl only when it is an https link on the bound platform', async () => {
+    const { http } = fakeHttp([
+      { status: 404, json: { error: 'credential_not_found', authorizeUrl: 'https://evil.example.test/phish' } },
+      { status: 404, json: { error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' } },
+    ]);
+    const r1 = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(!r1.ok && r1.reason === 'not_authorized' && r1.authorizeUrl).toBeUndefined();
+    const r2 = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(!r2.ok && r2.reason === 'not_authorized' && r2.authorizeUrl).toBe('https://platform.example.test/credentials');
+  });
+
+  it('caps an absurd expiresAt at 24h and refuses an invalid union id before calling out', async () => {
+    const { calls, http } = fakeHttp([{ status: 200, json: {
+      ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: Date.now() + 365 * 24 * 3_600_000,
+      variables: { LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't' },
+    } }]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(r.ok && r.value.expiresAt <= Date.now() + 24 * 3_600_000 + 1000).toBe(true);
+    const bad = await requestCredentialGrant({ ...REQ, unionId: '' }, { binding: BINDING, http });
+    expect(!bad.ok && bad.reason).toBe('client');
+    expect(calls).toHaveLength(1);
   });
 
   it('turns a thrown transport error into network, not an exception', async () => {

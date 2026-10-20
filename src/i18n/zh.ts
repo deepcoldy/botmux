@@ -522,6 +522,7 @@ export const messages: Record<string, string> = {
   'cmd.login.platform_step2': '授权完成后直接在本话题重试刚才的操作即可，不用再发命令。',
   'cmd.login.platform_note': '说明：本机已绑定中心化平台，{tool} 的授权统一由平台保管与续期，撤销也在那里。授权时请把本机所在的团队勾上，否则这台机器拿不到。',
   'cmd.login.platform_local_hint': '如需改用仅本机有效的扫码方式，发 /login {command}。',
+  'cmd.login.platform_unbound': '❌ 本 bot 要求按触发人的凭据只能来自中心化平台（credentialSource = platform），但本机尚未绑定平台，无法授权。请管理员在宿主终端执行 botmux bind，或把 triggerUserAuth.credentialSource 改为 auto / local。',
   'cmd.login.platform_status': '中心化平台：本机已绑定，{tool} 授权优先从平台获取；查看/撤销：{url}',
   'trigger_user_auth.provider_lark': '飞书',
   'trigger_user_auth.denied_you': 'botmux: 这一步要用你自己的 {provider} 授权，但你还没授权过 {tool}，命令未执行。',

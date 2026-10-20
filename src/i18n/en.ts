@@ -525,6 +525,7 @@ export const messages: Record<string, string> = {
   'cmd.login.platform_step2': 'Then retry the original action in this topic — no further command needed.',
   'cmd.login.platform_note': 'Note: this machine is bound to the central platform, which stores and renews your {tool} authorization (revoke it there too). Tick the team this machine belongs to when authorizing, or this machine cannot obtain it.',
   'cmd.login.platform_local_hint': 'To use a machine-local device login instead, send /login {command}.',
+  'cmd.login.platform_unbound': '❌ This bot requires sender credentials from the central platform only (credentialSource = platform), but this machine is not bound to a platform, so nothing can be authorized. Ask the operator to run botmux bind on the host, or set triggerUserAuth.credentialSource to auto / local.',
   'cmd.login.platform_status': 'Central platform: this machine is bound; {tool} authorization is obtained from the platform first. View/revoke: {url}',
   'trigger_user_auth.provider_lark': 'Feishu',
   'trigger_user_auth.denied_you': 'botmux: this step runs as you and needs your own {provider} authorization, but you have not authorized {tool}. Command not run.',

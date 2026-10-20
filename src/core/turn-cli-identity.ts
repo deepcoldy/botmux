@@ -174,14 +174,12 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     if (platform.state === 'granted') identity = platform.identity;
     else if (source === 'platform') return denyDelegated(tool, args, user);
   }
-  if (identity) {
-    // handled below
-  } else if (tool === 'bytedcli') {
+  if (!identity && tool === 'bytedcli') {
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
     if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
-  } else {
+  } else if (!identity && tool === 'lark-cli') {
     const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
     if (home) identity = { tool, mode: 'user-home', home };
     else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
