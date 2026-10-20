@@ -41,4 +41,12 @@ describe('Hook review input hold wiring', () => {
     expect(worker).toContain('hookReviewInputHold = false;');
     expect(worker).toContain('hookReviewInputHoldNotified = false;');
   });
+
+  it('wires disableCliBypass into the runtime type-ahead policy', () => {
+    const start = worker.indexOf('function runtimePtyInputPolicy');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const fn = worker.slice(start, worker.indexOf('\n}', start));
+    expect(fn).toContain('isTypeAheadBlockedByBypass(');
+    expect(fn).toContain('lastInitConfig?.disableCliBypass');
+  });
 });

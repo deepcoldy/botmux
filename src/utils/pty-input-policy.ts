@@ -4,12 +4,17 @@ import { busyProbeRegion } from './busy-probe.js';
 /** True when runtime config disables approval bypass on a CLI whose blocking
  *  permission dialog uses Enter as the approve key (`antigravity`).
  *
- *  Known issue (follow-up): passthrough slash commands (`/effort`, `/compact`,
- *  `/model`, `/btw`, `/clear`) delivered via worker `raw_input` IPC bypass
- *  `resolvePtyInputPolicy` while busy; a screen-based input hold alongside
- *  `hookReviewInputHold` is needed to block `raw_input` during `agy`'s
- *  permission dialog (`Allow creation of this file?` + numbered choices +
- *  `Navigate`). */
+ *  Known issue (unified screen-hold follow-up):
+ *  (1) passthrough slash commands (`/effort`, `/compact`, `/model`, `/btw`,
+ *      `/clear`) delivered via worker `raw_input` IPC bypass
+ *      `resolvePtyInputPolicy` while busy; and
+ *  (2) interactive TUI selection menus that still appear with bypass enabled
+ *      (e.g. `ask_question`'s `AskQuestionModel`, Plan artifact review) also
+ *      capture digit keys and Enter.
+ *  Both should be resolved together by a single unified screen-based input hold
+ *  (alongside `hookReviewInputHold`) that detects active confirmation/question
+ *  menus, holds queued + raw input, notifies the user in Lark, and flushes once
+ *  the menu clears. */
 export function isTypeAheadBlockedByBypass(
   adapter: { readonly id?: string } | undefined,
   disableCliBypass: boolean | undefined,

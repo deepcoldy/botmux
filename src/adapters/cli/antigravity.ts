@@ -461,9 +461,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
     // a permission dialog where Enter approves and digit keys jump options, so
     // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
-    // Known issue (follow-up): busy raw_input passthrough commands (/effort,
-    // /compact, /model, /btw, /clear) bypass runtimePtyInputPolicy and still
-    // need a screen-based hold alongside hookReviewInputHold.
+    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
+    // commands (/effort, /compact, /model, /btw, /clear) bypass
+    // runtimePtyInputPolicy, and interactive selection menus that still appear
+    // with bypass enabled (`ask_question`, Plan artifact review) also capture
+    // digit keys + Enter; both belong in one unified screen-based hold
+    // alongside hookReviewInputHold.
     supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;

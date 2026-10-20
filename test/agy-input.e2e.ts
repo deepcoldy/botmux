@@ -73,12 +73,14 @@ const AGY_AUTH_AVAILABLE = AGY_AVAILABLE && existsSync(OAUTH_TOKEN_PATH);
 
 function createIsolatedAgySandbox(queuedMessages: 'queue' | 'send-immediately' = 'queue') {
   const rootDir = mkdtempSync(join(tmpdir(), 'agy-e2e-sandbox-'));
+  // Keep outsideDir in an independent mkdtempSync root rather than a sibling
+  // under rootDir so agy reliably treats it as outside the workspace across
+  // environments.
+  const outsideDir = mkdtempSync(join(tmpdir(), 'agy-e2e-outside-'));
   const homeDir = join(rootDir, 'home');
   const workDir = join(rootDir, 'work');
-  const outsideDir = join(rootDir, 'outside');
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(workDir, { recursive: true });
-  mkdirSync(outsideDir, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: workDir });
 
   const realAgyDir = join(homedir(), '.gemini', 'antigravity-cli');
@@ -101,18 +103,42 @@ function createIsolatedAgySandbox(queuedMessages: 'queue' | 'send-immediately' =
       onboardingComplete: true,
     }, null, 2) + '\n',
   );
+  // Inherit model / modelProvider from the host's ~/.gemini/antigravity-cli/settings.json
+  // when present so the test works across accounts/regions without hardcoding a
+  // model that may be gated by location/tier eligibility.
+  let hostModel: string | undefined;
+  let hostModelProvider: string | undefined;
+  try {
+    const hostSettingsPath = join(realAgyDir, 'settings.json');
+    if (existsSync(hostSettingsPath)) {
+      const parsed = JSON.parse(readFileSync(hostSettingsPath, 'utf8'));
+      if (typeof parsed?.model === 'string' && parsed.model.trim()) {
+        hostModel = parsed.model;
+      }
+      if (typeof parsed?.modelProvider === 'string' && parsed.modelProvider.trim()) {
+        hostModelProvider = parsed.modelProvider;
+      }
+    }
+  } catch { /* ignore unreadable/malformed host settings */ }
+
   const settingsPath = join(isoAgyDir, 'settings.json');
   // agy strips keys that match its factory defaults ("queue") when writing
   // settings.json, so only include queuedMessages when non-default to keep
   // settingsContent byte-for-byte identical to agy's canonical file.
   const settingsObj: Record<string, unknown> = {
     colorScheme: 'dark',
-    model: 'Gemini 4 Argon (Medium)',
+    ...(hostModel ? { model: hostModel } : {}),
+    ...(hostModelProvider ? { modelProvider: hostModelProvider } : {}),
     ...(queuedMessages !== 'queue' ? { queuedMessages } : {}),
     trustedWorkspaces: Array.from(new Set([workDir, realpathSync(workDir)])),
   };
   const settingsContent = JSON.stringify(settingsObj, null, 2) + '\n';
   writeFileSync(settingsPath, settingsContent);
+
+  const cleanup = () => {
+    rmSync(rootDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  };
 
   return {
     rootDir,
@@ -124,6 +150,7 @@ function createIsolatedAgySandbox(queuedMessages: 'queue' | 'send-immediately' =
     settingsContent,
     historyPath: join(isoAgyDir, 'history.jsonl'),
     cliLogPath: join(isoAgyDir, 'cli.log'),
+    cleanup,
   };
 }
 
@@ -456,7 +483,7 @@ describe.skipIf(!AGY_AVAILABLE)('Antigravity (agy) first input submission', () =
       } finally {
         idleDetector.dispose();
         if (proc) { try { proc.kill(); } catch {} proc = null; }
-        rmSync(sandbox.rootDir, { recursive: true, force: true });
+        sandbox.cleanup();
       }
     },
     60_000,
@@ -580,7 +607,7 @@ describe.skipIf(!AGY_AVAILABLE)('Antigravity (agy) first input submission', () =
       } finally {
         idleDetector.dispose();
         if (proc) { try { proc.kill(); } catch {} proc = null; }
-        rmSync(sandbox.rootDir, { recursive: true, force: true });
+        sandbox.cleanup();
       }
     },
     60_000,
