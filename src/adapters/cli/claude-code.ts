@@ -1106,6 +1106,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // projectDir means no resume target could possibly exist — Claude
         // writes `<sid>.jsonl` there on first submit and never moves it.
         if (!existsSync(dirname(p))) return false;
+        // No CLI-native id was ever recorded, so the only resumable transcript
+        // is the botmux id's own, which Claude writes on the first submit. Its
+        // absence means a launch that died before any turn landed; `--resume`
+        // would only exit with "No conversation found".
+        if (!cliSessionId) return false;
         // Project dir exists but this specific sid doesn't. Could be a
         // mid-session rotation the adapter's pid resolver would catch — don't
         // block, let spawn try; the secondary guard still covers it.

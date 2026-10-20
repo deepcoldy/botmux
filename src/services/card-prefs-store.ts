@@ -82,6 +82,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
    *  gated on the tag) and costs two observability signals — see BotConfig.senderTag. */
   senderTag: boolean;
+  /** Hide email only in newly rendered sender tags. Default false. */
+  senderTagHideEmail: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -141,6 +143,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       privateCard: c.privateCard === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
+      senderTagHideEmail: c.senderTagHideEmail === true,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
@@ -176,6 +179,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       privateCard: false,
       cotEnabled: true,
       senderTag: true,
+      senderTagHideEmail: false,
       overloadAlert: false,
       botToBotSameDir: true,
       autoInviteOwnerOnGroupAdd: true,
@@ -300,6 +304,7 @@ async function updateBotCardPrefsInternal(
     if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
+    apply(entry, 'senderTagHideEmail', patch.senderTagHideEmail);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
@@ -338,6 +343,7 @@ async function updateBotCardPrefsInternal(
         privateCard: entry.privateCard === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
+        senderTagHideEmail: entry.senderTagHideEmail === true,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
@@ -409,6 +415,9 @@ async function updateBotCardPrefsInternal(
   if (patch.cotEnabled !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.cotEnabled = patch.cotEnabled === false ? false : undefined;
+  }
+  if (patch.senderTagHideEmail !== undefined) {
+    bot.config.senderTagHideEmail = patch.senderTagHideEmail || undefined;
   }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -487,6 +496,7 @@ async function updateBotCardPrefsInternal(
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
+    `senderTagHideEmail=${r.result.senderTagHideEmail} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +

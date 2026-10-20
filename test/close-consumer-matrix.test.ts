@@ -85,6 +85,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: '/dismiss returns refusal/residual details to the command handler and '
       + 'preserves the group unless closure is known and clean; test/dismiss-command.test.ts covers both.',
   },
+  'core/dismiss-command.ts::closeOne::closeSession': {
+    category: 'user_surface',
+    why: '/dismiss co-resident sessions of this bot: a refusal, unknown session or residual is '
+      + 'reported per session and keeps both the resident session and the group.',
+  },
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
     why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '
@@ -387,6 +392,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
   },
   'core/command-handler.ts::handleCommand::close-route': {
     why: 'Cross-daemon /close wt parses residual and refuses worktree removal when remote teardown is incomplete.',
+    mustParse: true,
+  },
+  'core/dismiss-command.ts::closeOne::close-route': {
+    why: '/dismiss closes peer bots\' sessions in the group; residual is reported and keeps the group.',
     mustParse: true,
   },
   'core/dashboard-ipc-server.ts::<module>::close-route': {

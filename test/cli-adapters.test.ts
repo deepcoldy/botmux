@@ -4455,6 +4455,45 @@ describe('resumeRequiresCliSessionId capability', () => {
   });
 });
 
+describe('claude-code checkResumeTargetExists', () => {
+  const sessionId = '3becbc33-71b1-4694-9b98-7a975ed890c6';
+  let dataDir: string;
+  let workingDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-claude-probe-'));
+    workingDir = mkdtempSync(join(tmpdir(), 'botmux-claude-cwd-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(workingDir, { recursive: true, force: true });
+  });
+  const projectDir = () => join(dataDir, 'projects', realpathSync(workingDir).replace(/[^A-Za-z0-9-]/g, '-'));
+
+  it('is false when a first launch died before writing its own transcript', () => {
+    // The cwd's project dir is shared with sibling sessions; it existing proves
+    // nothing about this session. `--resume` would exit "No conversation found".
+    mkdirSync(projectDir(), { recursive: true });
+    writeFileSync(join(projectDir(), `${randomUUID()}.jsonl`), '{}\n');
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({ sessionId, workingDir, dataDir })).toBe(false);
+  });
+
+  it('stays inconclusive for a recorded CLI id whose transcript is not in this cwd', () => {
+    mkdirSync(projectDir(), { recursive: true });
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({
+      sessionId, cliSessionId: randomUUID(), workingDir, dataDir,
+    })).toBeUndefined();
+  });
+
+  it('is true once the session transcript exists', () => {
+    mkdirSync(projectDir(), { recursive: true });
+    writeFileSync(join(projectDir(), `${sessionId}.jsonl`), '{}\n');
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({ sessionId, workingDir, dataDir })).toBe(true);
+  });
+});
+
 describe('kiro-cli buildArgs', () => {
   const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
 

@@ -43,6 +43,9 @@ function overflowAllowsScroll(value: string): boolean {
 }
 
 function canScroll(target: HTMLElement, axis: Axis): boolean {
+  // The session table owns its local interactive horizontal overlay. All other
+  // axes/containers retain the original display-only floating scrollbar path.
+  if (axis === 'x' && target.hasAttribute('data-local-horizontal-scrollbar')) return false;
   const style = getComputedStyle(target);
   const overflow = axis === 'y' ? style.overflowY : style.overflowX;
   if (!overflowAllowsScroll(overflow)) return false;
@@ -251,7 +254,7 @@ export function initFloatingScrollbars(root: HTMLElement): void {
     // in the observed subtree) would re-trigger the observer → a self-sustaining rAF loop.
     for (const record of records) {
       const node = record.target;
-      if (node instanceof Element && node.closest('.floating-scrollbar-layer')) continue;
+      if (node instanceof Element && node.closest('.floating-scrollbar-layer, .session-horizontal-scrollbar')) continue;
       scheduleRescan();
       return;
     }

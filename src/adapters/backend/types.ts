@@ -11,6 +11,119 @@ import type {
 
 export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
 
+export type HerdrBackendPlacement = 'workspace' | 'tab' | 'split';
+
+export interface HerdrBackendConfig {
+  /**
+   * Named Herdr session to host Botmux-managed agents.
+   * Defaults to 'botmux'.
+   * When pointing to an external user session (e.g. 'default'), Botmux launches
+   * agents inside that session and never destroys or restarts the host session.
+   */
+  sessionName?: string;
+
+  /**
+   * Placement mode for new managed agent panes:
+   * - 'workspace' (default): creates a new workspace for each topic (herdr workspace create).
+   * - 'tab': creates a new tab inside the target workspace (herdr tab create).
+   * - 'split': splits an existing pane inside the target tab (herdr pane split).
+   */
+  placement?: HerdrBackendPlacement;
+
+  /**
+   * Target workspace id or label when placement is 'tab' or 'split'. Matched by
+   * exact id/label, then the label's first word, then prefix, then substring.
+   * Falls back to the focused workspace.
+   */
+  workspace?: string;
+
+  /**
+   * Target tab id or label when placement is 'split' (e.g. "3 其他" or "3"),
+   * matched like `workspace`; also the label of a tab Botmux creates.
+   */
+  tab?: string;
+
+  /**
+   * Split direction when placement is 'split'. Default 'right'.
+   */
+  splitDirection?: 'right' | 'down';
+
+  /**
+   * Chat types this placement applies to (e.g. ['group'] keeps DM sessions out
+   * of the user's session). Unset = every session. Sessions of other types use
+   * the default machine-wide 'botmux' host with workspace placement.
+   */
+  chatTypes?: Array<'group' | 'p2p'>;
+}
+
+/** `chatTypes` from bots.json or a comma-separated env value. Unknown entries
+ *  are dropped; nothing valid left means "unset" (applies to every session). */
+export function normalizeHerdrChatTypes(raw: unknown): Array<'group' | 'p2p'> | undefined {
+  const items = typeof raw === 'string' ? raw.split(',') : Array.isArray(raw) ? raw : [];
+  const types = [...new Set(items
+    .map(item => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item): item is 'group' | 'p2p' => item === 'group' || item === 'p2p'))];
+  return types.length > 0 ? types : undefined;
+}
+
+/** Normalize a herdr block from bots.json or the BOTMUX_HERDR_* env, keeping
+ *  only the fields that are set so a bot block can be layered over the env
+ *  block field by field. Nothing set → undefined. */
+export function normalizeHerdrBackendConfig(raw: unknown): HerdrBackendConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+  const config: HerdrBackendConfig = {
+    sessionName: text(r.sessionName),
+    placement: r.placement === 'workspace' || r.placement === 'tab' || r.placement === 'split' ? r.placement : undefined,
+    workspace: text(r.workspace),
+    tab: text(r.tab),
+    splitDirection: r.splitDirection === 'right' || r.splitDirection === 'down' ? r.splitDirection : undefined,
+    chatTypes: normalizeHerdrChatTypes(r.chatTypes),
+  };
+  for (const key of Object.keys(config) as Array<keyof HerdrBackendConfig>) {
+    if (config[key] === undefined) delete config[key];
+  }
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+/** The herdr config a herdr-backed session spawns with: the bot's block layered
+ *  over the daemon-level BOTMUX_HERDR_* config field by field (an empty bot
+ *  block hides nothing). It only takes effect once it names a session or a
+ *  placement; otherwise the default 'botmux' host and workspace placement
+ *  apply, same as having no config. */
+export function resolveHerdrBackendConfig(
+  daemonConfig: HerdrBackendConfig | undefined,
+  botConfig: HerdrBackendConfig | undefined,
+): HerdrBackendConfig | undefined {
+  const merged: HerdrBackendConfig = { ...daemonConfig, ...botConfig };
+  return merged.sessionName || merged.placement ? merged : undefined;
+}
+
+/** The Herdr placement a worker applies, from its init `backendConfig`.
+ *  Undefined (default host and placement) when there is no herdr block or
+ *  `chatTypes` excludes this session's chat type. */
+export function herdrConfigForSession(
+  backendConfig: unknown,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  const config = backendConfig && typeof backendConfig === 'object'
+    && ('sessionName' in backendConfig || 'placement' in backendConfig)
+    ? backendConfig as HerdrBackendConfig
+    : undefined;
+  return herdrConfigForChatType(config, chatType);
+}
+
+/** The Herdr placement for one session, or undefined when `chatTypes` excludes
+ *  its chat type (the session then uses the default host). */
+export function herdrConfigForChatType(
+  config: HerdrBackendConfig | undefined,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  if (!config?.chatTypes) return config;
+  return chatType && config.chatTypes.includes(chatType) ? config : undefined;
+}
+
 export interface BackendTurnInput {
   content: string;
   turnId: string;
@@ -99,6 +212,8 @@ export interface SpawnOpts {
    * Backends that execute `bin` directly (pty/tmux/zellij/zmx) ignore it.
    */
   cliBin?: string;
+  /** Logical CLI identifier (e.g. 'claude', 'codex') for agent kind fallback. */
+  cliId?: string;
   /** Provider-neutral model selection for structured remote runners. */
   model?: string;
   /** Provider-neutral model backend variant for structured remote runners. */

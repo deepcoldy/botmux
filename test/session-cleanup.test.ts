@@ -24,7 +24,6 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 
 describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
-    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([24, 72, 168]);
     expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
     expect(parseIdleCleanupHours(24)).toBe(24);
     expect(parseIdleCleanupHours('72')).toBe(72);

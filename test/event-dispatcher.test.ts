@@ -1985,6 +1985,55 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('replays a granted message through the normal route outside durable primary', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello after grant' }),
+      messageId: 'msg-grant-replay',
+      chatId: 'chat-grant-replay',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.replayMessageEvent!(data);
+    await vi.waitFor(() => expect(handlers.handleNewTopic).toHaveBeenCalledOnce());
+    runtime.close();
+  });
+
+  it('does not replay a granted message around the durable inbox under durable primary', async () => {
+    // 授权卡落盘后能跨重启恢复：在 disabled/shadow 下发出的卡，daemon 以 primary 重启后被点「授权」，
+    // 重放不能绕过 durable Inbox / canonical Session 所有权直接本地派发。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary, primaryRecoverySettleMs: 0 },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello after grant' }),
+      messageId: 'msg-grant-replay-primary',
+      chatId: 'chat-grant-replay',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.replayMessageEvent!(data);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('persists realtime primary messages while the elected replica backfills history', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
@@ -4027,6 +4076,53 @@ describe('message listener polling backfill', () => {
           senderOpenId: OTHER_BOT_APP_ID,
           senderType: 'bot',
           msgType: 'interactive',
+        }),
+      }),
+    );
+  });
+
+  it('routes a recent top-level merge-forward message found in chat history', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [USER_OPEN_ID],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const forwarded = makeHistoryMessage({
+      senderAppId: USER_OPEN_ID,
+      senderType: 'user',
+      messageType: 'merge_forward',
+      messageId: 'msg-polled-forward',
+      chatId: 'chat_listener',
+      content: '{}',
+      createTime: String(Date.now()),
+    });
+    forwarded.sender.id_type = 'open_id';
+    mockListChatMessagesUntil.mockResolvedValueOnce([forwarded]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-forward' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-polled-forward',
+        messageListener: expect.objectContaining({
+          senderOpenId: USER_OPEN_ID,
+          senderType: 'user',
+          msgType: 'merge_forward',
         }),
       }),
     );
@@ -11796,6 +11892,30 @@ describe('solo-group mention bypass configuration', () => {
     const event = await send();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+    }));
+  });
+
+  it('routes configured merge-forward topic roots through the listener', async () => {
+    start({
+      soloGroupMentionBypass: false,
+      messageListeners: {
+        [CHAT]: {
+          enabled: true, prompt: 'Read forwarded messages',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = await send({
+      messageType: 'merge_forward',
+      content: '{}',
+    });
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      messageListener: expect.objectContaining({
+        senderOpenId: USER_OPEN_ID,
+        msgType: 'merge_forward',
+      }),
     }));
   });
 

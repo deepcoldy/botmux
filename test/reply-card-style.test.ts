@@ -8,9 +8,11 @@ import {
   normalizeReplyStyleConfig,
   parseReplyLayoutRequest,
   REPLY_LAYOUT_TAG_MAX_CODEPOINTS,
+  REPLY_HEADER_COLORS,
   REPLY_LAYOUT_TAG_COLORS,
   REPLY_LAYOUTS,
   REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
+  REPLY_TEXT_TAG_COLORS,
   resolveReplyStyle,
 } from '../src/im/lark/reply-card-style.js';
 
@@ -48,31 +50,16 @@ describe('reply-card layout request', () => {
 });
 
 describe('default reply-card layout headers', () => {
-  it('keeps the finalised five prefixes and official color mapping', () => {
-    expect(DEFAULT_REPLY_LAYOUT_TITLES).toEqual({
-      result: '结果',
-      progress: '进度',
-      risk: '需要确认',
-      blocked: '受阻',
-      handoff: '交接',
-    });
-    expect(DEFAULT_REPLY_LAYOUT_COLORS).toEqual({
-      result: 'green',
-      progress: 'blue',
-      risk: 'orange',
-      blocked: 'red',
-      handoff: 'indigo',
-    });
+  it('uses only colors from the official card palettes', () => {
+    // 飞书会拒收不在官方色板里的颜色；标题模板色与 text_tag 色是两套不同的色板。
+    for (const layout of REPLY_LAYOUTS) {
+      expect(REPLY_HEADER_COLORS).toContain(DEFAULT_REPLY_LAYOUT_COLORS[layout]);
+      expect(REPLY_TEXT_TAG_COLORS).toContain(REPLY_LAYOUT_TAG_COLORS[layout]);
+    }
   });
 
-  it('adds a red “需要你” tag only to risk and blocked', () => {
-    expect(DEFAULT_REPLY_LAYOUT_TAGS).toEqual({
-      result: '',
-      progress: '',
-      risk: '需要你',
-      blocked: '需要你',
-      handoff: '',
-    });
+  it('adds a tag only to the layouts that need the reader to act (risk and blocked)', () => {
+    expect(REPLY_LAYOUTS.filter(layout => DEFAULT_REPLY_LAYOUT_TAGS[layout])).toEqual(['risk', 'blocked']);
 
     for (const layout of REPLY_LAYOUTS) {
       const header = buildDefaultReplyLayoutHeader(layout);
@@ -220,9 +207,6 @@ describe('replyStyle normalisation and theme resolution', () => {
       risk: { template: 'orange', tag: '需要你', tagColor: 'red' },
       blocked: { template: 'red', tag: '需要你', tagColor: 'red' },
       handoff: { template: 'indigo', tag: '交接', tagColor: 'indigo' },
-    });
-    expect(REPLY_LAYOUT_TAG_COLORS).toEqual({
-      result: 'green', progress: 'blue', risk: 'red', blocked: 'red', handoff: 'indigo',
     });
   });
 

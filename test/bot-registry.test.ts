@@ -1357,6 +1357,26 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
   });
 });
 
+describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only an explicit true', () => {
+    const [enabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: true },
+    ]));
+    expect(enabled.autoStartOnGroupJoinGateRequired).toBe(true);
+
+    const [disabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
+    ]));
+    expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
 describe('parseBotConfigsFromText — replyStyle', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
 

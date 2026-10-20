@@ -520,7 +520,7 @@ describe('runHookCommandForTest', () => {
 
 // ─── 同步前置校验闸（sync gate hooks） ──────────────────────────────────────
 
-describe('sync gate hooks (prompt.submit)', () => {
+describe('sync gate hooks', () => {
   /** 写一个按参数决定行为的 hook 脚本，返回可直接放进 command 的路径。 */
   function writeHook(name: string, body: string, dir = tmpDir): string {
     const script = join(dir, name);
@@ -565,6 +565,32 @@ describe('sync gate hooks (prompt.submit)', () => {
     gateHooks([{ event: 'prompt.submit', command: '/bin/false', mode: 'async' }]);
     const decision = await evaluatePromptGate('prompt.submit', { content: 'hi' });
     expect(decision.allowed).toBe(true);
+  });
+
+  it('reports whether a matching sync hook actually adjudicated the event', async () => {
+    gateHooks([{
+      event: 'chat.bot_added',
+      mode: 'sync',
+      command: writeHook('allow-join.js', `console.log(JSON.stringify({ decision: 'allow' }));`),
+      filter: { larkAppId: 'cli_target' },
+    }]);
+    const unmatched = await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_other' });
+    expect(unmatched).toMatchObject({ allowed: true });
+    expect(unmatched.matched).not.toBe(true);
+
+    const matched = await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_target' });
+    expect(matched).toMatchObject({ allowed: true, matched: true });
+  });
+
+  it('honours larkAppId compatibility filters for per-bot lifecycle gates', async () => {
+    gateHooks([{
+      event: 'chat.bot_added',
+      mode: 'sync',
+      command: writeHook('deny-target-join.js', `console.log(JSON.stringify({ decision: 'deny' }));`),
+      filter: { lark_app_id: 'cli_target' },
+    }]);
+    expect((await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_other' })).allowed).toBe(true);
+    expect((await evaluatePromptGate('chat.bot_added', { larkAppId: 'cli_target' })).allowed).toBe(false);
   });
 
   it('denies on a JSON verdict and surfaces the reason to the caller', async () => {
@@ -810,11 +836,13 @@ describe('sync gate hooks (prompt.submit)', () => {
         BOTMUX_HOOKS_JSON: JSON.stringify([
           { event: 'session.start', command: '/bin/true', mode: 'sync' },
           { event: 'prompt.submit', command: '/bin/true', mode: 'sync' },
+          { event: 'chat.bot_added', command: '/bin/true', mode: 'sync' },
         ]),
       },
     });
     expect(hooks.find(h => h.event === 'session.start')?.mode).toBe('async');
     expect(hooks.find(h => h.event === 'prompt.submit')?.mode).toBe('sync');
+    expect(hooks.find(h => h.event === 'chat.bot_added')?.mode).toBe('sync');
   });
 
   it('never runs a sync gate hook a second time as a fire-and-forget notification', async () => {
