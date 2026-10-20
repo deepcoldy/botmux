@@ -1,6 +1,6 @@
 import { networkInterfaces } from 'node:os';
-import type { BackendType, HerdrBackendConfig } from './adapters/backend/types.js';
-import { normalizeHerdrChatTypes } from './adapters/backend/types.js';
+import type { BackendType } from './adapters/backend/types.js';
+import { normalizeHerdrBackendConfig } from './adapters/backend/types.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
@@ -297,18 +297,14 @@ export const config = {
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
-    herdr: (process.env.BOTMUX_HERDR_SESSION_NAME || process.env.BOTMUX_HERDR_PLACEMENT || process.env.BOTMUX_HERDR_TAB
-      ? {
-          sessionName: process.env.BOTMUX_HERDR_SESSION_NAME?.trim() || undefined,
-          placement: (process.env.BOTMUX_HERDR_PLACEMENT === 'tab' || process.env.BOTMUX_HERDR_PLACEMENT === 'split' || process.env.BOTMUX_HERDR_PLACEMENT === 'workspace')
-            ? process.env.BOTMUX_HERDR_PLACEMENT
-            : undefined,
-          workspace: process.env.BOTMUX_HERDR_WORKSPACE?.trim() || undefined,
-          tab: process.env.BOTMUX_HERDR_TAB?.trim() || undefined,
-          splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION === 'down' ? 'down' : (process.env.BOTMUX_HERDR_SPLIT_DIRECTION === 'right' ? 'right' : undefined),
-          chatTypes: normalizeHerdrChatTypes(process.env.BOTMUX_HERDR_CHAT_TYPES),
-        }
-      : undefined) as HerdrBackendConfig | undefined,
+    herdr: normalizeHerdrBackendConfig({
+      sessionName: process.env.BOTMUX_HERDR_SESSION_NAME,
+      placement: process.env.BOTMUX_HERDR_PLACEMENT,
+      workspace: process.env.BOTMUX_HERDR_WORKSPACE,
+      tab: process.env.BOTMUX_HERDR_TAB,
+      splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION,
+      chatTypes: process.env.BOTMUX_HERDR_CHAT_TYPES,
+    }),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',

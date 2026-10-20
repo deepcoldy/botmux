@@ -51,7 +51,13 @@ import {
   selectSessionBackend,
   retireSupersededRecordedHerdrTarget,
 } from '../src/adapters/backend/session-backend-selector.js';
-import { herdrConfigForChatType, herdrConfigForSession, normalizeHerdrChatTypes } from '../src/adapters/backend/types.js';
+import {
+  herdrConfigForChatType,
+  herdrConfigForSession,
+  normalizeHerdrBackendConfig,
+  normalizeHerdrChatTypes,
+  resolveHerdrBackendConfig,
+} from '../src/adapters/backend/types.js';
 
 describe('selectSessionBackend with Herdr placement config', () => {
   beforeEach(() => {
@@ -233,5 +239,35 @@ describe('Herdr placement from worker decision to backend selection', () => {
   it('reads no placement from a non-herdr backendConfig', () => {
     expect(herdrConfigForSession({ baseUrl: 'https://riff.example' }, 'group')).toBeUndefined();
     expect(herdrConfigForSession(undefined, 'group')).toBeUndefined();
+  });
+});
+
+describe('Herdr config layering', () => {
+  it('keeps only the fields that are set, from bots.json or env strings', () => {
+    expect(normalizeHerdrBackendConfig({
+      sessionName: ' default ',
+      placement: 'split',
+      tab: '',
+      splitDirection: 'sideways',
+      chatTypes: 'group',
+    })).toEqual({ sessionName: 'default', placement: 'split', chatTypes: ['group'] });
+    expect(normalizeHerdrBackendConfig({})).toBeUndefined();
+    expect(normalizeHerdrBackendConfig({ sessionName: undefined, placement: undefined })).toBeUndefined();
+    expect(normalizeHerdrBackendConfig(undefined)).toBeUndefined();
+  });
+
+  it('layers the bot block over the env block field by field', () => {
+    const env = { sessionName: 'default', placement: 'split' as const, tab: '9' };
+    expect(resolveHerdrBackendConfig(env, { tab: '3' })).toEqual({ sessionName: 'default', placement: 'split', tab: '3' });
+    // An empty bot block (normalized to undefined) hides nothing.
+    expect(resolveHerdrBackendConfig(env, normalizeHerdrBackendConfig({}))).toEqual(env);
+    expect(resolveHerdrBackendConfig(undefined, { sessionName: 'default' })).toEqual({ sessionName: 'default' });
+  });
+
+  it('stays inactive until a session or placement is named', () => {
+    expect(resolveHerdrBackendConfig({ splitDirection: 'down' }, undefined)).toBeUndefined();
+    expect(resolveHerdrBackendConfig(undefined, { tab: '3' })).toBeUndefined();
+    expect(resolveHerdrBackendConfig({ splitDirection: 'down' }, { placement: 'split' })).toEqual({ splitDirection: 'down', placement: 'split' });
+    expect(resolveHerdrBackendConfig(undefined, undefined)).toBeUndefined();
   });
 });

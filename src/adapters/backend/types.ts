@@ -65,6 +65,40 @@ export function normalizeHerdrChatTypes(raw: unknown): Array<'group' | 'p2p'> | 
   return types.length > 0 ? types : undefined;
 }
 
+/** Normalize a herdr block from bots.json or the BOTMUX_HERDR_* env, keeping
+ *  only the fields that are set so a bot block can be layered over the env
+ *  block field by field. Nothing set → undefined. */
+export function normalizeHerdrBackendConfig(raw: unknown): HerdrBackendConfig | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+  const config: HerdrBackendConfig = {
+    sessionName: text(r.sessionName),
+    placement: r.placement === 'workspace' || r.placement === 'tab' || r.placement === 'split' ? r.placement : undefined,
+    workspace: text(r.workspace),
+    tab: text(r.tab),
+    splitDirection: r.splitDirection === 'right' || r.splitDirection === 'down' ? r.splitDirection : undefined,
+    chatTypes: normalizeHerdrChatTypes(r.chatTypes),
+  };
+  for (const key of Object.keys(config) as Array<keyof HerdrBackendConfig>) {
+    if (config[key] === undefined) delete config[key];
+  }
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+/** The herdr config a herdr-backed session spawns with: the bot's block layered
+ *  over the daemon-level BOTMUX_HERDR_* config field by field (an empty bot
+ *  block hides nothing). It only takes effect once it names a session or a
+ *  placement; otherwise the default 'botmux' host and workspace placement
+ *  apply, same as having no config. */
+export function resolveHerdrBackendConfig(
+  daemonConfig: HerdrBackendConfig | undefined,
+  botConfig: HerdrBackendConfig | undefined,
+): HerdrBackendConfig | undefined {
+  const merged: HerdrBackendConfig = { ...daemonConfig, ...botConfig };
+  return merged.sessionName || merged.placement ? merged : undefined;
+}
+
 /** The Herdr placement a worker applies, from its init `backendConfig`.
  *  Undefined (default host and placement) when there is no herdr block or
  *  `chatTypes` excludes this session's chat type. */
