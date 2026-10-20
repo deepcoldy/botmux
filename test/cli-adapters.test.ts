@@ -27,6 +27,7 @@ vi.mock('node:child_process', () => ({
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -3569,12 +3570,20 @@ describe('readyPattern', () => {
     expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
     expect(typeof adapter.isSessionBusy).toBe('function');
     expect(adapter.supportsTypeAhead).toBe(true);
+    const bypassedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, false));
+    const restrictedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, true));
     expect(shouldWriteNow({
       isPromptReady: false,
       isFlushing: false,
-      supportsTypeAhead: adapter.supportsTypeAhead === true,
+      supportsTypeAhead: bypassedPolicy.supportsTypeAhead,
       awaitingFirstPrompt: false,
     })).toBe(true);
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: restrictedPolicy.supportsTypeAhead,
+      awaitingFirstPrompt: false,
+    })).toBe(false);
   });
 
   it('mtr has no readyPattern', () => {

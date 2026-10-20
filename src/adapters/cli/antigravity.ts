@@ -454,11 +454,16 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: /\? for shortcuts/,
     busyPattern: /esc to cancel/,
-    // agy records Enter in history.jsonl immediately while a turn is running,
-    // and Queued Messages = send-immediately forwards that text into the
-    // active conversation (it does not cancel the in-flight tool). Leave this
-    // off and botmux holds the next Lark message until the whole turn is idle,
-    // so the CLI setting never sees the keystrokes.
+    // agy records Enter in history.jsonl immediately while a turn is running:
+    // Queue mode parks the message until turn end (Auto-flush), while
+    // Queued Messages = send-immediately forwards it into the active
+    // conversation without cancelling the in-flight tool. Without
+    // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
+    // a permission dialog where Enter approves and digit keys jump options, so
+    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
+    // Known issue (follow-up): busy raw_input passthrough commands (/effort,
+    // /compact, /model, /btw, /clear) bypass runtimePtyInputPolicy and still
+    // need a screen-based hold alongside hookReviewInputHold.
     supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;

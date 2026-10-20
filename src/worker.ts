@@ -484,7 +484,11 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
-import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
+import {
+  inspectPostTerminalComposer,
+  isTypeAheadBlockedByBypass,
+  resolvePtyInputPolicy,
+} from './utils/pty-input-policy.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -14912,6 +14916,7 @@ function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
     cliAdapter ?? {},
     backendScreenEvidenceIsAuthoritativeForMutation(),
     codexAppRuntimeTypeAheadReady(),
+    isTypeAheadBlockedByBypass(cliAdapter ?? { id: lastInitConfig?.cliId }, lastInitConfig?.disableCliBypass),
   );
 }
 
