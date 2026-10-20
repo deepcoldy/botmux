@@ -1686,8 +1686,9 @@ export interface BotConfig {
    * `bytedcli` run as the person who sent the current message; a sender who has
    * not authorized gets a refusal carrying an authorization link — never the
    * bot's, the owner's or anyone else's login. `credentialSource` picks where
-   * that person's credentials come from (central platform / this machine).
-   * See services/trigger-user-auth.ts.
+   * that person's credentials come from (central platform / this machine); on a
+   * platform-bound machine the link points at the platform and no machine-local
+   * device login is started. See services/trigger-user-auth.ts.
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
