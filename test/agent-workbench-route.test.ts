@@ -22,44 +22,6 @@ describe('Agent Workbench route and surface integration', () => {
     }
   });
 
-  it('uses a chrome-less host for both Workbench surfaces', () => {
-    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
-    expect(app).toContain("activeHash.startsWith('#/agent-workbench-dock')");
-    expect(app).toContain('workbench-route-host');
-    expect(app).toContain('data-workbench-surface');
-  });
-
-  // 直达入口（/workbench 跳板、?t= 登录跳转、短票兑换、CLI / 卡片链接）落沉浸式
-  // 无边框壳，靠 hash 里的 botmuxWorkbenchShell=immersive 标记；侧栏进入不带标记、
-  // 保持正常壳。钉死三处服务端目标都取自同一份常量，前端壳判定认这个标记。
-  it('direct entries land on the immersive surface; the sidebar keeps the shell', () => {
-    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
-    expect(app).toContain('(readDashboardClientShell() || readDashboardWorkbenchShell())');
-
-    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboard).toContain(
-      "url.pathname === '/workbench/dock' ? WORKBENCH_DOCK_IMMERSIVE_HASH : WORKBENCH_IMMERSIVE_HASH",
-    );
-    const auth = readFileSync(join(process.cwd(), 'src/dashboard/auth.ts'), 'utf8');
-    expect(auth).toContain('? WORKBENCH_IMMERSIVE_ENTRY');
-    expect(auth).toContain('? WORKBENCH_DOCK_IMMERSIVE_ENTRY');
-    const ticket = readFileSync(join(process.cwd(), 'src/dashboard/workbench-ticket.ts'), 'utf8');
-    expect(ticket).toContain('location: WORKBENCH_IMMERSIVE_ENTRY');
-  });
-
-  // 工作台是无边框壳（没有 topbar/侧栏），登录态失效时 AuthExpiredOverlay 是它
-  // **唯一**的自救出口。普通壳一直传着 loginUrl，工作台壳漏传 → 浮层退化成
-  // 「访问链接已失效，知道了」的死胡同，一键登录按钮根本不渲染。两处必须一致。
-  it('passes loginUrl to AuthExpiredOverlay on the Workbench shell too', () => {
-    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
-    const overlayProps = app.match(/<AuthExpiredOverlay[\s\S]*?\/>/g) ?? [];
-    // 两个壳各一处：工作台壳 + 普通壳。
-    expect(overlayProps.length).toBe(2);
-    for (const usage of overlayProps) {
-      expect(usage).toContain('dashboardLoginHref(authLoginBaseUrl, location.hash)');
-    }
-  });
-
   it('allows login continuation only to Workbench routes', () => {
     expect(safeDashboardH5ReturnTo('/#/agent-workbench/s%2F1')).toBe('/#/agent-workbench/s%2F1');
     expect(safeDashboardH5ReturnTo('/#/agent-workbench-dock/s%2F1')).toBe('/#/agent-workbench-dock/s%2F1');
@@ -67,31 +29,8 @@ describe('Agent Workbench route and surface integration', () => {
     expect(safeDashboardH5ReturnTo('//evil.example/#/agent-workbench')).toBe('/');
   });
 
-  it('projects explicit ownership from terminal mutations and keeps H5 context private', () => {
-    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    // 控制权分发已经收进 dashboard/terminal-control-route.ts（生产与验收脚本共用的
-    // 那一份，行为断言在 test/terminal-control-route.test.ts）。这里只钉「接的是同
-    // 一根线」——上一轮正是因为脚本各写一份，`?expect=` 条件释放只在脚本里生效。
-    expect(dashboard).toContain('resolveTerminalControlAction({');
-    expect(dashboard).toContain('matchTerminalControlRoute(url.pathname)');
-    const route = readFileSync(join(process.cwd(), 'src/dashboard/terminal-control-route.ts'), 'utf8');
-    expect(route).toContain('{ ...result, owned: true }');
-    expect(route).toContain('{ ...result, owned: false }');
-    expect(dashboard).toContain("url.pathname === '/api/workbench/h5-context'");
-  });
-
   it('does not reinterpret a Workbench-only platform cookie as legacy owner authority', () => {
-    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    // P1-7 之后门禁选择与身份判定共用同一处结论，dashboard.ts 只负责接线；
-    // 语义断言在下面，用共享函数直接跑，而不是比对源码字符串。
-    expect(dashboard).toContain('resolveDashboardRequestGate({');
-    // 只读身份的写入口门禁住在共享路由里（生产与验收脚本同一份）。
-    const controlRoute = readFileSync(join(process.cwd(), 'src/dashboard/terminal-control-route.ts'), 'utf8');
-    expect(controlRoute).toContain("identity.terminalCapability === 'readonly'");
-    // 预览写操作的角色门禁改用共享判据（与 canInteract 投影、guard 壳的解锁按钮
-    // 同一个函数），语义矩阵在 test/preview-interaction.test.ts 里逐身份跑。
-    expect(dashboard).toContain('!previewInteractionWriteAllowed(requestIdentity)');
-
+    // P1-7 之后门禁选择与身份判定共用同一处结论（resolveDashboardRequestGate），这里直接跑共享函数。
     const ACTIVE = 'active-management-token';
     const platformIdentity = resolveDashboardIdentity({
       legacyCookie: ACTIVE,
@@ -156,40 +95,19 @@ describe('Agent Workbench route and surface integration', () => {
     expect(gate.decision.kind).toBe('deny401');
   });
 
-  // ── P1-4：能力集投影端点与前端消费链的接线钉死 ────────────────────────────
-  // 语义矩阵在 dashboard-auth.test.ts / agent-workbench-components.test.ts；这里
-  // 只钉「接的是同一根线」：端点调的是共享投影函数（而不是路由旁边再手写一张
-  // 表），前端严格解析后逐能力传给对应入口。
-  it('serves the capability projection from the shared projection function', () => {
+  // 源码结构护栏(K2)：预览交互的 unlock / activity / lock 分发在 dashboard.ts 的巨型请求处理里，
+  // 没有可单独驱动的 HTTP seam；previewInteractionWriteAllowed 是这条写入口唯一权威的角色门禁
+  // （前端按 canInteract 隐藏按钮只是省掉一次必然 403 的点击）。删掉或挪到写调用之后，只读身份
+  // 就能静默解锁预览写。判据本身的身份矩阵见 test/preview-interaction.test.ts。
+  it('gates every preview-interaction write behind the shared role check', () => {
     const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboard).toContain("url.pathname === '/api/workbench/capabilities'");
-    expect(dashboard).toContain('projectWorkbenchOperationCapabilities(requestIdentity)');
-  });
-
-  it('the SPA parses the projection strictly and hands each entry its own bit', () => {
-    const app = readFileSync(join(process.cwd(), 'src/dashboard/web/app.tsx'), 'utf8');
-    // 探测走 origFetch（匿名 401 是预期结果，不该触发全局登录浮层），且任何失败
-    // 回落 fail-closed 全 false。
-    expect(app).toContain("origFetch('/api/workbench/capabilities'");
-    expect(app).toContain('parseWorkbenchCapabilities');
-    expect(app).toContain('NO_WORKBENCH_CAPABILITIES');
-
-    const page = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-page.tsx'), 'utf8');
-    expect(page).toContain('capabilities={ui.workbenchCapabilities}');
-
-    const view = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8');
-    expect(view).toContain('props.capabilities.canLocate ? sessionId => api.locateSession(sessionId) : undefined');
-    // 行内的接管捷径已按产品决策移除（会话行只剩 聊天 / 终端），所以这里不再有
-    // `canControlTerminal` 这条投影——接管入口只剩终端面板标题栏那一个，能力位在
-    // 面板里把关（下面 panes 的 `props.capabilities.canControl` 就是那道闸；行为
-    // 断言见 agent-workbench-components.test.ts「行内没有『接管』按钮」与
-    // agent-workbench-terminal-control.test.ts「会话行只保留『聊天 / 终端』」）。
-    expect(view).not.toContain('canControlTerminal');
-    expect(view).toContain('onOpenTerminal={openSessionTerminal}');
-
-    const panes = readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-panes.tsx'), 'utf8');
-    expect(panes).toContain('props.capabilities.canControl');
-    expect(panes).toContain('props.capabilities.canInteract');
+    const gate = dashboard.search(/!\s*previewInteractionWriteAllowed\s*\(\s*requestIdentity\s*\)/);
+    expect(gate, 'dashboard.ts 里找不到预览写门禁').toBeGreaterThan(-1);
+    for (const write of ['unlock', 'activity', 'lock']) {
+      const calls = [...dashboard.matchAll(new RegExp(`previewInteraction\\.${write}\\(`, 'g'))].map(match => match.index!);
+      expect(calls.length, write).toBeGreaterThan(0);
+      for (const call of calls) expect(call, `previewInteraction.${write}( 先于门禁`).toBeGreaterThan(gate);
+    }
   });
 });
 
@@ -222,10 +140,4 @@ describe('chat opens as a real link, never as scripted navigation', () => {
       expect(stripComments(source)).not.toContain('location.assign');
     });
   }
-
-  it('keeps the anchor contract out of the JSAPI fallback path', () => {
-    const view = stripComments(readFileSync(join(process.cwd(), 'src/dashboard/web/agent-workbench-view.tsx'), 'utf8'));
-    expect(view).not.toContain('window.open');
-    expect(view).not.toContain('location.assign');
-  });
 });

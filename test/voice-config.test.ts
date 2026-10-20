@@ -3,7 +3,7 @@
  * Run: pnpm vitest run test/voice-config.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { evaluateVoiceConfig, DEFAULT_SAMI_SPEAKER } from '../src/services/voice/index.js';
+import { DEFAULT_SAMI_SPEAKER, evaluateVoiceConfig } from '../src/services/voice/index.js';
 import { toSpoken, pcmDurationMs, pcmToWav } from '../src/services/voice/audio.js';
 
 describe('evaluateVoiceConfig — button gating', () => {
@@ -94,6 +94,7 @@ describe('audio helpers', () => {
     expect(wav.length).toBe(44 + 100);
   });
 
+  // 外部服务标识：SAMI 侧的音色 id，写错只会在运行时合成失败。
   it('default SAMI speaker is 灿灿', () => {
     expect(DEFAULT_SAMI_SPEAKER).toBe('zh_female_cancan_mars_bigtts');
   });

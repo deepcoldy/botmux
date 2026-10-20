@@ -132,7 +132,7 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  lookup key; a collision-fallback spawn (grok mints its own id) is recovered through
  *  writeInput's prompt_history verify. */
 export const grokBridgeSpec: StructuredBridgeSpec = {
-  drain: (path, offset) => drainGrokUpdates(path, offset),
+  drain: (path, offset) => drainGrokUpdates(path, offset, { includePublicActivity: true }),
   locate: {
     bySessionId: (sessionId, cwd) => findGrokUpdatesBySessionId(sessionId, cwd),
     byPid: pid => {

@@ -2218,7 +2218,7 @@ export type CreateFeishuOpenPlatformAppResult =
 export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
   name: string;
   description?: string;
-  /** 测试/定制图标；默认复用 botmux dashboard 的 512x512 favicon。 */
+  /** 测试/定制图标；默认随机一种会话群同款渐变底色 + botmux logo（512x512，见 defaultAppIcon）。 */
   iconFilePath?: string;
   /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
   expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
@@ -2236,7 +2236,8 @@ class CreatedOpenPlatformAppError extends Error {
 }
 
 /**
- * The default Feishu app icon bytes (512×512 PNG).
+ * The plain botmux favicon (512×512 PNG): the fallback app icon when the random
+ * gradient icon cannot be rendered (see defaultAppIcon).
  *
  * ⚠️ THIS USED TO BE A DISK PATH AND THAT BROKE THE COMPILED BINARY. The old
  * implementation derived candidates from `import.meta.url`:
@@ -2271,6 +2272,21 @@ function defaultBotmuxAppIcon() {
     throw new Error(`botmux 默认应用图标解码后长度异常（${icon.length} != ${BOTMUX_APP_ICON_BYTES}）`);
   }
   return icon;
+}
+
+/**
+ * 新应用的默认图标：沿用会话群/`/g` 建群的头像——botmux logo + 十色渐变底色随机挑一种，
+ * 按开放平台上传要求渲染成 512×512。图标只是装饰，渲染异常时退回纯 favicon，
+ * 不能因此把建 bot 判死。
+ */
+async function defaultAppIcon(): Promise<Uint8Array> {
+  try {
+    const { renderBotAppIconPng } = await import('../services/bot-app-icon.js');
+    return renderBotAppIconPng();
+  } catch (err) {
+    console.warn(`随机渐变应用图标渲染失败，改用 botmux 默认图标: ${safeErrorMessage(err)}`);
+    return defaultBotmuxAppIcon();
+  }
 }
 
 /** The custom/test icon override, read off disk. Fails with the path in the message
@@ -2350,16 +2366,14 @@ export async function createOpenPlatformAppWithClient(
   // `iconFilePath` stays a DISK path: it is the test/custom-icon override, always
   // supplied by a caller that knows the file exists. Only the DEFAULT moved into the
   // module graph — that is the one that has to work inside the compiled binary.
-  //
-  // No explicit `Buffer` annotation on purpose: it widens to `Buffer<ArrayBufferLike>`,
-  // which tsc rejects as a `BlobPart` (SharedArrayBuffer is in that union). Inference
-  // keeps the narrower `Buffer<ArrayBuffer>` both branches actually produce.
   const icon = options.iconFilePath
     ? readIconFile(options.iconFilePath)
-    : defaultBotmuxAppIcon();
+    : await defaultAppIcon();
 
   const form = new FormData();
-  form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
+  // Copy into a fresh Uint8Array: tsc rejects `Uint8Array<ArrayBufferLike>` as a
+  // `BlobPart` (SharedArrayBuffer is in that union).
+  form.append('file', new Blob([new Uint8Array(icon)], { type: 'image/png' }), 'botmux.png');
   form.append('uploadType', '4'); // Open Platform console enum: Icon
   form.append('isIsv', 'false'); // 企业自建应用
   form.append('scale', JSON.stringify({ width: 512, height: 512 }));

@@ -60,6 +60,232 @@ function fakeStore() {
 }
 
 describe('durable session facade', () => {
+  it('renews retained live-runtime leases and stops renewing after a closed snapshot', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      vi.mocked(store.renewSessionLease).mockImplementation(async input => ({
+        kind: 'applied',
+        lease: { ...input.lease, leaseUntil: input.lease.leaseUntil + input.leaseDurationMs },
+      }));
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'live-runtime-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+      });
+
+      await expect(facade.writeExact('session-live', { status: 'active' }))
+        .resolves.toMatchObject({ kind: 'written' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+
+      await expect(facade.writeExact('session-live', { status: 'closed' }))
+        .resolves.toMatchObject({ kind: 'written' });
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a stale retained lease exactly once and stops renewing it', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      vi.mocked(store.renewSessionLease).mockResolvedValue({ kind: 'stale' });
+      const onLeaseLost = vi.fn();
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'stale-runtime-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+        onLeaseLost,
+      });
+
+      await facade.writeExact('session-stale', { status: 'active' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(onLeaseLost).toHaveBeenCalledOnce();
+      expect(onLeaseLost).toHaveBeenCalledWith('session-stale', expect.any(Error));
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a stale renewal result after a foreground write refreshes the lease', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      const delayedRenewal = deferred<Awaited<ReturnType<typeof store.renewSessionLease>>>();
+      vi.mocked(store.renewSessionLease).mockReturnValueOnce(delayedRenewal.promise);
+      const onLeaseLost = vi.fn();
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'renew-race-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+        onLeaseLost,
+      });
+
+      await facade.writeExact('session-renew-race', { status: 'active', revision: 1 });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.writeExact('session-renew-race', { status: 'active', revision: 2 });
+      delayedRenewal.resolve({ kind: 'stale' });
+      await Promise.resolve();
+
+      expect(onLeaseLost).not.toHaveBeenCalled();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a live lease renewing after a Session write throws', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-session-renew-error-'));
+    const databasePath = join(dir, 'coordination.db');
+    const ownerStore = new SqliteDurableCoordinationStore(databasePath, { now: () => Date.now() });
+    const peerStore = new SqliteDurableCoordinationStore(databasePath, { now: () => Date.now() });
+    const renew = vi.spyOn(ownerStore, 'renewSessionLease');
+    const write = vi.spyOn(ownerStore, 'writeSession');
+    const facade = createDurableSessionFacade({
+      store: ownerStore,
+      ownerId: 'renew-after-error-owner',
+      leaseDurationMs: 1_200,
+      keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+    });
+    try {
+      await expect(facade.writeExact('session-renew-after-error', { status: 'active', revision: 1 }))
+        .resolves.toMatchObject({ kind: 'written' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(renew).toHaveBeenCalledOnce();
+
+      write.mockRejectedValueOnce(new Error('transient Session write failure'));
+      await expect(facade.writeExact(
+        'session-renew-after-error',
+        { status: 'active', revision: 2 },
+      )).rejects.toThrow('transient Session write failure');
+
+      await vi.advanceTimersByTimeAsync(1_600);
+      expect(renew.mock.calls.length).toBeGreaterThan(1);
+      await expect(peerStore.acquireSessionLease({
+        sessionKey: 'session-renew-after-error',
+        ownerId: 'renew-after-error-peer',
+        leaseDurationMs: 1_200,
+      })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'renew-after-error-owner' });
+    } finally {
+      await facade.stop();
+      await ownerStore.close();
+      await peerStore.close();
+      rmSync(dir, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a live lease renewing after a conflicting Session write', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      vi.mocked(store.writeSession).mockResolvedValue({
+        kind: 'conflict',
+        current: {
+          sessionKey: 'session-live-conflict',
+          revision: 2,
+          value: { status: 'active' },
+          updatedAt: 2,
+        },
+      });
+      vi.mocked(store.renewSessionLease).mockImplementation(async input => ({
+        kind: 'applied',
+        lease: { ...input.lease, leaseUntil: input.lease.leaseUntil + input.leaseDurationMs },
+      }));
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'live-conflict-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+      });
+
+      await expect(facade.writeExact('session-live-conflict', { status: 'active' }))
+        .resolves.toMatchObject({ kind: 'conflict' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports lease loss when a live Session write returns stale lease', async () => {
+    const { store } = fakeStore();
+    vi.mocked(store.writeSession).mockResolvedValue({ kind: 'stale_lease' });
+    const onLeaseLost = vi.fn();
+    const facade = createDurableSessionFacade({
+      store,
+      ownerId: 'live-stale-write-owner',
+      keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+      onLeaseLost,
+    });
+
+    await expect(facade.writeExact('session-live-stale-write', { status: 'active' }))
+      .resolves.toEqual({ kind: 'stale_lease', coalescedCount: 1 });
+    expect(onLeaseLost).toHaveBeenCalledOnce();
+    expect(onLeaseLost).toHaveBeenCalledWith(
+      'session-live-stale-write',
+      expect.objectContaining({
+        message: expect.stringContaining('lease was stale when committing the Session write'),
+      }),
+    );
+    await facade.stop();
+  });
+
+  it('releases a write-scoped lease when a Session read throws', async () => {
+    const { store } = fakeStore();
+    vi.mocked(store.readSession).mockRejectedValueOnce(new Error('transient Session read failure'));
+    const facade = createDurableSessionFacade({ store, ownerId: 'release-after-error-owner' });
+
+    await expect(facade.writeExact('session-release-after-error', { status: 'active' }))
+      .rejects.toThrow('transient Session read failure');
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+    expect(store.releaseSessionLease).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'session-release-after-error',
+      ownerId: 'release-after-error-owner',
+    }));
+    await facade.stop();
+  });
+
+  it('orders an explicit lease release after earlier writes on the same lane', async () => {
+    const { store } = fakeStore();
+    const blockedWrite = deferred<WriteSessionResult>();
+    vi.mocked(store.writeSession).mockReturnValueOnce(blockedWrite.promise);
+    const facade = createDurableSessionFacade({ store, ownerId: 'release-owner' });
+
+    const write = facade.writeExact('session-release', { status: 'active' });
+    await vi.waitFor(() => expect(store.writeSession).toHaveBeenCalledOnce());
+    const release = facade.releaseLease('session-release');
+    expect(store.releaseSessionLease).not.toHaveBeenCalled();
+    blockedWrite.resolve({
+      kind: 'written',
+      record: {
+        sessionKey: 'session-release',
+        revision: 1,
+        value: { status: 'active' },
+        updatedAt: 1,
+      },
+    });
+
+    await expect(write).resolves.toMatchObject({ kind: 'written' });
+    await expect(release).resolves.toBe(true);
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+    await facade.stop();
+  });
+
   it('uses canonical equality across a real SQLite round trip', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-session-facade-'));
     const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 1 });

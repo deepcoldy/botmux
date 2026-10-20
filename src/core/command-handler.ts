@@ -1,4 +1,4 @@
-import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -10,7 +10,8 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
@@ -27,6 +28,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persist
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
+import { buildDismissConfirmCard } from '../im/lark/dismiss-card.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -162,24 +164,6 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
-
-const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
-
-/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
- *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
- *  iterating by code point keeps that limit without slicing an emoji's
- *  surrogate pair. */
-export function formatSlashGroupName(name: string, prefix = ''): string {
-  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
-  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
-
-  let truncated = '';
-  for (const character of prefixed) {
-    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
-    truncated += character;
-  }
-  return `${truncated}…`;
-}
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
@@ -398,8 +382,10 @@ function buildCloseWorktreeConfirmCard(args: {
   worktreeDir: string;
   sessions: import('../types.js').Session[];
   dirty: boolean;
-  dirtyCount: number;
-  dirtyFiles: string[];
+  uncommittedCount: number;
+  uncommittedFiles: string[];
+  ignoredCount: number;
+  ignoredFiles: string[];
   ahead: number;
   unpushedCommits: string[];
   invokerOpenId: string;
@@ -414,11 +400,17 @@ function buildCloseWorktreeConfirmCard(args: {
   // Safety checks: one compact line each; a detail line follows only when the
   // corresponding list is non-empty, so a clean worktree never prints "none\nnone".
   const checkLines: string[] = [
-    args.dirty
-      ? t('cmd.close.worktree_check_dirty_warn', { n: String(args.dirtyCount) }, loc)
-      : t('cmd.close.worktree_check_dirty_ok', undefined, loc),
+    args.uncommittedCount > 0
+      ? t('cmd.close.worktree_check_uncommitted_warn', { n: String(args.uncommittedCount) }, loc)
+      : t('cmd.close.worktree_check_uncommitted_ok', undefined, loc),
   ];
-  if (args.dirty && args.dirtyFiles.length) checkLines.push(closeWorktreeInlineDetail(args.dirtyFiles));
+  if (args.uncommittedFiles.length) checkLines.push(closeWorktreeInlineDetail(args.uncommittedFiles));
+  checkLines.push(
+    args.ignoredCount > 0
+      ? t('cmd.close.worktree_check_ignored_warn', { n: String(args.ignoredCount) }, loc)
+      : t('cmd.close.worktree_check_ignored_ok', undefined, loc),
+  );
+  if (args.ignoredFiles.length) checkLines.push(closeWorktreeInlineDetail(args.ignoredFiles));
   checkLines.push(
     args.ahead > 0
       ? t('cmd.close.worktree_check_ahead_warn', { n: String(args.ahead) }, loc)
@@ -455,18 +447,28 @@ function buildCloseWorktreeConfirmCard(args: {
       content: `<font color='grey'>${t(hasRisk ? 'cmd.close.worktree_confirm_effect' : 'cmd.close.worktree_effect_safe', undefined, loc)}</font>`,
     },
     {
-      tag: 'action',
-      actions: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
-        type: 'danger',
-        value: {
-          action: 'close_worktree_confirm',
-          root_id: args.rootId,
-          session_id: args.sessionId,
-          invoker_open_id: args.invokerOpenId,
-          confirmation_state: args.confirmationState,
-        },
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('cmd.close.worktree_confirm_button', undefined, loc) },
+          type: 'danger',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'close_worktree_confirm',
+              root_id: args.rootId,
+              session_id: args.sessionId,
+              invoker_open_id: args.invokerOpenId,
+              confirmation_state: args.confirmationState,
+            },
+          }],
+        }],
       }],
     },
   ];
@@ -1482,7 +1484,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex'].includes(ds?.session.cliId ?? botConfig.cliId);
+    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -2264,6 +2266,13 @@ export async function handleCommand(
       }
 
       case '/dismiss': {
+        // durable primary 下，解散会话组必须由跨副本一致的控制面提交。
+        // 这里仍是本地 session-store 路径；在接入 canonical control 前先 fail closed，
+        // 避免任一副本单独删除会话或群组状态。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.dismiss.primary_unsupported', undefined, loc));
+          break;
+        }
         const appId = larkAppId ?? ds?.larkAppId;
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
@@ -2278,22 +2287,37 @@ export async function handleCommand(
         }
         const result = await dismissSessionGroup({
           larkAppId: appId, chatId, rootId, senderId: message.senderId,
-          confirmedState: parsed[1], activeSessions,
+          confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
           // The deleted group cannot receive the receipt; notify privately.
           try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
           catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+        } else if (result.status === 'confirm') {
+          await sessionReply(rootId, buildDismissConfirmCard({
+            chatId,
+            invokerOpenId: message.senderId,
+            confirmationState: result.state,
+            rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            loc,
+          }), 'interactive');
+        } else if (result.status === 'peer_offline') {
+          await sessionReply(rootId, t('cmd.dismiss.peer_offline', { bots: result.larkAppIds.map(botDisplayName).join('、') }, loc));
         } else {
-          const reply = result.status === 'confirm'
-            ? t('cmd.dismiss.confirm', { command: `/dismiss --confirm=${result.state}` }, loc)
-            : t(`cmd.dismiss.${result.status}`, undefined, loc);
+          const reply = t(`cmd.dismiss.${result.status}`, undefined, loc);
           await sessionReply(rootId, reply + ('detail' in result && result.detail ? `\n${result.detail}` : ''));
         }
         break;
       }
 
       case '/close': {
+        // primary 的无参数 /close 会在 daemon 入口转交 durable control。
+        // 能落到这里的请求（含 /close wt 和卡片确认）都不能再执行本地关闭、
+        // sibling 回收或 worktree 删除；否则其它副本仍会保留旧的权威状态。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.close.primary_unsupported', undefined, loc));
+          break;
+        }
         const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
         const closeTokens = closeArg.split(/\s+/).filter(Boolean);
         const removeWorktree = /^(wt|worktree)$/i.test(closeTokens[0] ?? '');
@@ -2401,8 +2425,10 @@ export async function handleCommand(
                 worktreeDir,
                 sessions: [ds.session, ...siblingSessions],
                 dirty: safety.dirty,
-                dirtyCount: safety.dirtyCount,
-                dirtyFiles: safety.dirtyFiles,
+                uncommittedCount: safety.uncommittedCount,
+                uncommittedFiles: safety.uncommittedFiles,
+                ignoredCount: safety.ignoredCount,
+                ignoredFiles: safety.ignoredFiles,
                 ahead: safety.ahead,
                 unpushedCommits: safety.unpushedCommits,
                 invokerOpenId: message.senderId,
@@ -2687,6 +2713,12 @@ export async function handleCommand(
 
       case '/detach':
       case '/disconnect': {
+        // detach/disconnect 仍直接关闭本副本的 worker。primary 模式下必须等
+        // canonical control 接线后才能开放，否则会制造跨副本可见性分叉。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.detach.primary_unsupported', undefined, loc));
+          break;
+        }
         // 文字版的"⏏ 断开"按钮：共享接入会话适用。
         //   - tmux adopt：BotMux 停止观察外部终端，不结束原 CLI；
         //   - existing App Server adopt：BotMux 停止自己的 `codex --remote`
@@ -2973,7 +3005,8 @@ export async function handleCommand(
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
               || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
+              || current.pendingChatContext !== undefined
+              || current.pendingGroupJoinContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -3007,6 +3040,7 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  groupJoinContext: current.pendingGroupJoinContext,
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
@@ -3046,7 +3080,10 @@ export async function handleCommand(
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? {
+                turnId: pendingTurnId,
+                ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
+              } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -3065,6 +3102,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;
@@ -3779,9 +3818,50 @@ export async function handleCommand(
           await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
           break;
         }
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
+        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
+        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
+        const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
+          ? platformCredentialsUrl() : null;
+        const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
+        if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
+          && (subCmd === '' || explicitGoverned)) {
+          await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
+          break;
+        }
+        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
+          const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
+            : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
+          const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
+            ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
+          const lines = [
+            t('cmd.login.platform_title', undefined, loc), '',
+            t('cmd.login.platform_step1', { provider }, loc),
+            platformCredsUrl, '',
+            t('cmd.login.platform_step2', undefined, loc), '',
+            t('cmd.login.platform_note', { tool: which }, loc),
+          ];
+          if (credSource === 'auto' && subCmd === '') {
+            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
+          if (platformCredsUrl) {
+            lines.push(t('cmd.login.platform_status', {
+              tool: [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / '),
+              url: platformCredsUrl,
+            }, loc));
+          }
           if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
@@ -5005,7 +5085,15 @@ export async function handleCommand(
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
           baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
-        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
+        const namePrefix = readGlobalConfig().groupNamePrefix;
+        const groupName = formatSlashGroupName(baseGroupName, namePrefix);
+        // Unnamed groups are AI-titled from their first message, as session
+        // groups are. The title needs a one-shot print mode of this bot's CLI
+        // and an unsandboxed bot (the call runs on the host); otherwise the
+        // placeholder simply stays (same silent degrade).
+        const decorations = resolveGroupDecorations(groupArgs);
+        const { oneShotTitleAllowed } = await import('../services/session-group-title.js');
+        const autoTitle = decorations.autoTitle && oneShotTitleAllowed(getBot(creatorAppId).config);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
@@ -5013,6 +5101,11 @@ export async function handleCommand(
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
+          const { registerGroupAutoTitle } = await import('../services/group-auto-title.js');
+          // Settles when createGroupWithBots returns or throws, i.e. after its
+          // initial avatar; a fast AI title waits on it before re-rendering.
+          let settleDecorations!: () => void;
+          const decorationsSettled = new Promise<void>(resolve => { settleDecorations = resolve; });
           const result = await createGroupWithBots({
             creatorLarkAppId: creatorAppId,
             larkAppIds: larkAppIdsForGroup,
@@ -5021,10 +5114,19 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
-            ...((groupArgs.tag || groupArgs.avatar === 'name') ? {
-              customization: { tag: groupArgs.tag, avatar: groupArgs.avatar, userOpenId: senderOpenId },
+            ...((groupArgs.tag || decorations.avatar) ? {
+              customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
             } : {}),
-          });
+            // Register as soon as the chat exists: the invited sender can type
+            // in it while invites / owner transfer are still running.
+            ...(autoTitle ? {
+              onChatCreated: (chatId: string) => registerGroupAutoTitle(creatorAppId, chatId, {
+                placeholderName: groupName,
+                namePrefix: namePrefix || undefined,
+                nameAvatar: decorations.avatar === 'name' || undefined,
+              }, decorationsSettled),
+            } : {}),
+          }).finally(settleDecorations);
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
           const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
@@ -5032,6 +5134,7 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (autoTitle) hints.push(t('cmd.group.auto_title_pending', undefined, loc));
           if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
           if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
@@ -5066,7 +5169,7 @@ export async function handleCommand(
           }
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
           await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
-          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId}`);
+          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'}`);
           // Intentionally NO auto-bootstrap (repo-select card / chat-scope
           // session) here: the group name rarely carries enough context to seed
           // a useful prompt. The user starts a real conversation with the bot in
@@ -5626,7 +5729,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork <task>` hosts it in a new sibling topic of the same chat;
+        // both topic groups and native topics inside regular groups are valid.
         // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
@@ -5714,26 +5818,16 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          // 私聊（p2pMode chat/thread 均可）与话题群支持原地子话题分身。
-          // 私聊走 chatType 判定，不调 getChatModeStrict：DM 没有 chat_mode
-          // 概念，且该接口偶发 500，隐私敏感路径才用它（见本文件上方注释）。
+          // 私聊（p2pMode chat/thread 均可）、话题群与普通群里已有独立会话的
+          // 原生话题都支持原地分身。私聊走 chatType 判定，不调 getChatModeStrict：
+          // DM 没有 chat_mode 概念，且该接口偶发 500。群聊只要求源是 thread-scope
+          // 会话（有真实 om_ 根消息）——群类型不是会话隔离边界；普通群顶层的
+          // chat-scope 连续会话仍拒绝，改用 /fork --create。
           const forkInPlaceIsP2p = ds.chatType === 'p2p';
-          if (!forkInPlaceIsP2p) {
-            if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
-            let chatMode: string | undefined;
-            try {
-              chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-            } catch {
-              // Treat an unknown mode as unsupported: sending a top-level message
-              // to a regular group would not create the isolated topic we promise.
-            }
-            if (chatMode !== 'topic') {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
+          if (!forkInPlaceIsP2p
+            && (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_'))) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
           }
 
           const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
@@ -6564,13 +6658,16 @@ export const ADOPT_RESUME_LIMIT = 20;
 
 /** Discover the sessions resumable from disk for `cliId`, excluding any whose
  *  CLI-native id is already live in a botmux session (so a session botmux
- *  already runs isn't offered for re-import). Returns [] when the adapter has
- *  no on-disk store. */
+ *  already runs isn't offered for re-import). `extraExclude` adds more ids to
+ *  skip — the /adopt picker passes the session ids of the live panes it lists,
+ *  so a running session doesn't show up a second time as history. Returns []
+ *  when the adapter has no on-disk store. */
 export async function discoverResumableSessionsForBot(
   cliId: CliId,
   cliPathOverride: string | undefined,
   activeSessions: Map<string, DaemonSession>,
   limit = ADOPT_RESUME_LIMIT,
+  extraExclude?: ReadonlySet<string>,
 ): Promise<ResumableSession[]> {
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
@@ -6588,7 +6685,13 @@ export async function discoverResumableSessionsForBot(
   for (const ds of activeSessions.values()) {
     if (ds.session.sessionId) exclude.add(ds.session.sessionId);
     if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+    // An in-progress adopt observes an external CLI whose id lives only in
+    // adoptedFrom (a Claude adopt never sets cliSessionId). Hidden only while
+    // the adopt is active: once it ends the session is offered as history again.
+    const adoptedSessionId = ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId;
+    if (adoptedSessionId) exclude.add(adoptedSessionId);
   }
+  for (const id of extraExclude ?? []) exclude.add(id);
   try {
     return await adapter.listResumableSessions({ limit, exclude });
   } catch {
@@ -6674,7 +6777,8 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current session into a new sub-topic of the same topic group.
+/** Fork the current thread-scoped session into a new sibling topic of the same
+ *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
  *  and records display-only lineage for the parent panel. */
@@ -6722,6 +6826,10 @@ export async function startForkSubtopicSession(
   // 绝不能删；只有「话题内 / 引用形态」时新建的顶层锚点归我们所有。
   let seedMessageId: string | undefined;
   let anchorOwnedByBot = false;
+  // 普通群显式开话题用的 reply_in_thread 回复（bot 自有，失败时与锚点一起撤）。
+  let groupTopicReplyId: string | undefined;
+  // 普通群「锚点已发、话题尚未确认开出」的窗口：此间抛错仍归 topic_creation_failed。
+  let groupTopicPending = false;
 
   const recallAnchor = async (): Promise<boolean> => {
     if (forkInPlaceIsP2p) {
@@ -6744,15 +6852,21 @@ export async function startForkSubtopicSession(
       return results.every(Boolean);
     }
     if (!anchorId) return true;
-    try {
-      return await deleteMessage(appId, anchorId);
-    } catch (err) {
-      logger.warn(
-        `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
+    // 先撤话题内回复、再撤锚点；任一失败都算留下了孤儿话题。
+    let allRecalled = true;
+    for (const id of [groupTopicReplyId, anchorId]) {
+      if (!id) continue;
+      try {
+        if (!await deleteMessage(appId, id)) allRecalled = false;
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        allRecalled = false;
+      }
     }
+    return allRecalled;
   };
 
   try {
@@ -6799,6 +6913,7 @@ export async function startForkSubtopicSession(
         content: [[{ tag: 'text', text: t('cmd.fork.seed_anchor_line', undefined, loc) }]],
       },
     });
+    let childThreadId: string | undefined;
     if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
       // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
       // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
@@ -6817,10 +6932,31 @@ export async function startForkSubtopicSession(
         ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
         : await replyMessage(appId, anchorId, seedPost, 'post', true);
     } else {
-      // 群聊：顶层 post 本身就是话题锚点，无单独 seed。
+      // 群聊：顶层 post 作分身话题锚点。话题群里顶层消息自动成为话题，
+      // 不多发任何消息（原路径）；普通群的顶层消息保持顶层（client.ts
+      // ChatMode 注释），必须对锚点 reply_in_thread 才会显式开出原生话题。
+      // 群类型确认不了（'unknown'）时按普通群处理：多一条话题内回复无害，
+      // 但赌它是话题群会退化成「ok 却没有话题」。
+      const groupChatMode = await getChatModeStrict(appId, chatId);
       anchorId = sourceOptions
         ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
         : await sendMessage(appId, chatId, seedPost, 'post');
+      if (groupChatMode !== 'topic') {
+        groupTopicPending = true;
+        const topicReplyText = t('cmd.fork.seed_topic_reply', undefined, loc);
+        groupTopicReplyId = sourceOptions
+          ? await replyMessage(appId, anchorId, topicReplyText, 'text', true, undefined, undefined, sourceOptions)
+          : await replyMessage(appId, anchorId, topicReplyText, 'text', true);
+        // 从话题内回复取 thread_id：reply_in_thread 的回复必然带 omt_，根消息
+        // 未必立刻回填。拿不到真实 omt_ 就 fail closed——撤回锚点与回复并报错，
+        // 不能返回 ok 再配一个退化成「打开本群」的链接。
+        childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;
+        if (!childThreadId?.startsWith('omt_')) {
+          const orphanTopic = !await recallAnchor();
+          return { ok: false, error: 'topic_creation_failed', orphanTopic };
+        }
+        groupTopicPending = false;
+      }
     }
     // 私聊锚点必须登记 /t 同款溯源：扁平 DM 路由默认把 root_id+thread_id
     // 回复折进 chat-scope 会话，只有命中 marker 才会 promote 到锚点的分身
@@ -6831,7 +6967,7 @@ export async function startForkSubtopicSession(
       const { recordP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
       recordP2pForceTopicRoot(appId, anchorId, chatId);
     }
-    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+    childThreadId ??= (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
@@ -6925,7 +7061,7 @@ export async function startForkSubtopicSession(
     );
     return {
       ok: false,
-      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      error: anchorId && !groupTopicPending ? 'fork_subtopic_failed' : 'topic_creation_failed',
       // fork 已成功后的抛错绝不撤话题：已注册的分身必须保持可路由，
       // recall 会删 marker 让其回复折回扁平、静默失联。
       orphanTopic: forked ? false : (anchorId ? !await recallAnchor() : false),

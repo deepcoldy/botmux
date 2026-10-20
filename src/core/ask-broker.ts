@@ -120,7 +120,12 @@ export function _setHandoffRetentionForTest(ms: number): void {
  *  dispatcher gate / quota recheck (bot → evaluateBotTalk, human → evaluateTalk
  *  with the teamMember union leg). Without this, a cross-deployment team bot or a
  *  platform teamMember human answering by text is wrongly rejected. */
+const answerActors = new WeakMap<AskResult, AskAnswerActor>();
+/** In-process attribution, deliberately absent from the public AskResult JSON. */
+export function askAnswerActorFor(result: AskResult): AskAnswerActor | undefined { return answerActors.get(result); }
+
 export interface AskAnswerActor {
+  senderType?: 'user' | 'bot';
   /** Feishu-stamped bot sender (sender_type ∈ app|bot, or a cross-ref sibling). */
   botSender?: boolean;
   /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
@@ -727,13 +732,15 @@ export function submitCustomReply(args: {
   const text = args.text.trim();
   if (!text) return 'stale';
 
-  settle(args.askId, {
+  const result: AskResult = {
     kind: 'answered',
     answers: ask.questions.map(() => []),
     by: args.by,
     comment: text,
     timedOut: false,
-  });
+  };
+  if (args.actor) answerActors.set(result, { ...args.actor });
+  settle(args.askId, result);
   return 'accepted';
 }
 
@@ -762,6 +769,13 @@ export function findPendingAskByAnchor(args: {
     if (matches) return snapshot(ask);
   }
   return undefined;
+}
+
+/** Snapshot all live candidates, without changing the legacy first-match API. */
+export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: string; anchor: string }): PendingAsk[] {
+  return [...pending.values()].filter(ask => !ask.settled
+    && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
+    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor)).map(snapshot);
 }
 
 /** A DM answer must quote the exact document card. Never consume unrelated

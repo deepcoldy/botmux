@@ -627,6 +627,37 @@ describe('repo select card — plain switch', () => {
     expect(ds.pendingChatContext).toBeUndefined();
   });
 
+  it('preserves group-join provenance and caller through the repo picker without other buffered input', async () => {
+    const groupJoinContext = {
+        event: 'chat.bot_added' as const,
+        larkAppId: APP_ID,
+        chatId: CHAT_ID,
+        turnId: 'om_group_join',
+        operatorOpenId: 'ou_inviter',
+        gateMatched: true,
+      };
+    const trustedCaller = { requestLarkAppId: APP_ID, requestUserOpenId: 'ou_inviter' };
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingTurnId: groupJoinContext.turnId,
+      pendingGroupJoinContext: groupJoinContext,
+      pendingTrustedCaller: trustedCaller,
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[11]).toMatchObject({ groupJoinContext });
+    expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'mock-prompt' }, {
+      turnId: groupJoinContext.turnId, trustedCaller,
+    });
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ds.pendingGroupJoinContext).toBeUndefined();
+    expect(ds.pendingTrustedCaller).toBeUndefined();
+  });
+
   it('skip_repo also forwards the complete Codex App sidecar to forkWorker', async () => {
     const ds = makeDs({
       pendingRepo: true,
@@ -1721,6 +1752,17 @@ describe('repo select card — worktree open', () => {
       mode: 'group',
       fetchStatus: 'ok',
     };
+    const groupJoinContext = {
+        event: 'chat.bot_added' as const,
+        larkAppId: APP_ID,
+        chatId: CHAT_ID,
+        turnId: 'om_group_join_worktree',
+        operatorOpenId: 'ou_inviter',
+        gateMatched: true,
+      };
+    ds.pendingGroupJoinContext = groupJoinContext;
+    const trustedCaller = { requestLarkAppId: APP_ID, requestUserOpenId: 'ou_inviter' };
+    ds.pendingTrustedCaller = trustedCaller;
     const { deps } = makeDeps(ds);
     vi.mocked(createRepoWorktree).mockResolvedValue({
       path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master',
@@ -1733,11 +1775,12 @@ describe('repo select card — worktree open', () => {
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![0]).toBe('');
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toMatchObject({
       chatContext: { chatId: CHAT_ID },
+      groupJoinContext,
     });
     expect(forkWorker).toHaveBeenCalledWith(
       ds,
       { content: 'mock-prompt' },
-      { turnId: 'om_group_join_worktree' },
+      { turnId: 'om_group_join_worktree', trustedCaller },
     );
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
@@ -2178,6 +2221,39 @@ describe('repo select card — worktree open', () => {
     expect(res?.toast?.content).toContain('发起本次确认');
     expect(closeWorkerPoolSession).not.toHaveBeenCalled();
     expect(removeRepoWorktree).not.toHaveBeenCalled();
+  });
+
+  it('close_worktree_confirm fails closed in durable primary before local close or worktree deletion', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      const res = await handleCardAction({
+        operator: { open_id: OWNER },
+        action: { value: {
+          action: 'close_worktree_confirm',
+          root_id: ROOT_ID,
+          session_id: ds.session.sessionId,
+          invoker_open_id: OWNER,
+          confirmation_state: 'unsafe',
+        } },
+        context: { open_message_id: 'om_card' },
+      }, deps, APP_ID);
+
+      expect(res?.toast?.type).toBe('success');
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已拒绝本地关闭'),
+        undefined,
+        APP_ID,
+        'om_card',
+      );
+    } finally {
+      delete process.env.BOTMUX_COORDINATION_MODE;
+    }
   });
 
   it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {

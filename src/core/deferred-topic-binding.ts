@@ -74,3 +74,20 @@ export function removeDeferredTopicBinding(dataDir: string, sessionId: string): 
   const path = deferredTopicBindingPath(dataDir, sessionId);
   try { rmSync(path, { force: true }); } catch { /* best-effort lifecycle cleanup */ }
 }
+
+/** Whether this process can create files in the host binding sidecar. A
+ * sandboxed / read-isolated CLI cannot (EPERM), and must route the claim
+ * through the daemon instead. Probes with a real create because seatbelt and
+ * bwrap deny on the write itself, not on `access()`. */
+export function probeDeferredTopicBindingWritable(dataDir: string): boolean {
+  const dir = bindingDir(dataDir);
+  const probe = join(dir, `.probe-${process.pid}-${randomUUID()}`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(probe, '', { flag: 'wx' });
+  } catch {
+    return false;
+  }
+  try { rmSync(probe, { force: true }); } catch { /* best-effort */ }
+  return true;
+}

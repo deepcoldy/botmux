@@ -21,6 +21,12 @@ describe('remote runner config surface', () => {
       .toThrow(/unsupported field/);
     expect(() => normalizeRemoteRunnerConfig({ requiredCapabilities: ['vendor-extension'] }))
       .toThrow(/unsupported capability/);
+    expect(() => normalizeRemoteRunnerConfig({ requiredCapabilities: ['session_tool_schedule'] }))
+      .toThrow(/requires session_tool/);
+    expect(() => normalizeRemoteRunnerConfig({ requiredCapabilities: ['session_tool_schedule_actor'] }))
+      .toThrow(/requires session_tool_schedule/);
+    expect(() => normalizeRemoteRunnerConfig({ requiredCapabilities: ['outbound_message_final'] }))
+      .toThrow(/requires outbound_message/);
   });
 
   it('loads remote-runner without embedding credentials or provider endpoints', () => {

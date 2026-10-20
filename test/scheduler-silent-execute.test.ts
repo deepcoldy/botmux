@@ -352,6 +352,7 @@ describe('executeScheduledTask — silent thread fire', () => {
       requestUserOpenId: 'ou_creator',
       requestUserUnionId: 'on_creator',
       requestLarkAppId: APP,
+      senderType: 'user',
       source: 'schedule_creator',
       taskId: 'task0001',
     });
@@ -1202,6 +1203,7 @@ describe('executeScheduledTask — live-session injection', () => {
         requestUserOpenId: 'ou_creator',
         requestUserUnionId: 'on_creator',
         requestLarkAppId: APP,
+        senderType: 'user',
         source: 'schedule_creator',
         taskId: 'task0001',
       },

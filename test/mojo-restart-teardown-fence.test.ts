@@ -84,47 +84,29 @@ describe('classifyRestartTeardown', () => {
   });
 });
 
-describe('worker.ts restart wiring', () => {
-  const src = readFileSync(join(import.meta.dirname, '../src/worker.ts'), 'utf-8');
-  const restart = src.slice(src.indexOf('async function restartCliProcess('));
-  const killCli = restart.indexOf(
-    'killCli({\n        preservePending: opts.preservePending,\n        preservePolicyCapability: true,',
-  );
-  const teardownBlock = restart.slice(0, killCli);
-  it('locates the policy-preserving killCli boundary', () => {
+describe('worker.ts restart teardown fence', () => {
+  // 源码结构护栏(K2)：restartCliProcess 在 worker 闭包里，决策已抽成 classifyRestartTeardown
+  // （上面的行为用例覆盖），但「verdict 必须先于 killCli/respawn 生效」只能在源码上看到——
+  // 否则就要起真实 worker。守的不变量：teardown 未证实时拒绝 respawn（不然会在可能仍存活的
+  // 凭证子树上再起一条带新 env nonce 的 lineage），且这条路径绝不回滚 admission（mojo 后端 #803）。
+  it('refuses to respawn over an unproven teardown and never rolls admission back', () => {
+    const src = readFileSync(join(import.meta.dirname, '../src/worker.ts'), 'utf-8');
+    const restart = src.slice(src.indexOf('async function restartCliProcess('));
+    const killCli = restart.search(
+      /killCli\(\{\s*preservePending: opts\.preservePending,\s*preservePolicyCapability: true/,
+    );
     expect(killCli).toBeGreaterThan(-1);
-  });
-  it('no longer swallows the teardown outcome', () => {
-    // The exact laundering shape: a bare race against a sleep, discarded, inside an
-    // empty catch. Asserted on source because the alternative is spinning up a real
-    // worker process, and this decision has to be observable somewhere.
-    expect(teardownBlock).not.toContain('catch { /* destroySession logs its own failure details */ }');
-    expect(teardownBlock).toContain('classifyRestartTeardown');
-    expect(teardownBlock).toContain("kind: 'rejected'");
-    expect(teardownBlock).toContain("kind: 'timeout'");
-  });
-
-  it('gates killCli/respawn behind the verdict', () => {
-    // killCli must be preceded by the refusal branch, or the fix is decorative.
-    expect(teardownBlock).toContain('if (!teardownVerdict.mayRespawn)');
-    const guard = teardownBlock.indexOf('if (!teardownVerdict.mayRespawn)');
-    const ret = teardownBlock.indexOf('return;', guard);
-    expect(guard).toBeGreaterThan(-1);
-    expect(ret).toBeGreaterThan(guard);
-  });
-
-  it('never rolls back admission on the restart path', () => {
-    // Rollback is not the legitimate exit from an uncertain teardown: it would
-    // re-open writes on the very lineage we cannot prove is gone. Comments are
-    // stripped first, so the note explaining this rule cannot satisfy (or break)
-    // its own assertion.
-    const code = teardownBlock
+    // Comments stripped, so prose explaining the rule cannot satisfy (or break) it.
+    const code = restart.slice(0, killCli)
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .split('\n')
       .map(line => line.replace(/\/\/.*$/, ''))
       .join('\n');
+    const verdict = code.indexOf('classifyRestartTeardown(');
+    const guard = code.search(/if \(!\w+\.mayRespawn\)/);
+    expect(verdict).toBeGreaterThan(-1);
+    expect(guard).toBeGreaterThan(verdict);
+    expect(code.indexOf('return', guard)).toBeGreaterThan(guard);
     expect(code).not.toMatch(/abortDestroySession/);
-    // The stripping must not have eaten the code we DO care about.
-    expect(code).toContain('classifyRestartTeardown');
   });
 });

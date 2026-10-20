@@ -20,6 +20,7 @@
  */
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
 import type { ChatMode } from './groups-store.js';
+import type { GroupAvatarMode } from './group-creation-options.js';
 import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
@@ -36,7 +37,7 @@ export interface CreateGroupOpts {
   name?: string;
   /** Opt-in decorations; the personal tag requires the invoking user's open_id
    * in this creator app's scope. Failures never discard an existing chat. */
-  customization?: { tag?: string; avatar?: 'name' | 'off'; userOpenId: string };
+  customization?: { tag?: string; avatar?: GroupAvatarMode; userOpenId: string };
   /** Chat topology at creation time. 'topic' creates a 话题群; omit to let
    *  Feishu use its default 普通群 ('group'). Fixed for the chat's lifetime —
    *  it cannot be changed afterwards through this API. */
@@ -193,6 +194,11 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     try {
       const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
       await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
+  } else if (opts.customization?.avatar === 'logo') {
+    try {
+      const { applyLogoGroupAvatar } = await import('./session-group-avatar.js');
+      await applyLogoGroupAvatar(opts.creatorLarkAppId, r.chatId);
     } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
   }
 

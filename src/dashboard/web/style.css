@@ -1743,36 +1743,6 @@ a:focus-visible {
   transform: translateY(-1px);
 }
 
-/* 调试终端按钮：复用监控室按钮的胶囊样式，保持工具栏一致。 */
-.debug-terminal-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: var(--button-height);
-  min-height: var(--button-height);
-  padding: 0 var(--button-padding-x);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  background: var(--surface);
-  color: var(--fg);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  white-space: nowrap;
-  transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease,
-    transform 150ms ease;
-}
-
-.debug-terminal-btn:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent-strong);
-  transform: translateY(-1px);
-}
-
 .filter-toggle {
   display: inline-flex;
   align-items: center;
@@ -19285,6 +19255,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 /* Scheduled idle-session cleanup block: stack the toggle + threshold + interval
    rows with steady spacing, matching the other settings blocks. */
 .settings-session-cleanup {
+  --idle-cleanup-segment-active-bg: var(--accent);
+  --idle-cleanup-segment-active-fg: var(--on-accent);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -35184,4 +35156,574 @@ a.card-menu-item {
   background: var(--warning-soft, var(--surface-muted));
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* ── 管理 → 终端（宿主网页终端）──────────────────────────────────────────────
+   终端区本身固定深色（与会话终端页同一套 Tokyo Night 底色），外框跟随 dashboard 主题。
+   终端节点由 host-terminal-client.ts 命令式挂进 .terminal-host，React 不管它的子节点。 */
+main:has(.terminal-page) {
+  padding-bottom: 12px;
+  overflow: hidden;
+}
+
+.terminal-page {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #1a1b26;
+  box-shadow: var(--sh-md);
+  animation: none;
+}
+
+.terminal-page.is-fullscreen {
+  border-radius: 0;
+}
+
+.terminal-bar {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 4px 8px 0;
+  background: #15161e;
+  color: #a9b1d6;
+  font-size: 12px;
+}
+
+.terminal-tabs {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-tab {
+  position: relative;
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 96px;
+  max-width: 240px;
+  height: 32px;
+  padding: 0 6px 0 10px;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  color: #787c99;
+  cursor: pointer;
+  user-select: none;
+}
+
+.terminal-tab:hover {
+  background: #1f2030;
+  color: #c0caf5;
+}
+
+.terminal-tab.is-active {
+  background: #1a1b26;
+  color: #c0caf5;
+}
+
+.terminal-tab-glyph {
+  flex: 0 0 auto;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #7aa2f7;
+}
+
+.terminal-tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-tab-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e0af68;
+}
+
+.terminal-tab.is-reconnecting .terminal-tab-dot {
+  animation: terminal-dot-pulse 1s ease-in-out infinite;
+}
+
+.terminal-tab.is-exited .terminal-tab-dot {
+  background: #565f89;
+}
+
+.terminal-tab.is-failed .terminal-tab-dot {
+  background: #f7768e;
+}
+
+@keyframes terminal-dot-pulse {
+  50% { opacity: 0.25; }
+}
+
+.terminal-tab-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.terminal-tab:hover .terminal-tab-close,
+.terminal-tab.is-active .terminal-tab-close {
+  opacity: 0.7;
+}
+
+.terminal-tab-close:hover {
+  background: #2a2e45;
+  opacity: 1;
+}
+
+.terminal-tab-add,
+.terminal-connect-btn,
+.terminal-bar-tools button {
+  flex: 0 0 auto;
+  height: 26px;
+  margin-bottom: 3px;
+  padding: 0 10px;
+  border: 1px solid #2a2e45;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: #a9b1d6;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.terminal-tab-add {
+  width: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.terminal-tab-add:hover,
+.terminal-connect-btn:hover,
+.terminal-bar-tools button:hover {
+  border-color: #7aa2f7;
+  color: #c0caf5;
+}
+
+.terminal-bar-tools {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminal-renderer-badge {
+  margin-bottom: 3px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: #1f2335;
+  color: #9ece6a;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.terminal-font-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.terminal-font-size span {
+  min-width: 18px;
+  margin-bottom: 3px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.terminal-bar-tools .terminal-font-size button {
+  padding: 0 6px;
+}
+
+.terminal-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #1a1b26;
+}
+
+.terminal-host {
+  position: absolute;
+  inset: 6px 4px 4px 10px;
+  /* xterm 内部层（WebGL 的 link-layer 画布、helpers、滚动条）各自带 z-index，不隔离会
+     越过下面的退出提示条，把按钮点击吃掉。 */
+  z-index: 0;
+  isolation: isolate;
+  /* 跟随别的端尺寸时 xterm 网格可能比容器大：裁掉，不压到快捷键行上。 */
+  overflow: hidden;
+}
+
+.host-terminal-view {
+  display: none;
+  width: 100%;
+  height: 100%;
+}
+
+.host-terminal-view.is-active {
+  display: block;
+}
+
+.host-terminal-view .xterm {
+  height: 100%;
+}
+
+.host-terminal-view .xterm-viewport {
+  background-color: #1a1b26 !important;
+}
+
+.terminal-empty {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  color: #a9b1d6;
+  text-align: center;
+}
+
+.terminal-empty h2 {
+  margin: 0;
+  color: #c0caf5;
+  font-size: 18px;
+}
+
+.terminal-empty p {
+  margin: 0;
+  color: #787c99;
+  font-size: 13px;
+}
+
+.terminal-empty-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.terminal-empty-actions button:not(.page-primary-action),
+.terminal-exit-overlay button:not(.page-primary-action) {
+  height: var(--button-height);
+  padding: 0 14px;
+  border: 1px solid #2a2e45;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: #c0caf5;
+  cursor: pointer;
+}
+
+.terminal-exit-overlay {
+  position: absolute;
+  z-index: 1;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 16px;
+  border: 1px solid #2a2e45;
+  border-radius: var(--radius-full);
+  background: rgba(21, 22, 30, 0.94);
+  color: #a9b1d6;
+  font-size: 13px;
+  box-shadow: var(--sh-lg);
+}
+
+.terminal-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.terminal-picker {
+  position: absolute;
+  top: 40px;
+  left: 50%;
+  z-index: 41;
+  width: min(560px, calc(100% - 24px));
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  max-height: min(560px, 70vh);
+  border: 1px solid #2a2e45;
+  border-radius: var(--radius-lg);
+  background: #1f2030;
+  color: #c0caf5;
+  box-shadow: var(--sh-lg);
+  overflow: hidden;
+}
+
+.terminal-picker-search {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 1px solid #2a2e45;
+  background: transparent;
+  color: #c0caf5;
+  font-size: 14px;
+  outline: none;
+}
+
+.terminal-picker-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.terminal-picker-section + .terminal-picker-section {
+  margin-top: 6px;
+}
+
+.terminal-picker-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 4px;
+  color: #565f89;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.terminal-picker-section-title .btn-link {
+  color: #7aa2f7;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.terminal-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.terminal-picker-item.is-cursor {
+  background: #2a2e45;
+}
+
+.terminal-picker-item.is-dim {
+  opacity: 0.6;
+}
+
+.terminal-picker-glyph {
+  flex: 0 0 22px;
+  color: #7aa2f7;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  text-align: center;
+}
+
+.terminal-picker-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  text-align: left;
+}
+
+.terminal-picker-title,
+.terminal-picker-detail {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.45;
+}
+
+.terminal-picker-title {
+  font-size: 13px;
+}
+
+.terminal-picker-detail {
+  color: #787c99;
+  font-size: 11px;
+}
+
+.terminal-picker-empty {
+  padding: 6px 8px 8px 40px;
+  color: #565f89;
+  font-size: 12px;
+}
+
+.terminal-picker-empty.is-error {
+  color: #f7768e;
+}
+
+.terminal-owner-only {
+  margin: auto;
+  max-width: 420px;
+  padding: 32px;
+  color: #a9b1d6;
+  text-align: center;
+}
+
+.terminal-owner-only h2 {
+  margin: 0 0 8px;
+  color: #c0caf5;
+}
+
+/* ── 终端：触屏 / 沉浸布局 ──────────────────────────────────────────────── */
+/* 沉浸：盖满可视区（top/height 由 visualViewport 驱动，软键盘弹出时跟着缩），层级低于
+   抽屉 / 弹窗 / toast，确认框照常能弹在上面。 */
+.terminal-page.is-immersive {
+  position: fixed;
+  z-index: calc(var(--z-drawer) - 1);
+  left: 0;
+  right: 0;
+  top: var(--vv-top, 0px);
+  height: var(--vv-height, 100dvh);
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.terminal-page.is-immersive .terminal-bar {
+  padding-top: max(4px, env(safe-area-inset-top));
+  padding-left: max(8px, env(safe-area-inset-left));
+  padding-right: max(8px, env(safe-area-inset-right));
+}
+
+html.terminal-immersive-lock,
+html.terminal-immersive-lock body {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* iOS 会把字号 < 16px 的输入框在聚焦时自动放大整页（截图里的整页放大 + 左右错位就是它）。
+   xterm 的隐藏输入框不可见，字号只影响这个行为。 */
+.terminal-page.is-touch .xterm .xterm-helper-textarea {
+  font-size: 16px !important;
+}
+
+/* 触摸滚动由 host-terminal-client 接管（换算成 wheel），不让浏览器在终端上平移 / 下拉刷新。 */
+.terminal-page.is-touch .terminal-host {
+  touch-action: none;
+}
+
+.terminal-keys {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 6px max(8px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  overflow-x: auto;
+  background: #15161e;
+  scrollbar-width: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.terminal-keys::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-keys button {
+  flex: 0 0 auto;
+  min-width: 44px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid #2a2e45;
+  border-radius: var(--radius-sm);
+  background: #1f2030;
+  color: #c0caf5;
+  font: 600 13px/1 var(--mono, ui-monospace, monospace);
+  touch-action: manipulation;
+}
+
+.terminal-keys button:active {
+  background: #2a2e45;
+}
+
+.terminal-keys button.is-armed {
+  border-color: #7aa2f7;
+  background: #2f3b66;
+  color: #ffffff;
+}
+
+.terminal-follow-badge {
+  margin-bottom: 3px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: #3b2f1f;
+  color: #e0af68;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .terminal-bar {
+    gap: 6px;
+    padding: 4px 6px 0;
+  }
+
+  .terminal-tab {
+    min-width: 72px;
+    max-width: 160px;
+    padding: 0 4px 0 8px;
+  }
+
+  .terminal-renderer-badge,
+  .terminal-follow-badge {
+    display: none;
+  }
+
+  .terminal-tab-add,
+  .terminal-connect-btn,
+  .terminal-bar-tools button {
+    padding: 0 8px;
+  }
+
+  .terminal-host {
+    inset: 4px 2px 2px 6px;
+  }
+
+  .terminal-picker {
+    top: 38px;
+    width: calc(100% - 12px);
+    /* 选择器挂在顶栏里，百分比会按顶栏高度算；按可视区（沉浸时随软键盘变）给上限。 */
+    max-height: min(560px, calc(var(--vv-height, 100dvh) - 56px));
+  }
 }

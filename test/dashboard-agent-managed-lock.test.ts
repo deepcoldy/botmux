@@ -1,9 +1,11 @@
-import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { AgentManagedLock } from '../src/dashboard/web/bot-defaults-page.js';
+import { AgentManagedLock, BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { BotMultiSelect } from '../src/dashboard/web/bot-multi-select.js';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const lock = { id: 'ag_main01', name: '主仓库 Claude', sections: ['exec', 'workspace'] };
 
@@ -35,13 +37,23 @@ describe('AgentManagedLock (Bot config sections managed by an Agent)', () => {
     expect(html).not.toContain('bd-agent-lock-note');
   });
 
-  it('wraps only Agent-managed fields: skill injection and auto-start stay editable', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
-    const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
-    const lockEnd = agentSection.indexOf('</AgentManagedLock>');
-    expect(agentSection.indexOf("siSupport === 'dynamic'")).toBeGreaterThan(lockEnd);
-    const workingDir = page.slice(page.indexOf('function WorkingDirSection'));
-    expect(workingDir.indexOf('</AgentManagedLock>')).toBeLessThan(workingDir.indexOf('<AutoStartControls'));
+  it('locks the Agent-managed CLI controls but leaves skill injection editable', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_locked', cliId: 'claude-code', model: '', skillInjectionSupport: 'dynamic' },
+        sessionFallback: 'claude-code',
+        cliState: { options: [{ id: 'claude-code', label: 'Claude' }], ttadkModelDefault: '', ttadkModelSuggestions: [] },
+        patchBot: () => undefined,
+        lock,
+      }));
+    });
+    const lockedBodies = renderer.root.findAll(node => node.props.className === 'bd-agent-lock-body');
+    const inLock = (input: string) => lockedBodies.some(body => body.findAll(node => node.props.dataInput === input).length > 0);
+    expect(lockedBodies.length).toBeGreaterThan(0);
+    expect(inLock('agentCliId')).toBe(true);
+    expect(renderer.root.findAll(node => node.props.dataInput === 'skillInjection').length).toBeGreaterThan(0);
+    expect(inLock('skillInjection')).toBe(false);
   });
 });
 

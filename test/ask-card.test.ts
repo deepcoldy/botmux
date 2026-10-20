@@ -176,6 +176,17 @@ describe('buildAskCard', () => {
     expect(text).not.toContain('指定成员（仅本人可操作）');
   });
 
+  it('异步文档提问保留私信答复提示，普通异步提问提示引用本卡片', () => {
+    const ask = makePending({ originKind: 'native-user-input-async', answererOpenId: 'ou_owner' });
+    expect(buildAskCard(ask)).toContain('引用');
+    const documentAsk = buildAskCard({ ...ask, deliveryTarget: {
+      kind: 'document-author', openId: 'ou_owner', turnId: 'document-turn', fileToken: 'file', commentId: 'comment',
+    } });
+    expect(documentAsk).toContain('文档评论任务');
+    expect(documentAsk).not.toContain('只有一张待答卡');
+    expect(documentAsk).not.toContain('card.ask.async_reply_hint');
+  });
+
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
     const text = buildAskCard(makePending());
     expect(text).toContain('直接在话题');

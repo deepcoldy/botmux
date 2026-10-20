@@ -15,6 +15,9 @@ import {
   findTraexRolloutByPid,
   findTraexRolloutBySessionId,
   traexSessionIdFromRolloutPath,
+  readTraexThreadDetails,
+  readTraexThreadIndex,
+  traexRolloutUserInputs,
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
@@ -348,7 +351,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     /** Import path: TRAE writes Codex-family rollout files under
      *  `<TRAE_HOME>/cli/sessions`. */
     listResumableSessions({ limit, exclude }) {
-      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
+      // Ordering needs only the cheap per-thread index; prompt-bearing detail
+      // columns are read lazily for the candidates discovery actually parses.
+      const metadataById = new Map([...readTraexThreadIndex()].map(([id, entry]) => [id, {
+        cwd: entry.cwd,
+        lastActivityAt: entry.updatedAtMs,
+        rolloutPath: entry.rolloutPath,
+      }]));
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude, {
+        dialect: 'traex',
+        metadataById,
+        loadSessionDetails: ids => readTraexThreadDetails(ids),
+        userInputTexts: traexRolloutUserInputs,
+        sessionIdFromPath: traexSessionIdFromRolloutPath,
+      });
     },
 
     async writeInput(pty: PtyHandle, content: string) {

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { DURABLE_INBOX_LANE_SESSION_CONTROL, type InboxClaim } from '../src/services/durable-coordination.js';
 import {
+  durableDirectSessionControlEvent,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
   parseDurableLarkSessionControlClaim,
+  parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
 
 function rawControl(action: 'close' | 'resume' | 'restart' = 'close') {
@@ -52,6 +54,48 @@ describe('durable Lark session control envelope', () => {
       cardMessageId: 'om_card',
       attempts: 2,
     });
+  });
+
+  it.each(['lark-command', 'trusted-host'] as const)(
+    'parses a %s lifecycle request without weakening the card envelope',
+    source => {
+      const event = durableDirectSessionControlEvent({
+        source,
+        larkAppId: 'cli_test',
+        operationId: `${source}.session-control:cli_test:om_command`,
+        action: 'close',
+        sessionId: 'session-1',
+        rootId: 'om_root',
+        ...(source === 'lark-command' ? { operatorOpenId: 'ou_operator' } : {}),
+        cardMessageId: 'om_card',
+        now: 10,
+      });
+      expect(parseDurableSessionControlClaim(claim(event))).toMatchObject({
+        source,
+        operationId: `${source}.session-control:cli_test:om_command`,
+        partitionKey: 'lark-session-control:cli_test:session-1',
+        action: 'close',
+        sessionId: 'session-1',
+        rootId: 'om_root',
+        operatorOpenId: source === 'trusted-host' ? 'trusted-host' : 'ou_operator',
+        cardMessageId: 'om_card',
+      });
+      expect(() => parseDurableLarkSessionControlClaim(claim(event)))
+        .toThrow(/invalid envelope/);
+    },
+  );
+
+  it('rejects a command control without a Lark user principal', () => {
+    expect(() => durableDirectSessionControlEvent({
+      source: 'lark-command',
+      larkAppId: 'cli_test',
+      operationId: 'lark-command.session-control:cli_test:om_command',
+      action: 'close',
+      sessionId: 'session-1',
+      rootId: 'om_root',
+      operatorOpenId: 'trusted-host',
+      now: 10,
+    })).toThrow(/operator identity/);
   });
 
   it('rejects lifecycle actions that are not in the first durable close/resume slice', () => {

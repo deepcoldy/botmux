@@ -123,6 +123,16 @@ describe('resolveCodexNotifierRecipientView', () => {
 });
 
 describe('applySettingsWrite happy paths', () => {
+  it('runs the complete settings write inside one injected config transaction', async () => {
+    const runConfigMutation = vi.fn(async <T>(mutation: () => Promise<T>) => mutation());
+    const deps = makeDeps({ runConfigMutation });
+    const result = await applySettingsWrite({ publicReadOnly: true, repoPickerMode: 'repos' }, deps);
+    expect(result.ok).toBe(true);
+    expect(runConfigMutation).toHaveBeenCalledOnce();
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ publicReadOnly: true });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ repoPickerMode: 'repos' });
+  });
+
   it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);

@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -81,7 +82,7 @@ setInterval(() => {}, 1000);
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: { ...process.env, BOTMUX_XPI_ENABLED: xpiEnabled, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
+      env: privateTmuxEnv(root, { BOTMUX_XPI_ENABLED: xpiEnabled, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
@@ -134,7 +135,7 @@ setInterval(() => {}, 1000);
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
     }
     rmSync(root, { recursive: true, force: true });
   }

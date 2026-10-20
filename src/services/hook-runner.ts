@@ -34,7 +34,7 @@ export type HookEvent = typeof HOOK_EVENTS[number];
  * "this hook can block" to the operator. Those degrade to async with a warning
  * rather than silently pretending to gate — see `loadHookConfigs`.
  */
-export const GATE_EVENTS: readonly HookEvent[] = ['prompt.submit'] as const;
+export const GATE_EVENTS: readonly HookEvent[] = ['prompt.submit', 'chat.bot_added'] as const;
 
 export function isGateEvent(event: HookEvent): boolean {
   return GATE_EVENTS.includes(event);
@@ -46,6 +46,8 @@ function isSyncGateHook(hook: { event: HookEvent; mode?: 'sync' | 'async' }): bo
 }
 
 export type HookFilter = {
+  larkAppId?: string | string[];
+  lark_app_id?: string | string[];
   chatId?: string | string[];
   senderOpenId?: string | string[];
   sender_open_id?: string | string[];
@@ -185,11 +187,13 @@ function normalizeHookConfig(raw: unknown): HookConfig | null {
   if (rec.filter && typeof rec.filter === 'object') {
     const filterRec = rec.filter as Record<string, unknown>;
     const filter: HookFilter = {};
+    const larkAppId = normalizeStringList(filterRec.larkAppId ?? filterRec.lark_app_id);
     const chatId = normalizeStringList(filterRec.chatId);
     const senderOpenId = normalizeStringList(filterRec.senderOpenId ?? filterRec.sender_open_id);
+    if (larkAppId) filter.larkAppId = larkAppId;
     if (chatId) filter.chatId = chatId;
     if (senderOpenId) filter.senderOpenId = senderOpenId;
-    if (filter.chatId || filter.senderOpenId) hook.filter = filter;
+    if (filter.larkAppId || filter.chatId || filter.senderOpenId) hook.filter = filter;
   }
   if (rec.redact && typeof rec.redact === 'object') {
     const redactRec = rec.redact as Record<string, unknown>;
@@ -344,8 +348,10 @@ function valueMatchesFilter(allowed: string | string[] | undefined, actual: stri
 
 export function filterMatches(filter: HookFilter | undefined, payload: HookPayload): boolean {
   if (!filter) return true;
+  const larkAppId = typeof payload.larkAppId === 'string' ? payload.larkAppId : undefined;
   const senderOpenId = payload.senderOpenId ?? payload.sender_open_id;
-  return valueMatchesFilter(filter.chatId, payload.chatId)
+  return valueMatchesFilter(filter.larkAppId ?? filter.lark_app_id, larkAppId)
+    && valueMatchesFilter(filter.chatId, payload.chatId)
     && valueMatchesFilter(filter.senderOpenId ?? filter.sender_open_id, senderOpenId);
 }
 
@@ -648,6 +654,10 @@ export function runHookCommandForTest(
 
 export type PromptGateDecision = {
   allowed: boolean;
+  /** At least one matching sync hook actually adjudicated this event. A caller
+   *  that explicitly requires a gate can fail closed when config is missing or
+   *  invalid instead of mistaking the zero-hook fast path for approval. */
+  matched?: boolean;
   /** 拒绝原因（回给用户）。allow 时通常为空。 */
   reason?: string;
   /** 做出该裁决的 hook 命令（日志用，已截断）。 */
@@ -741,6 +751,7 @@ async function evaluateOneGateHook(hook: HookConfig, payload: HookPayload): Prom
 export async function evaluatePromptGate(
   event: HookEvent,
   body: Record<string, unknown> = {},
+  options: { emitObservers?: boolean } = {},
 ): Promise<PromptGateDecision> {
   try {
     if (!isGateEvent(event)) return GATE_ALLOW;
@@ -762,7 +773,9 @@ export async function evaluatePromptGate(
     const observers = matching.filter(hook => hook.mode !== 'sync');
     // 通知先发：它不参与裁决，不该被 deny 的短路吞掉——「这条消息被拦了」本身
     // 也是通知类 hook 想知道的事实。fireAndForget，绝不 await。
-    if (observers.length > 0) runHooksFireAndForget(event, payload, observers);
+    if (options.emitObservers !== false && observers.length > 0) {
+      runHooksFireAndForget(event, payload, observers);
+    }
     if (hooks.length === 0) return GATE_ALLOW;
 
     // 记住「有 hook 是坏掉后被兜过去的」。全允许时也要把这一位带出去：
@@ -778,11 +791,13 @@ export async function evaluatePromptGate(
           `[hooks] gate ${event} DENIED by ${decision.source}`
           + `${decision.reason ? `: ${decision.reason}` : ''}`,
         );
-        return decision;
+        return { ...decision, matched: true };
       }
       if (decision.fromError) sawFailOpen = true;
     }
-    return sawFailOpen ? { allowed: true, fromError: true } : GATE_ALLOW;
+    return sawFailOpen
+      ? { allowed: true, fromError: true, matched: true }
+      : { allowed: true, matched: true };
   } catch (err: any) {
     // 这条链路在收信主路上：任何未预期的异常都必须变成放行，不能把消息吞掉。
     logger.warn(`[hooks] gate ${event} evaluation crashed, allowing: ${err?.message ?? String(err)}`);

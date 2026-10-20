@@ -63,6 +63,7 @@ import {
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
+import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
@@ -77,7 +78,7 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './types.js';
-import type { DaemonSession } from './types.js';
+import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -776,17 +777,32 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
   ].join('\n');
 }
 
+function renderGroupJoinContextBlock(context?: GroupJoinContext): string {
+  if (!context) return '';
+  return [
+    `<botmux_group_join source="lark" trusted="true" event="${context.event}" gate_matched="${context.gateMatched}">`,
+    `  <lark_app_id>${xmlEscape(context.larkAppId)}</lark_app_id>`,
+    `  <chat_id>${xmlEscape(context.chatId)}</chat_id>`,
+    `  <turn_id>${xmlEscape(context.turnId)}</turn_id>`,
+    ...(context.operatorOpenId
+      ? [`  <operator_open_id>${xmlEscape(context.operatorOpenId)}</operator_open_id>`]
+      : []),
+    '</botmux_group_join>',
+  ].join('\n');
+}
+
 /**
  * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
  * (getBot throws for an unknown appId) or an absent key both mean "inject",
  * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
-function senderTagEnabled(larkAppId: string): boolean {
+function senderTagOptions(larkAppId: string): { enabled: boolean; hideEmail: boolean } {
   try {
-    return getBot(larkAppId).config.senderTag !== false;
+    const { senderTag, senderTagHideEmail } = getBot(larkAppId).config;
+    return { enabled: senderTag !== false, hideEmail: senderTagHideEmail === true };
   } catch {
-    return true;
+    return { enabled: true, hideEmail: false };
   }
 }
 
@@ -801,15 +817,17 @@ function senderTagEnabled(larkAppId: string): boolean {
  * at the call sites, so all five injection points (new topic, its codex-app
  * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
  * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
- * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
- * existing tests — keeps the historical always-inject behavior.
+ * judgment and cannot drift apart. `senderTagHideEmail: true` omits only the
+ * email attribute without mutating the resolved sender or daemon identity.
+ * Omitting `larkAppId` — synthetic callers and existing tests — keeps the historical always-inject behavior.
  */
 export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
-  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
+  const options = larkAppId ? senderTagOptions(larkAppId) : { enabled: true, hideEmail: false };
+  if (!options.enabled) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
-  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
+  if (sender.email && !options.hideEmail) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -1276,6 +1294,7 @@ type NewTopicOpts = {
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
   chatContext?: ChatContext;
+  groupJoinContext?: GroupJoinContext;
   sharedGroupContext?: string;
   turnId?: string;
   sessionBackendType?: BackendType;
@@ -1295,7 +1314,7 @@ type NewTopicOpts = {
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
-  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
+  | 'summaryMemory' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
 
@@ -1410,6 +1429,7 @@ function buildNewTopicBlocks(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1474,6 +1494,7 @@ function buildNewTopicBlocks(
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
+  if (groupJoinContextBlock) blocks.push({ key: 'groupJoin', text: groupJoinContextBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
   if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
@@ -1553,6 +1574,7 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    groupJoinContext?: GroupJoinContext;
     sharedGroupContext?: string;
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
@@ -1627,6 +1649,7 @@ export function buildNewTopicCliInput(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -1640,7 +1663,7 @@ export function buildNewTopicCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, groupJoinContextBlock].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -3531,6 +3554,218 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
   return ds.workerPort ?? undefined;
 }
 
+export type DurableActiveSessionTakeoverResult =
+  | { ok: true; ds: DaemonSession }
+  | {
+      ok: false;
+      error:
+        | 'canonical_changed'
+        | 'unsupported_session'
+        | 'anchor_occupied'
+        | 'materialization_failed'
+        | 'worker_start_failed';
+      detail?: string;
+      activeSessionId?: string;
+    };
+
+function activeCanonicalTakeoverUnsupportedReason(session: Session): string | undefined {
+  if (session.status !== 'active') return 'canonical Session is not active';
+  if (!session.larkAppId) return 'canonical Session has no Lark application identity';
+  if (session.backendType !== 'remote-runner' && session.cliId !== 'remote-runner') {
+    return 'canonical Session does not use the Remote Runner backend';
+  }
+  const remote = normalizeRemoteRunnerBackendState(session.remoteBackendState);
+  if (!remote?.remoteSessionId) {
+    return 'canonical Session has no resumable Remote Runner state';
+  }
+  let requiredCapabilities: readonly string[] | undefined;
+  try {
+    requiredCapabilities = getBot(session.larkAppId).config.remoteRunner?.requiredCapabilities;
+  } catch {
+    return 'canonical Session application is not configured on this replica';
+  }
+  if (!requiredCapabilities?.includes('turn_recovery')) {
+    return 'Remote Runner turn_recovery is not required on this replica';
+  }
+  if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
+    return 'adopted Sessions do not support active takeover';
+  }
+  if (session.workspaceRetirement) return 'workspace-retired Sessions cannot be taken over';
+  if (session.deferredScheduleRun || session.headless || session.queued
+      || session.pendingRepoSetup || session.principalLane
+      || session.xpiSharedCwdAdmissionGroupId
+      || session.queuedActivationPending
+      || (session.queuedActivationTail?.length ?? 0) > 0) {
+    return 'canonical Session uses a lifecycle not supported by active takeover';
+  }
+  return undefined;
+}
+
+/**
+ * Materialize one already-active canonical Remote Runner Session on this
+ * replica after the caller has acquired its distributed Session lease. The
+ * input must be the post-claim canonical snapshot, never the router's earlier
+ * read, so local persistence cannot materialize stale state.
+ */
+export async function takeOverDurableActiveRemoteSession(
+  canonical: Session,
+  activeSessions: Map<string, DaemonSession>,
+): Promise<DurableActiveSessionTakeoverResult> {
+  const unsupported = activeCanonicalTakeoverUnsupportedReason(canonical);
+  if (unsupported) return { ok: false, error: 'unsupported_session', detail: unsupported };
+  const expectedAppId = canonical.larkAppId!;
+  const expectedSessionId = canonical.sessionId;
+  const expectedAnchor = storedSessionAnchorId(canonical);
+  const key = sessionKey(expectedAnchor, expectedAppId);
+
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    const existing = activeSessions.get(key);
+    if (existing) {
+      return {
+        ok: false as const,
+        error: 'anchor_occupied' as const,
+        activeSessionId: existing.session.sessionId,
+      };
+    }
+    const sameIdElsewhere = [...activeSessions.values()].find(
+      ds => ds.session.sessionId === expectedSessionId,
+    );
+    if (sameIdElsewhere) {
+      return {
+        ok: false as const,
+        error: 'anchor_occupied' as const,
+        activeSessionId: sameIdElsewhere.session.sessionId,
+        detail: 'the Session id is already registered at another local route',
+      };
+    }
+    const priorLocal = sessionStore.getOwnedSession(expectedSessionId);
+    if (!existing && priorLocal?.status === 'active') {
+      return {
+        ok: false as const,
+        error: 'materialization_failed' as const,
+        detail: 'an unregistered active local Session row requires recovery before takeover',
+      };
+    }
+
+    const localConflict = sessionStore.listSessions().find(session =>
+      session.sessionId !== expectedSessionId
+      && session.status === 'active'
+      && (!session.larkAppId || session.larkAppId === expectedAppId)
+      && (session.scope === 'chat' ? 'chat' : 'thread')
+        === (canonical.scope === 'chat' ? 'chat' : 'thread')
+      && storedSessionAnchorId(session) === expectedAnchor,
+    );
+    if (localConflict) {
+      return {
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: localConflict.sessionId,
+        detail: 'another active local Session row occupies the canonical route',
+      };
+    }
+    // PID, Web Terminal and preview targets are replica-local observations.
+    // Keep the logical workerGeneration so reserveWorkerGeneration advances
+    // across takeover, but never import another Pod's process handles.
+    const materialized = structuredClone(canonical);
+    materialized.pid = undefined;
+    materialized.webPort = undefined;
+    materialized.previewTarget = undefined;
+    materialized.restoreQuarantinedAt = undefined;
+    try {
+      sessionStore.updateSession(materialized);
+    } catch (error) {
+      return {
+        ok: false,
+        error: 'materialization_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const persisted = sessionStore.getOwnedSession(expectedSessionId);
+    if (!persisted || persisted.status !== 'active'
+        || persisted.larkAppId !== expectedAppId
+        || storedSessionAnchorId(persisted) !== expectedAnchor) {
+      return {
+        ok: false,
+        error: 'materialization_failed',
+        detail: 'canonical active Session materialization did not persist',
+      };
+    }
+
+    const ds: DaemonSession = {
+      session: persisted,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: expectedAppId,
+      chatId: persisted.chatId,
+      chatType: persisted.chatType ?? 'group',
+      scope: persisted.scope === 'chat' ? 'chat' : 'thread',
+      spawnedAt: sessionCreatedAtMs(persisted),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: sessionLastMessageAtMs(persisted),
+      lastHumanMessageAt: persisted.lastHumanMessageAt
+        ? Date.parse(persisted.lastHumanMessageAt) || undefined
+        : undefined,
+      hasHistory: true,
+      workingDir: persisted.workingDir,
+      ownerOpenId: persisted.ownerOpenId,
+      streamCardId: persisted.streamCardId,
+      streamCardNonce: persisted.streamCardNonce,
+      streamCardReplyTargetKey: persisted.streamCardReplyTargetKey,
+      displayMode: persisted.displayMode ?? (persisted.streamExpanded ? 'screenshot' : 'hidden'),
+      currentImageKey: persisted.currentImageKey,
+      currentTurnTitle: persisted.currentTurnTitle,
+      usageLimit: persisted.usageLimit,
+      modelFallback: persisted.modelFallback,
+      lastUserPrompt: persisted.lastUserPrompt,
+      lastCliInput: persisted.lastCliInput,
+      lastCodexAppInput: persisted.lastCodexAppInput,
+      replyThreadAliases: persisted.replyThreadAliases,
+      currentReplyTarget: persisted.currentReplyTarget,
+      suppressRecoveryCard: true,
+    };
+    messageQueue.ensureQueue(expectedAnchor);
+    if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
+    if (!setActiveSessionIfActive(activeSessions, key, ds)
+        || activeSessions.get(key) !== ds) {
+      return {
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: activeSessions.get(key)?.session.sessionId,
+      };
+    }
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'reattach' }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+      });
+    } catch (error) {
+      logger.warn(
+        `[${expectedSessionId.substring(0, 8)}] Active canonical takeover worker failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      if (activeSessions.get(key) === ds) activeSessions.delete(key);
+      persisted.restoreQuarantinedAt = new Date().toISOString();
+      try { sessionStore.updateSession(persisted); } catch { /* retry remains fail-closed */ }
+      return {
+        ok: false,
+        error: 'worker_start_failed',
+        detail: `worker admission ${admission ?? 'not_reported'}`,
+      };
+    }
+    announceSessionRow(ds);
+    logger.info(
+      `[${expectedSessionId.substring(0, 8)}] Took over active canonical Remote Runner Session `
+      + `(anchor: ${expectedAnchor.substring(0, 12)})`,
+    );
+    return { ok: true, ds };
+  });
+}
+
 /**
  * Reactivate a single closed session — used by the "▶️ 恢复会话" card button
  * and the `botmux resume <id>` CLI command. Mirrors the per-session branch
@@ -4761,6 +4996,8 @@ async function forkOrShowRepoCard(
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;
+    ds.pendingGroupJoinContext = undefined;
+    ds.pendingTrustedCaller = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
     ds.pendingSender = undefined;

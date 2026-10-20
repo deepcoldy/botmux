@@ -11,6 +11,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -2791,6 +2792,9 @@ export function closeSession(
     removePromptContextDir(sessionId);
     // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
     removeStatuslineDir(config.session.dataDir, sessionId);
+    // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
+    // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
+    removeSessionSkillRuntime(sessionId, config.session.dataDir);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

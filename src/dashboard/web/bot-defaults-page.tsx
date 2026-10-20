@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
@@ -604,9 +605,12 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
     : tr('botDefaults.maxLiveWorkersStateOn', { count: cap });
 }
 
-function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
+export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    // The server omits default-true keys; overwrite old false values as well.
+    ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
+    showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
@@ -619,6 +623,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     privateCard: body.privateCard,
     cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
+    senderTagHideEmail: body.senderTagHideEmail,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -2487,6 +2492,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
@@ -2570,6 +2576,7 @@ export function BotAgentSection(props: {
         setTurnTimeoutError(null);
         setDshRuntimeTouched(false);
         setRuntimeTouched(false);
+        setCliSelectionTouched(false);
         setNativePolicyTouched(false);
         const savedNativePolicy = res.body.nativeSubagentRuntime;
         setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
@@ -2801,6 +2808,7 @@ export function BotAgentSection(props: {
             options={cliOptions}
             searchable
             onChange={updateCli}
+            notifyOnReselect
           />
           {option?.available === false && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
@@ -3690,12 +3698,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const enabled = policy?.enabled === true;
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
+  const credentialSource = policy?.credentialSource ?? 'auto';
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
+    platformBound?: boolean;
+    platformCredentialsUrl?: string;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -3729,7 +3740,11 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback });
+    void save({ enabled: true, tools: next, fallback, credentialSource });
+  }
+
+  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
+    void save({ enabled: true, tools, fallback, credentialSource: next });
   }
 
   return (
@@ -3742,7 +3757,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource } : null,
         )}
       />
       {enabled ? (
@@ -3762,6 +3777,33 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+            <select
+              data-action="trigger-user-auth-source"
+              value={credentialSource}
+              disabled={busy}
+              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+            >
+              <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
+              <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
+              <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
+            </select>
+          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          {credentialSource !== 'local' && info && info.platformBound === false ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
+              ⚠️ {tr(credentialSource === 'platform'
+                ? 'botDefaults.triggerUserAuthPlatformUnboundStrict'
+                : 'botDefaults.triggerUserAuthPlatformUnbound')}
+            </p>
+          ) : null}
+          {credentialSource !== 'local' && info?.platformBound && info.platformCredentialsUrl ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="bound">
+              {tr('botDefaults.triggerUserAuthPlatformBound')}{' '}
+              <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
+            </p>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
@@ -4522,6 +4564,9 @@ function ProfileRoles(props: { appId: string }) {
 export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [footerPrefs, setFooterPrefs] = useState(() => normalizeReplyFooter(bot));
+  const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
+  useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
@@ -4703,6 +4748,29 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             })}
           </div>
           {replyMode !== 'legacy' && pinToggle}
+        </section>
+
+        <section className="bd-card-setting-group" data-reply-footer-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.footerGroup')}</h4>
+          <p className="hint">{tr('botDefaults.footerHelp')}</p>
+          <div className="bd-card-control-list">
+            {REPLY_FOOTER_KEYS.map(key => (
+              <ToggleRow key={key} dataAction={`toggle-${key}`}
+                title={tr(`botDefaults.${key}`)} checked={footerPrefs[key] !== false}
+                disabled={busy !== null}
+                onChange={checked => {
+                  const previous = footerPrefs;
+                  setFooterPrefs({ ...footerPrefs, [key]: checked });
+                  void savePatch({ [key]: checked }, key, () => setFooterPrefs(previous));
+                }} />
+            ))}
+            <ToggleRow dataAction="toggle-showReplyTiming" title={tr('botDefaults.footerTiming')} help={tr('botDefaults.footerTimingHelp')}
+              checked={showTiming} disabled={busy !== null}
+              onChange={checked => {
+                const previous = showTiming; setShowTiming(checked);
+                void savePatch({ showReplyTiming: checked }, 'showReplyTiming', () => setShowTiming(previous));
+              }} />
+          </div>
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
@@ -5112,13 +5180,16 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   );
 }
 
-function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [on, setOn] = useState(props.bot.senderTag !== false);
+  const [hideEmail, setHideEmail] = useState(props.bot.senderTagHideEmail === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setOn(props.bot.senderTag !== false), [props.bot.senderTag]);
+
+  useEffect(() => setHideEmail(props.bot.senderTagHideEmail === true), [props.bot.senderTagHideEmail]);
 
   async function save(next: boolean): Promise<void> {
     const previous = on;
@@ -5134,6 +5205,20 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
     });
   }
 
+  async function saveHideEmail(next: boolean): Promise<void> {
+    const previous = hideEmail;
+    setHideEmail(next);
+    await saveBotField({
+      request: () => props.putCardPref({ senderTagHideEmail: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: () => props.patchBot(props.bot.larkAppId, { senderTagHideEmail: next }),
+      rollback: () => setHideEmail(previous),
+    });
+  }
+
   return (
     <section className="bd-section" data-sender-tag>
       <h3 className="bd-section-title">{tr('botDefaults.senderTag')}</h3>
@@ -5144,6 +5229,14 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
         title={tr('botDefaults.senderTagInject')}
         help={tr('botDefaults.senderTagHelp')}
         onChange={checked => void save(checked)}
+      />
+      <ToggleRow
+        checked={hideEmail}
+        disabled={busy}
+        dataAction="toggle-sender-tag-hide-email"
+        title={tr('botDefaults.senderTagHideEmail')}
+        help={tr('botDefaults.senderTagHideEmailHelp')}
+        onChange={checked => void saveHideEmail(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
       <div className="actions">

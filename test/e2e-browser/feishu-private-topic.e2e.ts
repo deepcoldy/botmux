@@ -57,7 +57,7 @@ export function registerMidsceneSuites(): void {
 
     it('bot uses topic replies in a private chat', async () => {
       const msg = testMessage('private-topic');
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Wait for bot to respond
       await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });

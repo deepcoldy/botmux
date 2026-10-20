@@ -423,6 +423,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
   // fallback cannot drift to the default when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -574,6 +575,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
   // env is never a config input for it.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',

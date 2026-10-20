@@ -2,96 +2,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-// Source-level regression guard for the iOS third-party IME fix injected into
-// the web terminal page (getTerminalHtml in src/worker.ts). That block is a
-// string of browser JS, so — like web-terminal-touch-scroll.test.ts — we assert
-// on its source rather than execute a DOM. These assertions lock the two
-// double-emit hardening invariants a Codex review flagged (composed gate +
-// _claim reset on keydown/blur, not just keyup) so a future edit can't silently
-// regress them, plus the core dead-path takeover behaviour.
+// Behavioural tests for the iOS third-party IME fix injected into the web
+// terminal page (getTerminalHtml in src/worker.ts). That block is a string of
+// browser JS inside a template literal, so we cut the real IIFE out of the
+// source and run it against a stub DOM.
 const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
-function imeBlock(): string {
-  const start = workerSource.indexOf('// ── iOS third-party IME fix');
-  const end = workerSource.indexOf('})();}', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
-  // include the closing IIFE
-  return workerSource.slice(start, end + '})();}'.length);
-}
-
-describe('web terminal iOS IME fix', () => {
-  it('claims the keyCode=229 dead path (returns false so xterm skips its broken fallback)', () => {
-    const block = imeBlock();
-    expect(block).toContain('if(e.keyCode===229){ _claim=true; return false; }');
-  });
-
-  it('claims Backspace ONLY when the textarea is non-empty (empty = normal terminal backspace)', () => {
-    const block = imeBlock();
-    // The non-empty guard is what keeps a plain shell-line backspace flowing to
-    // xterm (which sends its standard \x7f) instead of being swallowed.
-    expect(block).toContain('if(e.keyCode===8 && _ta && _ta.value.length>0){ _claim=true; return false; }');
-  });
-
-  it('resets _claim at the START of every keydown (iOS IME keys often fire no keyup)', () => {
-    const block = imeBlock();
-    // Must reset before deciding to claim, so a stuck-open _claim from a prior
-    // cycle (missing keyup) cannot leak into the next key.
-    const keydownIdx = block.indexOf("if(e.type==='keydown'){");
-    const resetIdx = block.indexOf('_claim=false;', keydownIdx);
-    const claim229Idx = block.indexOf('if(e.keyCode===229)', keydownIdx);
-    expect(keydownIdx).toBeGreaterThan(-1);
-    expect(resetIdx).toBeGreaterThan(keydownIdx);
-    // reset happens before the claim decision
-    expect(resetIdx).toBeLessThan(claim229Idx);
-  });
-
-  it('also closes the cycle on keyup AND blur (belt-and-suspenders against stuck-open _claim)', () => {
-    const block = imeBlock();
-    expect(block).toContain("_ta.addEventListener('keyup',function(){_claim=false;}");
-    expect(block).toContain("_ta.addEventListener('blur',function(){_claim=false;}");
-  });
-
-  it('forwards inserted text ONLY for inputType===insertText AND composed (whitelist, not just composed)', () => {
-    const block = imeBlock();
-    // composed is a shadow-DOM flag true for EVERY trusted InputEvent, so gating
-    // on composed alone would still swallow insertFromPaste / insertReplacementText.
-    // The whitelist restricts us to the exact dead path the target traces take.
-    expect(block).toContain("if(e.data&&e.composed&&it==='insertText'){try{term.input(e.data,true)}catch(_e){}}");
-    // the composed-only and unconditional forms are both regressions
-    expect(block).not.toContain('if(e.data&&e.composed){try{term.input(e.data,true)}catch(_e){}}');
-    expect(block).not.toContain('if(e.data){try{term.input(e.data,true)}catch(_e){}}');
-  });
-
-  it('maps each textarea delete to one terminal backspace (whole-run erase stays 1:1)', () => {
-    const block = imeBlock();
-    expect(block).toContain("if(it.indexOf('delete')===0){");
-    expect(block).toContain("term.input('\\\\x7f',true)");
-  });
-
-  it('never takes over while a real composition is active (WeChat Chinese stays on xterm)', () => {
-    const block = imeBlock();
-    expect(block).toContain("_ta.addEventListener('compositionstart',function(){_composing=true;_claim=false;}");
-    expect(block).toContain("_ta.addEventListener('compositionend',function(){_composing=false;_claim=false;}");
-    // the input handler bails while composing
-    expect(block).toContain('if(!_claim||_composing)return;');
-  });
-
-  it('uses term.input (not term.paste) so per-char input is not bracketed-paste-wrapped', () => {
-    const block = imeBlock();
-    expect(block).toContain('term.input(e.data,true)');
-    expect(block).not.toContain('term.paste(e.data)');
-  });
-
-  it('is gated behind hasToken and an ?imefix=0 escape hatch', () => {
-    const block = imeBlock();
-    expect(block).toContain('if(hasToken && !/[?&]imefix=0');
-  });
-});
-
-// ── Executable behavioural tests ────────────────────────────────────────────
-// The source-level asserts above lock statement SHAPE; these run the real IIFE
-// in a stub DOM and assert BEHAVIOUR, so a shape that "looks right" but emits
+// ── Executable rig ──────────────────────────────────────────────────────────
+// Runs the real IIFE in a stub DOM so a shape that "looks right" but emits
 // twice is caught. We model xterm's own emitters (verified against @xterm/xterm
 // 5.5.0 lib/xterm.js):
 //   • _inputEvent(e): emits iff e.data && e.inputType==='insertText' &&
@@ -101,7 +19,7 @@ describe('web terminal iOS IME fix', () => {
 //     input(insertFromPaste, composed=true) into the textarea.
 // A regression that forwards a non-insertText composed event shows up as
 // total emits > the single intended copy.
-function buildImeRig() {
+function buildImeRig(opts: { hasToken?: boolean; search?: string } = {}) {
   const start = workerSource.indexOf('if(hasToken && !/[?&]imefix=0');
   const end = workerSource.indexOf('})();}', start) + '})();}'.length;
   // The block lives in a template literal: \\x7f → \x7f, \\b → \b at emit time.
@@ -127,7 +45,11 @@ function buildImeRig() {
     },
   };
   // eslint-disable-next-line no-new-func
-  new Function('term', 'location', 'hasToken', emitted)(term, { search: '?tok=1' }, true);
+  new Function('term', 'location', 'hasToken', emitted)(
+    term,
+    { search: opts.search ?? '?tok=1' },
+    opts.hasToken ?? true,
+  );
 
   const fire = (type: string, ev: any) => (listeners[type] || []).forEach((fn) => fn(ev));
   // xterm's own _inputEvent emit rule (5.5.0):
@@ -139,9 +61,10 @@ function buildImeRig() {
     setTextarea(v: string) {
       textarea.value = v;
     },
-    keydown(keyCode: number) {
+    /** Returns the custom key handler's verdict: false = claimed (xterm skips the key). */
+    keydown(keyCode: number): boolean | undefined {
       keyDownSeen = true;
-      handler?.({ type: 'keydown', keyCode });
+      return handler?.({ type: 'keydown', keyCode });
     },
     keyup() {
       keyDownSeen = false;
@@ -168,6 +91,9 @@ function buildImeRig() {
     },
     get ours() {
       return ours;
+    },
+    get attached() {
+      return handler !== null || Object.keys(listeners).length > 0;
     },
     get total() {
       return xtermEmits + ours.length;
@@ -276,5 +202,63 @@ describe('web terminal iOS IME fix — behaviour (exactly-once, no double-emit)'
     rig.blur();
     rig.input({ inputType: 'insertFromPaste', data: 'zzz', composed: true });
     expect(rig.ours).toEqual([]);
+  });
+});
+
+describe('web terminal iOS IME fix — key claiming and cycle boundaries', () => {
+  it('claims keyCode 229 (xterm skips its broken fallback) and leaves ordinary keys to xterm', () => {
+    const rig = buildImeRig();
+    expect(rig.keydown(229)).toBe(false);
+    expect(rig.keydown(65)).toBe(true);
+  });
+
+  it('claims Backspace only while the textarea holds a pending IME edit', () => {
+    const rig = buildImeRig();
+    rig.setTextarea('');
+    // empty textarea = plain terminal backspace: xterm must keep sending its \x7f
+    expect(rig.keydown(8)).toBe(true);
+    rig.setTextarea('x');
+    expect(rig.keydown(8)).toBe(false);
+  });
+
+  it('every new keydown closes a stuck-open claim before deciding to claim again', () => {
+    const rig = buildImeRig();
+    rig.keydown(229); // claimed; iOS IME keys often fire no keyup
+    rig.keydown(65); // an unclaimed key starts a fresh, unclaimed cycle
+    rig.input({ inputType: 'deleteContentBackward', composed: true });
+    rig.input({ inputType: 'insertText', data: 'A', composed: true });
+    expect(rig.ours).toEqual([]);
+  });
+
+  it.each(['keyup', 'blur'] as const)('%s closes a claimed cycle', (closer) => {
+    const rig = buildImeRig();
+    rig.setTextarea('x');
+    rig.keydown(8);
+    rig[closer]();
+    rig.input({ inputType: 'deleteContentBackward', composed: true });
+    rig.input({ inputType: 'insertText', data: 'y', composed: true });
+    expect(rig.ours).toEqual([]);
+  });
+
+  it('neither claims nor forwards while a real composition is active', () => {
+    const rig = buildImeRig();
+    rig.compositionstart();
+    rig.setTextarea('ni');
+    expect(rig.keydown(229)).toBe(true);
+    expect(rig.keydown(8)).toBe(true);
+    rig.input({ inputType: 'insertText', data: '你', composed: true });
+    rig.input({ inputType: 'deleteContentBackward', composed: true });
+    expect(rig.ours).toEqual([]);
+    rig.compositionend();
+    expect(rig.keydown(229)).toBe(false);
+  });
+
+  it.each([
+    ['without a write token', { hasToken: false }],
+    ['behind the ?imefix=0 escape hatch', { search: '?tok=1&imefix=0' }],
+  ])('installs nothing %s', (_label, opts) => {
+    const rig = buildImeRig(opts);
+    expect(rig.attached).toBe(false);
+    expect(rig.keydown(229)).toBeUndefined();
   });
 });

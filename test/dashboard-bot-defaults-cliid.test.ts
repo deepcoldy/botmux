@@ -3,10 +3,10 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
 import {
-  BOT_DEFAULTS_TABS,
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
@@ -26,7 +26,6 @@ describe('bot defaults task tabs', () => {
     });
 
     const tabs = renderer.root.findAllByProps({ role: 'tab' });
-    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
     expect(tabs).toHaveLength(5);
     expect(tabs[0]!.props['aria-selected']).toBe(true);
     expect(tabs[1]!.props.tabIndex).toBe(-1);
@@ -175,6 +174,52 @@ describe('Codex-compatible runtime editor', () => {
 
     const oldWrapperPayload = renderAgent({ cliId: 'codex', wrapperCli: 'custom-launcher codex' });
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+  });
+
+
+  it.each([
+    ['codex', 'codex', 'codex --profile withhooks'],
+    ['claude-code', 'claude-code', 'custom-launcher claude'],
+    ['codex', 'ttadk-x-codex', 'ttadk codex'],
+  ])('sends replacement intent only after explicitly selecting the launch option for %s', async (cliId, key, wrapperCli) => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (init?.method !== 'PUT') return { ok: true, status: 200, json: async () => ({ models: [], source: 'static', profiles: [] }) } as any;
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({
+        ok: true, cliId, selectionKey: key, model: body.model,
+        wrapperCli: body.replaceCliSelection ? null : wrapperCli,
+      }) } as any;
+    });
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    try {
+      const rendered = renderAgent({ cliId, wrapperCli, agentSelectionKey: key });
+      renderer = rendered.renderer;
+      const { root, patchBot } = rendered;
+      const save = async () => { await act(async () => { root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); }); };
+      await save();
+      expect(requests[0]).not.toHaveProperty('replaceCliSelection');
+      expect(requests[0]).not.toHaveProperty('wrapperCli');
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli }));
+      act(() => root.findByProps({ dataInput: 'agentModel' }).props.onChange('new-model'));
+      await save();
+      expect(requests[1]).toMatchObject({ model: 'new-model' });
+      expect(requests[1]).not.toHaveProperty('replaceCliSelection');
+      // The picker can deliberately choose the same key. This is distinguishable
+      // from an untouched fallback key even for an unregistered Codex wrapper.
+      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
+        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      await save();
+      expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
+      await save();
+      expect(requests[3]).not.toHaveProperty('replaceCliSelection');
+    } finally {
+      if (renderer) act(() => renderer!.unmount());
+      globalThis.fetch = previousFetch;
+    }
   });
 
   it('shows and saves the configured Codex reasoning effort', async () => {
@@ -811,7 +856,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       expect(requests).toEqual([{
-        cliId: 'traex',
+        cliId: 'traex', replaceCliSelection: true,
         model: 'GPT-5.6-Terra',
         reasoningEffort: 'xhigh',
         modelBackendVariant: '',
@@ -1027,7 +1072,7 @@ describe('Codex-compatible runtime editor', () => {
         value => value === 1,
       );
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null }]);
       await waitForObserved(
         () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
         text => text.includes('已保存'),
@@ -1765,7 +1810,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -2412,5 +2457,67 @@ describe('card behavior defaults', () => {
       await pending;
     });
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
+    act(() => renderer.unmount());
   });
 });

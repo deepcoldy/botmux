@@ -334,6 +334,31 @@ describe('compact_session card action', () => {
     expect(result.toast.content).toContain('/compact');
   });
 
+  it('keeps the thread root as the reply root for a thread-scope session', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn();
+    await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0][2].replyRootId).toBe(ROOT);
+  });
+
+  it('does not pass the chat id as a reply root for a chat-scope session', async () => {
+    // Chat-scope cards carry the chat id as root_id; treating it as a thread
+    // root froze an unreplyable target for every later rootless post.
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat', rootMessageId: 'om_first' } });
+    const deliver = vi.fn();
+    const deps = depsWith(undefined, deliver);
+    deps.activeSessions.set(sessionKey('oc_chat', LARK_APP_ID), ds);
+    const data = actionData('compact_session');
+    data.action.value.root_id = 'oc_chat';
+    const result = await handleCardAction(data, deps, LARK_APP_ID);
+
+    expect(result.toast.type).toBe('success');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const opts = deliver.mock.calls[0][2];
+    expect(opts.anchor).toBe('oc_chat');
+    expect(opts.replyRootId).toBeUndefined();
+  });
+
   it('falls back to an unsupported toast when the daemon did not wire the dep', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('compact_session'), depsWith(ds, undefined), LARK_APP_ID);

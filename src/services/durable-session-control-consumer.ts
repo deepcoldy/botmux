@@ -5,7 +5,7 @@ import {
   type InboxClaim,
 } from './durable-coordination.js';
 import {
-  parseDurableLarkSessionControlClaim,
+  parseDurableSessionControlClaim,
   type DurableLarkSessionControlClaim,
 } from './durable-lark-session-control.js';
 
@@ -202,7 +202,7 @@ export function startDurableSessionControlConsumer(
 
     let control: DurableLarkSessionControlClaim | undefined;
     try {
-      control = parseDurableLarkSessionControlClaim(claim);
+      control = parseDurableSessionControlClaim(claim);
       const result = await options.dispatch(control, { claim, signal: controller.signal });
       clearInterval(renewalTimer);
       if (renewing) await renewing;

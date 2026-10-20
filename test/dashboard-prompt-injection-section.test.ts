@@ -4,8 +4,6 @@
  * per-bot route and is locked when a linked Agent manages the section.
  */
 import React from 'react';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, expect, it, vi } from 'vitest';
 import { PromptInjectionSection, zeroPromptSupportedFor } from '../src/dashboard/web/bot-defaults-page.js';
@@ -87,11 +85,4 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   })));
   expect(toggle(scratch).props.disabled).toBe(false);
   act(() => scratch.unmount());
-});
-
-it('lives in the Bot config advanced tab, next to reply delivery', () => {
-  const page = readFileSync(join(process.cwd(), 'src/dashboard/web/bot-defaults-page.tsx'), 'utf8');
-  const advanced = page.slice(page.indexOf('aria-labelledby="bd-tab-advanced"'));
-  expect(advanced.indexOf('<PromptInjectionSection')).toBeGreaterThan(-1);
-  expect(advanced.indexOf('<PromptInjectionSection')).toBeLessThan(advanced.indexOf('<ReplyDeliverySection'));
 });

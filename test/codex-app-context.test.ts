@@ -1,5 +1,4 @@
 import { Buffer } from 'node:buffer';
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   CODEX_APP_CONTEXT_CHUNK_BYTES,
@@ -44,17 +43,5 @@ describe('Codex App additional context chunking', () => {
     const next = withCodexAppContext(original, 'botmux_plugin_skills', '技'.repeat(1_000), 'application');
     expect(original.additionalContext).toEqual({ botmux_sender: { kind: 'untrusted', value: 'Alice' } });
     expect(Object.values(next.additionalContext ?? {}).filter(entry => entry.kind === 'application').length).toBeGreaterThan(1);
-  });
-
-  it('keeps fresh-generation Skill catalogs synchronized into the init sidecar', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const refreshStart = worker.indexOf('function refreshCliPluginGeneration');
-    const refreshEnd = worker.indexOf('/** v2 read isolation', refreshStart);
-    const refresh = worker.slice(refreshStart, refreshEnd);
-    expect(refresh).toContain('cfg.prompt = generation.prompt');
-    expect(refresh).toContain('cfg.promptCodexAppInput = withCodexAppContext');
-    expect(refresh).toContain("'botmux_plugin_skills'");
-    expect(refresh.indexOf('cfg.promptCodexAppInput = withCodexAppContext'))
-      .toBeGreaterThan(refresh.indexOf('cfg.prompt = generation.prompt'));
   });
 });

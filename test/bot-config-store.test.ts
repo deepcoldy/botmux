@@ -238,6 +238,20 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('hot-updates sender email hiding through botconfig and reloads it', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('senderTagHideEmail')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.senderTagHideEmail).toBe(true);
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('senderTagHideEmail');
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBeUndefined();
+  });
+
   it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
@@ -256,6 +270,32 @@ describe('bot-config store', () => {
     expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
     expect(readConfig().codexCapacityRecovery).toBeUndefined();
     expect(registry.getBot('app_default').config.codexCapacityRecovery).toBeUndefined();
+  });
+
+  it('defaults the delivered-final failure-notice opt-in off and round-trips only an explicit true', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    const spec = store.findConfigField('suppressDeliveredFinalFailureNotice')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'next-session', clearable: true });
+    expect(spec.defaultOn).toBeUndefined();
+    expect(spec.hint).toContain('实验性');
+    expect(spec.hint).toContain('默认 off');
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.loadBotConfigs()[0].suppressDeliveredFinalFailureNotice).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it.each(['true', 1, 'on'])('does not enable the delivered-final opt-in from a non-boolean bots.json value (%s)', async raw => {
+    const { registry } = await loaded({ cliId: 'codex', suppressDeliveredFinalFailureNotice: raw });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
   });
 
   it('normalizes noProgressNotify JSON and rejects out-of-range or unknown fields', async () => {

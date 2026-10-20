@@ -1,12 +1,14 @@
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from '../src/core/current-actor-attestation.js';
+import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
 
 function procStat(pid: number, ppid: number, start: string): string {
   const tail = ['S', String(ppid), '1', '1', '0', '-1', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', start];
@@ -313,6 +315,103 @@ describe('daemon current actor attestation', () => {
       procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
     expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  describe('persistent native Codex tool host', () => {
+    function fixture() {
+      const procRoot = mkdtempSync(join(tmpdir(), 'actor-codex-host-'));
+      writeProc(procRoot, 90, 1, '900');
+      writeProc(procRoot, 100, 1, '1000');
+      writeProc(procRoot, 101, 100, '1100');
+      writeProc(procRoot, 102, 101, '2000');
+      symlinkSync('/release/bin/codex', join(procRoot, '100', 'exe'));
+      symlinkSync('/release/bin/codex-code-mode-host', join(procRoot, '101', 'exe'));
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0');
+      const ds = activeSession();
+      ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '101:1100'];
+      const resolveIdentity = vi.fn(async () => ({
+        openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+      }));
+      const input = { sessionId: 's1', peer: { pid: 102, procStart: '2000' },
+        findSession: () => ds, resolveIdentity, procRoot };
+      const check = (pid = 102, procStart = '2000') => resolveDaemonCurrentActor({
+        ...input, peer: { pid, procStart },
+      });
+      return { procRoot, ds, resolveIdentity, check, input };
+    }
+
+    it('accepts a fresh command through the attested CLI native host on a later turn', async () => {
+      const { check, input } = fixture();
+      await expect(check()).resolves.toMatchObject({ ok: true,
+        document: { actor: { email: 'current@example.com' }, turnId: 'om_turn' } });
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_turn' });
+      // Incremental auth uses this same proof before creating a user grant.
+      expect(attestCurrentTurnLoopbackPeer(input)).toMatchObject({ callerOpenId: 'ou_current', turnId: 'om_turn' });
+    });
+
+    it.each([
+      ['100', '/release/bin/claude'],
+      ['101', '/another-release/codex-code-mode-host'],
+      ['101', '/release/bin/node'],
+      ['101', '/release/bin/codex-code-mode-host (deleted)'],
+      ['101', null],
+    ])('rejects an unverified executable %s -> %s even with a matching argv name', async (pid, executable) => {
+      const { procRoot, check, resolveIdentity } = fixture();
+      unlinkSync(join(procRoot, pid!, 'exe'));
+      if (executable) symlinkSync(executable, join(procRoot, pid!, 'exe'));
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      expect(resolveIdentity).not.toHaveBeenCalled();
+    });
+
+    it('uses the new turn sender while refusing the previous command below the same host', async () => {
+      const { procRoot, ds, check, resolveIdentity } = fixture();
+      await expect(check()).resolves.toMatchObject({ ok: true });
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      ds.managedTurnOrigin.turnId = 'om_next';
+      ds.managedTurnOrigin.callerOpenId = 'ou_next';
+      ds.managedTurnOrigin.capability = 'db'.repeat(32);
+      writeProc(procRoot, 103, 101, '3000');
+      resolveIdentity.mockResolvedValue({ openId: 'ou_next', type: 'user', email: 'next@example.com' });
+      await expect(check(103, '3000')).resolves.toMatchObject({ ok: true,
+        document: { actor: { email: 'next@example.com' }, turnId: 'om_next' } });
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+
+    it('does not grant the persistent host itself current-turn authority', async () => {
+      const { check } = fixture();
+      await expect(check(101, '1100')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+
+    it('still rejects a previous-turn command and new descendants below it', async () => {
+      const { procRoot, ds, check } = fixture();
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      writeProc(procRoot, 103, 102, '3000');
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      await expect(check(103, '3000')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+
+    it('rejects a host with arguments or a parent outside the attested roots', async () => {
+      const { procRoot, check } = fixture();
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0unexpected\0');
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0\0');
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeFileSync(join(procRoot, '101', 'cmdline'), 'codex-code-mode-host\0');
+      writeProc(procRoot, 101, 99, '1100');
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
+
+    it('rejects reused tool PIDs and authority revoked during identity lookup', async () => {
+      const { procRoot, ds, resolveIdentity, check } = fixture();
+      writeProc(procRoot, 102, 101, 'changed');
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeProc(procRoot, 102, 101, '2000');
+      resolveIdentity.mockImplementation(async () => {
+        ds.managedTurnOrigin = undefined;
+        return { openId: 'ou_current', type: 'user' as const, email: 'current@example.com' };
+      });
+      await expect(check()).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    });
   });
 
   it('rejects a stale worker generation before identity lookup', async () => {

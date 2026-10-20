@@ -75,6 +75,100 @@ export function extractMarkerFromMessages(messages: unknown[]): string | null {
   return null;
 }
 
+/** Prefix of every synthetic Responses-API (Codex) reply; E2E checks match it exactly. */
+export const MOCK_CODEX_REPLY_PREFIX = '【MOCK-REPLY】已收到指令并完成操作：';
+
+/**
+ * Follow-up prompts that carry this token ask the model to repeat the ACK marker
+ * of the topic's first message. A synthetic reply can only do that when the CLI
+ * really resent the earlier turn, so the E2E multi-turn case proves the session
+ * kept its conversation history instead of starting over.
+ */
+export const RECALL_FIRST_MARKER_TOKEN = 'RECALL_FIRST_MARKER';
+
+// Only the strict ACK form: workspace context (CLAUDE.md, file paths) injected
+// into the first user turn may contain looser `e2e-…` strings.
+const FIRST_ACK_PATTERN = /ACK-e2e-[a-zA-Z0-9_\-]+/;
+
+function userTexts(messages: unknown[]): string[] {
+  const texts: string[] = [];
+  for (const item of messages) {
+    if (!item) continue;
+    if (typeof item === 'string') {
+      texts.push(item);
+      continue;
+    }
+    const msg = item as { content?: unknown; role?: string };
+    if (msg.role === 'assistant' || msg.role === 'system') continue;
+    if (typeof msg.content === 'string') {
+      texts.push(msg.content);
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === 'string') texts.push(block);
+        else if (
+          block &&
+          typeof block === 'object' &&
+          'text' in block &&
+          typeof (block as { text: unknown }).text === 'string'
+        ) {
+          texts.push((block as { text: string }).text);
+        }
+      }
+    }
+  }
+  return texts;
+}
+
+/** The earliest ACK marker any user turn asked for, scanning oldest first. */
+export function extractFirstAckMarker(messages: unknown[]): string | null {
+  if (!Array.isArray(messages)) return null;
+  for (const text of userTexts(messages)) {
+    const match = text.match(FIRST_ACK_PATTERN);
+    if (match) return match[0];
+  }
+  return null;
+}
+
+/** User texts of the current turn: everything after the last assistant item. */
+function currentTurnTexts(messages: unknown[]): string[] {
+  let start = 0;
+  messages.forEach((item, index) => {
+    if (item && typeof item === 'object' && (item as { role?: string }).role === 'assistant') start = index + 1;
+  });
+  return userTexts(messages.slice(start));
+}
+
+// `e2e-<tag> [RECALL_FIRST_MARKER] 请立刻调用 …` — the head of every E2E probe.
+const PROBE_PATTERN = /(e2e-[A-Za-z0-9_-]+?-\d{10,})\s+(RECALL_FIRST_MARKER\s+)?请立刻调用/g;
+
+/**
+ * The reply for the latest user turn: one line per probe in it — `ACK-<tag>`,
+ * plus `RECALL <first marker>` for probes carrying
+ * {@link RECALL_FIRST_MARKER_TOKEN}. A real model answers every instruction in
+ * a turn; botmux batches messages that arrive while a session is still
+ * starting into one turn, and answering only the last left the earlier probe
+ * unanswered in CI. The first marker is the oldest ACK the session still holds
+ * — the probe's own one when it opened a fresh session — so a session that
+ * should have continued but restarted recalls the wrong marker and fails.
+ */
+export function buildMockReplyLine(messages: unknown[], marker: string): string {
+  if (!Array.isArray(messages)) return marker;
+  const first = extractFirstAckMarker(messages);
+  const lines = new Map<string, string>();
+  for (const text of currentTurnTexts(messages)) {
+    for (const match of text.matchAll(PROBE_PATTERN)) {
+      const own = `ACK-${match[1]}`;
+      lines.set(own, match[2] ? `${own} RECALL ${first ?? own}` : own);
+    }
+  }
+  if (lines.size > 0) return [...lines.values()].join('\n');
+  // Not a probe (e.g. the Codex marker prompt): echo the extracted marker.
+  const texts = userTexts(messages);
+  const latest = [...texts].reverse().find((text) => extractMarker(text));
+  if (!latest?.includes(RECALL_FIRST_MARKER_TOKEN)) return marker;
+  return `${marker} RECALL ${first ?? marker}`;
+}
+
 /**
  * Generate a safe, quote-escaped `botmux send` bash command to reply to the user.
  * Wraps content in single quotes with standard shell escaping to prevent command injection.

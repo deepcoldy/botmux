@@ -67,7 +67,7 @@ export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string
 export function sessionIdentityPath(
   sessionDataDir: string,
   sessionId: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
 ): string {
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`);
 }
@@ -184,14 +184,36 @@ function assertSafeSegment(value: string): string {
  * credentials. Injecting the token directly also sidesteps the macOS Keychain
  * (whose master key a sandboxed process cannot read).
  */
-export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> = {
+/**
+ * Tools that get an identity file + wrapper. The policy names `lark-cli` and
+ * `bytedcli`; `codebase` (the Codebase CLI) is a COMPANION of bytedcli — its
+ * credential is the Codebase JWT bytedcli mints, so it is never authorized on
+ * its own: whenever bytedcli's identity is published, codebase's is derived
+ * and published alongside, and whenever bytedcli is governed, codebase is
+ * wrapped too. Keeping it out of the policy type means no config, schedule
+ * scope or dashboard surface has to learn a third name.
+ */
+export const CODEBASE_COMPANION_TOOL = 'codebase' as const;
+export type IdentityTool = TriggerUserAuthTool | typeof CODEBASE_COMPANION_TOOL;
+
+export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // APP_SECRET appears only in bot mode; in user mode it is absent from the
   // file, and `export` on an unset name puts nothing in the child's env.
   'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
   // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
   // pushes authenticate with, so attribution of a commit follows from it.
   bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
+  // The Codebase CLI reads the same Codebase JWT from its own variable
+  // (`codebase auth login --help`: CI usage without persisting credentials).
+  codebase: ['CODEBASE_CLI_USER_JWT'],
 };
+
+/** The identity tools a policy actually governs (policy tools + companions). */
+export function identityToolsFor(tools: readonly TriggerUserAuthTool[]): IdentityTool[] {
+  const out = new Set<IdentityTool>(tools);
+  if (out.has('bytedcli')) out.add(CODEBASE_COMPANION_TOOL);
+  return [...out];
+}
 
 /** Common to every variant: the turn these credentials were published FOR.
  *  The wrapper refuses to use them during any other turn. Absent ⇒ no binding
@@ -264,12 +286,23 @@ export interface BotIdentity extends TurnBound {
  * because that is where the locale lives.
  */
 export interface DeniedIdentity extends TurnBound {
-  tool: TriggerUserAuthTool;
+  tool: IdentityTool;
   mode: 'denied';
   message: string;
 }
 
-export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+/**
+ * Codebase CLI as a person: derived from the bytedcli identity's Codebase JWT.
+ * Never resolved on its own — see {@link CODEBASE_COMPANION_TOOL}.
+ */
+export interface CodebaseCliIdentity extends TurnBound {
+  tool: typeof CODEBASE_COMPANION_TOOL;
+  codeJwt: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
+}
+
+export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | CodebaseCliIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -328,6 +361,8 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       ['LARKSUITE_CLI_APP_ID', identity.appId],
       ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
     );
+  } else if (identity.tool === CODEBASE_COMPANION_TOOL) {
+    pairs.push([MODE_VAR, 'user'], ['CODEBASE_CLI_USER_JWT', identity.codeJwt]);
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
@@ -365,7 +400,53 @@ export function writeSessionIdentity(
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
   mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
+  // Companion: every bytedcli publication (grant OR refusal) is mirrored for
+  // the Codebase CLI, so the two can never disagree about whose turn it is.
+  // Two files cannot be committed atomically; if the mirror fails, take the
+  // bytedcli file down with it rather than leave a granted bytedcli next to a
+  // stale codebase identity (an absent file is a refusal for both wrappers).
+  if (identity.tool === 'bytedcli') {
+    const companion = codebaseCompanionOf(identity);
+    try {
+      atomicWriteFileSync(
+        sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
+        renderIdentityEnv(companion),
+        { mode: 0o600 },
+      );
+    } catch (e) {
+      try { rmSync(path, { force: true }); } catch { /* best-effort */ }
+      throw e;
+    }
+  }
   return path;
+}
+
+function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
+  return 'mode' in identity && identity.mode === 'denied';
+}
+
+/** The codebase identity implied by a bytedcli one. A bytedcli grant without a
+ *  Codebase JWT (the mint is best-effort) refuses codebase rather than letting
+ *  it fall back to the machine's own Codebase login. */
+export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity): CodebaseCliIdentity | DeniedIdentity {
+  const turn = identity.turnId ? { turnId: identity.turnId } : {};
+  if (isDeniedIdentity(identity)) {
+    return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...turn };
+  }
+  if (!identity.codeJwt) {
+    return {
+      tool: CODEBASE_COMPANION_TOOL,
+      mode: 'denied',
+      ...turn,
+      message: 'botmux: ByteCloud 已授权，但本轮未能换取 Codebase 身份（Codebase JWT），codebase 命令未执行；请稍后重试，不会改用机器自己的 Codebase 登录。',
+    };
+  }
+  return {
+    tool: CODEBASE_COMPANION_TOOL,
+    codeJwt: identity.codeJwt,
+    ...turn,
+    ...(identity.openId ? { openId: identity.openId } : {}),
+  };
 }
 
 export function refreshSessionIdentity(
@@ -409,10 +490,12 @@ export function refreshSessionIdentity(
 export function clearSessionIdentity(
   sessionDataDir: string,
   sessionId: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
 ): void {
   try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  // The companion lives and dies with bytedcli's identity.
+  if (tool === 'bytedcli') clearSessionIdentity(sessionDataDir, sessionId, CODEBASE_COMPANION_TOOL);
   // Before #1543 identities lived directly under cli-identity/. Upgraded
   // sessions no longer read or overwrite those files, so remove the exact
   // legacy path as well instead of leaving a live token behind indefinitely.
@@ -472,7 +555,7 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *    once B has spoken. That is the trade this feature is for — a failed command
  *    is recoverable, a command that silently ran as the wrong person is not.
  */
-export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
+export function renderIdentityWrapper(tool: IdentityTool, realBinaryPath: string): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   return [
     '#!/bin/sh',
@@ -591,7 +674,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
 export function ensureSessionIdentityPlaceholders(
   sessionDataDir: string,
   sessionId: string,
-  tools: readonly TriggerUserAuthTool[],
+  tools: readonly IdentityTool[],
 ): void {
   mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   const paths = [
@@ -607,7 +690,7 @@ export function ensureSessionIdentityPlaceholders(
 }
 
 /** Whether the wrapper for `tool` is currently installed in `binDir`. */
-export function identityWrapperInstalled(binDir: string, tool: TriggerUserAuthTool): boolean {
+export function identityWrapperInstalled(binDir: string, tool: IdentityTool): boolean {
   return existsSync(join(binDir, tool));
 }
 
@@ -691,7 +774,7 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
  */
 export function installIdentityWrapper(
   binDir: string,
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
   realBinaryPath: string | null | undefined,
 ): string | null {
   if (!realBinaryPath) return null;
@@ -841,7 +924,7 @@ export function gitIdentityConfigEnv(
  * excluding the wrapper dir keeps that impossible by construction.
  */
 export function findRealToolBinary(
-  tool: TriggerUserAuthTool,
+  tool: IdentityTool,
   pathValue: string | undefined,
   excludeDirs: readonly string[] = [],
 ): string | null {
@@ -875,17 +958,18 @@ export function prepareTriggerUserCliEnv(
   // Empty is the correct initial content: no identity is published until the
   // first turn resolves one, and the wrapper treats an empty file as "no
   // identity", the same as absent.
+  const identityTools = identityToolsFor(policy.tools);
   try {
     ensureSessionIdentityPlaceholders(
       sessionDataDir,
       sessionId,
-      policy.tools,
+      identityTools,
     );
   } catch (e) {
     log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
   }
   let installedAny = false;
-  for (const tool of policy.tools) {
+  for (const tool of identityTools) {
     try {
       const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
       if (!real) {

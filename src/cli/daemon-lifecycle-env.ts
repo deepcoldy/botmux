@@ -72,6 +72,12 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS',
   'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS',
   'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS',
+  // Durable config mutations must resolve the same shared files in every
+  // daemon and in the dashboard. Without these paths in the fleet snapshot,
+  // a restart from a managed session could silently fall back to per-host
+  // defaults and make the scope-level CAS coordinate different files.
+  'BOTMUX_GLOBAL_CONFIG_FILE',
+  'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE',
   // Merlin Devbox auto-export switch (platform/devbox-dashboard-export.ts).
   // The dashboard resolves it (dashboard-url / control-csrf run there), so it
   // has to survive the allowlist copy — same reason BOTMUX_PUBLIC_URL is here.

@@ -435,6 +435,16 @@ function linuxBaseline(h: string): FsRule[] {
   ];
 }
 
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
+}
+
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**
@@ -920,6 +930,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // 单文件 bind 有效；worker 预创建文件与父目录（bwrap 不能 bind 不存在的源）。共享根与
   // 兄弟会话保持 deny-by-default —— 这份轨迹含会话标识与派发结果，不该跨会话可读可写。
   if (ctx.sessionId) push([`${sd}/ready-signal/${ctx.sessionId}.log`], 'readWrite', 'internal');
+  // Cursor stop hook appends only its own usage journal (no sibling writes).
+  if (ctx.sessionId) push([`${sd}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
   // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
   // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
   // write = tmp + rename in the parent dir, so a single-file grant (as for
@@ -1044,6 +1056,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
     // Own turn-send-ledger session dir (see the larkTransport branch).

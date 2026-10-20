@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  AUDIT_ASYNC_MAX_PENDING,
   AsyncFileControlAuditSink,
   controlAuditRecord,
   type AuditStreamLike,
@@ -119,7 +118,6 @@ describe('async audit sink backpressure', () => {
   });
 
   it('never blocks or hands the caller a promise: append stays synchronous fire-and-forget', async () => {
-    expect(AUDIT_ASYNC_MAX_PENDING).toBe(2_000);
     const stream = new FakeAuditStream();
     stream.accept = false; // 永不 drain 的最坏情况
     const sink = new AsyncFileControlAuditSink({

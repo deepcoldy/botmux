@@ -9,8 +9,12 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'renewSessionLease',
   'releaseSessionLease',
   'readSession',
+  'listSessions',
   'writeSession',
+  'readAuxiliaryState',
+  'writeAuxiliaryState',
   'enqueueInbox',
+  'enqueueInboxWithLease',
   'claimNextInbox',
   'renewInboxClaim',
   'completeInboxClaim',
@@ -118,6 +122,15 @@ function sessionRecord(value: unknown): boolean {
   const item = record(value);
   return !!item
     && nonempty(item.sessionKey)
+    && integer(item.revision, 1)
+    && durableJson(item.value)
+    && integer(item.updatedAt);
+}
+
+function auxiliaryStateRecord(value: unknown): boolean {
+  const item = record(value);
+  return !!item
+    && nonempty(item.stateKey)
     && integer(item.revision, 1)
     && durableJson(item.value)
     && integer(item.updatedAt);
@@ -235,6 +248,15 @@ export function validateDurableCoordinationProviderResult(
     case 'readSession':
       valid = value === null || sessionRecord(value);
       break;
+    case 'listSessions': {
+      const item = record(value);
+      valid = !!item
+        && Array.isArray(item.records)
+        && item.records.length <= 1_000
+        && item.records.every(sessionRecord)
+        && (item.nextSessionKey === undefined || nonempty(item.nextSessionKey));
+      break;
+    }
     case 'writeSession': {
       const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
       valid = !!item && (item.kind === 'written'
@@ -244,8 +266,24 @@ export function validateDurableCoordinationProviderResult(
           : true);
       break;
     }
+    case 'readAuxiliaryState':
+      valid = value === null || auxiliaryStateRecord(value);
+      break;
+    case 'writeAuxiliaryState': {
+      const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
+      valid = !!item && (item.kind === 'written'
+        ? auxiliaryStateRecord(item.record)
+        : item.kind === 'conflict'
+          ? item.current === undefined || auxiliaryStateRecord(item.current)
+          : true);
+      break;
+    }
     case 'enqueueInbox': {
       valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict']);
+      break;
+    }
+    case 'enqueueInboxWithLease': {
+      valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict', 'stale_lease']);
       break;
     }
     case 'claimNextInbox':

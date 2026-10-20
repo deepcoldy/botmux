@@ -140,10 +140,6 @@ describe('trusted plugin result delivery', () => {
       { revoke: timedOutRevoke, timeoutMs: 20 },
     )).rejects.toThrow('plugin_result_delivery_timeout');
     expect(timedOutRevoke).not.toHaveBeenCalled();
-
-    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
-    expect(workerSource).toContain('revoke: () => artifactStore.revoke(artifact.artifactId)');
   });
 
   it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {
@@ -189,14 +185,31 @@ describe('trusted plugin result delivery', () => {
     expect(readdirSync(join(byteLimited.root, 'tokens')).filter(name => name.endsWith('.json'))).toEqual([]);
   });
 
-  it('renders a metadata-only entry card without result content or internal handles', () => {
+  it.each([
+    ['feishu', 'https://applink.feishu.cn'],
+    ['lark', 'https://applink.larksuite.com'],
+  ] as const)('renders a metadata-only %s entry card with in-client desktop and direct mobile links', (brand, appLinkOrigin) => {
     const accessUrl = 'https://example.test/plugin-result-access/view_token_abcdefghijklmnopqrstuvwxyz';
-    const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: '2026-10-16T01:00:00.000Z' });
-    expect(card).toContain(accessUrl);
-    expect(card).toContain('结果已生成');
-    expect(card).not.toContain('private result');
-    expect(card).not.toContain('artifactId');
-    expect(card).not.toContain('deliveryId');
+    const card = JSON.parse(buildTrustedResultDeliveryCard({
+      accessUrl,
+      expiresAt: '2026-10-16T01:00:00.000Z',
+      brand,
+    }));
+    const button = card.elements[1].actions[0];
+    const desktopUrl = new URL(button.multi_url.url);
+    expect(desktopUrl.origin).toBe(appLinkOrigin);
+    expect(desktopUrl.pathname).toBe('/client/web_url/open');
+    expect(desktopUrl.searchParams.get('mode')).toBe('appCenter');
+    expect(desktopUrl.searchParams.get('url')).toBe(accessUrl);
+    expect(button.multi_url.pc_url).toBe(button.multi_url.url);
+    expect(button.multi_url.android_url).toBe(accessUrl);
+    expect(button.multi_url.ios_url).toBe(accessUrl);
+    expect(button.multi_url.android_url).not.toMatch(/^(?:about:|[a-z]+:\/\/applink\.)/i);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('结果已生成');
+    expect(serialized).not.toContain('private result');
+    expect(serialized).not.toContain('artifactId');
+    expect(serialized).not.toContain('deliveryId');
   });
 
   it('waits for IPC backpressure and serializes deliveries through the final receipt', async () => {

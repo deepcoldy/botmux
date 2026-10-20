@@ -105,6 +105,7 @@ const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
 const mockListThreadMessages = vi.fn(async () => [] as any[]);
 const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 const mockResolveUnionIdFromOpenId = vi.fn(async () => null as string | null);
+const mockResolveUnionIdFromOpenIdStrict = vi.fn(async () => ({ status: 'unavailable' as const }));
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -115,6 +116,7 @@ const mockSendUserMessage = vi.fn(async () => 'om_dm_card');
 const mockListChatMemberOpenIds = vi.fn(async () => [] as string[]);
 const mockGetChatName = vi.fn(async () => null as string | null);
 const mockSignedChatContext = vi.fn();
+const mockListChats = vi.fn(async () => [] as Array<{ chatId: string; chatMode?: string }>);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatContext: (...args: any[]) => mockSignedChatContext(...args),
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
@@ -127,6 +129,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   resolveUnionIdFromOpenId: (...args: any[]) => mockResolveUnionIdFromOpenId(...args),
+  resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdFromOpenIdStrict(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
   listChatMessages: (...args: any[]) => mockListChatMessages(...args),
   listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
@@ -136,6 +139,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendUserMessage: (...args: any[]) => mockSendUserMessage(...args),
   listChatMemberOpenIds: (...args: any[]) => mockListChatMemberOpenIds(...args),
   getChatName: (...args: any[]) => mockGetChatName(...args),
+}));
+
+vi.mock('../src/services/groups-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/groups-store.js')>()),
+  listChats: (...args: any[]) => mockListChats(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -195,7 +203,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -237,10 +245,12 @@ beforeEach(() => {
   mockReadFileSync.mockReset().mockReturnValue('[]');
   mockListChatMessages.mockReset().mockResolvedValue([]);
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+  mockListChats.mockReset().mockResolvedValue([]);
   mockResolveCurrentChatBotOpenIds.mockReset().mockResolvedValue({ ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution' });
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
   mockResolveUnionIdFromOpenId.mockReset().mockResolvedValue(null);
+  mockResolveUnionIdFromOpenIdStrict.mockReset().mockResolvedValue({ status: 'unavailable' });
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
   // Generic tests should not accidentally enter the sole-user免@ path. Tests
   // that exercise 1v1 behavior opt in explicitly, so execution order cannot
@@ -1120,6 +1130,71 @@ describe('Lark event dispatcher — durable primary processor', () => {
     queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
   });
 
+  it('persists recalled-message events before applying the local tombstone', async () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 4000 }));
+    try {
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const persistPrimaryGroupContextRecall = vi.fn(async () => undefined);
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        makeHandlers(),
+        'feishu',
+        undefined,
+        { enqueuePrimary, persistPrimaryGroupContextRecall },
+      );
+      runtime.connect();
+      const data = {
+        event_id: 'evt_primary_recall',
+        message_id: 'om_primary_recall',
+        chat_id: 'chat-primary',
+        recall_time: '1700000009000',
+      };
+
+      await capturedHandlers['im.message.recalled_v1'](data);
+      expect(enqueuePrimary).toHaveBeenCalledWith({
+        eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+        eventType: 'lark.im.message.recalled_v1',
+        partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+        data,
+      });
+      expect(persistPrimaryGroupContextRecall).not.toHaveBeenCalled();
+
+      await expect(runtime.processDurableMessage({
+        eventType: 'lark.im.message.recalled_v1',
+        eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+        partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+        larkAppId: MY_APP_ID,
+        messageId: 'om_primary_recall',
+        attempts: 1,
+        data,
+      }, {
+        claim: {
+          event: {
+            eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+            partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+            payload: {}, visibleAt: 1, createdAt: 1,
+          },
+          workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
+        },
+        signal: new AbortController().signal,
+        queuePostAdmissionOutput: () => undefined,
+      })).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'durable primary group-context recall committed',
+      });
+      expect(persistPrimaryGroupContextRecall).toHaveBeenCalledWith({
+        larkAppId: MY_APP_ID,
+        chatId: 'chat-primary',
+        messageId: 'om_primary_recall',
+        deletedAt: 1700000009000,
+      });
+      runtime.close();
+    } finally {
+      _resetGroupContextIngestForTest();
+    }
+  });
+
   it('routes without opening WS and returns the admitted canonical Session', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
@@ -1149,6 +1224,88 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     runtime.close();
   });
+
+  it.each([true, false])(
+    'does not trust a replica-local solo-group cache for primary routing (ownsSession=%s)',
+    async ownsSession => {
+      __resetChatStatsForTest();
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'chat',
+        soloGroupMentionBypass: true,
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetChatInfo
+        .mockReset()
+        .mockResolvedValueOnce({ userCount: 1, botCount: 1 })
+        .mockResolvedValueOnce({ userCount: 2, botCount: 1 });
+
+      // Seed the exact stale state a different replica would retain when Lark
+      // cluster-delivers the membership event to its peer.
+      await expect(getGroupStats(MY_APP_ID, 'chat-primary')).resolves.toEqual({
+        userCount: 1,
+        botCount: 1,
+      });
+
+      const handlers = makeHandlers();
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      const data = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'post-membership-change plain text' }),
+        messageId: 'om_primary_membership_changed',
+        chatId: 'chat-primary',
+        chatType: 'group',
+      });
+
+      await expect(processPrimary(runtime, data, 'om_primary_membership_changed')).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'message was filtered before canonical admission',
+      });
+      expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it.each([true, false])(
+    'fails the primary solo-group bypass closed when the fresh membership read fails (ownsSession=%s)',
+    async ownsSession => {
+      __resetChatStatsForTest();
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'chat',
+        soloGroupMentionBypass: true,
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetChatInfo
+        .mockReset()
+        .mockResolvedValueOnce({ userCount: 1, botCount: 1 })
+        .mockRejectedValueOnce(new Error('membership unavailable'));
+      await getGroupStats(MY_APP_ID, 'chat-primary');
+
+      const handlers = makeHandlers();
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      const data = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'membership read failed' }),
+        messageId: 'om_primary_membership_unavailable',
+        chatId: 'chat-primary',
+        chatType: 'group',
+      });
+
+      await expect(processPrimary(runtime, data, 'om_primary_membership_unavailable')).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'message was filtered before canonical admission',
+      });
+      expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
 
   it('exposes the canonical post-admission output queue to the routed handler', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
@@ -1308,6 +1465,216 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('routes through a newly fenced active canonical takeover before local side effects', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-taken-over',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-takeover-root',
+      scope: 'thread' as const,
+      title: 'Remote takeover',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    let local: typeof canonical | undefined;
+    handlers.resolveDurableSession = vi.fn(() => local);
+    handlers.isSessionOwner = vi.fn(() => local?.sessionId === canonical.sessionId);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      expect(local?.sessionId).toBe(canonical.sessionId);
+      ctx.ingressAdmission = { admitted: true };
+    });
+    const takeOverPrimarySession = vi.fn(async (sessionKey: string, current: typeof canonical) => {
+      expect(sessionKey).toBe(`msg-primary-takeover-root::${MY_APP_ID}`);
+      expect(current).toEqual(canonical);
+      local = canonical;
+      return canonical;
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-takeover-followup',
+      rootId: 'msg-primary-takeover-root',
+      threadId: 'omt_primary_takeover',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    const result = await processPrimary(runtime, data, 'msg-primary-takeover-followup');
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      kind: 'admitted',
+      session: { sessionId: canonical.sessionId },
+    });
+    runtime.close();
+  });
+
+  it('retries without running local handlers while the canonical Session lease is occupied', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-owned-by-peer',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-peer-root',
+      scope: 'thread' as const,
+      title: 'Peer owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    handlers.isSessionOwner = vi.fn(() => false);
+    const takeOverPrimarySession = vi.fn(async () => ({
+      kind: 'retry' as const,
+      reason: 'active Session lease is still owned by replica-a',
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA wait for owner' }),
+      messageId: 'msg-primary-peer-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_peer',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-peer-followup'))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+      });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('revalidates the owner lease before routing an already-local active Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-local-owner',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-local-root',
+      scope: 'thread' as const,
+      title: 'Local owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.ingressAdmission = { admitted: true };
+    });
+    const takeOverPrimarySession = vi.fn(async () => canonical);
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-local-followup',
+      rootId: 'msg-primary-local-root',
+      threadId: 'omt_primary_local',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-local-followup'))
+      .resolves.toMatchObject({ kind: 'admitted', session: { sessionId: canonical.sessionId } });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
+  it('returns an explicit retry when the canonical handler defers a busy Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-primary-busy',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-busy-root',
+      scope: 'thread' as const,
+      title: 'Busy owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      expect(ctx.durablePrimaryDispatch).toMatchObject({ attempt: 1 });
+      expect(ctx.durablePrimaryDispatch.signal).toBeInstanceOf(AbortSignal);
+      ctx.ingressAdmission.retryReason = 'session has an unfinished turn';
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession: async () => canonical,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA queued follow-up' }),
+      messageId: 'msg-primary-busy-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_busy',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-busy-followup'))
+      .resolves.toEqual({ kind: 'retry', reason: 'session has an unfinished turn' });
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
   it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
     setupBotState({ allowedUsers: [] });
     mockGetChatMode.mockResolvedValue('topic');
@@ -1346,6 +1713,57 @@ describe('Lark event dispatcher — durable primary processor', () => {
       .rejects.toThrow(/active canonical Session is owned by another replica/);
     expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root-bot::${MY_APP_ID}`);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('keeps a bot-to-bot follow-up retryable while the prior owner lease is occupied', async () => {
+    setupBotState({ allowedUsers: [] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const canonical = {
+      sessionId: 'session-bot-owned-by-peer',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-bot-peer-root',
+      scope: 'thread' as const,
+      title: 'Remote bot owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    const takeOverPrimarySession = vi.fn(async () => ({
+      kind: 'retry' as const,
+      reason: 'active Session lease is still owned by replica-a',
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA wait for owner' }),
+      messageId: 'msg-primary-bot-peer-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_bot_peer',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-bot-peer-followup'))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+      });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
   });
@@ -1417,6 +1835,34 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries a recovered human message when union identity lookup fails transiently', async () => {
+    setupBotState({ allowedUsers: ['ou_someone_else'] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockResolveUnionIdFromOpenIdStrict.mockResolvedValueOnce({
+      status: 'retryable',
+      error: 'temporary contact API failure',
+    });
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = {
+      ...makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA recovered' }),
+        messageId: 'om_primary_recovered_identity',
+        chatId: 'chat-primary',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }),
+      __durableRecovery: { source: 'lark-history' },
+    };
+
+    await expect(processPrimary(runtime, data, 'om_primary_recovered_identity'))
+      .rejects.toThrow('temporary contact API failure');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('suppresses sessionless commands before replying and safely completes the claim', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
@@ -1480,7 +1926,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       handlers,
       'feishu',
       undefined,
-      { enqueuePrimary },
+      { enqueuePrimary, primaryRecoverySettleMs: 0 },
     );
     runtime.connect();
     const data = makeUserMessageEvent({
@@ -1493,7 +1939,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     let acked = false;
     const callback = Promise.resolve(capturedHandlers['im.message.receive_v1']?.(data))
       .then(() => { acked = true; });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
     expect(acked).toBe(false);
     expect(enqueuePrimary).toHaveBeenCalledWith({
       eventId: `im.message.receive_v1:${MY_APP_ID}:msg-primary-ack`,
@@ -1505,6 +1951,387 @@ describe('Lark event dispatcher — durable primary processor', () => {
     release();
     await callback;
     expect(acked).toBe(true);
+    runtime.close();
+  });
+
+  it('durably accepts a first p2p message without primary recovery leadership', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'first private turn' }),
+      messageId: 'om_primary_first_p2p',
+      chatId: 'oc_first_p2p',
+      chatType: 'p2p',
+    });
+
+    await expect(capturedHandlers['im.message.receive_v1'](data)).resolves.toBeUndefined();
+    expect(enqueuePrimary).toHaveBeenCalledWith({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_first_p2p`,
+      partitionKey: `lark-message-routing:${MY_APP_ID}:oc_first_p2p`,
+      data,
+    });
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('persists realtime primary messages while the elected replica backfills history', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    let releaseChats!: (value: Array<{ chatId: string; chatMode?: string }>) => void;
+    mockListChats
+      .mockReturnValueOnce(new Promise(resolve => { releaseChats = resolve; }))
+      .mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    mockListChatMessagesUntil
+      .mockResolvedValueOnce([makeHistoryMessage({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA missed during failover' }),
+        messageId: 'om_primary_recovered',
+        chatId: 'chat-primary',
+        createTime: String(Date.now()),
+      })])
+      .mockResolvedValue([makeHistoryMessage({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA during socket handshake' }),
+        messageId: 'om_primary_handshake_gap',
+        chatId: 'chat-primary',
+        createTime: String(Date.now()),
+      })]);
+    const order: string[] = [];
+    const enqueuePrimary = vi.fn(async (input: any) => {
+      order.push(`live:${input.eventId}`);
+      return { kind: 'inserted' as const };
+    });
+    const enqueuePrimaryRecovery = vi.fn(async (input: any) => {
+      order.push(`recovery:${input.eventId}`);
+      return { kind: 'inserted' as const };
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
+    );
+    const leadership = new AbortController();
+    const recovery = runtime.connectPrimary({ signal: leadership.signal });
+    const live = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA live after takeover' }),
+      messageId: 'om_primary_live',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    const liveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](live));
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    await liveAck;
+
+    releaseChats([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    await vi.waitFor(() => expect(mockListChatMessagesUntil).toHaveBeenCalledOnce());
+    capturedWsClientOptions?.onReady?.();
+    await recovery.ready;
+
+    expect(order).toEqual([
+      `live:im.message.receive_v1:${MY_APP_ID}:om_primary_live`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_recovered`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
+    ]);
+    expect(mockListChats).toHaveBeenCalledTimes(3);
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3);
+    expect(enqueuePrimaryRecovery).toHaveBeenNthCalledWith(1, {
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_recovered`,
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      data: expect.objectContaining({
+        message: expect.objectContaining({
+          message_id: 'om_primary_recovered',
+          message_type: 'text',
+          content: JSON.stringify({ text: '@BotA missed during failover' }),
+          chat_type: 'group',
+        }),
+        sender: expect.objectContaining({
+          sender_type: 'user',
+          sender_id: { open_id: USER_OPEN_ID },
+        }),
+      }),
+    });
+    leadership.abort();
+    runtime.close();
+  });
+
+  it('starts leader recovery after an already-connected standby transport becomes owner', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockListChats.mockResolvedValue([]);
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
+    );
+    const client = runtime.connect();
+    capturedWsClientOptions?.onReady?.();
+    const leadership = new AbortController();
+
+    const recovery = runtime.connectPrimary({ signal: leadership.signal });
+    expect(recovery.client).toBe(client);
+    await recovery.ready;
+
+    expect(mockListChats).toHaveBeenCalledTimes(3);
+    expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
+    leadership.abort();
+    runtime.close();
+  });
+
+  it('hydrates and canonicalizes a card mention omitted by history before recovery enqueue', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const now = Date.now();
+    mockListChats.mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    mockListChatMessagesUntil.mockResolvedValue([makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderOpenBotId: OTHER_BOT_OPEN_ID,
+      senderType: 'app',
+      content: JSON.stringify({ text: '请升级至最新版本客户端，以查看内容' }),
+      messageId: 'om_primary_card_gap',
+      messageType: 'interactive',
+      chatId: 'chat-primary',
+      createTime: String(now),
+    })]);
+    mockGetMessageDetail.mockResolvedValue({
+      items: [{
+        mentions: [{ key: '@_user_1', name: '', id: MY_APP_ID, id_type: 'app_id' }],
+      }],
+    });
+    const enqueue = vi.fn(async () => ({ kind: 'inserted' as const }));
+
+    await __recoverDurablePrimaryIngressOnceForTest({
+      larkAppId: MY_APP_ID,
+      enqueue,
+      now,
+    });
+
+    expect(mockGetMessageDetail).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_primary_card_gap',
+      expect.objectContaining({ userCardContent: true, signal: expect.any(AbortSignal) }),
+    );
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_card_gap`,
+      data: expect.objectContaining({
+        __durableRecovery: { source: 'lark-history' },
+        message: expect.objectContaining({
+          mentions: [{ key: '@_user_1', name: '', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+        }),
+      }),
+    }));
+    const recoveredData = enqueue.mock.calls[0]![0].data;
+    expect(isBotMentioned(MY_APP_ID, recoveredData.message, undefined)).toBe(true);
+  });
+
+  it('fails recovery closed when an omitted card mention cannot be hydrated', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const now = Date.now();
+    mockListChats.mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    mockListChatMessagesUntil.mockResolvedValue([makeHistoryMessage({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '请升级至最新版本客户端，以查看内容' }),
+      messageId: 'om_primary_card_unavailable',
+      messageType: 'interactive',
+      chatId: 'chat-primary',
+      createTime: String(now),
+    })]);
+    mockGetMessageDetail.mockResolvedValue({ items: [] });
+
+    await expect(__recoverDurablePrimaryIngressOnceForTest({
+      larkAppId: MY_APP_ID,
+      enqueue: vi.fn(async () => ({ kind: 'inserted' as const })),
+      now,
+    })).rejects.toThrow('has no detail');
+  });
+
+  it('does not run the legacy listener poller in durable primary mode', async () => {
+    vi.useFakeTimers();
+    try {
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        messageListeners: {
+          chat_listener: {
+            enabled: true,
+            prompt: 'listener',
+            senderPolicy: { mode: 'all_except_excluded' },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'all' },
+            replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          },
+        },
+      });
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        makeHandlers(),
+        'feishu',
+        undefined,
+        { enqueuePrimary: vi.fn(async () => ({ kind: 'inserted' as const })) },
+      );
+      runtime.connect();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockListChatMessagesUntil).not.toHaveBeenCalled();
+      runtime.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps realtime ACKs independent while history recovery retries transient failures', async () => {
+    vi.useFakeTimers();
+    const leadership = new AbortController();
+    try {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      mockListChats
+        .mockRejectedValueOnce(new Error('temporary list failure'))
+        .mockResolvedValueOnce([]);
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        makeHandlers(),
+        'feishu',
+        undefined,
+        { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
+      );
+      const recovery = runtime.connectPrimary({ signal: leadership.signal });
+      capturedWsClientOptions?.onReady?.();
+      const live = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA after retry' }),
+        messageId: 'om_primary_after_retry',
+        chatId: 'chat-primary',
+        chatType: 'group',
+      });
+      const liveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](live));
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(mockListChats).toHaveBeenCalledOnce();
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+      await liveAck;
+      await vi.advanceTimersByTimeAsync(1);
+      await recovery.ready;
+
+      expect(mockListChats).toHaveBeenCalledTimes(4);
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+      expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
+      leadership.abort();
+      runtime.close();
+    } finally {
+      leadership.abort();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the acquisition cutoff fixed and the gate closed while settle fingerprints change', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-17T04:00:00.000Z'));
+    const leadership = new AbortController();
+    try {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const gapCreatedAt = Date.now();
+      const recovered = makeHistoryMessage({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA delayed history row' }),
+        messageId: 'om_primary_delayed_history',
+        chatId: 'chat-primary',
+        createTime: String(gapCreatedAt),
+      });
+      mockListChats.mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+      mockListChatMessagesUntil
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([recovered])
+        .mockResolvedValue([recovered]);
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        makeHandlers(),
+        'feishu',
+        undefined,
+        { enqueuePrimary, primaryRecoverySettleMs: 0 },
+      );
+      const recovery = runtime.connectPrimary({ signal: leadership.signal });
+      capturedWsClientOptions?.onReady?.();
+      await vi.waitFor(() => expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3));
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+
+      vi.setSystemTime(new Date(gapCreatedAt + 3 * 60_000));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await recovery.ready;
+
+      expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(6);
+      expect(enqueuePrimary).toHaveBeenCalledTimes(4);
+      expect(enqueuePrimary).toHaveBeenCalledWith(expect.objectContaining({
+        eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_delayed_history`,
+      }));
+      runtime.close();
+    } finally {
+      leadership.abort();
+      vi.useRealTimers();
+    }
+  });
+
+  it('runs the same gated reconciliation after the Lark SDK reconnects', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockListChats.mockResolvedValueOnce([]);
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
+    );
+    const leadership = new AbortController();
+    const initial = runtime.connectPrimary({ signal: leadership.signal });
+    capturedWsClientOptions?.onReady?.();
+    await initial.ready;
+
+    let releaseReconnectScan!: (value: Array<{ chatId: string; chatMode?: string }>) => void;
+    mockListChats.mockReturnValueOnce(new Promise(resolve => { releaseReconnectScan = resolve; }));
+    capturedWsClientOptions?.onReconnecting?.();
+    const live = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA after reconnect' }),
+      messageId: 'om_primary_after_reconnect',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+    const liveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](live));
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    await liveAck;
+
+    releaseReconnectScan([]);
+    await vi.waitFor(() => expect(mockListChats).toHaveBeenCalledTimes(4));
+    capturedWsClientOptions?.onReconnected?.();
+    await vi.waitFor(() => expect(mockListChats).toHaveBeenCalledTimes(6));
+    expect(enqueuePrimary).toHaveBeenCalledOnce();
+    expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
+    leadership.abort();
     runtime.close();
   });
 
@@ -1643,6 +2470,245 @@ describe('Lark event dispatcher — durable primary processor', () => {
     });
     expect(mockGetMessageDetail).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('resolves a chatless primary update into the receive chat partition before ACK', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValue({ items: [{
+      message_id: 'om_primary_chatless_edit',
+      chat_id: 'chat-primary',
+    }] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = {
+      event_id: 'evt-primary-chatless-edit',
+      message: { message_id: 'om_primary_chatless_edit' },
+    };
+
+    await capturedHandlers['im.message.updated_v1'](data);
+
+    expect(mockGetMessageDetail).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_primary_chatless_edit',
+      expect.objectContaining({ userCardContent: false }),
+    );
+    expect(enqueuePrimary).toHaveBeenCalledWith({
+      eventId: `im.message.updated_v1:${MY_APP_ID}:evt-primary-chatless-edit`,
+      eventType: 'lark.im.message.updated_v1',
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      data,
+    });
+    runtime.close();
+  });
+
+  it('does not ACK a chatless primary update when its ordering partition is unavailable', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValue({ items: [] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    await expect(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-chatless-missing',
+      message: { message_id: 'om_primary_chatless_missing' },
+    })).rejects.toThrow(/no authoritative chat_id/);
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('reserves arrival order before a chatless update awaits its partition readback', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseLookup!: (value: unknown) => void;
+    mockGetMessageDetail.mockReturnValueOnce(new Promise(resolve => {
+      releaseLookup = resolve;
+    }));
+    const order: string[] = [];
+    const enqueuePrimary = vi.fn(async (input: any) => {
+      order.push(input.eventId);
+      return { kind: 'inserted' as const };
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const updated = {
+      event_id: 'evt-primary-order-edit',
+      message: { message_id: 'om_primary_order_edit' },
+    };
+    const receive = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA later receive' }),
+      messageId: 'om_primary_order_receive',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    const updateAck = Promise.resolve(capturedHandlers['im.message.updated_v1'](updated));
+    const receiveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](receive));
+    await Promise.resolve();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+
+    releaseLookup({ items: [{
+      message_id: 'om_primary_order_edit',
+      chat_id: 'chat-primary',
+    }] });
+    await Promise.all([updateAck, receiveAck]);
+
+    expect(order).toEqual([
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-order-edit`,
+      `im.message.receive_v1:${MY_APP_ID}:om_primary_order_receive`,
+    ]);
+    expect(enqueuePrimary).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+    }));
+    expect(enqueuePrimary).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+    }));
+    runtime.close();
+  });
+
+  it('starts chatless lookups in parallel but consumes their partitions in arrival order', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseFirst!: (value: unknown) => void;
+    let releaseSecond!: (value: unknown) => void;
+    mockGetMessageDetail
+      .mockReturnValueOnce(new Promise(resolve => { releaseFirst = resolve; }))
+      .mockReturnValueOnce(new Promise(resolve => { releaseSecond = resolve; }));
+    const order: string[] = [];
+    const enqueuePrimary = vi.fn(async (input: any) => {
+      order.push(input.eventId);
+      return { kind: 'inserted' as const };
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    const firstAck = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-parallel-a',
+      message: { message_id: 'om_primary_parallel_a' },
+    }));
+    const secondAck = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-parallel-b',
+      message: { message_id: 'om_primary_parallel_b' },
+    }));
+    await Promise.resolve();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
+
+    releaseSecond({ items: [{ message_id: 'om_primary_parallel_b', chat_id: 'chat-b' }] });
+    await Promise.resolve();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    releaseFirst({ items: [{ message_id: 'om_primary_parallel_a', chat_id: 'chat-a' }] });
+    await Promise.all([firstAck, secondAck]);
+
+    expect(order).toEqual([
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-parallel-a`,
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-parallel-b`,
+    ]);
+    runtime.close();
+  });
+
+  it('releases the arrival reservation after a partition lookup rejects', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    const rejected = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-failed-lookup',
+      message: { message_id: 'om_primary_failed_lookup' },
+    }));
+    const receive = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA after failed lookup' }),
+      messageId: 'om_primary_after_failed_lookup',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+    const admitted = Promise.resolve(capturedHandlers['im.message.receive_v1'](receive));
+
+    await expect(rejected).rejects.toThrow(/no authoritative chat_id/);
+    await expect(admitted).resolves.toBeUndefined();
+    expect(enqueuePrimary).toHaveBeenCalledOnce();
+    expect(enqueuePrimary).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_after_failed_lookup`,
+    }));
+    runtime.close();
+  });
+
+  it('releases the arrival slot after partition registration without serializing DB writes', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseFirst!: (value: { kind: 'inserted' }) => void;
+    const firstWrite = new Promise<{ kind: 'inserted' }>(resolve => {
+      releaseFirst = resolve;
+    });
+    const enqueuePrimary = vi.fn()
+      .mockReturnValueOnce(firstWrite)
+      .mockResolvedValueOnce({ kind: 'inserted' as const });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA chat A' }),
+      messageId: 'om_primary_parallel_write_a',
+      chatId: 'chat-a',
+      chatType: 'group',
+    });
+    const second = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA chat B' }),
+      messageId: 'om_primary_parallel_write_b',
+      chatId: 'chat-b',
+      chatType: 'group',
+    });
+
+    const firstAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](first));
+    const secondAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](second));
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledTimes(2));
+    await expect(secondAck).resolves.toBeUndefined();
+    releaseFirst({ kind: 'inserted' });
+    await expect(firstAck).resolves.toBeUndefined();
     runtime.close();
   });
 
@@ -2961,6 +4027,53 @@ describe('message listener polling backfill', () => {
           senderOpenId: OTHER_BOT_APP_ID,
           senderType: 'bot',
           msgType: 'interactive',
+        }),
+      }),
+    );
+  });
+
+  it('routes a recent top-level merge-forward message found in chat history', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [USER_OPEN_ID],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const forwarded = makeHistoryMessage({
+      senderAppId: USER_OPEN_ID,
+      senderType: 'user',
+      messageType: 'merge_forward',
+      messageId: 'msg-polled-forward',
+      chatId: 'chat_listener',
+      content: '{}',
+      createTime: String(Date.now()),
+    });
+    forwarded.sender.id_type = 'open_id';
+    mockListChatMessagesUntil.mockResolvedValueOnce([forwarded]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-forward' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-polled-forward',
+        messageListener: expect.objectContaining({
+          senderOpenId: USER_OPEN_ID,
+          senderType: 'user',
+          msgType: 'merge_forward',
         }),
       }),
     );
@@ -10730,6 +11843,30 @@ describe('solo-group mention bypass configuration', () => {
     const event = await send();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+    }));
+  });
+
+  it('routes configured merge-forward topic roots through the listener', async () => {
+    start({
+      soloGroupMentionBypass: false,
+      messageListeners: {
+        [CHAT]: {
+          enabled: true, prompt: 'Read forwarded messages',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = await send({
+      messageType: 'merge_forward',
+      content: '{}',
+    });
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      messageListener: expect.objectContaining({
+        senderOpenId: USER_OPEN_ID,
+        msgType: 'merge_forward',
+      }),
     }));
   });
 

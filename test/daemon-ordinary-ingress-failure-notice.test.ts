@@ -1,6 +1,7 @@
 import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
+  __testOnly_recordDurablePrimaryInputCommit,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
@@ -394,6 +395,160 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.failedIdleTurnId).toBeUndefined();
     expect(ds.silentIdleTurnId).toBeUndefined();
     expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('reforks a dead durable-primary worker and waits for provider submission proof', async () => {
+    const anchor = 'om_thread_primary_dead_worker';
+    const turnId = 'om_primary_after_worker_exit';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 7,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, resume: any, options: any) => {
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId,
+        dispatchAttempt: 7,
+        durablePrimaryInbox: true,
+      });
+      target.workerGeneration = 5;
+      target.session.workerGeneration = 5;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 7,
+          durablePrimaryInbox: true,
+        }, 5);
+      });
+      return true;
+    });
+
+    await handleThreadReply(makeEventData(turnId, 'continue after worker exit', anchor), ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 7, workerGeneration: 5 }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('replays a queued activation journal after worker death before the durable follower', async () => {
+    const anchor = 'om_thread_primary_queued_recovery';
+    const openingTurnId = 'om_primary_queued_opening';
+    const followerTurnId = 'om_primary_queued_follower';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'activation-token';
+    ds.session.queuedActivationInput = { content: 'OPENING_N' };
+    ds.session.queuedActivationTurnId = openingTurnId;
+    ds.session.queuedActivationDispatchAttempt = 4;
+    ds.session.queuedActivationResume = true;
+    const ctx = makeCtx(anchor, followerTurnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 8,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, input: any, resume: any) => {
+      expect(input).toEqual({ content: 'OPENING_N' });
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId: openingTurnId,
+        dispatchAttempt: 4,
+      });
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(followerTurnId, 'FOLLOWER_N1', anchor),
+      ctx,
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: followerTurnId,
+        dispatchAttempt: 8,
+        cliInput: expect.objectContaining({ content: expect.stringContaining('FOLLOWER_N1') }),
+      }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('retries a dead durable-primary worker while another handler owns the start claim', async () => {
+    const anchor = 'om_thread_primary_live_start_claim';
+    const turnId = 'om_primary_during_live_start_claim';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = true;
+    ds.initialStartClaimToken = 'other-handler-claim';
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 2,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('retries a dead durable-primary worker while repository selection is pending', async () => {
+    const anchor = 'om_thread_primary_pending_repo';
+    const turnId = 'om_primary_during_pending_repo';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.pendingRepo = true;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 3,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait for repository', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
   });
 
   it('clears the previous failed label before reforking for a document comment', async () => {

@@ -1,56 +1,62 @@
-import { readFileSync } from 'node:fs';
+/**
+ * `botmux schedule add` rejects malformed scheduling flags in-process, before it
+ * infers a chat or contacts the daemon. Driven through the real CLI outside any
+ * session, in a throwaway HOME, so nothing here can ever create a task: every run
+ * exits 1 — either at the flag under test, or (for valid flags) later, at the
+ * chat-id inference. Naming the offending flag is what tells the two apart.
+ *
+ * What accepted flags turn into (execution position, followActive, model, the task
+ * id) is decided daemon-side by SCHEDULE_DELEGATED_ADD_ROUTE — see
+ * schedule-delegation-route.test.ts.
+ */
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
-const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-
-describe('schedule CLI session scope propagation', () => {
-  it('resolves the requested/current execution position into the daemon request', () => {
-    expect(cliSource).toContain("scope?: 'thread' | 'chat';");
-    expect(cliSource).toMatch(/function detectCurrentSession[\s\S]*?scope: s\.scope,/);
-    expect(cliSource).toContain('current turn caller does not match the session owner');
-    expect(cliSource).toMatch(/const executionPosition: 'top-level' \| 'topic' \| 'new-topic' =[\s\S]*?cur\?\.scope/);
-    // Group/topic_group sessions default to top-level (never pin results to the
-    // topic the schedule was created in — e.g. an adopted one); only p2p keeps
-    // the legacy scope-based inference.
-    expect(cliSource).toMatch(/cur\?\.chatType === 'p2p'/);
-    expect(cliSource).toMatch(/rootMessageId: executionPosition === 'topic' \? rootMessageId : undefined/);
-    expect(cliSource).toMatch(/const scope: 'thread' \| 'chat' = executionPosition === 'topic'/);
-    expect(cliSource).toMatch(/path: SCHEDULE_DELEGATED_ADD_ROUTE,[\s\S]*?body: \{ task: \{[\s\S]*?rootMessageId: executionPosition === 'topic' \? rootMessageId : undefined,[\s\S]*?executionPosition,[\s\S]*?larkAppId/);
-    expect(cliSource).not.toMatch(/task = scheduler\.addTask\(/);
-    expect(cliSource).not.toMatch(/ownerOpenId: process\.env\.BOTMUX_OWNER_OPEN_ID/);
-    expect(cliSource).not.toMatch(/ownerUnionId: cur\?\.ownerUnionId/);
-    expect(cliSource).not.toContain('--new-topic 与 --silent 不能同时使用');
-    expect(cliSource).toMatch(/const silent = rest\.includes\('--silent'\)[\s\S]*?executionPosition[\s\S]*?SCHEDULE_DELEGATED_ADD_ROUTE/);
+function scheduleAdd(...flags: string[]): { status: number | null; stderr: string } {
+  const home = mkdtempSync(join(tmpdir(), 'botmux-schedule-cli-'));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env, HOME: home, BOTMUX_HOME: join(home, '.botmux'), SESSION_DATA_DIR: join(home, 'data'),
+  };
+  for (const key of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_TURN_ID', 'BOTS_CONFIG']) delete env[key];
+  const run = spawnSyncTsScript('src/cli.ts', ['schedule', 'add', '10m', 'check the build', ...flags], {
+    env, encoding: 'utf8', timeout: 90_000,
   });
+  return { status: run.status, stderr: String(run.stderr) };
+}
 
-  it('wires --follow-active as topic execution and forwards the flag into the daemon request', () => {
-    // The flag must be stripped from positionals, or it would leak into the prompt.
-    expect(cliSource).toMatch(/positionals\(rest, \[[^\]]*'--follow-active'[^\]]*\]\)/);
-    // --follow-active implies topic execution (same chain, same literal shape).
-    expect(cliSource).toMatch(/const executionPosition: 'top-level' \| 'topic' \| 'new-topic' =[\s\S]*?wantsTopic \|\| wantsFollowActive\s*\?\s*'topic'/);
-    // Mutually exclusive with the two positions that have no topic to follow.
-    expect(cliSource).toMatch(/wantsFollowActive && \(wantsNewTopic \|\| wantsTopLevel\)/);
-    // Forwarded after topicTitle so the addTask arg order asserted above still holds.
-    expect(cliSource).toMatch(/body: \{ task: \{[\s\S]*?\.\.\.\(wantsFollowActive \? \{ followActive: true \} : \{\}\)[\s\S]*?\}\s*\}/);
-  });
+const mentionsIdFlag = /(?<![\w-])--id\b/;
 
-  it('forwards --model / --reasoning-effort and rejects a bad level before writing', () => {
-    // Both take a value, so `positionals` skips it automatically — asserting the
-    // flags are NOT in the boolean list is what keeps "gpt-5.6-sol" out of the prompt.
-    expect(cliSource).not.toMatch(/positionals\(rest, \[[^\]]*'--model'[^\]]*\]\)/);
-    expect(cliSource).not.toMatch(/positionals\(rest, \[[^\]]*'--reasoning-effort'[^\]]*\]\)/);
-    // Shape is validated in-process; the CLI/model pairing is not, because a
-    // sandboxed session cannot read bots.json (fire time degrades instead).
-    expect(cliSource).toMatch(/isScheduleReasoningEffort\(reasoningEffortArg\)/);
-    expect(cliSource).toMatch(/body: \{ task: \{[\s\S]*?\bmodel,[\s\S]*?\breasoningEffort,[\s\S]*?\}\s*\}/);
-    // The receipt must state the fresh-spawn-only limit rather than let it be
-    // discovered weeks later at fire time.
-    expect(cliSource).toMatch(/executionPosition === 'new-topic'[\s\S]*?模型每次生效[\s\S]*?仅在本任务新建会话的那次执行生效/);
-  });
+describe('botmux schedule add flag validation', () => {
+  it('lets well-formed --id / --reasoning-effort / --topic --follow-active through to chat inference', () => {
+    const run = scheduleAdd('--id', 'deadbeef', '--reasoning-effort', 'high', '--topic', '--follow-active');
+    expect(run.status).toBe(1);
+    expect(run.stderr).not.toMatch(mentionsIdFlag);
+    expect(run.stderr).not.toContain('--reasoning-effort');
+    expect(run.stderr).not.toContain('--follow-active');
+  }, 120_000);
 
-  it('accepts only an explicit 8-hex --id and forwards it to the daemon request', () => {
-    expect(cliSource).toMatch(/const explicitTaskId = argValue\(rest, '--id'\)/);
-    expect(cliSource).toMatch(/explicitTaskId !== undefined && !\/\^\[0-9a-f\]\{8\}\$\/\.test\(explicitTaskId\)/);
-    expect(cliSource).toMatch(/const delegatedTaskId = explicitTaskId \?\? randomBytes\(4\)\.toString\('hex'\)[\s\S]*?id: delegatedTaskId,[\s\S]*?\bname,/);
-  });
+  it('accepts only an explicit 8-hex --id', () => {
+    for (const id of ['NOTHEX', 'deadbeef0', 'DEADBEEF']) {
+      const run = scheduleAdd('--id', id);
+      expect(run.status, id).toBe(1);
+      expect(run.stderr, id).toMatch(mentionsIdFlag);
+    }
+  }, 300_000);
+
+  it('rejects an unknown --reasoning-effort level', () => {
+    const run = scheduleAdd('--reasoning-effort', 'bogus');
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('--reasoning-effort');
+  }, 120_000);
+
+  it('refuses --follow-active together with --top-level or --new-topic', () => {
+    for (const position of ['--top-level', '--new-topic']) {
+      const run = scheduleAdd('--follow-active', position);
+      expect(run.status, position).toBe(1);
+      expect(run.stderr, position).toContain('--follow-active');
+    }
+  }, 240_000);
 });
