@@ -31,14 +31,15 @@ export interface HerdrBackendConfig {
   placement?: HerdrBackendPlacement;
 
   /**
-   * Target workspace identifier or label (or prefix) when placement is 'tab' or 'split'.
-   * Matches by prefix, substring, or exact label. Falls back to the active workspace.
+   * Target workspace id or label when placement is 'tab' or 'split'. Matched by
+   * exact id/label, then the label's first word, then prefix, then substring.
+   * Falls back to the focused workspace.
    */
   workspace?: string;
 
   /**
-   * Target tab label or prefix when placement is 'split' (e.g. "3 其他" or "3 ").
-   * Matches by prefix, substring, or exact label.
+   * Target tab id or label when placement is 'split' (e.g. "3 其他" or "3"),
+   * matched like `workspace`; also the label of a tab Botmux creates.
    */
   tab?: string;
 

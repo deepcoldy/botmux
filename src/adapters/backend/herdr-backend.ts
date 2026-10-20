@@ -321,19 +321,26 @@ function extractAgents(raw: any): any[] {
   return Array.isArray(agents) ? agents : [];
 }
 
-function extractWorkspaces(raw: any): any[] {
-  const workspaces = raw?.workspaces ?? raw?.result?.workspaces;
-  return Array.isArray(workspaces) ? workspaces : [];
+/** A workspace/tab/pane list that placement decisions rest on. Unlike the
+ *  best-effort `jsonCommand`, a failed or malformed list throws: read as
+ *  "nothing there", it would make us create a workspace or tab in the user's
+ *  session. */
+function requiredHerdrList(operation: string, args: string[], key: 'workspaces' | 'tabs' | 'panes'): any[] {
+  const raw = requiredJsonCommand(operation, args);
+  const items = raw?.result?.[key] ?? raw?.[key];
+  if (!Array.isArray(items)) throw new Error(`${operation} failed: response has no ${key} list`);
+  return items;
 }
 
-function extractTabs(raw: any): any[] {
-  const tabs = raw?.tabs ?? raw?.result?.tabs;
-  return Array.isArray(tabs) ? tabs : [];
-}
-
-function extractPanes(raw: any): any[] {
-  const panes = raw?.panes ?? raw?.result?.panes;
-  return Array.isArray(panes) ? panes : [];
+/** The workspace/tab a configured name points to: exact id or label first,
+ *  then the label's first word (so "3" picks "3 其他", not "30 …"), then a
+ *  label prefix, then a substring. */
+function matchHerdrTarget(rows: any[], target: string, idKey: 'workspace_id' | 'tab_id'): any | undefined {
+  const label = (row: any): string => (typeof row?.label === 'string' ? row.label : '');
+  return rows.find(row => row?.[idKey] === target || label(row) === target)
+    ?? rows.find(row => label(row).split(/\s+/)[0] === target)
+    ?? rows.find(row => label(row).startsWith(target))
+    ?? rows.find(row => label(row).includes(target));
 }
 
 // Whether a matched `agent list` row represents an exited CLI. Verified against
@@ -981,15 +988,13 @@ export class HerdrBackend implements SessionBackend {
   }
 
   private resolveTargetWorkspaceId(target?: string): string {
-    const listed = jsonCommand(herdrSessionArgs(this.sessionName, ['workspace', 'list']));
-    const workspaces = extractWorkspaces(listed);
-    if (target) {
-      const trimmed = target.trim();
-      const matched = workspaces.find((w: any) =>
-        w?.workspace_id === trimmed
-        || w?.label === trimmed
-        || (typeof w?.label === 'string' && (w.label.startsWith(trimmed) || w.label.includes(trimmed))),
-      );
+    const workspaces = requiredHerdrList(
+      `herdr workspace list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['workspace', 'list']),
+      'workspaces',
+    );
+    if (target?.trim()) {
+      const matched = matchHerdrTarget(workspaces, target.trim(), 'workspace_id');
       if (matched?.workspace_id) return matched.workspace_id;
     }
     const focused = workspaces.find((w: any) => w?.focused === true);
@@ -998,7 +1003,9 @@ export class HerdrBackend implements SessionBackend {
 
     const created = requiredJsonCommand(
       `herdr workspace create for ${this.sessionName}`,
-      herdrSessionArgs(this.sessionName, ['workspace', 'create', '--no-focus']),
+      // Only reached when the session has no workspace at all. Name it after
+      // the configured target so the next lookup matches it.
+      herdrSessionArgs(this.sessionName, ['workspace', 'create', '--label', target?.trim() || 'botmux', '--no-focus']),
       { timeout: 10_000, env: this.childEnv },
     );
     const wsId = created?.result?.workspace?.workspace_id;
@@ -1010,21 +1017,21 @@ export class HerdrBackend implements SessionBackend {
   }
 
   private resolveTargetTab(workspaceId: string, target?: string): any | undefined {
-    const listed = jsonCommand(herdrSessionArgs(this.sessionName, ['tab', 'list']));
-    const allTabs = extractTabs(listed);
-    const tabs = allTabs.filter((t: any) => t?.workspace_id === workspaceId);
-    if (target) {
-      const trimmed = target.trim();
-      return tabs.find((t: any) => t?.label === trimmed)
-        || tabs.find((t: any) => typeof t?.label === 'string' && t.label.startsWith(trimmed))
-        || tabs.find((t: any) => typeof t?.label === 'string' && t.label.includes(trimmed));
-    }
+    const tabs = requiredHerdrList(
+      `herdr tab list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['tab', 'list']),
+      'tabs',
+    ).filter((t: any) => t?.workspace_id === workspaceId);
+    if (target?.trim()) return matchHerdrTarget(tabs, target.trim(), 'tab_id');
     return tabs.find((t: any) => t?.focused === true) || tabs[0];
   }
 
   private resolvePaneInTab(tabId: string): string | undefined {
-    const listed = jsonCommand(herdrSessionArgs(this.sessionName, ['pane', 'list']));
-    const panes = extractPanes(listed).filter((p: any) => p?.tab_id === tabId);
+    const panes = requiredHerdrList(
+      `herdr pane list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['pane', 'list']),
+      'panes',
+    ).filter((p: any) => p?.tab_id === tabId);
     const focused = panes.find((p: any) => p?.focused === true);
     return focused?.pane_id || panes[panes.length - 1]?.pane_id || panes[0]?.pane_id;
   }
