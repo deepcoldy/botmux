@@ -26,6 +26,7 @@ vi.mock('node:child_process', () => ({
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
+import { shouldWriteNow } from '../src/utils/input-gate.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -3567,6 +3568,13 @@ describe('readyPattern', () => {
     expect(adapter.busyPattern).toBeDefined();
     expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
     expect(typeof adapter.isSessionBusy).toBe('function');
+    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: adapter.supportsTypeAhead === true,
+      awaitingFirstPrompt: false,
+    })).toBe(true);
   });
 
   it('mtr has no readyPattern', () => {

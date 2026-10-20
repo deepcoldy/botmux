@@ -454,6 +454,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: /\? for shortcuts/,
     busyPattern: /esc to cancel/,
+    // agy records Enter in history.jsonl immediately while a turn is running,
+    // and Queued Messages = send-immediately forwards that text into the
+    // active conversation (it does not cancel the in-flight tool). Leave this
+    // off and botmux holds the next Lark message until the whole turn is idle,
+    // so the CLI setting never sees the keystrokes.
+    supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;
       const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
