@@ -28,7 +28,32 @@ import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
+export interface NativeExecutionStart {
+  workerGeneration: number;
+  nativeSessionId: string;
+  nativeTurnId: string;
+  startedAtMs: number;
+  proofKind: 'codex_transcript_start' | 'codex_rpc_turn_start';
+}
+const validExecutionStart = (value: unknown): value is NativeExecutionStart => {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as NativeExecutionStart;
+  return Number.isSafeInteger(v.workerGeneration) && v.workerGeneration > 0
+    && typeof v.nativeSessionId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(v.nativeSessionId)
+    && typeof v.nativeTurnId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(v.nativeTurnId)
+    && Number.isFinite(v.startedAtMs) && v.startedAtMs > 0
+    && ['codex_transcript_start','codex_rpc_turn_start'].includes(v.proofKind);
+};
 export interface PersistedAsyncTriggerResult {
+  /** Frozen at admission; an absent value preserves historical caller-only delivery. */
+  resultDelivery?: 'conversation';
+  executionStarted?: NativeExecutionStart;
+  /** Receiver ACK, independent of IM reply anchors or an optional dedupe key. */
+  inputCommit?: { workerGeneration: number; observedAt: number };
+  /** Exact Worker terminal observed before its output was durably captured.
+   * Read-side convergence survives restart; it never submits another input. */
+  outputPendingTerminal?: { workerGeneration: number; observedAt: number; drainUntil: number };
+
   status: 'pending' | 'completed' | 'failed' | 'interrupted';
   createdAt: number;
   completedAt?: number;
@@ -124,6 +149,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  fields are likewise type-checked when present. */
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
+  if (value.resultDelivery !== undefined && value.resultDelivery !== 'conversation') return false;
+  if (value.inputCommit !== undefined && (!isPlainObject(value.inputCommit)
+    || !Number.isSafeInteger(value.inputCommit.workerGeneration) || Number(value.inputCommit.workerGeneration) <= 0
+    || typeof value.inputCommit.observedAt !== 'number' || !Number.isFinite(value.inputCommit.observedAt)
+    || !Number.isFinite(new Date(value.inputCommit.observedAt).getTime()))) return false;
+  if (value.outputPendingTerminal !== undefined) {
+    const terminal = value.outputPendingTerminal;
+    if (!isPlainObject(terminal) || !Number.isSafeInteger(terminal.workerGeneration)
+      || Number(terminal.workerGeneration) <= 0 || typeof terminal.observedAt !== 'number'
+      || !Number.isFinite(terminal.observedAt) || typeof terminal.drainUntil !== 'number'
+      || !Number.isFinite(terminal.drainUntil) || terminal.drainUntil !== terminal.observedAt + ASYNC_OUTPUT_DRAIN_MS
+      || value.inputCommit && Number(value.inputCommit.workerGeneration) > Number(terminal.workerGeneration)) return false;
+  }
+  if (value.executionStarted !== undefined && (!validExecutionStart(value.executionStarted)
+    || value.inputCommit && (value.inputCommit as {workerGeneration: number}).workerGeneration > value.executionStarted.workerGeneration
+    || value.outputPendingTerminal && (value.outputPendingTerminal as {workerGeneration: number}).workerGeneration < value.executionStarted.workerGeneration)) return false;
   const status = value.status;
   if (status !== 'pending' && status !== 'completed' && status !== 'failed' && status !== 'interrupted') return false;
   if (typeof value.createdAt !== 'number') return false;
@@ -206,16 +247,112 @@ function saveStrict(sessionId: string, file: AsyncTriggerFile): void {
  *  can be rejected fail-closed (an unstamped file would be un-attributable and
  *  therefore un-servable). Pass '' only in tests that deliberately exercise the
  *  legacy-unstamped path. */
-export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId: string): void {
-  const file = load(sessionId);
-  if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
-  file.results[triggerId] = { status: 'pending', createdAt };
-  file.latestTriggerId = triggerId;
-  save(sessionId, file);
+export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId: string, durable = false, resultDelivery?: 'conversation'): void {
+  const write = () => {
+    const file = durable ? loadStrict(sessionId) : load(sessionId);
+    if (durable) {
+      if (!ownerLarkAppId || file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+        throw new Error('async_pending_owner_mismatch');
+      }
+      const prior = file.results[triggerId];
+      if (prior !== undefined) {
+        if (!isValidPersistedResult(prior) || prior.status !== 'pending' || prior.createdAt !== createdAt
+          || prior.resultDelivery !== resultDelivery) {
+          throw new Error('async_pending_identity_conflict');
+        }
+        return;
+      }
+    }
+    if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = { status: 'pending', createdAt, ...(resultDelivery ? { resultDelivery } : {}) };
+    file.latestTriggerId = triggerId;
+    if (durable) saveStrict(sessionId, file);
+    else save(sessionId, file);
+  };
+  if (durable) { ensureDir(); withFileLockSync(getFilePath(sessionId), write); }
+  else write();
 }
 
-/** Mark an async trigger completed with its captured final output.
- *  `ownerLarkAppId` is REQUIRED (see recordPending). `usage` optional per-turn tokens. */
+/** Called only after the live Worker's exact input-queue ACK. A missing,
+ * foreign or terminal trigger cannot acquire new acceptance evidence. Preserve
+ * the first generation; a repeated ACK is observation, never another dispatch. */
+export function recordInputCommit(sessionId: string, triggerId: string, ownerLarkAppId: string,
+  workerGeneration: number, observedAt = Date.now()): boolean {
+  if (!ownerLarkAppId || !Number.isSafeInteger(workerGeneration) || workerGeneration <= 0
+    || !Number.isFinite(observedAt) || !Number.isFinite(new Date(observedAt).getTime())) throw new Error('invalid input commit');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId), prior = file.results[triggerId];
+    if (file.ownerLarkAppId !== ownerLarkAppId || !prior) return false;
+    if (!isValidPersistedResult(prior)) throw new Error('invalid original trigger');
+    if (prior.executionStarted && prior.executionStarted.workerGeneration < workerGeneration) return false;
+    if (prior.outputPendingTerminal && prior.outputPendingTerminal.workerGeneration < workerGeneration) return false;
+    if (prior.inputCommit) return prior.inputCommit.workerGeneration === workerGeneration;
+    if (prior.status !== 'pending') return false;
+    file.results[triggerId] = { ...prior, inputCommit: { workerGeneration, observedAt } };
+    saveStrict(sessionId, file);
+    return true;
+  });
+}
+
+/** Native start evidence belongs to an exact trigger, not the session's latest
+ * status. Queue ACKs and transcript history alone cannot produce this record.
+ * The current live worker is attested at IPC admission. A queued input can be
+ * admitted by an older worker, so preserve that receipt and bind the separate
+ * first execution proof to its actual (same or newer) worker generation. */
+export function recordExecutionStarted(sessionId: string, triggerId: string, ownerLarkAppId: string,
+  proof: NativeExecutionStart): boolean {
+  if (!ownerLarkAppId || !validExecutionStart(proof)) throw new Error('invalid native start');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file=loadStrict(sessionId), prior=file.results[triggerId];
+    if (file.ownerLarkAppId!==ownerLarkAppId || !prior) return false;
+    if (!isValidPersistedResult(prior)) throw new Error('invalid original trigger');
+    if (prior.executionStarted) return prior.executionStarted.workerGeneration===proof.workerGeneration
+      && prior.executionStarted.nativeSessionId===proof.nativeSessionId && prior.executionStarted.nativeTurnId===proof.nativeTurnId;
+    if (prior.status!=='pending' || prior.steerParkedBy
+      || prior.inputCommit && prior.inputCommit.workerGeneration>proof.workerGeneration
+      || prior.outputPendingTerminal && prior.outputPendingTerminal.workerGeneration<proof.workerGeneration) return false;
+    file.results[triggerId]={...prior,executionStarted:{...proof}};saveStrict(sessionId,file);return true;
+  });
+}
+
+/** Native completion is stronger than screen-idle, but does not prove silence.
+ * Wait a bounded period for final-output hydration, then expose an ambiguous
+ * no-output outcome from this durable record. A later real final still wins. */
+export const ASYNC_OUTPUT_DRAIN_MS = 30_000;
+export function recordOutputPendingTerminal(
+  sessionId: string, triggerId: string, ownerLarkAppId: string,
+  workerGeneration: number, observedAt = Date.now(),
+): boolean {
+  if (!ownerLarkAppId || !Number.isSafeInteger(workerGeneration) || workerGeneration <= 0
+    || !Number.isFinite(observedAt)) throw new Error('invalid output terminal');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId), prior = file.results[triggerId];
+    if (file.ownerLarkAppId !== ownerLarkAppId || !prior) return false;
+    if (!isValidPersistedResult(prior)) throw new Error('invalid original trigger');
+    if (prior.status !== 'pending' || prior.steerParkedBy) return false;
+    if (prior.inputCommit && prior.inputCommit.workerGeneration > workerGeneration) return false;
+    if (prior.executionStarted && prior.executionStarted.workerGeneration > workerGeneration) return false;
+    if (prior.outputPendingTerminal) return prior.outputPendingTerminal.workerGeneration === workerGeneration;
+    file.results[triggerId] = { ...prior, outputPendingTerminal: {
+      workerGeneration, observedAt, drainUntil: observedAt + ASYNC_OUTPUT_DRAIN_MS,
+    } };
+    saveStrict(sessionId, file); return true;
+  });
+}
+function withOutputDrainOutcome(result: PersistedAsyncTriggerResult): PersistedAsyncTriggerResult {
+  const terminal = result.outputPendingTerminal;
+  if (result.status !== 'pending' || result.steerParkedBy || !terminal || Date.now() < terminal.drainUntil) return result;
+  return { ...result, status: 'failed', failedAt: terminal.drainUntil,
+    errorCode: 'no_output', reason: 'dispatch_unknown' };
+}
+
+/** Commit the original final before publishing an in-memory terminal. Throws on
+ * unreadable/corrupt state, foreign ownership or any durable write failure.
+ * Returning the canonical record prevents late finals from resurrecting an
+ * explicit interrupt/failure, or rewriting an already committed final. */
 export function recordCompleted(
   sessionId: string,
   triggerId: string,
@@ -223,31 +360,37 @@ export function recordCompleted(
   completedAt: number,
   ownerLarkAppId: string,
   usage?: PersistedAsyncTriggerResult['usage'],
-): void {
-  // Serialize with recordFailedStrict on the same per-session lock so a
-  // completed proof and a dispatch_unknown failure can't interleave-clobber.
-  // A completed proof can replace an ambiguous dispatch_unknown outcome.
-  // An explicit worker failure or caller interrupt is already terminal; a
-  // late transcript/fallback must not promote either to a successful result.
+): PersistedAsyncTriggerResult {
   ensureDir();
-  withFileLockSync(getFilePath(sessionId), () => {
-    const file = load(sessionId);
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (ownerLarkAppId && file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error('async_completion_owner_mismatch');
+    }
     if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
     const prev = file.results[triggerId];
-    // An acknowledged explicit interrupt is the caller-selected terminal
-    // boundary. A late transcript final may have been emitted concurrently
-    // with Ctrl+C, but must not rewrite the externally observed cancellation.
+    if (prev && !isValidPersistedResult(prev)) throw new Error('invalid original trigger');
     if (prev?.status === 'interrupted'
-      || (prev?.status === 'failed' && prev.reason === 'turn_terminal')) return;
-    file.results[triggerId] = {
+      || (prev?.status === 'failed' && prev.reason === 'turn_terminal')) return prev;
+    if (prev?.status === 'completed') {
+      if (prev.content !== content) throw new Error('async_completion_content_conflict');
+      return prev;
+    }
+    const result: PersistedAsyncTriggerResult = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
+      ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
+      ...(prev?.outputPendingTerminal ? { outputPendingTerminal: prev.outputPendingTerminal } : {}),
       completedAt,
       content,
       ...(usage ? { usage } : {}),
     };
+    file.results[triggerId] = result;
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
-    save(sessionId, file);
+    saveStrict(sessionId, file);
+    return result;
   });
 }
 
@@ -267,19 +410,33 @@ export function recordSteerParked(
   successorTurnId: string,
   now: number,
   ownerLarkAppId: string,
+  requireOriginal = false,
 ): void {
   ensureDir();
   withFileLockSync(getFilePath(sessionId), () => {
-    const file = load(sessionId);
+    const file = requireOriginal ? loadStrict(sessionId) : load(sessionId);
     const prev = file.results[triggerId];
+    if (requireOriginal) {
+      if (!ownerLarkAppId || file.ownerLarkAppId !== ownerLarkAppId || !prev
+        || !isValidPersistedResult(prev)) throw new Error('async_steer_recipient_unverified');
+      const successor = file.results[successorTurnId];
+      if (!successor || !isValidPersistedResult(successor) || successorTurnId === triggerId) {
+        throw new Error('async_steer_successor_unverified');
+      }
+      if (prev.steerParkedBy && prev.steerParkedBy !== successorTurnId) throw new Error('async_steer_successor_changed');
+    }
     if (prev && prev.status !== 'pending') return;
     if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'pending',
       createdAt: prev?.createdAt ?? now,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
+      ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       steerParkedBy: successorTurnId,
     };
-    save(sessionId, file);
+    if (requireOriginal) saveStrict(sessionId, file);
+    else save(sessionId, file);
   });
 }
 
@@ -334,6 +491,9 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
     file.results[predecessorTriggerId] = {
       status: 'failed',
       createdAt: predecessor.createdAt,
+      ...(predecessor.resultDelivery ? { resultDelivery: predecessor.resultDelivery } : {}),
+      ...(predecessor.inputCommit ? { inputCommit: predecessor.inputCommit } : {}),
+      ...(predecessor.executionStarted ? { executionStarted: predecessor.executionStarted } : {}),
       failedAt: supersededAt,
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
@@ -348,7 +508,7 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
  * Record a durable `failed` async outcome (STRICT). This is the authoritative
  * terminal state the idempotency reconcile/barrier writes for a
  * `dispatch_unknown` turn — an at-most-once ambiguous crash that must NOT be
- * re-run. Unlike recordPending/recordCompleted's best-effort save, this:
+ * re-run. Unlike recordPending's best-effort save, this:
  *   - takes the per-session cross-process lock (serialized with recordCompleted),
  *   - writes crash-durable (fsync temp + rename), and
  *   - THROWS on any I/O error (the caller must treat a failed persist as a hard
@@ -392,6 +552,9 @@ export function recordFailedStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
+      ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       failedAt,
       errorCode: 'no_output',
       reason,
@@ -428,6 +591,9 @@ export function recordTerminalFailureStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
+      ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       failedAt,
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
@@ -462,6 +628,9 @@ export function recordInterruptedStrict(
     file.results[triggerId] = {
       status: 'interrupted',
       createdAt: prev?.createdAt ?? interruptedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
+      ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       interruptedAt,
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
@@ -484,7 +653,7 @@ export function lookup(sessionId: string, triggerId?: string): {
   if (!resolved) return undefined;
   const result = file.results[resolved];
   if (!result) return undefined;
-  return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+  return { triggerId: resolved, result: withOutputDrainOutcome(result), ownerLarkAppId: file.ownerLarkAppId };
 }
 
 /** STRICT variant of `lookup`: ONLY a genuinely absent file (ENOENT) or an
@@ -511,7 +680,7 @@ export function lookupStrict(sessionId: string, triggerId?: string): {
   if (!isValidPersistedResult(result)) {
     throw new Error(`corrupt async-trigger result (invalid shape) for ${sessionId}/${resolved}`);
   }
-  return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+  return { triggerId: resolved, result: withOutputDrainOutcome(result), ownerLarkAppId: file.ownerLarkAppId };
 }
 
 /** Walk a durable steer-park chain (T1→T2→…→Tn) from `firstSuccessorTurnId`

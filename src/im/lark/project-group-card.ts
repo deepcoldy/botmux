@@ -90,6 +90,7 @@ function uniquePlanItems(items: string[]): string[] {
 }
 
 function projectProgressSummary(project: ProjectGroupState): string {
+  if(project.projection)return project.projection.stateLabel;
   if (project.status === 'completed') return '目标已完成';
   if (project.workstreams.length === 0) {
     if (project.blockers.length > 0) return `${project.blockers.length} 项阻塞`;
@@ -421,6 +422,7 @@ export function buildProjectGroupCard(
     : project.status === 'paused'
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
+  if (project.projection) statusMeta.label = project.projection.stateLabel;
   const title = displayProjectTitle(project.title);
   const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
   body.push(

@@ -47,7 +47,7 @@ export type IdempotencyState = 'reserved' | 'attempting';
  *  Reconcile also reads it to avoid fresh-only teardown (closeSession) on a turn
  *  lease whose session is shared and must survive. Absent on disk = legacy
  *  pre-#71 record → treated as `fresh` (the only kind that existed then). */
-export type IdempotencyKind = 'fresh' | 'turn';
+export type IdempotencyKind = 'fresh' | 'turn' | 'routed_turn';
 
 export interface IdempotencyRecord {
   ownerLarkAppId: string;
@@ -146,9 +146,9 @@ function readRecord(fp: string): IdempotencyRecord | undefined {
     || !Number.isSafeInteger(data.revision) || data.revision < 1
     || !Number.isFinite(data.createdAt) || !Number.isFinite(data.updatedAt)
     || (data.state !== 'reserved' && data.state !== 'attempting')
-    || (data.kind !== undefined && data.kind !== 'fresh' && data.kind !== 'turn')
+    || (data.kind !== undefined && data.kind !== 'fresh' && data.kind !== 'turn' && data.kind !== 'routed_turn')
     || (data.inputCommit !== undefined && (
-      data.kind !== 'turn' || data.state !== 'attempting'
+      (data.kind !== 'turn' && data.kind !== 'routed_turn') || data.state !== 'attempting'
       || !data.inputCommit || typeof data.inputCommit !== 'object'
       || !Number.isSafeInteger(data.inputCommit.workerGeneration)
       || data.inputCommit.workerGeneration < 1
@@ -192,14 +192,14 @@ export function lookup(ownerLarkAppId: string, key: string, kind: IdempotencyKin
  * Duplicate ACKs keep the first observation and do not churn the revision. */
 export function recordTurnInputCommit(input: {
   ownerLarkAppId: string; key: string; sessionId: string; triggerId: string;
-  ownerBootId: string; workerGeneration: number; observedAt: number;
+  ownerBootId: string; workerGeneration: number; observedAt: number; kind?: 'turn' | 'routed_turn';
 }): boolean {
   if (!Number.isSafeInteger(input.workerGeneration) || input.workerGeneration < 1
     || !Number.isFinite(input.observedAt)) return false;
-  return withKeyLock(fileFor(input.ownerLarkAppId, input.key, 'turn'), () => {
-    const fp = fileFor(input.ownerLarkAppId, input.key, 'turn');
+  return withKeyLock(fileFor(input.ownerLarkAppId, input.key, input.kind ?? 'turn'), () => {
+    const fp = fileFor(input.ownerLarkAppId, input.key, input.kind ?? 'turn');
     const current = readRecord(fp);
-    if (!current || current.kind !== 'turn' || current.state !== 'attempting'
+    if (!current || current.kind !== (input.kind ?? 'turn') || current.state !== 'attempting'
       || current.ownerLarkAppId !== input.ownerLarkAppId
       || current.sessionId !== input.sessionId || current.triggerId !== input.triggerId
       || current.ownerBootId !== input.ownerBootId) return false;

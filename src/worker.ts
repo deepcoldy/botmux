@@ -61,7 +61,7 @@ import {
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
-import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
+import { isRemoteBackendType, isSuspendableBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
 import {
   decodeTerminalWriteFrameSource,
@@ -71,6 +71,7 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
+import { verifyCodexAppProcessAttestation, type CodexAppProcessAttestation } from './utils/codex-app-process-attestation.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
@@ -134,6 +135,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
+  isSerialCliInput,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
   shouldTrackArgvBakedFirstPrompt,
@@ -173,7 +175,8 @@ import {
   readScheduledTaskAnchors,
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
-import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
+import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns, serialDispatchRecoveryMark, settleFencedSerialDispatch } from './services/codex-adopt-recovery.js';
+import { preparedSerialDispatch, serialDispatchBlocksInput } from './utils/codex-app-dispatch-ledger.js';
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
@@ -314,6 +317,7 @@ import { HerdrWebTerminalBinding } from './utils/herdr-web-terminal-binding.js';
 import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type {
   CodexAppDispatchLedgerEntry,
+  CodexRpcThreadRuntime,
   CodexAppGenerationCommit,
   CodexAppTurnInput,
   CotEntry,
@@ -567,6 +571,7 @@ import {
 import { isLinuxIsolationLauncher } from './core/linux-isolation.js';
 import {
   CodexRpcEngine,
+  releaseCodexRpcScope,
   type CodexRpcTurnIdentity,
   type CodexRpcTurnTerminal,
 } from './codex-rpc-engine.js';
@@ -685,6 +690,7 @@ let idleScreenSettleTask: {
   revision: number;
   promise: Promise<{ proceed: boolean; degraded: boolean }>;
 } | null = null;
+const exitedNativeBackends = new WeakSet<SessionBackend>();
 let intentionalRestartBackend: SessionBackend | null = null;
 // Hybrid codex RPC input mode (opt-in per bot, cfg.codexRpcInput). When active,
 // user input is delivered to codex via the app-server JSON-RPC channel
@@ -846,12 +852,41 @@ function notifyRpcTeardownBeforeActivation(
   });
 }
 
+// The durable serial ledger remains the owner while an RPC transport is torn
+// down. This only holds the process-release proof; it does not admit or retry input.
+const serialRpcRelease = new Map<string, { engine: CodexRpcEngine; released: boolean; proof: Promise<boolean> }>();
+function fenceSerialRpcExecution(engine: CodexRpcEngine): Promise<boolean> | undefined {
+  const entry = preparedSerialDispatch(codexAppRecoveredDispatches);
+  if (!entry || !isSerialOwnedTurn(entry.turnId, entry.dispatchAttempt)) return undefined;
+  const key = serialTurnKey(entry.turnId, entry.dispatchAttempt);
+  const existing = serialRpcRelease.get(key);
+  if (existing) return existing.proof;
+  const fence = { engine, released: false, proof: Promise.resolve(false) };
+  serialRpcRelease.set(key, fence);
+  fence.proof = engine.stopAndWait().then(released => {
+    fence.released = released;
+    if (released) {
+      // Read original completion before deciding that the interrupted attempt
+      // is ambiguous. Neither timeout nor socket close is positive completion.
+      if (preparedSerialDispatch(codexAppRecoveredDispatches)?.dispatchId === entry.dispatchId) {
+        settleSerialAfterBackingGone('gone');
+      }
+    } else {
+      send({ type: 'user_notify', turnId: entry.turnId, dispatchAttempt: entry.dispatchAttempt,
+        message: '旧执行进程退出尚未核验，后续输入继续排队。系统保留原执行记录，待进程释放后恢复。' });
+    }
+    return released;
+  });
+  return fence.proof;
+}
+
 function stopCodexRpcEngine(): void {
   // Invalidate even when the engine has not yet been published: engageCodexRpc
   // may be awaiting a local engine/thread/probe while another IPC handler starts
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
   const engine = codexRpcEngine;
+  if (engine) fenceSerialRpcExecution(engine);
   taskContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
@@ -1301,13 +1336,18 @@ async function prepareCodexNativeTitleGeneration(
  *  (verified), hence the first turn must persist the rollout BEFORE the pane
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
-async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  startupRuntime = preparedSerialDispatch(codexAppRecoveredDispatches)?.serialRecovery?.rpcThreadRuntime,
+): Promise<EngageOutcome> {
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
     TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
   }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   stopCodexRpcEngine();
+  for (const fence of serialRpcRelease.values()) {
+    if (!await fence.proof) throw new Error('serial_rpc_previous_execution_exit_unproven');
+  }
   const engagementLease = rpcEngagementFence.begin();
   let engine: CodexRpcEngine | undefined;
   let enginePidMarker: string | null = null;
@@ -1388,6 +1428,11 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       }, params, signal),
       onTurnTerminal: (terminal) => {
         if (!engine) return;
+        if ((terminal.status === 'engine-dead' || terminal.status === 'stopped')
+          && isSerialOwnedTurn(terminal.identity.turnId, terminal.identity.dispatchAttempt)) {
+          fenceSerialRpcExecution(engine);
+          return;
+        }
         handleRpcTurnTerminal(terminal, {
           engine,
           cliGeneration: engineCliGeneration,
@@ -1415,6 +1460,17 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         }
       },
     });
+    // The original prewrite runtime survives daemon death; the replacement
+    // engine and viewer cannot testify that the old tool process tree exited.
+    if (wantResume && startupRuntime && !startupRuntime.nativeScopeId) {
+      throw new Error('serial_recovery_rpc_original_scope_unavailable');
+    }
+    if (wantResume && startupRuntime?.nativeScopeId) {
+      if (!releaseCodexRpcScope(startupRuntime.nativeScopeId, cfg.sessionId)) {
+        throw new Error('serial_recovery_rpc_exit_unproven');
+      }
+      settleSerialAfterBackingGone('gone');
+    }
     await engine.start();
     assertRpcEngagementCurrent();
     // Shell tools run under the app-server process tree, not the viewer TUI.
@@ -1430,7 +1486,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // exists. Publish the independently attested engine root immediately so
     // current-actor remains available during that narrow startup window.
     publishLocalProcessAttestation(undefined, engine.appServerPid);
-    const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
+    const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!, startupRuntime) : await engine.startThread();
     assertRpcEngagementCurrent();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
@@ -1444,6 +1500,20 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         engine,
         cliGeneration: engineCliGeneration,
       };
+      if (cfg.queueAfterActiveTurn) {
+        if (!cfg.codexAppDispatchId || !cfg.turnId) throw new Error('serial_rpc_dispatch_identity_required');
+        if (!engine.activeThreadRuntime) throw new Error('serial_rpc_runtime_binding_unavailable');
+        persistCliSessionId(threadId);
+        const prepared = await prepareSerialNativeInput({
+          turnId: cfg.turnId, dispatchAttempt: cfg.dispatchAttempt, codexAppDispatchId: cfg.codexAppDispatchId,
+          content: cfg.prompt, noReplay: cfg.atMostOnce, rpcThreadRuntime: engine.activeThreadRuntime,
+          trustedCaller: cfg.trustedCaller, trustedController: cfg.trustedController,
+        });
+        assertRpcEngagementCurrent();
+        if (!prepared) throw new Error('serial_rpc_prepare_unconfirmed');
+        reserveActiveTurn({ ...firstIdentity, queueAfterActiveTurn: true,
+          trustedCaller: cfg.trustedCaller, trustedController: cfg.trustedController });
+      }
       installAwaitingRpcActivation(
         firstIdentity,
         firstGeneration,
@@ -1459,6 +1529,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // mutation; a superseded delivery is never pasted or re-queued.
       assertRpcEngagementCurrent();
       if (first.outcome === 'not-sent') {
+        if (cfg.queueAfterActiveTurn) throw new Error('serial_rpc_prepared_frame_not_sent');
         clearAwaitingRpcActivation(firstIdentity, firstGeneration);
         // The turn/start frame never left → the turn cannot have run → tear the
         // engine down and fall back to paste. flushPending marks the bridge once
@@ -1597,6 +1668,15 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       clearRpcEnginePidMarker();
       try { engine?.stop(); } catch { /* best effort */ }
       stopCodexRpcEngine();
+      throw err;
+    }
+    if (startupRuntime || freshDeliveryOwned
+      || preparedSerialDispatch(codexAppRecoveredDispatches)?.serialRecovery?.rpcThreadRuntime) {
+      // Once prepared, recovery must retain the original transport and runtime.
+      // A read/identity/startup error is not authorization to create a paste
+      // execution, nor to let the current default model replace that binding.
+      log(`Codex RPC recovery retained its original dispatch: ${err?.message ?? err}`);
+      try { engine?.stop(); } catch { /* original marker retains cleanup ownership */ }
       throw err;
     }
     log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
@@ -2750,6 +2830,9 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
   /** Stop the current generation and resume the exact thread on the verified
    *  executable; returns the verified replacement processes. */
   const restorePass = async (pass: number, launch: 'thread' | 'requested', stopping: CodexProcess[]): Promise<CodexProcess[]> => {
+    // A folded restart may require another pass. Capture that pass's actual
+    // engine runtime before teardown, not the first engine's stale scope.
+    const rpcStartupRuntime = codexRpcEngine?.activeThreadRuntime;
     if (pass > 1) {
       codexAutoUpgrade!.stage = 'stopping';
       replacementSpawnInProgress = false;
@@ -2784,7 +2867,7 @@ async function autoUpgradeCodex(target: CodexExecutable, running: CodexProcess[]
     if (codexRpcEligible(restartCfg, { sandboxForced: sandboxEnabled() })) {
       await prepareCliPluginGenerationAndGateway(restartCfg, createCliAdapterSync(restartCfg.cliId as CliId, upgradeContext.executable));
       pluginGenerationPrepared = true;
-      const outcome = await engageCodexRpc(restartCfg);
+      const outcome = await engageCodexRpc(restartCfg, rpcStartupRuntime);
       if (outcome !== 'resumed' || remoteThreadId !== upgradeContext.threadId) {
         throw new Error('Codex RPC did not resume the original thread');
       }
@@ -3701,11 +3784,13 @@ function turnAuthorityIdentity(input: {
   turnId?: string;
   queueAfterActiveTurn?: true;
   dispatchAttempt?: number;
+  atMostOnce?: boolean;
+  noReplay?: boolean;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): TurnAuthorityIdentity {
   return {
-    ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    ...(isSerialCliInput(input) ? { queueAfterActiveTurn: true } : {}),
     ...(input.turnId ? { turnId: input.turnId } : {}),
     ...(input.dispatchAttempt !== undefined
       ? { dispatchAttempt: input.dispatchAttempt }
@@ -3740,11 +3825,15 @@ function activeTurnBlocks(input: {
   turnId?: string;
   queueAfterActiveTurn?: true;
   dispatchAttempt?: number;
+  atMostOnce?: boolean;
+  noReplay?: boolean;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): boolean {
+  if (serialDispatchBlocksInput(codexAppRecoveredDispatches, input)) return true;
   // Group FIFO is independent of the experimental cross-principal question gate.
-  if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;
+  if (!isSerialCliInput(input) && !activeTurnAuthority.snapshot()?.queueAfterActiveTurn
+    && !crossPrincipalIsolationOn()) return false;
   return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
 }
 
@@ -3767,7 +3856,7 @@ function activeTurnBlocks(input: {
  * failure handling rather than assuming that.
  */
 function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boolean {
-  if (identity.queueAfterActiveTurn) return false;
+  if (identity.queueAfterActiveTurn || activeTurnAuthority.snapshot()?.queueAfterActiveTurn) return false;
   if (crossPrincipalIsolationOn()) return false;
   const active = activeTurnAuthority.snapshot();
   if (!activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)) return false;
@@ -3783,6 +3872,8 @@ function reserveActiveTurn(input: {
   queueAfterActiveTurn?: true;
   turnId?: string;
   dispatchAttempt?: number;
+  atMostOnce?: boolean;
+  noReplay?: boolean;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): boolean {
@@ -3803,6 +3894,8 @@ function markActiveTurnStarted(input: {
   queueAfterActiveTurn?: true;
   turnId?: string;
   dispatchAttempt?: number;
+  atMostOnce?: boolean;
+  noReplay?: boolean;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): void {
@@ -3819,6 +3912,9 @@ function releaseActiveTurnAuthority(
   reason: string,
   exact?: { turnId: string; dispatchAttempt?: number },
 ): boolean {
+  const active = activeTurnAuthority.snapshot();
+  if (reason === 'prompt_ready' && active?.turnId
+    && serialDispatchIds.has(serialTurnKey(active.turnId, active.dispatchAttempt))) return false;
   const released = exact
     ? activeTurnAuthority.releaseExact(exact)
     : activeTurnAuthority.clear();
@@ -4411,11 +4507,13 @@ let codexAppGenerationCommits: CodexAppGenerationCommit[] = [];
 const codexAppPendingDaemonAcks = new Map<string, {
   resolve: (ok: boolean) => void;
   timer: NodeJS.Timeout;
+  serialPrepare?: { dispatchId: string; turnId: string; dispatchAttempt?: number; publish: () => void };
 }>();
 let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppProcessAttestation: CodexAppProcessAttestation | undefined;
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -4510,13 +4608,19 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  if (codexAppProcessAttestation) {
+    codexAppProcessAttestation = undefined;
+    publishLocalProcessAttestation(undefined, undefined, false);
+  }
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
   // after the old runner proves a warm reattach; stale queued entries must not
   // cross a stop/restart boundary.
   if (!opts.preserveDispatchRecovery) {
     codexAppTurnDispatchQueue.clear();
-    codexAppRecoveredDispatches = [];
+    // Native serial ownership survives CLI/control teardown until its exact
+    // daemon receipt; it is independent of the App runner generation.
+    codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(entry => entry.executionPolicy === 'serial');
   }
   for (const pending of codexAppPendingDaemonAcks.values()) {
     clearTimeout(pending.timer);
@@ -5729,7 +5833,10 @@ let codexAdoptRecoveryAttempted = false;
 let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
-const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
+const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted, turn => {
+  send({ type: 'native_turn_started', turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt, nativeSessionId: turn.sourceSessionId!,
+    nativeTurnId: turn.sourceTurnId!, startedAtMs: turn.nativeStartTimeMs!, proofKind: 'codex_transcript_start' });
+});
 // Structured rollout CoT: Codex/Pi messages and TraeX history mutations emit
 // rollout reasoning/tool events attributed to the collecting turn, feeding
 // the same thinking channel as Claude's transcript attribution. The observer
@@ -5940,14 +6047,14 @@ function checkpointCodexAdoptRecovery(): void {
   // The first attach must consume the previous generation's journal before a
   // new pre-path input or an early empty drain can replace it.
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
-  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, isSerialOwnedTurn); }
   catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
 function checkpointStructuredBridgeRecovery(): void {
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
-  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, isSerialOwnedTurn); }
   catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -8204,7 +8311,25 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   codexBridgeRolloutPath = rolloutPath;
   codexSubagentLimitTracker.clear();
   if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
-  if (mode === 'fresh-empty') {
+  const serialRecoveryMarks = codexAppRecoveredDispatches.flatMap(entry => {
+    const mark = serialDispatchRecoveryMark(entry, rolloutPath, codexSessionIdFromRolloutPath(rolloutPath));
+    return mark ? [mark] : [];
+  });
+  if (serialRecoveryMarks.length > 0 && !structuredBridgeRecoveryAttempted) {
+    // Only the exact original file/range/native turn may hydrate this prepared
+    // head. The durable ledger survives legacy clear-at-pop and process death.
+    const plan = planBridgeTurnRecovery(serialRecoveryMarks, statSync(rolloutPath).size);
+    if (plan.kind !== 'recover') throw new Error('serial_recovery_range_' + plan.reason);
+    const result = structuredBridgeIngestPath(rolloutPath, plan.fromOffset);
+    codexBridgeQueue.restorePendingTurns(serialRecoveryMarks);
+    codexBridgeQueue.ingest(result.events);
+    codexBridgeOffset = result.newOffset;
+    codexBridgePendingTail = result.pendingTail;
+    codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
+    emitReadyCodexTurns();
+    log(`Recovered ${serialRecoveryMarks.length} prepared serial input(s) from original native transcript without resubmission`);
+  } else if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
     // attach are still in the queue, so the user_message that just landed
@@ -8228,7 +8353,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const journalPath = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
     const recover = journalPath && !codexAdoptRecoveryAttempted;
     const { history, live, restored } = recover
-      ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
+      ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff, Date.now(), isSerialOwnedTurn)
       : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
     if (journalPath) {
       codexAdoptRecoveryAttempted = true;
@@ -8309,7 +8434,8 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
     // timestamp-cutoff replay cannot partition Cursor history, so Cursor stays on the offset EOF baseline.
     const canRecover = journalPath && !structuredBridgeRecoveryAttempted && !structuredBridgeIs('cursor');
-    const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath }) : [];
+    const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath })
+      .filter(entry => !isSerialOwnedTurn(entry.turnId, entry.dispatchAttempt)) : [];
     if (journalPath) structuredBridgeRecoveryAttempted = true;
     if (restorable.length > 0 && journalPath) {
       let rolloutSize = Number.NaN;
@@ -8333,7 +8459,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           const result = structuredBridgeIngestPath(rolloutPath, recoveryPlan.fromOffset);
           const minMarkTime = Math.min(...restorable.map(e => e.markTimeMs));
           const cutoff = minMarkTime - 5_000;
-          const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
+          const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff, Date.now(), isSerialOwnedTurn);
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
@@ -9287,7 +9413,9 @@ function codexBridgeMarkPendingTurn(
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark);
+  const authority = activeTurnAuthority.snapshot();
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark,
+    authority?.turnId === turnId ? authority.queueAfterActiveTurn : undefined);
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -9690,6 +9818,37 @@ function drainReliableTerminalBeforeInterrupt(): void {
       log(`Codex bridge terminal drain failed: ${err.message}`);
     }
   }
+}
+
+/** Reuses the structured bridge and its normal output/suppression path. The
+ * original prewrite range is read before reporting an unknown interrupted turn. */
+function settleSerialAfterBackingGone(backing: 'live' | 'gone' | 'unknown'): void {
+  if (lastInitConfig?.cliId !== 'codex' || lastInitConfig.adoptMode) return;
+  const entry = preparedSerialDispatch(codexAppRecoveredDispatches);
+  if (!entry) return;
+  const key = serialTurnKey(entry.turnId, entry.dispatchAttempt);
+  settleFencedSerialDispatch({
+    backing,
+    hasTerminal: () => serialPendingTerminals.has(key) || !!entry.serialResult?.terminal,
+    readback: () => {
+      const path = entry.serialRecovery?.jsonlPath
+        ?? (entry.serialNativeStart && findCodexRolloutBySessionId(entry.serialNativeStart.nativeSessionId));
+      if (!path) throw new Error('serial_recovery_original_path_unavailable');
+      const mark = serialDispatchRecoveryMark(entry, path, codexSessionIdFromRolloutPath(path));
+      if (!mark) throw new Error('serial_recovery_original_binding_unavailable');
+      const before = statSync(path);
+      if (!before.isFile() || before.size < mark.offsetAtMark) throw new Error('serial_recovery_range_unavailable');
+      const result = structuredBridgeIngestPath(path, mark.offsetAtMark);
+      const after = statSync(path);
+      if (after.ino !== before.ino || after.dev !== before.dev || after.size !== before.size
+        || result.pendingTail) throw new Error('serial_recovery_transcript_not_stable');
+      codexBridgeQueue.restorePendingTurns([mark]);
+      codexBridgeQueue.ingest(result.events);
+      emitReadyCodexTurns();
+    },
+    ambiguous: (errorCode) => emitTurnTerminal(entry.turnId, 'ambiguous', errorCode,
+      entry.dispatchAttempt, undefined, false),
+  });
 }
 
 function emitReadyCodexTurns(): void {
@@ -10526,6 +10685,7 @@ async function writeAdoptMessage(
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
+  queueAfterActiveTurn?: true,
 ): Promise<AdoptWriteResult> {
   const executionFence = fence ?? captureAdoptWriteFence();
   if (!executionFence || !adoptWriteFenceIsCurrent(executionFence)) {
@@ -10546,7 +10706,7 @@ async function writeAdoptMessage(
   }
   setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
-  markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
+  markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController, queueAfterActiveTurn });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
   writeCliPidMarker();
   publishSandboxRelayCapability();
@@ -10801,15 +10961,19 @@ async function runAdoptMessageForCapturedGeneration(
     queue: adoptWriteQueue,
     isCurrent: () => adoptWriteFenceIsCurrent(fence),
     onStale: requeueOnce,
-    write: () => writeAdoptMessage(
-      item.content,
-      item.turnId,
-      item.dispatchAttempt,
-      item.vcMeetingImTurnOrigin,
-      item.trustedCaller,
-      item.trustedController,
-      fence,
-    ),
+    write: () => {
+      if (activeTurnBlocks(item)) return Promise.resolve('stale-before-write' as const);
+      return writeAdoptMessage(
+        item.content,
+        item.turnId,
+        item.dispatchAttempt,
+        item.vcMeetingImTurnOrigin,
+        item.trustedCaller,
+        item.trustedController,
+        fence,
+        isSerialCliInput(item) ? true : undefined,
+      );
+    },
   });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
   if (queued.value === 'stale-before-write') requeueOnce();
@@ -12413,16 +12577,27 @@ const CODEX_APP_DAEMON_PERSIST_TIMEOUT_MS = 30_000;
 function waitForCodexAppDaemonPersistence(
   requestId: string,
   publish: () => void,
+  serialPrepare?: Pick<CodexAppDispatchLedgerEntry, 'dispatchId' | 'turnId' | 'dispatchAttempt'>,
 ): Promise<boolean> {
   return new Promise(resolve => {
     const timer = setTimeout(() => {
       const pending = codexAppPendingDaemonAcks.get(requestId);
       if (!pending) return;
+      if (pending.serialPrepare) {
+        // Keep the original prewrite continuation. The daemon's existing
+        // maintenance reconciliation may resend this receipt request; it must
+        // never create another native turn or downgrade the input transport.
+        send({ type: 'user_notify', turnId: pending.serialPrepare.turnId,
+          dispatchAttempt: pending.serialPrepare.dispatchAttempt,
+          message: '任务已保留，正在核验执行前的保存回执；回执确认后将继续原任务，无需重复发送。' });
+        return;
+      }
       codexAppPendingDaemonAcks.delete(requestId);
       resolve(false);
     }, CODEX_APP_DAEMON_PERSIST_TIMEOUT_MS);
     timer.unref?.();
-    codexAppPendingDaemonAcks.set(requestId, { resolve, timer });
+    codexAppPendingDaemonAcks.set(requestId, { resolve, timer,
+      ...(serialPrepare ? { serialPrepare: { ...serialPrepare, publish } } : {}) });
     try {
       publish();
     } catch {
@@ -12435,7 +12610,7 @@ function waitForCodexAppDaemonPersistence(
 
 function requestCodexAppDispatchTransition(
   operation: 'submit' | 'cancel' | 'retry',
-  entries: Array<{ dispatchId: string; turnId: string; dispatchAttempt?: number }>,
+  entries: Array<Pick<CodexAppDispatchLedgerEntry, 'dispatchId' | 'turnId' | 'dispatchAttempt' | 'serialRecovery'>>,
 ): Promise<boolean> {
   if (!sessionId || entries.length === 0) return Promise.resolve(entries.length === 0);
   const requestId = randomBytes(16).toString('hex');
@@ -12445,7 +12620,7 @@ function requestCodexAppDispatchTransition(
     requestId,
     operation,
     entries,
-  }));
+  }), operation === 'submit' && entries.length === 1 && entries[0]?.serialRecovery?.rpcThreadRuntime ? entries[0] : undefined);
 }
 
 /** Retire one exact durable dispatch before its receipt/lease owner is allowed
@@ -12590,6 +12765,21 @@ async function handleTrustedCodexAppMarker(
       appTurnId: event.appTurnId,
       turnId: event.replyTurnId,
     });
+    return true;
+  }
+
+  if (kind === 'process_attestation' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const proof = process.platform === 'linux'
+      ? verifyCodexAppProcessAttestation(payload, currentCodexObservedPid())
+      : undefined;
+    if (!proof) {
+      failCodexAppControlGeneration('Codex App runner process attestation did not match its live process tree');
+      return false;
+    }
+    codexAppProcessAttestation = proof;
+    // Add the authenticated engine root without re-snapshotting a running
+    // turn. Otherwise warm reconnects would classify its active tools as old.
+    publishLocalProcessAttestation(currentCodexObservedPid(), proof.enginePid, false);
     return true;
   }
 
@@ -15073,6 +15263,13 @@ async function flushPending(): Promise<void> {
     log(`Ignoring native session rename — unsupported by ${cliName()}${renameOnRemoteBackend ? ` on ${effectiveBackendType} backend` : ''}`);
     if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
+  // Do not consume a genuine native-ready edge when no write can run.
+  // In particular, result persistence may still own the serial predecessor;
+  // its later ACK must be able to flush without waiting for another PTY byte.
+  if (!supportedSessionRenameReady && !rawInputReady && !adoptInputReady) {
+    if (pendingMessages.length === 0 && hasRunStartupCommands) return;
+    if (pendingMessages[0] && activeTurnBlocks(pendingMessages[0])) return;
+  }
   if (!isPromptReady && pendingMessages.length === 0) return;
   if (!isPromptReady && !typeAheadAllowed) return;
 
@@ -15084,7 +15281,11 @@ async function flushPending(): Promise<void> {
   // pending adopt writes re-arm inside writeAdoptMessage. Clearing readiness
   // here would make an adopt rename's in-queue readiness recheck always see a
   // synthetic false. Normal prompt/startup flushes keep the original re-arm.
-  if (!rawInputReady && !supportedSessionRenameReady && !adoptInputReady) {
+  const serialPrepareBeforeWrite = lastInitConfig?.cliId === 'codex'
+    && !!pendingMessages[0]?.codexAppDispatchId
+    && (hasRunStartupCommands || !lastInitConfig.startupCommands?.length)
+    && (hasRunInitialNativeRename || !lastInitConfig.initialNativeRename);
+  if (!rawInputReady && !supportedSessionRenameReady && !adoptInputReady && !serialPrepareBeforeWrite) {
     beginCliWriteCycle();
   }
 
@@ -15198,7 +15399,7 @@ async function flushPending(): Promise<void> {
       // sending queued user prompts; otherwise they can land in its picker.
       return;
     }
-    if (adoptInputReady && pendingAdoptMessages.length > 0) {
+    if (adoptInputReady && pendingAdoptMessages.length > 0 && !activeTurnBlocks(pendingAdoptMessages[0]!)) {
       const item = pendingAdoptMessages.shift()!;
       await runAdoptMessageForCapturedGeneration(item, () => {
         pendingAdoptMessages.unshift(item);
@@ -15220,6 +15421,18 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      if (lastInitConfig?.cliId === 'codex' && item.codexAppDispatchId && item.turnId) {
+        const prepared = await prepareSerialNativeInput({ ...item,
+          turnId: item.turnId, codexAppDispatchId: item.codexAppDispatchId });
+        if (!prepared) {
+          // Failed receipt is not permission to write. The daemon may already
+          // have prepared the entry; only the same identity may reconcile it.
+          pendingMessages.unshift(item);
+          log('Serial input prepare unconfirmed; retained before native write');
+          break;
+        }
+        item.queueAfterActiveTurn = true;
+      }
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
       // queued credential turns (A/B/C ran as A/C/C).
@@ -16033,7 +16246,7 @@ function sendToPty(
   const next: PendingCliInput = {
     content,
     turnId,
-    ...(opts.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    ...(isSerialCliInput(opts) ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
@@ -18658,7 +18871,7 @@ async function spawnCli(
   const durableInitialPromptArgBaseline = hasDurableInitialPrompt
     ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
     : undefined;
-  const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = cfg.queueAfterActiveTurn === true || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -20453,6 +20666,15 @@ async function spawnCli(
     if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
   }
 
+  if (cfg.cliId === 'codex' && !cfg.adoptMode && !codexRpcEngine && preparedSerialDispatch(codexAppRecoveredDispatches)
+    && persistentSessionName && isSuspendableBackendType(effectiveBackendType)) {
+    const originalTarget = cfg.persistentBackendTarget ?? selectedBackend.persistentBackendTarget;
+    const originalName = originalTarget?.sessionName ?? persistentSessionName;
+    const backing = persistentPaneProbe(effectiveBackendType, originalName, originalTarget);
+    if (backing === 'unknown') throw new Error('serial_recovery_backing_probe_unknown');
+    settleSerialAfterBackingGone(backing);
+  }
+
   // Publish the exact selected resource BEFORE spawn. This both restores host
   // affinity for later in-worker restarts and closes the crash window where a
   // shared Herdr agent could be created but the daemon still knew only bmx-*.
@@ -21780,6 +22002,7 @@ async function spawnCli(
     restoreHerdrWebBindings();
   }
   backend.onExit((code, signal) => {
+    exitedNativeBackends.add(observedBackend);
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -21858,7 +22081,15 @@ async function spawnCli(
       );
       return;
     }
-    if ((cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt)
+    const serialPreparedAtExit = lastInitConfig?.cliId === 'codex'
+      && preparedSerialDispatch(codexAppRecoveredDispatches);
+    if (serialPreparedAtExit && !intentionalRestart && !codexRpcEngine) {
+      const backing = persistentSessionName && isSuspendableBackendType(effectiveBackendType)
+        ? persistentPaneProbe(effectiveBackendType, persistentSessionName, selectedBackend.persistentBackendTarget)
+        : effectiveBackendType === 'pty' && !codexRpcEngine ? 'gone' : 'unknown';
+      settleSerialAfterBackingGone(backing);
+    }
+    if (!serialPreparedAtExit && (cliAdapter?.reliableTurnTerminal === true || lastSpawnArgvDurableInitialPrompt)
       && exitedTurnId
       && exitedDispatchAttempt !== undefined) {
       // The CLI may have durably appended its terminal record immediately
@@ -21931,17 +22162,19 @@ async function spawnCli(
     // only it is excluded, from BOTH the inflight carry-over and the still-queued
     // pendingMessages.
     const stashed = inflightInputs.onCliExit(
-      item => item.dispatchAttempt === undefined && !item.noReplay,
+      item => item.dispatchAttempt === undefined && !item.noReplay && !item.codexAppDispatchId,
     );
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
-    const droppedPending = pendingMessages.filter(m => m.noReplay).length;
+    const retainAcceptedSerial = (item: typeof pendingMessages[number]) => !!item.turnId && !!item.codexAppDispatchId
+      && serialDispatchIds.get(serialTurnKey(item.turnId, item.dispatchAttempt)) === item.codexAppDispatchId;
+    const droppedPending = pendingMessages.filter(m => m.noReplay && !retainAcceptedSerial(m)).length;
     if (droppedPending > 0) {
       // Remove ONLY the no-replay items still queued (never written); keep any
       // ordinary follow-up input for the restart's normal flush.
       for (let i = pendingMessages.length - 1; i >= 0; i--) {
-        if (pendingMessages[i].noReplay) pendingMessages.splice(i, 1);
+        if (pendingMessages[i].noReplay && !retainAcceptedSerial(pendingMessages[i])) pendingMessages.splice(i, 1);
       }
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
     }
@@ -22404,6 +22637,9 @@ async function restartCliProcess(
       // the engine and clears remoteThreadId. The replacement app-server must
       // resume this exact thread on its fresh port.
       const rpcThreadId = remoteThreadId;
+      const rpcStartupRuntime = codexRpcEngine?.activeThreadRuntime;
+      const rpcRelease = codexRpcEngine && fenceSerialRpcExecution(codexRpcEngine);
+      if (rpcRelease && !await rpcRelease) throw new Error('serial_restart_rpc_exit_unproven');
       const restartingBackend = backend;
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
@@ -22449,11 +22685,28 @@ async function restartCliProcess(
         ));
         return;
       }
+      if (lastInitConfig?.cliId === 'codex' && preparedSerialDispatch(codexAppRecoveredDispatches)
+        && !codexRpcEngine && isSuspendableBackendType(effectiveBackendType)) {
+        const target = lastInitConfig.persistentBackendTarget;
+        const name = target?.sessionName ?? persistentPaneInfo(effectiveBackendType, lastInitConfig.sessionId)?.name;
+        if (!name || !await killPersistentSessionVerified(effectiveBackendType, name, lastInitConfig.sessionId, target)) {
+          throw new Error('serial_restart_backing_fence_unproven');
+        }
+        settleSerialAfterBackingGone('gone');
+      }
+      const waitForNativePtyExit = lastInitConfig?.cliId === 'codex' && !codexRpcEngine
+        && effectiveBackendType === 'pty' && !!preparedSerialDispatch(codexAppRecoveredDispatches);
       stopOwnedSessionScope('restart');
       killCli({
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
       });
+      if (waitForNativePtyExit) {
+        const deadline = Date.now() + 3_500;
+        while (restartingBackend && !exitedNativeBackends.has(restartingBackend) && Date.now() < deadline) await delay(25);
+        if (!restartingBackend || !exitedNativeBackends.has(restartingBackend)) throw new Error('serial_restart_pty_exit_unproven');
+        settleSerialAfterBackingGone('gone');
+      }
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
@@ -22478,7 +22731,7 @@ async function restartCliProcess(
               const adapter = createCliAdapterSync(restartCfg.cliId as CliId, restartCfg.cliPathOverride);
               await prepareCliPluginGenerationAndGateway(restartCfg, adapter);
               rpcPluginGenerationPrepared = true;
-              await engageCodexRpc(restartCfg);
+              await engageCodexRpc(restartCfg, rpcStartupRuntime);
             }
             replacementSpawnInProgress = true;
             await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
@@ -24661,6 +24914,97 @@ if(isTouch&&hasToken){(function(){
 // ─── IPC Communication ───────────────────────────────────────────────────────
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
+// The durable ledger owns admission; these maps only retain transport payloads
+// until the daemon acknowledges its exact commit. They never schedule a model.
+const serialDispatchIds = new Map<string, string>();
+// Durable serial ownership excludes this input from legacy journal recovery,
+// including after its exact terminal ACK removes the active transport mirror.
+const serialOwnedTurnKeys = new Set<string>();
+const isSerialOwnedTurn = (turnId: string, attempt?: number) => serialOwnedTurnKeys.has(serialTurnKey(turnId, attempt));
+const serialFinalOutputs = new Map<string, Extract<WorkerToDaemon, { type: 'final_output' }>>();
+const serialPendingTerminals = new Map<string, Extract<WorkerToDaemon, { type: 'turn_terminal' }>>();
+const serialSettlementInFlight = new Set<string>();
+const serialSettlementNotified = new Set<string>();
+const serialTurnKey = (turnId: string, dispatchAttempt?: number) => JSON.stringify([turnId, dispatchAttempt ?? null]);
+/** One durable prewrite boundary for both RPC startup and queued native input.
+ * Repeated receipt checks preserve the original frontier; they never write a turn. */
+async function prepareSerialNativeInput(input: {
+  turnId: string; dispatchAttempt?: number; codexAppDispatchId: string;
+  content: string; logicalContent?: string; noReplay?: boolean; rpcThreadRuntime?: CodexRpcThreadRuntime;
+  trustedCaller?: NonNullable<CodexAppDispatchLedgerEntry['origin']>['caller'];
+  trustedController?: NonNullable<CodexAppDispatchLedgerEntry['origin']>['controller'];
+}): Promise<boolean> {
+  const rpcThreadRuntime = input.rpcThreadRuntime ?? codexRpcEngine?.activeThreadRuntime;
+  const serialRecovery = codexAppRecoveredDispatches.find(entry => entry.dispatchId === input.codexAppDispatchId)?.serialRecovery
+    ?? { markTimeMs: Date.now(), fingerprint: makeFingerprint(input.logicalContent ?? input.content) ?? '',
+      ...structuredBridgeRecoveryCursorAtMark(),
+      ...(rpcThreadRuntime ? { rpcThreadRuntime: { ...rpcThreadRuntime } } : {}) };
+  codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(entry => entry.dispatchId !== input.codexAppDispatchId);
+  codexAppRecoveredDispatches.push({ executionPolicy: 'serial', state: 'prepared',
+    dispatchId: input.codexAppDispatchId, turnId: input.turnId, dispatchAttempt: input.dispatchAttempt,
+    content: input.content, serialRecovery,
+    origin: { caller: input.trustedCaller, controller: input.trustedController, ...(input.noReplay ? { atMostOnce: true } : {}) },
+  });
+  return requestCodexAppDispatchTransition('submit', [{
+    dispatchId: input.codexAppDispatchId, turnId: input.turnId, dispatchAttempt: input.dispatchAttempt, serialRecovery,
+  }]);
+}
+
+function retainSerialInput(input: { turnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string }): void {
+  if (lastInitConfig?.cliId !== 'codex' || !input.turnId || !input.codexAppDispatchId) return;
+  serialOwnedTurnKeys.add(serialTurnKey(input.turnId, input.dispatchAttempt));
+  serialDispatchIds.set(serialTurnKey(input.turnId, input.dispatchAttempt), input.codexAppDispatchId);
+  for (const key of serialOwnedTurnKeys) {
+    if (serialOwnedTurnKeys.size <= 4_096) break;
+    if (!serialDispatchIds.has(key)) serialOwnedTurnKeys.delete(key);
+  }
+}
+function acceptSerialTerminalCommit(msg: Extract<DaemonToWorker, { type: 'turn_terminal_committed' }>): void {
+      const key = serialTurnKey(msg.turnId, msg.dispatchAttempt);
+      if (msg.sessionId !== sessionId || serialDispatchIds.get(key) !== msg.dispatchId
+   || !serialPendingTerminals.has(key)) return;
+      const pending = codexAppPendingDaemonAcks.get(msg.dispatchId);
+      if (pending) {
+   codexAppPendingDaemonAcks.delete(msg.dispatchId);
+   clearTimeout(pending.timer);
+   pending.resolve(true);
+      }
+      serialSettlementNotified.delete(key);
+      serialRpcRelease.delete(key);
+  serialPendingTerminals.delete(key);
+      serialFinalOutputs.delete(key);
+      serialDispatchIds.delete(key);
+      codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(entry => entry.dispatchId !== msg.dispatchId);
+      releaseCommittedTurn(msg.turnId, msg.dispatchAttempt);
+
+}
+
+function publishSerialSettlement(key: string): void {
+  if (serialSettlementInFlight.has(key)) return;
+  const terminal = serialPendingTerminals.get(key);
+  const dispatchId = serialDispatchIds.get(key);
+  if (!terminal || !dispatchId) return;
+  serialSettlementInFlight.add(key);
+  void (async () => {
+    // Reuse the bounded daemon receipt wait; only raw observations are retried.
+    // No new dispatch, CLI write or business side effect is manufactured here.
+    for (let attempt = 0; attempt < 5 && serialPendingTerminals.has(key); attempt++) {
+      const persisted = await waitForCodexAppDaemonPersistence(dispatchId, () => {
+        const output = serialFinalOutputs.get(key);
+        if (output) send(output);
+        send(terminal);
+      });
+      if (persisted) return;
+    }
+    if (serialPendingTerminals.has(key) && !serialSettlementNotified.has(key)) {
+      serialSettlementNotified.add(key);
+      send({
+      type: 'user_notify', turnId: terminal.turnId, dispatchAttempt: terminal.dispatchAttempt,
+      message: '本次执行已经结束，但结果保存尚未确认。原结果已保留，后续输入继续排队；恢复结果存储后将核验同一执行。',
+      });
+    }
+  })().finally(() => serialSettlementInFlight.delete(key));
+}
 const emittedTurnTerminals = new TurnTerminalDeduper();
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
@@ -24690,6 +25034,14 @@ function emitTurnTerminal(
   completedAtMs?: number,
 ): void {
   if (!sessionId || !turnId) return;
+  if (status === 'ambiguous' && isSerialOwnedTurn(turnId, dispatchAttempt)) {
+    const key = serialTurnKey(turnId, dispatchAttempt);
+    if (codexRpcEngine && (errorCode?.startsWith('rpc_engine_') || errorCode === 'rpc_delivery_ambiguous_timeout')) {
+      fenceSerialRpcExecution(codexRpcEngine);
+    }
+    const fence = serialRpcRelease.get(key);
+    if (fence && !fence.released) return;
+  }
   cancelSubmitFailureChainForTerminal(
     submitFailureChains,
     { turnId, dispatchAttempt },
@@ -24700,6 +25052,7 @@ function emitTurnTerminal(
     // already published this turn's timing and consumed the entry, but a
     // *replay* whose first emission never ran through this path could.
     turnExecutionClock.forget(turnId, dispatchAttempt);
+    publishSerialSettlement(serialTurnKey(turnId, dispatchAttempt));
     return;
   }
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
@@ -24709,11 +25062,17 @@ function emitTurnTerminal(
       log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
     }
   }
-  // Revoke before publishing terminal. A stale terminal from a superseded
-  // same-principal steer must not clear the newer turn's authority.
-  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
+  }
+  // Outbound authority ends at native completion, even while a serial result
+  // still awaits its durable ACK. Keep the admission slot until that ACK;
+  // revoking a send capability must not start the queued successor early.
+  const active = activeTurnAuthority.snapshot();
+  if (active?.turnId === turnId && active.dispatchAttempt === dispatchAttempt) {
+    completeManagedTurnOriginRevocation(
+      sandboxRelayCapability, turnId, dispatchAttempt, { revokePolicy: false },
+    );
   }
   send({
     type: 'turn_terminal',
@@ -24727,6 +25086,18 @@ function emitTurnTerminal(
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
   });
+  const key = serialTurnKey(turnId, dispatchAttempt);
+  if (serialDispatchIds.has(key)) {
+    publishSerialSettlement(key);
+    return;
+  }
+  releaseCommittedTurn(turnId, dispatchAttempt);
+}
+
+function releaseCommittedTurn(turnId: string, dispatchAttempt?: number): void {
+  // Release admission only after the serial result commits (ordinary turns
+  // release immediately). Exact identity preserves a newer steered turn.
+  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
   let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -24779,7 +25150,37 @@ function send(msg: WorkerToDaemon): void {
     log('Dropped final_output after close fence');
     return;
   }
-  const payload = workerIpcPayload(msg);
+  let payload = workerIpcPayload(msg);
+  if (payload.type === 'native_turn_started') {
+    const dispatchId = serialDispatchIds.get(serialTurnKey(payload.turnId, payload.dispatchAttempt));
+    if (dispatchId) {
+      payload = { ...payload, serialDispatchId: dispatchId };
+      const entry = codexAppRecoveredDispatches.find(item => item.dispatchId === dispatchId);
+      if (entry && !entry.serialNativeStart) entry.serialNativeStart = {
+        nativeSessionId: payload.nativeSessionId, nativeTurnId: payload.nativeTurnId,
+        startedAtMs: payload.startedAtMs, proofKind: payload.proofKind,
+      };
+    }
+  }
+  if (payload.type === 'final_output' || payload.type === 'turn_terminal') {
+    const key = serialTurnKey(payload.turnId, payload.dispatchAttempt);
+    const dispatchId = serialDispatchIds.get(key);
+    if (dispatchId) {
+      payload = { ...payload, serialDispatchId: dispatchId };
+      const entry = codexAppRecoveredDispatches.find(item => item.dispatchId === dispatchId);
+      if (entry) {
+        entry.serialResult ??= {};
+        if (payload.type === 'final_output') entry.serialResult.output ??= payload;
+        else entry.serialResult.terminal ??= payload;
+      }
+      if (payload.type === 'final_output') serialFinalOutputs.set(key, payload);
+      else {
+        serialPendingTerminals.set(key, payload);
+        // publishSerialSettlement owns the first send and every replay.
+        if (!serialSettlementInFlight.has(key)) return;
+      }
+    }
+  }
   if (isWorkflowWorker() && payload.type === 'final_output') {
     workflowFinalOutputSent = true;
   }
@@ -24831,6 +25232,11 @@ function acknowledgeNativeInputConsumed(
   nativeTurnId?: string,
 ): void {
   if (!turnId) return;
+  if (proofKind === 'codex_rpc_turn_start' && nativeSessionId && nativeTurnId) {
+    send({type:'native_turn_started',turnId,
+      ...(currentBotmuxTurnId === turnId ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+      nativeSessionId,nativeTurnId,startedAtMs:Date.now(),proofKind});
+  }
   send({
     type: 'native_input_consumed', turnId, proofKind,
     ...(nativeSessionId ? { nativeSessionId } : {}),
@@ -24870,10 +25276,13 @@ function rejectOrdinaryImTurn(
 
 function publishLocalProcessAttestation(
   cliPid?: number,
-  enginePid = codexRpcEngine?.appServerPid,
+  enginePid = codexRpcEngine?.appServerPid ?? codexAppProcessAttestation?.enginePid,
+  refreshTurnSnapshot = true,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  const engineProcStart = enginePid === codexAppProcessAttestation?.enginePid
+    ? codexAppProcessAttestation?.engineProcStart
+    : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
@@ -24887,7 +25296,7 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
-  if (currentBotmuxTurnId) publishSandboxRelayCapability();
+  if (refreshTurnSnapshot && currentBotmuxTurnId) publishSandboxRelayCapability();
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`
@@ -25099,7 +25508,7 @@ process.on('message', async (raw: unknown) => {
         // 无 .db 而有 leftover JSON 时 load() 记为 unmigrated，getSession 抛错。
         sessionStore.init(msg.larkAppId, { owner: false });
       }
-      if (isCodexAppCliId(msg.cliId)) {
+      if (isCodexAppCliId(msg.cliId) || msg.cliId === 'codex') {
         codexAppRecoveredDispatches = (msg.codexAppRecoveredDispatches ?? []).map(entry => ({
           ...entry,
           codexAppInput: entry.codexAppInput ? { ...entry.codexAppInput } : undefined,
@@ -25107,7 +25516,7 @@ process.on('message', async (raw: unknown) => {
         codexAppGenerationCommits = [...(msg.codexAppGenerationCommits ?? [])];
         codexAppTurnDispatchQueue.restore(
           codexAppRecoveredDispatches
-            .filter(entry => entry.state === 'prepared')
+            .filter(entry => entry.state === 'prepared' && entry.executionPolicy !== 'serial')
             .map(entry => ({
               dispatchId: entry.dispatchId,
               turnId: entry.turnId,
@@ -25121,6 +25530,34 @@ process.on('message', async (raw: unknown) => {
               ...(entry.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
             })),
         );
+      }
+      retainSerialInput(msg);
+      for (const entry of codexAppRecoveredDispatches) {
+        if (entry.executionPolicy === 'serial') retainSerialInput({
+          turnId: entry.turnId, dispatchAttempt: entry.dispatchAttempt, codexAppDispatchId: entry.dispatchId,
+        });
+      }
+      const serialPrepared = codexAppRecoveredDispatches.find(entry =>
+        entry.executionPolicy === 'serial' && entry.state === 'prepared');
+      if (serialPrepared) {
+        reserveActiveTurn({
+          turnId: serialPrepared.turnId, dispatchAttempt: serialPrepared.dispatchAttempt,
+          queueAfterActiveTurn: true, trustedCaller: serialPrepared.origin?.caller,
+          trustedController: serialPrepared.origin?.controller,
+        });
+        if (serialPrepared.serialResult?.output) {
+          serialFinalOutputs.set(serialTurnKey(serialPrepared.turnId, serialPrepared.dispatchAttempt),
+            serialPrepared.serialResult.output);
+        }
+        if (serialPrepared.serialResult?.terminal) {
+          serialPendingTerminals.set(serialTurnKey(serialPrepared.turnId, serialPrepared.dispatchAttempt),
+            serialPrepared.serialResult.terminal);
+          publishSerialSettlement(serialTurnKey(serialPrepared.turnId, serialPrepared.dispatchAttempt));
+        } else {
+          send({ type: 'user_notify', turnId: serialPrepared.turnId,
+            dispatchAttempt: serialPrepared.dispatchAttempt,
+            message: '恢复时发现上一执行已进入提交边界，但尚无已确认的终态。系统正在保留原执行归属，后续输入仍在队列中，未重复执行。' });
+        }
       }
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
@@ -25155,9 +25592,11 @@ process.on('message', async (raw: unknown) => {
         setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined, msg.turnCallerOpenId);
         if (msg.turnId) {
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
-          if (msg.prompt) {
+          if (msg.prompt && !msg.queueAfterActiveTurn) {
             reserveActiveTurn({
               turnId: msg.turnId,
+              atMostOnce: msg.atMostOnce,
+              queueAfterActiveTurn: msg.queueAfterActiveTurn,
               dispatchAttempt: msg.dispatchAttempt,
               trustedCaller: msg.trustedCaller,
               trustedController: msg.trustedController,
@@ -25291,8 +25730,10 @@ process.on('message', async (raw: unknown) => {
                 : undefined),
             codexAppInput: entry.codexAppInput,
             vcMeetingImTurnOrigin: entry.vcMeetingImTurnOrigin,
-            trustedCaller: msg.trustedCaller,
-            trustedController: msg.trustedController,
+            trustedCaller: entry.origin?.caller,
+            trustedController: entry.origin?.controller,
+            ...(entry.origin?.atMostOnce ? { noReplay: true as const } : {}),
+            ...(entry.executionPolicy === 'serial' ? { queueAfterActiveTurn: true as const } : {}),
           }));
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
@@ -25322,6 +25763,7 @@ process.on('message', async (raw: unknown) => {
             dispatchAttempt: msg.dispatchAttempt,
             durablePrimaryInbox: msg.durablePrimaryInbox,
             codexAppDispatchId: msg.codexAppDispatchId,
+            ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
@@ -25342,7 +25784,7 @@ process.on('message', async (raw: unknown) => {
           });
           initialInputCommitted = true;
           initialInputQueued = true;
-        } else if (isCodexAppCliId(msg.cliId)) {
+        } else if (isCodexAppCliId(msg.cliId) || msg.cliId === 'codex') {
           pendingMessages.unshift(...recoveredAcceptedInputs);
         } else if (msg.prompt) {
           // A successful spawn with a non-queued prompt means the adapter baked
@@ -25443,6 +25885,7 @@ process.on('message', async (raw: unknown) => {
         if (initialInputCommitted && !initialInputQueued) {
           markActiveTurnStarted({
             turnId: msg.turnId,
+            atMostOnce: msg.atMostOnce,
             dispatchAttempt: msg.dispatchAttempt,
             trustedCaller: msg.trustedCaller,
             trustedController: msg.trustedController,
@@ -25493,6 +25936,30 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'turn_terminal_committed': {
+      acceptSerialTerminalCommit(msg);
+      break;
+    }
+    case 'reconcile_serial_dispatch': {
+      if (msg.sessionId !== sessionId || lastInitConfig?.cliId !== 'codex') break;
+      for (const receipt of msg.committed) acceptSerialTerminalCommit({
+        type: 'turn_terminal_committed', sessionId, ...receipt,
+      });
+      for (const entry of msg.pending) {
+        for (const pending of codexAppPendingDaemonAcks.values()) {
+          const prepare = pending.serialPrepare;
+          if (prepare?.dispatchId === entry.dispatchId && prepare.turnId === entry.turnId
+            && prepare.dispatchAttempt === entry.dispatchAttempt) prepare.publish();
+        }
+        const key = serialTurnKey(entry.turnId, entry.dispatchAttempt);
+        if (serialDispatchIds.get(key) === entry.dispatchId) publishSerialSettlement(key);
+      }
+      // Only a previously observed ready edge and an exact local unsent input
+      // can retry prepare. This message never creates a CLI input or readiness.
+      void flushPending();
+      break;
+    }
+
     case 'codex_app_dispatch_persisted': {
       const pending = codexAppPendingDaemonAcks.get(msg.requestId);
       if (!pending) break;
@@ -25506,6 +25973,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      retainSerialInput(msg);
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
       // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
@@ -25544,7 +26012,7 @@ process.on('message', async (raw: unknown) => {
       // Cross-principal turns are rejected at this worker boundary. The daemon
       // normally isolates them before worker IPC; this closes races/restarts so
       // another human can never steer the active turn directly.
-      if (!msg.queueAfterActiveTurn && activeTurnBlocks({
+      if (!isSerialCliInput(msg) && !activeTurnAuthority.snapshot()?.queueAfterActiveTurn && activeTurnBlocks({
         turnId: msg.turnId,
         dispatchAttempt: msg.dispatchAttempt,
         trustedCaller: msg.trustedCaller,
@@ -25576,7 +26044,7 @@ process.on('message', async (raw: unknown) => {
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.
-      if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
+      if (!lastInitConfig?.adoptMode && !isSerialCliInput(msg)) {
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       }
@@ -25640,6 +26108,8 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig?.adoptMode) {
         const item: PendingCliInput = {
           content,
+          ...(isSerialCliInput(msg) ? { queueAfterActiveTurn: true as const } : {}),
+          ...(msg.atMostOnce ? { noReplay: true } : {}),
           turnId: msg.turnId,
           replyTurnId: msg.replyTurnId,
           dispatchAttempt: msg.dispatchAttempt,
@@ -25654,7 +26124,7 @@ process.on('message', async (raw: unknown) => {
         // process.on('message') does not serialize async listeners. Hold the
         // per-worker queue across transcript mark + complete adapter write so
         // two CoCo/Codex paste→wait→Enter/history cycles cannot overlap.
-        if (cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight()) {
+        if (cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight() || activeTurnBlocks(item)) {
           pendingAdoptMessages.push(item);
           log(`Deferred adopt message until the CLI generation/input gate settles (${content.length} chars)`);
         } else {
@@ -25884,7 +26354,7 @@ process.on('message', async (raw: unknown) => {
       // turn-origin relay、丢弃 bridge 尝试）；它排的 flushPending 微任务会因下面
       // restartCliProcess 同步置位 cliRestartInProgress 而空跑。
       settleDurableTurnForRestart({
-        hasInFlightTurn: durableTurnInFlight,
+        hasInFlightTurn: durableTurnInFlight && !preparedSerialDispatch(codexAppRecoveredDispatches),
         hasCurrentTurnId: !!currentBotmuxTurnId,
         drain: () => {
           drainReliableTerminalBeforeInterrupt();

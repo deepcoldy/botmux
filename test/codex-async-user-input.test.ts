@@ -66,6 +66,8 @@ describe('Codex async user input', () => {
       questions: parseCodexAsyncQuestions(item), timeoutMs: 60_000, requestId: identity.itemId,
       originKind: 'native-user-input-async', asyncUserInput: identity };
     expect(parseAskBody(body)).toMatchObject({ asyncUserInput: identity });
+    expect(parseAskBody({ ...body, deliveryMode: 'continuation' })).toEqual({ error: 'bad_deliveryMode' });
+    expect(parseAskBody({ ...body, deliveryMode: 'continuation', asyncFailure: 'limit' })).toEqual({ error: 'bad_deliveryMode' });
     for (const patch of [{ requestId: 'other' }, { originKind: 'native-user-input' },
       { asyncUserInput: undefined }, { asyncUserInput: { ...identity, threadId: '' } },
       { asyncUserInput: { ...identity, answererOpenId: 'forged' } }]) {

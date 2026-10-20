@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
+  isSerialCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
   resetPreservingPendingCliInputs,
@@ -389,4 +390,19 @@ it('keeps collaborative messages separate even from the same sender', () => {
     expect(tail.content).toBe('first');
     expect(tail.turnId).toBe('a');
   }
+});
+
+it.each([
+  { noReplay: true }, { dispatchAttempt: 0 }, { queueAfterActiveTurn: true as const },
+  { queuedActivationToken: 'activation' },
+])('uses one independent-result boundary for queue policy: %j', flags => {
+  const caller = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app', senderType: 'user' as const };
+  const first = { content: 'first', turnId: 'first', trustedCaller: caller, ...flags };
+  const next = { content: 'next', turnId: 'next', trustedCaller: caller };
+  expect(isSerialCliInput(first)).toBe(true);
+  expect(mergeQueuedCliInput([first], next)).toBe(false);
+  expect(mergeQueuedCliInput([next], first)).toBe(false);
+  expect(pendingInputAllowsTypeAhead(true, false, first)).toBe(false);
+  expect(shouldStopPendingBatch(first, next)).toBe(true);
+  expect(shouldStopPendingBatch(next, first)).toBe(true);
 });

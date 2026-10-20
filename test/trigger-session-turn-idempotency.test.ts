@@ -97,6 +97,7 @@ import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { config } from '../src/config.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { buildFollowUpCliInput } from '../src/core/session-manager.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -789,5 +790,64 @@ describe('completed turn retry after session leaves active map', () => {
     expect((await triggerSessionTurn(fresh, { larkAppId: APP, activeSessions: active })).ok).toBe(false);
     expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
     expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('HTTP wait result draining after a positively observed native terminal', () => {
+  it.each(['empty', 'late-final', 'missing-final'] as const)('%s preserves the exact waiter and never re-dispatches', async mode => {
+    vi.useFakeTimers();
+    try {
+      const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+      const req = followUpReq(undefined); req.options = { waitForFinalOutput: true };
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+      await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+      const waiter = [...ds.pendingWaitPromises!.values()][0];
+      expect(waiter.completedTerminal).toBeTypeOf('function');
+      waiter.completedTerminal!(mode === 'empty');
+      if (mode === 'late-final') waiter.resolve('original final');
+      await vi.advanceTimersByTimeAsync(30_001);
+      const result = await pending;
+      expect(result.ok).toBe(mode !== 'missing-final');
+      if (mode === 'empty') expect(result.output?.content).toBe('');
+      if (mode === 'late-final') expect(result.output?.content).toBe('original final');
+      if (mode === 'missing-final') expect(result.errorCode).toBe('no_output');
+      expect(ds.pendingWaitPromises?.size).toBe(0);
+      expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+describe('frozen conversation result destination', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => ['group', 'p2p'].flatMap(chatType => [true, false].map(live => ({ cliId, chatType, live })))))(
+    'admits one $cliId $chatType answer with live=$live and retains the destination', async ({ cliId, chatType, live }) => {
+      mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+      const ds = existingDs({ chatId: 'oc_real', chatType: chatType as 'group' | 'p2p', worker: live ? { killed: false, send: vi.fn() } as any : null });
+      ds.session.chatId = 'oc_real';
+      const req = followUpReq('conversation'); req.options!.resultDelivery = 'conversation';
+      const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+      expect(first.ok).toBe(true);
+      expect(asyncTriggerStore.lookupStrict(SID, first.triggerId!)!.result.resultDelivery).toBe('conversation');
+      const dispatch = live ? mockSendWorkerInput : mockForkWorker;
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(dispatch.mock.calls[0])).not.toContain('botmux_http_response_mode');
+      expect(JSON.stringify(dispatch.mock.calls[0])).toContain('botmux_conversation_response_mode');
+      expect(buildFollowUpCliInput).toHaveBeenLastCalledWith(expect.any(String), SID, expect.objectContaining({ hostManagedResponse: true }));
+      asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'answer', Date.now(), APP);
+      const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+      expect(repeated.ok).toBe(true); expect(repeated.idempotent).toBe(true);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      req.options!.resultDelivery = 'caller';
+      expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) })).errorCode).toBe('idempotency_conflict');
+    });
+  it.each(['virtual', 'apiOnly', 'wrong-bot', 'mismatched-chat'])('rejects unbound conversation output: %s', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('unbound'); req.options!.resultDelivery = 'conversation';
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) })).ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });

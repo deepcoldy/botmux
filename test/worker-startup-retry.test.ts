@@ -15,6 +15,8 @@ import {
   MAX_STARTUP_AUTO_RETRIES,
   isTransientStartupFailure,
   startupAutoRetryDelayMs,
+  planSerialWorkerRecovery,
+  projectSerialWorkerRecovery,
 } from '../src/core/worker-startup-retry.js';
 
 describe('isTransientStartupFailure', () => {
@@ -86,5 +88,33 @@ describe('startupAutoRetryDelayMs', () => {
   it('exports a bounded retry budget', () => {
     expect(MAX_STARTUP_AUTO_RETRIES).toBeGreaterThan(0);
     expect(MAX_STARTUP_AUTO_RETRIES).toBeLessThanOrEqual(5);
+  });
+});
+
+describe('durable serial worker recovery', () => {
+  it('keeps the original budget and deadline across JSON persistence', () => {
+    const first = planSerialWorkerRecovery('original-session', undefined, true, 1000);
+    const restored = JSON.parse(JSON.stringify({ ...first, attempts: 2 }));
+    const retry = planSerialWorkerRecovery('original-session', restored, true, 2000);
+    expect(retry.attempts).toBe(2);
+    expect(retry.nextRetryAt).toBe(2000 + startupAutoRetryDelayMs('original-session', 3));
+    expect(retry.status).toBe('backoff');
+    expect(planSerialWorkerRecovery('original-session', { ...retry, attempts: 3 }, true, 3000))
+      .toMatchObject({ status: 'blocked', attempts: 3, reason: 'worker_recovery_exhausted' });
+  });
+  it('does not retry deterministic failures, but may re-probe unknown host liveness', () => {
+    expect(planSerialWorkerRecovery('s', undefined, false).status).toBe('blocked');
+    expect(isTransientStartupFailure('[read-isolation] refusing startup; liveness probe: unknown')).toBe(true);
+    expect(isTransientStartupFailure('[read-isolation] confirmed foreign owner')).toBe(false);
+  });
+  it('reports the actual FIFO blocker for its tail without leaking into unrelated turns', () => {
+    const head = { dispatchId: 'd1', turnId: 'first', executionPolicy: 'serial', state: 'accepted', content: 'x',
+      workerRecovery: planSerialWorkerRecovery('s', undefined, false, 1000) } as const;
+    const tail = { dispatchId: 'd2', turnId: 'second', executionPolicy: 'serial', state: 'accepted', content: 'y' } as const;
+    expect(projectSerialWorkerRecovery([head, tail], 'second')).toMatchObject({
+      status: 'blocked', blockedByTurnId: 'first', recoveryAction: 'repair_backend_and_wake_original_session',
+    });
+    expect(projectSerialWorkerRecovery([head, tail], 'unrelated')).toBeUndefined();
+    expect(projectSerialWorkerRecovery([tail], 'second')).toBeUndefined();
   });
 });

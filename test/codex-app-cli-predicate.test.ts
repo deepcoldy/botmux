@@ -64,7 +64,7 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
     expect(pool).not.toMatch(/isCodexAppCliId\(\s*ds\.session\.cliId\s*\?\?/);
     expect(pool).not.toMatch(/effectiveCliId = ds\.session\.cliId \?\? botCfg\.cliId;\s*\n\s*(?:return |if \()!?isCodexAppCliId/);
     expect(pool).toMatch(/const effectiveCliId = sessionCliId\(ds, botCfg\);\s*\n\s*return isCodexAppCliId\(effectiveCliId\)/);
-    expect(pool).toMatch(/const effectiveCliId = sessionCliId\(ds, botCfg\);\s*\n\s*if \(!isCodexAppCliId\(effectiveCliId\) \|\| !turnId\) return undefined;/);
+    expect(pool).toMatch(/const effectiveCliId = sessionCliId\(ds, botCfg\);\s+const serial = effectiveCliId === 'codex'[\s\S]*?if \(\(!isCodexAppCliId\(effectiveCliId\) && !serial\) \|\| !turnId\) return undefined;/);
     expect(pool).toContain('isCodexAppCliId(sessionCliId(ds, getBot(ds.larkAppId).config))');
 
     const daemon = read('src/daemon.ts');

@@ -136,6 +136,58 @@ describe('GET trigger-registration', () => {
       inputCommitted: { state: 'unknown' }, result: { state: 'unknown' },
     });
   });
+  it('reads the original async ACK after restart when the lease mirror is absent', async () => {
+    register();
+    results.recordPending(SID, TURN, 2000, OWNER, true);
+    await handle.close();
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    expect(results.recordInputCommit(SID, TURN, OWNER, 8, 3000)).toBe(true);
+    results.recordCompleted(SID, TURN, 'recovered answer', 4000, OWNER);
+    expect(leases.lookup(OWNER, leaseKey, 'turn')?.inputCommit).toBeUndefined();
+    expect((await poll()).body).toMatchObject({
+      registration: { state: 'attempting', ownerBootId: 'boot-original' },
+      inputCommitted: { state: 'observed', workerGeneration: 8, observedAt: 3000 },
+      result: { state: 'completed' },
+    });
+    expect(leases.lookup(OWNER, leaseKey, 'turn')?.inputCommit).toBeUndefined();
+  });
+  it.each([undefined, 'app_foreign'])('cannot use an async ACK from owner %s', async owner => {
+    register();
+    results.recordPending(SID, TURN, 2000, owner);
+    if (owner) expect(results.recordInputCommit(SID, TURN, owner, 8, 3000)).toBe(true);
+    expect((await poll()).body).toMatchObject({
+      inputCommitted: { state: 'unknown' }, result: { state: 'unknown' },
+    });
+  });
+  it('cannot promote a reserved registration using an async ACK', async () => {
+    register(OWNER, false);
+    results.recordPending(SID, TURN, 2000, OWNER, true);
+    expect(results.recordInputCommit(SID, TURN, OWNER, 8, 3000)).toBe(true);
+    expect((await poll()).body).toMatchObject({
+      registration: { state: 'reserved', revision: 1 }, inputCommitted: { state: 'unknown' },
+    });
+  });
+  it('rejects conflicting original ACK generations without rewriting either record', async () => {
+    register(); commit();
+    results.recordPending(SID, TURN, 2000, OWNER, true);
+    expect(results.recordInputCommit(SID, TURN, OWNER, 8, 3000)).toBe(true);
+    expect(await poll()).toEqual({ status: 503, body: { ok: false, errorCode: 'observation_unavailable' } });
+  });
+  it('does not borrow an ACK from a different trigger in the same session', async () => {
+    register();
+    results.recordPending(SID, 'trg-other', 2000, OWNER, true);
+    expect(results.recordInputCommit(SID, 'trg-other', OWNER, 8, 3000)).toBe(true);
+    expect((await poll()).body.inputCommitted).toEqual({ state: 'unknown' });
+  });
+  it('rejects corrupt async ACK evidence', async () => {
+    register();
+    results.recordPending(SID, TURN, 2000, OWNER, true);
+    const file = join(dataDir, 'async-triggers', SID + '.json');
+    const row = JSON.parse(readFileSync(file, 'utf8'));
+    row.results[TURN].inputCommit = { workerGeneration: '8', observedAt: 3000 };
+    writeFileSync(file, JSON.stringify(row));
+    expect(await poll()).toEqual({ status: 503, body: { ok: false, errorCode: 'observation_unavailable' } });
+  });
   it('does not mirror a parked steer or claim pending is executing', async () => {
     register();
     results.recordPending(SID, TURN, 2000, OWNER);

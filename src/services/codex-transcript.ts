@@ -1681,6 +1681,10 @@ export function drainCodexRollout(
     // boundary comes only from task_complete. Reasoning / tool calls surface
     // as cosmetic 'cot' events above, never as boundaries.
   }
+  // The worker has already selected this owned rollout. Keep its native
+  // session identity on every event, including incremental chunks without meta.
+  const sourceSessionId = codexSessionIdFromRolloutPath(path);
+  if (sourceSessionId) for (const event of events) event.sourceSessionId = sourceSessionId;
   return {
     events,
     newOffset,

@@ -7007,6 +7007,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               --plain  纯文本表格输出（管道/脚本场景）
   observe [--session <id>] [--lark-app <appId>] [--include-raw]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
+  ask-fact --bot <appId> --session <id> --request <id> --ask <id>  宿主回读原生持久问题原件
+  interaction-actor --bot <appId> --chat <chatId> --open <openId> | --union <unionId>
+              宿主只读解析目标 App 用户身份并检查当前群成员和发言权限
   interaction-context --bot <appId> --session <id> [--actor <openId>]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -7109,6 +7112,7 @@ ${SEND_HELP_BODY}
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
+  ask buttons --host-wait [--request-id <key>]  宿主持久等待；只返回登记回执，答案续接原会话
   ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
@@ -15214,8 +15218,7 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
  *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
  *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
-async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
-  type AskResult = import('./core/ask-types.js').AskResult;
+async function postAsk<T = import('./core/ask-types.js').AskResult>(body: Record<string, unknown>): Promise<T> {
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
     Object.assign(new Error(message), { exitCode: 3, retryable });
@@ -15274,7 +15277,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 
   try {
-    return (await res.json()) as AskResult;
+    return (await res.json()) as T;
   } catch (jsonErr) {
     // A malformed body is not something a retry fixes.
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
@@ -15328,7 +15331,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
-  const positionalArgs = positionals(rest, ['--json', '--multi']);
+  const hostWait = rest.includes('--host-wait') || process.env.BOTMUX_ASK_DELIVERY_MODE === 'continuation';
+  const positionalArgs = positionals(rest, ['--json', '--multi', '--host-wait']);
 
   let options;
   let questions;
@@ -15391,6 +15395,18 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
   };
+
+  if (hostWait) {
+    if (!liveAskOrigin?.turnId) throw new Error('botmux ask: host wait requires a verified active turn');
+    const { createHash } = await import('node:crypto');
+    const requestId = argValue(rest, '--request-id') ?? createHash('sha256')
+      .update(JSON.stringify([askSessionId, liveAskOrigin.turnId, questions ?? [{ prompt, options, multiSelect }]])).digest('hex');
+    const registered = await postAsk<import('./core/ask-types.js').AskWaitRegistration>({ ...body, requestId, deliveryMode: 'continuation' });
+    if (registered.ok !== true || registered.deliveryMode !== 'continuation' || registered.sessionId !== askSessionId || registered.requestId !== requestId)
+      throw new Error('botmux ask: host wait registration unproven');
+    process.stdout.write(JSON.stringify(registered) + '\n');
+    return;
+  }
 
   const protectAskWait = () => {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
@@ -18070,7 +18086,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context', 'interaction-actor',
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
@@ -18321,6 +18337,41 @@ switch (command) {
     }
     break;
   }
+  case 'interaction-actor': {
+    try {
+      if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
+      const { parseInteractionActorCommand } = await import('./cli/interaction-actor.js');
+      const command = parseInteractionActorCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { ...command.init, signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      console.log(JSON.stringify(await response.json()));
+      if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux interaction-actor: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
+  case 'ask-fact': {
+    try {
+      if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
+      const { parseAskFactCommand } = await import('./cli/ask-fact.js');
+      const command = parseAskFactCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.identity.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { method: 'GET', signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      const body = await response.json() as Record<string, unknown>;
+      if (response.ok && (body.ok !== true || body.schemaVersion !== 1
+        || Object.entries(command.identity).some(([key,value]) => body[key] !== value))) throw new Error('Ask observation identity mismatch');
+      console.log(JSON.stringify(body)); if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux ask-fact: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1;
+    }
+    break;
+  }
   case 'trigger-registration': {
     try {
       if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
@@ -18330,9 +18381,10 @@ switch (command) {
       if (!daemon) throw new Error('Bot daemon is unavailable');
       const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
         { method: 'GET', signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
-      const body = await response.json() as { ok?: boolean; schemaVersion?: number; larkAppId?: string; sessionId?: string };
+      const body = await response.json() as { ok?: boolean; schemaVersion?: number; larkAppId?: string; sessionId?: string; target?: { chatId?: string; rootMessageId?: string } };
       if (response.ok && (body.ok !== true || body.schemaVersion !== 1
-        || body.larkAppId !== command.larkAppId || body.sessionId !== command.sessionId)) throw new Error('Registration observation identity mismatch');
+        || body.larkAppId !== command.larkAppId || (command.sessionId ? body.sessionId !== command.sessionId
+          : body.target?.chatId !== command.chatId || body.target?.rootMessageId !== command.rootMessageId))) throw new Error('Registration observation identity mismatch');
       console.log(JSON.stringify(body));
       if (!response.ok) process.exitCode = 1;
     } catch (error) {

@@ -10,9 +10,10 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const backendType = process.env.BOTMUX_TEST_WORKER_BINARY ? 'tmux' : 'pty';
+for (const mode of ['collaborative', 'keyed'] as const) {
 for (const xpiEnabled of ['false', 'true']) {
 it.skipIf(backendType === 'tmux' && !probeTmuxFunctional().ok)(
-  `queues collaborative inputs until real Codex completion with XPI=${xpiEnabled}`,
+  `serializes ${mode} inputs through the Worker and Codex transcript adapter with XPI=${xpiEnabled}`,
   async () => {
   // Linux systemd scopes are host-wide, even with an isolated HOME/TMPDIR.
   const sessionId = randomUUID();
@@ -97,6 +98,7 @@ setInterval(() => {}, 1000);
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli, backendType,
       prompt: 'first-task', turnId: 'om_first', trustedCaller: owner,
+      ...(mode === 'keyed' ? { atMostOnce: true as const } : {}),
       larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(loadingFile));
@@ -104,12 +106,14 @@ setInterval(() => {}, 1000);
     // Observe CLI input directly: enqueue ACKs do not prove the task was submitted.
     await waitFor(() => existsSync(inputFile) && readFileSync(inputFile, 'utf8').includes('first-task'));
     // Opting into XPI still rejects unmarked cross-principal steering.
-    if (xpiEnabled === 'true') {
+    if (xpiEnabled === 'true' && mode === 'collaborative') {
       child.send({ type: 'message', content: 'must-not-run', turnId: 'om_reject', trustedCaller: other } satisfies DaemonToWorker);
       await waitFor(() => messages.some(m => m.type === 'turn_input_rejected' && m.turnId === 'om_reject'));
     }
     for (const [turnId, content] of [['om_second', 'second-task'], ['om_third', 'third-task']]) {
-      child.send({ type: 'message', turnId, content, trustedCaller: other, queueAfterActiveTurn: true } satisfies DaemonToWorker);
+      child.send({ type: 'message', turnId, content, trustedCaller: mode === 'keyed' ? owner : other,
+        ...(mode === 'keyed' ? { atMostOnce: true as const } : { queueAfterActiveTurn: true as const }),
+      } satisfies DaemonToWorker);
     }
     await waitFor(() => messages.some(m => m.type === 'turn_input_received' && m.turnId === 'om_third'));
     // Cross the prompt-idle threshold: an unfinished transcript still owns the CLI.
@@ -125,6 +129,10 @@ setInterval(() => {}, 1000);
     const submitted = readFileSync(inputFile, 'utf8');
     expect(submitted.match(/(?:first|second|third)-task/g)).toEqual(['first-task', 'second-task', 'third-task']);
     expect(submitted).not.toContain('must-not-run');
+    writeFileSync(finishFile, '3');
+    await waitFor(() => ['om_first', 'om_second', 'om_third'].every(turnId =>
+      messages.some(m => m.type === 'final_output' && m.turnId === turnId)));
+    expect(messages.filter(m => m.type === 'final_output').map(m => m.turnId)).toEqual(['om_first', 'om_second', 'om_third']);
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
       const exited = new Promise<void>(r => child!.once('exit', () => r()));
@@ -140,4 +148,5 @@ setInterval(() => {}, 1000);
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+}
 }

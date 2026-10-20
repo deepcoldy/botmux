@@ -30,6 +30,7 @@ export interface ProjectMilestone {
 
 export interface ProjectGroupState {
   schemaVersion: 1;
+  projection?: {providerId: string; sourceId: string; revision: number; hash: string; stateLabel: string; appliedHash?: string};
   revision: number;
   chatId: string;
   larkAppId: string;

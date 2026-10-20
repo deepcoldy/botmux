@@ -213,7 +213,8 @@ describe('turn-terminal nonblocking queue', () => {
       terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'failed' },
       onError: e => errors.push(e),
     });
-    expect(second).toBe(first); // dedup still returns the in-flight promise
+    expect(second).not.toBe(first); // conflicting status cannot borrow the success receipt
+    expect((await second).persisted).toBe(false);
     expect(String(errors[0])).toContain('turn_terminal_status_conflict_enqueue');
     (blocker as any).db.exec('COMMIT;');
     await first;
@@ -250,5 +251,49 @@ describe('turn-terminal nonblocking queue', () => {
     });
     expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
     expect(store.listTurnCompletionEvents().length).toBe(1); // turn-2 not persisted (correctly refused)
+  });
+});
+
+describe('terminal persistence receipt', () => {
+  it('does not report persistence on exhausted lock retries or closed admission', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    const blocker = await SkillFeedbackStore.open(dir);
+    (blocker as any).db.exec('BEGIN IMMEDIATE;');
+    try {
+      const receipt = await enqueueTurnTerminal({
+        dataDir: dir, botAppId: 'app', sessionId: 'sess',
+        terminal: { turnId: 'failed-commit', status: 'completed' }, maxAttempts: 1,
+      });
+      expect(receipt.persisted).toBe(false);
+      expect(store.listTurnCompletionEvents()).toHaveLength(0);
+    } finally {
+      (blocker as any).db.exec('ROLLBACK;');
+      blocker.close();
+    }
+    const committed = await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'failed-commit', status: 'completed' },
+    });
+    expect(committed).toEqual({ persisted: true });
+    await drainTurnTerminalQueue();
+    expect((await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'new-after-close', status: 'completed' },
+    })).persisted).toBe(false);
+  });
+
+  it('a conflicting duplicate cannot borrow the other status persistence receipt', async () => {
+    const dir = freshDir();
+    const first = enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'same', status: 'completed' },
+    });
+    const conflict = enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'same', status: 'failed' },
+    });
+    expect((await first).persisted).toBe(true);
+    expect((await conflict).persisted).toBe(false);
   });
 });

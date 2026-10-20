@@ -172,6 +172,20 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(envelope).not.toContain('至少 botmux send 回应一次');
   });
 
+  it('host-managed response omits send guidance from both PTY and hook sidecar without hiding sender context', () => {
+    const result = buildFollowUpCliInput('host response', SESSION_ID,
+      followUpOpts({ hostManagedResponse: true, whiteboardId: 'wb_1' }));
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+    expect(result.content).not.toContain('<botmux_reminder>');
+    expect(envelope).toBeDefined();
+    expect(envelope).not.toContain('<botmux_reminder>');
+    expect(envelope).toContain('<sender ');
+    expect(envelope).toContain('<whiteboard');
+    const next = buildFollowUpCliInput('ordinary next turn', SESSION_ID,
+      followUpOpts({ turnId: 'ordinary-after-host' }));
+    expect(claimByPrompt(SESSION_ID, 'ordinary-after-host', next.content)).toContain('<botmux_reminder>');
+  });
+
   it('off：完全 inline（reminder 在 PTY 文本里，无 sidecar）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },

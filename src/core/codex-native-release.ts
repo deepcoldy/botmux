@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readProcessStartIdentity } from '../utils/process-identity.js';
+import { readProcessStartIdentity, isLinuxZombie } from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 
@@ -30,6 +30,7 @@ export async function waitForCodexNativeRelease(processes: readonly { pid: numbe
   const deadline = Date.now() + timeoutMs;
   do {
     const gone = processes.every(({ pid, started }) => {
+      if (isLinuxZombie(pid)) return true;
       const now = readProcessStartIdentity(pid);
       return now ? now !== started : !pidNotProvablyGone(pid);
     });
@@ -37,4 +38,12 @@ export async function waitForCodexNativeRelease(processes: readonly { pid: numbe
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
   return false;
+}
+
+/** Signal only the captured process incarnation; never a reused PID. */
+export function signalCodexNativeProcesses(processes: readonly { pid: number; started: string }[], signal: NodeJS.Signals): void {
+  for (const { pid, started } of processes) {
+    if (readProcessStartIdentity(pid) !== started || isLinuxZombie(pid)) continue;
+    try { process.kill(pid, signal); } catch { /* waitForCodexNativeRelease retains unknown outcomes */ }
+  }
 }

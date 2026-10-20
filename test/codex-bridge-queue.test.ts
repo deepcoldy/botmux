@@ -1807,3 +1807,43 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
     expect(emitDecisions(q, [])).toEqual([{ turnId: 't2', suppressed: false }]);
   });
 });
+
+// Native started proof requires BOTH the original input and its native start.
+describe('exact native start evidence',()=>{
+  for(const order of ['user-first','start-first'])it(order+' requires corroboration',()=>{
+    const observed: string[]=[];
+    const q=new CodexBridgeQueue(()=>1000,undefined,turn=>observed.push(turn.turnId));
+    q.mark('first','first exact input',1000);
+    const user={...userEv('first exact input',undefined,1001),sourceSessionId:'session',sourceTurnId:'native1'};
+    const start={...startedEv('native1',undefined,1002),sourceSessionId:'session'};
+    q.ingest([order==='user-first'?user:start]);expect(observed).toEqual([]);
+    q.ingest([order==='user-first'?start:user]);expect(observed).toEqual(['first']);
+  });
+  it('foreign native id and unbound starts cannot attest the queued input',()=>{
+    const observed: string[]=[];const q=new CodexBridgeQueue(()=>1000,undefined,turn=>observed.push(turn.turnId));
+    q.mark('first','first exact input',1000);
+    q.ingest([{...startedEv('native1',undefined,1001),sourceSessionId:'session'}]);
+    q.ingest([{...userEv('first exact input',undefined,1002),sourceSessionId:'session',sourceTurnId:'foreign'}]);
+    expect(observed).toEqual([]);
+    q.ingest([{...userEv('first exact input',undefined,1003),sourceSessionId:'session',sourceTurnId:'native1'}]);
+    expect(observed).toEqual(['first']);
+  });
+});
+
+describe('serial turn merge violation', () => {
+  it.each([undefined, 1])('preserves a terminal for a serial request (attempt %s)', attempt => {
+    const q = new CodexBridgeQueue(() => 10_000);
+    q.mark('serial-first', 'first input', 10_000, attempt, undefined, true);
+    q.mark('next', 'next input', 10_000);
+    q.ingest([
+      userEv('first input', 'u1', 10_000),
+      userEv('next input', 'u2', 10_001),
+      asstEv('combined', 'a1', 10_002),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(turn => turn.turnId)).toEqual(['serial-first', 'next']);
+    expect(ready[0]).toMatchObject({ finalText: '', terminalStatus: 'ambiguous', terminalErrorCode: 'native_turn_merged' });
+    expect(ready[1].finalText).toBe('combined');
+    expect(q.size()).toBe(0);
+  });
+});

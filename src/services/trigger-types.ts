@@ -48,6 +48,9 @@ export interface TriggerRequest {
   };
   options?: {
     dryRun?: boolean;
+    /** Admission precondition for managed callers. Compared to the session's
+     * effective directory before any new dispatch; never changes its workspace. */
+    expectedWorkingDir?: string;
     dedupKey?: string;
     /** Caller-provided idempotency key (scoped per bot). A retried /api/trigger
      *  with the same key returns the SAME session + triggerId instead of
@@ -56,7 +59,7 @@ export interface TriggerRequest {
      *  grouping). Non-empty, ≤200 chars. FRESH async virtual only — mutually
      *  exclusive with `turnIdempotencyKey` (which is for follow-up turns). */
     idempotencyKey?: string;
-    /** Caller-provided idempotency key for a FOLLOW-UP turn on an existing
+    /** Caller-provided idempotency key for a turn on an existing
      *  session (requires `target.sessionId`). Same at-most-once dispatch lease as
      *  `idempotencyKey`, but scoped to (sessionId, turnIdempotencyKey): a retried
      *  /api/trigger appending to the same session with the same key resolves to
@@ -64,11 +67,18 @@ export interface TriggerRequest {
      *  on an existing-session append can't double-run. Mutually exclusive with
      *  `idempotencyKey`; requires `target.sessionId` (no wait/dryRun).
      *  Ordinary turns keep Lark delivery; async turns keep HTTP polling.
+     *  Async calls may instead target a stable real chat/thread route (chatId,
+     *  optional rootMessageId, presentation.topicMessage=null). The daemon
+     *  creates or reuses the route's session and retains the original binding.
      *  Non-empty, ≤200 chars. */
     turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Async admission and result polling do not choose the reply recipient.
+     * Conversation replies use the normal, original-session delivery pipeline.
+     * Explicit opt-in, only for an existing real conversation without steer. */
+    resultDelivery?: 'caller' | 'conversation';
     /** Permit explicit botmux send for messages authorized by this request in the
      * existing real group. The caller determines message content and timing.
      * Final output still returns to the caller. Defaults to false; turn-local.
@@ -153,6 +163,17 @@ export interface TriggerResponse {
   /** Four-state async lifecycle. Present on trigger-result (async polling)
    *  responses; absent on synchronous turn/workflow dispatch responses. */
   state?: AsyncTriggerState;
+  /** Host recovery is independent of model execution; no worker means the
+   * original pending input is waiting, not actively running the model. */
+  workerRecovery?: {
+    status: 'backoff' | 'blocked';
+    attempts: number;
+    maxAttempts: number;
+    nextRetryAt?: string;
+    reason: string;
+    blockedByTurnId: string;
+    recoveryAction: 'wait_for_original_worker' | 'repair_backend_and_wake_original_session';
+  };
   /** ISO8601 completion/termination time. Present on completed/failed states. */
   finishedAt?: string;
   target?: {
@@ -258,6 +279,11 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.steer === true && options.dryRun === true) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
   }
+  if (options.expectedWorkingDir !== undefined && (typeof options.expectedWorkingDir !== 'string'
+    || !options.expectedWorkingDir.startsWith('/') || options.expectedWorkingDir.length > 4096
+    || /[\u0000-\u001f]/.test(options.expectedWorkingDir))) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'expectedWorkingDir must be an absolute path' } };
+  }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
@@ -305,6 +331,14 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (waitForFinalOutput && asyncReturnSessionId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.resultDelivery !== undefined && !['caller', 'conversation'].includes(options.resultDelivery as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'invalid resultDelivery' } };
+  }
+  if (options.resultDelivery === 'conversation' && (target.kind !== 'turn' || !hasSessionId
+    || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless'
+    || options.steer === true || options.suppressFinalOutput === true)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'conversation result delivery requires an existing async conversation without steer or suppression' } };
   }
   if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };
@@ -375,7 +409,7 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     // dispatch receipt; async turns retain the HTTP result-store lease.
     if (
       target.kind !== 'turn'
-      || !hasSessionId
+      || (!hasSessionId && !(asyncReturnSessionId && routedTurnTarget(target, raw.presentation)))
       || waitForFinalOutput
       || options.dryRun === true
     ) {
@@ -383,10 +417,24 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
         ok: false, status: 400,
         body: {
           ok: false, errorCode: 'bad_request',
-          error: 'options.turnIdempotencyKey is only supported for a follow-up turn on an existing session (target.kind=turn, target.sessionId set, no waitForFinalOutput/dryRun)',
+          error: 'options.turnIdempotencyKey requires an existing session or a stable async real chat route (presentation.topicMessage=null), without waitForFinalOutput/dryRun',
         },
       };
     }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
+}
+
+/** Stable native route: never opens an unkeyed IM topic as a dispatch side effect. */
+export function routedTurnTarget(target: unknown, presentation: unknown):
+  { chatId: string; rootMessageId?: string } | undefined {
+  if (!isRecord(target) || target.sessionId || !isRecord(presentation)
+    || presentation.topicMessage !== null || typeof target.chatId !== 'string'
+    || !/^oc_[A-Za-z0-9_-]{1,196}$/.test(target.chatId)) return undefined;
+  if (target.rootMessageId !== undefined && (typeof target.rootMessageId !== 'string'
+    || !/^om_[A-Za-z0-9_-]{1,196}$/.test(target.rootMessageId))) return undefined;
+  return { chatId: target.chatId, ...(target.rootMessageId ? { rootMessageId: target.rootMessageId as string } : {}) };
+}
+export function routedTurnKey(target: { chatId: string; rootMessageId?: string }, key: string): string {
+  return JSON.stringify([target.chatId, target.rootMessageId ?? null, key.trim()]);
 }

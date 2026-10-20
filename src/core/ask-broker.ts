@@ -1,3 +1,4 @@
+import type { AskContinuation, AskWaitRegistration } from './ask-types.js';
 /**
  * In-memory broker for `botmux ask` (v0.1.8).
  *
@@ -234,9 +235,9 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   // recovers its matching durable Session record and re-registers through the
   // non-IPC registerHostAsk entry point. Both kinds require a stable requestId.
   const resumable = input.requestId !== undefined && (
-    hostManaged
+    input.continuation || (hostManaged
       ? (originKind.startsWith('host_cross_principal_') || originKind === 'host_explicit')
-      : RESUMABLE_ORIGINS.has(originKind) && input.backendSurvivesRestart === true
+      : RESUMABLE_ORIGINS.has(originKind) && input.backendSurvivesRestart === true)
   );
   // Invocation identity: prefer the caller-supplied requestId (hook generates it
   // once and reuses it across reconnect retries). A caller without one (explicit
@@ -289,9 +290,9 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   const askId = randomUUID();
   const nonce = randomUUID().slice(0, 8);
   const createdAt = Date.now();
-  const deadlineAt = createdAt + input.timeoutMs;
+  const deadlineAt = input.continuation ? Number.MAX_SAFE_INTEGER : createdAt + input.timeoutMs;
 
-  return new Promise<AskResult>((resolve) => {
+
     const selections = new Map<number, Set<string>>();
     for (let i = 0; i < input.questions.length; i++) selections.set(i, new Set(input.questions[i]!.defaultSelectedKeys ?? []));
 
@@ -300,7 +301,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       askKey,
       requestId,
       originKind,
-      resumable,
+      resumable: Boolean(resumable),
+      continuation: input.continuation ? { ...input.continuation } : undefined,
       nonce,
       larkAppId: input.larkAppId,
       chatId: input.chatId,
@@ -316,20 +318,21 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       settled: false,
       waiters: [],
       timeoutMs: input.timeoutMs,
-      timeoutStartsAfterDelivery: hostManaged,
+      timeoutStartsAfterDelivery: hostManaged && !input.continuation,
       selections,
     };
     if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
-    attachWaiter(ask, resolve, signal);
+    const result = new Promise<AskResult>(resolve => attachWaiter(ask, resolve, signal));
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
     // lands still leaves a resumable record; restore/re-attach re-sends.
     if (resumable) {
-      persistFromInternal(ask);
+      try { persistFromInternal(ask); }
+      catch (error) { pending.delete(askId); clearTimeout(ask.timeoutHandle); throw error; }
       logger.info?.(`ask-broker: registered + persisted ask ${askId} (key=${askKey}, session=${input.sessionId})`);
     }
     void sendCardForAsk(ask);
-  });
+    return result;
 }
 
 /** A disconnected IPC caller is no longer an answer consumer. Keep other
@@ -380,6 +383,8 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
+    ask.continuation?.originTurnId === input.continuation?.originTurnId &&
+    ask.continuation?.originDispatchAttempt === input.continuation?.originDispatchAttempt &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -420,8 +425,11 @@ const CARD_DISPATCH_BACKOFF_CAP_MS = 4_000;
  *  socket broke converges to one logical card. A non-retryable error
  *  (deterministic 4xx / withdrawn) — or a plain untyped throw (fail closed) —
  *  invalidates immediately. */
-function sendCardForAsk(ask: InternalPending): void {
-  void (async () => {
+const cardDispatchClaims = new Set<string>();
+function sendCardForAsk(ask: InternalPending): Promise<void> {
+  if (cardDispatchClaims.has(ask.askId)) return Promise.resolve();
+  cardDispatchClaims.add(ask.askId);
+  return (async () => {
     for (let attempt = 1; attempt <= CARD_DISPATCH_MAX_ATTEMPTS; attempt++) {
       // Bail if the ask settled out from under us (timeout / invalidate / a click
       // on a restored dormant card) — nothing left to dispatch.
@@ -438,6 +446,7 @@ function sendCardForAsk(ask: InternalPending): void {
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
+          if (cur.continuation && !cur.settled) cur.continuation = { ...cur.continuation, state: 'waiting', reason: undefined, nextObserveAt: undefined };
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -467,6 +476,11 @@ function sendCardForAsk(ask: InternalPending): void {
         logger.warn?.(
           `ask-broker: ${ask.askId} card dispatch failed (${retryable ? 'transient, retries exhausted' : 'not retryable'}): ${msg}`,
         );
+        if (ask.continuation) {
+          ask.continuation = { ...ask.continuation, state: 'blocked', reason: 'question_delivery_unavailable', nextObserveAt: Date.now() + 30_000 };
+          persistFromInternal(ask);
+          return;
+        }
         settle(ask.askId, {
           kind: 'invalidated', reason: `card dispatch failed: ${msg}`,
           failureCode: 'card_delivery_failed',
@@ -475,10 +489,11 @@ function sendCardForAsk(ask: InternalPending): void {
         return;
       }
     }
-  })();
+  })().catch(error => logger.warn(`ask card persistence: ${String(error)}`)).finally(() => cardDispatchClaims.delete(ask.askId));
 }
 
 function armAskTimeout(ask: InternalPending, timeoutMs: number, startedAt: number): void {
+  if (ask.continuation) return;
   clearTimeout(ask.timeoutHandle);
   ask.timeoutStartedAt = startedAt;
   ask.deadlineAt = startedAt + timeoutMs;
@@ -548,6 +563,7 @@ function persistFromInternal(ask: InternalPending): void {
   if (ask.settled && !ask.answeredResult) return;
   const persisted: PersistedAsk = {
     v: 2,
+    continuation: ask.continuation,
     askKey: ask.askKey,
     requestId: ask.requestId,
     originKind: ask.originKind,
@@ -836,7 +852,7 @@ export function invalidateReplyCardAsks(target: { larkAppId: string; sessionId: 
  *  (settled-but-retained entries from the race window are skipped). */
 export function invalidateAll(reason: string): number {
   const ids = [...pending.entries()]
-    .filter(([, ask]) => !ask.settled)
+    .filter(([, ask]) => !ask.settled && !ask.continuation)
     .map(([id]) => id);
   for (const id of ids) {
     settle(id, {
@@ -893,7 +909,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     const remaining = awaitsDelivery
       ? (p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt))
       : Math.max(0, p.deadlineAt - now);
-    const timeoutHandle = hasStashedAnswer || awaitsDelivery
+    const timeoutHandle = hasStashedAnswer || awaitsDelivery || p.continuation
       ? undefined
       : setTimeout(() => {
           settle(p.askId, {
@@ -907,6 +923,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       askKey: p.askKey,
       requestId: p.requestId,
       originKind: p.originKind,
+      continuation: p.continuation,
       resumable: true, // only resumable origins were ever persisted
       nonce: p.nonce,
       larkAppId: p.larkAppId,
@@ -944,7 +961,8 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // Re-arm the absolute handoff-expiry reaper for a restored stash (codex
     // P1-4): a SECOND restart before the hook claims must still reap memory +
     // disk at the ORIGINAL answeredAt + retention, not restart the clock.
-    if (hasStashedAnswer) armHandoffExpiry(ask);
+    if (hasStashedAnswer && !ask.continuation) armHandoffExpiry(ask);
+    if (ask.continuation && !hasStashedAnswer && !ask.cardMessageId) void sendCardForAsk(ask);
     restored++;
     logger.info?.(
       `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
@@ -968,6 +986,18 @@ function settle(askId: string, result: AskResult): void {
   const ask = pending.get(askId);
   if (!ask || ask.settled) return;
 
+  if (ask.continuation && result.kind === 'answered') {
+    // Persist BEFORE acknowledging the click or exposing any resolved result.
+    // A failed write leaves the question answerable for the same original card.
+    const next = { ...ask, settled: true, settledAt: Date.now(), terminalResult: result, answeredResult: result,
+      continuation: { ...ask.continuation, state: 'answer_received' as const } };
+    persistFromInternal(next);
+    Object.assign(ask, next);
+    clearTimeout(ask.timeoutHandle);
+    const waiters = ask.waiters.splice(0); for (const resolve of waiters) resolve(result);
+    notifyOnSettle(ask, result);
+    return;
+  }
   // The daemon-owned explicit claimant must receive a durably committed
   // terminal result BEFORE any live promise is resolved or record removed.
   // Its receipt writer will explicitly release this handoff after fsync.
@@ -1100,7 +1130,7 @@ function snapshot(ask: InternalPending): PendingAsk {
 function gcSettled(): void {
   const cutoff = Date.now() - SETTLED_RETENTION_MS;
   for (const [id, ask] of pending) {
-    if ((ask.dormant || ask.originKind === 'host_explicit') && ask.answeredResult) continue; // unclaimed handoff — keep
+    if (ask.continuation || (ask.dormant || ask.originKind === 'host_explicit') && ask.answeredResult) continue; // unclaimed handoff — keep
     if (ask.settled && ask.settledAt !== undefined && ask.settledAt < cutoff) {
       pending.delete(id);
     }
@@ -1219,6 +1249,8 @@ export function _allAskIds(): string[] {
 /** Reset broker state — for tests only. Does NOT resolve outstanding promises,
  *  so tests must not call this while real CLI processes might be waiting. */
 export function _resetForTest(): void {
+  cardDispatchClaims.clear();
+  continuationClaims.clear();
   for (const ask of pending.values()) {
     clearTimeout(ask.timeoutHandle);
     clearTimeout(ask.handoffExpiryHandle);
@@ -1231,4 +1263,78 @@ export function _resetForTest(): void {
   // reaping a shared dataDir could wipe a LIVE pending ask). Tests own their
   // temp dir's cleanup via their own teardown.
   persistStore = null;
+}
+
+/** Explicit admission only. Replays return the same registration, never consume
+ * a saved answer through stdout. One mode means there is no inline/host race. */
+export function registerContinuationAsk(input: CreateAskInput): AskWaitRegistration {
+  if (!persistStore || !input.requestId || !input.continuation?.originTurnId) throw new Error('ask_continuation_origin_required');
+  const bound = { ...input, originKind: 'host_wait' };
+  const key = askKeyFor(bound.larkAppId, bound.sessionId, 'host_wait', bound.requestId!);
+  let ask = findByKey(key);
+  if (ask && !sameIdentity(ask, bound)) throw new Error('ask_continuation_identity_changed');
+  if (!ask) {
+    void registerAskInternal(bound, true).catch(error => logger.warn(`ask host wait: ${String(error)}`));
+    ask = findByKey(key);
+  }
+  if (!ask?.continuation) throw new Error('ask_continuation_registration_failed');
+  return { ok: true, askId: ask.askId, sessionId: ask.sessionId, requestId: ask.requestId,
+    deliveryMode: 'continuation', state: ask.continuation.state === 'waiting' ? 'waiting_for_user' : ask.continuation.state };
+}
+export interface AskAnswerDelivery {
+  askId: string; askKey: string; larkAppId: string; sessionId: string; chatId: string; rootMessageId: string | null;
+  chatType?: 'group' | 'p2p';
+  questions: ReadonlyArray<import('./ask-types.js').AskQuestion>; result: Extract<AskResult, { kind: 'answered' }>; answeredAt: number;
+  continuation: AskContinuation;
+}
+const continuationClaims = new Set<string>();
+export async function reconcileAskContinuations(
+  larkAppId: string, deliver: (answer: AskAnswerDelivery) => Promise<Partial<AskContinuation> & { state: 'accepted' | 'committed' | 'blocked' }>,
+): Promise<void> {
+  for (const ask of pending.values()) {
+    if (ask.larkAppId === larkAppId && ask.continuation && !ask.settled && !ask.cardMessageId
+      && Date.now() >= (ask.continuation.nextObserveAt ?? 0)) await sendCardForAsk(ask);
+    if (ask.larkAppId !== larkAppId || !ask.continuation || ask.continuation.state === 'committed'
+      || ask.answeredResult?.kind !== 'answered' || continuationClaims.has(ask.askKey)) continue;
+    continuationClaims.add(ask.askKey);
+    try {
+      const outcome = await deliver({ askId: ask.askId, askKey: ask.askKey, larkAppId, sessionId: ask.sessionId,
+        chatId: ask.chatId, rootMessageId: ask.rootMessageId, chatType: ask.chatType, questions: ask.questions, result: ask.answeredResult,
+        answeredAt: ask.settledAt!, continuation: { ...ask.continuation } });
+      const next = { ...ask, continuation: { ...ask.continuation, ...outcome } };
+      persistFromInternal(next);
+      const changed = JSON.stringify(ask.continuation) !== JSON.stringify(next.continuation);
+      ask.continuation = next.continuation;
+      if (changed) notifyOnSettle(ask, ask.answeredResult!);
+    } catch (error) {
+      // Keep the original answer and key. The next sweep observes/retries the
+      // same queue registration; a transport error is not a fresh dispatch.
+      const next = { ...ask, continuation: { ...ask.continuation, state: 'blocked' as const,
+        reason: 'answer_delivery_unavailable' } };
+      try {
+        persistFromInternal(next);
+        const changed = JSON.stringify(ask.continuation) !== JSON.stringify(next.continuation);
+        ask.continuation = next.continuation;
+        if (changed) notifyOnSettle(ask, ask.answeredResult!);
+      } catch { /* retry original durable answer */ }
+      logger.warn(`ask continuation ${ask.askId}: ${String(error)}`);
+    } finally { continuationClaims.delete(ask.askKey); }
+  }
+}
+export function listAskContinuations(): Array<{ askId: string; sessionId: string; continuation: AskContinuation }> {
+  return [...pending.values()].filter(ask => ask.continuation).map(ask => ({ askId: ask.askId,
+    sessionId: ask.sessionId, continuation: { ...ask.continuation! } }));
+}
+
+/** Host-only source evidence for a durable native wait. Reading never claims an
+ * answer, mutates its continuation or substitutes another question in a session. */
+export function readContinuationAskFact(identity: { larkAppId: string; sessionId: string; requestId: string; askId: string }) {
+  const ask = pending.get(identity.askId);
+  if (!ask?.continuation || ask.originKind !== 'host_wait' || ask.larkAppId !== identity.larkAppId
+    || ask.sessionId !== identity.sessionId || ask.requestId !== identity.requestId) return null;
+  return structuredClone({ askId: ask.askId, requestId: ask.requestId, larkAppId: ask.larkAppId,
+    sessionId: ask.sessionId, chatId: ask.chatId, rootMessageId: ask.rootMessageId,
+    questions: ask.questions, answererOpenId: ask.answererOpenId,
+    cardMessageId: ask.cardMessageId, createdAt: ask.createdAt, answeredAt: ask.settledAt,
+    result: ask.answeredResult ?? ask.terminalResult, continuation: ask.continuation });
 }

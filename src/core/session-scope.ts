@@ -244,13 +244,38 @@ export function wrapCommandInSessionScope(
 
 export function stopSessionScope(
   sessionId: string,
-  options: { platform?: NodeJS.Platform; run?: RunSync } = {},
+  options: { platform?: NodeJS.Platform; run?: RunSync; signal?: 'SIGKILL' } = {},
 ): boolean {
   if ((options.platform ?? process.platform) !== 'linux') return false;
   const run = options.run ?? defaultRun;
+  if (options.signal) run('systemctl', [
+    '--user', 'kill', '--kill-whom=all', `--signal=${options.signal}`, sessionScopeUnitName(sessionId),
+  ]);
   return run('systemctl', ['--user', 'stop', sessionScopeUnitName(sessionId)]).status === 0;
 }
 
 export function __testOnly_resetSessionScopeCapabilityCache(): void {
   cachedCapabilities = undefined;
+}
+
+/** A successful stop request alone is not release proof. Require systemd to
+ * report the owned control group absent as well as an inactive/dead unit.
+ * Query errors stay unknown; a missing user bus is never an empty scope. */
+export function sessionScopeReleased(
+  sessionId: string,
+  options: { platform?: NodeJS.Platform; run?: RunSync } = {},
+): boolean {
+  if ((options.platform ?? process.platform) !== 'linux') return false;
+  const shown = (options.run ?? defaultRun)('systemctl', [
+    '--user', 'show', sessionScopeUnitName(sessionId),
+    '--property=LoadState,ActiveState,SubState,ControlGroup',
+  ]);
+  if (shown.status !== 0 || shown.error) return false;
+  const fields = Object.fromEntries(shown.stdout.trim().split('\n').map(line => {
+    const separator = line.indexOf('=');
+    return [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+  return ['loaded', 'not-found'].includes(fields.LoadState ?? '')
+    && fields.ActiveState === 'inactive' && fields.SubState === 'dead'
+    && fields.ControlGroup === '';
 }

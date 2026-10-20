@@ -53,6 +53,7 @@ function harness() {
       nativeSessionTitle: 'Old title', nativeSessionTitlePrompt: 'rename instructions',
     },
     remoteThreadId: undefined,
+    codexRpcEngine: undefined,
     codexAutoUpgrade: undefined,
     cliRestartInProgress: false,
     replacementSpawnInProgress: false,
@@ -698,19 +699,50 @@ describe('worker Codex session automatic upgrade', () => {
     expect(h.state.codexAutoUpgrade).toEqual({ stage: 'failed', threadId });
   });
 
-  it('restores RPC ownership and plugin generation before spawning the original thread viewer', async () => {
+  it.each([undefined, {
+    threadId, rolloutPath: '/runtime/original.jsonl', model: 'fixture-model',
+    modelProvider: 'fixture-provider', reasoningEffort: 'high', nativeScopeId: 'original-scope',
+  }])('restores RPC ownership and its startup runtime before spawning the original viewer: %j', async startupRuntime => {
     const h = harness();
+    h.state.codexRpcEngine = startupRuntime ? { activeThreadRuntime: startupRuntime } : undefined;
     h.state.codexRpcEligible.mockReturnValue(true);
     const done = h.run();
     await settleMicrotasks();
     expect(h.state.engageCodexRpc).toHaveBeenCalledWith(expect.objectContaining({
       cliSessionId: threadId, resume: true, prompt: '', forkSession: false,
-    }));
+    }), startupRuntime);
     expect(h.steps.indexOf('plugins')).toBeLessThan(h.steps.indexOf('rpc resume'));
     expect(h.steps.indexOf('rpc resume')).toBeLessThan(h.steps.indexOf('spawn'));
     expect(h.state.spawnCli).toHaveBeenCalledWith(expect.anything(), { pluginGenerationPrepared: true });
     h.ready();
     expect(await done).toBeUndefined();
+  });
+
+  it('carries each RPC incarnation into a folded restart, never the first pass scope', async () => {
+    const h = harness();
+    const original = { threadId, rolloutPath: '/runtime/original.jsonl', nativeScopeId: 'original-scope' };
+    const upgraded = { ...original, nativeScopeId: 'upgraded-scope' };
+    h.state.lastInitConfig.model = undefined;
+    h.state.codexRpcEngine = { activeThreadRuntime: original };
+    h.state.codexRpcEligible.mockReturnValue(true);
+    h.state.engageCodexRpc.mockImplementation(async () => {
+      h.state.remoteThreadId = threadId;
+      h.state.codexRpcEngine = { activeThreadRuntime: upgraded };
+      return 'resumed';
+    });
+    const done = h.run();
+    await untilSpawned(h, 1);
+    h.state.lastInitConfig.model = 'gpt-6-edited';
+    h.state.foldRestartIntoWindow('folded-rpc-config');
+    h.ready();
+    await untilSpawned(h, 2);
+    expect(h.state.engageCodexRpc.mock.calls.map((call: any[]) => call[1])).toEqual([original, upgraded]);
+    expect(h.state.flushPending).not.toHaveBeenCalled();
+    h.ready();
+    expect(await done).toBeUndefined();
+    expect(restartReceipts(h)).toEqual([
+      { type: 'restart_result', attemptId: 'folded-rpc-config', status: 'succeeded', category: 'prompt_ready' },
+    ]);
   });
 
   it.each([

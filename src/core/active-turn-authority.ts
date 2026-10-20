@@ -121,6 +121,7 @@ export class ActiveTurnAuthority {
     }
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(identity.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
@@ -147,9 +148,11 @@ export class ActiveTurnAuthority {
     nowMs = Date.now(),
   ): boolean {
     if (!identity.turnId) return false;
+    if (this.active?.queueAfterActiveTurn && !this.matches(identity)) return false;
     const active = this.active;
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(identity.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
@@ -178,6 +181,7 @@ export class ActiveTurnAuthority {
       const previous = this.active;
       this.active = Object.freeze({
         turnId: identity.turnId,
+        ...(identity.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
         ...(identity.dispatchAttempt !== undefined
           ? { dispatchAttempt: identity.dispatchAttempt }
           : {}),
@@ -202,7 +206,8 @@ export class ActiveTurnAuthority {
   blocks(identity: TurnAuthorityIdentity): boolean {
     return !!this.active
       && !this.matches(identity)
-      && (identity.queueAfterActiveTurn === true || !mayControlActiveTurn(this.active, identity));
+      && (this.active.queueAfterActiveTurn === true || identity.queueAfterActiveTurn === true
+        || !mayControlActiveTurn(this.active, identity));
   }
 
   /**

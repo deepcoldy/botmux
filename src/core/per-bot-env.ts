@@ -37,7 +37,8 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * botmux-managed flag. Mirrors the worker's injected/redacted keys
  * (BOTMUX_INJECTED_ENV_KEYS + REDACTED_CHILD_ENV_KEYS); kept as a local literal
  * so this stays a dependency-free leaf module. `LARK_APP_` covers both bare
- * creds; `BOTMUX` prefix covers all session-routing keys.
+ * creds; `BOTMUX` prefix covers all session-routing keys. The bounded Ask
+ * delivery preference is the only configurable BOTMUX behavior exception.
  */
 const RESERVED_ENV_PREFIXES = ['BOTMUX', 'LARK_APP_'] as const;
 const RESERVED_ENV_KEYS = new Set<string>([
@@ -97,6 +98,8 @@ const RESERVED_ENV_KEYS = new Set<string>([
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */
 export function isReservedPerBotEnvKey(key: string): boolean {
+  // This bounded behavior preference cannot change session identity or routing.
+  if (key === 'BOTMUX_ASK_DELIVERY_MODE') return false;
   if (RESERVED_ENV_KEYS.has(key)) return true;
   return RESERVED_ENV_PREFIXES.some((p) => key.startsWith(p));
 }
@@ -117,6 +120,7 @@ export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
   for (const [key, value] of Object.entries(obj)) {
     if (!ENV_KEY_RE.test(key)) continue;
     if (isReservedPerBotEnvKey(key)) continue;
+    if (key === 'BOTMUX_ASK_DELIVERY_MODE' && value !== 'continuation' && value !== 'blocking') continue;
     if (typeof value === 'string') out[key] = value;
     else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
   }

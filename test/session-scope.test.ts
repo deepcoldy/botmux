@@ -8,6 +8,7 @@ import {
   sessionScopePayloadPid,
   sessionScopeUnitName,
   stopSessionScope,
+  sessionScopeReleased,
   userSystemdBusEnv,
   wrapCommandInSessionScope,
 } from '../src/core/session-scope.js';
@@ -224,6 +225,29 @@ describe('owned session systemd scope', () => {
     ]);
     run.mockClear();
     stopSessionScope('ABC/123', { platform: 'darwin', run });
+    expect(run).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('native execution scope release evidence', () => {
+  it.each(['loaded', 'not-found'])('accepts an absent group only with inactive/dead %s unit evidence', load => {
+    expect(sessionScopeReleased('owned', { platform: 'linux',
+      run: () => result(0, `LoadState=${load}\nActiveState=inactive\nSubState=dead\nControlGroup=\n`),
+    })).toBe(true);
+  });
+  it.each([
+    result(1, '', 'bus unavailable'),
+    result(0, ''),
+    result(0, 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'),
+    result(0, 'LoadState=loaded\nActiveState=active\nSubState=running\nControlGroup=\n'),
+    result(0, 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nControlGroup=/still-owned\n'),
+  ])('holds release on incomplete, failed or still-live inspection', shown => {
+    expect(sessionScopeReleased('owned', { platform: 'linux', run: () => shown })).toBe(false);
+  });
+  it('does not infer Linux scope release on another platform', () => {
+    const run = vi.fn();
+    expect(sessionScopeReleased('owned', { platform: 'darwin', run })).toBe(false);
     expect(run).not.toHaveBeenCalled();
   });
 });

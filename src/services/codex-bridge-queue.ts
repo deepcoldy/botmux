@@ -66,6 +66,8 @@ export const STRUCTURED_TASK_START_CORROBORATION_GRACE_MS = 10 * 60_000;
 export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
 
 export interface CodexPendingTurn {
+  /** Serial admission requires its own terminal; ordinary native steering does not. */
+  queueAfterActiveTurn?: true;
   turnId: string;
   dispatchAttempt?: number;
   started: boolean;
@@ -83,6 +85,8 @@ export interface CodexPendingTurn {
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
   transcriptStartTimeMs?: number;
+  /** Native task_started, separately corroborated by this input fingerprint. */
+  nativeStartTimeMs?: number;
   /** Local observation time for a task_started-only provisional claim. Cleared
    *  once the fingerprinted user record corroborates the claim. */
   provisionalTaskStartedAtMs?: number;
@@ -157,7 +161,14 @@ export class CodexBridgeQueue {
   constructor(
     private readonly now: () => number = Date.now,
     private readonly onLocalTurnStarted?: (turn: CodexPendingTurn) => void,
+    private readonly onNativeTurnStarted?: (turn: CodexPendingTurn) => void,
   ) {}
+
+  private publishNativeStart(turn: CodexPendingTurn): void {
+    if (turn.isLocal || !turn.contentFingerprint || turn.transcriptStartTimeMs === undefined
+      || turn.nativeStartTimeMs === undefined || !turn.sourceSessionId || !turn.sourceTurnId) return;
+    this.onNativeTurnStarted?.({ ...turn });
+  }
 
   private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
     return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
@@ -201,6 +212,7 @@ export class CodexBridgeQueue {
     if (!this.isProvisionalTaskStart(turn)) return;
     turn.started = false;
     turn.provisionalTaskStartedAtMs = undefined;
+    turn.nativeStartTimeMs = undefined;
     turn.taskStartedRollbackAtMs = observedAtMs;
     turn.sourceSessionId = undefined;
     turn.sourceTurnId = undefined;
@@ -269,10 +281,12 @@ export class CodexBridgeQueue {
     markTimeMs: number = this.now(),
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+    queueAfterActiveTurn?: true,
   ): void {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(queueAfterActiveTurn ? { queueAfterActiveTurn } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
@@ -288,21 +302,30 @@ export class CodexBridgeQueue {
    * and their confirmation state when a message is already in this queue. */
   restorePendingTurns(entries: readonly {
     turnId: string;
+    dispatchAttempt?: number;
+    queueAfterActiveTurn?: true;
     fingerprint: string;
     markTimeMs: number;
     jsonlPath?: string;
     offsetAtMark?: number;
+    nativeStart?: { nativeSessionId: string; nativeTurnId: string; startedAtMs: number };
   }[]): void {
-    const existing = new Set(this.queue.map(turn => turn.turnId));
+    const identity = (turn: { turnId: string; dispatchAttempt?: number }) => JSON.stringify([turn.turnId, turn.dispatchAttempt ?? null]);
+    const existing = new Set(this.queue.map(identity));
     const restored: CodexPendingTurn[] = [];
     for (const entry of entries) {
-      if (existing.has(entry.turnId)) continue;
-      existing.add(entry.turnId);
-      restored.push({ turnId: entry.turnId, started: false,
+      const key = identity(entry);
+      if (existing.has(key)) continue;
+      existing.add(key);
+      restored.push({ turnId: entry.turnId, dispatchAttempt: entry.dispatchAttempt,
+        queueAfterActiveTurn: entry.queueAfterActiveTurn, started: !!entry.nativeStart,
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
-        recoveryJsonlPathAtMark: entry.jsonlPath,
-        recoveryOffsetAtMark: entry.offsetAtMark,
-        unconfirmedAttributionStartedAtMs: entry.markTimeMs });
+        recoveryJsonlPathAtMark: entry.jsonlPath, recoveryOffsetAtMark: entry.offsetAtMark,
+        ...(entry.nativeStart ? {
+          sourceSessionId: entry.nativeStart.nativeSessionId, sourceTurnId: entry.nativeStart.nativeTurnId,
+          nativeStartTimeMs: entry.nativeStart.startedAtMs, transcriptStartTimeMs: entry.nativeStart.startedAtMs,
+        } : { unconfirmedAttributionStartedAtMs: entry.markTimeMs }),
+      });
     }
     this.queue.unshift(...restored);
   }
@@ -627,7 +650,10 @@ export class CodexBridgeQueue {
       if (active && active.finalText === undefined
         && this.sourceSessionsCompatible(active.sourceSessionId, ev.sourceSessionId)) {
         if (active.sourceTurnId) {
-          if (!ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId) return;
+          if (!ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId) {
+            if (ev.sourceTurnId && ev.sourceSessionId === active.sourceSessionId) { active.nativeStartTimeMs = ev.timestampMs; this.publishNativeStart(active); }
+            return;
+          }
           // Codex can abandon one native task_started id and immediately
           // retry the same logical turn under another id, without ever
           // emitting a terminal for the first. A still-provisional claim has
@@ -644,6 +670,7 @@ export class CodexBridgeQueue {
             && ev.timestampMs < active.transcriptStartTimeMs) return;
           if (ev.sourceTurnId) active.sourceTurnId = ev.sourceTurnId;
           if (!active.sourceSessionId && ev.sourceSessionId) active.sourceSessionId = ev.sourceSessionId;
+          if(ev.sourceSessionId && ev.sourceTurnId) { active.nativeStartTimeMs = ev.timestampMs; this.publishNativeStart(active); }
           return;
         }
       }
@@ -656,6 +683,7 @@ export class CodexBridgeQueue {
       next.submitVerificationStartedAtMs = undefined;
       next.unconfirmedAttributionStartedAtMs = undefined;
       next.provisionalTaskStartedAtMs = this.now();
+      next.nativeStartTimeMs = ev.timestampMs;
       next.taskStartedRollbackAtMs = undefined;
       next.sourceSessionId = ev.sourceSessionId;
       next.sourceTurnId = ev.sourceTurnId;
@@ -693,7 +721,8 @@ export class CodexBridgeQueue {
           && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
         const collectingFingerprintOk = !provisional.contentFingerprint
           || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
-        if (!collectingTooOld && collectingFingerprintOk) {
+        if (!collectingTooOld && collectingFingerprintOk
+          && (!ev.sourceTurnId || !provisional.sourceTurnId || ev.sourceTurnId===provisional.sourceTurnId)) {
           provisional.transcriptStartTimeMs = ev.timestampMs;
           provisional.provisionalTaskStartedAtMs = undefined;
           provisional.taskStartedRollbackAtMs = undefined;
@@ -703,6 +732,7 @@ export class CodexBridgeQueue {
           if (!provisional.sourceTurnId && ev.sourceTurnId) {
             provisional.sourceTurnId = ev.sourceTurnId;
           }
+          this.publishNativeStart(provisional);
           return;
         }
         // In non-adopt mode an unmatched user record may only be transcript
@@ -732,20 +762,11 @@ export class CodexBridgeQueue {
       const willStartNext = !!next && !tooOld && fingerprintOk;
       const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
 
-      // HOL-block drop (codex 0.134.0 active-turn steer): when a real new
-      // turn-start arrives while a turn is still collecting with no finalText,
-      // codex steered/merged this input into the active turn — it processes
-      // both as ONE turn and emits a single combined assistant_final, so the
-      // collecting turn will NEVER get its own final. Drop it now, otherwise
-      // it sits at the queue head forever and `drainEmittable()` wedges
-      // (started, no finalText → breaks the FIFO scan). Gating on "is a real
-      // turn-start" reuses the tooOld/fingerprint freshness already proven for
-      // turn-start, so the same 5s-skew invariant applies to both: a replayed
-      // historical user event is tooOld → won't start a turn → won't evict a
-      // live collecting turn; and a non-matching stray user event (non-adopt)
-      // is ignored rather than treated as a turn boundary. Mirrors Claude's
-      // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
-      // text yet" — the streaming-transcript equivalent of "no finalText").
+      // A transcript may merge ordinary type-ahead into one native turn.
+      // A serial admission must preserve its own ambiguous terminal rather
+      // than lose an admitted request. The combined final belongs only to the
+      // successor. Explicit shared-App steering uses preserveCollecting and
+      // retains its existing durable continuation chain.
       const isDistinctNativeTurn = !!ev.sourceTurnId
         && !!this.collecting?.sourceTurnId
         && ev.sourceTurnId !== this.collecting.sourceTurnId;
@@ -756,12 +777,19 @@ export class CodexBridgeQueue {
         && !isDistinctNativeTurn
         && ev.preserveCollecting !== true) {
         const superseded = this.collecting;
-        const idx = this.queue.indexOf(superseded);
-        if (idx >= 0) this.queue.splice(idx, 1);
-        this.collecting = null;
-        if (idx >= 0) {
-          try { this.cotSupersededObserver?.(superseded); } catch { /* cosmetic only */ }
+        if (superseded.queueAfterActiveTurn || superseded.dispatchAttempt !== undefined) {
+          superseded.finalText = '';
+          superseded.terminalStatus = 'ambiguous';
+          superseded.terminalErrorCode = 'native_turn_merged';
+        } else {
+          // Ordinary steering intentionally has one combined answer. Retain its
+          // existing superseded-card observer without inventing a failed turn.
+          const index = this.queue.indexOf(superseded);
+          if (index >= 0) this.queue.splice(index, 1);
         }
+        // Do not close sourceTurnId: the successor still uses that native id.
+        this.collecting = null;
+        try { this.cotSupersededObserver?.(superseded); } catch { /* cosmetic only */ }
       }
 
       if (willStartNext) {

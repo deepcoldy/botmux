@@ -9,3 +9,5 @@ HTTP 为 `POST /api/sessions/:id/interaction-context`，请求 `{larkAppId, acto
 外部 provider 必须在创建、发送和处理回调时重新查询，核对原 bot/session/chat/root/owner、所选 actor 及其当前 canTalk。无 owner 群应保留 owner 的 null 值并单独绑定 actor，不能把答题人写回会话 ownership。该响应不是可缓存的授权令牌，不保证随后发送的原子性；IM 操作仍需严格目标校验。卡片 actor 必须取官方插件网关提供的真实 operator，禁止从卡片 value 或请求正文自报身份。
 
 普通 chat/topic 必须有确定 scope、chatType 和原锚点；除上述无 owner 普通群外，仍要求合法 owner，无 owner 的 thread 或 p2p 不适用。已关闭/未装载的会话返回 404；文档、HTTP 和 headless 来源返回 409，即使它们带有完整 owner；v3 工作流使用独立运行注册表。503 仅表示宿主观察服务异常。此接口不发消息、不恢复会话、不改权限，也不承诺业务执行完成。
+
+`botmux interaction-actor --bot APP --chat CHAT --open OPEN_ID` resolves a human observed through that App. Use `--union UNION_ID` to resolve the same human in another App. This host-only observation uses the existing native identity and talk evaluators, checks current group membership, and returns only the principal, App-local open ID and permission facts. A scoped open ID is never copied to another App; missing cross-App evidence remains unresolved. The command does not grant permissions, create sessions, or change their owners.

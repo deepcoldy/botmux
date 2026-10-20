@@ -117,7 +117,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts } from '../src/core/worker-pool.js';
+import { initWorkerPool, __testOnly_setupWorkerHandlers, restartCounts, reconcileSerialWorkerReceipts, forkWorker } from '../src/core/worker-pool.js';
 import { MAX_STARTUP_AUTO_RETRIES } from '../src/core/worker-startup-retry.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -243,6 +243,76 @@ describe("worker-pool 'error' transient self-heal wiring", () => {
     vi.useRealTimers();
   });
 
+  const serialDs = () => {
+    const ds = makeDs('sid-serial-start', makeFakeWorker());
+    ds.session.cliId = 'codex';
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'original-dispatch', turnId: 'original-turn', content: 'original input',
+      executionPolicy: 'serial', state: 'accepted', deliverySink: 'http_async',
+    }];
+    return ds;
+  };
+  it('keeps a task-carrying transient failure in its original durable recovery path', async () => {
+    const ds = serialDs();
+    await failOnce(ds, '[read-isolation] startup liveness probe: unknown', { turnId: 'original-turn' });
+    expect(ds.session.codexAppDispatchLedger?.[0]).toMatchObject({
+      dispatchId: 'original-dispatch', turnId: 'original-turn', state: 'accepted',
+      workerRecovery: { status: 'backoff', attempts: 0 },
+    });
+    expect(ds.startupAutoRetry).toBeUndefined();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    const saved = JSON.parse(JSON.stringify(ds.session));
+    ds.session = saved; ds.worker = null;
+    const writes = updateSessionMock.mock.calls.length;
+    reconcileSerialWorkerReceipts(ds);
+    expect(updateSessionMock).toHaveBeenCalledTimes(writes);
+    expect(ds.worker).toBeNull();
+  });
+  it('does not bypass the persisted budget through automatic boot or terminal view', () => {
+    const ds = serialDs();
+    ds.worker = null;
+    ds.session.codexAppDispatchLedger![0].workerRecovery = {
+      status: 'blocked', attempts: 3, nextRetryAt: 1, reason: 'worker_recovery_exhausted',
+    };
+    const admission = vi.fn();
+    expect(forkWorker(ds, '', true, { onAdmission: admission })).toBe(true);
+    expect(admission).toHaveBeenCalledWith('deferred');
+    expect(ds.worker).toBeNull();
+    expect(ds.session.codexAppDispatchLedger![0].workerRecovery.attempts).toBe(3);
+  });
+  it('retains a visible blocked recovery when the same input exhausts its host budget', async () => {
+    const ds = serialDs();
+    ds.session.codexAppDispatchLedger![0].workerRecovery = {
+      status: 'backoff', attempts: MAX_STARTUP_AUTO_RETRIES, nextRetryAt: 1, reason: 'worker_start_transient',
+    };
+    await failOnce(ds, INCIDENT_REASON, { turnId: 'original-turn' });
+    expect(ds.session.codexAppDispatchLedger?.[0].workerRecovery).toMatchObject({
+      status: 'blocked', attempts: MAX_STARTUP_AUTO_RETRIES, reason: 'worker_recovery_exhausted',
+    });
+    ds.worker = null;
+    reconcileSerialWorkerReceipts(ds);
+    expect(ds.worker).toBeNull();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+  });
+  it('does not consume a recovery budget when its original journal write fails', async () => {
+    const ds = serialDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('SQLITE_BUSY'); });
+    worker.emit('message', { type: 'error', message: INCIDENT_REASON, turnId: 'original-turn' });
+    await flush();
+    expect(ds.session.codexAppDispatchLedger?.[0].workerRecovery).toBeUndefined();
+    expect(ds.startupAutoRetry).toBeUndefined();
+  });
+  it('never restarts closed sessions or moves recovery ownership to a tail failure', async () => {
+    const ds = serialDs();
+    await failOnce(ds, INCIDENT_REASON, { turnId: 'another-turn' });
+    expect(ds.session.codexAppDispatchLedger?.[0].workerRecovery).toBeUndefined();
+    ds.worker = null; ds.session.status = 'closed';
+    reconcileSerialWorkerReceipts(ds);
+    expect(ds.session.codexAppDispatchLedger?.[0].workerRecovery).toBeUndefined();
+    expect(ds.worker).toBeNull();
+  });
   it('schedules a silent bounded retry for a turn-less transient failure (08-23 incident shape)', async () => {
     const ds = makeDs('sid-transient', makeFakeWorker());
     await failOnce(ds, INCIDENT_REASON);

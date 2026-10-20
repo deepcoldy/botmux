@@ -9,6 +9,7 @@ import {
   readComm,
 } from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
+import { preparedSerialDispatch } from './utils/codex-app-dispatch-ledger.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
 
@@ -274,6 +275,15 @@ export async function orchestrateCodexRpcInit(
   runtime: CodexRpcRuntimeGates = {},
 ): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
+  // The daemon's original prepared receipt owns transport selection. A wrapper
+  // may exec a differently named viewer, and the viewer may already be gone;
+  // neither changes which app-server accepted the original serial input.
+  const originalRpc = preparedSerialDispatch(cfg.codexAppRecoveredDispatches)?.serialRecovery?.rpcThreadRuntime;
+  if (originalRpc && (cfg.resume !== true || cfg.cliSessionId !== originalRpc.threadId
+    || !codexRpcEligible(cfg, runtime))) {
+    fx.notify('原任务的执行通道或会话身份无法核验，已保留原执行，未切换通道或重发输入。');
+    return { engaged: false, queuePrompt: false, abortSpawn: true };
+  }
   if (!codexRpcEligible(cfg, runtime)) return NONE;
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
@@ -295,15 +305,17 @@ export async function orchestrateCodexRpcInit(
         // Resume engaged (no pre-send) → queue the waking prompt for post-ready flush.
         return { engaged: true, queuePrompt: true, abortSpawn: false };
       case 'not-engaged':
+        if (originalRpc) return { engaged: false, queuePrompt: false, abortSpawn: true };
         return NONE; // setup failed or frame never dispatched → safe paste fallback
     }
   }
-  if (fx.paneIsRemote(pane.name)) {
+  if (originalRpc || fx.paneIsRemote(pane.name)) {
     // Surviving RPC `--remote` pane on the now-dead prior app-server (always a
     // resume). Re-engage, then replace the stale pane.
     await fx.prepare();
     const outcome = await fx.engage();
     if (outcome === 'not-engaged') {
+      if (originalRpc) return { engaged: false, queuePrompt: false, abortSpawn: true };
       // The pane is still a viewer for the prior incarnation's dead app-server;
       // merely returning to the paste path would reattach that pane and silently
       // drop input. Remove it first so spawnCli can create a native paste pane.

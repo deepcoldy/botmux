@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { observeInteractionContext, type InteractionSession } from '../src/core/interaction-context.js';
+import { observeInteractionContext, configuredGroupContext, type InteractionSession } from '../src/core/interaction-context.js';
 import { parseInteractionContextCommand } from '../src/cli/interaction-context.js';
 const session: InteractionSession = { sessionId: 's1', larkAppId: 'app1', status: 'active', chatId: 'oc_chat',
   scope: 'thread', rootMessageId: 'om_root', ownerOpenId: 'ou_owner', chatType: 'group' };
@@ -84,4 +84,16 @@ it('requires an explicit native-authorized actor for an ownerless group without 
   allowed = false;
   expect(observeInteractionContext(request, deps).body.context).toMatchObject({ canTalk: false });
   expect(observeInteractionContext(request, { ...deps, findActive: () => ({ ...group, chatType: 'p2p' }) }).status).toBe(409);
+});
+
+
+it('uses only configured real group scopes without inventing a Worker owner', () => {
+ const group=configuredGroupContext('app1','chat:oc_configured',id=>id==='oc_configured');
+ expect(group).toMatchObject({chatId:'oc_configured',scope:'chat',ownerOpenId:'',active:true});
+ expect(configuredGroupContext('app1','chat:oc_other',()=>false)).toBeUndefined();
+ expect(configuredGroupContext('app1','chat:http_virtual',()=>true)).toBeUndefined();
+ expect(configuredGroupContext('app1','om_topic',()=>true)).toBeUndefined();
+ const query={trustedHost:true,daemonAppId:'app1',sessionId:'chat:oc_configured',body:{larkAppId:'app1',actorOpenId:'ou_member'}};
+ expect(observeInteractionContext(query,{findActive:()=>group,canTalk:()=>true}).body.context).toMatchObject({ownerOpenId:null,actorOpenId:'ou_member',canTalk:true});
+ expect(observeInteractionContext(query,{findActive:()=>group,canTalk:()=>false}).body.context).toMatchObject({canTalk:false});
 });

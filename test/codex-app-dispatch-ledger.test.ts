@@ -199,3 +199,35 @@ describe('Codex App durable dispatch ledger', () => {
       .toEqual({ ok: true, ledger: [duplicateDispatchId[1]] });
   });
 });
+
+describe('serial dispatch ledger', () => {
+  it('a prepared predecessor remains a FIFO barrier', async () => {
+    const { prepareCodexAppDispatch } = await import('../src/utils/codex-app-dispatch-ledger.js');
+    const a = { dispatchId: 'a', turnId: 'a', content: 'A', executionPolicy: 'serial' as const, state: 'prepared' as const };
+    const b = { dispatchId: 'b', turnId: 'b', content: 'B', executionPolicy: 'serial' as const, state: 'accepted' as const };
+    expect(prepareCodexAppDispatch([a, b], b)).toEqual({ ok: false, error: 'serial_predecessor_unsettled' });
+    expect(prepareCodexAppDispatch([b], b)).toMatchObject({ ok: true, ledger: [{ state: 'prepared' }] });
+  });
+  it('round-trips terminal and raw output with original identity and requires both consumer receipts', async () => {
+    const { observeSerialDispatch, commitSerialDispatchConsumer, serialDispatchReadyToRetire } =
+      await import('../src/utils/codex-app-dispatch-ledger.js');
+    const a = { dispatchId: 'a', turnId: 'a', content: 'A', executionPolicy: 'serial' as const, state: 'prepared' as const,
+      origin: { caller: { requestLarkAppId: 'app', requestUserOpenId: 'alice', senderType: 'user' as const } } };
+    let ledger = observeSerialDispatch([a], {
+      type: 'turn_terminal', sessionId: 'session', turnId: 'a', status: 'completed', completedAtMs: 123,
+    });
+    ledger = observeSerialDispatch(ledger, {
+      type: 'final_output', sessionId: 'session', turnId: 'a', content: '原始结果', lastUuid: 'native-a',
+    });
+    ledger = commitSerialDispatchConsumer(ledger, a, 'terminal');
+    expect(serialDispatchReadyToRetire(ledger[0])).toBe(false);
+    const restored = JSON.parse(JSON.stringify(ledger));
+    expect(restored[0].origin).toEqual(a.origin);
+    expect(restored[0].serialResult.terminal.completedAtMs).toBe(123);
+    ledger = commitSerialDispatchConsumer(restored, a, 'output');
+    expect(serialDispatchReadyToRetire(ledger[0])).toBe(true);
+    expect(() => observeSerialDispatch(ledger, {
+      type: 'final_output', sessionId: 'session', turnId: 'a', content: 'another result', lastUuid: 'native-a',
+    })).toThrow('serial_output_conflict');
+  });
+});

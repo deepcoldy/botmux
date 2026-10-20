@@ -223,7 +223,10 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           stderr: 'pipe',
         });
         client = new Client({ name: 'sandbox-gateway-test', version: '1.0.0' });
-        await client.connect(transport);
+        let gatewayStderr = '';
+        transport.stderr?.on('data', chunk => { gatewayStderr = (gatewayStderr + String(chunk)).slice(-8000); });
+        try { await client.connect(transport); }
+        catch (error) { throw new Error(`Sandbox MCP handshake failed: ${gatewayStderr}`, { cause: error }); }
 
         expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
         const result = await client.callTool({ name: 'echo', arguments: { value: 1 } });

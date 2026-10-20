@@ -30,7 +30,9 @@ describe('explicit Ask durable continuation', () => {
     const request = explicitAskRecoveryRequest({ version: 1, input, result: answer }, 'ask-stable-key', chatType);
     expect(validateTriggerRequest(request).ok).toBe(true);
     expect(request.target).toEqual({ kind: 'turn', sessionId: 'session' });
-    expect(request.options!.allowChatMessages).toBe(chatType === 'group');
+    expect(request.options).toMatchObject({ asyncReturnSessionId: true, resultDelivery: 'conversation' });
+    expect(request.options!.suppressFinalOutput).toBeUndefined();
+    expect(request.options!.allowChatMessages).toBeUndefined();
     expect(request.options!.steer).toBeUndefined();
     expect(request.instruction).toContain('solution revision');
     expect(request.instruction).toContain('timeout or invalidation is not approval');

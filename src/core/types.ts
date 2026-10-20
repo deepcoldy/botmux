@@ -693,13 +693,14 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; completedTerminal?: (nothingToSend: boolean) => void }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
+    resultDelivery?: 'conversation';
     status: 'pending' | 'completed' | 'failed' | 'interrupted';
     createdAt: number;
     completedAt?: number;
@@ -729,7 +730,7 @@ export interface DaemonSession {
     key: string;
     /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
      *  convergence looks the lease up under the correct unforgeable namespace. */
-    kind: 'fresh' | 'turn';
+    kind: 'fresh' | 'turn' | 'routed_turn';
     /** The worker generation this turn was dispatched on. The exit handler only
      *  converges when the DYING generation is this one (a later generation that
      *  completed and moved on must not be retro-failed). */

@@ -641,7 +641,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('follow:') }),
       'external-follower-n1',
-      { dispatchAttempt: 4 },
+      { dispatchAttempt: 4, queueAfterActiveTurn: true },
     );
     expect(ds.session.queuedActivationTail).toEqual([
       expect.objectContaining({

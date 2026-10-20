@@ -576,3 +576,30 @@ describe('async group communication contract', () => {
     }
   });
 });
+
+
+describe('async result recipient contract', () => {
+  function conversation(): TriggerRequest {
+    return { ...request(), target: { kind: 'turn', sessionId: 'existing' },
+      options: { asyncReturnSessionId: true, resultDelivery: 'conversation', turnIdempotencyKey: 'answer-1' } };
+  }
+  it('keeps genuine conversation instructions outside HTTP-only output mode', () => {
+    const req = conversation();
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(buildUntrustedEventPrompt(req, 'turn')).not.toContain('botmux_http_response_mode');
+    req.options!.resultDelivery = 'caller';
+    expect(buildUntrustedEventPrompt(req, 'turn')).toContain('not shown in a chat');
+  });
+  it.each(['missing-session', 'headless', 'sync', 'steer', 'suppression', 'not-async', 'unknown-value'])(
+    'rejects conversation result delivery for %s', kind => {
+      const req = conversation();
+      if (kind === 'missing-session') req.target = { kind: 'turn', chatId: 'oc_new' };
+      if (kind === 'headless') req.source.type = 'headless';
+      if (kind === 'sync') req.options!.waitForFinalOutput = true;
+      if (kind === 'steer') req.options!.steer = true;
+      if (kind === 'suppression') req.options!.suppressFinalOutput = true;
+      if (kind === 'not-async') req.options!.asyncReturnSessionId = false;
+      if (kind === 'unknown-value') (req.options as any).resultDelivery = 'guess';
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    });
+});

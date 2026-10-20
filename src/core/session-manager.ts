@@ -1271,6 +1271,8 @@ function mergeBackgroundAttachments(current: LarkAttachment[] | undefined, backg
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
  *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
 type NewTopicOpts = {
+  /** Per-turn host response contract. Suppresses send guidance, never grants IM permission. */
+  hostManagedResponse?: boolean;
   promptInjection?: PromptInjection;
   larkAppId?: string;
   chatId?: string;
@@ -1343,7 +1345,7 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId);
+    : buildBotmuxShellHints(locale, noTransport || opts?.hostManagedResponse, replyDelivery, cliId);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1396,7 +1398,7 @@ function buildNewTopicBlocks(
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      ...(noTransport || replyDelivery === 'transcript'
+      ...(noTransport || opts?.hostManagedResponse || replyDelivery === 'transcript'
         ? []
         : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
@@ -1407,7 +1409,7 @@ function buildNewTopicBlocks(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
-    replyDelivery,
+    replyDelivery: opts?.hostManagedResponse ? 'transcript' : replyDelivery,
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
@@ -1543,6 +1545,8 @@ export function buildNewTopicCliInput(
   locale?: Locale,
   sender?: ResolvedSender,
   opts?: {
+    /** See NewTopicOpts. Set only by host-managed trigger inputs. */
+    hostManagedResponse?: boolean;
     promptInjection?: PromptInjection;
     larkAppId?: string;
     chatId?: string;
@@ -1624,7 +1628,7 @@ export function buildNewTopicCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
-    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection),
+    replyDelivery: opts?.hostManagedResponse ? 'transcript' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection),
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
@@ -1674,6 +1678,8 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'w
 /** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
  *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
 type FollowUpOpts = {
+  /** Per-turn host response contract. Suppresses send guidance, never grants IM permission. */
+  hostManagedResponse?: boolean;
   promptInjection?: PromptInjection;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];
@@ -1727,7 +1733,7 @@ function buildFollowUpBlocks(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
-    replyDelivery: transcript ? 'transcript' : 'send',
+    replyDelivery: transcript || opts?.hostManagedResponse ? 'transcript' : 'send',
     locale: opts?.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
@@ -1745,7 +1751,7 @@ function buildFollowUpBlocks(
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
-  if (opts?.cliId !== 'mira' && !transcript) {
+  if (opts?.cliId !== 'mira' && !transcript && !opts?.hostManagedResponse) {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
     // anti-resend variant only when the experimental dashboard toggle is on
@@ -1983,7 +1989,7 @@ export function buildFollowUpCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
-    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
+    replyDelivery: opts.hostManagedResponse ? 'transcript' : replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);

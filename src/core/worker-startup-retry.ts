@@ -47,6 +47,7 @@ const STARTUP_AUTO_RETRY_BASE_DELAYS_MS = [15_000, 60_000, 180_000];
  * same user-actionable failure.
  */
 export function isTransientStartupFailure(reason: string): boolean {
+  if (/\[read-isolation\][\s\S]*liveness probe: unknown/i.test(reason)) return true;
   return /\bETIMEDOUT\b|\bECONNREFUSED\b|\bEAGAIN\b|\bEMFILE\b|\bENFILE\b|error connecting to|lost server|server exited unexpectedly/i.test(reason);
 }
 
@@ -71,4 +72,38 @@ export function startupAutoRetryDelayMs(sessionId: string, attempt: number): num
   }
   const jitter = (hash >>> 0) % (base / 2 + 1);
   return Math.round(base * 0.75 + jitter);
+}
+
+/** An unfinished serial input keeps its host-recovery budget across daemon
+ * generations. This is metadata on the existing FIFO, not another dispatcher. */
+export function planSerialWorkerRecovery(
+  sessionId: string,
+  previous: import('../types.js').CodexAppDispatchLedgerEntry['workerRecovery'],
+  transient: boolean,
+  now = Date.now(),
+): NonNullable<import('../types.js').CodexAppDispatchLedgerEntry['workerRecovery']> {
+  const attempts = previous?.attempts ?? 0;
+  const exhausted = attempts >= MAX_STARTUP_AUTO_RETRIES;
+  return {
+    attempts,
+    status: !transient || exhausted ? 'blocked' : 'backoff',
+    nextRetryAt: now + startupAutoRetryDelayMs(sessionId, attempts + 1),
+    reason: exhausted ? 'worker_recovery_exhausted' : transient ? 'worker_start_transient' : 'worker_start_failed',
+  };
+}
+
+export function projectSerialWorkerRecovery(
+  ledger: readonly import('../types.js').CodexAppDispatchLedgerEntry[] | undefined,
+  turnId: string | undefined,
+): import('../services/trigger-types.js').TriggerResponse['workerRecovery'] {
+  const head = ledger?.[0];
+  const recovery = head?.workerRecovery;
+  if (!turnId || head?.executionPolicy !== 'serial' || !recovery
+    || !ledger?.some(entry => entry.turnId === turnId)) return undefined;
+  return {
+    status: recovery.status, attempts: recovery.attempts, maxAttempts: MAX_STARTUP_AUTO_RETRIES,
+    ...(recovery.status === 'backoff' ? { nextRetryAt: new Date(recovery.nextRetryAt).toISOString() } : {}),
+    reason: recovery.reason, blockedByTurnId: head.turnId,
+    recoveryAction: recovery.status === 'backoff' ? 'wait_for_original_worker' : 'repair_backend_and_wake_original_session',
+  };
 }

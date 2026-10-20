@@ -164,7 +164,8 @@ describe('worker durable lease expiry ordering', () => {
     const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
     const terminal = workerSource.slice(terminalStart, terminalEnd);
     expect(terminal).toContain("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });");
-    expect(terminal.indexOf("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });"))
+    // Send authority is revoked before terminal; serial admission waits for ACK.
+    expect(terminal.indexOf('completeManagedTurnOriginRevocation('))
       .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
 
     const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');

@@ -93,9 +93,10 @@ vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   };
 });
 
-import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers, __testOnly_deliverFinalOutput } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { EventEmitter } from 'node:events';
 
 function makeDs(): DaemonSession {
@@ -177,7 +178,9 @@ function terminalMsg(
 
 describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
   beforeEach(() => {
-    recordCompletedMock.mockClear();
+    recordCompletedMock.mockReset().mockImplementation((_session, _turn, content, completedAt) => ({
+      status: 'completed', content, completedAt, createdAt: completedAt,
+    }));
     recordTerminalFailureStrictMock.mockClear();
     recordTerminalFailureStrictMock.mockReturnValue('written_failed');
     initWorkerPool({
@@ -208,6 +211,30 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     );
     // Worker-exit convergence entry dropped (by triggerId) so a later graceful exit can't retro-fail it.
     expect(ds.idempotentAsyncTurns!.get('turn-silent')).toBeUndefined();
+  });
+
+  it.each([false, true])('a failed durable write leaves output pending and a same-output retry can settle (failure=%s)', async failure => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['commit-fault', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['commit-fault', {} as any]]);
+    const store = failure ? recordTerminalFailureStrictMock : recordCompletedMock;
+    store.mockImplementationOnce(() => { throw new Error('ENOSPC'); });
+    const msg: Extract<WorkerToDaemon, { type: 'final_output' }> = {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'commit-fault',
+      lastUuid: 'same-final', content: 'exact original output',
+      ...(failure ? { turnFailed: true, turnFailureCode: 'provider_eof' } : {}),
+    };
+    const receipt = vi.fn();
+    __testOnly_deliverFinalOutput(ds, msg, 'fixture', 0, receipt);
+    expect(receipt).toHaveBeenLastCalledWith(false);
+    expect(ds.asyncTriggerResults.get('commit-fault')?.status).toBe('pending');
+    expect(ds.idempotentAsyncTurns.has('commit-fault')).toBe(true);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    __testOnly_deliverFinalOutput(ds, msg, 'fixture', 0, receipt);
+    expect(receipt).toHaveBeenLastCalledWith(true);
+    expect(ds.asyncTriggerResults.get('commit-fault')?.status).toBe(failure ? 'failed' : 'completed');
+    expect(ds.idempotentAsyncTurns.has('commit-fault')).toBe(false);
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('does NOT settle on a bare completed terminal (no disposition) — the RPC-hydration-timeout case', async () => {
@@ -458,5 +485,270 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     await new Promise(r => setTimeout(r, 20));
     expect(ds.asyncTriggerResults!.has('turn-feishu')).toBe(false);
     expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('serial native turn commit barrier', () => {
+  let durable: typeof import('../src/services/async-trigger-store.js');
+  let fs: typeof import('node:fs');
+  let dataDir: string;
+  let previousDataDir: string;
+  const terminalConsumer = vi.fn(async () => {});
+  const serialDs = () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-a', turnId: 'serial-a', executionPolicy: 'serial', state: 'prepared',
+        content: 'first', deliverySink: 'http_async', origin: {} },
+      { dispatchId: 'dispatch-b', turnId: 'serial-b', executionPolicy: 'serial', state: 'accepted',
+        content: 'second', deliverySink: 'http_async', origin: {} },
+    ];
+    durable.recordPending(ds.session.sessionId, 'serial-a', Date.now(), ds.larkAppId);
+    durable.recordPending(ds.session.sessionId, 'serial-b', Date.now(), ds.larkAppId);
+    ds.asyncTriggerResults = new Map([['serial-a', { status: 'pending', createdAt: Date.now() } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return ds;
+  };
+  const output = (): Extract<WorkerToDaemon, { type: 'final_output' }> => ({
+    type: 'final_output', sessionId: 'sid-async-settle', turnId: 'serial-a',
+    serialDispatchId: 'dispatch-a', lastUuid: 'native-final-a', content: 'exact result',
+  });
+  const terminal = () => terminalMsg('serial-a', { serialDispatchId: 'dispatch-a' });
+  const emit = (ds: DaemonSession, msg: WorkerToDaemon) => (ds.worker as any).emit('message', msg);
+  const commits = (ds: DaemonSession) => (ds.worker as any).send.mock.calls
+    .map(([msg]: any[]) => msg).filter((msg: any) => msg.type === 'turn_terminal_committed');
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fs = await import('node:fs');
+    const { config } = await import('../src/config.js');
+    previousDataDir = config.session.dataDir;
+    dataDir = fs.mkdtempSync('/tmp/botmux-serial-result-');
+    config.session.dataDir = dataDir;
+    durable = await vi.importActual('../src/services/async-trigger-store.js');
+    terminalConsumer.mockReset().mockResolvedValue(undefined);
+    recordCompletedMock.mockReset().mockImplementation(durable.recordCompleted);
+    recordTerminalFailureStrictMock.mockReset().mockImplementation(durable.recordTerminalFailureStrict);
+    initWorkerPool({ sessionReply: sessionReplyMock, getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal: terminalConsumer } as any);
+  });
+  afterEach(async () => {
+    const { config } = await import('../src/config.js');
+    config.session.dataDir = previousDataDir;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  it.each([false, true])('restores conversation delivery and commits once (terminalFirst=%s)', async terminalFirst => {
+    const ds = serialDs();
+    durable.recordPending(ds.session.sessionId, 'serial-a', Date.now(), ds.larkAppId, false, 'conversation');
+    ds.asyncTriggerResults = undefined;
+    if (terminalFirst) emit(ds, terminal());
+    emit(ds, output());
+    if (!terminalFirst) emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(durable.lookupStrict(ds.session.sessionId, 'serial-a')?.result).toMatchObject({
+      status: 'completed', content: 'exact result', resultDelivery: 'conversation',
+    });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output()); emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds).length).toBeGreaterThan(1));
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+  });
+  it('repairs a missing HTTP start projection from the original ledger before retiring a recovered result', async () => {
+    const ds = serialDs();
+    durable.recordInputCommit(ds.session.sessionId, 'serial-a', ds.larkAppId, 1);
+    const start = { nativeSessionId: 'native-session', nativeTurnId: 'native-turn', startedAtMs: 1234,
+      proofKind: 'codex_rpc_turn_start' as const, workerGeneration: 2 };
+    ds.session.codexAppDispatchLedger![0].serialNativeStart = start;
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output()); emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(durable.lookupStrict(ds.session.sessionId, 'serial-a')?.result).toMatchObject({
+      status: 'completed', inputCommit: { workerGeneration: 1 }, executionStarted: start,
+    });
+  });
+  it.each(['oc_real_group_route', 'headless_canary'])('restores the original async recipient on %s', async chatId => {
+    const ds = serialDs();
+    ds.chatId = chatId;
+    ds.asyncTriggerResults = undefined;
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0].serialResult?.terminal).toBeDefined());
+    // Recreate the volatile loss between observations, as on a second restart.
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(durable.lookupStrict(ds.session.sessionId, 'serial-a')?.result).toMatchObject({
+      status: 'completed', content: 'exact result',
+    });
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+  it.each(['absent', 'foreign', 'unstamped', 'corrupt'])('retains the raw result when its recipient is %s', async state => {
+    const ds = serialDs();
+    ds.asyncTriggerResults = undefined;
+    const path = `${dataDir}/async-triggers/${ds.session.sessionId}.json`;
+    if (state === 'absent') fs.unlinkSync(path);
+    else if (state === 'corrupt') fs.writeFileSync(path, '{broken');
+    else {
+      const stored = JSON.parse(fs.readFileSync(path, 'utf8'));
+      stored.ownerLarkAppId = state === 'foreign' ? 'other-bot' : undefined;
+      fs.writeFileSync(path, JSON.stringify(stored));
+    }
+    emit(ds, output());
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0].serialResult?.output).toBeDefined());
+    expect(commits(ds)).toEqual([]);
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(terminalConsumer).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+  it('refuses a recovered wait result without its original caller', async () => {
+    const ds = serialDs();
+    ds.session.codexAppDispatchLedger![0].deliverySink = 'http_wait';
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output());
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0].serialResult?.output).toBeDefined());
+    expect(commits(ds)).toEqual([]);
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+  it('reconciles a result already durably committed before daemon death', async () => {
+    const ds = serialDs();
+    durable.recordCompleted(ds.session.sessionId, 'serial-a', output().content, Date.now(), ds.larkAppId);
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output()); emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+  it('does not retire from an output flag without the durable recipient receipt', async () => {
+    const ds = serialDs();
+    ds.session.codexAppDispatchLedger![0].serialResult = { output: output(), outputCommitted: true };
+    ds.asyncTriggerResults = undefined;
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(terminalConsumer).toHaveBeenCalled());
+    expect(commits(ds)).toEqual([]);
+    expect(ds.session.codexAppDispatchLedger?.[0].turnId).toBe('serial-a');
+  });
+  it.each(['nothing_to_send', 'failed'])('settles a recovered %s terminal into the original store', async kind => {
+    const ds = serialDs();
+    ds.asyncTriggerResults = undefined;
+    emit(ds, { ...terminal(), ...(kind === 'failed'
+      ? { status: 'failed' as const, errorCode: 'provider_error' }
+      : { outputDisposition: 'nothing_to_send' as const }) });
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(durable.lookupStrict(ds.session.sessionId, 'serial-a')?.result.status)
+      .toBe(kind === 'failed' ? 'failed' : 'completed');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('holds the successor until both raw result and terminal commit (terminalFirst=%s)', async terminalFirst => {
+    const ds = serialDs();
+    emit(ds, terminalFirst ? terminal() : output());
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0].serialResult).toBeDefined());
+    expect(commits(ds)).toEqual([]);
+    expect(ds.session.codexAppDispatchLedger?.[1].state).toBe('accepted');
+    emit(ds, terminalFirst ? output() : terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(ds.session.codexAppDispatchLedger?.map(x => x.turnId)).toEqual(['serial-b']);
+    expect(ds.asyncTriggerResults?.get('serial-a')?.content).toBe('exact result');
+    expect(ds.session.serialDispatchCommits?.[0].dispatchId).toBe('dispatch-a');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    // An ACK lost after durable retirement cannot redeliver output or pop B.
+    const writes = recordCompletedMock.mock.calls.length;
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(2));
+    expect(recordCompletedMock).toHaveBeenCalledTimes(writes);
+    expect(ds.session.codexAppDispatchLedger?.[0].turnId).toBe('serial-b');
+  });
+  it('preserves raw output on consumer disk failure and replays without another native input', async () => {
+    const ds = serialDs();
+    recordCompletedMock.mockImplementationOnce(() => { throw new Error('ENOSPC'); });
+    emit(ds, output());
+    await vi.waitFor(() => expect(recordCompletedMock).toHaveBeenCalledTimes(1));
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0].serialResult?.terminal).toBeDefined());
+    expect(terminalConsumer).not.toHaveBeenCalled();
+    expect(commits(ds)).toEqual([]);
+    expect(ds.asyncTriggerResults?.get('serial-a')?.status).toBe('pending');
+    const raw = ds.session.codexAppDispatchLedger?.[0].serialResult?.output;
+    expect(raw?.content).toBe('exact result');
+    emit(ds, raw!);
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect((ds.worker as any).send.mock.calls.some(([msg]: any[]) => msg.type === 'message')).toBe(false);
+  });
+  it('retains native ownership when terminal persistence rejects', async () => {
+    const ds = serialDs();
+    terminalConsumer.mockRejectedValueOnce(new Error('SQLITE_BUSY exhausted'));
+    emit(ds, output());
+    await vi.waitFor(() => expect(recordCompletedMock).toHaveBeenCalled());
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(terminalConsumer).toHaveBeenCalledTimes(1));
+    expect(commits(ds)).toEqual([]);
+    expect(ds.session.codexAppDispatchLedger?.[0].serialResult?.terminalCommitted).toBeUndefined();
+    emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+  });
+  it('does not ACK when raw journal persistence itself fails', async () => {
+    const ds = serialDs();
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('EIO'); });
+    emit(ds, output());
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(commits(ds)).toEqual([]);
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.[0].serialResult).toBeUndefined();
+  });
+  it('commits no_output after the original deadline and releases the successor without model replay', async () => {
+    vi.useFakeTimers();
+    try {
+      const ds = serialDs();
+      emit(ds, terminal());
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(commits(ds)).toEqual([]);
+      expect(terminalConsumer).not.toHaveBeenCalled();
+      const deadline = ds.session.codexAppDispatchLedger![0].serialResult!.outputDrainUntil;
+      // Repeated terminal cannot extend the first observed deadline.
+      emit(ds, terminal());
+      expect(ds.session.codexAppDispatchLedger![0].serialResult!.outputDrainUntil).toBe(deadline);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(terminalConsumer).toHaveBeenCalledWith(ds,
+        expect.objectContaining({ status: 'ambiguous', errorCode: 'no_output', retryable: false }), expect.anything());
+      expect(ds.asyncTriggerResults?.get('serial-a')?.status).toBe('failed');
+      expect(commits(ds)).toHaveLength(1);
+      expect(ds.session.codexAppDispatchLedger?.[0].turnId).toBe('serial-b');
+      // Once no_output is committed a delayed result cannot reopen that attempt.
+      emit(ds, output());
+      await vi.advanceTimersByTimeAsync(1);
+      expect(recordCompletedMock).not.toHaveBeenCalled();
+      expect(ds.asyncTriggerResults?.get('serial-a')?.status).toBe('failed');
+      expect((ds.worker as any).send.mock.calls.some(([msg]: any[]) => msg.type === 'message')).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+  it('reopens the persisted drain deadline and retries failed terminal storage without inventing success', async () => {
+    vi.useFakeTimers();
+    try {
+      const ds = serialDs();
+      const original = terminal();
+      ds.session.codexAppDispatchLedger![0].serialResult = {
+        terminal: original, outputDrainUntil: Date.now() - 1,
+      };
+      terminalConsumer.mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+      emit(ds, original);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(commits(ds)).toEqual([]);
+      expect(ds.session.codexAppDispatchLedger![0].serialResult!.outputAbsentAt).toBeDefined();
+      expect(ds.session.codexAppDispatchLedger![0].serialResult!.terminal!.status).toBe('completed');
+      emit(ds, original);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(commits(ds)).toHaveLength(1);
+      expect(recordCompletedMock).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+  it('rejects a tail result, wrong dispatch identity and stale worker', async () => {
+    const ds = serialDs();
+    emit(ds, { ...output(), turnId: 'serial-b', serialDispatchId: 'dispatch-b' });
+    emit(ds, { ...output(), serialDispatchId: 'other' });
+    const old = ds.worker as any;
+    ds.worker = undefined;
+    old.emit('message', output());
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(old.send.mock.calls.some(([msg]: any[]) => msg.type === 'turn_terminal_committed')).toBe(false);
   });
 });

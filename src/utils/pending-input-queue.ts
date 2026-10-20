@@ -60,6 +60,23 @@ export interface PendingCliInput {
   taskContinuation?: TaskContinuationDispatchMarker;
 }
 
+/** Inputs requiring their own result cannot be merged or steered. The lease
+ * marker and receipt attempt are independent: HTTP idempotency has no receipt
+ * attempt, but still requires one completion for each accepted request. */
+export function isSerialCliInput(input: {
+  queueAfterActiveTurn?: true;
+  dispatchAttempt?: number;
+  atMostOnce?: boolean;
+  noReplay?: boolean;
+  queuedActivationToken?: string;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+} | undefined): boolean {
+  return !!input && (input.queueAfterActiveTurn === true
+    || input.dispatchAttempt !== undefined
+    || input.atMostOnce === true || input.noReplay === true
+    || !!input.queuedActivationToken || !!input.vcMeetingImTurnOrigin);
+}
+
 /**
  * Run a synchronous CLI/backend reset without losing inputs that have not yet
  * been dequeued for a PTY write. The reset path intentionally clears the live
@@ -113,11 +130,8 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
-    || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+  if (isSerialCliInput(tail) || isSerialCliInput(next)
     || tail.codexAppDispatchId || next.codexAppDispatchId
-    || tail.queuedActivationToken || next.queuedActivationToken
-    || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
@@ -148,8 +162,7 @@ export function pendingInputAllowsTypeAhead(
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
     && !directRpcTurnInFlight
-    && next?.dispatchAttempt === undefined
-    && !next?.vcMeetingImTurnOrigin;
+    && !isSerialCliInput(next);
 }
 
 /** Args-baked first prompts bypass `flushPending`, which is where durable HOL
@@ -279,12 +292,8 @@ export function shouldStopPendingBatch(
   allowBackToBackWrites = true,
 ): boolean {
   return !allowBackToBackWrites
-    || written.dispatchAttempt !== undefined
-    || next?.dispatchAttempt !== undefined
-    || !!written.queuedActivationToken
-    || !!next?.queuedActivationToken
-    || !!written.vcMeetingImTurnOrigin
-    || !!next?.vcMeetingImTurnOrigin;
+    || isSerialCliInput(written)
+    || isSerialCliInput(next);
 }
 
 /** A durable attempt is a hard head-of-line barrier even if screen detection

@@ -1,3 +1,4 @@
+import {applyProjectProjection, type ProjectProjection} from './project-projection.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -243,6 +244,13 @@ export class ProjectCoordinator {
     });
   }
 
+  project(context: ProjectCoordinatorContext, input: ProjectProjection, writeBoard: (input:ProjectProjection, hash:string)=>Promise<void>): Promise<ProjectGroupState> {
+    return queued(`${context.dataDir}:${context.chatId}`,()=>applyProjectProjection(context,input,{
+      mutate: fn=>mutateProjectGroup(context.dataDir,context.chatId,fn),
+      publish: project=>this.publish(context,project),writeBoard,
+    }));
+  }
+
   run(context: ProjectCoordinatorContext, action: ProjectCoordinatorAction): Promise<ProjectGroupState> {
     return queued(`${context.dataDir}:${context.chatId}`, async () => {
       if (action.action === 'status') {
@@ -255,6 +263,11 @@ export class ProjectCoordinator {
         if (!current) throw new Error('project_not_found');
         if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
         return this.publish(context, current);
+      }
+      const current = readProjectGroup(context.dataDir, context.chatId);
+      if(current?.projection) {
+        if(action.action==='dispatch' || action.action==='report')return current;
+        throw new Error('project_managed_by_provider');
       }
       const changed = await this.apply(context, action);
       return this.publish(context, changed);

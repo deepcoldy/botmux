@@ -23,8 +23,13 @@ describe('structured queue CoT supersession', () => {
     q.ingest(events);
     q.ingest(events);
     expect(seen).toEqual(['first:tool_result', 'superseded:first:2', 'second:thinking']);
-    // No synthetic durable completion for the retired first turn.
-    expect(q.drainEmittable()).toMatchObject([{ turnId: 'second', dispatchAttempt: 3, finalText: 'answer' }]);
+    // The predecessor must remain observable as ambiguous, never silently
+    // disappear or inherit the successor's successful result.
+    expect(q.drainEmittable()).toMatchObject([
+      { turnId: 'first', dispatchAttempt: 2, finalText: '', terminalStatus: 'ambiguous', terminalErrorCode: 'native_turn_merged' },
+      { turnId: 'second', dispatchAttempt: 3, finalText: 'answer' },
+    ]);
+    expect(q.drainEmittable()).toEqual([]);
   });
 
   it.each(['unmatched', 'historical', 'absorbed', 'distinct-native', 'preserved', 'completed'])(

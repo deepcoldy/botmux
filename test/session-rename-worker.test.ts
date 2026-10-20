@@ -75,7 +75,9 @@ describe('worker native session rename queue', () => {
     const end = workerSource.indexOf('/** RPC panes have NO terminal input path', start);
     const region = workerSource.slice(start, end);
     const ownershipIdx = region.indexOf('codexRpcEngine = engine');
-    const persistIdx = region.indexOf('persistCliSessionId(threadId)');
+    // Serial preparation also persists the thread before external input. This
+    // assertion concerns ownership publication after engagement, before title IO.
+    const persistIdx = region.indexOf('persistCliSessionId(threadId)', ownershipIdx);
     const titleIdx = region.indexOf('void syncFreshCodexNativeSessionTitle');
 
     expect(ownershipIdx).toBeGreaterThanOrEqual(0);

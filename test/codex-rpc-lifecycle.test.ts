@@ -322,6 +322,35 @@ describe('orchestrateCodexRpcInit — three-state fresh / resume / kill-failure 
     return { effects, calls };
   }
 
+  const recoveredRpc = () => baseCfg({ resume: true, cliSessionId: 'original-thread', prompt: '',
+    codexAppRecoveredDispatches: [{ executionPolicy: 'serial', state: 'prepared',
+      dispatchId: 'original-dispatch', turnId: 'original-turn', content: 'original task',
+      serialRecovery: { markTimeMs: 1, fingerprint: 'original task', rpcThreadRuntime: {
+        threadId: 'original-thread', rolloutPath: '/tmp/original.jsonl', model: 'original-model', modelProvider: 'original-provider',
+      } },
+    }],
+  });
+
+  it('uses the original prepared RPC receipt when a wrapper renamed its surviving viewer', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-owned', live: true }, isRemote: false, outcome: 'resumed' });
+    expect(await orchestrateCodexRpcInit(recoveredRpc(), effects)).toEqual({ engaged: true, queuePrompt: true, abortSpawn: false });
+    expect(calls).toEqual(['paneInfo', 'prepare', 'engage', 'killVerify']);
+  });
+
+  it.each([null, { name: 'bmx-owned', live: true }])('never downgrades a prepared RPC task when resume fails (%s)', async pane => {
+    const { effects, calls } = fx({ pane, outcome: 'not-engaged' });
+    expect(await orchestrateCodexRpcInit(recoveredRpc(), effects)).toEqual({ engaged: false, queuePrompt: false, abortSpawn: true });
+    expect(calls).not.toContain('killVerify');
+  });
+
+  it.each([{ cliSessionId: 'other-thread' }, { codexRpcInput: false }, { sandbox: true }])(
+    'retains the original execution when resume identity or security policy changed (%s)', async change => {
+      const { effects, calls } = fx();
+      expect((await orchestrateCodexRpcInit({ ...recoveredRpc(), ...change }, effects)).abortSpawn).toBe(true);
+      expect(calls).toEqual(['notify']);
+    },
+  );
+
   it('not eligible → no-op, engine never engaged', async () => {
     const { effects, calls } = fx();
     const d = await orchestrateCodexRpcInit(baseCfg({ codexRpcInput: false }), effects);

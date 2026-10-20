@@ -1,3 +1,4 @@
+import * as asyncResults from '../src/services/async-trigger-store.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
@@ -648,5 +649,55 @@ describe('worker final-output topic transport', () => {
     expect(mocks.create).toHaveBeenCalledOnce();
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(mocks.request.mock.calls.filter(([r]) => r.url.includes('/im/v1/messages/'))).toHaveLength(0);
+  });
+});
+
+
+describe('async conversation result uses original final transport', () => {
+  function recipient(conversation: boolean) {
+    asyncResults.recordPending(ds.session.sessionId, 'om_turn_old', 1000, APP, true, conversation ? 'conversation' : undefined);
+    ds.asyncTriggerResults = new Map([['om_turn_old', { status: 'pending', createdAt: 1000,
+      ...(conversation ? { resultDelivery: 'conversation' as const } : {}) }]]);
+  }
+  it('captures the original result and replies in the original topic, not the current sibling', async () => {
+    recipient(true);
+    const done = await final();
+    expect(done.owned).toBe(true);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mocks.reply.mock.calls[0])).toContain('om_source');
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(asyncResults.lookupStrict(ds.session.sessionId, 'om_turn_old')!.result)
+      .toMatchObject({ status: 'completed', content: 'answer', resultDelivery: 'conversation' });
+  });
+  it('keeps ordinary caller-only async output out of the conversation', async () => {
+    recipient(false); await final();
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
+    expect(asyncResults.lookupStrict(ds.session.sessionId, 'om_turn_old')!.result.status).toBe('completed');
+  });
+  it('does not publish a late success after an exact interrupt', async () => {
+    recipient(true);
+    asyncResults.recordInterruptedStrict(ds.session.sessionId, 'om_turn_old', 2000, APP);
+    await final();
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
+    expect(asyncResults.lookupStrict(ds.session.sessionId, 'om_turn_old')!.result.status).toBe('interrupted');
+  });
+  it('captures and publishes a genuine failed conversation without reviving it as success', async () => {
+    recipient(true); ds.settledHttpTerminalTurns = new Set(['om_turn_old']);
+    await new Promise<void>(resolve => deliverFinalOutput(ds, {
+      type: 'final_output', turnId: 'om_turn_old', content: 'failed to complete', lastUuid: 'failed-output',
+      turnFailed: true, turnFailureCode: 'native_failed',
+    }, 'fixture', 0, () => resolve()));
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(asyncResults.lookupStrict(ds.session.sessionId, 'om_turn_old')!.result)
+      .toMatchObject({ status: 'failed', resultDelivery: 'conversation', terminalErrorCode: 'native_failed' });
+    await final(); expect(mocks.reply).toHaveBeenCalledTimes(1);
+  });
+  it('preserves a captured conversation result while delivery retries', async () => {
+    recipient(true);
+    mocks.reply.mockRejectedValueOnce(new Error('transient network failure'));
+    const done = await final();
+    expect(done.owned).toBe(true); expect(mocks.reply).toHaveBeenCalledTimes(2);
+    expect(asyncResults.lookupStrict(ds.session.sessionId, 'om_turn_old')!.result)
+      .toMatchObject({ content: 'answer', resultDelivery: 'conversation', status: 'completed' });
   });
 });

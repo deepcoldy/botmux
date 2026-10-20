@@ -117,9 +117,9 @@ export function createExplicitAskContinuation(deps: {
   return { wait, acknowledge, sweep };
 }
 
-/** Shared production builder: group-only chat permission must never leak into
- * private sessions. Recovery is a quiet append, never a new task or a steer. */
-export function explicitAskRecoveryRequest(receipt: ExplicitAskReceipt, key: string, chatType?: 'group' | 'p2p'): TriggerRequest {
+/** Original-user recovery retains its conversation output destination.
+ * Recovery is an independent append, never a new task or a steer. */
+export function explicitAskRecoveryRequest(receipt: ExplicitAskReceipt, key: string, _chatType?: 'group' | 'p2p'): TriggerRequest {
   if (receipt.input.deliveryTarget || receipt.input.chatId.startsWith('doc:')) {
     throw new Error('Document ask automatic recovery requires a bound document turn; reconnect to the original ask');
   }
@@ -130,6 +130,6 @@ export function explicitAskRecoveryRequest(receipt: ExplicitAskReceipt, key: str
       payload: { requestId: receipt.input.requestId, questions: receipt.input.questions, result: receipt.result } },
     instruction: 'Recover the result of this existing Ask in the original task and session. Read current task state and verify the question, scope and solution revision before consuming this decision. Do not ask it again, create a new task, or replay completed development, tests or deployment. A timeout or invalidation is not approval. Record the existing decision and continue only already-authorized pending work; if scope no longer matches, retain the evidence and report the conflict.',
     options: { asyncReturnSessionId: true, turnIdempotencyKey: key,
-      allowChatMessages: chatType === 'group', suppressFinalOutput: true },
+      resultDelivery: 'conversation' },
   };
 }

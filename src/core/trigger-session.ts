@@ -1,3 +1,5 @@
+import { routedTurnTarget, routedTurnKey } from '../services/trigger-types.js';
+import { realpathSync } from 'node:fs';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
@@ -33,7 +35,8 @@ import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSessio
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { logger } from '../utils/logger.js';
-import type { CliTurnPayload } from '../types.js';
+import type { CliTurnPayload, Session } from '../types.js';
+import { serialDispatchOwnsRecovery } from '../utils/codex-app-dispatch-ledger.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -114,7 +117,8 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     if (instruction) {
       lines.push('', '<botmux_task trusted="true">', instruction, '</botmux_task>');
     }
-    if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
+    if ((req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId)
+      && req.options?.resultDelivery !== 'conversation') {
       lines.push(
         '',
         '<botmux_http_response_mode trusted="true">',
@@ -135,7 +139,8 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       '</botmux_task>',
     );
   }
-  if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
+  if ((req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId)
+    && req.options?.resultDelivery !== 'conversation') {
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
@@ -158,6 +163,20 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       // 复用同一 prompt），所以两轮的 settle 都靠它触发。
       'If you have nothing to answer (e.g. the request needs no reply), output ONLY the single token BOTMUX_NOTHING_TO_SEND — the program receives an empty result.',
       '</botmux_http_response_mode>',
+    );
+  }
+  if (req.options?.resultDelivery === 'conversation') {
+    if (lines.length > 0) lines.push('');
+    lines.push(
+      '<botmux_conversation_response_mode trusted="true">',
+      'For this turn, Botmux delivers your final assistant output to the original conversation automatically.',
+      'Return the complete user-facing answer in your final output. This overrides session-wide instructions to send a reply yourself.',
+      ...(req.options.allowChatMessages === true ? [
+        'You may separately call botmux send only for messages authorized by this request; do not send a duplicate of the final answer.',
+      ] : ['Do not call botmux send; the host owns delivery of this reply.']),
+      'Do not include internal routing headers, transport details, or delivery instructions in the user-facing answer.',
+      'If this turn requires no reply, output ONLY BOTMUX_NOTHING_TO_SEND.',
+      '</botmux_conversation_response_mode>',
     );
   }
   return lines.join('\n');
@@ -312,6 +331,10 @@ export function resolveIdempotencyHit(
     return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted; not re-run under the same idempotency key' };
   }
   if (hit.state === 'attempting') {
+    const ownedSession = live?.larkAppId === hit.ownerLarkAppId ? live.session : sessionStore.getOwnedSession(hit.sessionId);
+    if (serialDispatchOwnsRecovery(ownedSession?.codexAppDispatchLedger, hit.triggerId)) {
+      return { kind: 'reuse', chatId, message: 'original serial dispatch retained for recovery; poll the original trigger' };
+    }
     // Ground truth for "genuinely in flight" is a LIVE WORKER, not registry
     // presence or ownerBootId. A dispatched turn holds a non-killed worker from
     // fork (synchronous, no await between register and fork) until the worker
@@ -362,7 +385,7 @@ export function resolveIdempotencyHit(
 export async function reconcileIdempotencyLeasesOnBoot(
   ownerLarkAppId: string,
   currentBootId: string,
-  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getOwnedSession,
+  getSession: (id: string) => Pick<Session, 'chatId' | 'codexAppDispatchLedger'> | undefined = sessionStore.getOwnedSession,
 ): Promise<Set<string>> {
   const now = Date.now();
   const quarantined = new Set<string>();
@@ -401,6 +424,13 @@ export async function reconcileIdempotencyLeasesOnBoot(
     // own in-flight leases.
     if (record.ownerLarkAppId !== ownerLarkAppId) continue;
     if (record.ownerBootId === currentBootId) continue;
+    if (record.state === 'attempting') {
+      const dest = asyncTriggerStore.lookupStrict(record.sessionId, record.triggerId);
+      if (dest?.ownerLarkAppId === ownerLarkAppId
+        && serialDispatchOwnsRecovery(getSession(record.sessionId)?.codexAppDispatchLedger, record.triggerId)) {
+        continue;
+      }
+    }
     // TURN leases govern a follow-up turn on a SHARED, long-lived session — NOT a
     // throwaway fresh-session. The fresh-session reconcile below quarantines +
     // closeSession(record.sessionId) to stop restore reviving an orphaned session;
@@ -410,7 +440,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
     // the async store (so the caller polls `failed` at-most-once) or CAS-remove a
     // provably-pre-dispatch reserved lease — and NEVER touch the session. A
     // genuine I/O failure still throws → fail-closed (aggregated below).
-    if (record.kind === 'turn') {
+    if (record.kind === 'turn' || record.kind === 'routed_turn') {
       try {
         const asyncRec = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
         const outcome = (asyncRec && asyncRec.ownerLarkAppId === ownerLarkAppId) ? asyncRec.result.status : undefined;
@@ -451,7 +481,12 @@ export async function reconcileIdempotencyLeasesOnBoot(
       // An explicit interrupt is a successful terminal of THIS exact turn. It
       // deliberately leaves the fresh session usable, just like completed, so
       // boot reconcile must not quarantine/close it after a daemon restart.
-      if (outcome === 'completed' || outcome === 'interrupted') continue;
+      // An explicit failed native turn is terminal for that turn, not for the
+      // logical session. In particular a completed failure of the initial turn
+      // must not close accepted successors on a later daemon boot. Only the
+      // legacy unproven dispatch below owns orphan-session quarantine.
+      if (outcome === 'completed' || outcome === 'interrupted'
+        || (outcome === 'failed' && asyncRec?.result.reason === 'turn_terminal')) continue;
       if (outcome === 'failed') {
         // Already durable-failed, but a PREVIOUS boot may have crashed after
         // writing failed and before closing → always re-quarantine and re-attempt
@@ -623,6 +658,12 @@ export function convergeIdempotentAsyncTurnOnWorkerExit(
     const ownedCompleted = existing?.result.status === 'completed'
       && existing.ownerLarkAppId === turn.ownerLarkAppId;
     if (ownedCompleted) { turns.delete(triggerId); convergedAny = true; continue; }
+    if (ds.larkAppId === turn.ownerLarkAppId && existing?.ownerLarkAppId === turn.ownerLarkAppId
+      && serialDispatchOwnsRecovery(ds.session.codexAppDispatchLedger, triggerId)) {
+      // The replacement worker consumes this same persisted transaction. Keep
+      // the lease and its exact stamp instead of failing an unwritten tail.
+      continue;
+    }
     try {
       // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
       // completed-wins, so a foreign-occupied slot throws here → caught below →
@@ -658,18 +699,35 @@ function waitForSessionFinalOutput(
 ): Promise<TriggerResponse> {
   ds.pendingWaitPromises ??= new Map();
   return new Promise<TriggerResponse>((resolve) => {
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
+      if (drainTimer) clearTimeout(drainTimer);
       ds.pendingWaitPromises?.delete(triggerId);
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      completedTerminal: (nothingToSend: boolean) => {
+        const waiter = ds.pendingWaitPromises?.get(triggerId);
+        if (!waiter) return;
+        if (nothingToSend) { waiter.resolve(''); return; }
+        if (drainTimer) return;
+        drainTimer = setTimeout(() => {
+          if (ds.pendingWaitPromises?.get(triggerId) !== waiter) return;
+          clearTimeout(timer);
+          ds.pendingWaitPromises.delete(triggerId);
+          resolve({ ok: false, triggerId, errorCode: 'no_output', error: 'native execution ended but its final output could not be verified; not re-run' });
+        }, asyncTriggerStore.ASYNC_OUTPUT_DRAIN_MS);
+        drainTimer.unref?.();
+      },
       resolve: (text: string) => {
         clearTimeout(timer);
+        if (drainTimer) clearTimeout(drainTimer);
         ds.pendingWaitPromises?.delete(triggerId);
         resolve(buildCompletedResponse(text));
       },
       reject: (err: Error) => {
         clearTimeout(timer);
+        if (drainTimer) clearTimeout(drainTimer);
         ds.pendingWaitPromises?.delete(triggerId);
         resolve({ ok: false, triggerId, errorCode: 'trigger_failed', error: err.message });
       },
@@ -689,19 +747,16 @@ function waitForSessionFinalOutput(
   });
 }
 
-function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+function beginAsyncTrigger(ds: DaemonSession, triggerId: string, resultDelivery?: 'caller' | 'conversation'): void {
   const createdAt = Date.now();
+  // The durable recipient is an admission prerequisite, not a best-effort
+  // projection. Otherwise a disk failure could start work with no recoverable
+  // consumer. Publish the in-memory binding only after the durable write.
+  const conversation = resultDelivery === 'conversation' ? 'conversation' as const : undefined;
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId, true, conversation);
   ds.asyncTriggerResults ??= new Map();
-  ds.asyncTriggerResults.set(triggerId, {
-    status: 'pending',
-    createdAt,
-  });
+  ds.asyncTriggerResults.set(triggerId, { status: 'pending', createdAt, ...(conversation ? { resultDelivery: conversation } : {}) });
   ds.latestAsyncTriggerId = triggerId;
-  // Durably record the pending trigger so a poller can still resolve this
-  // session after a daemon restart (the in-memory Map above does not survive
-  // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
-  // write only forfeits restart recovery.
-  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId);
 }
 
 function buildAsyncQueuedResponse(
@@ -750,6 +805,7 @@ function buildExistingSessionContent(
   codexAppApplicationContext: string,
   codexAppMessageContext: string,
   turnId: string,
+  hostManagedResponse: boolean,
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
@@ -767,6 +823,7 @@ function buildExistingSessionContent(
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
     sessionBackendType: ds.session.backendType,
+    hostManagedResponse,
     promptInjection: sessionPromptInjection(ds),
     turnId,
   });
@@ -1048,9 +1105,16 @@ async function triggerSessionTurnAdmitted(
   // idempotencyStore and is woven into deliverToExisting's async branch below;
   // here we only do the fast pre-check (reuse/terminal short-circuit).
   const turnIdempotencyKey = req.options?.turnIdempotencyKey?.trim();
+  const routedTarget = turnIdempotencyKey && !req.target.sessionId
+    ? routedTurnTarget(req.target, req.presentation) : undefined;
+  if (turnIdempotencyKey && !req.target.sessionId && (!routedTarget || !req.options?.asyncReturnSessionId
+    || req.options.waitForFinalOutput || dryRun)) {
+    return { ok: false, errorCode: 'bad_request', error: 'keyed chat turns require a stable async route' };
+  }
+  const turnLeaseKind = routedTarget ? 'routed_turn' as const : 'turn' as const;
   const turnLeaseKey = turnIdempotencyKey && req.target.sessionId
     ? `${req.target.sessionId}\u0000${turnIdempotencyKey}`
-    : undefined;
+    : routedTarget && turnIdempotencyKey ? routedTurnKey(routedTarget, turnIdempotencyKey) : undefined;
   // requestHash binds the key to its full business payload (same rule as the
   // fresh-session key): a same-key retry with a DIFFERENT payload is a caller bug
   // (409), not a silent join. Excludes both idempotency keys (lookup keys, not
@@ -1061,8 +1125,8 @@ async function triggerSessionTurnAdmitted(
   const { idempotencyKey: _omitK1, turnIdempotencyKey: _omitK2, ...turnOptionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   const turnRequestHash = turnLeaseKey
     ? computeInputHash({
-        seam: 'turn',
-        sessionId: req.target.sessionId ?? null,
+        ...(routedTarget ? { seam: 'routed_turn', target: routedTarget }
+          : { seam: 'turn', sessionId: req.target.sessionId ?? null }),
         instruction: req.instruction ?? null,
         envelope: req.envelope,
         source: req.source,
@@ -1085,7 +1149,7 @@ async function triggerSessionTurnAdmitted(
     }
     let hit: idempotencyStore.IdempotencyRecord | undefined;
     try {
-      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey, 'turn');
+      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey, turnLeaseKind);
     } catch (err) {
       return { ok: false, errorCode: 'trigger_failed', error: `idempotency lease unreadable: ${(err as Error).message}` };
     }
@@ -1167,6 +1231,17 @@ async function triggerSessionTurnAdmitted(
       // decision.kind === 'takeover' — an older-boot pre-dispatch reserved lease
       // for this same turn key. Re-claim via takeover at dispatch time below.
       turnIdempotencyTakeover = hit;
+    }
+  }
+
+  if (req.options?.resultDelivery === 'conversation') {
+    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
+    if (!req.options.asyncReturnSessionId || req.options.waitForFinalOutput || req.options.steer
+      || req.options.suppressFinalOutput || req.source.type === 'headless' || getBot(larkAppId).config.apiOnly
+      || !bound || bound.larkAppId !== larkAppId || !['group', 'p2p'].includes(bound.chatType)
+      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: getBot(larkAppId).config.apiOnly })
+      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'conversation result delivery requires an existing real conversation' };
     }
   }
 
@@ -1261,7 +1336,15 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+  const workspaceMatches = (directory: string | undefined): boolean => {
+    if (req.options?.expectedWorkingDir === undefined) return true;
+    try { return !!directory && realpathSync(directory) === realpathSync(req.options.expectedWorkingDir); }
+    catch { return false; }
+  };
+  const deliverToExisting = async (target: DaemonSession, openingInput?: CliTurnPayload): Promise<TriggerResponse> => {
+    if (!workspaceMatches(target.workingDir ?? target.session.workingDir)) {
+      return { ok: false, errorCode: 'bad_request', error: 'target session working directory changed' };
+    }
     const prompt = promptForSession(target);
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
@@ -1302,8 +1385,9 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
-    const content = buildExistingSessionContent(
+    const content = openingInput ?? buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
+      !!(req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId),
     );
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
@@ -1372,17 +1456,17 @@ async function triggerSessionTurnAdmitted(
       const res = turnIdempotencyTakeover
         ? idempotencyStore.takeover({
             ownerLarkAppId: larkAppId, key: turnLeaseKey, expect: turnIdempotencyTakeover,
-            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(), kind: 'turn',
+            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(), kind: turnLeaseKind,
           })
         : idempotencyStore.claim({
             ownerLarkAppId: larkAppId, sessionId: target.session.sessionId, triggerId,
-            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(), kind: 'turn',
+            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(), kind: turnLeaseKind,
           });
       if (res.kind === 'existing') return { reuse: reuseWinner(res.record) };
       // Commit-unknown barrier: CAS reserved→attempting durably BEFORE dispatch.
       const attempting = idempotencyStore.transition(larkAppId, turnLeaseKey, res.record, {
         state: 'attempting', now: Date.now(),
-      }, 'turn');
+      }, turnLeaseKind);
       return { lease: attempting };
     };
     // Stamp the idempotent-async-turn descriptor so a worker that dies with no
@@ -1398,7 +1482,7 @@ async function triggerSessionTurnAdmitted(
       (target.idempotentAsyncTurns ??= new Map()).set(triggerId, {
         ownerLarkAppId: larkAppId,
         key: turnLeaseKey,
-        kind: 'turn',
+        kind: turnLeaseKind,
         workerGeneration: dispatchedGeneration,
       });
     };
@@ -1470,7 +1554,7 @@ async function triggerSessionTurnAdmitted(
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+              ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
             });
             if (!accepted) throw new Error('worker refused trigger input before acceptance');
             recordAcceptedInput();
@@ -1506,7 +1590,7 @@ async function triggerSessionTurnAdmitted(
         if (turnLease) stampTurnConvergence();
         let accepted: boolean;
         try {
-          beginAsyncTrigger(target, triggerId);
+          beginAsyncTrigger(target, triggerId, req.options?.resultDelivery);
           const dispatchAttempt = prepareStableDispatch(target, false);
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
@@ -1516,7 +1600,7 @@ async function triggerSessionTurnAdmitted(
             // after the daemon has already terminalized it (dispatch_unknown). The
             // dormant-fork branch rides atMostOnce on the fork init instead.
             ...(turnLease ? { atMostOnce: true } : {}),
-            ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+            ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
           });
         } catch (err) {
           // A throw AFTER the barrier (begin/prepare/arm/send). Nothing is proven
@@ -1572,7 +1656,7 @@ async function triggerSessionTurnAdmitted(
       const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
-        ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+        ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
       });
       if (!accepted) {
         disarmLoudFinalSuppression(target);
@@ -1653,7 +1737,7 @@ async function triggerSessionTurnAdmitted(
       // fork init (mirrors the fresh-session path).
       const atMostOnce = !!(turnLeaseKey && turnLease);
       try {
-        beginAsyncTrigger(target, triggerId);
+        beginAsyncTrigger(target, triggerId, req.options?.resultDelivery);
         const dispatchAttempt = prepareStableDispatch(target, true);
         armFinalOutputSuppression(target, dispatchAttempt);
         forkWorker(target, withSteer(content), {
@@ -1715,6 +1799,9 @@ async function triggerSessionTurnAdmitted(
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
 
+  if (!workspaceMatches(wd.workingDir)) {
+    return { ok: false, errorCode: 'bad_request', error: 'target route working directory changed' };
+  }
   const bot = getBot(larkAppId);
   const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
@@ -1964,6 +2051,7 @@ async function triggerSessionTurnAdmitted(
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,
+      hostManagedResponse: !!(req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId),
       // Trigger sessions are newly created above and fork without resume.
       larkToolResume: false,
     },
@@ -1994,6 +2082,14 @@ async function triggerSessionTurnAdmitted(
     newDs.pendingCodexAppApplicationContext = undefined;
     newDs.pendingCodexAppMessageContext = undefined;
   };
+
+  // A stable chat/thread route shares the same dispatch lease and worker
+  // convergence path as an existing-session append. No second opening seam.
+  // No await occurs inside that path between claim and the synchronous fork.
+  if (routedTarget) {
+    releaseInitialReservation();
+    return deliverToExisting(newDs, promptInput);
+  }
 
   // Idempotency claim (fresh async virtual only — validator guarantees this is
   // the asyncReturnSessionId branch). Bind key → this session as a `reserved`
@@ -2158,7 +2254,7 @@ async function triggerSessionTurnAdmitted(
     // `running` forever. Write the authoritative durable failed (dispatch_unknown)
     // and close — at-most-once, never re-dispatched (finding #5b).
     try {
-      beginAsyncTrigger(newDs, triggerId);
+      beginAsyncTrigger(newDs, triggerId, req.options?.resultDelivery);
       // Stamp the idempotent-async-turn descriptor so a worker that dies with no
       // final_output converges to a durable `dispatch_unknown` instead of polling
       // `running` forever (codex #776 round-6 finding #1). Only for keyed turns:

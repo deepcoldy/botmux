@@ -1410,3 +1410,50 @@ describe('async group message input contract', () => {
       }
     });
 });
+
+
+describe('host-managed response guidance', () => {
+  it.each(['caller', 'conversation'] as const)('renders the %s destination without a conflicting send reminder', resultDelivery => {
+    const req: TriggerRequest = {
+      source: { type: 'ui', connectorId: 'native-ask' },
+      target: { kind: 'turn', sessionId: 'original-session' },
+      envelope: { format: 'json', sourceName: 'answer', payload: { answer: 'continue' } },
+      options: { asyncReturnSessionId: true, resultDelivery },
+    };
+    const context = buildExternalEventApplicationContext(req);
+    expect(context).toContain('Do not call botmux send');
+    expect(context).toContain(resultDelivery === 'conversation'
+      ? 'original conversation automatically' : 'not shown in a chat');
+    const prompt = buildUntrustedEventPrompt(req, 'trigger-one');
+    for (const cliId of ['codex', 'claude-code', 'codex-app'] as const) {
+      const input = buildFollowUpCliInput(prompt, 'original-session', {
+        cliId, larkAppId: 'app_test', chatId: 'oc_original', hostManagedResponse: true,
+        codexAppApplicationContext: context, codexAppText: 'answer',
+      });
+      expect(input.content).not.toContain('<botmux_reminder>');
+      expect(input.content).toContain('Do not call botmux send');
+      if (cliId === 'codex-app') expect(JSON.stringify(input.codexAppInput)).toContain('Do not call botmux send');
+      const next = buildFollowUpCliInput('next ordinary message', 'original-session', {
+        cliId, larkAppId: 'app_test', chatId: 'oc_original',
+      });
+      expect(next.content).toContain('<botmux_reminder>');
+    }
+    const opening = buildNewTopicCliInput(prompt, 'new-session', 'codex', undefined,
+      undefined, undefined, undefined, undefined, undefined, 'zh', undefined,
+      { larkAppId: 'app_test', chatId: 'oc_original', hostManagedResponse: true });
+    const routing = opening.content.match(/<botmux_routing>([\s\S]*?)<\/botmux_routing>/)?.[1];
+    expect(routing).toBeDefined();
+    expect(routing).not.toContain('botmux send');
+  });
+
+  it('does not turn conversation delivery into permission for unsolicited explicit messages', () => {
+    const req: TriggerRequest = {
+      source: { type: 'ui' }, target: { kind: 'turn', sessionId: 'original-session' },
+      envelope: { format: 'text', sourceName: 'answer' },
+      options: { asyncReturnSessionId: true, resultDelivery: 'conversation', allowChatMessages: true },
+    };
+    const context = buildExternalEventApplicationContext(req);
+    expect(context).toContain('only for messages authorized by this request');
+    expect(context).toContain('do not send a duplicate of the final answer');
+  });
+});

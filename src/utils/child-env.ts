@@ -371,6 +371,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // current session/thread. The worker refreshes them per pane/turn.
   'BOTMUX_SESSION_ID',
   'BOTMUX_SESSION_SCOPE',
+  // Ask behavior is configurable per bot. Carry inherited defaults into the
+  // owning pane, then let explicit per-bot env override them; always unset
+  // stale shared-server/rcfile values for an unconfigured pane.
+  'BOTMUX_ASK_DELIVERY_MODE',
   'BOTMUX_CHAT_ID',
   // Session-scoped plugin MCP relay. The worker owns the credential-bearing
   // Gateway; the CLI and its native MCP launcher receive only this socket

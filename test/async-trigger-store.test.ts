@@ -13,6 +13,15 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+const writeFault = vi.hoisted(() => ({ enabled: false }));
+vi.mock('../src/utils/atomic-write.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/utils/atomic-write.js')>();
+  return { ...actual, atomicWriteFileSync: (...args: Parameters<typeof actual.atomicWriteFileSync>) => {
+    if (writeFault.enabled) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    return actual.atomicWriteFileSync(...args);
+  } };
+});
+
 let tempDir: string;
 
 vi.mock('../src/config.js', () => ({
@@ -29,6 +38,10 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import {
   recordPending,
+  recordInputCommit,
+  recordExecutionStarted,
+  recordOutputPendingTerminal,
+  ASYNC_OUTPUT_DRAIN_MS,
   recordCompleted,
   recordFailedStrict,
   recordTerminalFailureStrict,
@@ -46,6 +59,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  writeFault.enabled = false;
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -499,5 +513,190 @@ describe('recordSteerParked (HTTP steer group restart insurance)', () => {
     file.results.trg_bad = { status: 'completed', createdAt: 1, completedAt: 2, steerParkedBy: 'trg_q' };
     writeFileSync(fp, JSON.stringify(file));
     expect(() => lookupStrict('sessS4', 'trg_bad')).toThrow();
+  });
+});
+
+describe('native completion without hydrated output', () => {
+  it('persists an exact terminal and bounds pending output across restart without a new write', () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    try {
+      recordPending('drain', 'first', 99_000, 'app');
+      recordInputCommit('drain', 'first', 'app', 3);
+      expect(recordOutputPendingTerminal('drain', 'first', 'app', 3)).toBe(true);
+      const persisted = readFileSync(join(tempDir, 'async-triggers', 'drain.json'), 'utf8');
+      expect(lookupStrict('drain', 'first')?.result.status).toBe('pending');
+      clock.mockReturnValue(100_000 + ASYNC_OUTPUT_DRAIN_MS);
+      // Both readers reconstruct the outcome solely from the reopened file.
+      expect(lookupStrict('drain', 'first')?.result).toMatchObject({ status: 'failed', errorCode: 'no_output', reason: 'dispatch_unknown' });
+      expect(lookup('drain', 'first')?.result.status).toBe('failed');
+      expect(readFileSync(join(tempDir, 'async-triggers', 'drain.json'), 'utf8')).toBe(persisted);
+      // Hydrated bytes are stronger than an ambiguous no-output observation.
+      recordCompleted('drain', 'first', 'actual final', Date.now(), 'app');
+      expect(lookupStrict('drain', 'first')?.result).toMatchObject({ status: 'completed', content: 'actual final' });
+    } finally { clock.mockRestore(); }
+  });
+  it('never times out a live turn or an explicit steer group and rejects foreign generation/owner', () => {
+    recordPending('live', 'first', 0, 'app');
+    recordInputCommit('live', 'first', 'app', 2);
+    expect(recordOutputPendingTerminal('live', 'first', 'other', 2, 0)).toBe(false);
+    expect(recordOutputPendingTerminal('live', 'first', 'app', 1, 0)).toBe(false);
+    expect(lookupStrict('live', 'first')?.result.status).toBe('pending');
+    recordSteerParked('live', 'first', 'second', 0, 'app');
+    expect(recordOutputPendingTerminal('live', 'first', 'app', 2, 0)).toBe(false);
+    expect(lookupStrict('live', 'first')?.result.status).toBe('pending');
+  });
+  it('does not extend the drain deadline on repeated terminal messages', () => {
+    recordPending('repeat', 'first', 0, 'app');
+    expect(recordOutputPendingTerminal('repeat', 'first', 'app', 4, 1)).toBe(true);
+    expect(recordOutputPendingTerminal('repeat', 'first', 'app', 4, 20_000)).toBe(true);
+    expect(recordInputCommit('repeat', 'first', 'app', 5)).toBe(false);
+    expect(lookupStrict('repeat', 'first')?.result.outputPendingTerminal?.drainUntil).toBe(1 + ASYNC_OUTPUT_DRAIN_MS);
+  });
+});
+
+describe('native execution start',()=>{
+  it('retains the original queue ACK while a replacement worker starts and completes the same input',()=>{
+    recordPending('queued','trigger',1000,'app');recordInputCommit('queued','trigger','app',1,1100);
+    const started={workerGeneration:2,nativeSessionId:'native-session',nativeTurnId:'native-turn',startedAtMs:1200,proofKind:'codex_rpc_turn_start' as const};
+    expect(recordExecutionStarted('queued','trigger','app',started)).toBe(true);
+    expect(recordInputCommit('queued','trigger','app',2,1300)).toBe(false);
+    expect(recordExecutionStarted('queued','trigger','app',{...started,workerGeneration:3})).toBe(false);
+    expect(recordOutputPendingTerminal('queued','trigger','app',1,1400)).toBe(false);
+    expect(recordOutputPendingTerminal('queued','trigger','app',2,1400)).toBe(true);
+    recordCompleted('queued','trigger','same original result',1500,'app');
+    expect(lookupStrict('queued','trigger')?.result).toMatchObject({status:'completed',
+      inputCommit:{workerGeneration:1,observedAt:1100},executionStarted:started});
+  });
+  it('allows a delayed earlier queue receipt after native start, but rejects a receipt newer than execution',()=>{
+    recordPending('reordered','trigger',1000,'app');
+    expect(recordExecutionStarted('reordered','trigger','app',{workerGeneration:2,nativeSessionId:'s',nativeTurnId:'t',startedAtMs:1200,proofKind:'codex_rpc_turn_start'})).toBe(true);
+    expect(recordInputCommit('reordered','trigger','app',3)).toBe(false);
+    expect(recordInputCommit('reordered','trigger','app',1)).toBe(true);
+    expect(lookupStrict('reordered','trigger')?.result.inputCommit?.workerGeneration).toBe(1);
+  });
+
+  const proof={workerGeneration:3,nativeSessionId:'native-session',nativeTurnId:'native-turn',startedAtMs:1234,proofKind:'codex_transcript_start' as const};
+  it('queue ACK alone stays unknown; exact start survives terminal hydration',()=>{
+    recordPending('session','trigger',1000,'cli_owner');recordInputCommit('session','trigger','cli_owner',3);
+    expect(lookupStrict('session','trigger')?.result.executionStarted).toBeUndefined();
+    expect(recordExecutionStarted('session','trigger','cli_owner',proof)).toBe(true);
+    recordCompleted('session','trigger','done',2000,'cli_owner');
+    expect(lookupStrict('session','trigger')?.result.executionStarted).toEqual(proof);
+  });
+  it('preserves native start proof when a completed successor retires an ambiguous predecessor',()=>{
+    recordPending('session','trigger',1000,'cli_owner');recordInputCommit('session','trigger','cli_owner',3);
+    recordExecutionStarted('session','trigger','cli_owner',proof);
+    recordCompleted('session','successor','done',2000,'cli_owner');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict('session','trigger','successor',3000,'cli_owner')).toBe('superseded');
+    expect(lookupStrict('session','trigger')?.result.executionStarted).toEqual(proof);
+  });
+  it('rejects foreign owner, trigger, generation, and terminal without reopening work',()=>{
+    recordPending('session','trigger',1000,'cli_owner');recordInputCommit('session','trigger','cli_owner',3);
+    expect(recordExecutionStarted('session','trigger','cli_foreign',proof)).toBe(false);
+    expect(recordExecutionStarted('session','other','cli_owner',proof)).toBe(false);
+    expect(recordExecutionStarted('session','trigger','cli_owner',{...proof,workerGeneration:2})).toBe(false);
+    recordCompleted('session','trigger','done',2000,'cli_owner');
+    expect(recordExecutionStarted('session','trigger','cli_owner',proof)).toBe(false);
+    expect(lookupStrict('session','trigger')?.result.status).toBe('completed');
+  });
+});
+
+describe('completion durability and immutable ownership', () => {
+  it('rejects a corrupt file without overwriting any original evidence', () => {
+    recordPending('strict', 'first', 1000, 'app');
+    const path = join(tempDir, 'async-triggers', 'strict.json');
+    writeFileSync(path, '{"results":');
+    expect(() => recordCompleted('strict', 'first', 'done', 2000, 'app')).toThrow();
+    expect(readFileSync(path, 'utf8')).toBe('{"results":');
+  });
+  it('never stamps another bot over an existing owner', () => {
+    recordPending('strict', 'first', 1000, 'app');
+    const path = join(tempDir, 'async-triggers', 'strict.json');
+    const before = readFileSync(path, 'utf8');
+    expect(() => recordCompleted('strict', 'first', 'done', 2000, 'other')).toThrow('owner_mismatch');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+  it('does not acknowledge a failed write; the original pending record remains retryable', () => {
+    recordPending('strict', 'first', 1000, 'app');
+    const path = join(tempDir, 'async-triggers', 'strict.json');
+    const original = readFileSync(path, 'utf8');
+    writeFault.enabled = true;
+    expect(() => recordCompleted('strict', 'first', 'done', 2000, 'app')).toThrow('disk full');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    writeFault.enabled = false;
+    expect(recordCompleted('strict', 'first', 'done', 2000, 'app').status).toBe('completed');
+    expect(lookupStrict('strict', 'first')?.result.content).toBe('done');
+  });
+  it('duplicate completion retains original timing and bytes; a different final is a conflict', () => {
+    const first = recordCompleted('strict', 'first', 'done', 2000, 'app');
+    expect(recordCompleted('strict', 'first', 'done', 3000, 'app')).toEqual(first);
+    expect(() => recordCompleted('strict', 'first', 'different', 4000, 'app')).toThrow('content_conflict');
+    expect(lookupStrict('strict', 'first')?.result).toEqual(first);
+  });
+  it('returns the authoritative interrupt instead of allowing a live completed projection', () => {
+    recordPending('strict', 'first', 1000, 'app');
+    recordInterruptedStrict('strict', 'first', 1500, 'app');
+    expect(recordCompleted('strict', 'first', 'late', 2000, 'app').status).toBe('interrupted');
+  });
+});
+
+describe('durable steer successor handoff before FIFO retirement', () => {
+  it('requires both original recipients and exact bot ownership', () => {
+    recordPending('s', 'first', 1, 'owner');
+    expect(() => recordSteerParked('s', 'first', 'second', 2, 'owner', true)).toThrow('successor_unverified');
+    recordPending('s', 'second', 2, 'owner');
+    expect(() => recordSteerParked('s', 'first', 'second', 2, 'foreign', true)).toThrow('recipient_unverified');
+    expect(lookupStrict('s', 'first')?.result.steerParkedBy).toBeUndefined();
+    recordSteerParked('s', 'first', 'second', 2, 'owner', true);
+    recordCompleted('s', 'second', 'answer', 3, 'owner');
+    expect(followSteerParkedChain('s', lookupStrict('s', 'first')!.result.steerParkedBy!)?.result.content).toBe('answer');
+  });
+  it('preserves the original successor and propagates durable write failures', () => {
+    for (const id of ['first', 'second', 'third']) recordPending('s', id, 1, 'owner');
+    writeFault.enabled = true;
+    expect(() => recordSteerParked('s', 'first', 'second', 2, 'owner', true)).toThrow('disk full');
+    writeFault.enabled = false;
+    expect(lookupStrict('s', 'first')?.result.steerParkedBy).toBeUndefined();
+    recordSteerParked('s', 'first', 'second', 2, 'owner', true);
+    recordSteerParked('s', 'first', 'second', 2, 'owner', true);
+    expect(() => recordSteerParked('s', 'first', 'third', 2, 'owner', true)).toThrow('successor_changed');
+  });
+});
+
+describe('durable async recipient admission', () => {
+  it('does not acknowledge lost storage or overwrite an existing result/foreign owner', () => {
+    writeFault.enabled = true;
+    expect(() => recordPending('s', 't', 1, 'owner', true)).toThrow('disk full');
+    writeFault.enabled = false;
+    expect(lookupStrict('s', 't')).toBeUndefined();
+    recordPending('s', 't', 1, 'owner', true);
+    recordPending('s', 't', 1, 'owner', true);
+    expect(() => recordPending('s', 'foreign', 2, 'other', true)).toThrow('owner_mismatch');
+    recordCompleted('s', 't', 'original', 3, 'owner');
+    expect(() => recordPending('s', 't', 1, 'owner', true)).toThrow('identity_conflict');
+    expect(lookupStrict('s', 't')?.result.content).toBe('original');
+  });
+});
+
+
+describe('frozen async result recipient', () => {
+  it.each(['completed', 'failed', 'interrupted'] as const)('retains conversation delivery after %s and a fresh read', status => {
+    recordPending('conversation', 'answer', 1000, 'cli_test', true, 'conversation');
+    recordInputCommit('conversation', 'answer', 'cli_test', 1, 1500);
+    if (status === 'completed') recordCompleted('conversation', 'answer', 'original reply', 2000, 'cli_test');
+    if (status === 'failed') recordTerminalFailureStrict('conversation', 'answer', 2000, 'cli_test', 'test_failure');
+    if (status === 'interrupted') recordInterruptedStrict('conversation', 'answer', 2000, 'cli_test');
+    const original = lookupStrict('conversation', 'answer')!.result;
+    expect(original).toMatchObject({ status, resultDelivery: 'conversation', inputCommit: { workerGeneration: 1 } });
+    const raw = JSON.parse(readFileSync(join(tempDir, 'async-triggers', 'conversation.json'), 'utf8'));
+    expect(raw.results.answer.resultDelivery).toBe('conversation');
+  });
+  it('rejects a recipient change for the same pending admission and corrupt recipients', () => {
+    recordPending('conversation', 'answer', 1000, 'cli_test', true, 'conversation');
+    expect(() => recordPending('conversation', 'answer', 1000, 'cli_test', true)).toThrow('identity_conflict');
+    const file = join(tempDir, 'async-triggers', 'conversation.json');
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    raw.results.answer.resultDelivery = 'guess'; writeFileSync(file, JSON.stringify(raw));
+    expect(() => lookupStrict('conversation', 'answer')).toThrow();
   });
 });

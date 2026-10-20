@@ -166,6 +166,7 @@ describe('Codex environment updates in adopted turns', () => {
     ].map(ev).join(''));
     q.ingest(drainCodexRollout(path, 0).events);
     expect(retired).toEqual(['lark-turn']);
+    expect(q.drainEmittable()).toEqual([]); // Ordinary steer does not synthesize a failed serial terminal.
     expect(q.peek()).toMatchObject([{ isLocal: true, userText: text }]);
   });
 
@@ -188,6 +189,7 @@ describe('Codex environment updates in adopted turns', () => {
     }).join(''));
     q.ingest(drainCodexRollout(path, 0).events);
     expect(retired).toEqual(['first']);
+    expect(q.drainEmittable()).toEqual([]); // Preserve the original ordinary steering contract.
     expect(q.peek()).toMatchObject([{ turnId: 'second' }]);
     expect(q.peek()[0].isLocal).not.toBe(true);
   });
@@ -1783,4 +1785,16 @@ describe('explicit Codex capacity failures', () => {
 it.each(['401 Unauthorized', '429 Too Many Requests', '400 invalid request'])('a capacity message cannot override %s', async code => {
   const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
   expect(isCodexCapacityError({ code, message: 'Selected model is at capacity. Please try a different model.' })).toBe(false);
+});
+
+it('real 0.163 task_started + delayed user record preserve native start identity across drains',()=>{
+  const sid='01a153cc-b2c3-78f0-9ab0-6976492518c7',tid='01a153cc-c2b9-7750-80a4-ba9590684dac';
+  const file=join(dir,'rollout-2026-10-19T18-54-46-'+sid+'.jsonl');
+  writeFileSync(file,ev({timestamp:'2026-10-19T10:54:50.660Z',type:'event_msg',payload:{type:'task_started',turn_id:tid}}));
+  const starts: unknown[]=[];const q=new CodexBridgeQueue(()=>Date.parse('2026-10-19T10:54:50Z'),undefined,turn=>starts.push({turnId:turn.turnId,session:turn.sourceSessionId,native:turn.sourceTurnId}));
+  q.mark('original-input','First run the isolated check.',Date.parse('2026-10-19T10:54:50Z'));
+  const first=drainCodexRollout(file,0);q.ingest(first.events);expect(starts).toEqual([]);
+  appendFileSync(file,ev(userResponseItem('First run the isolated check.','2026-10-19T10:54:52.976Z')));
+  const second=drainCodexRollout(file,first.newOffset,first.state);q.ingest(second.events);
+  expect(starts).toEqual([{turnId:'original-input',session:sid,native:tid}]);
 });

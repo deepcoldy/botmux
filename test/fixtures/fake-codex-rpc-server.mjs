@@ -28,6 +28,17 @@ if (process.env.FAKE_ENV_PROBE_PATH) {
   }));
 }
 
+// A native tool can survive its launcher and ignore graceful termination.
+if (process.env.FAKE_STUBBORN_CHILD_PATH) {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, ['-e',
+    "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000)"],
+    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], detached: true });
+  await new Promise(resolve => child.once('message', resolve));
+  writeFileSync(process.env.FAKE_STUBBORN_CHILD_PATH, String(child.pid));
+  child.disconnect();
+}
+
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;
@@ -128,7 +139,11 @@ wss.on('connection', (ws) => {
         if (process.env.FAKE_THREAD_CONFIG_FILE) {
           try { writeFileSync(process.env.FAKE_THREAD_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
         }
-        return reply({ thread: { id: 'thread-fake-1' } });
+        if (process.env.FAKE_ROLLOUT_PATH) {
+          writeFileSync(process.env.FAKE_ROLLOUT_PATH, JSON.stringify({ type: 'session_meta', payload: { id: 'thread-fake-1' } }) + '\n');
+        }
+        return reply({ thread: { id: 'thread-fake-1', path: process.env.FAKE_ROLLOUT_PATH },
+          model: msg.params?.config?.model ?? 'test-model', modelProvider: 'test-provider', reasoningEffort: 'high' });
       }
       case 'thread/resume': {
         if (process.env.FAKE_RESUME_CONFIG_FILE) {

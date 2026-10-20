@@ -25,6 +25,10 @@ function validBody(over: Record<string, unknown> = {}) {
 }
 
 describe('parseAskBody — happy path', () => {
+  it('keeps host continuations independent of native async question transport', () => {
+    expect(parseAskBody(validBody({ deliveryMode: 'continuation', requestId: 'original-continuation' })))
+      .toMatchObject({ deliveryMode: 'continuation', requestId: 'original-continuation' });
+  });
   it('parses explicit result acknowledgement without treating it as a new Ask', () => {
     expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
   });

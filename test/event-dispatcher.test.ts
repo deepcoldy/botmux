@@ -3973,6 +3973,17 @@ describe('message listener polling backfill', () => {
     _resetGrantPending();
     __resetMessageListenerPollCursorForTest();
     mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+    // History bodies are flattened. Supply the matching authoritative card
+    // readback; listener assertions still use the original transport snapshot.
+    mockGetMessageDetail.mockImplementation(async (_app: string, id: string) => {
+      for (const result of [...mockListChatMessagesUntil.mock.results].reverse()) {
+        if (result.type !== 'return') continue;
+        const rows = await result.value;
+        const found = rows?.find((item: any) => item.message_id === id);
+        if (found) return {items:[found]};
+      }
+      return {items:[]};
+    });
     setupBotState({
       allowedUsers: [USER_OPEN_ID],
       messageListeners: {
@@ -3991,6 +4002,16 @@ describe('message listener polling backfill', () => {
       },
     });
     handlers = makeHandlers();
+  });
+
+  it('does not admit a polled status notice even when the listener subscribes to all bot cards', async () => {
+    const notice = makeHistoryMessage({senderAppId:OTHER_BOT_APP_ID,senderType:'app',messageType:'interactive',messageId:'om_polled_notice',chatId:'chat_listener',
+      content:JSON.stringify({schema:'2.0',body:{elements:[{tag:'hr',element_id:'botmux_notice_v1'},{tag:'markdown',content:'交接下一步'}]}}),createTime:String(Date.now())});
+    mockListChatMessagesUntil.mockResolvedValueOnce([notice]);
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('routes a recent top-level Argos interactive card found in chat history', async () => {
@@ -4660,6 +4681,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       chatId: 'chat_listener',
     });
     event.message.root_id = undefined as any;
+    mockGetMessageDetail.mockResolvedValueOnce({items:[{message_id:event.message.message_id,chat_id:event.message.chat_id,sender:{sender_type:'app'},body:{content:event.message.content}}]});
 
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
@@ -9426,6 +9448,50 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
+  it.each(['full', 'placeholder'])('does not auto-start or dispatch a bot status notice (%s)', async shape => {
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotTopicSeed('om_notice_seed', 'oc_notice_seed');
+    event.message.message_type = 'interactive';
+    const content = JSON.stringify({schema:'2.0', body:{elements:[
+      {tag:'hr', element_id:'botmux_notice_v1'},
+      {tag:'markdown', content:'开发机器人 → 质量机器人，已排队。'},
+    ]}});
+    event.message.content = shape === 'full' ? content : JSON.stringify({text:'请升级客户端'});
+    mockGetMessageDetail.mockResolvedValueOnce({items:[{message_id:'om_notice_seed',chat_id:'oc_notice_seed',sender:{sender_type:'bot'},body:{content}}]});
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    mockGetMessageDetail.mockReset().mockResolvedValue({items:[]});
+  });
+
+  it('rejects unreadable bot card ACKs and can redeliver the same message without losing or duplicating work', async () => {
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotTopicSeed('om_unreadable_card', 'oc_notice_seed');
+    event.message.message_type = 'interactive';
+    event.message.content = '{}';
+    mockGetMessageDetail.mockRejectedValueOnce(new Error('temporary read outage'));
+    const first = capturedHandlers['im.message.receive_v1'](event);
+    const duplicate = capturedHandlers['im.message.receive_v1'](event);
+    const rejected = await Promise.allSettled([first, duplicate]);
+    expect(rejected.map(item => item.status)).toEqual(['rejected', 'rejected']);
+    expect(rejected.map(item => item.status === 'rejected' ? item.reason.message : '')).toEqual([
+      'temporary read outage', 'temporary read outage',
+    ]);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    mockGetMessageDetail.mockResolvedValue({items:[{
+      message_id:'om_unreadable_card',chat_id:'oc_notice_seed',sender:{sender_type:'bot'},
+      body:{content:JSON.stringify({schema:'2.0',body:{elements:[{tag:'markdown',content:'请开始审查'}]}})},
+    }]});
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    mockGetMessageDetail.mockReset().mockResolvedValue({items:[]});
+  });
+
   it('已知 peer bot 开新话题（未 @）+ 开关开 → 自动开工', async () => {
     setupAutoTopicBotSender(true, true);
     const event = makeBotTopicSeed('msg-bot-seed-1', 'chat-bot-topic-1');
@@ -12454,6 +12520,16 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
       },
     };
   }
+
+  it('captures managed edits before the first-mention shortcut using the native readback version and sender', async () => {
+    handlers.captureHumanInput=vi.fn(()=>true);
+    mockGetMessageDetail.mockResolvedValue({items:[{...makeReadbackItem({messageId:'om_managed_edit',text:'revised without mention',mentioned:false}),update_time:'1720000000123'}]});
+    await capturedHandlers['im.message.updated_v1']({...makeUpdatedEvent('om_managed_edit','evt-managed-edit'),operator:{operator_id:{open_id:'ou_forged'}}});
+    await flushEventWork();
+    expect(handlers.captureHumanInput).toHaveBeenCalledWith(expect.objectContaining({__captureContentVersion:'1720000000123',sender:expect.objectContaining({sender_id:expect.objectContaining({open_id:USER_OPEN_ID})})}));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
 
   function grantEvents(messageId: string, inThread = false) {
     const text = '@_bot_a /grant @_target';

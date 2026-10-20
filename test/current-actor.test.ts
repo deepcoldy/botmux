@@ -2,6 +2,8 @@ import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
+import * as ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -102,12 +104,39 @@ describe('current actor client contract', () => {
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
   });
 
-  it('republishes the opening turn after the live CLI pid is attested', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const start = worker.indexOf('function publishLocalProcessAttestation');
-    const body = worker.slice(start, worker.indexOf('/** Deliver a terminal IPC', start));
-    expect(body).toContain("type: 'local_process_attestation'");
-    expect(body).toContain('if (currentBotmuxTurnId) publishSandboxRelayCapability()');
+  it.each([
+    { name: 'opening turn', turnId: 'turn-1', refresh: undefined, warm: false, expectSnapshot: true },
+    { name: 'no active turn', turnId: undefined, refresh: undefined, warm: false, expectSnapshot: false },
+    { name: 'warm app reconnect', turnId: 'turn-1', refresh: false, warm: true, expectSnapshot: false },
+  ])('publishes process identity before any turn snapshot: $name', ({ turnId, refresh, warm, expectSnapshot }) => {
+    // Execute the production function without booting a Worker. Source-string
+    // matching cannot prove ordering or that warm reconnects retain the snapshot.
+    const worker = ts.createSourceFile('worker.ts',
+      readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
+    const declaration = worker.statements.find((statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && statement.name?.text === 'publishLocalProcessAttestation');
+    expect(declaration).toBeDefined();
+    const code = ts.transpileModule(declaration!.getText(worker), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const calls: Array<{ kind: string; payload?: unknown }> = [];
+    const publish = runInNewContext(`${code}\npublishLocalProcessAttestation`, {
+      codexRpcEngine: warm ? undefined : { appServerPid: 102 },
+      codexAppProcessAttestation: warm ? { enginePid: 102, engineProcStart: 'frozen-102' } : undefined,
+      readProcessStartIdentity: (pid: number) => `start-${pid}`,
+      effectiveBackendType: 'pty',
+      currentCliCredentialIsolated: false,
+      currentBotmuxTurnId: turnId,
+      send: (payload: unknown) => calls.push({ kind: 'identity', payload }),
+      publishSandboxRelayCapability: () => calls.push({ kind: 'snapshot' }),
+    }) as (cliPid: number, enginePid?: number, refreshTurnSnapshot?: boolean) => void;
+    publish(101, undefined, refresh);
+    expect(calls.map(call => call.kind)).toEqual(expectSnapshot ? ['identity', 'snapshot'] : ['identity']);
+    expect(calls[0].payload).toEqual({
+      type: 'local_process_attestation', backendType: 'pty', credentialIsolated: false,
+      cliPid: 101, cliProcStart: 'start-101', enginePid: 102,
+      engineProcStart: warm ? 'frozen-102' : 'start-102',
+    });
   });
 
   it('accepts only the machine-readable current command', () => {

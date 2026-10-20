@@ -155,6 +155,7 @@ import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hook
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
+import { recordPending as recordAsyncPending, lookupStrict as lookupAsyncStrict } from '../src/services/async-trigger-store.js';
 import { homedir, tmpdir } from 'node:os';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -1836,17 +1837,43 @@ describe('Bridge final_output delivery (P2 retry)', () => {
         },
       } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
 
-      await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+      if (deliverySink !== 'http_async') await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
       expect(sessionReply).not.toHaveBeenCalled();
       await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'codex_app_dispatch_persisted',
           requestId: `settle-${deliverySink}`,
-          ok: true,
+          ok: deliverySink !== 'http_async',
         }),
       ));
+      if (deliverySink === 'http_async') expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
     },
   );
+
+  it.each([false, true].flatMap(conversation => [false, true].map(suppressDelivery => ({ conversation, suppressDelivery }))))('recovers the durable Codex App async recipient (conversation=$conversation, suppressed=$suppressDelivery)', async ({ conversation, suppressDelivery }) => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'recover-d', turnId: 'recover-t', state: 'prepared', content: 'input', deliverySink: 'http_async',
+    }];
+    recordAsyncPending(ds.session.sessionId, 'recover-t', Date.now(), ds.larkAppId, true, conversation ? 'conversation' : undefined);
+    ds.asyncTriggerResults = undefined;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, content: 'original result', lastUuid: 'recover-output',
+      turnId: 'recover-t', suppressDelivery,
+      codexAppSettlement: { requestId: 'recover-s', generation: 'recover-g', seq: 1, dispatchId: 'recover-d' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+    expect(lookupAsyncStrict(ds.session.sessionId, 'recover-t')?.result).toMatchObject({
+      status: 'completed', content: 'original result',
+    });
+    expect(sessionReply).toHaveBeenCalledTimes(conversation && !suppressDelivery ? 1 : 0);
+    if (conversation) expect(lookupAsyncStrict(ds.session.sessionId, 'recover-t')?.result.resultDelivery).toBe('conversation');
+  });
 
   it.each([
     { name: 'non-steerable head', steerable: false, sink: 'lark' as const },
@@ -2089,6 +2116,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'd-http-grp-1', turnId: 'turn-http-grp-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
       { dispatchId: 'd-http-grp-2', turnId: 'turn-http-grp-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
     ];
+    for (const [turnId, result] of ds.asyncTriggerResults!) {
+      recordAsyncPending(ds.session.sessionId, turnId, result.createdAt, ds.larkAppId);
+    }
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     // Member 1: superseded — ACK true, ledger pops, parked for fan-out, no Lark.
@@ -2209,6 +2239,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'd-prune-1', turnId: 'turn-prune-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
       { dispatchId: 'd-prune-2', turnId: 'turn-prune-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
     ];
+    for (const [turnId, result] of ds.asyncTriggerResults!) {
+      recordAsyncPending(ds.session.sessionId, turnId, result.createdAt, ds.larkAppId);
+    }
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     // Member 1 settles superseded → parked for fan-out.
@@ -3000,17 +3033,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(card).not.toContain('ou_dispatcher_bot');
     });
 
-    it('addresses the ambiguous-terminal failure card to the bot admin, not the dispatcher', async () => {
+    it.each(['ordinary', 'caller', 'conversation'] as const)('routes the %s ambiguous-terminal failure card to its actual recipient', async recipient => {
       await bindTopicToDispatcher();
       vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
       const sessionReply = vi.fn(async () => 'om_failed_card');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = dispatchedRunnerDs('dsh');
       ds.adoptedFrom = undefined;
+      if (recipient !== 'ordinary') {
+        recordAsyncPending(ds.session.sessionId, 'turn-1', Date.now(), ds.larkAppId, true,
+          recipient === 'conversation' ? 'conversation' : undefined);
+        ds.asyncTriggerResults = new Map([['turn-1', lookupAsyncStrict(ds.session.sessionId, 'turn-1')!.result as any]]);
+      }
       const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
       ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'turn-1', status: 'ambiguous' });
       await vi.advanceTimersByTimeAsync(10);
+      if (recipient === 'caller') {
+        expect(sessionReply).not.toHaveBeenCalled(); return;
+      }
       expect(sessionReply).toHaveBeenCalledOnce();
       expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
     });

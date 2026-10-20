@@ -9,10 +9,10 @@
  *   等历史回归，纯 mock 测不到）
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   __testOnly_readComm,
   __testOnly_readCwd,
@@ -54,12 +54,12 @@ describe('readComm', () => {
   it('返回子进程的 comm 名 (basename, 不含路径)', () => {
     const comm = __testOnly_readComm(child.pid!);
     expect(comm).toBeDefined();
-    // Linux /proc/<pid>/comm 给短名 "node"；BSD ps 给完整路径，readComm
-    // 已统一 basename，所以这里都不应包含 "/"。
+    // comm 是系统报告的进程短名，Node 24 也可能报告 MainThread，
+    // 不能从可执行文件名推断。用实际 ps 观察核对 Linux procfs 读取和 BSD 路径归一化。
     expect(comm).not.toContain('/');
-    // The child is `process.execPath`: Node on vitest, bun on `bun test`.
-    // Linux `/proc/<pid>/comm` is the short name of whichever runtime we spawned.
-    expect(comm).toMatch(/^(node|bun)/i);
+    const observed = execFileSync('ps', ['-o', 'comm=', '-p', String(child.pid!)], { encoding: 'utf8' }).trim();
+    expect(observed).not.toBe('');
+    expect(comm).toBe(basename(observed));
   });
 
   it('对不存在的 PID 返回 undefined', () => {

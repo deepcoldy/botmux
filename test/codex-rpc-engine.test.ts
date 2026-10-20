@@ -3,8 +3,9 @@ import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync }
 import { fileURLToPath } from 'node:url';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
+import { sessionScopeCapabilities, sessionScopeReleased } from '../src/core/session-scope.js';
 import { join } from 'node:path';
-import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import { CodexRpcEngine, rpcRuntimeNeedsStartupRestore, releaseCodexRpcScope } from '../src/codex-rpc-engine.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -32,13 +33,57 @@ function makeEngine(
     cliBin: FIXTURE, cwd: tmpdir(), env: process.env,
     sessionId: `test-${Math.round(performance.now())}-${over.sessionId ?? ''}`,
     ...over,
-  }, dependencies);
+  }, { scopeCapabilities: { cleanupSupported: false, memoryControllerSupported: false },
+    spawnProcess: spawn, ...dependencies });
   liveEngines.add(engine);
   return engine;
 }
 const owner = (turnId: string, dispatchAttempt?: number) => ({
   turnId,
   ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+});
+
+describe('original RPC startup runtime recovery', () => {
+  it('only restores an interrupted startup and validates the original transcript identity and completeness', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-runtime-'));
+    const path = join(dir, 'rollout.jsonl');
+    const binding = { threadId: 'original-thread', rolloutPath: path, model: 'original-model',
+      modelProvider: 'original-provider', reasoningEffort: 'high' };
+    const header = JSON.stringify({ type: 'session_meta', payload: { id: binding.threadId } }) + '\n';
+    try {
+      writeFileSync(path, header + JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }) + '\n');
+      expect(rpcRuntimeNeedsStartupRestore(binding)).toBe(true);
+      expect(() => rpcRuntimeNeedsStartupRestore({ ...binding, threadId: 'different' })).toThrow('thread_mismatch');
+      writeFileSync(path, header + '{"type":');
+      expect(() => rpcRuntimeNeedsStartupRestore(binding)).toThrow('source_unstable');
+      writeFileSync(path, header + JSON.stringify({ type: 'turn_context', payload: { model: 'user-selected-model' } }) + '\n');
+      expect(rpcRuntimeNeedsStartupRestore(binding)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('supplies the complete original triple only before any runtime context was persisted', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-runtime-request-'));
+    const path = join(dir, 'rollout.jsonl');
+    const config = join(dir, 'resume.json');
+    const binding = { threadId: 'thread-fake-1', rolloutPath: path, model: 'original-model',
+      modelProvider: 'original-provider', reasoningEffort: 'high' };
+    const header = JSON.stringify({ type: 'session_meta', payload: { id: binding.threadId } }) + '\n';
+    writeFileSync(path, header);
+    const engine = makeEngine({ model: 'new-default', reasoningEffort: 'low', env: { ...process.env, FAKE_RESUME_CONFIG_FILE: config } });
+    try {
+      await engine.start();
+      await engine.resumeThread(binding.threadId, binding);
+      expect(JSON.parse(readFileSync(config, 'utf8'))).toMatchObject({ model: 'original-model',
+        modelProvider: 'original-provider', config: { model_reasoning_effort: 'high' } });
+      writeFileSync(path, header + JSON.stringify({ type: 'turn_context', payload: { model: 'user-selected-model' } }) + '\n');
+      await engine.resumeThread(binding.threadId, binding);
+      const resumed = JSON.parse(readFileSync(config, 'utf8'));
+      expect(resumed.model).toBeUndefined(); expect(resumed.modelProvider).toBeUndefined();
+      expect(resumed.config.model_reasoning_effort).toBeUndefined();
+    } finally { await engine.stopAndWait(); rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
@@ -843,6 +888,23 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     expect(dead).toBe(false);
   }, 20_000);
 
+  it('does not release execution when only the launcher exited; kills a stubborn native child', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { isLinuxZombie } = await import('../src/utils/process-identity.js');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-native-release-'));
+    const childPath = join(dir, 'child.pid');
+    const engine = makeEngine({ env: { ...process.env, FAKE_STUBBORN_CHILD_PATH: childPath } });
+    try {
+      await engine.start();
+      const pid = Number(readFileSync(childPath, 'utf8'));
+      expect(isAlive(pid)).toBe(true);
+      expect(await engine.stopAndWait(100)).toBe(false);
+      expect(isAlive(pid) && !isLinuxZombie(pid)).toBe(true);
+      expect(await engine.stopAndWait()).toBe(true);
+      expect(isAlive(pid) && !isLinuxZombie(pid)).toBe(false);
+    } finally { await engine.stopAndWait(); rmSync(dir, { recursive: true, force: true }); }
+  }, 20_000);
+
   it('stop releases every still-active native turn with its exact owner', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({
@@ -880,4 +942,46 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     expect(order).toEqual(['terminal:active-dead:engine-dead', 'dead']);
     engine.stop();
   }, 20_000);
+});
+
+
+describe('RPC scope owner validation before native recovery', () => {
+  it.each(['', 'rpc-foreign-00000000-0000-0000-0000-000000000000', '../other.scope'])('rejects an unbound scope %s before any stop', scope => {
+    expect(() => releaseCodexRpcScope(scope, 'original-session')).toThrow('rpc_native_scope_owner_mismatch');
+  });
+});
+
+
+describe('native RPC scope lifecycle on a real systemd user bus', () => {
+  it.runIf(sessionScopeCapabilities().cleanupSupported)('fences detached tools after natural root death using the original durable runtime', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { isLinuxZombie } = await import('../src/utils/process-identity.js');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-owned-scope-'));
+    const childPath = join(dir, 'child.pid');
+    const sid = `scope-proof-${process.pid}-${Date.now()}`;
+    let died = false;
+    const engine = makeEngine({ sessionId: sid, onDead: () => { died = true; }, env: { ...process.env, FAKE_STUBBORN_CHILD_PATH: childPath, FAKE_ROLLOUT_PATH: join(dir, 'rollout.jsonl') } }, {
+      spawnProcess: spawn, scopeCapabilities: { cleanupSupported: true, memoryControllerSupported: false },
+    });
+    try {
+      await engine.start();
+      await engine.startThread();
+      const original = JSON.parse(JSON.stringify(engine.activeThreadRuntime));
+      expect(original.nativeScopeId).toBeTruthy();
+      const childPid = Number(readFileSync(childPath, 'utf8'));
+      expect(isAlive(childPid)).toBe(true);
+      process.kill(engine.appServerPid!, 'SIGKILL');
+      const deathDeadline = Date.now() + 10_000;
+      while (!died && Date.now() < deathDeadline) await new Promise(r => setTimeout(r, 25));
+      expect(died).toBe(true);
+      const deadline = Date.now() + 10_000;
+      while (!await engine.stopAndWait() && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      expect(sessionScopeReleased(original.nativeScopeId)).toBe(true);
+      expect(isAlive(childPid) && !isLinuxZombie(childPid)).toBe(false);
+      // A new process can independently establish the same proof after marker
+      // removal; a current engine's PID or viewer is not needed.
+      expect(releaseCodexRpcScope(original.nativeScopeId, sid)).toBe(true);
+      expect(() => releaseCodexRpcScope(original.nativeScopeId, 'foreign')).toThrow('owner_mismatch');
+    } finally { await engine.stopAndWait(); rmSync(dir, { recursive: true, force: true }); }
+  }, 25_000);
 });

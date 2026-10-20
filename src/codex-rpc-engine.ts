@@ -24,19 +24,24 @@
 import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { join, isAbsolute } from 'node:path';
+import type { CodexRpcThreadRuntime } from './types.js';
 import { homedir } from 'node:os';
+import { randomUUID, createHash } from 'node:crypto';
+import { wrapCommandInSessionScope, stopSessionScope, sessionScopeReleased, type SessionScopeCapabilities } from './core/session-scope.js';
 import { WebSocket } from 'ws';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
   CODEX_CAPACITY_ERROR_CODE,
   isCodexCapacityError,
   isExactCodexOutputLimitError,
+  readLatestCodexRuntime,
 } from './services/codex-transcript.js';
 import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
 import { pidIsSignalable } from './utils/process-alive.js';
+import { captureCodexNativeProcesses, signalCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
@@ -116,6 +121,7 @@ export interface CodexRpcEngineDependencies {
   /** Process boundary kept injectable so launch argv/env can be verified without
    * relying on platform-specific process introspection such as Linux /proc. */
   spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+  scopeCapabilities?: SessionScopeCapabilities;
   validateServiceTier?(input: {
     cliBin: string;
     env: NodeJS.ProcessEnv;
@@ -180,8 +186,46 @@ const REQUEST_TIMEOUT_MS = 60_000;
  *  200ms–10s budgets. */
 const MIN_POLL_REQUEST_BUDGET_MS = 50;
 
+/** Only an identity-checked, complete original transcript can establish that
+ * startup ended before native model settings were persisted. */
+export function rpcRuntimeNeedsStartupRestore(runtime: CodexRpcThreadRuntime): boolean {
+  if (!runtime.threadId || !runtime.model || !runtime.modelProvider || !isAbsolute(runtime.rolloutPath)) {
+    throw new Error('rpc_startup_runtime_identity_invalid');
+  }
+  const before = statSync(runtime.rolloutPath);
+  if (!before.isFile()) throw new Error('rpc_startup_runtime_source_invalid');
+  const assertStable = () => {
+    const after = statSync(runtime.rolloutPath);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs) throw new Error('rpc_startup_runtime_source_unstable');
+  };
+  const fd = openSync(runtime.rolloutPath, 'r');
+  const header = Buffer.alloc(Math.min(before.size, 64 * 1024));
+  try { readSync(fd, header, 0, header.length, 0); } finally { closeSync(fd); }
+  const firstLineEnd = header.indexOf(10);
+  if (firstLineEnd < 0) throw new Error('rpc_startup_runtime_header_incomplete');
+  const first = JSON.parse(header.subarray(0, firstLineEnd).toString('utf8'));
+  if (first.type !== 'session_meta' || (first.payload?.id ?? first.payload?.session_id) !== runtime.threadId) {
+    throw new Error('rpc_startup_runtime_thread_mismatch');
+  }
+  if (before.size > 2 * 1024 * 1024) {
+    const runtimeObserved = readLatestCodexRuntime(runtime.rolloutPath).model;
+    assertStable();
+    if (runtimeObserved) return false;
+    throw new Error('rpc_startup_runtime_evidence_incomplete');
+  }
+  const text = readFileSync(runtime.rolloutPath, 'utf8');
+  assertStable();
+  if (!text.endsWith('\n')) throw new Error('rpc_startup_runtime_source_unstable');
+  const records = text.trim().split('\n').map(line => JSON.parse(line));
+  return !records.some(record => record.type === 'turn_context' && typeof record.payload?.model === 'string');
+}
+
 export class CodexRpcEngine {
   private child?: ChildProcess;
+  private nativeShutdownSnapshot?: ReturnType<typeof captureCodexNativeProcesses>;
+  private nativeShutdownProof?: Promise<boolean>;
+  private nativeScopeId?: string;
   private ws?: WebSocket;
   private nextId = 1;
   private pending = new Map<number, {
@@ -201,6 +245,7 @@ export class CodexRpcEngine {
   }>();
   private port = 0;
   private threadId?: string;
+  private threadRuntime?: CodexRpcThreadRuntime;
   private closed = false;
   private deadNotified = false;
   private lastStderr = '';
@@ -215,6 +260,7 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
+  get activeThreadRuntime(): CodexRpcThreadRuntime | undefined { return this.threadRuntime && { ...this.threadRuntime }; }
   get appServerPid(): number | undefined { return this.child?.pid; }
 
   private ownerKey(identity: CodexRpcTurnIdentity): string {
@@ -310,7 +356,7 @@ export class CodexRpcEngine {
 
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
-    this.reapStaleAppServer();
+    await this.reapStaleAppServer();
     const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
       cliBin: this.opts.cliBin,
       env: this.opts.env,
@@ -322,7 +368,13 @@ export class CodexRpcEngine {
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);
-    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    const args = ['app-server', ...featureArgs, ...configArgs, '--listen', this.wsUrl];
+    const scopeId = this.opts.sessionId ? `${rpcScopePrefix(this.opts.sessionId)}${randomUUID()}` : undefined;
+    const launch = scopeId
+      ? wrapCommandInSessionScope(scopeId, this.opts.cliBin, args, undefined, this.dependencies.scopeCapabilities)
+      : { bin: this.opts.cliBin, args, unitName: undefined };
+    this.nativeScopeId = launch.unitName ? scopeId : undefined;
+    this.child = this.dependencies.spawnProcess(launch.bin, launch.args, {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -336,7 +388,11 @@ export class CodexRpcEngine {
     });
     this.child.once('error', err => this.failAll(new Error(`codex app-server spawn failed: ${err.message}`)));
     this.child.once('exit', (code, signal) => {
-      this.removeMarkerIfOwned(); // child confirmed dead → drop OUR marker only (ABA-safe)
+      // A launcher can exit before its children. The shutdown proof owns marker
+      // removal once a process-tree snapshot exists.
+      // Keep the durable marker when a launcher dies naturally: detached tools
+      // may still be alive. Scope or captured-tree proof owns removal.
+      if (this.nativeScopeId) this.beginScopeRelease();
       if (!this.closed) this.failAll(new Error(`codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`));
     });
     this.writeMarker();
@@ -355,13 +411,14 @@ export class CodexRpcEngine {
     const r = await this.request('thread/start', this.threadParams());
     this.threadId = String(r?.thread?.id ?? '');
     if (!this.threadId) throw new Error('thread/start returned no thread id');
+    this.captureThreadRuntime(r);
     return this.threadId;
   }
 
   /** Resume the persisted thread after a botmux reconnect (P0 resume-survival),
    *  so RPC mode stays engaged across daemon restarts instead of reverting to
    *  the paste path. */
-  async resumeThread(threadId: string): Promise<string> {
+  async resumeThread(threadId: string, startupRuntime?: CodexRpcThreadRuntime): Promise<string> {
     // forResume=true: a cold resume must NOT re-send ANY model-related override.
     // The codex/TraeX app-server sees any single override (model OR
     // model_reasoning_effort) as "caller is pinning config" and early-returns out
@@ -376,9 +433,32 @@ export class CodexRpcEngine {
     // remains the only non-model resume override. Fresh thread/start stamps it too.
     const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
+    if (startupRuntime) {
+      if (startupRuntime.threadId !== threadId) throw new Error('rpc_startup_runtime_thread_mismatch');
+      if (rpcRuntimeNeedsStartupRestore(startupRuntime)) {
+        // Restore the exact admitted triple, never the current bot default.
+        params.model = startupRuntime.model;
+        params.modelProvider = startupRuntime.modelProvider;
+        if (startupRuntime.reasoningEffort) params.config.model_reasoning_effort = startupRuntime.reasoningEffort;
+      }
+    }
     const r = await this.request('thread/resume', params);
     this.threadId = String(r?.thread?.id ?? threadId);
+    this.captureThreadRuntime(r);
     return this.threadId;
+  }
+
+  private captureThreadRuntime(result: Json): void {
+    const threadId = String(result.thread?.id ?? '');
+    const rolloutPath = String(result.thread?.path ?? '');
+    const model = String(result.model ?? result.thread?.model ?? '');
+    const modelProvider = String(result.modelProvider ?? result.thread?.modelProvider ?? '');
+    const reasoningEffort = result.reasoningEffort ?? result.thread?.reasoningEffort;
+    this.threadRuntime = threadId && rolloutPath && model && modelProvider
+      ? { threadId, rolloutPath, model, modelProvider,
+          ...(typeof reasoningEffort === 'string' ? { reasoningEffort } : {}),
+          ...(this.nativeScopeId ? { nativeScopeId: this.nativeScopeId } : {}) }
+      : undefined;
   }
 
   private threadParams(forResume = false): Json {
@@ -566,6 +646,11 @@ export class CodexRpcEngine {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.child?.pid && this.child.exitCode == null && this.child.signalCode == null) {
+      try { this.nativeShutdownSnapshot = captureCodexNativeProcesses([this.child.pid]); }
+      catch (error) { this.log(`[codex-rpc] native shutdown capture unavailable: ${error}`); }
+      this.writeMarker(true);
+    }
     this.emitAllTurnTerminals('stopped', 'rpc_engine_stopped');
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
@@ -581,28 +666,52 @@ export class CodexRpcEngine {
         if (child.exitCode == null && child.signalCode == null && isAlive(pid)) {
           try { killGroup(pid, 'SIGKILL'); } catch { /* */ }
         }
+        // The wrapper's exit must not cancel escalation for a surviving tool.
+        if (this.nativeShutdownSnapshot) signalCodexNativeProcesses(this.nativeShutdownSnapshot, 'SIGKILL');
       }, 2000);
-      child.once('exit', () => clearTimeout(t));
       t.unref?.();
-    } else {
-      this.removeMarkerIfOwned();
+      if (this.nativeShutdownSnapshot && !this.nativeScopeId) {
+        this.nativeShutdownProof = waitForCodexNativeRelease(this.nativeShutdownSnapshot).then(released => {
+          if (released) { clearTimeout(t); this.removeMarkerIfOwned(); }
+          else this.nativeShutdownProof = undefined;
+          return released;
+        });
+      }
     }
+    if (this.nativeScopeId) this.beginScopeRelease();
     this.failAll(new Error('engine stopped'));
   }
 
-  /** Keep this owner alive until the actual native child exit is observed.
-   * stop() remains synchronous for restart callers; explicit close awaits this. */
+  /** A transport terminal is not process death. Explicit owners await the full
+   * captured tree, including tool children that outlive the app-server wrapper. */
   async stopAndWait(timeoutMs = 3_500): Promise<boolean> {
-    const child = this.child;
-    if (!child) { this.stop(); return false; }
-    const exited = child.exitCode != null || child.signalCode != null;
-    if (exited) { this.stop(); return true; }
-    return new Promise<boolean>(resolve => {
-      const done = (ok: boolean) => { clearTimeout(timer); child.off('exit', onExit); resolve(ok); };
-      const onExit = () => done(true);
-      const timer = setTimeout(() => done(false), timeoutMs);
-      child.once('exit', onExit);
-      this.stop();
+    this.stop();
+    // Missing capture must not be converted into positive execution release.
+    if (this.nativeScopeId) return this.beginScopeRelease();
+    if (!this.nativeShutdownSnapshot) return false;
+    const proof = this.nativeShutdownProof ??= waitForCodexNativeRelease(this.nativeShutdownSnapshot, timeoutMs).then(released => {
+      if (released) this.removeMarkerIfOwned();
+      else this.nativeShutdownProof = undefined;
+      return released;
+    });
+    return new Promise(resolve => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      void proof.then(released => { clearTimeout(timer); resolve(released); });
+    });
+  }
+
+  private beginScopeRelease(): Promise<boolean> {
+    if (this.nativeShutdownProof) return this.nativeShutdownProof;
+    const scope = this.nativeScopeId;
+    if (!scope) return Promise.resolve(false);
+    return this.nativeShutdownProof = Promise.resolve().then(async () => {
+      stopSessionScope(scope, { signal: 'SIGKILL' });
+      const released = sessionScopeReleased(scope)
+        && (this.nativeShutdownSnapshot ? await waitForCodexNativeRelease(this.nativeShutdownSnapshot)
+          : !!this.child && (this.child.exitCode != null || this.child.signalCode != null));
+      if (released) this.removeMarkerIfOwned();
+      else this.nativeShutdownProof = undefined;
+      return released;
     });
   }
 
@@ -633,25 +742,50 @@ export class CodexRpcEngine {
   /** Kill an app-server left behind by a prior incarnation of this session
    *  (e.g. the worker was SIGKILLed so its exit hooks never ran). Identity-checked
    *  so a reused pid is never mis-killed. */
-  private reapStaleAppServer(): void {
+  private async reapStaleAppServer(): Promise<void> {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
-    try {
-      const [pidStr, markedUrl] = readFileSync(mp, 'utf8').trim().split('\n');
-      const pid = parseInt(pidStr, 10);
-      if (Number.isInteger(pid) && pid > 0 && isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) {
-        killGroup(pid, 'SIGKILL'); // orphan from a crashed worker — no grace needed
-        this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
+    const raw = readFileSync(mp, 'utf8');
+    const [pidStr, markedUrl, captured, scopeId] = raw.trim().split('\n');
+    const pid = Number(pidStr);
+    let processes: ReturnType<typeof captureCodexNativeProcesses> | undefined;
+    if (scopeId) {
+      if (!releaseCodexRpcScope(scopeId, this.opts.sessionId!)) throw new Error('rpc_stale_native_exit_unproven');
+      if (existsSync(mp) && readFileSync(mp, 'utf8') === raw) rmSync(mp, { force: true });
+      return;
+    }
+    if (captured && captured !== 'null') {
+      const parsed: unknown = JSON.parse(captured);
+      if (!Array.isArray(parsed) || !parsed.length || parsed.length > 64
+        || parsed.some(p => !Number.isSafeInteger(p?.pid) || p.pid <= 1 || typeof p.started !== 'string')) {
+        throw new Error('invalid native shutdown marker');
       }
-      rmSync(mp, { force: true });
-    } catch { /* best effort */ }
+      processes = parsed;
+    }
+    if (Number.isInteger(pid) && pid > 1 && isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) {
+      processes ??= captureCodexNativeProcesses([pid]);
+      killGroup(pid, 'SIGKILL');
+      this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
+    }
+    if (processes) {
+      signalCodexNativeProcesses(processes, 'SIGKILL');
+      if (!await waitForCodexNativeRelease(processes)) throw new Error('rpc_stale_native_exit_unproven');
+    }
+    // Do not delete an identity another incarnation wrote during the wait.
+    if (existsSync(mp) && readFileSync(mp, 'utf8') === raw) rmSync(mp, { force: true });
   }
 
-  private writeMarker(): void {
+  private writeMarker(onlyIfOwned = false): void {
     const mp = this.markerPath();
     if (!mp || !this.child?.pid) return;
+    if (onlyIfOwned) {
+      try {
+        const [pid, url] = readFileSync(mp, 'utf8').trim().split('\n');
+        if (pid !== String(this.child.pid) || url !== this.wsUrl) return;
+      } catch { return; }
+    }
     // pid + the exact --listen url so a reused pid fails the identity check.
-    try { mkdirSync(MARKER_DIR, { recursive: true }); writeFileSync(mp, `${this.child.pid}\n${this.wsUrl}`, { mode: 0o600 }); }
+    try { mkdirSync(MARKER_DIR, { recursive: true }); writeFileSync(mp, `${this.child.pid}\n${this.wsUrl}${this.nativeShutdownSnapshot || this.nativeScopeId ? `\n${JSON.stringify(this.nativeShutdownSnapshot ?? null)}` : ''}${this.nativeScopeId ? `\n${this.nativeScopeId}` : ''}`, { mode: 0o600 }); }
     catch { /* best effort */ }
   }
 
@@ -952,4 +1086,20 @@ export class CodexRpcEngine {
       try { this.opts.onDead?.(); } catch { /* best effort */ }
     }
   }
+}
+
+/** The caller supplies the original prewrite runtime, never a current/default
+ * scope. Validate the full owner before signalling a systemd unit. */
+export function releaseCodexRpcScope(scopeId: string, sessionId: string): boolean {
+  const prefix = rpcScopePrefix(sessionId);
+  if (!scopeId.startsWith(prefix) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(scopeId.slice(prefix.length))
+    || scopeId.length > 96) {
+    throw new Error('rpc_native_scope_owner_mismatch');
+  }
+  stopSessionScope(scopeId, { signal: 'SIGKILL' });
+  return sessionScopeReleased(scopeId);
+}
+
+function rpcScopePrefix(sessionId: string): string {
+  return `rpc-${createHash('sha256').update(sessionId).digest('hex').slice(0, 32)}-`;
 }

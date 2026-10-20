@@ -2217,7 +2217,7 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
-  it('preserves TRAE steer attribution: the last typed-ahead turn gets the single completion', () => {
+  it('preserves TRAE steer attribution and explicitly retires the merged predecessor', () => {
     writeFileSync(path, [
       line(user('first durable prompt', '2000-01-01T00:00:01.000Z')),
       line(user('second steered prompt', '2000-01-01T00:00:02.000Z')),
@@ -2230,11 +2230,16 @@ describe('drainTraexRollout', () => {
 
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({
+        turnId: 'delivery-1', dispatchAttempt: 3, finalText: '',
+        terminalStatus: 'ambiguous', terminalErrorCode: 'native_turn_merged',
+      }),
+      expect.objectContaining({
         turnId: 'delivery-2',
         dispatchAttempt: 4,
         finalText: 'one merged answer',
       }),
     ]);
+    expect(queue.drainEmittable()).toEqual([]);
   });
 
   it('maps a task_complete error payload to a failed terminal (path A: endpoint failure)', () => {

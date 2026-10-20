@@ -198,3 +198,16 @@ describe('adopted Codex turn recovery', () => {
     expect(live).toHaveLength(2);
   });
 });
+
+it('keeps canonical serial inputs out of the legacy journal and rejects stale serial marks at restore', () => {
+  const owned = (id: string) => id === 'om_original';
+  const old = checkpoint();
+  expect(readBridgeTurnJournal(path)).toHaveLength(1);
+  const restored = new CodexBridgeQueue(() => 40_000);
+  const result = restoreCodexAdoptTurns(path, rollout, restored, events, 35_000, 40_000, owned);
+  expect(result.restored).toBe(0);
+  restored.absorb(result.history); restored.ingest(result.live);
+  expect(restored.peek()).toEqual([]);
+  checkpointCodexAdoptTurns(path, rollout, old, 0, owned);
+  expect(readBridgeTurnJournal(path)).toEqual([]);
+});

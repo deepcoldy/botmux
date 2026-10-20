@@ -25,7 +25,7 @@ export default defineConfig({
       {
         test: {
           name: 'unit',
-          include: ['test/**/*.{test,spec}.ts'],
+          include: ['test/**/*.{test,spec}.ts', 'src/**/__tests__/*.test.ts'],
           // Belt-and-suspenders: *.test.ts never matches *.e2e.ts, but keep the
           // e2e dir out explicitly so a stray *.test.ts there can't sneak in.
           exclude: ['test/e2e-browser/**', '**/*.e2e.ts', 'node_modules/**'],

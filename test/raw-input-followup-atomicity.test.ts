@@ -37,6 +37,14 @@ function caseRegion(src: string, marker: string, span = 3000): string {
   return src.slice(start, start + span);
 }
 
+function flushPendingRegion(): string {
+  const start = workerSrc.indexOf('async function flushPending()');
+  const end = workerSrc.indexOf('\nfunction sendToPty(', start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return workerSrc.slice(start, end);
+}
+
 describe('worker raw_input handler', () => {
   const region = caseRegion(workerSrc, "case 'raw_input':");
 
@@ -73,7 +81,7 @@ describe('worker raw_input handler', () => {
 
 describe('worker adopt/native-rename coordination', () => {
   const messageRegion = caseRegion(workerSrc, "case 'message':", 8500);
-  const flushRegion = caseRegion(workerSrc, 'async function flushPending()', 16000);
+  const flushRegion = flushPendingRegion();
 
   it('parks ordinary adopt messages for the full native-rename settle window', () => {
     expect(messageRegion).toContain('pendingAdoptMessages.push(item)');
@@ -82,7 +90,7 @@ describe('worker adopt/native-rename coordination', () => {
     expect(messageRegion).toContain('cliRestartInProgress || rawInputRestartGate || !backend || sessionRenameInFlight()');
     expect(messageRegion).toContain('await runAdoptMessageForCapturedGeneration(item, () =>');
     expect(flushRegion).toContain('const adoptInputReady = isPromptReady');
-    expect(flushRegion).toContain('if (adoptInputReady && pendingAdoptMessages.length > 0)');
+    expect(flushRegion).toContain('if (adoptInputReady && pendingAdoptMessages.length > 0 && !activeTurnBlocks(pendingAdoptMessages[0]!))');
   });
 
   it('serializes adopt rename and rechecks readiness after older composer writes', () => {
@@ -92,7 +100,7 @@ describe('worker adopt/native-rename coordination', () => {
     expect(flushRegion).toContain('!rawInputRestartGate');
     expect(flushRegion).toContain('if (!sent)');
     expect(flushRegion).toContain('pendingSessionRename = title');
-    expect(flushRegion).toContain('if (!rawInputReady && !supportedSessionRenameReady && !adoptInputReady)');
+    expect(flushRegion).toContain('if (!rawInputReady && !supportedSessionRenameReady && !adoptInputReady && !serialPrepareBeforeWrite)');
     expect(flushRegion).toContain("sessionRenamePhase = 'reserved'");
     const beginIdx = flushRegion.indexOf('beginCliWriteCycle();', flushRegion.indexOf('const writeRename'));
     const writingIdx = flushRegion.indexOf("sessionRenamePhase = 'writing'", beginIdx);
@@ -214,7 +222,7 @@ describe('worker raw_input delivery', () => {
   });
 
   it('holds ordinary prompt flushes only for the text-to-Enter critical window', () => {
-    const flush = caseRegion(workerSrc, 'async function flushPending()', 9000);
+    const flush = flushPendingRegion();
     expect(flush).toContain('if (commandLineWritesPending > 0) return');
     expect(region).not.toContain('if (!isPromptReady)');
     expect(region).not.toContain('if (isPromptReady)');
@@ -609,9 +617,9 @@ describe('post-settle restart fence', () => {
   // async 化扩出的第二个窗口。三处 source-level 顺序断言钉死修复。
 
   it('flushPending re-checks cliRestartInProgress AFTER the awaited detector, BEFORE any write', () => {
-    // RPC lifecycle/replay wiring expands the front half of flushPending; keep
-    // the slice large enough to include both structured adapter write paths.
-    const flush = caseRegion(workerSrc, 'async function flushPending()', 35000);
+    // Use the complete function; unrelated lifecycle wiring must not move a
+    // protected write beyond a fixed character window.
+    const flush = flushPendingRegion();
     const detector = flush.indexOf('if (await detectBareShellLaunch())');
     const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
     const startup = flush.indexOf('await runStartupCommands()', detector);

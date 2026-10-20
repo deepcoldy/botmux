@@ -1,3 +1,7 @@
+import {configuredGroupContext} from './core/interaction-context.js';
+import { registerContinuationAsk, reconcileAskContinuations, listAskContinuations, readContinuationAskFact } from './core/ask-broker.js';
+import { createAskContinuationDispatcher } from './core/ask-continuation.js';
+import { readTurnRegistration } from './core/trigger-registration.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -557,6 +561,7 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { reconcileSerialWorkerReceipts } from './core/worker-pool.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
   SessionOwnerReminderController,
@@ -8140,6 +8145,17 @@ const explicitAskContinuation = createExplicitAskContinuation({
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
+ipcRoute('GET', '/api/asks/fact', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'host_context_required' });
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const identity = { larkAppId: query.get('larkAppId') ?? '', sessionId: query.get('sessionId') ?? '',
+    requestId: query.get('requestId') ?? '', askId: query.get('askId') ?? '' };
+  if (Object.values(identity).some(value => !value || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value)))
+    return jsonRes(res, 400, { ok: false, error: 'bad_ask_identity' });
+  const question = readContinuationAskFact(identity);
+  return jsonRes(res, 200, { ok: true, schemaVersion: 1, ...identity, state: question ? 'observed' : 'unknown', question });
+});
+ipcRoute('GET', '/api/asks/continuations', (_req, res) => jsonRes(res, 200, { ok: true, waits: listAskContinuations() }));
 
 /** Resolve once at registration; delivery must not consult evictable replyTargets
  * or mutable lastCallerOpenId. Autonomous asks use the existing canTalk policy. */
@@ -8300,6 +8316,19 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       ok: false, error: 'card_delivery_failed',
       detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
     });
+  }
+  if (boundAsk.deliveryMode === 'continuation') {
+    const origin = askSession?.managedTurnOrigin;
+    if (!askSession || !origin?.turnId || body.originTurnId !== origin.turnId
+      || body.originDispatchAttempt !== origin.dispatchAttempt) return jsonRes(res, 403, { ok: false, error: 'ask_continuation_origin_unproven' });
+    const identity = { larkAppId: askSession.larkAppId, sessionId: askSession.session.sessionId,
+      chatId: askSession.chatId, rootMessageId: askSession.session.scope === 'chat' ? null : askSession.session.rootMessageId };
+    try {
+      const registration = registerContinuationAsk({ ...boundAsk, ...identity, chatType: askChatType, deliveryTarget: documentDelivery,
+        ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
+        continuation: { originTurnId: origin.turnId, originDispatchAttempt: origin.dispatchAttempt, state: 'waiting' } });
+      return jsonRes(res, 202, registration);
+    } catch { return jsonRes(res, 503, { ok: false, error: 'ask_continuation_registration_failed' }); }
   }
   const asyncInput = boundAsk.asyncUserInput;
   const asyncWorker = askSession?.worker;
@@ -29381,6 +29410,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // BOT_HOME), split a legacy shared data/schedules.json if one still exists,
   // then watch our own store for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
+  const deliverAskAnswer = createAskContinuationDispatcher({
+    submit: request => triggerSessionTurn(request, { larkAppId: cfg.larkAppId, activeSessions }),
+    observe: (sessionId, key) => readTurnRegistration(cfg.larkAppId, sessionId, key),
+  });
+  const askContinuationTimer = setInterval(() => {
+    if (sessionsRestored) void reconcileAskContinuations(cfg.larkAppId, deliverAskAnswer)
+      .catch(error => logger.warn(`ask continuation scan: ${String(error)}`));
+  }, 5_000);
+  askContinuationTimer.unref();
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
   try {
@@ -29563,6 +29601,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot's activeSessions map, so the configured limit is per bot.
   let liveSessionCapSweepPending = false;
   const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
+    // Receipt recovery must run even when the resource cap needs no action.
+    for (const ds of activeSessions.values()) reconcileSerialWorkerReceipts(ds);
     // Coalesce spawn/idle/timer bursts.  The detached mutation evaluates the
     // current map and current config only after every admitted turn has drained,
     // so one pending sweep subsumes all triggers that arrive before it runs.
@@ -29767,6 +29807,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      // A native terminal may release several independent admission lanes.
+      // Persist the common fact FIRST, including API-only bots. The bounded
+      // queue yields on SQLite contention; enqueueing alone is not a commit.
+      const receipt = await enqueueTurnTerminal({
+        dataDir: config.session.dataDir,
+        botAppId: ds.larkAppId,
+        sessionId: ds.session.sessionId,
+        terminal,
+        onError: error => logger.error(
+          '[turn-completion] persistence failed: '
+          + (error instanceof Error ? error.message : String(error)),
+        ),
+      });
+      if (!receipt.persisted) throw receipt.error;
+      if (ds.session.workerGeneration !== context.workerGeneration) {
+        throw new Error('turn_terminal_worker_replaced_during_commit');
+      }
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
@@ -29806,36 +29863,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         queueMicrotask(() => {
           void confirmNextCrossPrincipalSuggestion(ds);
           void driveCrossPrincipalInterruptions(ds);
-        });
-      }
-      // Feedback turn-completion persistence is a synchronous node:sqlite write.
-      // Route it through the nonblocking, tracked retry queue so a cross-process
-      // write-lock (a `botmux send --response-kind final` subprocess) can never
-      // stall the daemon event loop up to busy_timeout — the queue fails fast on
-      // contention and retries on a timer that yields the loop. apiOnly bots
-      // never produce a feedback delivery, so skip them outright; everyone else
-      // enqueues (a hosted-team may have enabled feedback with no bot-level
-      // config, so we must not gate on bot config alone).
-      if (!getBot(ds.larkAppId).config.apiOnly) {
-        void enqueueTurnTerminal({
-          dataDir: config.session.dataDir,
-          botAppId: ds.larkAppId,
-          sessionId: ds.session.sessionId,
-          terminal: {
-            turnId: terminal.turnId,
-            dispatchAttempt: terminal.dispatchAttempt,
-            status: terminal.status,
-            // Carry the worker's real completion instant and native execution
-            // span. Without these the store can only stamp its own write time
-            // and leave duration NULL, which is what made recorded "completion
-            // time" unusable for measuring how long a turn actually took.
-            ...(terminal.completedAtMs !== undefined ? { completedAtMs: terminal.completedAtMs } : {}),
-            ...(terminal.durationMs !== undefined ? { durationMs: terminal.durationMs } : {}),
-          },
-          onError: error => logger.error(
-            `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-            + `${error instanceof Error ? error.message : String(error)}`,
-          ),
         });
       }
       // Record the failed/interrupted turn for /retry. Best-effort: a persist
@@ -30640,6 +30667,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       larkAppId: cfg.larkAppId,
       store: createInputCaptureStore(config.session.dataDir, cfg.larkAppId),
       session(id) {
+        const group=configuredGroupContext(cfg.larkAppId,id,chatId=>!!getBot(cfg.larkAppId).config.oncallChats?.some(c=>c.chatId===chatId));
+        if(group)return group;
         const ds = [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === id);
         if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
         return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
@@ -30650,7 +30679,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)
         && !!readPluginRegistry().plugins[id]?.contributions?.cardActions,
       canTalk: (session, actor, memberUnionId) => evaluateAskAnswerTalk(cfg.larkAppId, session.chatId, actor,
-        [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === session.sessionId)?.chatType,
+        [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === session.sessionId)?.chatType ?? (session.chatType === 'group' ? 'group' : undefined),
         { memberUnionId }),
       deliver: deliverCapturedInput,
       warn: () => logger.warn('[input-capture] delivery pending; retained for reconciliation'),

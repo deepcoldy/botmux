@@ -231,3 +231,19 @@ for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUse
     expect(authority.identity()).toEqual({ turnId: 'b', caller });
   });
 }
+
+it('retains a serial execution boundary against later ordinary input and envelope takeover', () => {
+  const authority = new ActiveTurnAuthority();
+  const first = { turnId: 'keyed-a', caller: humanA, queueAfterActiveTurn: true as const };
+  const next = { turnId: 'ordinary-b', caller: humanA };
+  expect(authority.reserve(first)).toBe(true);
+  expect(authority.markStarted(first)).toBe(true);
+  expect(authority.blocks(next)).toBe(true);
+  expect(authority.reserve(next)).toBe(false);
+  expect(authority.markStarted(next)).toBe(false);
+  expect(authority.adoptEnvelopePreservingPrincipal(next)).toBe(false);
+  expect(authority.snapshot()).toMatchObject({ turnId: 'keyed-a', queueAfterActiveTurn: true, started: true });
+  authority.releaseExact(first);
+  expect(authority.reserve(next)).toBe(true);
+  expect(authority.markStarted(next)).toBe(true);
+});

@@ -77,11 +77,15 @@ export interface EnqueueTurnTerminalInput {
   maxAttempts?: number;
 }
 
+export type TurnTerminalPersistenceResult =
+  | { persisted: true }
+  | { persisted: false; error: unknown };
+
 interface PendingItem {
   input: EnqueueTurnTerminalInput;
   attempts: number;
-  promise: Promise<void>;
-  resolve: () => void;
+  promise: Promise<TurnTerminalPersistenceResult>;
+  resolve: (result: TurnTerminalPersistenceResult) => void;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -106,31 +110,31 @@ function dedupeKey(i: EnqueueTurnTerminalInput): string {
  * status for the same key, that is a real conflict (the store would throw
  * turn_terminal_status_conflict on commit); surface it immediately via onError
  * instead of silently letting the first-arrived status win.
- * Never rejects: terminal failures are surfaced via onError and the promise
- * resolves so a caller awaiting drain cannot hang. After shutdown drain closes
+ * Never rejects: failures are surfaced via onError AND an explicit persisted:false
+ * result. Only persisted:true proves a durable write; a drained queue does not. After shutdown drain closes
  * admission, new enqueues are refused (surfaced via onError) — the daemon is
  * stopping and the durable outbox / next boot reconcile; accepting here would
  * race the drain and could be silently dropped.
  */
-export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<void> {
+export function enqueueTurnTerminal(input: EnqueueTurnTerminalInput): Promise<TurnTerminalPersistenceResult> {
   const key = dedupeKey(input);
   const existing = pending.get(key);
   if (existing) {
     if (existing.input.terminal.status !== input.terminal.status) {
-      input.onError?.(new Error(
-        `turn_terminal_status_conflict_enqueue:${input.terminal.turnId.slice(0, 12)}:`
-        + `${existing.input.terminal.status}!=${input.terminal.status}`,
-      ));
+      const error = new Error('turn_terminal_status_conflict_enqueue:' + input.terminal.turnId);
+      input.onError?.(error);
+      return Promise.resolve({ persisted: false, error });
     }
     return existing.promise;
   }
   if (admissionClosed) {
-    input.onError?.(new Error(`turn_terminal_persist_refused_shutdown:${input.terminal.turnId.slice(0, 12)}`));
-    return Promise.resolve();
+    const error = new Error('turn_terminal_persist_refused_shutdown:' + input.terminal.turnId);
+    input.onError?.(error);
+    return Promise.resolve({ persisted: false, error });
   }
 
-  let resolve!: () => void;
-  const promise = new Promise<void>(r => { resolve = r; });
+  let resolve!: (result: TurnTerminalPersistenceResult) => void;
+  const promise = new Promise<TurnTerminalPersistenceResult>(r => { resolve = r; });
   const item: PendingItem = { input, attempts: 0, promise, resolve };
   pending.set(key, item);
   // Kick off asynchronously so the caller's stack unwinds first (the store
@@ -167,11 +171,12 @@ async function attempt(key: string): Promise<void> {
       status: input.terminal.status,
       ...turnTerminalTiming(input.terminal),
     });
-    if (result.done) { finish(key); return; }
+    if (result.done) { finish(key, { persisted: true }); return; }
     // Write lock busy: reschedule with capped backoff, yielding the loop.
     if (item.attempts >= maxAttempts) {
-      input.onError?.(new Error(`turn_terminal_persist_gave_up:${input.terminal.turnId.slice(0, 12)}:busy_after_${item.attempts}`));
-      finish(key);
+      const error = new Error('turn_terminal_persist_gave_up:' + input.terminal.turnId + ':busy_after_' + item.attempts);
+      input.onError?.(error);
+      finish(key, { persisted: false, error });
       return;
     }
     scheduleRetry(key, item, input);
@@ -184,7 +189,7 @@ async function attempt(key: string): Promise<void> {
     // corruption) or exhausting the bound gives up.
     if (isPermanentPersistError(error) || item.attempts >= maxAttempts) {
       input.onError?.(error);
-      finish(key);
+      finish(key, { persisted: false, error });
       return;
     }
     input.onError?.(error); // surface each transient failure, but keep retrying
@@ -200,12 +205,12 @@ function scheduleRetry(key: string, item: PendingItem, input: EnqueueTurnTermina
   item.timer.unref?.();
 }
 
-function finish(key: string): void {
+function finish(key: string, result: TurnTerminalPersistenceResult): void {
   const item = pending.get(key);
   if (!item) return;
   if (item.timer) clearTimeout(item.timer);
   pending.delete(key);
-  item.resolve();
+  item.resolve(result);
 }
 
 /**

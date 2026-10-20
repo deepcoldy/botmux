@@ -212,7 +212,7 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     const start = workerSource.indexOf('function activeTurnBlocks(input: {');
     expect(start).toBeGreaterThanOrEqual(0);
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    const gate = body.indexOf('if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;');
+    const gate = body.indexOf('if (!isSerialCliInput(input) && !activeTurnAuthority.snapshot()?.queueAfterActiveTurn');
     const consult = body.indexOf('activeTurnAuthority.blocks(');
     expect(gate).toBeGreaterThanOrEqual(0);
     // Order matters: the gate must precede the only call that can reject.
@@ -249,7 +249,7 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     const gate = body.indexOf('if (crossPrincipalIsolationOn()) return false;');
     // Master's queueAfterActiveTurn FIFO gate must stay ahead of both the XPI
     // gate and #1456's principal-preserving adoption; clear()+reserve() is gone.
-    const fifoGate = body.indexOf('if (identity.queueAfterActiveTurn) return false;');
+    const fifoGate = body.indexOf('if (identity.queueAfterActiveTurn || activeTurnAuthority.snapshot()?.queueAfterActiveTurn) return false;');
     const adopt = body.indexOf('activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)');
     const clear = body.indexOf('activeTurnAuthority.clear()');
     expect(gate).toBeGreaterThanOrEqual(0);

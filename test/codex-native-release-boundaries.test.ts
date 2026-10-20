@@ -1,6 +1,6 @@
 import { captureCodexCleanupRelease } from '../src/services/codex-cleanup-release.js';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -21,7 +21,22 @@ vi.mock('../src/services/codex-app-threads.js', async original => ({
   ...await original<typeof import('../src/services/codex-app-threads.js')>(),
   setCodexAppThreadArchived: vi.fn(async () => undefined),
 }));
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// Linux kill(pid, 0) also succeeds for an exited child awaiting waitpid.
+// Archive requires no executing native process, not that its parent has reaped
+// the kernel entry. Read the OS state independently of the release helper.
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] !== 'Z';
+    }
+    return true;
+  } catch (error) {
+    if (['ESRCH', 'ENOENT'].includes((error as NodeJS.ErrnoException).code ?? '')) return false;
+    throw error; // Permission or read errors cannot prove release.
+  }
+};
 function row(): Session { return { sessionId: 'review-boundary-local', status: 'closed', cliId: 'codex', backendType: 'pty',
   larkAppId: 'review-boundary-bot', cliSessionId: 'mock-native',
   codexCleanupTarget: { threadId: 'mock-native', codexHome: '/tmp/fake-home', codexBin: '/tmp/fake-bin' } } as Session; }
