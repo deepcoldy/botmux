@@ -2,7 +2,7 @@
 // `pendingSuspendReason`，真正的 kill 推迟到会话转入 idle/limited 后由
 // runPendingSuspendIfSettled 兑现。这里钉住兑现函数的状态门控与幂等；
 // 排队半边（IPC 路由）见 ipc-suspend-route.test.ts。
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
@@ -37,6 +37,7 @@ import {
   __testOnly_resetOrdinaryImDeliveries,
   sessionReasoningControl,
   __testOnly_sessionAgentConfig as sessionAgentConfig,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 vi.mock('../src/services/codex-transcript.js', async orig => ({
   ...await orig<typeof import('../src/services/codex-transcript.js')>(),
@@ -45,6 +46,9 @@ vi.mock('../src/services/codex-transcript.js', async orig => ({
 }));
 import { drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
 import { logger } from '../src/utils/logger.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 
 function fakeWorker() {
   return {

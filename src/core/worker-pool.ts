@@ -8117,6 +8117,104 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
   return 'saved';
 }
 
+export interface SuspendBackingVerificationOps {
+  kill(target: PersistentBackendTarget, sessionId: string): void;
+  probe(target: PersistentBackendTarget): ReturnType<typeof probePersistentBackendTarget>;
+  killDiagnostic?(sessionName: string): void;
+  probeDiagnostic?(sessionName: string): ReturnType<typeof TmuxBackend.probeSession>;
+}
+
+/**
+ * Destroy and positively verify the exact persistent backing before a logical
+ * session is committed as dormant. Worker IPC is deliberately not the authority
+ * here: if the worker is wedged or its IPC channel is already closed, killing
+ * only that process detaches tmux/herdr/zellij/zmx and leaves the memory-heavy
+ * CLI alive. Unknown probe results fail closed, so dormant is never persisted
+ * on an unverified teardown.
+ */
+export function destroySuspendBackingVerified(
+  ds: DaemonSession,
+  ops: SuspendBackingVerificationOps = {
+    kill: killPersistentBackendTarget,
+    probe: probePersistentBackendTarget,
+    killDiagnostic: sessionName => TmuxBackend.killSession(sessionName),
+    probeDiagnostic: sessionName => TmuxBackend.probeSession(sessionName),
+  },
+): boolean {
+  if (ds.crashDiagnosticParked) {
+    const diagnosticName = TmuxBackend.diagnosticSessionName(ds.session.sessionId);
+    let diagnosticProbe: ReturnType<typeof TmuxBackend.probeSession> = 'unknown';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName); }
+      catch { /* the post-probe below is authoritative */ }
+      try {
+        diagnosticProbe = (ops.probeDiagnostic ?? TmuxBackend.probeSession)(diagnosticName);
+      } catch { diagnosticProbe = 'unknown'; }
+      if (diagnosticProbe === 'missing') break;
+    }
+    if (diagnosticProbe !== 'missing') {
+      logger.error(
+        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified probe=${diagnosticProbe}`,
+      );
+      return false;
+    }
+    try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); }
+    catch { /* absent — benign */ }
+  }
+
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) {
+    logger.error(`[${tag(ds)}] Suspend refused: persistent backing target is unavailable`);
+    return false;
+  }
+
+  let probe: ReturnType<typeof probePersistentBackendTarget> = 'unknown';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      ops.kill(target, ds.session.sessionId);
+    } catch (error) {
+      logger.warn(
+        `[${tag(ds)}] Suspend backing kill attempt ${attempt} threw: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try { probe = ops.probe(target); }
+    catch (error) {
+      probe = 'unknown';
+      logger.warn(
+        `[${tag(ds)}] Suspend backing probe attempt ${attempt} threw: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (probe === 'missing') {
+      logger.info(
+        `[${tag(ds)}] Suspend backing verified missing backend=${target.backendType} attempt=${attempt}`,
+      );
+      return true;
+    }
+    if (attempt < 2) {
+      logger.warn(
+        `[${tag(ds)}] Suspend backing teardown not yet verified `
+        + `backend=${target.backendType} probe=${probe}; retrying`,
+      );
+    }
+  }
+  logger.error(
+    `[${tag(ds)}] Suspend refused: backing teardown unverified `
+    + `backend=${target.backendType} probe=${probe}`,
+  );
+  return false;
+}
+
+let suspendBackingVerifier: (ds: DaemonSession) => boolean = destroySuspendBackingVerified;
+
+/** Unit-test seam; production never overrides the exact kill + post-probe path. */
+export function __testOnly_setSuspendBackingVerifier(
+  verifier?: (ds: DaemonSession) => boolean,
+): void {
+  suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
@@ -8139,6 +8237,10 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
+  if (!suspendBackingVerifier(ds)) {
+    clearLifecycleRetirement(ds, w);
+    return false;
+  }
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -8169,9 +8271,11 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // immediately after resume.
   ds.idleSinceAt = undefined;
   ds.session.webPort = undefined;
-  // The worker's suspend handler destroys the backing session + CLI (frees
-  // memory), so there is no live CLI to reattach to: the next turn MUST
-  // cold-resume from the on-disk transcript. forkWorker(resume=true) builds the
+  // The daemon already destroyed the exact backing session + CLI and verified
+  // it missing before reaching this state. The worker's suspend handler now
+  // performs its idempotent local cleanup and exits; there is no live CLI to
+  // reattach to, so the next turn MUST cold-resume from the on-disk transcript.
+  // forkWorker(resume=true) builds the
   // CLI's `--resume <cliSessionId>` args, so mark this session as having history
   // (the normal `claude_exit` path that sets this never fires on suspend —
   // process.exit(0) races it). Also persist `suspendedColdResume` to record the

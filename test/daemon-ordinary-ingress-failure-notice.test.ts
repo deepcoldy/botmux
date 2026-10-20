@@ -397,6 +397,41 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.completedIdleTurnId).toBeUndefined();
   });
 
+  it('cold-resumes the same dormant session and native CLI lineage from its original Lark anchor', async () => {
+    const anchor = 'om_thread_dormant_cold_resume';
+    const turnId = 'om_dormant_follow_up';
+    const ds = seedThreadSession(anchor, 'dormant seeded') as any;
+    const sessionId = ds.session.sessionId;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.session.suspendedColdResume = true;
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = 'native-cli-lineage-42';
+    ds.lastCliInput = 'previous accepted turn';
+    ds.session.lastCliInput = 'previous accepted turn';
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, options: any) => {
+      expect(target).toBe(ds);
+      expect(options).toMatchObject({ resume: true, turnId });
+      expect(target.session.sessionId).toBe(sessionId);
+      expect(target.session.cliSessionId).toBe('native-cli-lineage-42');
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(turnId, 'continue from the dormant context', anchor),
+      makeCtx(anchor, turnId),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(ds);
+    expect(ds.session.sessionId).toBe(sessionId);
+    expect(ds.session.cliSessionId).toBe('native-cli-lineage-42');
+    expect(ds.lastCliInput).toContain('continue from the dormant context');
+    expect(ds.session.lastCliInput).toContain('continue from the dormant context');
+  });
+
   it('reforks a dead durable-primary worker and waits for provider submission proof', async () => {
     const anchor = 'om_thread_primary_dead_worker';
     const turnId = 'om_primary_after_worker_exit';

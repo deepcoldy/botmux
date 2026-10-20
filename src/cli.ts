@@ -179,6 +179,13 @@ import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, 
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
+  formatIdleSuspendCandidate,
+  MAINTENANCE_SUSPEND_IDLE_USAGE,
+  parseMaintenanceCommandArgs,
+  safeIdleSuspendCliText,
+  type IdleSuspendApiCandidate,
+} from './cli/idle-suspend-command.js';
+import {
   buildCardStreamSuccessOutput,
   CARD_STREAM_USAGE,
   cardMessageRouteFromDetail,
@@ -4315,7 +4322,7 @@ type AuthoritativeAbandonResult =
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
-type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'prune' | 'wake';
+type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'maintenance_suspend_idle' | 'prune' | 'wake';
 
 /** Resolve the coordination mode for a standalone host CLI invocation.
  * Daemons dotenv-load ~/.botmux/.env, but `botmux delete|resume|suspend|list`
@@ -4355,6 +4362,8 @@ function primaryLocalLifecycleMutationError(
       ? '`botmux resume` 恢复'
       : operation === 'suspend'
         ? '`botmux suspend` 挂起'
+        : operation === 'maintenance_suspend_idle'
+          ? '`botmux maintenance suspend-idle --yes` 批量挂起'
         : operation === 'prune'
           ? '`botmux list` 自动清理'
           : '`botmux list` 唤醒';
@@ -5778,6 +5787,148 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
+interface IdleSuspendApiFailure {
+  candidate: IdleSuspendApiCandidate;
+  error: string;
+}
+
+interface IdleSuspendApiResponse {
+  ok?: boolean;
+  error?: string;
+  execute?: boolean;
+  larkAppId?: string;
+  olderThanMs?: number;
+  candidates?: IdleSuspendApiCandidate[];
+  suspended?: IdleSuspendApiCandidate[];
+  failures?: IdleSuspendApiFailure[];
+  affected?: number;
+}
+
+/** Fleet-wide, daemon-authoritative idle-session maintenance. The safe default
+ * is still explicit: callers must choose --dry-run or acknowledge --yes. */
+async function cmdMaintenance(args: string[]): Promise<void> {
+  const parsed = parseMaintenanceCommandArgs(args);
+  if (!parsed.ok) {
+    console.error(`❌ ${parsed.error}`);
+    console.error(MAINTENANCE_SUSPEND_IDLE_USAGE);
+    process.exitCode = 2;
+    return;
+  }
+  if ('help' in parsed) {
+    console.log(MAINTENANCE_SUSPEND_IDLE_USAGE);
+    return;
+  }
+  if (parsed.command.execute) rejectPrimaryLocalLifecycleMutation('maintenance_suspend_idle');
+
+  const online = listOnlineDaemons();
+  const targets = parsed.command.botAppId
+    ? online.filter(daemon => daemon.larkAppId === parsed.command.botAppId)
+    : online;
+  if (targets.length === 0) {
+    const reason = parsed.command.botAppId
+      ? `指定 Bot 的 daemon 不在线: ${safeIdleSuspendCliText(parsed.command.botAppId)}`
+      : '没有在线 Bot daemon';
+    if (parsed.command.json) console.log(JSON.stringify({ ok: false, error: 'daemon_offline', reason }));
+    else console.error(`❌ ${reason}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const responses = await Promise.all(targets.map(async (daemon) => {
+    try {
+      const response = await fetchDaemonIpc(
+        daemon.ipcPort,
+        '/api/maintenance/suspend-idle',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            execute: parsed.command.execute,
+            olderThanMs: parsed.command.olderThanMs,
+          }),
+          signal: AbortSignal.timeout(30_000),
+        },
+      );
+      const body = await response.json().catch(() => ({
+        ok: false,
+        error: `invalid_json_response_http_${response.status}`,
+      })) as IdleSuspendApiResponse;
+      return { daemon, status: response.status, transportOk: response.ok, body };
+    } catch (error) {
+      return {
+        daemon,
+        status: 0,
+        transportOk: false,
+        body: { ok: false, error: error instanceof Error ? error.message : String(error) },
+      };
+    }
+  }));
+
+  const failedResponses = responses.filter(result => !result.transportOk || result.body.ok !== true);
+  const candidateCount = responses.reduce(
+    (sum, result) => sum + (result.body.candidates?.length ?? 0),
+    0,
+  );
+  const affected = responses.reduce(
+    (sum, result) => sum + (result.body.affected ?? 0),
+    0,
+  );
+  const failureCount = responses.reduce(
+    (sum, result) => sum + (result.body.failures?.length ?? 0),
+    0,
+  );
+
+  if (parsed.command.json) {
+    console.log(JSON.stringify({
+      ok: failedResponses.length === 0,
+      execute: parsed.command.execute,
+      requestedOlderThanMs: parsed.command.olderThanMs,
+      candidateCount,
+      affected,
+      failureCount,
+      daemons: responses.map(({ daemon, status, body }) => ({
+        status,
+        ...body,
+        larkAppId: daemon.larkAppId,
+        botName: daemon.botName,
+      })),
+    }));
+  } else {
+    for (const { daemon, status, body } of responses) {
+      const botName = daemon.botName ?? daemon.larkAppId;
+      const rows = parsed.command.execute ? body.suspended ?? [] : body.candidates ?? [];
+      for (const candidate of rows) {
+        console.log(
+          `${parsed.command.execute ? '✓ 已休眠' : '· 候选'} ${formatIdleSuspendCandidate(candidate, botName)}`,
+        );
+      }
+      for (const failure of body.failures ?? []) {
+        console.error(
+          `✗ 休眠失败（${safeIdleSuspendCliText(failure.error)}） `
+          + formatIdleSuspendCandidate(failure.candidate, botName),
+        );
+      }
+      if (body.ok !== true && body.error) {
+        const label = safeIdleSuspendCliText(botName);
+        const error = safeIdleSuspendCliText(body.error, `HTTP ${status}`);
+        console.error(`✗ ${label}: ${error}`);
+      }
+    }
+    if (parsed.command.execute) {
+      console.log(
+        `\n完成：发现 ${candidateCount} 个候选，已休眠 ${affected} 个`
+        + `${failureCount ? `，失败 ${failureCount} 个` : ''}。`,
+      );
+    } else {
+      console.log(
+        `\nDRY-RUN：发现 ${candidateCount} 个候选，阈值 `
+        + `${parsed.command.olderThanMs}ms；未修改任何会话。`,
+      );
+    }
+  }
+  if (failedResponses.length > 0) process.exitCode = 1;
+}
+
 /** 会话级 CLI IPC（slash/cd/close/preview）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
@@ -7018,6 +7169,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --bot <appId>   挂起该 bot 的全部活跃会话
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
        --dry-run       只列出目标，不执行
+  maintenance suspend-idle [--older-than 7d] --dry-run|--yes
+                       从各 daemon 权威状态预览或批量休眠长期无活动会话；默认 7 天
   slash "<斜杠命令>"   会话空闲后向本会话 CLI 注入一条原生斜杠命令（需 bots.json 配 tuiSlashAllow；/cd 恒被拒）
   role switch <目录>  （会话内）切换本话题到角色库内的角色目录——角色切换用；
                    目录必须位于 ~/botmux-roles 之下
@@ -18280,6 +18433,7 @@ switch (command) {
   case 'rm':      await cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
+  case 'maintenance': await cmdMaintenance(process.argv.slice(3)); break;
   case 'slash':   await cmdSlash(); break;
   case 'cd': {
     // Tombstone for the removed `botmux cd`（改名为 `botmux role switch`）。**必须

@@ -1,7 +1,13 @@
 import type { DaemonSession } from './types.js';
-import { suspendWorker } from './worker-pool.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
+import { isSessionTransferring, suspendWorker } from './worker-pool.js';
+import {
+  getSessionPersistentBackendType,
+  isSuspendableBackendType,
+  persistentBackendTargetForSession,
+} from './persistent-backend.js';
 import { tryWithBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * Default per-bot live-session cap applied when a bot has no explicit
@@ -63,8 +69,184 @@ export interface IdleWorkerSweepResult {
   reason: string;
 }
 
+export interface IdleSuspendCandidate {
+  sessionId: string;
+  larkAppId: string;
+  title: string;
+  lastActivityAt: number;
+  idleForMs: number;
+  workerPid?: number;
+  backendType: string;
+  backendTarget?: string;
+  processTypes: string[];
+  backingReleased?: boolean;
+  workerRetirementRequested?: boolean;
+}
+
+export interface IdleAgeSweepOptions {
+  olderThanMs: number;
+  now?: number;
+  mutationAcquireTimeoutMs?: number;
+}
+
+export interface IdleAgeSweepFailure {
+  candidate: IdleSuspendCandidate;
+  error: 'session_changed' | 'suspend_refused' | 'suspend_failed';
+}
+
+export interface IdleAgeSweepResult {
+  candidates: IdleSuspendCandidate[];
+  suspended: IdleSuspendCandidate[];
+  failures: IdleAgeSweepFailure[];
+}
+
 function liveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
   return [...activeSessions.values()].filter(ds => !!ds.worker && !ds.worker.killed);
+}
+
+function uniqueLiveWorkers(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
+  const seen = new Set<string>();
+  return liveWorkers(activeSessions).filter(ds => {
+    const sessionId = ds.session.sessionId;
+    if (seen.has(sessionId)) return false;
+    seen.add(sessionId);
+    return true;
+  });
+}
+
+function conservativeIdleActivityAt(ds: DaemonSession): number | undefined {
+  const persisted = Date.parse(ds.session.lastMessageAt ?? '');
+  // idleSinceAt and spawnedAt are conservative safety clocks: an old message
+  // must not make a newly-idle or newly-restored worker look seven days idle.
+  const values = [persisted, ds.lastMessageAt, ds.idleSinceAt, ds.spawnedAt]
+    .filter((value): value is number => typeof value === 'number'
+      && Number.isFinite(value) && value > 0);
+  return values.length > 0 ? Math.max(...values) : undefined;
+}
+
+function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
+  return hasProtectedSessionMutationOwnership(ds)
+    || isSessionTransferring(ds)
+    || !!ds.pendingRepo
+    || !!ds.pendingRepoCommitInFlight
+    || !!ds.worktreeCreating
+    || !!ds.pendingRawInput
+    || !!ds.pendingFollowUpInput
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+    || !!ds.cascadeInFlight
+    || (ds.cascadeDeferred?.length ?? 0) > 0
+    || !!ds.tuiPromptCardId
+    || (ds.tuiPromptOptions?.length ?? 0) > 0
+    || !!ds.tuiPromptProcessing
+    || !!ds.agentAttention
+    || !!ds.usageLimit
+    || (ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0
+    || !!ds.pendingSuspendReason
+    || ds.pendingSuspendGeneration !== undefined
+    || ds.remoteCloseState !== undefined
+    || ds.remoteShutdownState !== undefined;
+}
+
+function expectedReleasedProcessTypes(ds: DaemonSession, backendType: string): string[] {
+  const cliId = ds.session.cliId ?? ds.initConfig?.cliId ?? 'cli';
+  const processTypes = ['botmux __worker', `${backendType} session`, cliId];
+  if (cliId === 'traex') processTypes.push('traex-code-mode-host');
+  return processTypes;
+}
+
+/**
+ * Read-only candidate selection for the operator maintenance command. This is
+ * intentionally stricter than memory-pressure reclaim: unknown readiness or
+ * activity fails closed, and manually locked / user-attention sessions are
+ * never proposed. Selection uses daemon-owned runtime state, not `botmux list`
+ * process guesses.
+ */
+export function selectIdleSuspendCandidates(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): IdleSuspendCandidate[] {
+  if (!Number.isFinite(opts.olderThanMs) || opts.olderThanMs <= 0) return [];
+  const now = opts.now ?? Date.now();
+  if (!Number.isFinite(now) || now <= 0) return [];
+
+  return uniqueLiveWorkers(activeSessions)
+    .filter(ds => ds.session.status === 'active')
+    .filter(ds => !ds.adoptedFrom && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode)
+    .filter(ds => ds.session.locked !== true)
+    .filter(ds => getSessionPersistentBackendType(ds) !== undefined)
+    .filter(ds => ds.workerReady === true && ds.lastScreenStatus === 'idle')
+    .filter(ds => !hasUnsettledIdleSuspendState(ds))
+    .map((ds): IdleSuspendCandidate | undefined => {
+      const lastActivityAt = conservativeIdleActivityAt(ds);
+      if (lastActivityAt === undefined || lastActivityAt > now
+        || now - lastActivityAt < opts.olderThanMs) return undefined;
+      const backend = persistentBackendTargetForSession(ds);
+      if (!backend) return undefined;
+      const backendTarget = 'agentName' in backend && backend.agentName
+        ? `${backend.sessionName}:${backend.agentName}`
+        : backend.sessionName;
+      return {
+        sessionId: ds.session.sessionId,
+        larkAppId: ds.larkAppId,
+        title: ds.session.title ?? '',
+        lastActivityAt,
+        idleForMs: now - lastActivityAt,
+        ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+        backendType: backend.backendType,
+        backendTarget,
+        processTypes: expectedReleasedProcessTypes(ds, backend.backendType),
+      };
+    })
+    .filter((candidate): candidate is IdleSuspendCandidate => candidate !== undefined)
+    .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+}
+
+export function sweepIdleWorkersByAge(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): IdleAgeSweepResult {
+  const candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  const bySessionId = new Map(
+    uniqueLiveWorkers(activeSessions).map(ds => [ds.session.sessionId, ds] as const),
+  );
+  const suspended: IdleSuspendCandidate[] = [];
+  const failures: IdleAgeSweepFailure[] = [];
+  for (const candidate of candidates) {
+    const ds = bySessionId.get(candidate.sessionId);
+    if (!ds) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    try {
+      if (suspendWorker(ds, 'idle_timeout')) {
+        suspended.push({
+          ...candidate,
+          backingReleased: true,
+          workerRetirementRequested: true,
+        });
+      }
+      else failures.push({ candidate, error: 'suspend_refused' });
+    } catch (error) {
+      failures.push({ candidate, error: 'suspend_failed' });
+      logger.error(
+        `[idle-suspend] failed session=${candidate.sessionId} bot=${candidate.larkAppId}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return { candidates, suspended, failures };
+}
+
+export function sweepIdleWorkersByAgeAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+): Promise<IdleAgeSweepResult | null> {
+  return tryWithBotTurnMutation(
+    larkAppId,
+    opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
+    () => sweepIdleWorkersByAge(activeSessions, opts),
+  ).then(result => result.acquired ? result.value : null);
 }
 
 /**

@@ -4967,6 +4967,7 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   it('suspends a live session via suspendWorker (manual_suspend reason)', async () => {
     const ds = {
       session: { sessionId: 's-susp', cliId: 'claude-code' },
+      initConfig: { backendType: 'tmux' },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
     } as any;

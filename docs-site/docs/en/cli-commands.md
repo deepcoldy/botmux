@@ -15,6 +15,7 @@ Manage the daemon and sessions from the terminal.
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions whose processes have exited |
+| `botmux maintenance suspend-idle --dry-run\|--yes` | Preview or suspend long-idle sessions by last activity time (default: 7 days) |
 | `botmux dashboard [current\|rotate]` | Get the current Dashboard login URL, creating the first token if absent; `rotate` explicitly replaces an existing token |
 
 When the daemon is online, `botmux delete` first asks the owning daemon to run
@@ -24,7 +25,18 @@ The local fallback is used only when the owning daemon is confirmed offline. If
 an online daemon rejects the request or IPC fails, the command fails without a
 local hard kill.
 
-When `BOTMUX_COORDINATION_MODE=primary`, the durable PostgreSQL Session is the canonical truth. In this mode, `delete`, `resume`, non-dry-run `suspend`, and delete/wake actions in the interactive `list` are rejected explicitly. `list` remains available as a read-only local view, but skips local auto-pruning. Use the session card in the original topic to close or resume through the fenced durable session-control lane.
+When `BOTMUX_COORDINATION_MODE=primary`, the durable PostgreSQL Session is the canonical truth. In this mode, `delete`, `resume`, non-dry-run `suspend`, `maintenance suspend-idle`, and delete/wake actions in the interactive `list` are rejected explicitly. `list` remains available as a read-only local view, but skips local auto-pruning. Use the session card in the original topic to close or resume through the fenced durable session-control lane.
+
+## Idle Session Maintenance
+
+```bash
+botmux maintenance suspend-idle --older-than 7d --dry-run
+botmux maintenance suspend-idle --older-than 7d --yes
+```
+
+`--dry-run` reads authoritative runtime state from each online daemon and never changes a session or process. Its output includes the session, Bot, title, last activity, worker PID, persistent backend target, and expected process types to reclaim. Execution requires an explicit `--yes` and goes through the daemon's existing `suspendWorker` path. The daemon first destroys the exact persistent backend and post-probes it as missing; only then does it persist the logical session as active + dormant. The next message cold-resumes from the transcript. An `exists` or `unknown` teardown result fails closed instead of claiming a successful suspension.
+
+Candidate selection fails closed. A worker must be ready, explicitly idle, backed by a resumable backend, and have a known activity timestamp. Adopted, locked, repository-pending, queued-input, unsettled-dispatch, user-attention, and transferring sessions are skipped. Use `--bot <appId>` to scope one Bot and `--json` for machine-readable output. The Dashboard's per-Bot idle auto-suspend setting remains the periodic policy; this command is the operator preview and batch-execution surface.
 
 ## Auto-Start on Boot
 

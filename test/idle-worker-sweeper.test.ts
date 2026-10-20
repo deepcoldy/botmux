@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
@@ -20,8 +20,11 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  selectIdleSuspendCandidates,
   sweepIdleWorkers,
   sweepIdleWorkersAfterTurnDrain,
+  sweepIdleWorkersByAge,
+  sweepIdleWorkersByAgeAfterTurnDrain,
   reclaimIdleWorkersForAdmission,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
   DEFAULT_MAX_LIVE_WORKERS,
@@ -32,10 +35,18 @@ import {
   withBotTurnAdmission,
   withBotTurnMutation,
 } from '../src/core/bot-turn-mutation-gate.js';
+import { updateSession } from '../src/services/session-store.js';
+import { __testOnly_setSuspendBackingVerifier } from '../src/core/worker-pool.js';
 
 function ds(sessionId: string, backendType: string, lastMessageAt: number, worker = {}) {
   return {
-    session: { sessionId, status: 'active' },
+    session: {
+      sessionId,
+      status: 'active',
+      title: `title-${sessionId}`,
+      cliId: 'traex',
+      lastMessageAt: new Date(lastMessageAt).toISOString(),
+    },
     initConfig: { backendType },
     worker: {
       killed: false,
@@ -48,13 +59,171 @@ function ds(sessionId: string, backendType: string, lastMessageAt: number, worke
     },
     workerPort: 1000,
     workerToken: 'tok',
+    workerReady: true,
+    larkAppId: 'cli_test',
+    spawnedAt: lastMessageAt,
     lastMessageAt,
     lastScreenStatus: 'idle',
     exitEventEmitted: false,
   } as any;
 }
 
-const now = 1_000_000;
+const now = Date.UTC(2026, 9, 19, 12, 0, 0);
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
+
+describe('maintenance idle suspension', () => {
+  const day = 24 * 60 * 60 * 1_000;
+
+  beforeEach(() => {
+    __testOnly_resetBotTurnMutationGates();
+    vi.mocked(updateSession).mockReset();
+  });
+
+  it('selects only old, ready, idle, recoverable, unprotected sessions', () => {
+    const old = ds('old', 'tmux', now - 8 * day, { pid: 4242 });
+    const recent = ds('recent', 'tmux', now - 2 * day);
+    const working = { ...ds('working', 'tmux', now - 9 * day), lastScreenStatus: 'working' };
+    const notReady = { ...ds('not-ready', 'tmux', now - 9 * day), workerReady: false };
+    const pty = ds('pty', 'pty', now - 10 * day);
+    const adopted = { ...ds('adopted', 'tmux', now - 11 * day), adoptedFrom: { tmuxTarget: 'user:0.1' } };
+    const locked = ds('locked', 'tmux', now - 12 * day);
+    locked.session.locked = true;
+    const protectedDispatch = ds('protected', 'tmux', now - 13 * day);
+    protectedDispatch.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-1', turnId: 't-1', state: 'accepted', content: 'owned' },
+    ];
+    const pendingRepo = ds('pending-repo', 'tmux', now - 14 * day);
+    pendingRepo.session.pendingRepoSetup = { mode: 'picker', prompt: 'pending' };
+    const queued = ds('queued', 'tmux', now - 14 * day);
+    queued.session.queued = true;
+    const activationHead = ds('activation-head', 'tmux', now - 14 * day);
+    activationHead.session.queuedActivationPending = true;
+    const activationTail = ds('activation-tail', 'tmux', now - 14 * day);
+    activationTail.session.queuedActivationTail = [{ turnId: 't-tail' }];
+    const initialStart = ds('initial-start', 'tmux', now - 14 * day);
+    initialStart.initialStartPending = true;
+    const pendingInput = ds('pending-input', 'tmux', now - 15 * day);
+    pendingInput.pendingRawInput = '/goal';
+    const attention = ds('attention', 'tmux', now - 16 * day);
+    attention.agentAttention = { kind: 'decision', reason: 'pick one', at: now - day };
+    const unknown = ds('unknown', 'tmux', now - 17 * day);
+    unknown.session.lastMessageAt = undefined;
+    unknown.lastMessageAt = 0;
+    unknown.idleSinceAt = undefined;
+    unknown.spawnedAt = undefined;
+
+    const activeSessions = new Map<string, any>([
+      ['old', old], ['recent', recent], ['working', working], ['notReady', notReady],
+      ['pty', pty], ['adopted', adopted], ['locked', locked], ['protected', protectedDispatch],
+      ['pendingRepo', pendingRepo], ['queued', queued], ['activationHead', activationHead],
+      ['activationTail', activationTail], ['initialStart', initialStart],
+      ['pendingInput', pendingInput], ['attention', attention],
+      ['unknown', unknown],
+    ]);
+
+    const candidates = selectIdleSuspendCandidates(activeSessions, { olderThanMs: 7 * day, now });
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      sessionId: 'old',
+      larkAppId: 'cli_test',
+      title: 'title-old',
+      workerPid: 4242,
+      backendType: 'tmux',
+      processTypes: ['botmux __worker', 'tmux session', 'traex', 'traex-code-mode-host'],
+    });
+    expect(candidates[0]?.backendTarget).toContain('old');
+  });
+
+  it('uses the newest safety clock and rejects future timestamps', () => {
+    const newlyIdle = ds('newly-idle', 'tmux', now - 9 * day);
+    newlyIdle.idleSinceAt = now - day;
+    const newlySpawned = ds('newly-spawned', 'tmux', now - 10 * day);
+    newlySpawned.spawnedAt = now - 2 * day;
+    const future = ds('future', 'tmux', now - 11 * day);
+    future.session.lastMessageAt = new Date(now + day).toISOString();
+
+    expect(selectIdleSuspendCandidates(new Map([
+      ['newlyIdle', newlyIdle], ['newlySpawned', newlySpawned], ['future', future],
+    ]), { olderThanMs: 7 * day, now })).toEqual([]);
+  });
+
+  it('covers every resumable backend without depending on a TraeX-specific CLI', () => {
+    const entries = (['tmux', 'herdr', 'zellij', 'zmx', 'pty'] as const).map((backend) => {
+      const session = ds(`old-${backend}`, backend, now - 8 * day);
+      session.session.cliId = 'claude-code';
+      session.initConfig.cliId = 'claude-code';
+      return [backend, session] as const;
+    });
+
+    const candidates = selectIdleSuspendCandidates(new Map(entries), {
+      olderThanMs: 7 * day,
+      now,
+    });
+
+    expect(candidates.map(candidate => candidate.backendType)).toEqual([
+      'tmux', 'herdr', 'zellij', 'zmx',
+    ]);
+    expect(candidates.every(candidate => candidate.processTypes.at(-1) === 'claude-code')).toBe(true);
+  });
+
+  it('isolates one persistence failure and continues the batch', () => {
+    const first = ds('first', 'tmux', now - 9 * day);
+    const second = ds('second', 'tmux', now - 8 * day);
+    vi.mocked(updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+
+    const result = sweepIdleWorkersByAge(new Map([
+      ['first', first], ['second', second],
+    ]), { olderThanMs: 7 * day, now });
+
+    expect(result.candidates.map(candidate => candidate.sessionId)).toEqual(['first', 'second']);
+    expect(result.suspended.map(candidate => candidate.sessionId)).toEqual(['second']);
+    expect(result.failures).toEqual([
+      { candidate: expect.objectContaining({ sessionId: 'first' }), error: 'suspend_failed' },
+    ]);
+  });
+
+  it('is idempotent when the same batch is run again', () => {
+    const old = ds('old-once', 'tmux', now - 8 * day);
+    const sessions = new Map<string, any>([['old', old]]);
+
+    expect(sweepIdleWorkersByAge(sessions, { olderThanMs: 7 * day, now })).toMatchObject({
+      suspended: [expect.objectContaining({ sessionId: 'old-once' })],
+      failures: [],
+    });
+    expect(sweepIdleWorkersByAge(sessions, { olderThanMs: 7 * day, now })).toEqual({
+      candidates: [],
+      suspended: [],
+      failures: [],
+    });
+  });
+
+  it('returns null rather than mutating when the admission gate stays busy', async () => {
+    const appId = 'cli_busy';
+    const old = ds('old', 'tmux', now - 8 * day);
+    const activeSessions = new Map<string, any>([['old', old]]);
+    let release!: () => void;
+    let started!: () => void;
+    const admitted = new Promise<void>(resolve => { started = resolve; });
+    const admission = withBotTurnAdmission(appId, async () => {
+      started();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await admitted;
+
+    await expect(sweepIdleWorkersByAgeAfterTurnDrain(appId, activeSessions, {
+      olderThanMs: 7 * day,
+      now,
+      mutationAcquireTimeoutMs: 5,
+    })).resolves.toBeNull();
+    expect(old.worker).not.toBe(null);
+
+    release();
+    await admission;
+  });
+});
 
 describe('sweepIdleWorkers (per-bot count cap)', () => {
   beforeEach(() => {

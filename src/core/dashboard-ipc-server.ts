@@ -223,6 +223,10 @@ import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
+import {
+  selectIdleSuspendCandidates,
+  sweepIdleWorkersByAgeAfterTurnDrain,
+} from './idle-worker-sweeper.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -2459,12 +2463,105 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
       ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
     });
   }
-  if (!suspendWorker(ds, 'manual_suspend')) {
-    // Live worker but a non-suspendable (pty) backend: killing it would drop the
-    // in-memory conversation with no persistent pane to resume from lazily.
+  if (!isSuspendableBackendType(ds.initConfig?.backendType)) {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
+  if (!suspendWorker(ds, 'manual_suspend')) {
+    // The backend is nominally suspendable, so false means the exact backing
+    // teardown could not be positively verified (or a last-moment ownership
+    // guard refused). Never report dormant success in that state.
+    return jsonRes(res, 409, { ok: false, error: 'suspend_failed' });
+  }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+  });
+});
+
+/**
+ * Preview or execute age-based idle suspension for THIS daemon. This operator
+ * route is host-only even in tests/dev servers: loopback alone is not identity.
+ * Preview is read-only; execution re-evaluates the strict candidate set after
+ * every already-admitted turn has drained.
+ */
+ipcRoute('POST', '/api/maintenance/suspend-idle', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  if (coordinationModeIsPrimary()) {
+    return jsonRes(res, 409, { ok: false, error: 'durable_primary_unsupported' });
+  }
+
+  let body: { execute?: unknown; olderThanMs?: unknown };
+  try { body = await readJsonBody(req, 4_096); }
+  catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  if (typeof body.execute !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_execute' });
+  }
+  if (typeof body.olderThanMs !== 'number'
+    || !Number.isSafeInteger(body.olderThanMs) || body.olderThanMs <= 0) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_older_than_ms' });
+  }
+
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const runtimeAppIds = new Set(
+    [...registry.values()].map(ds => ds.larkAppId).filter(Boolean),
+  );
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
+  const larkAppId = cachedLarkAppId || [...runtimeAppIds][0];
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+
+  const options = { olderThanMs: body.olderThanMs };
+  if (!body.execute) {
+    const candidates = selectIdleSuspendCandidates(registry, options);
+    return jsonRes(res, 200, {
+      ok: true,
+      execute: false,
+      larkAppId,
+      olderThanMs: body.olderThanMs,
+      candidates,
+      suspended: [],
+      failures: [],
+      affected: 0,
+    });
+  }
+
+  const result = await sweepIdleWorkersByAgeAfterTurnDrain(larkAppId, registry, options);
+  if (result === null) {
+    return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  }
+  for (const candidate of result.suspended) {
+    logger.info(
+      `[idle-suspend] reason=idle_timeout session=${candidate.sessionId} bot=${larkAppId} `
+      + `lastActivity=${new Date(candidate.lastActivityAt).toISOString()} `
+      + `releaseRequested=${candidate.processTypes.join(',')} `
+      + `backingReleased=${candidate.backingReleased === true} `
+      + `workerRetirementRequested=${candidate.workerRetirementRequested === true}`,
+    );
+  }
+  for (const failure of result.failures) {
+    logger.warn(
+      `[idle-suspend] reason=idle_timeout session=${failure.candidate.sessionId} bot=${larkAppId} `
+      + `result=${failure.error}`,
+    );
+  }
+  return jsonRes(res, 200, {
+    ok: result.failures.length === 0,
+    execute: true,
+    larkAppId,
+    olderThanMs: body.olderThanMs,
+    candidates: result.candidates,
+    suspended: result.suspended,
+    failures: result.failures,
+    affected: result.suspended.length,
   });
 });
 
