@@ -262,6 +262,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 | 字段 | 说明 |
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+| `senderTagHideEmail` | 布尔，默认 `false`（关）。开启后仅在新构造的 `<sender>` 中省略 `email` 属性，保留姓名、ID 和类型。与 `senderTag` 独立保存；不修改身份缓存、鉴权或 `--mention-back`，不清理已排队输入、历史或正文中的邮箱。可用 `/botconfig set senderTagHideEmail on\|off` 热更新 |
 | `replyDelivery` | `"transcript"` 或 `"send"`，**所有 CLI 缺省都是 `send`**（与上游行为一致），`transcript` 需显式开启。最终回复怎么送到飞书：`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，系统提示不再提及 `botmux send`；`send` = 模型必须自己 `botmux send`（历史行为）。显式写 `"send"` 才让 claude-code 退回旧行为；`send` / `transcript` 都会写盘，`unset` 回各 CLI 默认 |
 
 ### `replyDelivery: "transcript"`

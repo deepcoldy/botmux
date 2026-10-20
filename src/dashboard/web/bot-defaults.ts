@@ -168,6 +168,7 @@ export type BotDefaultsRow = {
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
+  senderTagHideEmail?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {
