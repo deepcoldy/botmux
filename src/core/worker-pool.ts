@@ -163,6 +163,7 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
@@ -19512,22 +19513,20 @@ function deliverFinalOutput(
       // worker/Riff environment received; live config applies on the next fork.
       let feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
       // Freeze email reviewers into this bot's app-scoped open_id so the
-      // card callback can match network-free against the delivery snapshot. Pure
-      // ou_/on_ lists (and requester/everyone) skip the lookup. An empty
-      // materialized list keeps the control visible while the callback rejects
-      // every operator.
+      // card callback can match network-free against the delivery snapshot.
+      // Pure ou_/on_ lists (and requester/everyone) skip the lookup. A
+      // definitive empty list keeps the control visible while the callback
+      // rejects every operator; a TRANSIENT failure reuses last-known-good
+      // rather than shipping an empty snapshot, and with no cache the control
+      // is dropped for this delivery.
       if (feedbackPolicy && feedbackPolicy.audience === 'reviewers') {
         try {
-          const { materializeFeedbackReviewers } = await import('../services/feedback-policy.js');
           const { resolveAllowedUsersWithMap } = await import('../im/lark/client.js');
-          feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
-            const { map } = await resolveAllowedUsersWithMap(ds.larkAppId, entries);
-            const resolved = new Map<string, string>();
-            for (const entry of entries) {
-              const id = map.get(entry);
-              if (id && id.startsWith('ou_')) resolved.set(entry, id);
-            }
-            return resolved;
+          feedbackPolicy = await materializeFeedbackPolicyForDelivery({
+            policy: feedbackPolicy,
+            larkAppId: ds.larkAppId,
+            dataDir: config.session.dataDir,
+            resolveAllowedUsersWithMap,
           });
         } catch {
           feedbackPolicy = undefined;

@@ -1482,6 +1482,65 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
   });
 
+  it('reuses the last-known-good reviewer id when contact resolution transiently fails', async () => {
+    // Seed a warm cache from a prior healthy send of the same reviewer list.
+    const { writeFeedbackReviewersCache } = await import('../src/utils/feedback-reviewers-cache.js');
+    writeFeedbackReviewersCache(config.session.dataDir, 'app_test', {
+      map: new Map([['oncall@example.com', 'ou_oncall_cached']]),
+      retainKeys: ['oncall@example.com'],
+    });
+    // The contact API now blips: every email staged transient with an empty map.
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The card still ships (control visible) and the snapshot keeps the cached
+    // id, so the configured real reviewer is not rejected.
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_transient_feedback');
+    expect(delivery?.policy?.reviewers).toEqual(['ou_oncall_cached']);
+  });
+
+  it('drops the feedback control on a cold-cache transient failure instead of shipping an empty snapshot', async () => {
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_cold_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
   it('renders a fail-closed reviewers card when no reviewers are configured', async () => {
     const sessionReply = vi.fn(async () => 'om_empty_reviewers_feedback');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -1494,7 +1553,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore('/tmp/test-sessions'))
+    expect((await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
       .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });

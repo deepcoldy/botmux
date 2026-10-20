@@ -88,7 +88,7 @@ Core 只接受三种语义：
 - 按钮 2–4 个，key 唯一，只允许 `[a-z0-9_-]+`。
 - 负向原因最多 6 个。
 - 说明最大长度 1–2000。
-- `audience` 仅接受 `requester` / `reviewers` / `everyone`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱，最多 50 项且不重复。邮箱在发送时用当前 bot 凭证解析为 `ou_` 后才写入策略快照；解析不到时丢弃该项，全部无法解析时保留空名单和反馈按钮，但点击鉴权仍 fail closed。跨 app 场景应优先使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
+- `audience` 仅接受 `requester` / `reviewers` / `everyone`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱，最多 50 项且不重复。邮箱在发送时用当前 bot 凭证解析为 `ou_` 后才写入策略快照。联系人 API 明确判定该邮箱不存在或不可见（definitive miss）时丢弃该项，全部丢弃时保留空名单和反馈按钮，但点击鉴权仍 fail closed；联系人 API 限流 / 5xx / 网络故障（transient）不收敛成空名单：仍在当前配置中的条目沿用 dataDir 下 `feedback-reviewers-cache-<appId>.json` 里上次健康解析的 `ou_`（与 owner allowedUsers 同一条不变量，definitive 失败或已移出配置的条目不复活），冷缓存且全部不可恢复时本次不发反馈控件，避免真人配置正确却被误拒。跨 app 场景应优先使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
 - `audience: "reviewers"` 允许缺省或清空 `reviewers`，此时按钮可见但没有任何用户能提交反馈；`requester` / `everyone` audience 带非空名单仍会被判为无效策略。
 - 不允许配置任意 Lark card JSON；配置仅包含受约束的领域字段。
 
