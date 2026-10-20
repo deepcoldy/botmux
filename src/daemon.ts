@@ -24378,6 +24378,11 @@ async function handleBotAdded(
           ...(name ? { name } : {}),
         };
       }
+      // Without bot evidence, caller deliberately has no senderType; it cannot
+      // match a later platform-authenticated user via sameTrustedPrincipal.
+      // Owner continuity instead relies on trustedSessionController's separate
+      // user-typed owner, even for app operators. Turn privileges read caller,
+      // not controller; tightening the latter also requires migrating owner checks.
       groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
         ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
         : undefined;
@@ -26344,6 +26349,11 @@ async function handleThreadReplyAdmitted(
   // the existing-owner route below, i.e. deliver the message like any other —
   // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
   // message that is not diverted here is also not rejected there.
+  // A join caller without senderType differs from a later authenticated user.
+  // The independent user-typed owner controller preserves that owner's continuity;
+  // if trustedSessionController is tightened, migrate this owner check with it.
+  // App operators retain the existing user-typed owner limitation: later bot
+  // messages do not match it, while downstream owner handling still takes user branches.
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn

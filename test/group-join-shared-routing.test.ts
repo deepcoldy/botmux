@@ -286,10 +286,11 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it.each(['peer', 'bot', 'app'] as const)('keeps %s operator bot evidence through opening and identity-cache resolution', async (evidence) => {
-    const { daemon, registry, identities } = modules;
+    const { daemon, registry, identities, types } = modules;
     const appId = `app_join_bot_${evidence}`;
     const chatId = `oc_join_bot_${evidence}`;
     const operator = 'ou_peer_operator';
+    mocks.forkWorker.mockReturnValueOnce(true);
     mocks.listChatMemberOpenIds.mockResolvedValue([operator]);
     if (evidence === 'peer') {
       writeFileSync(join(process.env.SESSION_DATA_DIR!, `bot-openids-${appId}.json`), JSON.stringify({ peer: operator }));
@@ -312,6 +313,36 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     expect(input.content).toContain(`<sender type="bot" open_id="${operator}"`);
     expect(identities.getIdentity(appId, operator)?.type).toBe('bot');
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.activeInteractiveTurn?.caller.senderType).toBe('bot');
+    expect(ds?.activeInteractiveTurn?.controller).toMatchObject({
+      requestUserOpenId: operator, senderType: 'user',
+    });
+  });
+
+  it('starts without sender or caller authority when the join event has no operator', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_no_operator';
+    const chatId = 'oc_join_no_operator';
+    mocks.forkWorker.mockReturnValueOnce(true);
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir('repo-no-operator'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [, input, options] = mocks.forkWorker.mock.calls[0]!;
+    expect(input.content).toContain('<botmux_group_join ');
+    expect(input.content).not.toContain('<sender');
+    expect(input.content).not.toContain('<operator_open_id>');
+    expect(options.trustedCaller).toBeUndefined();
+    expect(ds?.pendingTrustedCaller).toBeUndefined();
+    expect(ds?.activeInteractiveTurn?.caller).toBeUndefined();
   });
 
   it('does not turn a cached display-user into verified human authority', async () => {
