@@ -780,6 +780,8 @@ import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import { pluginCommandGateway } from './core/plugins/commands/runtime.js';
+import type { PluginCommandTable } from './core/plugins/commands/gateway.js';
+import { runPluginSlashCommand } from './core/plugins/commands/execute.js';
 import {
   buildCodexCompletionCard,
   buildCodexNotifierResultCard,
@@ -6413,13 +6415,23 @@ function canTalkForGroupSessions(
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
 }
 
-/**
- * Run a Lark slash command declared by a plugin (`kind: 'plugin'` route). It
- * never creates a session, never reaches the CLI and never spends quota: the
- * plugin service answers with an optional text/card that the host posts back.
- * Admission is canTalk (same as `/sessions`); management authority travels to
- * the plugin as host-computed `privileges`, never inferred from the args.
- */
+/** Plugin command table for routing. Only `/…` text can route to a plugin, so
+ * ordinary messages skip the registry + bots.json read entirely. */
+function pluginCommandsForRouting(larkAppId: string, text: string): PluginCommandTable | undefined {
+  return text.trim().startsWith('/') ? pluginCommandGateway.table(larkAppId) : undefined;
+}
+
+/** A plugin command whose name the bot also passes through goes to the CLI
+ * (routing order, design §10 decision 2). Say so once at startup. */
+function warnPluginCommandsShadowedByPassthrough(larkAppId: string): void {
+  const passthrough = resolvePassthroughCommands(larkAppId);
+  for (const command of pluginCommandGateway.list(larkAppId)) {
+    if (!passthrough.has(command.name)) continue;
+    logger.warn(`[plugin-command] app=${larkAppId} command=${command.name} plugin=${command.pluginId ?? 'conflict'} shadowed by passthrough; it goes to the CLI`);
+  }
+}
+
+/** Daemon wiring for a `kind: 'plugin'` route; admission order lives in `runPluginSlashCommand`. */
 async function executePluginSlashCommand(input: {
   decision: Extract<SlashRouteDecision, { kind: 'plugin' }>;
   larkAppId: string;
@@ -6435,52 +6447,34 @@ async function executePluginSlashCommand(input: {
 }): Promise<void> {
   const { decision, larkAppId, chatId, anchor, deps } = input;
   const locale = localeForBot(larkAppId);
-  const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, input.senderOpenId, decision.cmd);
-  if (restrictedText) {
-    await deps.sessionReply(anchor, restrictedText, 'text', larkAppId);
-    return;
-  }
-  const canTalk = canTalkForGroupSessions(
+  await runPluginSlashCommand({
+    cmd: decision.cmd,
+    content: decision.content,
+    pluginId: decision.pluginId,
     larkAppId,
     chatId,
-    input.senderOpenId,
-    input.teamTrustUnionId,
-    input.senderUnionId,
-    input.chatType,
-    input.botSender,
-  );
-  if (!canTalk) {
-    await deps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd: decision.cmd }, locale), 'text', larkAppId);
-    return;
-  }
-  if (decision.pluginId === null) {
-    await deps.sessionReply(anchor, tr('daemon.plugin_command_conflict', { cmd: decision.cmd }, locale), 'text', larkAppId);
-    return;
-  }
-  const outcome = await pluginCommandGateway.execute(decision.pluginId, {
-    eventId: input.messageId,
-    larkAppId,
-    command: decision.cmd,
-    // route content is the whole invocation (`/work-bind status`); plugins get only the args.
-    args: decision.content.replace(/^\S+/, '').trim(),
-    chat: { chatId, chatType: input.chatType ?? null, anchor },
-    sender: { openId: input.senderOpenId ?? null, unionId: input.senderUnionId ?? null },
-    privileges: {
-      canOperate: canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
-      canTalk,
-    },
+    chatType: input.chatType,
+    anchor,
+    messageId: input.messageId,
+    senderOpenId: input.senderOpenId,
+    senderUnionId: input.senderUnionId,
     locale,
+  }, {
+    restrictedText: () => grantRestrictedSlashCommandText(larkAppId, chatId, input.senderOpenId, decision.cmd),
+    canTalk: () => canTalkForGroupSessions(
+      larkAppId,
+      chatId,
+      input.senderOpenId,
+      input.teamTrustUnionId,
+      input.senderUnionId,
+      input.chatType,
+      input.botSender,
+    ),
+    canOperate: () => canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
+    execute: pluginCommandGateway.execute,
+    reply: (content, msgType) => deps.sessionReply(anchor, content, msgType, larkAppId),
+    text: key => tr(key, { cmd: decision.cmd }, locale),
   });
-  if (!outcome.ok) {
-    await deps.sessionReply(anchor, tr('daemon.plugin_command_unavailable', { cmd: decision.cmd }, locale), 'text', larkAppId);
-    return;
-  }
-  if (!outcome.reply) return;
-  if (outcome.reply.kind === 'text') {
-    await deps.sessionReply(anchor, outcome.reply.text, 'text', larkAppId);
-    return;
-  }
-  await deps.sessionReply(anchor, JSON.stringify(outcome.reply.card), 'interactive', larkAppId);
 }
 
 // Dependencies passed to card-handler
@@ -25542,7 +25536,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
-    pluginCommands: pluginCommandGateway.table(larkAppId),
+    pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
   });
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
@@ -29129,7 +29123,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
-      pluginCommands: pluginCommandGateway.table(larkAppId),
+      pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
@@ -32596,6 +32590,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Normalize legacy document-native watches before restore can close their old sessions.
   if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
+  warnPluginCommandsShadowedByPassthrough(cfg.larkAppId);
 
   // Restore active sessions from previous run
   const startupXpiQuarantineNotices = await restoreSessionsAndScheduleStartupRecovery({

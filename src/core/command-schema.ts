@@ -216,13 +216,23 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 }
 
 /**
+ * Commands `im/lark/event-dispatcher.ts` consumes before slash routing (each has
+ * its own `tryHandle…` matcher). They are not in the table above, but a plugin
+ * declaring one would never receive it.
+ */
+const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
+]);
+
+/**
  * Every slash token Botmux itself owns: table names and aliases (including
- * CLI-specific ones such as `/effort`) plus the topic-header commands. Plugin
- * commands may never claim one of these.
+ * CLI-specific ones such as `/effort`), the topic-header commands and the
+ * pre-routing commands. Plugin commands may never claim one of these.
  */
 export function isBuiltinSlashCommandName(cmd: string): boolean {
   const key = cmd.trim().toLowerCase();
-  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key);
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key) || PRE_ROUTING_COMMANDS.has(key);
 }
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────

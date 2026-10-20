@@ -238,7 +238,7 @@ describe('plugin manifest and registry basics', () => {
       endpoint: '/botmux/commands/v1',
       commands: [{ name: '/work-bind', description: '绑定工作项' }],
     });
-    for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact']) {
+    for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact', '/grant']) {
       expect(() => scanPluginContributions(makeSource(`cmd-${reserved.slice(1)}`, [{ name: reserved }]), manifest('cmd-x')))
         .toThrow(`plugin_command_reserved:${reserved}`);
     }

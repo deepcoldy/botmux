@@ -96,4 +96,13 @@ describe('plugin command gateway', () => {
     expect(await gatewayWith(records, request).execute('work-ledger', invocation()))
       .toEqual({ ok: false, error: 'invalid_plugin_command_reply_card_callback' });
   });
+
+  it('re-checks ownership at execution time instead of trusting the routing decision', async () => {
+    // Routing saw only work-ledger; by execution a second plugin claims the same name.
+    const request = vi.fn(async () => jsonResponse({ schemaVersion: 1 }));
+    const nowConflicting = [...records, makeRecord('rival', { commands: [{ name: '/work-bind' }] })];
+    expect(await gatewayWith(nowConflicting, request).execute('work-ledger', invocation()))
+      .toEqual({ ok: false, error: 'plugin_command_not_routable' });
+    expect(request).not.toHaveBeenCalled();
+  });
 });

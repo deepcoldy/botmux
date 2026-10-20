@@ -33,7 +33,7 @@
 安装期 scanner 校验（失败即拒绝安装，错误码风格同 cardActions）：
 
 - `name` 满足 `SLASH_COMMAND_SHAPE`（`/^\/[a-z0-9][a-z0-9:_-]*$/`），小写；同一文件内不重复；1–16 条。
-- 不得与内置命令及别名（`command-schema.ts` 全表，含 `cliId` 专属命令）、`PASSTHROUGH_COMMANDS`、`ROUTE_SPECIAL_COMMANDS` 冲突。
+- 不得与内置命令及别名（`command-schema.ts` 全表，含 `cliId` 专属命令）、`PASSTHROUGH_COMMANDS`、`ROUTE_SPECIAL_COMMANDS` 冲突，也不得与 event-dispatcher 在路由前就消费的元命令（`/grant` `/revoke` `/introduce` `/summary` `/tabs` `/tab` `/mention-mode` `/substitute` `/reply-mode` `/workflow` `/template` `/invite`，见 `command-schema.ts` 的 `PRE_ROUTING_COMMANDS`）冲突——插件永远收不到它们。
 - `description` 可选，≤ 120 字符，无控制字符。
 - `endpoint` 规则与 `readCardActionEndpoint` 相同（相对路径、无 query/hash/反斜杠/`..`），直接复用该函数。
 - registry / materialized marker 只记录 `name`、`description`、`endpoint`。
@@ -42,7 +42,7 @@
 
 ### 冲突与作用域
 
-- 只看当前 `larkAppId` 的有效插件（global + Bot 级，`resolveEffectivePluginIds`），每条消息实时读取 registry，enable/disable 下一条消息即生效，不需要重启 daemon。
+- 只看当前 `larkAppId` 的有效插件（global + Bot 级，`resolveEffectivePluginIds`），每条 `/` 开头的消息实时读取 registry（普通消息不读，避免热路径上的 bots.json 解析），enable/disable 下一条消息即生效，不需要重启 daemon。
 - 同一 bot 上两个已启用插件声明同名指令 → 该指令 fail closed（回一句固定文案「插件指令冲突，请联系管理员」并记日志），不按安装顺序抢占。
 - 内置命令与固定透传命令永远优先：即使旧 registry 或手改文件含冲突声明，路由器 ⑤½ 仍对 `isBuiltinSlashCommandName` / `PASSTHROUGH_COMMANDS` 命中的名字拒绝插件（codex-app 的透传集为空，没有这道栅栏 `/compact` 会落到插件手里——差分测试实测抓到）。
 - bot 的 `customPassthroughCommands` 若包含同名指令：显式 bot 配置优先，走透传（路由顺序天然如此，见 §3），并在 daemon 启动时 warn 一次。
@@ -77,7 +77,7 @@ if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 
 ## 4. 入口执行
 
-`handleNewTopicAdmitted` 与 `handleThreadReplyAdmitted` 在 `classifySlash` 之后各加一个分支，抽成共用函数 `executePluginCommand(decision, ctx)`：
+`handleNewTopicAdmitted` 与 `handleThreadReplyAdmitted` 在 `classifySlash` 之后各加一个分支，共用 `src/core/plugins/commands/execute.ts` 的 `runPluginSlashCommand`（准入与 IO 由 daemon 注入，便于单测）：
 
 1. **准入**：插件指令按 `canTalk` 准入（与 `/sessions` 同级），未通过回复与 `/sessions` 相同的「仅允许的用户可用」文案；`grantRestrictedSlashCommandText` 照查（受限成员的命令限制对插件指令同样生效）。bot 发送方由路由 ① 处理。
 2. **不扣额度、不建会话**：与 `skipCharge` 的控制类消息一致；不调用 `enforceMessageQuotaForCliInput` 的扣费段，也不触发 `prompt.submit` 闸（不进 CLI）。
@@ -145,7 +145,8 @@ if (pluginId !== undefined) return { kind: 'plugin', cmd, content, pluginId };
 
 - 单测：scanner 声明校验（合法/冲突/越权 endpoint）；`classifySlash` 新分支；有效插件解析与冲突 fail closed；协议请求构造与响应解析（text/card/越权 callback/超限/超时）；卡片网关 `privileges` 计算（身份缺失 fail closed）。
 - 差分测试：缺省输入全量通过；新维度登记 `INTENTIONAL`。
-- 集成：`test/plugin-supervisor.integration.test.ts` 风格起一个最小插件服务，覆盖指令 → 卡片 → 点击 → `privileges` 往返。
+- 入口准入链：`test/plugin-slash-command-execute.test.ts` 覆盖 args 剥离、`privileges` 转发、卡片回复，以及 restricted → canTalk → 冲突的拒绝顺序（均不触达插件）；gateway 执行期 owner 复检有专门用例（变异验证：删复检即红）。
+- 集成（后续）：起最小插件服务覆盖指令 → 卡片 → 点击 → `privileges` 往返，随首个真实插件接入时补。
 - live：`bun run switch:here && bun run daemon:restart`，在测试群用最小示例插件验证 `/xxx` 出卡、非管理员点击被插件拒绝。
 
 ## 10. 评审决策（2026-10-14 已定）
