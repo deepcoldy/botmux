@@ -11926,3 +11926,58 @@ describe('host interaction context observation', () => {
     } finally { workerPool.setActiveSessionsRegistry(previous ?? new Map()); }
   });
 });
+
+describe('PUT /api/bot-card-prefs — reply footer master and blocks', () => {
+  it('validates booleans and preserves saved blocks while the master is disabled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-footer-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-footer-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', brandLabel: 'KEEP', replyFooterModel: false }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const disabled = await save({ replyFooterEnabled: false, replyFooterUsage: false, showReplyTiming: true });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ ok: true, replyFooterEnabled: false, replyFooterModel: false, replyFooterUsage: false, showReplyTiming: true });
+      const invalid = await save({ replyFooterEnabled: 'true', replyFooterModel: true });
+      expect(invalid.status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ replyFooterEnabled: false, replyFooterModel: false });
+      const enabled = await save({ replyFooterEnabled: true });
+      expect(enabled.status).toBe(200);
+      const readback = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(readback).toMatchObject({ replyFooterModel: false, replyFooterUsage: false, showReplyTiming: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ replyFooterModel: false, replyFooterUsage: false, brandLabel: 'KEEP' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('GET /api/sessions/:sessionId/reply-render-snapshot', () => {
+  it('passes exact turn and attempt to the independent render snapshot contract', async () => {
+    const ds = { session: { sessionId: 's-render' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const snapshot = { usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: false }, timing: { executionDurationMs: 4000, executionInProgress: true } };
+    const renderSpy = vi.spyOn(workerPool, 'getDaemonReplyCardRenderSnapshot').mockReturnValue(snapshot);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}/api/sessions/s-render/reply-render-snapshot`;
+      const response = await fetch(`${base}?turnId=om_exact&dispatchAttempt=2`);
+      expect(await response.json()).toEqual({ snapshot });
+      expect(renderSpy).toHaveBeenCalledWith(ds, { turnId: 'om_exact', dispatchAttempt: 2 });
+      const invalid = await fetch(`${base}?turnId=om_exact&dispatchAttempt=NaN`);
+      expect(invalid.status).toBe(400);
+      findSpy.mockReturnValue(undefined);
+      expect((await fetch(base)).status).toBe(404);
+    } finally { findSpy.mockRestore(); renderSpy.mockRestore(); }
+  });
+});

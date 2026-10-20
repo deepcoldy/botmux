@@ -140,6 +140,8 @@ import {
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
+import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
@@ -484,6 +486,25 @@ export function getDaemonReplyCardUsageSnapshot(
   return withCardRuntimeIdentity(ds, showUsage
     ? getDaemonSessionUsageSnapshot(ds, effectiveCliId)
     : { context: null, tokens: null }, effectiveCliId);
+}
+
+/** Presentation and timing have their own IPC/snapshot contract, separate from /usage. */
+export function getDaemonReplyCardRenderSnapshot(
+  ds: DaemonSession,
+  options: { turnId?: string; dispatchAttempt?: number; finalTiming?: { durationMs?: number; executionStartedAtMs?: number } } = {},
+  effectiveCliId?: CliId,
+): ReplyCardRenderSnapshot {
+  let cfg: { showReplyTiming?: boolean } = {};
+  try { cfg = getBot(ds.larkAppId).config; } catch { /* offline defaults */ }
+  const observation = options.turnId ? ds.replyExecutionStarts?.get(JSON.stringify([options.turnId, options.dispatchAttempt ?? null])) : undefined;
+  const startedAtMs = options.finalTiming ? options.finalTiming.executionStartedAtMs
+    : observation?.workerGeneration === ds.workerGeneration ? observation?.startedAtMs : undefined;
+  const timing = cfg.showReplyTiming === true ? measureReplyTiming({
+    startedAtMs,
+    receivedAtMs: options.dispatchAttempt === undefined && options.turnId ? ds.turnReceivedAtMs?.get(options.turnId) : undefined,
+    durationMs: options.finalTiming?.durationMs, completed: options.finalTiming !== undefined, nowMs: Date.now(),
+  }) : undefined;
+  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg), ...(timing ? { timing } : {}) };
 }
 
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend
@@ -14621,6 +14642,17 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'turn_execution_started': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration || !msg.turnId
+          || !Number.isFinite(msg.startedAtMs) || msg.startedAtMs < 0 || msg.startedAtMs > Date.now()) break;
+        const starts = ds.replyExecutionStarts ??= new Map();
+        const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
+        starts.delete(key);
+        starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration });
+        if (starts.size > 512) starts.delete(starts.keys().next().value!);
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -18247,6 +18279,9 @@ function setupWorkerHandlers(
         const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
         if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        // This is a historical exchange, so carry the current display policy
+        // without attributing the active turn's execution timing to it.
+        const renderSnapshot = getDaemonReplyCardRenderSnapshot(ds, {}, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
@@ -18257,7 +18292,8 @@ function setupWorkerHandlers(
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
-          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
+          usage: renderSnapshot.usage,
+          presentation: renderSnapshot,
         });
         replyWithImageFallback(cardJson, 'interactive', content => {
           if (!ownsLifecycleMutation()) return Promise.reject(new Error('Adopt worker ownership changed'));
@@ -18941,7 +18977,7 @@ function deliverFinalOutput(
   onComplete?: (owned: boolean, messageId?: string) => void,
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
-  frozenUsage?: CardUsageSnapshot,
+  frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
   imageFallback: ReplyImageState = { omitImages: false },
 ): void {
@@ -18949,7 +18985,7 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
-  let cardUsage = frozenUsage;
+  let renderSnapshot = frozenRenderSnapshot;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
     && sessionPromptInjection(ds) === 'none';
@@ -19390,19 +19426,15 @@ function deliverFinalOutput(
         && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
         ? { policy: feedbackPolicy }
         : undefined;
-      cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      renderSnapshot ??= getDaemonReplyCardRenderSnapshot(ds, {
+        turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+        finalTiming: { durationMs: msg.durationMs ?? msg.codexAppSettlement?.durationMs, executionStartedAtMs: msg.executionStartedAtMs },
+      }, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
-      const executionDurationMs = getBot(ds.larkAppId).config.showReplyTiming === true
-        ? msg.durationMs ?? msg.codexAppSettlement?.durationMs
-        : undefined;
-      const receivedAtMs = ds.turnReceivedAtMs?.get(msg.turnId);
-      const waitingDurationMs = executionDurationMs !== undefined && msg.dispatchAttempt === undefined
-        && receivedAtMs !== undefined && msg.executionStartedAtMs !== undefined
-        ? msg.executionStartedAtMs - receivedAtMs : undefined;
       let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
@@ -19414,9 +19446,8 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
@@ -19427,9 +19458,8 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
           });
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
@@ -19809,7 +19839,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

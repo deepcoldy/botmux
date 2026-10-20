@@ -9,13 +9,19 @@ export type GroupContextCardProjection = { kind: 'runtime' }
 type CardNode = Record<string, any>;
 
 // Version 1 reserves runs of 12, 13, and 14 of the existing footer carrier.
+// Runs 15–17 carry the same purposes inside media, so a flattened table's
+// final row can be distinguished from a signed footer paragraph.
 // Lark retains U+2063 when flattening B into A, unlike arbitrary JSON metadata
 // or hidden Markdown links. The original four-character footer signature is
 // a prefix, so normal history/quoted parsing keeps stripping the whole footer.
 const PURPOSE_LENGTH: Record<GroupContextCardPurpose, number> = { runtime: 12, message: 13, 'turn-message': 14 };
-const PURPOSE_BY_LENGTH = new Map(Object.entries(PURPOSE_LENGTH).map(([purpose, length]) => [length, purpose as GroupContextCardPurpose]));
+const PURPOSE_BY_LENGTH = new Map(Object.entries(PURPOSE_LENGTH).flatMap(([purpose, length]) =>
+  [[length, purpose as GroupContextCardPurpose], [length + 3, purpose as GroupContextCardPurpose]]));
+const CHART_PURPOSE_BY_ID = new Map(Object.keys(PURPOSE_LENGTH).map(purpose =>
+  [`botmux_group_context_chart_${purpose.replace('-', '_')}`, purpose as GroupContextCardPurpose]));
 const CARRIER = /\u2063{4,}/g;
-const TRAILING_PURPOSE_CARRIER = /\u2063{12,14}$/;
+const TRAILING_PURPOSE_CARRIER = /(?<!\u2063)\u2063{12,17}$/;
+const TRAILING_MEDIA_CARRIER = /(?<!\u2063)\u2063{15,17}$/;
 
 function nodes(value: unknown, visibleOnly = false): CardNode[] {
   if (!value || typeof value !== 'object') return [];
@@ -45,6 +51,10 @@ export function stripTrailingGroupContextCardPurposeMarker(value: string): strin
   return value.replace(TRAILING_PURPOSE_CARRIER, '');
 }
 
+export function hasTrailingGroupContextMediaPurposeMarker(value: string): boolean {
+  return TRAILING_MEDIA_CARRIER.test(value);
+}
+
 function inlinePurposeCarrier(root: any[], marker: string): boolean {
   // Prefer the first authored Markdown block. A signed visible footer is
   // always the final paragraph after Lark's B→A flattening; putting the inline
@@ -62,6 +72,47 @@ function inlinePurposeCarrier(root: any[], marker: string): boolean {
   return false;
 }
 
+/** Reuse an existing media/table text field instead of allocating a blank row. */
+function inlineMediaPurposeCarrier(value: any, marker: string, kind: 'table' | 'img'): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(child => inlineMediaPurposeCarrier(child, marker, kind));
+  if (RUNTIME_ID.test(value.element_id ?? '')) return false;
+  if (kind === 'img' && value.tag === 'img') {
+    const alt = typeof value.alt === 'string' ? value.alt : value.alt?.content;
+    value.alt = { tag: 'plain_text', content: `${stripTrailingGroupContextCardPurposeMarker(typeof alt === 'string' ? alt : '')}${marker}` };
+    return true;
+  }
+  if (kind === 'table' && value.tag === 'table' && Array.isArray(value.columns)) {
+    // The last text cell also stays at the end when a table is flattened.
+    const textColumns = value.columns.filter((column: CardNode) => column?.data_type === 'lark_md');
+    for (const row of [...(Array.isArray(value.rows) ? value.rows : [])].reverse()) {
+      for (const column of [...textColumns].reverse()) {
+        if (!row || typeof row[column.name] !== 'string') continue;
+        row[column.name] = `${stripTrailingGroupContextCardPurposeMarker(row[column.name])}${marker}`;
+        return true;
+      }
+    }
+    const column = [...value.columns].reverse().find((column: CardNode) => typeof column?.display_name === 'string');
+    if (column) {
+      column.display_name = `${stripTrailingGroupContextCardPurposeMarker(column.display_name)}${marker}`;
+      return true;
+    }
+  }
+  return ['elements', 'columns'].some(key => inlineMediaPurposeCarrier(value[key], marker, kind));
+}
+
+/** Native charts support element IDs; never modify categories, values or titles. */
+function chartPurposeCarrier(value: any, purpose: GroupContextCardPurpose): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(child => chartPurposeCarrier(child, purpose));
+  if (RUNTIME_ID.test(value.element_id ?? '')) return false;
+  if (value.tag === 'chart' && !value.element_id) {
+    value.element_id = `botmux_group_context_chart_${purpose.replace('-', '_')}`;
+    return true;
+  }
+  return ['elements', 'columns'].some(key => chartPurposeCarrier(value[key], purpose));
+}
+
 /** Stamp an outgoing structured card without mutating the caller's object. */
 export function markGroupContextCardPurpose<T extends Record<string, any>>(card: T, purpose: GroupContextCardPurpose): T;
 export function markGroupContextCardPurpose(card: string, purpose: GroupContextCardPurpose): string;
@@ -72,16 +123,25 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   if (!clone || typeof clone !== 'object' || Array.isArray(clone)) return card;
   const root = elements(clone);
   if (!root) return card;
+  // A saved card may carry an older purpose in image alt. Remove it before
+  // choosing a different carrier, otherwise re-stamping creates a conflict.
+  for (const node of nodes(root, true)) {
+    if (node.tag === 'chart' && CHART_PURPOSE_BY_ID.has(node.element_id)) delete node.element_id;
+    for (const key of node.tag === 'img' ? ['alt'] : node.tag === 'table' ? ['rows', 'columns'] : []) {
+      if (node[key] !== undefined) node[key] = stripMediaPurposeText(node[key]);
+    }
+  }
   const marker = '\u2063'.repeat(PURPOSE_LENGTH[purpose]);
+  const mediaMarker = '\u2063'.repeat(PURPOSE_LENGTH[purpose] + 3);
   const footer = nodes(root).find(node => node.element_id === REPLY_CARD_FOOTER_ELEMENT_ID && typeof node.content === 'string');
   if (footer) {
     if (footer.content.includes(REPLY_CARD_FOOTER_MARKER)) footer.content = footer.content.replace(CARRIER, marker);
     else footer.content = footer.content.replace(/(?=<\/font>\s*$)|$/, marker);
-  } else if (!inlinePurposeCarrier(root, marker)) {
-    // Image/table-only cards have no text carrier. Keep the compatibility
-    // fallback for those rare shapes; ordinary text progress cards stay on
-    // their existing Markdown element so an invisible protocol marker does
-    // not allocate a blank footer row in Lark.
+  } else if (!inlinePurposeCarrier(root, marker)
+    && !inlineMediaPurposeCarrier(root, mediaMarker, 'table')
+    && !chartPurposeCarrier(root, purpose)
+    && !inlineMediaPurposeCarrier(root, mediaMarker, 'img')) {
+    // Unsupported custom shapes retain the compatibility carrier.
     root.push({ tag: 'markdown', element_id: REPLY_CARD_FOOTER_ELEMENT_ID, text_size: 'notation',
       content: `<font color='grey'>${marker}</font>` });
   }
@@ -91,10 +151,23 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
 function purposeOf(card: CardNode): GroupContextCardPurpose | 'conflict' | undefined {
   const purposes = new Set<GroupContextCardPurpose>();
   for (const node of nodes(card, true)) {
+    if (node.tag === 'chart') {
+      const chartPurpose = CHART_PURPOSE_BY_ID.get(node.element_id);
+      if (chartPurpose) purposes.add(chartPurpose);
+    }
     // Read only rendered text carriers, never a callback value or premerged text.
-    for (const field of ['content', 'text']) {
-      if (typeof node[field] !== 'string') continue;
-      for (const run of node[field].matchAll(CARRIER)) {
+    const texts = [node.content, node.text];
+    if (node.tag === 'table' && Array.isArray(node.columns)) {
+      texts.push(...node.columns.map((column: CardNode) => column?.display_name));
+      for (const row of Array.isArray(node.rows) ? node.rows : []) {
+        for (const column of node.columns) {
+          if (column?.data_type === 'lark_md') texts.push(row?.[column.name]);
+        }
+      }
+    }
+    for (const text of texts) {
+      if (typeof text !== 'string') continue;
+      for (const run of text.matchAll(CARRIER)) {
         const purpose = PURPOSE_BY_LENGTH.get(run[0].length);
         if (purpose) purposes.add(purpose);
       }
@@ -129,6 +202,10 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
   if (Array.isArray(value)) return value.map(child => projectNode(child, legacy, apiFormat)).filter(child => child !== undefined);
   if (RUNTIME_ID.test(value.element_id ?? '')) return undefined;
   if (legacy && isLegacyProcess(value)) return undefined;
+  if (value.tag === 'chart') {
+    const chartData = projectChartData(value.chart_spec);
+    if (chartData) return chartData;
+  }
   if (/^botmux_turn_options_\d+$/.test(value.element_id ?? '')) {
     return { tag: 'markdown', content: nodes(value).filter(node => node.tag === 'button').map(button => renderedText(button.text)).filter(Boolean).join('\n') };
   }
@@ -140,7 +217,9 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
   for (const [key, child] of Object.entries(value)) {
     // Never let the generic parser short-circuit on unprojected A+B text.
     if (key === '__botmux_card_text__' || key === 'behaviors' || key === 'callback') continue;
-    const projected = projectNode(child, legacy, apiFormat);
+    const mediaText = value.tag === 'img' && key === 'alt'
+      || value.tag === 'table' && (key === 'rows' || key === 'columns');
+    const projected = projectNode(mediaText ? stripMediaPurposeText(child) : child, legacy, apiFormat);
     if (projected !== undefined) result[key] = projected;
   }
   if (['markdown', 'div', 'plain_text'].includes(result.tag) && Array.isArray(result.property?.elements)
@@ -151,6 +230,30 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
     result.content = renderedText(result.property.elements);
   }
   return result;
+}
+
+/** Context readers need chart facts even when detail B has no image snapshot.
+ * This projection is never sent back to Lark; the published chart is unchanged. */
+function projectChartData(spec: any): CardNode | undefined {
+  const rows = spec?.data?.values;
+  if (!Array.isArray(rows) || !rows.length || !rows.every(row => row && typeof row === 'object' && !Array.isArray(row))) return undefined;
+  const fields = [...new Set(rows.flatMap(row => Object.keys(row)))];
+  if (!fields.length) return undefined;
+  const title = typeof spec.title?.text === 'string' ? spec.title.text : '';
+  return { tag: 'div', elements: [
+    ...(title ? [{ tag: 'plain_text', content: title }] : []),
+    { tag: 'table', columns: fields.map((field, index) => ({ name: `c${index}`, display_name: field, data_type: 'text' })),
+      rows: rows.map(row => Object.fromEntries(fields.map((field, index) => [`c${index}`, row[field] ?? '']))) },
+  ] };
+}
+
+function stripMediaPurposeText(value: any): any {
+  if (typeof value === 'string') return stripTrailingGroupContextCardPurposeMarker(value);
+  if (Array.isArray(value)) return value.map(stripMediaPurposeText);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, stripMediaPurposeText(child)]));
+  }
+  return value;
 }
 
 function isLegacyProcess(node: CardNode): boolean {
@@ -219,7 +322,10 @@ function conversation(card: CardNode, turnReply: boolean, legacy = false): Group
 }
 
 /** A shared-only structural projection. Ordinary history parsing stays intact. */
-export function projectGroupContextCard(rawContent: string): GroupContextCardProjection | undefined {
+export function projectGroupContextCard(
+  rawContent: string,
+  options: { botmuxSender?: boolean } = {},
+): GroupContextCardProjection | undefined {
   let card: CardNode;
   try { card = JSON.parse(rawContent); } catch { return undefined; }
   if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
@@ -241,7 +347,15 @@ export function projectGroupContextCard(rawContent: string): GroupContextCardPro
     if (!status || root?.some(Array.isArray)) return { kind: 'unresolved' };
     return conversation(card, true);
   }
-  if (!status) return undefined;
+  if (!status) {
+    // Format A drops image alt text. Rehydrate the structured card before
+    // deciding whether an image-only bot message is runtime or conversation.
+    // Unmarked structured cards still follow the ordinary parsing path.
+    const imageOnlyApiCard = root?.length && root.every(paragraph => Array.isArray(paragraph)
+      && paragraph.length > 0 && paragraph.every(node => node?.tag === 'img'
+        || node?.tag === 'text' && typeof node.text === 'string' && !node.text.trim()));
+    return options.botmuxSender === true && imageOnlyApiCard ? { kind: 'unresolved' } : undefined;
+  }
   const statusText = renderedText(status);
   // The rendered property tree can omit Markdown's bold delimiters. Rebuild
   // only that wrapper, then retain the exact icon/label/duration allowlist.

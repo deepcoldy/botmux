@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
@@ -176,7 +177,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, latestLarkToolBindingForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, latestLarkToolBindingForRespawn, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -1738,6 +1739,20 @@ ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { error: 'not_found' });
   jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
+});
+
+/** Reply rendering owns policy and timing; native /usage stays data-only. */
+ipcRoute('GET', '/api/sessions/:sessionId/reply-render-snapshot', (req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { error: 'not_found' });
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const turnId = query.get('turnId') ?? undefined;
+  const rawAttempt = query.get('dispatchAttempt');
+  const dispatchAttempt = rawAttempt === null ? undefined : Number(rawAttempt);
+  if (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt < 1)) {
+    return jsonRes(res, 400, { error: 'invalid_dispatch_attempt' });
+  }
+  jsonRes(res, 200, { snapshot: getDaemonReplyCardRenderSnapshot(ds, { turnId, dispatchAttempt }) });
 });
 
 /** Session-bound single-message delivery through the primary durable outbox.
@@ -7405,6 +7420,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
     // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
     defaultBackendType: config.daemon.backendType,
+    ...normalizeReplyFooter(cardPrefs),
+    showReplyTiming: cardPrefs.showReplyTiming,
     usageDisplay: cardPrefs.usageDisplay,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
@@ -7554,6 +7571,13 @@ ipcRoute('PUT', '/api/bot-quota-fallback', requireBoundBot(async (req, res) => {
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{
+    replyFooterEnabled?: unknown;
+    replyFooterBrand?: unknown;
+    replyFooterModel?: unknown;
+    replyFooterUsage?: unknown;
+    replyFooterRecipients?: unknown;
+    replyFooterVoice?: unknown;
+    showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
@@ -7567,7 +7591,8 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }>(req, res);
   if (body === BAD_JSON) return;
 
-  const patch: {
+  const patch: ReplyFooterPreferences & {
+    showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
@@ -7580,6 +7605,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
   } = {};
+  for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
+    if (body[key] !== undefined) {
+      if (typeof body[key] !== 'boolean') return jsonRes(res, 400, { ok: false, error: `invalid_${key}` });
+      patch[key] = body[key];
+    }
+  }
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (body.replyCardMode !== undefined) {
     if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {

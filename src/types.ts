@@ -2054,6 +2054,8 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
+  /** Native write observation for display timing; never an admission or completion receipt. */
+  | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own
    * conversation: an exact owned history/transcript user record, or an RPC
    * turn acknowledgement. Neither IPC arrival, queue ownership nor a generic

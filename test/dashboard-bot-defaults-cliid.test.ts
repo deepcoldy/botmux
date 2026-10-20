@@ -7,6 +7,7 @@ import {
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
@@ -2458,5 +2459,67 @@ describe('card behavior defaults', () => {
       await pending;
     });
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
+    act(() => renderer.unmount());
   });
 });

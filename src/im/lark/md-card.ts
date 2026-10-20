@@ -19,6 +19,8 @@
  * the outer block (CommonMark spec).
  */
 
+import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
+import type { ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -696,29 +698,32 @@ export function buildReplyCardFooter(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
   locale?: Locale;
 }): ReplyCardFooter | null {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return null;
   const parts: string[] = [];
-  const brandSeg = brandFooterSegment(opts.brand);
+  const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
   let hasUsage = false;
   if (opts.usage) {
-    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
-    const runtimeSeg = cardUsageRuntimeSegment(opts.usage);
+    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage);
     if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
-  const durationMs = opts.executionDurationMs;
+  const durationMs = opts.presentation?.timing?.executionDurationMs ?? opts.executionDurationMs;
   const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
-  const waitingMs = opts.waitingDurationMs;
+  const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
   const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
   if (hasWaiting) {
     parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
   }
   if (hasDuration) {
-    parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
-  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
   if (hasRecipient) {
     parts.push(
@@ -762,6 +767,23 @@ export function buildReplyCardFooter(opts: {
   };
 }
 
+/** Compose the entire footer once: text, divider and optional voice action. */
+export function buildReplyCardFooterElements(
+  opts: Parameters<typeof buildReplyCardFooter>[0] & { voiceButton?: Record<string, unknown> },
+): any[] {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return [];
+  const footer = buildReplyCardFooter(opts);
+  const voice = policy.voice ? opts.voiceButton : undefined;
+  if (!footer && !voice) return [];
+  return [{ tag: 'hr' }, ...(voice ? [{
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'default', columns: [
+      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [footer?.element ?? { tag: 'markdown', text_size: 'notation', content: ' ' }] },
+      { tag: 'column', width: 'auto', vertical_align: 'center', elements: [voice] },
+    ],
+  }] : [footer!.element])];
+}
+
 /** Clone a caller-supplied schema-2 card and append the canonical reply
  * footer. Returns null for cards without a v2 `body.elements` array or when a
  * caller-owned element already occupies the globally unique footer id. */
@@ -788,8 +810,7 @@ export function appendReplyCardFooterToV2Card(
   ) {
     return null;
   }
-  const footer = buildReplyCardFooter(opts);
-  if (footer) body.elements.push({ tag: 'hr' }, footer.element);
+  body.elements.push(...buildReplyCardFooterElements(opts));
   return cloned;
 }
 
@@ -1542,19 +1563,18 @@ export function buildMarkdownCard(
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   usage?: CardUsageSnapshot,
+  presentation?: ReplyCardPresentation,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    presentation,
   });
   // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
+  elements.push(...footerElements);
   const card = createReplyCard(elements);
   fitBuiltCard(card, 'markdown_card');
   return JSON.stringify(card);
@@ -1574,19 +1594,21 @@ export function buildCanonicalFinalReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
     : [];
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
     usage: opts.usage,
+    presentation: opts.presentation,
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
-  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  elements.push(...footerElements);
   const card = createReplyCard(elements);
   composeFinalCardSections(card, {
     ...(opts.completionProposal
@@ -1635,6 +1657,7 @@ export function buildContextualReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
   feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
@@ -1678,18 +1701,16 @@ export function buildContextualReplyCard(opts: {
 
   if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
 
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
+    presentation: opts.presentation,
   });
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
+  elements.push(...footerElements);
 
   const card = createReplyCard(elements);
   fitBuiltCard(card, 'contextual_reply');

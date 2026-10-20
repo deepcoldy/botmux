@@ -217,6 +217,7 @@ import {
   loadBotConfigs,
   resolveBrandLabel,
   resolveUsageDisplay,
+  resolveReplyFooterPreferences,
   type BotConfig,
 } from './bot-registry.js';
 import {
@@ -6092,6 +6093,7 @@ async function deliverRemoteRunnerOutboundMessage(
     BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
     BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
     BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+    BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
   };
   const pinnedConfig = resolveChildBotsConfig(
     lastInitConfig.loadedBotsConfigPath,
@@ -6141,6 +6143,7 @@ async function deliverRemoteRunnerSessionTool(
     BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
     BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
     BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+    BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(lastInitConfig.larkAppId)),
   };
   const pinnedConfig = resolveChildBotsConfig(
     lastInitConfig.loadedBotsConfigPath,
@@ -17053,6 +17056,7 @@ async function spawnCli(
     (riffBackendConfig as EffectiveMojoConfig).env = {
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
@@ -17083,6 +17087,7 @@ async function spawnCli(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+      BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
@@ -17135,6 +17140,7 @@ async function spawnCli(
     // it again here to prevent a stale/forged remote value from desynchronising
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
+    mergedEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
     // Public selector metadata is a host-resolved session snapshot. It is only
     // a send-time validation hint (the daemon reauthorizes every callback), but
     // still freeze it after raw riff env merges so stale config cannot desync
@@ -18889,6 +18895,7 @@ async function spawnCli(
   // for this bot; anything else is 'true' (absent config = default ON).
   childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  childEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.
@@ -24246,7 +24253,9 @@ const turnExecutionClock = new TurnExecutionClock();
  *  now. Called from every literal-write site (flush, adopt, passthrough, init)
  *  so `durationMs` measures the CLI, not the daemon's backlog. */
 function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: number): void {
-  turnExecutionClock.start(turnId, dispatchAttempt);
+  const startedAtMs = Date.now();
+  turnExecutionClock.start(turnId, dispatchAttempt, startedAtMs);
+  if (turnId) send({ type: 'turn_execution_started', turnId, dispatchAttempt, startedAtMs });
 }
 
 /** Report CLI processing completion independently from user-visible output.
