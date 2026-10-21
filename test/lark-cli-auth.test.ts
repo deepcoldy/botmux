@@ -314,7 +314,7 @@ describe('begin / complete device flow', () => {
       clock.mockReturnValue(1_800_000_060_000);
       expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
       expect(pendingLarkCliChallenge(OPEN)).toBeNull();
-      expect(larkCliHomeForTurn(OPEN_B)).toBeNull();
+      expect(hasLarkCliHome(OPEN_B)).toBe(false);
     },
   );
 
