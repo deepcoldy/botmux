@@ -62,21 +62,29 @@ import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
-/** Extract the cliSessionId encoded in a rollout filename. Codex's session
- *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
- *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
- *  contains its own dashes that would otherwise let a greedy match swallow
- *  parts of the sid.
+/** STRICT, cross-CLI parser for the cliSessionId encoded in a rollout
+ *  filename. Codex's session id is UUID-shaped (8-4-4-4-12 hex), which lets
+ *  us anchor the regex on the UUID alone — the `<ts>` segment between
+ *  "rollout-" and the sid contains its own dashes that would otherwise let a
+ *  greedy match swallow parts of the sid.
  *
- *  This is deliberately STRICT: the canonical Codex name is
- *  `rollout-<ts>-<sid>.jsonl`. The byte-identical `-<sid>_<uuid>.jsonl`
- *  shape means a resumed SEGMENT for TRAE X; a shared parser accepting that
- *  suffix could let TRAE pid-probe adopt persist the wrong native session
- *  id (#1854). Codex resumed GENERATION files use that shape too, but are
- *  read only through Codex-scoped paths (a Codex pid's open fds /
- *  CODEX_HOME index+scan / an already-bound Codex bridge) — those use
- *  {@link codexGenerationSessionIdFromRolloutPath}, never this shared one.
- *  Returns undefined for paths that don't match. */
+ *  Deliberately STRICT — it matches only the canonical
+ *  `rollout-<ts>-<sid>.jsonl` name and returns undefined for the
+ *  byte-identical `-<sid>_<uuid>.jsonl` shape. That suffix is ambiguous: for
+ *  Codex it is a resumed GENERATION file, but for TRAE X it is a resumed
+ *  SEGMENT. A shared/ambiguous caller that accepted the suffix could let a
+ *  TRAE pid-probe adopt persist the wrong native session id (#1854).
+ *
+ *  This exported function currently has ZERO production callers by design:
+ *  Codex's own generation-aware reads all go through the Codex-scoped
+ *  {@link codexGenerationSessionIdFromRolloutPath} (a Codex pid's open fds /
+ *  CODEX_HOME index+scan / an already-bound Codex bridge — the only places a
+ *  `_<uuid>` suffix is known to mean a Codex generation). Do NOT treat this
+ *  parser as dead code under the "remove test-only exports" rule: it is the
+ *  load-bearing body of the cross-CLI invariant pinned by
+ *  `test/structured-bridge-spec.test.ts > pins the per-CLI differences`
+ *  (mutating the regex to accept the suffix makes that guard fail). Keep the
+ *  strict parser and the Codex-scoped parser separate. */
 export function codexSessionIdFromRolloutPath(path: string): string | undefined {
   return CODEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
 }
@@ -122,7 +130,10 @@ type CodexRolloutRef = { path: string; cliSessionId: string };
  *  transcripts open in the same process, so choosing the first fd can bind
  *  an adopted pane to the wrong conversation.
  *
- *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
+ *  两种平台（Linux /proc 与 macOS lsof 兜底）都用同一套进程打开文件枚举
+ *  与 `codexGenerationSessionIdFromRolloutPath` 提取 sid：这些 fd 已确定属于
+ *  一个 Codex 进程，所以这里可以识别 Codex 的 generation 后缀；严格的
+ *  {@link codexSessionIdFromRolloutPath} 只服务跨 CLI 歧义守卫，不在此链路。 */
 export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
   const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
@@ -193,9 +204,11 @@ function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   // env-independent structural shape: a `sessions/` path segment plus the
   // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
   if (!/(^|\/)sessions\//.test(target)) return undefined;
-  // These fds belong to a Codex process, so a resumed-generation suffix is a
-  // real Codex rollout, not the same-shaped TRAE segment (#1854 keeps the
-  // shared strict parser used by ambiguous/non-Codex callers).
+  // These fds belong to a Codex process, so a `_<uuid>` suffix here is a real
+  // Codex resumed generation — use the Codex-scoped parser. The strict
+  // codexSessionIdFromRolloutPath (which rejects that suffix because the same
+  // shape is a TRAE segment, #1854) is intentionally not used on this
+  // Codex-owned path; it exists only to pin the cross-CLI guard in tests.
   const sid = codexGenerationSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
