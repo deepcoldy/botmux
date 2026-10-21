@@ -4,9 +4,8 @@ import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import {
   CODEX_APP_INPUT_PREFIX,
   decodeCodexAppRunnerInput,
-  normalizeAppRunnerFinalMarker,
   normalizeCodexAppLifecycleEvent,
-  projectAppRunnerFinalIds,
+  normalizeFinalUsage,
 } from '../src/services/codex-app-runner-protocol.js';
 
 function encodedLine(value: unknown): string {
@@ -75,65 +74,25 @@ describe('Codex App runner input protocol', () => {
   });
 });
 
-describe('app runner final marker normalization', () => {
-  it('keeps app-server and Feishu ids in separate fields', () => {
-    expect(normalizeAppRunnerFinalMarker({
-      appTurnId: 'app-turn-1',
-      replyTurnId: 'om_follow_up',
-      content: 'done',
-      startedAtMs: 10,
-      completedAtMs: 20,
-    })).toEqual({
-      appTurnId: 'app-turn-1',
-      replyTurnId: 'om_follow_up',
-      legacyTurnId: undefined,
-      content: 'done',
-      startedAtMs: 10,
-      completedAtMs: 20,
-    });
-  });
-
-  it('projects new ids separately while preserving legacy single-id markers', () => {
-    expect(projectAppRunnerFinalIds({
-      appTurnId: 'app-turn-1',
-      replyTurnId: 'om_follow_up',
-      content: 'done',
-    }, 'om_latest', 'generated')).toEqual({
-      lastUuid: 'app-turn-1',
-      turnId: 'om_follow_up',
-    });
-    expect(projectAppRunnerFinalIds({
-      legacyTurnId: 'legacy-turn',
-      content: 'done',
-    }, 'om_latest', 'generated')).toEqual({
-      lastUuid: 'legacy-turn',
-      turnId: 'legacy-turn',
-    });
-  });
-
-  it('rejects malformed final markers', () => {
-    expect(normalizeAppRunnerFinalMarker({ content: 42, appTurnId: 'x' })).toBeUndefined();
-    expect(normalizeAppRunnerFinalMarker(null)).toBeUndefined();
-  });
-
+describe('app runner final usage normalization', () => {
   it('passes through a well-formed usage object', () => {
     const usage = { inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 };
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage }).usage).toEqual(usage);
+    expect(normalizeFinalUsage(usage)).toEqual(usage);
   });
 
   it('drops a malformed usage object (missing/non-numeric field) rather than persist partial', () => {
     // missing cacheCreateTokens
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 1 } }).usage).toBeUndefined();
+    expect(normalizeFinalUsage({ inputTokens: 1, outputTokens: 1, cacheReadTokens: 1 })).toBeUndefined();
     // non-numeric
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { inputTokens: 'x', outputTokens: 1, cacheReadTokens: 1, cacheCreateTokens: 1 } }).usage).toBeUndefined();
+    expect(normalizeFinalUsage({ inputTokens: 'x', outputTokens: 1, cacheReadTokens: 1, cacheCreateTokens: 1 })).toBeUndefined();
     // not an object
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: 42 }).usage).toBeUndefined();
+    expect(normalizeFinalUsage(42)).toBeUndefined();
   });
 
   it('drops usage with a negative or fractional token count (boundary at the marker layer)', () => {
     const base = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreateTokens: 0 };
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { ...base, inputTokens: -1 } }).usage).toBeUndefined();
-    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { ...base, outputTokens: 2.5 } }).usage).toBeUndefined();
+    expect(normalizeFinalUsage({ ...base, inputTokens: -1 })).toBeUndefined();
+    expect(normalizeFinalUsage({ ...base, outputTokens: 2.5 })).toBeUndefined();
   });
 });
 

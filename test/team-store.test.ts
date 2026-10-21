@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { logger } from '../src/utils/logger.js';
 import {
   DEFAULT_TEAM_ID, listTeams, getTeam, getDefaultTeam, ensureDefaultTeam,
-  createTeam, addMember, removeMember, isMember, deleteTeam, listTeamsForMember,
+  createTeam, addMember, removeMember, isMember, deleteTeam,
 } from '../src/services/team-store.js';
 
 let dataDir: string;
@@ -90,18 +90,6 @@ describe('team-store', () => {
     expect(getTeam(dataDir, a.id)).toBeNull();
     expect(listTeams(dataDir).map(t => t.id)).toEqual([b.id]);
     expect(deleteTeam(dataDir, 'nope')).toBe(false);
-  });
-
-  it('listTeamsForMember returns only teams the identity belongs to', () => {
-    const a = createTeam(dataDir, 'A');
-    const b = createTeam(dataDir, 'B');
-    createTeam(dataDir, 'C');
-    addMember(dataDir, a.id, { unionId: 'on_1' });
-    addMember(dataDir, b.id, { unionId: 'on_1' });
-    addMember(dataDir, b.id, { unionId: 'on_2' });
-    expect(listTeamsForMember(dataDir, { unionId: 'on_1' }).map(t => t.id).sort()).toEqual([a.id, b.id].sort());
-    expect(listTeamsForMember(dataDir, { unionId: 'on_2' }).map(t => t.id)).toEqual([b.id]);
-    expect(listTeamsForMember(dataDir, {})).toEqual([]);
   });
 });
 

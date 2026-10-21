@@ -22,6 +22,8 @@ function buildStreamingCardCallSites(source: string): string[] {
   return sites;
 }
 
+// 源码结构护栏(K4)：同上，每个 buildStreamingCard 调用点都必须传入按机器人解析的隐藏按钮策略，
+// 否则重渲染会把机器人隐藏的按钮重新露出来。调用点在闭包里，只能逐个核对。
 describe('streaming-card button policy wiring', () => {
   for (const rel of [
     'src/core/worker-pool.ts',

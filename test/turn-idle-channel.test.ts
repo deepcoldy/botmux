@@ -7,12 +7,13 @@
  * turn-idle-cli.test.ts. This file pins the pure fence, the daemon route's
  * authorization, and the "only dsh-tui opts in" invariants.
  */
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { decideTurnIdleReport } from '../src/utils/turn-idle-report.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { turnIdleHookCommand } from '../src/adapters/hook-command.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { BOTMUX_INJECTED_ENV_KEYS, SESSION_TURN_MARKER_ENV_KEYS } from '../src/utils/child-env.js';
 
 const REPO_ROOT = join(__dirname, '..');
@@ -180,82 +181,33 @@ describe('/api/turn-idle authorization', () => {
 });
 
 describe('turn-idle protocol wiring', () => {
-  it('registers the daemon route with session-scoped authorization before forwarding', () => {
+  // 源码结构护栏(K2)：/api/turn-idle 的处理器写在 daemon.ts 的闭包里，没有可调用的入口。
+  // 守的是转发前的两道门：先做会话级鉴权（receiver 会话不放行），再把声明的 turn/attempt
+  // 绑定到签发 token 的那个 origin；任何一道被挪到转发之后，都会让伪造的 idle 报告结算掉别人的轮次。
+  it('authorizes and binds the claimed turn to the live origin before forwarding', () => {
     const daemon = source('src/daemon.ts');
     const route = daemon.indexOf("ipcRoute('POST', '/api/turn-idle'");
     expect(route).toBeGreaterThan(-1);
     const routeBody = daemon.slice(route, daemon.indexOf("ipcRoute(", route + 10));
-    expect(routeBody).toContain('authorizeSessionScopedIpc({');
-    expect(routeBody).toContain("jsonRes(res, 403");
-    expect(routeBody).toContain("type: 'turn_idle'");
-    // Observable route: receiver sessions are denied (unlike session-ready).
     expect(routeBody).toContain('allowReceiver: false');
-    // Never forward before the capability check.
-    expect(routeBody.indexOf('authorizeSessionScopedIpc({'))
-      .toBeLessThan(routeBody.indexOf("type: 'turn_idle'"));
-  });
-
-  it('carries the report in the daemon→worker protocol', () => {
-    const types = source('src/types.ts');
-    expect(types).toMatch(/type: 'turn_idle'; turnId\?: string; dispatchAttempt\?: number/);
-  });
-
-  it('binds the claimed turn/attempt to the live origin before forwarding', () => {
-    const daemon = source('src/daemon.ts');
-    const route = daemon.indexOf("ipcRoute('POST', '/api/turn-idle'");
-    const routeBody = daemon.slice(route, daemon.indexOf("ipcRoute(", route + 10));
-    // The capability only proves "holds this session's current token"; the claim
-    // is bound to the origin that token was minted for, and a mismatch is
-    // refused instead of forwarded.
-    expect(routeBody).toContain('decideTurnIdleReport({');
-    expect(routeBody).toContain("error: 'origin_identity_mismatch'");
-    expect(routeBody.indexOf('authorizeSessionScopedIpc({'))
-      .toBeLessThan(routeBody.indexOf('decideTurnIdleReport({'));
-    expect(routeBody.indexOf('decideTurnIdleReport({'))
-      .toBeLessThan(routeBody.indexOf("type: 'turn_idle'"));
-  });
-
-  it('transports the frozen (event-time) identity instead of re-resolving the marker', () => {
-    const cli = source('src/cli.ts');
-    expect(cli).toContain('parsed.v === TURN_IDLE_PROTOCOL_VERSION');
-    expect(cli).toContain('frozenOrigin');
-    // The frozen path must not fall back to the live marker or its env fallback.
-    const frozen = cli.slice(cli.indexOf('const frozenOrigin = opts?.frozenOrigin'));
-    const originAssignment = frozen.slice(0, frozen.indexOf('satisfies RequestInit'));
-    expect(originAssignment).toContain('frozenOrigin');
-    expect(originAssignment).toContain('liveOrigin?.turnId');
-    expect(originAssignment).toContain('process.env.BOTMUX_TURN_ID');
-    // …and when a frozen origin is present the marker walk is skipped entirely.
-    expect(cli).toContain('const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(');
-  });
-
-  it('registers `botmux __turn-idle-v2` and allowlists it inside workflow subagents', () => {
-    const cli = source('src/cli.ts');
-    expect(cli).toContain("case '__turn-idle-v2':");
-    expect(cli).toContain('await cmdTurnIdle();');
-    expect(cli).toContain("'__turn-idle-v2',");
+    const auth = routeBody.indexOf('authorizeSessionScopedIpc({');
+    const bind = routeBody.indexOf('decideTurnIdleReport({');
+    const forward = routeBody.indexOf("type: 'turn_idle'");
+    expect(auth).toBeGreaterThan(-1);
+    expect(bind).toBeGreaterThan(auth);
+    expect(forward).toBeGreaterThan(bind);
   });
 
   it('builds the shell command from the same launcher resolution as session-ready', () => {
     expect(turnIdleHookCommand()).toMatch(/__turn-idle-v2$/);
-    expect(source('src/adapters/hook-command.ts')).toContain("renderShellCommand(undefined, '__turn-idle-v2')");
   });
 });
 
 describe('turn-idle opt-in surface', () => {
-  it('is opted into by dsh-tui alone', () => {
-    const adapterDir = join(REPO_ROOT, 'src', 'adapters', 'cli');
-    const optingIn = readdirSync(adapterDir)
-      .filter(name => name.endsWith('.ts'))
-      .filter(name => source(join('src', 'adapters', 'cli', name)).includes('injectsTurnIdleHook: true'))
-      .sort();
-    expect(optingIn).toEqual(['dsh-tui.ts']);
-  });
+  const adapters = ALL_CLI_IDS.map(id => ({ id, adapter: createCliAdapterSync(id, process.execPath) }));
 
-  it('injects the env only for adapters that declare the flag', () => {
-    const worker = source('src/worker.ts');
-    expect(worker).toContain('if (cliAdapter.injectsTurnIdleHook) childEnv.BOTMUX_TURN_IDLE_COMMAND = turnIdleHookCommand();');
-    expect(worker).toContain('else delete childEnv.BOTMUX_TURN_IDLE_COMMAND;');
+  it('is opted into by dsh-tui alone', () => {
+    expect(adapters.filter(({ adapter }) => adapter.injectsTurnIdleHook === true).map(({ id }) => id)).toEqual(['dsh-tui']);
   });
 
   it('transports and scrubs the env key at every session boundary', () => {
@@ -264,12 +216,9 @@ describe('turn-idle opt-in surface', () => {
   });
 
   it('keeps BOTMUX_READY_COMMAND opt-in as before (no other adapter gained the gate)', () => {
-    const adapterDir = join(REPO_ROOT, 'src', 'adapters', 'cli');
-    const readyOptIn = readdirSync(adapterDir)
-      .filter(name => name.endsWith('.ts'))
-      .filter(name => source(join('src', 'adapters', 'cli', name)).includes('injectsReadyHook: true'))
-      .sort();
-    // claude-code + dsh-tui opt into injectsReadyHook; grok dropped it to avoid 45s ready-gate hold.
-    expect(readyOptIn).toEqual(['claude-code.ts', 'dsh-tui.ts']);
+    // claude-code (and seed / relay, built by the same factory) + dsh-tui opt into
+    // injectsReadyHook; grok dropped it to avoid the 45s ready-gate hold.
+    expect(adapters.filter(({ adapter }) => adapter.injectsReadyHook === true).map(({ id }) => id).sort())
+      .toEqual(['claude-code', 'dsh-tui', 'relay', 'seed']);
   });
 });

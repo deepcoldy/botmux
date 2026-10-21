@@ -39,6 +39,9 @@ import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 export interface BridgeTurnJournalEntry {
   turnId: string;
   dispatchAttempt?: number;
+  /** Admission-frozen mode for this exact turn. Absence is disabled and keeps
+   *  journals written by older Botmux versions byte-compatible on read. */
+  linkRefMode?: 'observe' | 'enabled';
   /** Wall-clock millis of the original mark — restored verbatim so the
    *  send-marker window and the split cutoff keep their original bounds. */
   markTimeMs: number;
@@ -143,7 +146,10 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
     typeof entry?.turnId === 'string'
     && typeof entry?.markTimeMs === 'number'
     && typeof entry?.jsonlPath === 'string'
-    && typeof entry?.offsetAtMark === 'number');
+    && typeof entry?.offsetAtMark === 'number'
+    && (entry?.linkRefMode === undefined
+      || entry.linkRefMode === 'observe'
+      || entry.linkRefMode === 'enabled'));
 }
 
 export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[]): void {

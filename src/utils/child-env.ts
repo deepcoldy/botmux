@@ -273,6 +273,13 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // boundary is safe. Kept as a string literal (like the keys above) with a
   // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
   'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+  // Daemon-only LinkRef rollout authority. Workers and CLI children receive
+  // only the frozen typed turn mode through authenticated IPC.
+  'BOTMUX_LINK_REFS_MODE',
+  // Set only on the narrow host relay re-exec after it has authenticated the
+  // exact live turn. An ordinary child must not inherit or replay either bit.
+  'BOTMUX_LINK_REF_TURN_MODE',
+  'BOTMUX_HOST_RELAY_AUTHORIZED',
 ] as const;
 
 /**

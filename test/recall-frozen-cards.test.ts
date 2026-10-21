@@ -9,6 +9,9 @@ import { pendingStartingCardPublication } from '../src/core/starting-card-public
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
 import { activeSessionKey, sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
@@ -1532,15 +1535,31 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
   });
 
   it('reads usage fresh so the 12s tick beats the 15s cost-reader throttle', () => {
-    // The whole point of the tick is to break the reparse throttle. The 17th
-    // buildStreamingCard arg is the streaming usage snapshot; assert the tick
-    // asked for a fresh read (empty transcript here → concrete empty snapshot).
+    // The whole point of the tick is to break the reparse throttle: two ticks
+    // inside one throttle window must both see the transcript as it is now.
+    // The 17th buildStreamingCard arg is the streaming usage snapshot.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'usage-fresh-')));
+    const cliSessionId = 'usage-fresh-sid';
+    const transcript = join(homedir(), '.claude', 'projects', cwd.replace(/[^A-Za-z0-9-]/g, '-'), `${cliSessionId}.jsonl`);
+    mkdirSync(dirname(transcript), { recursive: true });
+    const assistant = (id: string, input: number) => JSON.stringify({
+      type: 'assistant',
+      message: { id, model: 'claude-sonnet-4-20250514', usage: { input_tokens: input, output_tokens: 1 } },
+    });
+    writeFileSync(transcript, `${assistant('msg_a', 100)}\n`);
     const ds = workingDs();
+    ds.workingDir = cwd;
+    ds.session.cliSessionId = cliSessionId;
+
     refreshStreamingCardUsage(ds);
-    const call = buildStreamingCardMock.mock.calls[0]!;
-    // Snapshot present (17th positional arg) and interval < throttle by design.
-    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
+    appendFileSync(transcript, `${assistant('msg_b', 200)}\n`);
+    refreshStreamingCardUsage(ds);
+
+    const [first, second] = buildStreamingCardMock.mock.calls.map(call => call[16]);
+    expect(first.tokens).toMatchObject({ inputTokens: 100 });
+    expect(second.tokens).toMatchObject({ inputTokens: 300 });
     expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
+    rmSync(cwd, { recursive: true, force: true });
   });
 
   it('renders an empty terminal URL for a port=0 backend (ZMX) — no fake `:undefined` link', () => {

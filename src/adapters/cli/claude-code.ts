@@ -412,11 +412,11 @@ function currentFileSize(path: string): number {
   try { return statSync(path).size; } catch { return 0; }
 }
 
-function deltaHasSubmit(path: string, fromByte: number): boolean {
-  if (!existsSync(path)) return false;
+function readDeltaText(path: string, fromByte: number): string | undefined {
+  if (!existsSync(path)) return undefined;
   let size: number;
-  try { size = statSync(path).size; } catch { return false; }
-  if (size <= fromByte) return false;
+  try { size = statSync(path).size; } catch { return undefined; }
+  if (size <= fromByte) return undefined;
   const len = size - fromByte;
   const buf = Buffer.alloc(len);
   const fd = openSync(path, 'r');
@@ -425,8 +425,24 @@ function deltaHasSubmit(path: string, fromByte: number): boolean {
   } finally {
     closeSync(fd);
   }
-  const text = buf.toString('utf8');
-  return SUBMIT_MARKERS.some(m => text.includes(m));
+  return buf.toString('utf8');
+}
+
+function deltaHasSubmit(path: string, fromByte: number): boolean {
+  const text = readDeltaText(path, fromByte);
+  return !!text && SUBMIT_MARKERS.some(m => text.includes(m));
+}
+
+/** Transcript marker of an executed slash command. Claude Code records every
+ *  command it runs as a user line carrying `<command-name>/name</command-name>`:
+ *  local commands (`/effort`, `/model`, `/rename`, `/clear`…) together with
+ *  their `<local-command-stdout>`, prompt commands as the submitted message.
+ *  A line left in the composer (its Enter coalesced into a paste burst) or
+ *  still buffered by a CLI that is not reading input yet records nothing. */
+export function claudeCommandRecordMarker(commandLine: string): string | undefined {
+  const name = commandLine.trim().split(/\s+/, 1)[0] ?? '';
+  if (!/^\/[\w:.-]+$/.test(name)) return undefined;
+  return `<command-name>${name}</command-name>`;
 }
 
 async function waitForSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
@@ -1256,7 +1272,33 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     injectsSessionContext: true,
 
+    commandExecutionProbe(pty, commandLine) {
+      const marker = claudeCommandRecordMarker(commandLine);
+      if (!marker) return undefined;
+      const resolvePath = (): string | undefined => {
+        if (pty.cliPid && pty.cliCwd) {
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
+          if (resolved) return resolved.path;
+        }
+        return pty.claudeJsonlPath;
+      };
+      const path = resolvePath();
+      if (!path) return undefined;
+      const baseByte = currentFileSize(path);
+      return () => {
+        if (readDeltaText(path, baseByte)?.includes(marker)) return true;
+        // `/clear` & co. move Claude onto a new transcript and record the
+        // command there; that file did not exist at baseline time.
+        const current = resolvePath();
+        return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
+      };
+    },
+
     async writeInput(pty, content) {
+      // HERDR advertises an explicit bracketed-paste frame: send the complete
+      // payload once so newlines stay literal rather than depending on per-line
+      // backslash + Enter behavior. Keep the existing JSONL receipt gate below.
+      // Other keyed transports retain their established typing strategy:
       // Type content like a human: literal text via send-keys -l, and each
       // newline replaced by `\` + Enter (Claude Code's documented soft-newline
       // idiom — keeps content in the input box without submitting). The final
@@ -1295,12 +1337,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
       const sendSubmit = (): boolean => {
         if (pty.sendSpecialKeys && keybindings.submitKeys) {
-          pty.sendSpecialKeys(...keybindings.submitKeys);
-          return true;
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
         }
         if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
-          pty.write(keybindings.rawSubmitSequence);
-          return true;
+          return pty.write(keybindings.rawSubmitSequence) !== false;
         }
         return false;
       };
@@ -1338,6 +1378,35 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           : { submitted };
         return failureReason ? { ...result, failureReason } : result;
       };
+      const recheck = (): boolean => {
+        if (!submitFingerprint) return false;
+        // Latest pid → path; covers post-failure rotations (/clear, /resume).
+        if (pty.cliPid && pty.cliCwd) {
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
+          if (resolved) applyResolved(resolved);
+        }
+        const currentPath = pty.claudeJsonlPath;
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+          includeQueueOperations: true,
+          minEventTimestampMs: submitSearchMinMtime,
+        })) {
+          return true;
+        }
+        // Fan out to sibling jsonls in the project dir, then across every
+        // sibling project dir under `~/.claude/projects/` (catches workingDir
+        // drift like worker thinking `-foo-bar/` while Claude actually appends
+        // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
+        // fallback so a stale historical match can't suppress the warning.
+        const searchPath = currentPath ?? pty.claudeJsonlPath;
+        if (!searchPath) return false;
+        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
+          minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
+          includeQueueOperations: true,
+        });
+        return !!matched;
+      };
+      const unconfirmed = () => ({ ...buildResult(false), recheck });
       const submitKeySupportedByBackend = pty.sendSpecialKeys
         ? !!keybindings.submitKeys
         : !!keybindings.rawSubmitSequence;
@@ -1345,12 +1414,14 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }
 
-      if (pty.sendText && pty.sendSpecialKeys) {
+      if (pty.sendBracketedPaste) {
+        if (pty.sendBracketedPaste(sanitizedContent) === false) return unconfirmed();
+      } else if (pty.sendText && pty.sendSpecialKeys) {
         const lines = sanitizedContent.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
-              pty.sendText(chunk);
+              if (pty.sendText(chunk) === false) return unconfirmed();
               await tick();
             }
           }
@@ -1358,21 +1429,21 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             if (!keybindings.enterIsNewline) {
               // Soft-newline: backslash + Enter inserts a newline in Claude
               // Code's input box without submitting.
-              pty.sendText('\\');
+              if (pty.sendText('\\') === false) return unconfirmed();
               await tick();
             }
-            pty.sendSpecialKeys('Enter');
+            if (pty.sendSpecialKeys('Enter') === false) return unconfirmed();
             await tick();
           }
         }
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write(wrapBracketedPaste(sanitizedContent));
+        if (pty.write(wrapBracketedPaste(sanitizedContent)) === false) return unconfirmed();
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
-        return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
+        return unconfirmed();
       }
 
       // Without a JSONL path we can't verify — trust the fixed delay and return.
@@ -1497,34 +1568,6 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // UserPromptSubmit / SessionStart hook (e.g. superpowers) defers Claude's
       // jsonl append by 5–15s. The worker calls recheck() after a delay, and
       // suppresses the user-facing warning when the line shows up by then.
-      const recheck = (): boolean => {
-        if (!submitFingerprint) return false;
-        // Latest pid → path; covers post-failure rotations (/clear, /resume).
-        if (pty.cliPid && pty.cliCwd) {
-          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
-          if (resolved) applyResolved(resolved);
-        }
-        const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
-          includeQueueOperations: true,
-          minEventTimestampMs: submitSearchMinMtime,
-        })) {
-          return true;
-        }
-        // Fan out to sibling jsonls in the project dir, then across every
-        // sibling project dir under `~/.claude/projects/` (catches workingDir
-        // drift like worker thinking `-foo-bar/` while Claude actually appends
-        // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
-        // fallback so a stale historical match can't suppress the warning.
-        const searchPath = currentPath ?? pty.claudeJsonlPath;
-        if (!searchPath) return false;
-        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
-          minMtimeMs: submitSearchMinMtime,
-          minEventTimestampMs: submitSearchMinMtime,
-          includeQueueOperations: true,
-        });
-        return !!matched;
-      };
       return { ...buildResult(false), recheck };
     },
 

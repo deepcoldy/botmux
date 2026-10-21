@@ -193,6 +193,8 @@ describe('mojo backend bypasses local-only machinery', () => {
       .toBe(true);
   });
 
+  // 源码结构护栏(K1)：失败形态是类型里少了一个字段——TS 不对透传对象做多余属性检查，参数类型被收窄后
+  // env 会静默丢失、绕过重新出现，运行时调用观察不到「字段不存在」，只能看类型声明。
   it('the proof plumbing does not silently drop env on the way in', () => {
     // Narrowing any of these parameter types (as they originally were) drops `env`
     // WITHOUT a compile error — TS only rejects excess properties on fresh literals,
@@ -382,6 +384,8 @@ describe('mojo requires a local binary (unlike riff/mira)', () => {
   });
 });
 
+// 源码结构护栏(K4)：daemon 侧每个发出 raw_input / inject_command 的点都必须附带 mojo 凭据快照；
+// 发送点散落在 daemon.ts / worker-pool.ts 的闭包里，只能逐个扫出来核对（豁免表要求写明证据）。
 describe('every turn-starting IPC carries the mojo credential snapshot', () => {
   // Per-CHANGE-POINT guard, not per-defect. The original fix had two daemon-side
   // send points plus the worker-side apply, but only the worker side was pinned:

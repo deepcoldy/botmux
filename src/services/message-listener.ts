@@ -9,6 +9,7 @@ export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 export type MessageListenerSenderType = 'user' | 'bot';
 
 export interface MessageListenerMatch {
+  autoCloseAfterCompletion?: boolean;
   name?: string;
   replyCardTitle?: string;
   prompt: string;
@@ -349,6 +350,7 @@ export function evaluateMessageListener(input: {
     prompt: listener.prompt,
     workingDir: listener.workingDir,
     replyMode: listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread',
+    ...(listener.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     messageText,
     messageTitle,
     msgType,

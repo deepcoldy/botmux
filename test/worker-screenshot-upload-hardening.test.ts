@@ -489,6 +489,9 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const readSendMarkers = () => [];
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, log = () => {};
+      // Restart bookkeeping (restored-input settle) is short-circuited here; it is
+      // covered by unsent-input-journal.test.ts and the restart integration tests.
+      const noteCliInputWritten = () => {};
       const ordinaryImTurnDedupe = { commit: () => {} };
       let normalWritePrepared = false, item, durableWrite = false, durableTurnInFlight = false;
       let promptReadyAtFlushStart = false, itemsWrittenInThisFlush = 0, turnSeq = 0, bridgeTurnId;

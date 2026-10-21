@@ -141,6 +141,16 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
 - **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
 
+## 测试原则（写/改测试必读）
+
+测试要证明**行为**，不是给实现拍照。下面几类已经集中治理过，不要再新增：
+
+- **不读 `src/` 源码文本做断言。** `readFileSync('src/worker.ts')` 后 `toContain` 某行代码、或比 `indexOf` 先后，钉的是实现文本：改名、重构就红，代码还在但已经走不到时照样绿。git 历史里这类文件几乎每次改 `worker.ts` / `daemon.ts` 都得跟着改字符串。被测逻辑埋在闭包里时，**把它抽成可导出的纯函数再测**，而不是 grep；治理时因为没有 seam 而删掉的绊线记在 `docs/plans/2026-10-20-test-seam-backlog.md`，动到对应代码时顺手补上。只有真正的结构约束才保留这种写法：K1 import 边界与编译态限制、K2 没有行为 seam 的安全护栏、K3 高危回归绊线（数据丢失、fleet 崩溃、消息丢失或重复）、K4 机器可校验的一致性。保留时在用例或外层 `describe` 上方写 `// 源码结构护栏(Kx)：<为什么只能读源码、守的是什么不变量>`；只是把 src 下的 HTML/CSS 当夹具或交给浏览器、并不断言其文本的，写 `// 非文本断言：<说明>`。`test/test-hygiene.test.ts` 会拒绝没有标注的读源码用例。从 `worker.ts` / `daemon.ts` 切出真实函数执行再断言结果（`test/helpers/worker-function-harness.ts`）是没有 seam 时的过渡写法，扫描器不拦，但它依赖函数名和自由变量名，能导出时就直接 import。
+- **不钉文案和文档措辞。** 断言 docs / README / 卡片文案里有某句话，或断言另一个测试文件里有某个用例标题，都证明不了行为。文档由代码生成时，用 `--check` 式的漂移检查；需要「文档覆盖全部枚举值」这类一致性时，两侧都从真实数据取，不要抄字符串。
+- **不钉内部常量。** `expect(TIMEOUT_MS).toBe(60_000)` 只是把字面量再抄一遍。外部协议值（飞书错误码、终端转义序列、跨进程退出码、HTTP 路由、wire format）可以钉；常量之间的关系（`A >= B + C`）写成关系断言。
+- **不为死代码写测试。** 一个导出如果只有测试在调用，要么接进生产路径，要么连同测试一起删掉。测试隔离用的 `reset*` / `clear*Cache` 钩子不在此列。
+- 落笔前自问两句：这条测试会在**真实的行为回归**时变红吗？会在**无害的重构、改文案、调参数**时变红吗？前一问答「会」、后一问答「不会」，才值得写。
+
 ## PR 规范
 
 - 标题与 commit message 同格式：`type(scope): 中文描述`

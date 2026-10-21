@@ -407,6 +407,8 @@ describe('deliberate-silence closure (turn_terminal nothing_to_send)', () => {
  * NEW call site: a behavioral test only covers the paths someone remembered to
  * write.
  */
+// 源码结构护栏(K4)：每个 buildStreamingCard 调用点都必须传入静默轮次的 idle 标签与 dshRuntime；调用点在
+// daemon / worker-pool / card-handler 的闭包里，漏传任何一处都只在那条路径上出错，只能逐个调用点核对。
 describe('buildStreamingCard call sites all pass idleCardLabel', () => {
   const files = [
     'src/core/worker-pool.ts',

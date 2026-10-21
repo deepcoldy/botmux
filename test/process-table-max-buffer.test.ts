@@ -221,6 +221,8 @@ describe('PROCESS_TABLE_MAX_BUFFER', () => {
     }
   });
 
+  // 源码结构护栏(K4)：src 里每个整表 ps 调用都必须带共享的 maxBuffer 上限，否则进程多时输出超过 1MiB 会
+  // ENOBUFS 并退回空结果；调用点散落各处，只能扫源码核对（上面的用例自检了扫描器的分类）。
   it('every whole-table ps exec in src/ uses the shared cap', () => {
     const hits: string[] = [];
     const missing: string[] = [];

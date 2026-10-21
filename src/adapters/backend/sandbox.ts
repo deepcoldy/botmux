@@ -1711,6 +1711,8 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  delete env.BOTMUX_LINK_REFS_MODE;
+  delete env.BOTMUX_LINK_REF_TURN_MODE;
   // This channel locates the pane's read-isolation proof, not the host
   // watcher's origin. Carrying it across re-exec misclassifies the host child
   // as isolated. Durable origin still comes from authorize below; do not add
@@ -1750,6 +1752,8 @@ export function startOutboxWatcher(
              * and re-exec therefore fails closed instead of degrading to an
              * ordinary mutable-session send. */
             requiresCodexAppLedger?: boolean;
+            /** Admission-frozen LinkRef mode. Absence is the disabled path. */
+            linkRefMode?: 'observe' | 'enabled';
           };
         }
       | { ok: false; error: string };
@@ -1893,6 +1897,11 @@ export function startOutboxWatcher(
         requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER = '1';
       } else {
         delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+      }
+      if (trustedOrigin?.linkRefMode) {
+        requestEnv.BOTMUX_LINK_REF_TURN_MODE = trustedOrigin.linkRefMode;
+      } else {
+        delete requestEnv.BOTMUX_LINK_REF_TURN_MODE;
       }
       const child = spawn(cliInvocation.command, [...cliInvocation.args, v.value.command, ...hostArgs], { env: requestEnv });
       let out = '', err = '';

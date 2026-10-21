@@ -17,6 +17,9 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
+   * Unlike pasteText, this capability guarantees the boundary markers. */
+  sendBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
@@ -429,6 +432,15 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Optional deterministic evidence that a slash-command LINE typed into the
+   *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.
+   *  Claude Code's transcript `<command-name>/effort</command-name>` record.
+   *  Called right before the line is typed so the adapter can take its
+   *  baseline; the returned probe is polled afterwards and must be cheap.
+   *  Returns undefined when no such evidence is available — the worker then
+   *  falls back to PTY evidence (output after the submit key, then the prompt). */
+  commandExecutionProbe?(pty: PtyHandle, commandLine: string): (() => boolean) | undefined;
+
   /** Optional structured input path for adapters whose protocol can keep
    * application context out of the visible user message. The worker calls this
    * only when a typed sidecar is present; every other adapter continues through
@@ -641,7 +653,14 @@ export interface CliAdapter {
    *  (0.134.0+) parks it too but STEERS it into the active turn — a tool-running
    *  turn can merge the queued input into one final (rollout: user1 → user2 →
    *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
-   *  correct for both shapes. */
+   *  correct for both shapes. Antigravity (`agy`) records the Enter in
+   *  `history.jsonl` immediately while busy: `queue` holds it until the turn
+   *  ends (`Auto-flushing` at turn end, strictly interleaved), whereas
+   *  `send-immediately` forwards it into the active conversation without
+   *  cancelling the in-flight tool (a merged turn's final is attributed to the
+   *  later message). Requires approval bypass on `agy`; `resolvePtyInputPolicy`
+   *  suppresses type-ahead when `disableCliBypass` is enabled because Enter
+   *  approves `agy`'s blocking permission dialog. */
   readonly supportsTypeAhead?: boolean;
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext

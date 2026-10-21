@@ -1,4 +1,4 @@
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -99,6 +99,28 @@ describe('current actor client contract', () => {
       BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_other', BOTMUX_DAEMON_IPC_PORT: '7951',
     }, { comm: 'tmux: server', exe: '/tmp/not-tmux' });
 
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+  });
+
+  it.skipIf(process.platform !== 'linux')('fails closed when no ancestor carries complete BotMux routing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
+    writeProcEnv(root, 20, 10, { PATH: '/usr/bin' });
+    writeProcEnv(root, 10, 1, { PATH: '/usr/bin' });
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+    // A narrow tool shell alone is not a routing authority.
+    writeProcEnv(root, 20, 10, { BOTMUX: '1', BOTMUX_SESSION_ID: 's1' });
+    expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+  });
+
+  it.skipIf(process.platform !== 'linux')('fails closed when a mid-chain ancestor env is unreadable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
+    writeProcEnv(root, 20, 10, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    writeProcEnv(root, 10, 1, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    rmSync(join(root, '10', 'environ'), { force: true });
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
   });
 

@@ -166,6 +166,8 @@ export interface CardUsageSnapshot {
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
+    /** Native CLI menu accepted this setting for the next turn. */
+    nextTurn?: boolean;
     choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
     selected?: string;
     pending: boolean;
@@ -1523,28 +1525,6 @@ export function buildImageCardElements(
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
   return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
-}
-
-/**
- * Heuristic: does `text` contain markdown syntax that renders badly as plain
- * text in Feishu (code fences, headings, lists, bold, inline code, links,
- * tables, blockquotes, hr)? Callers use this to decide between an interactive
- * card and a plain post.
- */
-export function hasMarkdown(text: string): boolean {
-  if (!text) return false;
-  return (
-    /```/.test(text) ||
-    /^#{1,6}\s/m.test(text) ||
-    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
-    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
-    /\*\*[^*\n]+\*\*/.test(text) ||
-    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
-    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
-    /^\s*\|.+\|\s*$/m.test(text) ||
-    /^>\s/m.test(text) ||
-    /^(?:---|\*\*\*|___)\s*$/m.test(text)
-  );
 }
 
 /**

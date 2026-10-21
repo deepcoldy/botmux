@@ -279,6 +279,19 @@ export interface DaemonSession {
    * In-memory only; not persisted.
    */
   consumedRepoCardMessageIds?: string[];
+  /**
+   * The session's working directory was gone when a CLI start was attempted
+   * (forkWorker refuses instead of starting it elsewhere), and a recovery card
+   * was published for it. `cardMessageId` is unset while that card is still
+   * being built. `rebuild` is where the deleted worktree came from, when git
+   * still knows. In-memory only: after a restart the next refused start
+   * publishes a fresh card.
+   */
+  workingDirRecovery?: {
+    path: string;
+    cardMessageId?: string;
+    rebuild?: { repo: string; branch: string };
+  };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
   /** Exact Lark message id whose user input is waiting for the first worker
@@ -341,6 +354,8 @@ export interface DaemonSession {
    * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
    * bot-added / scheduler / system bootstrap) never infers it. */
   pendingCodexAppSteerable?: true;
+  /** LinkRef mode frozen when a pending-repository opening was admitted. */
+  pendingLinkRefMode?: import('../services/link-ref-types.js').LinkRefMode;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
@@ -493,8 +508,9 @@ export interface DaemonSession {
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** `backgroundTasks` of the last working/idle screen_update: the main turn
-   *  ended while this many background tasks kept running. Card label only
-   *  (see streamCardLabel). In-memory only. */
+   *  ended while this many background tasks kept running. Card label (see
+   *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
+   *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
@@ -539,6 +555,8 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Successful listener terminal evidence; idle alone never authorizes closing. */
+  messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
   /**
@@ -619,6 +637,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** A confirmed native-menu preference awaiting its first new turn. */
+  codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it
@@ -779,6 +799,8 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
+    linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;

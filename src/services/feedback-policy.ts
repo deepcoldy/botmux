@@ -214,11 +214,6 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   };
 }
 
-export function resolveFeedbackPolicy(raw: unknown, bot?: { apiOnly?: boolean }): FeedbackPolicy | undefined {
-  if (bot?.apiOnly || !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw as { enabled?: unknown }).enabled !== true) return undefined;
-  return normalizeFeedbackPolicy(raw);
-}
-
 /** Whether an entry needs a send-time contact lookup to become a matchable id. */
 function isResolvableReviewerEntry(entry: string): boolean {
   return !entry.startsWith('ou_') && !entry.startsWith('on_');

@@ -1417,7 +1417,3 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }
-
-export function formatNumber(n: number): string {
-  return n.toLocaleString('en-US');
-}

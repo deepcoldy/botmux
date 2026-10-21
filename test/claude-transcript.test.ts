@@ -27,7 +27,6 @@ import {
   isScheduledTurnStartEvent,
   cronCreateToolUseIds,
   cronCreateAcks,
-  readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
   isTranscriptRateLimitEvent,
@@ -1389,51 +1388,6 @@ describe('findJsonlContainingFingerprint: acceptCandidate', () => {
     );
     const got = findJsonlContainingFingerprint(dir, 'test');
     expect(got).toBe(path);
-  });
-});
-
-// ─── readFirstEventTimestamp ───────────────────────────────────────────────
-describe('readFirstEventTimestamp', () => {
-  it('returns the first parseable timestamp from a top-level field', () => {
-    appendFileSync(
-      path,
-      JSON.stringify({
-        type: 'user',
-        timestamp: '2026-04-29T05:45:14.091Z',
-        message: { role: 'user', content: 'hello' },
-      }) + '\n',
-      'utf8',
-    );
-    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.091Z'));
-  });
-
-  it('falls through to snapshot.timestamp for file-history-snapshot leading event', () => {
-    // Mirrors Claude Code's actual emit order: file-history-snapshot at the
-    // top (no top-level timestamp; it lives under .snapshot.timestamp),
-    // then SessionStart with a top-level timestamp.
-    appendFileSync(
-      path,
-      JSON.stringify({
-        type: 'file-history-snapshot',
-        snapshot: { timestamp: '2026-04-29T05:45:14.092Z' },
-      }) + '\n' +
-      JSON.stringify({
-        type: 'user',
-        timestamp: '2026-04-29T05:45:14.200Z',
-        attachment: { hookName: 'SessionStart:clear' },
-      }) + '\n',
-      'utf8',
-    );
-    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.092Z'));
-  });
-
-  it('returns undefined when the file is missing or unreadable', () => {
-    expect(readFirstEventTimestamp(join(dir, 'nope.jsonl'))).toBeUndefined();
-  });
-
-  it('returns undefined when the leading chunk has no parseable timestamp', () => {
-    appendFileSync(path, '{"type":"unknown","no":"timestamp"}\n', 'utf8');
-    expect(readFirstEventTimestamp(path)).toBeUndefined();
   });
 });
 

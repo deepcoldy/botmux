@@ -1542,11 +1542,6 @@ export function isPlaceholderOnlyText(text: string): boolean {
   return stripped === '';
 }
 
-/** Wrap merged text so extractCardContent returns it verbatim downstream. */
-export function wrapResolvedCardText(text: string): string {
-  return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });
-}
-
 /** Strip inline markup (font/text_tag tags, bold markers) but keep text,
  *  brackets and links so labels and values stay readable. */
 function stripInlineMarkup(s: string): string {
@@ -1745,7 +1740,7 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
-  'worktree_toggle_mode',
+  'worktree_toggle_mode', 'repo_rebuild_worktree',
   // config / grant / relay cards
   'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
   'config_quota_save', 'config_text_open', 'config_text_save',

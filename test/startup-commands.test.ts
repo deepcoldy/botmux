@@ -5,6 +5,7 @@ import {
   parseStartupCommandsInput,
   shouldRunStartupCommandsOnSpawn,
   shouldDeferInitialPromptForStartup,
+  judgeStartupCommandAck,
 } from '../src/core/startup-commands.js';
 
 describe('normalizeStartupCommand', () => {
@@ -81,5 +82,28 @@ describe('shouldDeferInitialPromptForStartup', () => {
   it('does NOT defer without startup commands, nor in adopt mode', () => {
     expect(shouldDeferInitialPromptForStartup({ hasStartupCommands: false, adoptMode: false, passesInitialPromptViaArgs: true })).toBe(false);
     expect(shouldDeferInitialPromptForStartup({ hasStartupCommands: true, adoptMode: true, passesInitialPromptViaArgs: true })).toBe(false);
+  });
+});
+
+describe('judgeStartupCommandAck', () => {
+  const pty = { outputSinceSubmit: true, quietForMs: 2_000, promptVisible: true, quietMs: 500 };
+
+  it('trusts deterministic adapter evidence over PTY evidence, both ways', () => {
+    // A command folded into a paste burst echoes, goes quiet and keeps ❯ on
+    // screen — PTY evidence must not confirm what the transcript denies.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: false })).toBe(false);
+    expect(judgeStartupCommandAck({
+      executionRecorded: true, outputSinceSubmit: false, quietForMs: 0, promptVisible: false, quietMs: 500,
+    })).toBe(true);
+  });
+
+  it('without an adapter probe, requires output after the submit key, quiet, and the prompt', () => {
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined })).toBe(true);
+    // A CLI that is not reading input yet produces nothing after the Enter.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, outputSinceSubmit: false })).toBe(false);
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, quietForMs: 100 })).toBe(false);
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, promptVisible: false })).toBe(false);
+    // No readyPattern to check: output + quiet suffice.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, promptVisible: undefined })).toBe(true);
   });
 });

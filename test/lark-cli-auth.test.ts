@@ -16,7 +16,7 @@
  * Run: npx vitest run --project unit test/lark-cli-auth.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -24,9 +24,7 @@ import {
   completeLarkCliLogin,
   larkCliHomeFor,
   hasLarkCliHome,
-  clearLarkCliAuth,
   pendingLarkCliChallenge,
-  larkCliHomeForTurn,
   resolveLarkCliHomeForTurn,
   LARK_CLI_DEVICE_SCOPES,
   __setLarkCliHomeRootForTest,
@@ -67,6 +65,7 @@ beforeEach(() => {
   __setLarkCliRunnerForTest(null);
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   __setLarkCliHomeRootForTest(null);
   __setMachineHomeForTest(null);
   __setLarkCliRunnerForTest(null);
@@ -110,14 +109,12 @@ describe('lark-cli per-person HOME layout', () => {
     await beginLarkCliLogin(OPEN);
     // begin seeded the HOME and stored a challenge, but no token file yet.
     expect(hasLarkCliHome(OPEN)).toBe(false);
-    expect(larkCliHomeForTurn(OPEN)).toBeNull();
   });
 
   it('becomes authorized only once a per-person token file exists', () => {
     seedMachine();
     simulateUserToken();
     expect(hasLarkCliHome(OPEN)).toBe(true);
-    expect(larkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
   });
 
   it('isolates two people: B has no token while A does', () => {
@@ -125,8 +122,6 @@ describe('lark-cli per-person HOME layout', () => {
     simulateUserToken(OPEN);
     expect(hasLarkCliHome(OPEN)).toBe(true);
     expect(hasLarkCliHome(OPEN_B)).toBe(false);
-    // No shared token leaks across: B's turn gets nothing.
-    expect(larkCliHomeForTurn(OPEN_B)).toBeNull();
   });
 });
 
@@ -143,6 +138,9 @@ describe('begin / complete device flow', () => {
 
     expect(challenge?.authUrl).toBe('https://v/verify');
     expect(seen[0].args).toEqual(['auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' ')]);
+    const scopes = seen[0].args[seen[0].args.indexOf('--scope') + 1].split(' ');
+    // Task-specific permissions belong to incremental authorization, not login.
+    expect(scopes.some(scope => scope.startsWith('base:'))).toBe(false);
     // The call already ran inside this person's HOME.
     expect(seen[0].home).toBe(larkCliHomeFor(OPEN));
   });
@@ -229,7 +227,7 @@ describe('begin / complete device flow', () => {
     }));
     await completeLarkCliLogin(OPEN, 'dc-1');
     // A later re-login (e.g. expired) mints fresh because the old challenge is gone.
-    clearLarkCliAuth(OPEN);
+    rmSync(larkCliHomeFor(OPEN), { recursive: true, force: true });
     expect((await beginLarkCliLogin(OPEN))?.authUrl).toBeDefined();
   });
 
@@ -288,6 +286,71 @@ describe('begin / complete device flow', () => {
     expect(pendingLarkCliChallenge(OPEN)).toBeNull();
   });
 
+  it.each(['[lark-cli-auth] timed out', 'connect ETIMEDOUT', 'upstream HTTP 503', ''])(
+    'retains the same link after %s and completes a later approval', async (error) => {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+      seedMachine();
+      const runner = vi.fn(async () => ({
+        ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-stable' }), stderr: '',
+      }));
+      __setLarkCliRunnerForTest(runner);
+      await beginLarkCliLogin(OPEN);
+      __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: error }));
+      expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: error || undefined });
+      expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-stable');
+      __setLarkCliRunnerForTest(runner);
+      expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/stable');
+      expect(runner).toHaveBeenCalledTimes(1);
+      __setLarkCliRunnerForTest(async () => {
+        simulateUserToken();
+        return { ok: true, stdout: '{}', stderr: '' };
+      });
+      clock.mockReturnValue(1_800_000_060_000);
+      expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+      expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+      expect(hasLarkCliHome(OPEN_B)).toBe(false);
+    },
+  );
+
+  it('reads a terminal device-code failure from the stderr JSON envelope', async () => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-invalid' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    const message = 'authorization failed: The device_code is invalid. Please restart the device authorization flow.';
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: '', stderr: JSON.stringify({ ok: false, error: { type: 'authentication', message } }),
+    }));
+    expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: message });
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+  });
+
+  it.each([
+    ['unknown', 'Authorization denied by user', 'failed', true],
+    ['unknown', 'access_denied', 'failed', true],
+    ['unknown', 'authorization_declined', 'failed', true],
+    ['unknown', 'The device_code has expired', 'failed', true],
+    ['unknown', 'expired_token', 'failed', true],
+    ['unknown', 'An unrecognized upstream error', 'failed', false],
+    ['unknown', 'network request expired', 'failed', false],
+    ['unknown', 'authorization_pending', 'pending', false],
+    ['unknown', 'Authorization not yet completed', 'pending', false],
+    ['unknown', 'waiting for approval', 'pending', false],
+  ] as const)('classifies stderr %s / %s without guessing from unknown subtype', async (subtype, message, state, cleared) => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-envelope' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: '', stderr: JSON.stringify({ ok: false, error: { type: 'authentication', subtype, message } }),
+    }));
+    expect((await completeLarkCliLogin(OPEN)).state).toBe(state);
+    expect(pendingLarkCliChallenge(OPEN) === null).toBe(cleared);
+    expect(hasLarkCliHome(OPEN)).toBe(false);
+  });
+
   it('fails without an in-progress challenge', async () => {
     seedMachine();
     const r = await completeLarkCliLogin(OPEN);
@@ -297,6 +360,90 @@ describe('begin / complete device flow', () => {
 });
 
 describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
+  async function startChallenge(openId = OPEN) {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-' + openId }), stderr: '',
+    }));
+    await beginLarkCliLogin(openId);
+  }
+
+  it('skips automatic polls for 60 seconds after failure without extending the challenge TTL', async () => {
+    const started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: '[lark-cli-auth] timed out' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    const saved = JSON.parse(readFileSync(join(larkCliHomeFor(OPEN), '.botmux-login-challenge'), 'utf8'));
+    expect(saved).toMatchObject({ createdAt: started, autoPollAfter: started + 60_000 });
+    clock.mockReturnValue(started + 59_999);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/stable');
+    expect(runner).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(started + 60_000);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(pendingLarkCliChallenge(OPEN)?.createdAt).toBe(started);
+    clock.mockReturnValue(started + 9 * 60_000 + 1);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows explicit login completion during cooldown and clears the challenge on success', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(OPEN);
+    const runner = vi.fn(async () => {
+      simulateUserToken();
+      return { ok: true, stdout: '{}', stderr: '' };
+    });
+    __setLarkCliRunnerForTest(runner);
+    expect((await completeLarkCliLogin(OPEN)).state).toBe('authorized');
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not apply one person’s cooldown to another person', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge(OPEN);
+    await startChallenge(OPEN_B);
+    const runner = vi.fn(async (_args: string[], _home: string) => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN_B)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner.mock.calls.map(call => call[1])).toEqual([larkCliHomeFor(OPEN), larkCliHomeFor(OPEN_B)]);
+  });
+
+  it('does not put a replacement challenge into cooldown for a stale poll', async () => {
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    expect((await completeLarkCliLogin(OPEN, 'older-device-code')).state).toBe('failed');
+    expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-' + OPEN);
+    expect(pendingLarkCliChallenge(OPEN)?.autoPollAfter).toBeUndefined();
+  });
+
+  it('does not delay a normal pending approval or an already available user token', async () => {
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: 'authorization_pending' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(pendingLarkCliChallenge(OPEN)?.autoPollAfter).toBeUndefined();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(OPEN);
+    simulateUserToken();
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
   it('returns an existing HOME without polling anything', async () => {
     seedMachine();
     simulateUserToken();
@@ -366,17 +513,5 @@ describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
     __setLarkCliRunnerForTest(runner);
     expect(await resolveLarkCliHomeForTurn(undefined)).toBeNull();
     expect(runner).not.toHaveBeenCalled();
-  });
-});
-
-describe('clear', () => {
-  it('removes only that person’s HOME', () => {
-    seedMachine();
-    simulateUserToken(OPEN);
-    simulateUserToken(OPEN_B);
-    expect(hasLarkCliHome(OPEN)).toBe(true);
-    clearLarkCliAuth(OPEN);
-    expect(hasLarkCliHome(OPEN)).toBe(false);
-    expect(hasLarkCliHome(OPEN_B)).toBe(true); // B untouched
   });
 });

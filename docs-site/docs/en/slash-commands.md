@@ -170,11 +170,17 @@ step_model_switching = true
 
 With the feature disabled, commands sent during a task still save future-turn settings and explicitly report why the active turn was not updated. A completed or unavailable target turn produces a separate notice. Only an `applied` response confirms that the server accepted the active-turn update; requests already issued keep their original parameters, and the turn may have no further inference steps.
 
-For ordinary Codex CLI, Claude Code and other CLIs, `/effort` continues to follow the passthrough rules below.
+## Change reasoning effort in a Codex CLI session
+
+Send `/effort low|medium|high|xhigh|max|ultra` in an existing local Codex CLI session. Botmux drives the native `/model` menu, keeps the current model, and selects the level for **this session only**. After native confirmation, it saves the session launch preference. The receipt explicitly says **next turn only; the running turn keeps its original effort**, even when `step_model_switching` is enabled.
+
+This supports managed local PTY / tmux sessions with the native `s session` menu action and `thread_settings_applied` receipts (verified with Codex 0.162.1). RPC input, remote backends, wrappers, adopted sessions, sandbox and read isolation are excluded. Drafts, other menus, conflicting input and unrecognized screens are rejected without clearing the composer or restarting the task. You can still use `/model` manually.
+
+For Claude Code and other CLIs, `/effort` continues to follow the passthrough rules below.
 
 ## 🔀 Passthrough to the Underlying CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands (except Codex App `/effort`, described above).
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands (except Codex CLI / App `/effort`, described above).
 
 `/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
 

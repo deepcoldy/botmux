@@ -72,6 +72,20 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     });
   });
 
+  it('reports a Lark turn whose own user record reached the transcript, and only that', () => {
+    const q = new CodexBridgeQueue();
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'review PR 1650', 100);
+    q.ingest([userEv('something else', 'u-other', 150)]);
+    expect(started).toEqual([]);
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
+    // Re-ingesting the same record does not report it again.
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
+  });
+
   it('rejects CoT from a different native provider turn', () => {
     const q = new CodexBridgeQueue();
     const seen: string[] = [];
@@ -1231,6 +1245,25 @@ describe('CodexBridgeQueue', () => {
     const ready = q.drainEmittable();
     expect(ready.map(t => t.turnId)).toEqual(['t1', 't2']);
     expect(ready.map(t => t.finalText)).toEqual(['first reply', 'second reply']);
+  });
+
+  it('keeps each type-ahead turn LinkRef mode frozen on its own final', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t-enabled', 'first prompt', 100, undefined, undefined, 'enabled');
+    q.mark('t-disabled', 'second prompt', 100);
+    q.ingest([
+      userEv('first prompt', 'u-enabled', 5_000),
+      asstEv('first reply', 'a-enabled', 6_000),
+      userEv('second prompt', 'u-disabled', 12_000),
+      asstEv('second reply', 'a-disabled', 13_000),
+    ]);
+
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([
+      { turnId: 't-enabled', linkRefMode: 'enabled', finalText: 'first reply' },
+      { turnId: 't-disabled', finalText: 'second reply' },
+    ]);
+    expect(ready[1]).not.toHaveProperty('linkRefMode');
   });
 
   it('Codex steer-merge: user2 steered into active turn before any final → t1 dropped, t2 gets merged final, no wedge', () => {

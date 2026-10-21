@@ -9,6 +9,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { procStatFieldsAfterComm } from '../utils/proc-stat.js';
 import type { TrustedCaller } from '../types.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export {
   readLinuxBootIdentity,
@@ -18,6 +19,7 @@ export {
 export interface QueuedTypeAheadTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }
@@ -26,6 +28,7 @@ export interface AncestorSessionContext {
   sessionId: string;
   turnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   queuedTurnId?: string;
@@ -97,6 +100,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
+      linkRefMode?: unknown;
       trustedCaller?: unknown;
       trustedController?: unknown;
       procStart?: unknown;
@@ -106,6 +110,9 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       capability?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
+    const linkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
+      ? parsed.linkRefMode
+      : undefined;
     const queuedTurns = Array.isArray(parsed.queuedTurns)
       ? parsed.queuedTurns
           .filter((t: any) => typeof t?.turnId === 'string' && t.turnId)
@@ -114,6 +121,9 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
             return {
               turnId: String(t.turnId),
               ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+              ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
+                ? { linkRefMode: t.linkRefMode }
+                : {}),
               ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
               ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
             };
@@ -126,6 +136,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
       ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(linkRefMode ? { linkRefMode } : {}),
       ...(parsed.trustedCaller && typeof parsed.trustedCaller === 'object' ? { trustedCaller: parsed.trustedCaller } : {}),
       ...(parsed.trustedController && typeof parsed.trustedController === 'object' ? { trustedController: parsed.trustedController } : {}),
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
@@ -183,6 +194,7 @@ export function findAuthenticatedAncestorSessionContext(
         sessionId: marker.sessionId,
         turnId: marker.turnId,
         ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+        ...(marker.linkRefMode ? { linkRefMode: marker.linkRefMode } : {}),
         markerPid: pid,
         ...(marker.capability ? { capability: marker.capability } : {}),
         procStart: marker.procStart,
@@ -263,6 +275,7 @@ export function findAncestorSessionMarkerContext(
           sessionId: marker.sessionId,
           ...(marker.turnId ? { turnId: marker.turnId } : {}),
           ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+          ...(marker.linkRefMode ? { linkRefMode: marker.linkRefMode } : {}),
           ...(marker.trustedCaller ? { trustedCaller: marker.trustedCaller } : {}),
           ...(marker.trustedController ? { trustedController: marker.trustedController } : {}),
           markerPid: pid,
@@ -326,6 +339,7 @@ export function advanceAncestorSessionTurn(
         turnId: nextTurn.turnId,
         steerPromotedTurn: true,
         ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
+        ...(nextTurn.linkRefMode ? { linkRefMode: nextTurn.linkRefMode } : {}),
         ...(nextTurn.trustedCaller ? { trustedCaller: nextTurn.trustedCaller } : {}),
         ...(nextTurn.trustedController ? { trustedController: nextTurn.trustedController } : {}),
         ...(marker.procStart ? { procStart: marker.procStart } : {}),
@@ -387,6 +401,7 @@ export function resolveSessionContext(
       ...(protectedClaim.dispatchAttempt !== undefined
         ? { dispatchAttempt: protectedClaim.dispatchAttempt }
         : {}),
+      ...(protectedClaim.linkRefMode ? { linkRefMode: protectedClaim.linkRefMode } : {}),
     };
   }
   if (envSessionId) return { sessionId: envSessionId };

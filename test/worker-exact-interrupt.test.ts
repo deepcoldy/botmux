@@ -25,6 +25,7 @@ function harness(delivered = true) {
   const control = vi.fn(async () => delivered);
   const context = createContext({
     currentBotmuxTurnId: 'stop', backend: {}, lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'pty', isCodexAppCliId,
+    codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),

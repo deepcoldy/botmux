@@ -32,6 +32,7 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isMidTurnAbsorbedQueuedCommand,
   isScheduledTurnStartEvent,
   cronCreateToolUseIds,
   cronCreateAcks,
@@ -58,6 +59,7 @@ function assistantHasVisibleText(content: unknown): boolean {
 export interface BridgePendingTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   started: boolean;
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
@@ -130,6 +132,13 @@ export interface BridgePendingTurn {
   restoredFromJournal?: boolean;
   /** Observed at least one non-error assistant event (including tool calls). */
   hasAssistantActivity?: boolean;
+  /** Set on a Lark turn whose input Claude Code folded into the turn already
+   *  running (a mid-turn system reminder) instead of starting its own. It has
+   *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
+  absorbedIntoTurnId?: string;
+  /** Lark turns folded into this one. They leave the queue right behind it and
+   *  share its terminal, so each still gets the end signal its card waits for. */
+  absorbedTurns?: BridgePendingTurn[];
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -265,11 +274,12 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean },
+    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
   ): string {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(opts?.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
       started: false,
       assistantUuids: [],
       contentFingerprint,
@@ -406,6 +416,10 @@ export class BridgeTurnQueue {
         // would skip queued_command events and the type-ahead'd turn's
         // assistant text would either be dropped or attributed to a
         // sibling turn.
+        if (isMidTurnAbsorbedQueuedCommand(ev)) {
+          this.handleAbsorbedInput(ev, sourceJsonlPath);
+          continue;
+        }
         if (!isMeaningfulQueuedCommand(ev)) continue;
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
@@ -598,6 +612,7 @@ export class BridgeTurnQueue {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.dropAbsorbedTurns(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
@@ -641,6 +656,50 @@ export class BridgeTurnQueue {
     this.collecting = scheduledTurn;
     this.lastLocalTurnId = scheduledTurn.turnId;
     this.onLocalTurnStarted?.(scheduledTurn);
+  }
+
+  /** A message typed while a turn ran, which Claude Code folded into that turn
+   *  as a system reminder instead of starting a new one. Not a turn boundary
+   *  (the running turn keeps collecting), but it is where the pending Lark
+   *  mark's input entered the conversation, and no `role:user` line follows.
+   *  Bind the mark here — under the same fingerprint / truncation proof as a
+   *  real turn start — and end it together with the turn that absorbed it;
+   *  otherwise the mark expires unmatched and its turn never gets a terminal.
+   *  A non-matching or unfingerprinted mark is left alone. */
+  private handleAbsorbedInput(ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    const next = this.queue.find(t => !t.started);
+    if (!next?.contentFingerprint) return;
+    const userText = normaliseForFingerprint(extractTurnStartText(ev));
+    if (!userText.includes(next.contentFingerprint) && !isTruncatedMatch(userText, next.contentNormalized)) return;
+    const fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
+    const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    next.started = true;
+    if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+    next.markTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    const host = this.collecting;
+    if (host && !host.terminalObserved) {
+      next.absorbedIntoTurnId = host.turnId;
+      (host.absorbedTurns ??= []).push(next);
+    } else {
+      // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
+      // running turn): what the model does from here on answers this input.
+      this.collecting = next;
+    }
+    this.lastLarkTurnId = next.turnId;
+    this.lastLocalTurnId = undefined;
+    this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+  }
+
+  /** A head-of-line dropped turn takes the input it absorbed with it: left
+   *  behind, a started turn that can never see a terminal would block the
+   *  queue head for good. */
+  private dropAbsorbedTurns(host: BridgePendingTurn): void {
+    for (const absorbed of host.absorbedTurns ?? []) {
+      const idx = this.queue.indexOf(absorbed);
+      if (idx < 0) continue;
+      this.queue.splice(idx, 1);
+      this.droppedNeedingJournalClear.push(absorbed);
+    }
   }
 
   /** Shared turn-start handler. Called for both `role:user` and
@@ -691,6 +750,7 @@ export class BridgeTurnQueue {
       // 「本轮执行失败」card. Local turns are skipped: they are synthesised by
       // this queue and never had a journal entry to begin with.
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.dropAbsorbedTurns(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
@@ -804,6 +864,16 @@ export class BridgeTurnQueue {
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
       out.push(head);
+      for (const absorbed of head.absorbedTurns ?? []) {
+        const idx = this.queue.indexOf(absorbed);
+        if (idx < 0) continue;
+        this.queue.splice(idx, 1);
+        if (this.collecting === absorbed) this.collecting = null;
+        absorbed.terminalObserved = head.terminalObserved;
+        if (head.terminalOutcome) absorbed.terminalOutcome ??= head.terminalOutcome;
+        if (head.rateLimited) absorbed.rateLimited = true;
+        out.push(absorbed);
+      }
     }
     return out;
   }

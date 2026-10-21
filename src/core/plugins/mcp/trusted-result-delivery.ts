@@ -9,6 +9,11 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { LinkRefMode } from '../../../services/link-ref-types.js';
+import type {
+  OutboundLinkRefPayload,
+  ResolvedOutboundLinkRefs,
+} from '../../../services/link-ref-resolver.js';
 
 export const BOTMUX_HOST_DELIVERY_META_KEY = 'botmuxHostDelivery';
 
@@ -36,6 +41,27 @@ export interface TrustedResultDeliveryReceipt {
   delivered: true;
   deliveryId: string;
   fileCount: number;
+}
+
+/** Resolve host-delivery Markdown before the callback that creates a durable
+ * artifact. Enabled-mode failures deliberately propagate so callers cannot
+ * persist or send a receipt containing an unresolved placeholder. */
+export async function resolveTrustedResultDeliveryLinkRefs(input: {
+  delivery: TrustedResultDelivery;
+  mode: LinkRefMode;
+  resolve: (payload: OutboundLinkRefPayload) => Promise<ResolvedOutboundLinkRefs>;
+  persist?: (delivery: TrustedResultDelivery) => void | Promise<void>;
+}): Promise<TrustedResultDelivery> {
+  let delivery = input.delivery;
+  if (input.mode === 'enabled' && delivery.markdown !== undefined) {
+    const resolved = await input.resolve({ text: delivery.markdown });
+    delivery = {
+      ...delivery,
+      markdown: resolved.text ?? delivery.markdown,
+    };
+  }
+  await input.persist?.(delivery);
+  return delivery;
 }
 
 export const TRUSTED_RESULT_DELIVERY_ACK_TIMEOUT_MS = 120_000;

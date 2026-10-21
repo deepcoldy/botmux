@@ -1,6 +1,6 @@
 # 测试 seam 待办（源码文本断言治理的后续）
 
-2026-10-20 的测试治理删除了一批「读 src 源码文本做断言」的用例（见 CLAUDE.md「测试原则」）。其中 202 条（85 个文件）当初确实守过真实 bug，但被测逻辑埋在 `worker.ts` / `daemon.ts` / `cli.ts` 等文件的闭包里，没有可调用的入口，只能删掉、无法当场改成行为测试。
+2026-10-20 的测试治理删除了一批「读 src 源码文本做断言」的用例（见 CLAUDE.md「测试原则」）。其中 214 条（88 个文件）当初确实守过真实 bug，但被测逻辑埋在 `worker.ts` / `daemon.ts` / `cli.ts` 等文件的闭包里，没有可调用的入口，只能删掉、无法当场改成行为测试。
 
 下表按原测试文件列出缺口条数与建议抽出的 seam。动到对应代码时，顺手把逻辑抽成可导出的函数并补上行为测试，再从表里划掉这一行。
 
@@ -91,3 +91,6 @@
 | `test/v3-saved-workflow-command.test.ts` | 1 | 把 daemon 两个入口调用 handleV3SavedWorkflowCommandIfAny 前的「stripBotMentions(cmdContent, …)」归一化收进 handler（或抽成共享纯函数），才能行为测试每个调用点都剥了本 bot 的 @ |
 | `test/web-terminal-tmux-window-size.test.ts` | 1 | 把 web 终端 startAttach 的 tmux 准备步骤（set-option window-size largest + attach argv）抽成函数 |
 | `test/worker-backend-exit-crash-order.test.ts` | 1 | 把 spawnCli 里的 backend.onExit 回调抽成接受 (observedBackend, 当前 backend, durable 状态) 的函数 |
+| `test/turn-idle-channel.test.ts` | 3 | 把 cmdTurnIdle 的 origin 解析（有 frozen origin 时直接用它、不回溯 live marker 与 env 兜底）抽成纯函数；把 worker 按 `injectsTurnIdleHook` 注入或清除 `BOTMUX_TURN_IDLE_COMMAND` 的 env 组装抽成纯函数；`__turn-idle-v2` 子命令注册与 workflow subagent 白名单用一次 CLI 级 spawn 测试覆盖 |
+| `test/cursor-cot-wiring.test.ts` | 3 | 把 Cursor CoT 读取器的三个启动/停止接线点（observeCursorCliSessionId、cursorBridgeAttach 与排队轮次的 prepareNormalWrite、stopCodexBridge）收拢成一个可注入 start/stop 的生命周期对象 |
+| `test/usage-refresh-timer-wiring.test.ts` | 6 | 把 worker-pool 里 screen_update / ready / screenshot_uploaded / worker exit / postFreshStreamingCard 对用量刷新定时器的 arm/clear 决策抽成一个以（事件, ds 状态）为输入的纯函数（谓词、fresh 读取与 port=0 不渲染终端链接已由 recall-frozen-cards 的行为测试覆盖） |

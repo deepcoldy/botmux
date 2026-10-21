@@ -15,6 +15,8 @@
  */
 
 import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+import { stripCodeSpans } from '../utils/markdown-code.js';
+import type { BotMentionEntry, OutgoingMention } from '../utils/bot-routing.js';
 
 export { resolveSendTarget };
 
@@ -449,19 +451,6 @@ export function activeConversationBotOpenIds(input: {
   return openIds;
 }
 
-/** Resolve the stable Review/orchestrator addressee independently of placement. */
-export function resolveReportRecipient(input: {
-  creatorOpenId?: string;
-  ownerOpenId?: string;
-  quoteTargetSenderOpenId?: string;
-}): string | undefined {
-  return [
-    input.creatorOpenId,
-    input.ownerOpenId,
-    input.quoteTargetSenderOpenId,
-  ].find(value => !!value?.trim())?.trim();
-}
-
 export interface ReportRecipientSession {
   sessionId?: string;
   larkAppId?: string;
@@ -546,29 +535,6 @@ export function resolveReportRecipientForSession(input: {
   return { source: 'none' };
 }
 
-/**
- * Compatibility view of registry coordinates plus recipient.
- *
- * `cmdReport` no longer treats these coordinates as the ordinary no-registry
- * placement. It uses them only to preserve a matching dispatch route; otherwise
- * {@link resolveReportPlacement} inherits the executing conversation turn.
- */
-export function resolveReportTarget(input: {
-  registryEntry?: { orchChatId?: string; orchScope?: string; orchRoot?: string };
-  sessionChatId?: string;
-  creatorOpenId?: string;
-  ownerOpenId?: string;
-  quoteTargetSenderOpenId?: string;
-}): { orchChatId?: string; orchScope: string; orchRoot: string; orchOpenId?: string } {
-  const e = input.registryEntry;
-  return {
-    orchChatId: e?.orchChatId ?? input.sessionChatId,
-    orchScope: e?.orchScope ?? 'chat',
-    orchRoot: e?.orchRoot ?? '',
-    orchOpenId: resolveReportRecipient(input),
-  };
-}
-
 export type ReportPlacementSource =
   | 'explicit-into'
   | 'explicit-top-level'
@@ -581,7 +547,7 @@ export type ReportPlacementSource =
  * Resolve only the visible placement of a `botmux report`.
  *
  * The report recipient is intentionally resolved separately by
- * {@link resolveReportRecipient}: choosing where the message is shown must never
+ * {@link resolveReportRecipientForSession}: choosing where the message is shown must never
  * change who is @-mentioned. Explicit placement wins, a dispatch registry keeps
  * its existing orchestrator-return semantics, and an explicitly marked legacy
  * cross-machine dispatch without a local registry keeps the old top-level
@@ -635,57 +601,6 @@ export function resolveReportPlacement(input: {
     }),
     source: input.currentTurnId ? 'current-turn' : 'session-default',
   };
-}
-
-export interface DispatchRegistryEntry {
-  orchChatId?: string;
-  orchScope?: string;
-  orchRoot?: string;
-  orchAppId?: string;
-  orchSessionId?: string;
-  createdAt?: string;
-}
-
-/**
- * Resolve the dispatch record for either a normal thread session or a
- * regular-group chat-scope session folded from a dispatch topic.
- *
- * Folded sessions are keyed by chatId, while the registry is keyed by the seed
- * message id. Their currentReplyTarget is usable only when it belongs to the
- * CLI's executing turn. Historical replyThreadAliases deliberately do not
- * participate: they have no turn id and could route a later ordinary report
- * back into a stale dispatch.
- */
-export function findDispatchRegistryEntry(input: {
-  registry: Record<string, DispatchRegistryEntry>;
-  dispatchRootId?: string;
-  sessionScope?: 'thread' | 'chat';
-  rootMessageId?: string;
-  currentReplyTargetRootId?: string;
-  currentReplyTargetTurnId?: string;
-  currentTurnId?: string;
-}): { key: string; entry: DispatchRegistryEntry } | undefined {
-  if (input.dispatchRootId) {
-    const entry = input.registry[input.dispatchRootId];
-    return entry ? { key: input.dispatchRootId, entry } : undefined;
-  }
-  const ordered: string[] = [];
-  const add = (value: string | undefined) => {
-    if (value && !ordered.includes(value)) ordered.push(value);
-  };
-  if (
-    input.currentTurnId
-    && input.currentReplyTargetTurnId === input.currentTurnId
-  ) {
-    add(input.currentReplyTargetRootId);
-  }
-  // Chat-scope rootMessageId is traceability metadata, not a routing anchor.
-  if (input.sessionScope !== 'chat') add(input.rootMessageId);
-  for (const key of ordered) {
-    const entry = input.registry[key];
-    if (entry) return { key, entry };
-  }
-  return undefined;
 }
 
 export interface DispatchAcceptanceSession {
@@ -863,4 +778,73 @@ export function eligibleAutoMentionAliases(input: {
     out.push(cliId);
   }
   return out;
+}
+
+/**
+ * Which known peer bots a reply names in prose (`@BotName`), resolved to the
+ * sender app's own open_ids. One matcher for every reply channel that has no
+ * explicit `--mention`: `botmux send`'s auto-injection and the daemon's
+ * zero-injection final card, so the same text @s the same bot either way.
+ *
+ *   - Code (inline spans, fenced blocks) is not scanned: a quoted `@Bot` is an
+ *     example, not a handoff.
+ *   - Boundary: the lookbehind blocks only ASCII word chars (`user@Claude` is
+ *     rejected, a CJK-prefixed `看看@CoCo` is accepted); the lookahead blocks
+ *     any Unicode letter/digit (`@Claude2` / `@Claude分身` are not `Claude`).
+ *     A non-letter separator (`@Claude-Code`) can still match a shorter name
+ *     too; the inline rewrite (applyInlineMentions) binds it to the longer one.
+ *   - Lark open_ids are per-app scoped, so only the sender's cross-ref counts.
+ *     The target's self-reported `botOpenId` is the wrong scope; a named bot
+ *     without a cross-ref entry is returned in `unresolved`, never guessed.
+ */
+export function resolveProseBotMentions(input: {
+  text: string;
+  botEntries: readonly BotMentionEntry[];
+  crossRef: Readonly<Record<string, string>>;
+  selfAppId: string;
+  /** Bots with an active session in this conversation; only they may be
+   *  named by their type-generic cliId alias (see eligibleAutoMentionAliases). */
+  convoBotAppIds: Set<string>;
+  /** open_ids already addressed explicitly; not returned again. */
+  alreadyMentioned?: Iterable<string>;
+}): { mentions: Array<Required<OutgoingMention>>; unresolved: string[] } {
+  const textForBotScan = stripCodeSpans(input.text);
+  const sortedEntries = [...input.botEntries].sort(
+    (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
+  );
+  const selfAliases = new Set(
+    input.botEntries
+      .filter(entry => entry.larkAppId === input.selfAppId)
+      .flatMap(entry => [entry.botName, entry.cliId])
+      .filter((name): name is string => !!name)
+      .map(name => name.toLowerCase()),
+  );
+  const mentioned = new Set(input.alreadyMentioned);
+  const mentions: Array<Required<OutgoingMention>> = [];
+  const unresolved: string[] = [];
+  for (const entry of sortedEntries) {
+    if (!entry.botName || entry.larkAppId === input.selfAppId) continue;
+    const names = eligibleAutoMentionAliases({
+      botName: entry.botName,
+      cliId: entry.cliId ?? undefined,
+      larkAppId: entry.larkAppId ?? undefined,
+      selfAliases,
+      convoBotAppIds: input.convoBotAppIds,
+    });
+    for (const name of names) {
+      const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
+      if (!re.test(textForBotScan)) continue;
+      const senderScopedId = input.crossRef[entry.botName];
+      if (!senderScopedId) {
+        unresolved.push(entry.botName);
+        break;
+      }
+      if (mentioned.has(senderScopedId)) break;
+      mentions.push({ open_id: senderScopedId, name: entry.botName });
+      mentioned.add(senderScopedId);
+      break;
+    }
+  }
+  return { mentions, unresolved };
 }

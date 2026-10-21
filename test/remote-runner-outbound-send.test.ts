@@ -32,6 +32,8 @@ fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
   sessionId: process.env.BOTMUX_SESSION_ID,
   turnId: process.env.BOTMUX_TURN_ID,
   dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
+  adminMode: process.env.BOTMUX_LINK_REFS_MODE ?? null,
+  turnMode: process.env.BOTMUX_LINK_REF_TURN_MODE ?? null,
 }));
 process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbound' }) + '\\n');
 `);
@@ -53,8 +55,13 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
       sessionId: 'session-1',
       turnId: 'turn-1',
       dispatchAttempt: 3,
+      linkRefMode: 'enabled',
       cliPath: fixture,
-      env: { PATH: process.env.PATH },
+      env: {
+        PATH: process.env.PATH,
+        BOTMUX_LINK_REFS_MODE: 'disabled',
+        BOTMUX_LINK_REF_TURN_MODE: 'observe',
+      },
     })).resolves.toEqual({ outcome: 'delivered', messageId: 'om_remote_outbound' });
 
     expect(JSON.parse(readFileSync(observed, 'utf8'))).toMatchObject({
@@ -76,6 +83,8 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
       sessionId: 'session-1',
       turnId: 'turn-1',
       dispatchAttempt: '3',
+      adminMode: null,
+      turnMode: 'enabled',
     });
   });
 
@@ -92,6 +101,15 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
         code: 'outbound_delivery_unknown',
         message: 'provider response lost',
       });
+    expect(classifyRemoteRunnerOutboundHostResult(
+      2,
+      '',
+      'botmux send refused: link_ref_unknown\nprivate database detail',
+    )).toEqual({
+      outcome: 'rejected',
+      code: 'link_ref_unknown',
+      message: 'link_ref_unknown',
+    });
   });
 
   it('passes explicit mention arguments to the ordinary host send policy', async () => {
@@ -166,5 +184,44 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_final' }) + 
       '--content-file', expect.any(String),
       '--session-id', 'session-final',
     ]);
+  });
+
+  it('does not inherit either LinkRef mode variable for a disabled turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-disabled-link-ref-'));
+    roots.push(root);
+    const observed = join(root, 'observed.json');
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
+  adminMode: process.env.BOTMUX_LINK_REFS_MODE ?? null,
+  turnMode: process.env.BOTMUX_LINK_REF_TURN_MODE ?? null,
+}));
+process.stdout.write(JSON.stringify({ success: true, messageId: 'om_disabled' }) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    await expect(sendRemoteRunnerOutboundMessage({
+      operationId: 'operation-disabled',
+      turnId: 'turn-disabled',
+      generation: 2,
+      content: 'plain',
+      responseKind: 'progress',
+      mention: 'none',
+    }, {
+      sessionId: 'session-disabled',
+      turnId: 'turn-disabled',
+      cliPath: fixture,
+      env: {
+        PATH: process.env.PATH,
+        BOTMUX_LINK_REFS_MODE: 'enabled',
+        BOTMUX_LINK_REF_TURN_MODE: 'enabled',
+      },
+    })).resolves.toEqual({ outcome: 'delivered', messageId: 'om_disabled' });
+
+    expect(JSON.parse(readFileSync(observed, 'utf8'))).toEqual({
+      adminMode: null,
+      turnMode: null,
+    });
   });
 });

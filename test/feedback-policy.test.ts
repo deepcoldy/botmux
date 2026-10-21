@@ -2,15 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   materializeFeedbackReviewers,
   normalizeFeedbackPolicy,
-  resolveFeedbackPolicy,
 } from '../src/services/feedback-policy.js';
 
 describe('feedback policy', () => {
-  it('is disabled when absent or not explicitly enabled', () => {
-    expect(resolveFeedbackPolicy(undefined)).toBeUndefined();
-    expect(resolveFeedbackPolicy({ enabled: false })).toBeUndefined();
-  });
-
   it('normalizes enabled policy with product defaults', () => {
     expect(normalizeFeedbackPolicy({ enabled: true })).toEqual({
       enabled: true,
@@ -106,10 +100,6 @@ describe('feedback policy', () => {
     [{ enabled: true, negativeFollowup: { comment: { maxLength: 2001 } } }, /2000/],
   ])('rejects invalid policy %#', (input, error) => {
     expect(() => normalizeFeedbackPolicy(input)).toThrow(error);
-  });
-
-  it('never resolves feedback for api-only bots', () => {
-    expect(resolveFeedbackPolicy({ enabled: true }, { apiOnly: true })).toBeUndefined();
   });
 
   describe('reviewers audience', () => {

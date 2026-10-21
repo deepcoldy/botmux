@@ -63,6 +63,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// 非文本断言：从 renderer HTML 读出 webview 实际使用的 partition 名作为测试输入，
+// 断言的是权限处理器真的挂到了那个 session 上，而不是 HTML 的写法。
 describe('desktop main lifecycle', () => {
   it('quits a duplicate app instance without bootstrapping', async () => {
     await loadDesktopMain(false);

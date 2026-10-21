@@ -293,8 +293,11 @@ const IS_DARWIN = process.platform === 'darwin';
 // Resolved on use, not at module load: this module sits in widely imported
 // graphs (session-skill-runtime, the v3 ephemeral pool), and a test that
 // partially mocks node:fs without `constants` must still be able to import them.
-const nofollow = (): number =>
-  IS_DARWIN ? (fsConstants.O_NOFOLLOW | O_NOFOLLOW_ANY_DARWIN) : fsConstants.O_NOFOLLOW;
+export const __testOnly_snapshotNofollowFlags = (platform: NodeJS.Platform): number =>
+  platform === 'darwin' ? O_NOFOLLOW_ANY_DARWIN : fsConstants.O_NOFOLLOW;
+// Darwin rejects O_NOFOLLOW | O_NOFOLLOW_ANY with EINVAL. O_NOFOLLOW_ANY
+// already covers the final component as well as every ancestor.
+const nofollow = (): number => __testOnly_snapshotNofollowFlags(process.platform);
 
 /** An open directory plus the path used for diagnostics / darwin lookups. */
 interface Dir { fd: number; path: string }

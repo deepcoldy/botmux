@@ -28,16 +28,14 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
-  findDispatchRegistryEntry,
+  resolveProseBotMentions,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
   foldableChatSessionAppIds,
   recordDispatchInputCommit,
   resolveReportPlacement,
-  resolveReportRecipient,
   resolveReportRecipientForSession,
-  resolveReportTarget,
   resolveSendTarget,
   threadRootForReachability,
 } from '../src/core/dispatch.js';
@@ -622,6 +620,67 @@ describe('eligibleAutoMentionAliases', () => {
   });
 });
 
+describe('resolveProseBotMentions', () => {
+  // Shared by `botmux send` and the zero-injection final card: the same text
+  // must @ the same bot through either channel.
+  const botEntries = [
+    { larkAppId: 'cli_self', botName: 'Reviewer(pi)', cliId: 'pi', botOpenId: 'ou_self_selfview' },
+    { larkAppId: 'cli_dev', botName: 'Dev(Claude)', cliId: 'claude-code', botOpenId: 'ou_dev_selfview' },
+    { larkAppId: 'cli_claude', botName: 'Claude', cliId: 'claude-code', botOpenId: 'ou_claude_selfview' },
+    { larkAppId: 'cli_twin', botName: 'Claude分身', cliId: 'claude-code', botOpenId: 'ou_twin_selfview' },
+    { larkAppId: 'cli_codex', botName: 'Dev(codex)', cliId: 'codex', botOpenId: 'ou_codex_selfview' },
+    { larkAppId: 'cli_unseen', botName: 'Other(pi)', cliId: 'pi', botOpenId: 'ou_unseen_selfview' },
+  ];
+  // Open_ids as the sender app sees each peer (Lark open_ids are per-app).
+  const crossRef = {
+    'Dev(Claude)': 'ou_dev_here',
+    Claude: 'ou_claude_here',
+    'Claude分身': 'ou_twin_here',
+    'Dev(codex)': 'ou_codex_here',
+    'Reviewer(pi)': 'ou_self_here',
+  };
+  const resolve = (text: string, extra: Partial<Parameters<typeof resolveProseBotMentions>[0]> = {}) =>
+    resolveProseBotMentions({ text, botEntries, crossRef, selfAppId: 'cli_self', convoBotAppIds: new Set(), ...extra });
+
+  it('resolves a named bot to the sender-scoped cross-ref id, never its self-view id', () => {
+    expect(resolve('结论可合。@Dev(Claude) 请执行合并。')).toEqual({
+      mentions: [{ open_id: 'ou_dev_here', name: 'Dev(Claude)' }],
+      unresolved: [],
+    });
+  });
+
+  it('matches whole names only, case-insensitively, with CJK-aware boundaries', () => {
+    expect(resolve('@Claude分身 看下').mentions.map(m => m.name)).toEqual(['Claude分身']);
+    expect(resolve('@claude 看下').mentions.map(m => m.name)).toEqual(['Claude']);
+    expect(resolve('看看@dev(codex)').mentions.map(m => m.open_id)).toEqual(['ou_codex_here']);
+    expect(resolve('mail user@Claude please').mentions).toEqual([]);
+    expect(resolve('@Claude2 不是它').mentions).toEqual([]);
+  });
+
+  it('ignores names quoted in inline code or fenced blocks', () => {
+    expect(resolve('示例 `@Dev(Claude)`\n```\n@Claude\n```')).toEqual({ mentions: [], unresolved: [] });
+  });
+
+  it('never resolves the sender itself', () => {
+    expect(resolve('@Reviewer(pi) 收到')).toEqual({ mentions: [], unresolved: [] });
+  });
+
+  it('reports a named bot without a cross-ref entry instead of guessing an id', () => {
+    expect(resolve('@Other(pi) 你看下')).toEqual({ mentions: [], unresolved: ['Other(pi)'] });
+  });
+
+  it('accepts a cliId alias only for a bot active in this conversation', () => {
+    expect(resolve('@codex 看下').mentions).toEqual([]);
+    expect(resolve('@codex 看下', { convoBotAppIds: new Set(['cli_codex']) }).mentions)
+      .toEqual([{ open_id: 'ou_codex_here', name: 'Dev(codex)' }]);
+  });
+
+  it('skips bots already addressed explicitly', () => {
+    expect(resolve('@Dev(Claude) 和 @Dev(codex)', { alreadyMentioned: ['ou_dev_here'] }).mentions)
+      .toEqual([{ open_id: 'ou_codex_here', name: 'Dev(codex)' }]);
+  });
+});
+
 describe('offTopicSubBotTopic', () => {
   const registry = { 'om_topicA': { orchChatId: 'oc_main', bots: ['ou_subbot', 'ou_reviewer'] } };
   const activeSeeds = new Set(['om_topicA']);
@@ -651,45 +710,6 @@ describe('offTopicSubBotTopic', () => {
 
   it('allows when there is no dispatch registry', () => {
     expect(offTopicSubBotTopic({ mentionOpenId: 'ou_subbot', quoteTargetSenderOpenId: 'ou_human', chatId: 'oc_main', registry: {}, activeSeeds: new Set() })).toBeNull();
-  });
-});
-
-describe('resolveReportTarget', () => {
-  it('uses the registry entry when present (same-machine, precise thread routing)', () => {
-    const r = resolveReportTarget({
-      registryEntry: { orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_root' },
-      sessionChatId: 'oc_sub', creatorOpenId: 'ou_orch',
-    });
-    expect(r).toEqual({ orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_root', orchOpenId: 'ou_orch' });
-  });
-
-  it('keeps the legacy no-registry coordinate fallback for compatibility callers', () => {
-    const r = resolveReportTarget({ registryEntry: undefined, sessionChatId: 'oc_sub', creatorOpenId: 'ou_orch' });
-    expect(r).toEqual({ orchChatId: 'oc_sub', orchScope: 'chat', orchRoot: '', orchOpenId: 'ou_orch' });
-  });
-
-  it('orchOpenId prefers creatorOpenId, then ownerOpenId, then quoteTargetSenderOpenId', () => {
-    expect(resolveReportTarget({ creatorOpenId: 'c', ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('c');
-    expect(resolveReportTarget({ ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('o');
-    expect(resolveReportTarget({ quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('q');
-  });
-});
-
-describe('resolveReportRecipient', () => {
-  it('keeps the stable creator as recipient regardless of message placement', () => {
-    expect(resolveReportRecipient({
-      creatorOpenId: 'ou_reviewer',
-      ownerOpenId: 'ou_owner',
-      quoteTargetSenderOpenId: 'ou_latest_sender',
-    })).toBe('ou_reviewer');
-  });
-
-  it('skips empty legacy identity fields', () => {
-    expect(resolveReportRecipient({
-      creatorOpenId: '  ',
-      ownerOpenId: 'ou_owner',
-      quoteTargetSenderOpenId: 'ou_latest_sender',
-    })).toBe('ou_owner');
   });
 });
 
@@ -896,79 +916,6 @@ describe('resolveReportPlacement', () => {
       target: { mode: 'thread', rootMessageId: 'om_session_topic' },
       source: 'session-default',
     });
-  });
-});
-
-describe('findDispatchRegistryEntry', () => {
-  const registry = {
-    om_seed_old: { orchRoot: 'om_orch_old', orchSessionId: 's_old' },
-    om_seed_new: { orchRoot: 'om_orch_new', orchSessionId: 's_new' },
-  };
-
-  it('uses the thread root for a normal thread-scoped dispatched session', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'thread',
-      rootMessageId: 'om_seed_new',
-    })).toEqual({
-      key: 'om_seed_new',
-      entry: registry.om_seed_new,
-    });
-  });
-
-  it('uses currentReplyTarget for a chat-scope session folded from a dispatch topic', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_current',
-      currentTurnId: 'om_turn_current',
-    })).toEqual({ key: 'om_seed_new', entry: registry.om_seed_new });
-  });
-
-  it('prefers the immutable turn root when the chat-scope session has advanced to a newer dispatch', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      dispatchRootId: 'om_seed_old',
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_new',
-      currentTurnId: 'om_turn_new',
-    })).toEqual({ key: 'om_seed_old', entry: registry.om_seed_old });
-  });
-
-  it('fails closed when an explicit turn root is absent instead of falling through to the latest alias', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      dispatchRootId: 'om_seed_missing',
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_current',
-      currentTurnId: 'om_turn_current',
-    })).toBeUndefined();
-  });
-
-  it('ignores a stale currentReplyTarget whose turn id does not match', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_old',
-      currentReplyTargetTurnId: 'om_turn_old',
-      currentTurnId: 'om_turn_new',
-    })).toBeUndefined();
-  });
-
-  it('does not treat a chat-scope trace root as a dispatch route', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'om_seed_old',
-      currentTurnId: 'om_turn_new',
-    })).toBeUndefined();
   });
 });
 

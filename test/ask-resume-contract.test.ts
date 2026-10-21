@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
   createAskPersistStore,
   askKeyFor,
-  dispatchUuidForKey,
+  dispatchUuidForAsk,
   ASK_STORE_SENTINEL,
   type PersistedAsk,
 } from '../src/core/ask-persist-store.js';
@@ -132,18 +132,21 @@ describe('clause 1 — canonical identity is unique end-to-end (codex P1-1)', ()
     );
   });
 
-  it('dispatch uuid: stable per invocation, distinct across sessions, ≤50 chars', () => {
+  it('dispatch uuid: stable per ask instance, distinct across sessions and instances, ≤50 chars', () => {
     const kA = askKeyFor('cli_app', 'sess-A', 'hook', 'shared-req');
     const kB = askKeyFor('cli_app', 'sess-B', 'hook', 'shared-req');
-    // Same invocation → same uuid (a restart re-send dedupes server-side).
-    expect(dispatchUuidForKey(kA)).toBe(
-      dispatchUuidForKey(askKeyFor('cli_app', 'sess-A', 'hook', 'shared-req')),
+    // Same ask (askId is persisted) → same uuid (a restart re-send dedupes server-side).
+    expect(dispatchUuidForAsk(kA, 'ask-1')).toBe(
+      dispatchUuidForAsk(askKeyFor('cli_app', 'sess-A', 'hook', 'shared-req'), 'ask-1'),
     );
     // Same requestId, different session → DIFFERENT uuid (uuid is not a bearer
     // token that a second session could reuse to alias the first's card).
-    expect(dispatchUuidForKey(kA)).not.toBe(dispatchUuidForKey(kB));
+    expect(dispatchUuidForAsk(kA, 'ask-1')).not.toBe(dispatchUuidForAsk(kB, 'ask-1'));
+    // A later ask under the same key gets its own card (its buttons carry a new
+    // askId + nonce, so the old card could not answer it).
+    expect(dispatchUuidForAsk(kA, 'ask-1')).not.toBe(dispatchUuidForAsk(kA, 'ask-2'));
     // Feishu message uuid hard cap.
-    expect(dispatchUuidForKey(kA).length).toBeLessThanOrEqual(50);
+    expect(dispatchUuidForAsk(kA, 'b0a61a51-3d3e-40e1-b03b-259858b07b77').length).toBeLessThanOrEqual(50);
   });
 });
 

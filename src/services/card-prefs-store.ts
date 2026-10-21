@@ -12,9 +12,10 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
  *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • hiddenStreamingCardButtons — omit selected controls from live cards
- *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
- *                                  lightweight status reactions on the trigger
- *                                  message (only meaningful while the card is off)
+ *   • silentTurnReactions       — drop the ✋→✅ lightweight status reactions on
+ *                                  the trigger message in card-off sessions, and
+ *                                  suppress Codex App steer acknowledgement
+ *                                  messages in any card mode
  *   • writableTerminalLinkInCard — embed a directly-usable writable terminal
  *                                  link in the streaming card body
  *   • privateCard               — `/card` sends a private ephemeral snapshot

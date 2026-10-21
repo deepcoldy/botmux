@@ -104,19 +104,6 @@ export interface TriggerUserAuthConfig {
   gitTokenExchangeUrl?: string;
 }
 
-/** Per-tool facts that decide what "unauthorized" can degrade to. */
-export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
-  TriggerUserAuthTool,
-  { supportsBotIdentity: boolean }
-> = {
-  // `lark-cli --as bot` works with app credentials alone.
-  'lark-cli': { supportsBotIdentity: true },
-  // `bytedcli auth` offers only SSO personal login — no bot/tenant identity to
-  // degrade to. (Per-person authorization itself IS supported; see
-  // services/bytedcli-auth.ts.)
-  bytedcli: { supportsBotIdentity: false },
-};
-
 /**
  * How well the on-disk token store is actually protected for this session.
  *
@@ -287,26 +274,4 @@ export function triggerUserAuthApplies(
   tool: TriggerUserAuthTool,
 ): boolean {
   return !!config?.enabled && config.tools.includes(tool);
-}
-
-/** How a specific tool behaves when the sender has not authorized it. */
-export type UnauthorizedOutcome = 'bot-identity' | 'fail';
-
-/**
- * Resolve the configured policy intent for `tool` when the current sender has
- * no credentials.
- *
- * Descriptive only: the turn publisher refuses unauthorized calls for BOTH
- * tools today (see turn-cli-identity), so nothing in production branches on
- * this result. It is kept because stored configs still carry the field and
- * tests pin what was configured. `bytedcli` reports `fail` even under
- * `fallback: 'bot-identity'` because it never had a non-human identity.
- */
-export function unauthorizedOutcomeFor(
-  config: TriggerUserAuthConfig | null | undefined,
-  tool: TriggerUserAuthTool,
-): UnauthorizedOutcome {
-  if (!triggerUserAuthApplies(config, tool)) return 'bot-identity';
-  if (config!.fallback === 'none') return 'fail';
-  return TRIGGER_USER_AUTH_TOOL_CAPABILITIES[tool].supportsBotIdentity ? 'bot-identity' : 'fail';
 }

@@ -1129,9 +1129,11 @@ export function buildStreamingCard(
       })),
       value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
     }] });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
-      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
-    ) + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '') }] });
+    const effortScope = effortControl.pending && effortControl.nextTurn
+      ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
+      : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
+        + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: effortScope }] });
   }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
@@ -1368,7 +1370,17 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
  *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
  *  many trailing projects to fit the card byte budget; the card then says so.
  *  Callers go through buildRepoSelectCard, which owns the budget. */
-function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
+/** Recovery form of the repo picker: the session's working directory is gone.
+ *  The top row names the missing path and, when git still knows where the
+ *  worktree came from, offers to rebuild it there; switching works as usual
+ *  but keeps the session. */
+export interface RepoSelectRecovery {
+  missingPath: string;
+  /** Branch the deleted worktree had; absent → no rebuild button. */
+  rebuildBranch?: string;
+}
+
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1390,8 +1402,39 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
     }));
 
   const card = wideCard({
-    header: cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
+    header: recovery
+      ? cardHeaderTemplateFirst('orange', t('card.repo.recovery_title', undefined, locale))
+      : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
+      // Recovery: the missing directory + 「重建 worktree」take the top row. There
+      // is no 「直接开启会话」— the directory it would start in is the one gone.
+      ...(recovery ? [{
+        tag: 'column_set',
+        flex_mode: 'flow',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              larkMdDiv(t(recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild', { path: escapeMd(recovery.missingPath) }, locale)),
+            ],
+          },
+          ...(recovery.rebuildBranch ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              callbackButton(
+                t('card.btn.rebuild_worktree', { branch: recovery.rebuildBranch }, locale),
+                'primary',
+                { action: 'repo_rebuild_worktree', root_id: rootMessageId ?? '' },
+              ),
+            ],
+          }] : []),
+        ],
+      }] : [
       // Current working directory + 「直接开启会话」on the same row: the skip
       // button means "use this directory as-is, don't pick a repo", so it pairs
       // with the current-dir line rather than the switch dropdown below.
@@ -1426,11 +1469,13 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             ],
           },
         ],
-      },
+      }]),
       {
         tag: 'hr',
       },
-      {
+      // A recovery card is published with whatever the scan finds, possibly
+      // nothing; it then offers manual entry (below) instead of an empty select.
+      ...(options.length > 0 || !recovery ? [{
         tag: 'action',
         actions: [
           {
@@ -1440,7 +1485,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
         ],
-      },
+      }] : []),
       // Worktree open. Two modes, persisted per-bot (worktreeMultiPicker):
       //   • single (default) — instant single-select dropdown + a short 「🔀 多仓库」
       //     button on the SAME action row (a select_static can't live in a
@@ -1567,7 +1612,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
+            content: t(recovery ? 'card.repo.recovery_note' : 'card.repo.note', undefined, locale),
           },
         ],
       },
@@ -1603,9 +1648,9 @@ export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
  *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
  *  thing before and after a truncation. The scanner sorts repos ahead of
  *  worktrees, so in practice the tail that goes is worktrees. */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, recovery?: RepoSelectRecovery): string {
   const render = (visible: number): string =>
-    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible, recovery);
   const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
 
   const full = render(projects.length);

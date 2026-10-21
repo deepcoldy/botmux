@@ -309,6 +309,35 @@ function herdrSessionArgs(sessionName: string, args: string[]): string[] {
   return ['--session', sessionName, ...args];
 }
 
+/** Linux MAX_ARG_STRLEN caps one argv element at 131072 bytes (32 pages).
+ *  Keep the `pane send-text` argument below it with headroom, since execve
+ *  rejects the whole call (E2BIG) once any single element reaches the cap. */
+const HERDR_SEND_TEXT_MAX_ARG_BYTES = 131072 - 8192;
+
+/** Split a string into pieces whose UTF-8 byte length is <= maxBytes, never
+ *  cutting through a multi-byte character. Returns one piece for short/empty
+ *  input so callers always issue at least one write. */
+export function chunkByUtf8Bytes(text: string, maxBytes: number): string[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError('maxBytes must be an integer >= 4');
+  }
+  const chunks: string[] = [];
+  let chunk = '';
+  let chunkBytes = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (chunk && chunkBytes + charBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += char;
+    chunkBytes += charBytes;
+  }
+  chunks.push(chunk);
+  return chunks;
+}
+
 function extractAgent(raw: any): any | undefined {
   return raw?.result?.agent;
 }
@@ -715,10 +744,21 @@ export class HerdrBackend implements SessionBackend {
     this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    return runHerdr(
-      herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]),
-      { timeout: 5000 },
-    );
+    // Linux caps a SINGLE argv element at MAX_ARG_STRLEN (32 pages = 131072
+    // bytes), independent of ARG_MAX. A longer `pane send-text` payload dies
+    // with E2BIG before exec — the whole message is lost, and runHerdr reports
+    // false. Split oversized payloads into argv-safe pieces on UTF-8 boundaries
+    // and write them in order: the pane receives the identical byte sequence.
+    // A bracketed paste keeps one pair of markers because they are part of the
+    // stream; split points between the markers never leave paste mode.
+    const chunks = chunkByUtf8Bytes(data, HERDR_SEND_TEXT_MAX_ARG_BYTES);
+    for (const chunk of chunks) {
+      if (!runHerdr(
+        herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, chunk]),
+        { timeout: 5000 },
+      )) return false;
+    }
+    return true;
   }
 
   sendText(text: string): boolean {
@@ -734,6 +774,12 @@ export class HerdrBackend implements SessionBackend {
       herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]),
       { timeout: 5000 },
     );
+  }
+
+  /** One frame avoids per-line Enter/paste-burst ambiguity in Claude's composer.
+   * Send the paste boundaries through the raw terminal transport. */
+  sendBracketedPaste(text: string): boolean {
+    return this.write('\x1b[200~' + text + '\x1b[201~');
   }
 
   pasteText(text: string): boolean {

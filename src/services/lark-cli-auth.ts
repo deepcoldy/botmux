@@ -110,6 +110,8 @@ const CHALLENGE_TTL_MS = 9 * 60_000;
  *  network-bound; generous enough for a slow network, short enough that a wedged
  *  CLI cannot hold a turn open. */
 const LARK_CLI_TIMEOUT_MS = 30_000;
+/** Failed automatic polls must not stall every incoming turn during an outage. */
+const AUTO_POLL_COOLDOWN_MS = 60_000;
 
 /** Scopes the CLI needs to do the document/drive/wiki/sheets/IM reads a
  *  triggered task performs. Kept level with the old bot-OAuth DEFAULT_SCOPES so
@@ -164,12 +166,6 @@ function listUserTokenFiles(home: string): string[] {
   try {
     return readdirSync(larkCliDataDir(home)).filter(f => /^cli_[A-Za-z0-9]+_ou_[A-Za-z0-9]+\.enc$/.test(f));
   } catch { return []; }
-}
-
-/** Forget one person's lark-cli authorization entirely. */
-export function clearLarkCliAuth(openId: string): void {
-  try { rmSync(larkCliHomeFor(openId), { recursive: true, force: true }); }
-  catch { /* best-effort: absence is the desired state */ }
 }
 
 export interface LarkCliResult {
@@ -320,16 +316,18 @@ function challengePath(openId: string): string {
 }
 
 /** The resume token + link from an in-progress login if still usable. */
-export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number } | null {
+export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number; autoPollAfter?: number } | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown };
+      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown; autoPollAfter?: unknown };
     if (typeof raw.deviceCode !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
       deviceCode: raw.deviceCode,
       ...(typeof raw.authUrl === 'string' ? { authUrl: raw.authUrl } : {}),
       createdAt: raw.createdAt,
+      ...(typeof raw.autoPollAfter === 'number' && Number.isFinite(raw.autoPollAfter)
+        ? { autoPollAfter: raw.autoPollAfter } : {}),
     };
   } catch { return null; }
 }
@@ -348,6 +346,19 @@ function saveChallenge(openId: string, deviceCode: string, authUrl: string): voi
 
 function clearChallenge(openId: string): void {
   try { rmSync(challengePath(openId), { force: true }); } catch { /* already gone */ }
+}
+
+function deferAutomaticPoll(openId: string, deviceCode: string): void {
+  const challenge = pendingLarkCliChallenge(openId);
+  // Do not resurrect an expired request or change a replacement challenge.
+  if (!challenge || challenge.deviceCode !== deviceCode) return;
+  try {
+    atomicWriteFileSync(challengePath(openId), JSON.stringify({
+      ...challenge, autoPollAfter: Date.now() + AUTO_POLL_COOLDOWN_MS,
+    }), { mode: 0o600 });
+  } catch {
+    logger.debug('[lark-cli-auth] could not persist automatic poll cooldown');
+  }
 }
 
 export interface LarkCliLoginChallenge {
@@ -412,23 +423,26 @@ export async function completeLarkCliLogin(
     // ok but no token file yet — treat as pending rather than authorized.
     return { state: 'pending' };
   }
+  // CLI error envelopes are written to stderr; older runners used stdout.
+  if (!parsed?.error) {
+    try { parsed = JSON.parse(stderr) as Record<string, unknown>; } catch { /* plain stderr */ }
+  }
   const raw = String((parsed?.error as Record<string, unknown> | undefined)?.message ?? stderr).trim();
-  // "authorization_pending"-style messages are the normal not-scanned-yet case.
   if (/pending|not yet|waiting/i.test(raw)) return { state: 'pending' };
-  // A terminal failure (expired / denied / unknown code) never turns into a
-  // success by re-polling the same code: drop it so the next begin mints a
-  // fresh link instead of reusing a dead one until the TTL expires. A transient
-  // transport error costs one extra link, which the refusal hands over at once.
-  clearChallenge(openId);
+  // A bounded local wait or transport failure does not invalidate the server's
+  // device code. Keep the same challenge so a later approval can still finish.
+  // Only explicit terminal authorization outcomes justify issuing a new link.
+  // lark-cli 1.0.96 reports device-flow terminal errors as subtype=unknown.
+  // That subtype alone is not evidence of expiry or rejection.
+  const denied = /access_denied|authorization_declined|authorization denied/i.test(raw);
+  const invalidCode = /device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw);
+  const expired = /expired[_ ]token|(?:device[_ ]code|authorization).*expired/i.test(raw);
+  if (denied || invalidCode || expired) {
+    clearChallenge(openId);
+  } else {
+    deferAutomaticPoll(openId, code);
+  }
   return { state: 'failed', detail: raw || undefined };
-}
-
-/** Absolute HOME directory to export for this person's lark-cli calls this turn,
- *  or null when they have no per-person login (caller denies). */
-export function larkCliHomeForTurn(openId: string | undefined): string | null {
-  if (!openId) return null;
-  try { return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null; }
-  catch { return null; }
 }
 
 /**
@@ -439,14 +453,18 @@ export function larkCliHomeForTurn(openId: string | undefined): string | null {
  * tapped the link and (as instructed) retried the operation would be refused
  * again until they guessed `/login done`. One poll per turn is the same shape
  * bytedcli already uses; a still-pending or failed poll resolves to null (the
- * caller refuses again with a fresh link) — it never manufactures a HOME, so
- * someone who has not approved stays refused.
+ * caller refuses again). Temporary failures reuse the link and defer automatic
+ * polls for one minute; explicit /login done calls complete directly. It never
+ * manufactures a HOME, so someone who has not approved stays refused.
  */
 export async function resolveLarkCliHomeForTurn(openId: string | undefined): Promise<string | null> {
   if (!openId) return null;
   try {
-    if (!hasLarkCliHome(openId) && pendingLarkCliChallenge(openId)) {
-      await completeLarkCliLogin(openId);
+    if (!hasLarkCliHome(openId)) {
+      const challenge = pendingLarkCliChallenge(openId);
+      if (challenge && (challenge.autoPollAfter ?? 0) <= Date.now()) {
+        await completeLarkCliLogin(openId);
+      }
     }
     return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
   } catch {

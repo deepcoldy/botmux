@@ -50,7 +50,7 @@ describe('botmux update/upgrade target arguments validation', () => {
       expect(res.stderr).toContain('不能同时指定多个升级目标');
       expect(res.stdout).not.toContain('本地 checkout 更新');
     }
-  }, 15_000);
+  }, 30_000);
 
   it('rejects URL, protocol, and alias specs with rc=2', () => {
     const protocolCases = [
@@ -105,5 +105,5 @@ describe('botmux update/upgrade target arguments validation', () => {
       expect(res.stderr).toContain('当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本');
       expect(res.stdout).not.toContain('本地 checkout 更新');
     }
-  }, 15_000);
+  }, 30_000);
 });

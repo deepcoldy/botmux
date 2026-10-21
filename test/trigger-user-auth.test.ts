@@ -19,7 +19,6 @@ import { describe, it, expect } from 'vitest';
 import {
   parseTriggerUserAuthConfig,
   triggerUserAuthApplies,
-  unauthorizedOutcomeFor,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
   tokenStoreProtection, credentialSourceOf } from '../src/services/trigger-user-auth.js';
@@ -108,34 +107,6 @@ describe('triggerUserAuthApplies', () => {
     expect(config?.enabled).toBe(true);
     for (const tool of TRIGGER_USER_AUTH_TOOLS) {
       expect(triggerUserAuthApplies(config, tool)).toBe(false);
-    }
-  });
-});
-
-describe('unauthorizedOutcomeFor', () => {
-  it('leaves ungoverned tools on their existing behavior', () => {
-    expect(unauthorizedOutcomeFor(null, 'bytedcli')).toBe('bot-identity');
-    const larkOnly = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
-    expect(unauthorizedOutcomeFor(larkOnly, 'bytedcli')).toBe('bot-identity');
-  });
-
-  it('lets lark-cli degrade to the bot\'s own identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true });
-    expect(unauthorizedOutcomeFor(config, 'lark-cli')).toBe('bot-identity');
-  });
-
-  // bytedcli offers only SSO personal login: no service account, no AK/SK.
-  // Reporting `bot-identity` here would produce a call that fails anyway, with
-  // a misleading reason.
-  it('fails for bytedcli even under fallback: bot-identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
-    expect(unauthorizedOutcomeFor(config, 'bytedcli')).toBe('fail');
-  });
-
-  it('fails for every governed tool under fallback: none', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'none' });
-    for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-      expect(unauthorizedOutcomeFor(config, tool)).toBe('fail');
     }
   });
 });

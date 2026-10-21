@@ -569,6 +569,22 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
   });
 
+  it('retains strict auto-close opt-in across listener config reloads', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'listener-close', larkAppSecret: 's',
+      globalMessageListener: { enabled: true, prompt: 'global', autoCloseAfterCompletion: true },
+      groupMessageListenerOverrides: {
+        oc_custom: { mode: 'custom', listener: { enabled: true, prompt: 'custom', autoCloseAfterCompletion: false } },
+      },
+      messageListeners: { oc_legacy: { enabled: true, prompt: 'legacy', autoCloseAfterCompletion: 'true' } },
+    }]));
+    expect(cfg.globalMessageListener?.autoCloseAfterCompletion).toBe(true);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom' });
+    const custom = cfg.groupMessageListenerOverrides?.oc_custom;
+    if (custom?.mode === 'custom') expect(custom.listener.autoCloseAfterCompletion).toBeUndefined();
+    expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
+  });
+
   it('normalizes per-chat messageListeners without enabling them by default', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {

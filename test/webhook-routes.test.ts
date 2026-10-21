@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -646,8 +646,11 @@ describe('webhook new-group lifecycle', () => {
     expect(result.body).toMatchObject({ ok: false, errorCode: 'legacy_workflow_retired' });
     expect(captured).toHaveLength(0);
     expect(createLifecycleGroup).not.toHaveBeenCalled();
-    const { listWebhookLifecycleRecords } = await import('../src/services/webhook-lifecycle-store.js');
-    expect(listWebhookLifecycleRecords({ connectorId: connector.id }, dataDir)).toEqual([]);
+    const lifecyclePath = join(dataDir, 'webhook-lifecycle.json');
+    const lifecycleRecords: Array<{ connectorId?: string }> = existsSync(lifecyclePath)
+      ? JSON.parse(readFileSync(lifecyclePath, 'utf-8')).records ?? []
+      : [];
+    expect(lifecycleRecords.filter(r => r.connectorId === connector.id)).toEqual([]);
   });
 
   it('never creates a workflow lifecycle group after retirement', async () => {

@@ -1248,23 +1248,6 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Submit-confirmation probe: only a complete user event record appended after
- * `fromOffset` can match. Read-only — drains with `probe` so
- * it never mutates the per-turn agent_message cache the production drainer
- * relies on (a re-drain of the same live rollout at a different offset must
- * not clear pending turn state). Not currently wired into the production
- * submit-confirmation path; kept as a tested probe. */
-export function traexRolloutHasUserInputSince(
-  path: string,
-  fromOffset: number,
-  expectedText: string,
-): boolean {
-  const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
-    event.kind === 'user' && normaliseInputText(event.text) === expected,
-  );
-}
-
 // -- history.jsonl submit-confirmation (submit-time truth) ------------------
 //
 // TRAE writes ~/.trae/cli/history.jsonl at SUBMIT time — one JSON line

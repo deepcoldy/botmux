@@ -212,15 +212,16 @@ Tests are split into two Vitest projects with different execution profiles
 
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
-  `bun run test` runs, so the default is fast (~10s) and needs no real CLI binary
-  or browser.
+  `bun run test` runs; it needs no real CLI binary or browser. The full project
+  takes minutes, not seconds (CI splits it into three shards), so while iterating
+  run only the files you touched: `bun run test -- test/<name>.test.ts`.
 - **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
   runs sequentially. Opt-in only.
 - **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
   `@midscene/test` against a shared daemon and logged-in browser session.
 
 ```bash
-bun run test                # Unit tests only — parallel, ~10s (default)
+bun run test                # Unit tests only — parallel (default)
 bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
 bun run test:e2e-browser    # Feishu browser cases through Midscene Test
@@ -235,6 +236,25 @@ bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 > `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
 > such delay. Filesystem-mocked unit tests set it small to collapse those waits.
 > See [`docs/test-benchmark.md`](docs/test-benchmark.md).
+
+### What Makes a Test Worth Keeping
+
+Tests must prove **behavior**, not photograph the implementation. Before writing
+one, ask: will it fail on a real behavioral regression, and will it stay green
+through a harmless refactor, copy edit or tuning change? The full rules live in
+the "测试原则" section of [`CLAUDE.md`](CLAUDE.md); in short:
+
+- Do not read `src/` files as text and assert on their contents. Extract the
+  logic into an exported function and test that instead. The few genuine
+  structural guards (import boundaries, compiled-binary constraints, security
+  guards without a behavioral seam, high-severity regression tripwires,
+  machine-checkable consistency) must carry a `// 源码结构护栏(Kx)：…` comment
+  (or `// 非文本断言：…` when a src asset is only used as a fixture);
+  `test/test-hygiene.test.ts` rejects unmarked ones.
+- Do not pin documentation wording, UI copy or internal tuning constants.
+  External protocol values and relationships between constants are fine.
+- Do not keep production exports alive just for their tests: wire them in or
+  delete both.
 
 ### Timing-Sensitive Test Contract
 

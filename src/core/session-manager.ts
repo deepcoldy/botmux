@@ -104,6 +104,8 @@ import {
 } from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { initialLinkRefSources } from './link-ref-turn.js';
+import type { LinkRefMode, LinkRefSourceType } from '../services/link-ref-types.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
@@ -1297,6 +1299,10 @@ type NewTopicOpts = {
   chatContext?: ChatContext;
   groupJoinContext?: GroupJoinContext;
   sharedGroupContext?: string;
+  /** Frozen LinkRef mode for this accepted turn. Missing preserves legacy input. */
+  linkRefMode?: LinkRefMode;
+  linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+  publicSystemDocUrls?: string[];
   turnId?: string;
   sessionBackendType?: BackendType;
   /** Exact worker launch decision for this opening input. This cannot be
@@ -1582,6 +1588,9 @@ export function buildNewTopicCliInput(
     chatContext?: ChatContext;
     groupJoinContext?: GroupJoinContext;
     sharedGroupContext?: string;
+    linkRefMode?: LinkRefMode;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+    publicSystemDocUrls?: string[];
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
     trustedCaller?: CliTurnPayload['trustedCaller'];
@@ -1634,7 +1643,7 @@ export function buildNewTopicCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText };
+      return withInitialLinkRefSources({ content: ptyText }, userMessage, { ...opts, attachments });
     }
     // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
   }
@@ -1645,7 +1654,11 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
-    return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+    return withInitialLinkRefSources(
+      { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+      userMessage,
+      { ...opts, attachments },
+    );
   }
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
@@ -1664,7 +1677,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
-  return {
+  return withInitialLinkRefSources({
     content,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -1685,7 +1698,7 @@ export function buildNewTopicCliInput(
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
       attachments,
     }),
-  };
+  }, userMessage, { ...opts, attachments });
 }
 
 /**
@@ -1718,6 +1731,10 @@ type FollowUpOpts = {
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
   sharedGroupContext?: string;
+  /** Frozen LinkRef mode for this accepted turn. Missing preserves legacy input. */
+  linkRefMode?: LinkRefMode;
+  linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+  publicSystemDocUrls?: string[];
   /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
    *  Claude hook 进程，强制 inline 模式。 */
   sessionBackendType?: BackendType;
@@ -1959,6 +1976,38 @@ function effectivePromptHookConfigPath(
   return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
+function withInitialLinkRefSources(
+  payload: CliTurnPayload,
+  userText: string,
+  opts: {
+    linkRefMode?: LinkRefMode;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+    sharedGroupContext?: string;
+    publicSystemDocUrls?: string[];
+    attachments?: LarkAttachment[];
+  } | undefined,
+): CliTurnPayload {
+  // Builders only describe explicitly model-visible sources. They do not read
+  // mutable rollout configuration: the real fork/send boundary freezes that
+  // decision after every await/defer. Keep callers without a daemon app scope
+  // byte-compatible (pure formatter/tests and unsupported transports).
+  if (!opts?.linkRefMode && (!opts || !('larkAppId' in opts) || !opts.larkAppId)) return payload;
+  const mode = opts?.linkRefMode ?? 'disabled';
+  return {
+    ...payload,
+    linkRefs: {
+      mode,
+      sources: initialLinkRefSources({
+        userText,
+        userSourceType: opts?.linkRefSourceType,
+        groupContext: opts?.sharedGroupContext,
+        attachments: opts?.attachments,
+        publicSystemDocUrls: opts?.publicSystemDocUrls,
+      }),
+    },
+  };
+}
+
 /** Follow-up counterpart of buildNewTopicCliInput. */
 export function buildFollowUpCliInput(
   content: string,
@@ -1999,13 +2048,21 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+      return withInitialLinkRefSources(
+        { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+        content,
+        opts,
+      );
     }
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
-    return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+    return withInitialLinkRefSources(
+      { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+      content,
+      opts,
+    );
   }
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
@@ -2020,7 +2077,7 @@ export function buildFollowUpCliInput(
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
   const mentionBlock = renderMentionBlock(opts.mentions);
-  return {
+  return withInitialLinkRefSources({
     content: legacyContent,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -2037,7 +2094,7 @@ export function buildFollowUpCliInput(
       groupHistoryBlock: opts.sharedGroupContext,
       attachments: opts.attachments,
     }),
-  };
+  }, content, opts);
 }
 
 /**
@@ -2157,6 +2214,7 @@ export function buildReforkCliInput(
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
     turnId?: string;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
   },
 ): CliTurnPayload {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -2186,6 +2244,7 @@ export function buildReforkCliInput(
     sessionBackendType: ds.session.backendType,
     promptInjection: sessionPromptInjection(ds),
     turnId: opts?.turnId,
+    linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -3292,6 +3351,9 @@ export async function restoreActiveSessions(
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  // Rows whose backing session probed alive: their CLI is running already, so
+  // re-attaching is allowed even when the working directory is gone.
+  const liveBackendReattach = new Set<DaemonSession>();
   const restoreCandidates: Array<{
     ds: DaemonSession;
     backendType: PersistentBackendType;
@@ -3425,6 +3487,7 @@ export async function restoreActiveSessions(
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
     toReattach.push(ds);
+    liveBackendReattach.add(ds);
   }
 
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
@@ -3444,17 +3507,16 @@ export async function restoreActiveSessions(
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
-      forkWorker(
-        ds,
-        recoverExactNonCodex || '',
-        recoverExactNonCodex
-          ? {
-              resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-              turnId: ds.session.queuedActivationTurnId,
-              dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-            }
-          : true,
-      );
+      const prompt = recoverExactNonCodex || '';
+      const resume = recoverExactNonCodex
+        ? {
+            resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+            turnId: ds.session.queuedActivationTurnId,
+            dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          }
+        : true;
+      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
+      else forkWorker(ds, prompt, resume);
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,

@@ -135,6 +135,19 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes host-authorized LinkRef relay controls from ordinary children', () => {
+    const out = redactChildEnv({
+      BOTMUX_LINK_REF_TURN_MODE: 'enabled',
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      KEEP: 'v',
+    });
+    for (const key of ['BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED']) {
+      expect(key in out, key).toBe(false);
+      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+    }
+    expect(out.KEEP).toBe('v');
+  });
+
   it('removes the Dashboard Feishu H5 credential family from child env', () => {
     // BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET is a full Feishu app credential: the
     // daemon dotenv-loads ~/.botmux/.env wholesale, so before this scrub every
@@ -215,6 +228,12 @@ describe('redactChildEnv()', () => {
     // neighbors) rather than an import, so guard against the two definitions
     // drifting apart if the env var is ever renamed.
     expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  });
+
+  it('keeps the daemon-only LinkRef rollout setting out of CLI children', () => {
+    const out = redactChildEnv({ BOTMUX_LINK_REFS_MODE: 'enabled', KEEP: 'v' });
+    expect(out.BOTMUX_LINK_REFS_MODE).toBeUndefined();
+    expect(out.KEEP).toBe('v');
   });
 
   // Two REAL-CHILD guards for the same leak vector, split by transport.

@@ -17,7 +17,6 @@ import {
   resolveSchedulePrecondition,
   schedulePreconditionPath,
   schedulePreconditionRoot,
-  schedulePreconditionTrustedFileExamplePath,
   schedulePreconditionTrustedFilesRoot,
   stageSchedulePrecondition,
 } from '../src/services/schedule-precondition-store.js';
@@ -304,10 +303,6 @@ describe('trusted schedule precondition configuration', () => {
       'schedule-preconditions',
       'trusted-files',
     ));
-    expect(schedulePreconditionTrustedFileExamplePath()).toBe(join(
-      schedulePreconditionTrustedFilesRoot(),
-      'check-ready.sh',
-    ));
     expect(existsSync(schedulePreconditionTrustedFilesRoot())).toBe(true);
   });
 
@@ -467,7 +462,7 @@ describe('trusted schedule precondition configuration', () => {
     });
     expect(disabled.task?.preconditionRef).toBe(created.preconditionRef);
 
-    const trustedFilePath = schedulePreconditionTrustedFileExamplePath();
+    const trustedFilePath = join(schedulePreconditionTrustedFilesRoot(), 'check-ready.sh');
     const replacedAndEnabled = updateTaskWithOptionalPrecondition(
       created.id,
       {},

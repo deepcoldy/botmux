@@ -225,6 +225,7 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['skip_repo', { pendingRepoOwnerException: true }],
   ['repo_manual_submit', { pendingRepoOwnerException: true }],
   ['repo_worktree_submit', { pendingRepoOwnerException: true }],
+  ['repo_rebuild_worktree', NO_META],
   ['worktree_toggle_mode', NO_META],
   ['retry_last_task', NO_META],
   ['retry_turn', NO_META],

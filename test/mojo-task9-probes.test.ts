@@ -42,7 +42,6 @@ import {
     acquireContainmentHandle,
     containmentHandles,
     hasUnprovenContainment,
-    inheritContainmentHandles,
     proveContainmentQuiescent,
     readProcLiveness,
     recordContainmentHandle,
@@ -325,11 +324,11 @@ exit 0`);
         const h = acquireContainmentHandle({ sessionId: 'probe2b', generation: 1, rootPid: escaped, nonce }, {});
         recordContainmentHandle(h, dataDir);
         // Generation 2 reads ONLY the store — nothing in memory.
-        const inherited = inheritContainmentHandles('probe2b', 2, dataDir);
-        note(`P2b: gen2 inherited ${inherited.length} handle(s) from a cold store; `
+        const stored = containmentHandles('probe2b', dataDir);
+        note(`P2b: gen2 read ${stored.length} handle(s) from a cold store; `
             + `blocker_retained=${hasUnprovenContainment('probe2b', dataDir)}`);
-        expect(inherited).toHaveLength(1);
-        expect(containmentHandles('probe2b', dataDir)[0]).toMatchObject({ rootPid: escaped });
+        expect(stored).toHaveLength(1);
+        expect(stored[0]).toMatchObject({ rootPid: escaped });
         expect(hasUnprovenContainment('probe2b', dataDir)).toBe(true);
 
         try { process.kill(escaped, 'SIGKILL'); } catch { /* gone */ }

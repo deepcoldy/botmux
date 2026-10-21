@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BackendType } from '../src/adapters/backend/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 
@@ -21,7 +21,12 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { suspendWorker } from '../src/core/worker-pool.js';
+import {
+  __testOnly_setSuspendBackingVerifier,
+  destroySuspendBackingVerified,
+  retiringWorkersForSession,
+  suspendWorker,
+} from '../src/core/worker-pool.js';
 import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
@@ -45,6 +50,12 @@ const CLI_IDS: CliId[] = [
 ];
 
 const BACKENDS: BackendType[] = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'];
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  __testOnly_setSuspendBackingVerifier(() => true);
+});
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 
 describe('worker suspend backend gating', () => {
   it.each(BACKENDS)('classifies %s correctly', (backend) => {
@@ -73,8 +84,68 @@ function fakeWorker() {
 }
 
 describe('suspendWorker', () => {
+  it('kills the exact backing and requires a positive missing post-probe', () => {
+    const ds: any = {
+      session: { sessionId: 'sid-verified', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      larkAppId: 'cli_test',
+    };
+    const kill = vi.fn();
+    const probe = vi.fn()
+      .mockReturnValueOnce('exists')
+      .mockReturnValueOnce('missing');
+
+    expect(destroySuspendBackingVerified(ds, { kill, probe })).toBe(true);
+    expect(kill).toHaveBeenCalledTimes(2);
+    expect(kill).toHaveBeenCalledWith(
+      expect.objectContaining({ backendType: 'tmux', sessionName: expect.stringContaining('sid-veri') }),
+      'sid-verified',
+    );
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['exists', 'unknown'] as const)(
+    'fails closed when the backing remains %s after retry',
+    (finalProbe) => {
+      const ds: any = {
+        session: { sessionId: `sid-${finalProbe}`, status: 'active' },
+        initConfig: { backendType: 'tmux' },
+        larkAppId: 'cli_test',
+      };
+      const kill = vi.fn();
+      const probe = vi.fn(() => finalProbe);
+
+      expect(destroySuspendBackingVerified(ds, { kill, probe })).toBe(false);
+      expect(kill).toHaveBeenCalledTimes(2);
+      expect(probe).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('also fails closed when a parked crash-diagnostic shell cannot be verified gone', () => {
+    const ds: any = {
+      session: { sessionId: 'sid-diagnostic', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      larkAppId: 'cli_test',
+      crashDiagnosticParked: true,
+    };
+    const kill = vi.fn();
+    const probe = vi.fn(() => 'missing' as const);
+    const killDiagnostic = vi.fn();
+    const probeDiagnostic = vi.fn(() => 'unknown' as const);
+
+    expect(destroySuspendBackingVerified(ds, {
+      kill, probe, killDiagnostic, probeDiagnostic,
+    })).toBe(false);
+    expect(killDiagnostic).toHaveBeenCalledTimes(2);
+    expect(probeDiagnostic).toHaveBeenCalledTimes(2);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it('suspends a persistent worker without closing the active session', () => {
     const worker = fakeWorker();
+    const order: string[] = [];
+    __testOnly_setSuspendBackingVerifier(() => { order.push('backing-verified'); return true; });
+    worker.send.mockImplementation(() => { order.push('worker-notified'); });
     const ds: any = {
       session: { sessionId: 'sid-1', status: 'active' },
       initConfig: { backendType: 'tmux' },
@@ -89,6 +160,7 @@ describe('suspendWorker', () => {
     const didSuspend = suspendWorker(ds, 'idle_budget');
 
     expect(didSuspend).toBe(true);
+    expect(order).toEqual(['backing-verified', 'worker-notified']);
     expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.session.status).toBe('active');
     expect(ds.worker).toBe(null);
@@ -96,8 +168,8 @@ describe('suspendWorker', () => {
     expect(ds.workerToken).toBe(null);
     expect(ds.managedTurnOrigin).toBeUndefined();
     expect(ds.lastScreenStatus).toBeUndefined();
-    // The worker's suspend handler destroys the backing session + CLI, so the
-    // next turn must cold-resume: mark history (→ forkWorker resume=true builds
+    // The daemon-side verifier proved the backing session + CLI gone before the
+    // worker notification, so the next turn must cold-resume: mark history (→ forkWorker resume=true builds
     // --resume) and persist the suspend intent (→ restore won't zombie-close it).
     expect(ds.hasHistory).toBe(true);
     expect(ds.session.suspendedColdResume).toBe(true);
@@ -125,6 +197,47 @@ describe('suspendWorker', () => {
     expect(worker.send).not.toHaveBeenCalled();
     expect(ds.worker).toBe(worker);
     expect(ds.managedTurnOrigin).toEqual({ capability: 'cap-pty', turnId: 'om-pty' });
+  });
+
+  it('does not persist dormant or notify the worker when teardown is unverified', () => {
+    __testOnly_setSuspendBackingVerifier(() => false);
+    const worker = fakeWorker();
+    const ds: any = {
+      session: { sessionId: 'sid-unverified', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerPort: 3456,
+      workerToken: 'token',
+      lastScreenStatus: 'idle',
+      exitEventEmitted: false,
+    };
+
+    expect(suspendWorker(ds, 'idle_budget')).toBe(false);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.suspendedColdResume).toBeUndefined();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+    // The retirement tracked before the verifier ran must be rolled back: a
+    // still-live worker left in the retiring index biases the VC fence's
+    // producer-liveness gate against this session.
+    expect(retiringWorkersForSession('sid-unverified')).toEqual([]);
+  });
+
+  it('tracks the worker as retiring only after teardown is verified', () => {
+    const worker = fakeWorker();
+    const ds: any = {
+      session: { sessionId: 'sid-retiring', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerPort: 3456,
+      workerToken: 'token',
+      lastScreenStatus: 'idle',
+      exitEventEmitted: false,
+    };
+
+    expect(suspendWorker(ds, 'idle_budget')).toBe(true);
+    // Verified suspend marks retirement; release happens on the worker's exit.
+    expect(retiringWorkersForSession('sid-retiring')).toContain(worker);
   });
 
   it('refuses suspension while the durable Codex App dispatch ledger is non-empty', () => {

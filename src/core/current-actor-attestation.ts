@@ -12,6 +12,7 @@ import {
   procStatFieldsAfterComm,
   procStatStartTimeDigits,
 } from '../utils/proc-stat.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -58,10 +59,6 @@ export function snapshotProcessIdentities(
   return identities.length > 0 ? identities.sort() : undefined;
 }
 
-function isLoopbackAddress(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-}
-
 function peerSocketInodes(procRoot: string, clientPort: number, serverPort: number): Set<string> | undefined {
   const out = new Set<string>();
   let tableRead = false;
@@ -93,7 +90,14 @@ export function resolveLoopbackPeerProcesses(input: {
   procRoot?: string;
 }): LoopbackPeerResolution {
   const procRoot = input.procRoot ?? '/proc';
-  if (!isLoopbackAddress(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
+  // First ring: the peer address must be local (default loopback set, plus
+  // BOTMUX_LOOPBACK_PEERS for hosts whose kernel reports a same-machine peer
+  // as a LAN IP). This is NOT the trust boundary by itself: a remote peer can
+  // never produce a client-side row in THIS host's /proc/net/tcp, so the
+  // socket-inode → fd → process lineage resolution below still pins the peer
+  // to a local process. Relaxing the address ring only stops a local peer with
+  // a non-standard reported address from failing before that resolution.
+  if (!isLoopbackPeer(input.remoteAddress)) return { ok: false, reason: 'not_loopback' };
   if (procRoot === '/proc' && process.platform !== 'linux') {
     return { ok: false, reason: 'platform_unsupported' };
   }
