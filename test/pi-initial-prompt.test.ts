@@ -113,6 +113,38 @@ describe('Pi initial prompt @file delivery', () => {
     expect(piInitialPromptNeedsFile(undefined)).toBe(false);
   });
 
+  it('routes a --help-leading first prompt through @file so Pi never parses it as its own help flag', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // A user typing "--help" in a Lark topic is asking the agent, not asking
+      // pi(1) to print CLI help: a bare positional is consumed by pi's option
+      // parser and exits before any turn can run.
+      const prompt = '--help 这个命令怎么用';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-help',
+        sessionDataDir: dataDir,
+      });
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+
+      // The delivered argv keeps the prompt as a trailing @file positional:
+      // pi's own --help flag must not appear, so the help/version branch that
+      // a bare `pi --help …` would take is unreachable.
+      const args = createPiAdapter('pi').buildArgs({
+        sessionId: 'sess-leading-help',
+        initialPrompt: result.initialPromptArg,
+      });
+      expect(args).not.toContain('--help');
+      expect(args.at(-1)).toBe(result.initialPromptArg);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('writes short multiline prompts to @file so Herdr can forward control-free argv on resume', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
     try {
