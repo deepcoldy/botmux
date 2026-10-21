@@ -9260,6 +9260,23 @@ botConfigPutRoute<{ oncallGroup?: unknown }>('/api/bot-oncall-group', 'oncallGro
   respond: value => ({ ok: true, oncallGroup: value }),
 });
 
+// Security-sensitive Bot caller → human Owner bindings. There is deliberately
+// no free-form merge mode: each PUT replaces the complete target-Bot policy
+// after the shared strict parser validates exact keys, both source ids, Owner
+// union/email and duplicate identities. null clears the policy.
+botConfigPutRoute<{ botActorOwnerBindings?: unknown }>(
+  '/api/bot-actor-owner-bindings',
+  'botActorOwnerBindings',
+  {
+    normalize: (body, spec) => {
+      if (body.botActorOwnerBindings === null) return fieldOk(null);
+      const parsed = coerceConfigValue(spec, JSON.stringify(body.botActorOwnerBindings ?? []));
+      return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+    },
+    respond: value => ({ ok: true, botActorOwnerBindings: value ?? null }),
+  },
+);
+
 // Per-bot Codex App 无进展提醒 noProgressNotify（#1162）。Body
 // `{ noProgressNotify?: { enabled?: boolean; timeoutMs?: number } | null }`:
 //   • null/缺省 → 清回默认（开启 + 90s）

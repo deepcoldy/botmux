@@ -3,7 +3,8 @@ import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
-import { withPlatformBotOwner } from './core/bot-owner-attribution.js';
+import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
+import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -91,6 +92,8 @@ import {
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
   botAcceptsSlashFromBots,
+  getLoadedConfigPath,
+  getLoadedConfigProvenance,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -289,10 +292,25 @@ async function trustedCallerForInboundTurn(
     senderUnionId,
     senderIsBot,
   );
-  const enriched = await withPlatformBotOwner(caller, config.session.dataDir);
+  const canonicalBindings = caller?.senderType === 'bot'
+    ? await readCanonicalBotActorOwnerBindings(
+      getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
+      larkAppId,
+    )
+    : { ok: true as const, bindings: undefined };
+  if (!canonicalBindings.ok) {
+    logger.debug(
+      `[bot-owner] canonical binding unavailable reason=${canonicalBindings.reason} `
+      + `target=${larkAppId}; user credentials remain unavailable`,
+    );
+  }
+  const enriched = await withConfiguredBotOwner(
+    caller,
+    canonicalBindings.ok ? canonicalBindings.bindings : undefined,
+  );
   if (caller?.senderType === 'bot' && !enriched?.botOwner) {
     logger.debug(
-      `[bot-owner] no verified platform owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
+      `[bot-owner] no verified configured owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
       + `target=${larkAppId}; user credentials remain unavailable`,
     );
   }

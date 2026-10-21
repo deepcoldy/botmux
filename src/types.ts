@@ -100,15 +100,16 @@ export interface TrustedCaller {
    * to the bot owner's human credentials (for example, developer_default).
    *
    * The value is present only when the sender was positively identified as a
-   * bot, its union_id matched the authoritative platform team-sync roster, and
-   * the owner was resolved through the receiving Lark app. Message text,
-   * session ownership and last-human state never populate it.
+   * bot, both sender ids matched the receiving Bot's deployment-owned binding,
+   * and the configured owner union/email were re-read through the receiving
+   * Lark app. Message text, session ownership and last-human state never
+   * populate it.
    */
   botOwner?: {
     openId: string;
     unionId: string;
     email: string;
-    source: 'platform_team';
+    source: 'bot_config';
   };
 }
 

@@ -70,7 +70,7 @@ describe('RemoteRunnerBackend', () => {
           openId: 'ou_owner',
           unionId: 'on_owner',
           email: 'owner@bytedance.com',
-          source: 'platform_team',
+          source: 'bot_config',
         },
       },
     })).resolves.toEqual({ submitted: true });

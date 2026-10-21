@@ -122,7 +122,7 @@ export interface RemoteRunnerTrustedCaller {
     openId: string;
     unionId: string;
     email: string;
-    source: 'platform_team';
+    source: 'bot_config';
   };
 }
 
@@ -512,8 +512,8 @@ function normalizeBotOwner(value: unknown): RemoteRunnerTrustedCaller['botOwner'
   const unionId = nonEmptyString(raw?.unionId, 256);
   const email = nonEmptyString(raw?.email, 320)?.toLowerCase();
   if (!raw || !openId?.startsWith('ou_') || !unionId?.startsWith('on_')
-      || !email || !email.includes('@') || raw.source !== 'platform_team') return null;
-  return { openId, unionId, email, source: 'platform_team' };
+      || !email || !email.includes('@') || raw.source !== 'bot_config') return null;
+  return { openId, unionId, email, source: 'bot_config' };
 }
 
 function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {

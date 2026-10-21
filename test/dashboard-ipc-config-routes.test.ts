@@ -29,6 +29,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
   ['/api/bot-env', LEGACY],
@@ -70,6 +71,13 @@ const CASES: readonly Case[] = [
   ['/api/bot-launch-shell', '{"launchShell":"bash"}', 200, { ok: true, launchShell: 'bash' }, { launchShell: 'bash' }],
   ['/api/bot-launch-shell', '{"launchShell":"  "}', 200, { ok: true, launchShell: '' }, { launchShell: undefined }],
   ['/api/bot-oncall-group', '{"oncallGroup":"x"}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com"}]}', 200, {
+    ok: true,
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }, {
+    botActorOwnerBindings: [{ sourceBotOpenId: 'ou_source', sourceBotUnionId: 'on_source', ownerUnionId: 'on_owner', ownerEmail: 'owner@bytedance.com' }],
+  }],
+  ['/api/bot-actor-owner-bindings', '{"botActorOwnerBindings":[{"sourceBotOpenId":"ou_source","sourceBotUnionId":"on_source","ownerUnionId":"on_owner","ownerEmail":"owner@bytedance.com","source":"forged"}]}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":300000}}', 200, { ok: true, noProgressNotify: { enabled: true, timeoutMs: 300000 } }, { noProgressNotify: { enabled: true, timeoutMs: 300000 } }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":null}', 200, { ok: true, noProgressNotify: null }, { noProgressNotify: undefined }],
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":5}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],

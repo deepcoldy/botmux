@@ -387,7 +387,7 @@ export async function resolveVerifiedUserIdentity(
   }
 }
 
-/** Resolve a platform-attested union_id through the receiving bot app. */
+/** Resolve a deployment-configured Owner union_id through the receiving bot app. */
 export async function resolveVerifiedUserIdentityByUnionId(
   larkAppId: string,
   unionId: string,
