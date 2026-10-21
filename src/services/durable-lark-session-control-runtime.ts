@@ -7,6 +7,7 @@ import type { DurableCoordinationStore, DurableJson } from './durable-coordinati
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
 import { durableLarkSessionControlPartition } from './durable-lark-session-control.js';
 import type { DurableSessionControlDispatchOptions } from './durable-session-control-dispatch.js';
+import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
   commitDurableLarkSessionControl,
@@ -56,7 +57,7 @@ export interface DurableLarkSessionControlRuntimeOptions {
   takeOverActiveSession?(
     sessionKey: string,
     canonical: Session,
-  ): Promise<Session | undefined>;
+  ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
@@ -277,7 +278,10 @@ export function createDurableLarkSessionControlRuntime(
         // While the old owner is still live this remains retryable; once its
         // lease expires, any replica can materialize and apply the control.
         if (persisted?.status !== 'closed') {
-          await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          const takeover = await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+            throw new DurableSessionControlOwnerHandoffError(takeover.reason);
+          }
           live = options.findActiveSession(control.sessionId);
           persisted = options.getPersistedSession(control.sessionId);
           if (!live || live.session.sessionId !== canonicalSession.sessionId) {

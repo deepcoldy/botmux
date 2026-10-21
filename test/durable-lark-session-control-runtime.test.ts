@@ -18,6 +18,7 @@ import {
   parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
 import { createDurableLarkSessionControlRuntime } from '../src/services/durable-lark-session-control-runtime.js';
+import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import { admitDurableLarkSession, parseDurablePrimarySessionRecord } from '../src/services/durable-session-primary.js';
 import { parseDurableLarkOutboxRecord } from '../src/services/durable-lark-outbox.js';
@@ -937,6 +938,45 @@ describe('durable Lark session control runtime', () => {
     expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
       .toMatchObject({ session: { status: 'closed' } });
     await facade.stop();
+    await store.close();
+  });
+
+  it('classifies an occupied active-session takeover as an owner handoff', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-owner-handoff-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const setupFacade = createDurableSessionFacade({ store, ownerId: 'setup-owner' });
+    await admitDurableLarkSession({ facade: setupFacade, message: message(), session: session() });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => setupFacade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
+      takeOverActiveSession: async () => ({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by exact-owner',
+      }),
+      canOperate: () => true,
+      closeSession: async () => ({ ok: true, outcome: 'closed' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = control('close');
+
+    await expect(runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    await setupFacade.stop();
     await store.close();
   });
 });

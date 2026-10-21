@@ -13,10 +13,9 @@ export function buildSessionControlPendingCard(
 ): string {
   const prefix = action === 'close' ? 'card.action.close_pending' : 'card.action.resume_pending';
   return JSON.stringify({
-    schema: '2.0',
     config: {
-      width_mode: 'fill',
-      enable_forward_interaction: false,
+      wide_screen_mode: true,
+      update_multi: true,
     },
     header: {
       template: 'blue',
@@ -25,13 +24,9 @@ export function buildSessionControlPendingCard(
         content: t(`${prefix}_title`, undefined, locale),
       },
     },
-    body: {
-      direction: 'vertical',
-      elements: [{
-        tag: 'markdown',
-        element_id: 'botmux_session_control_pending',
-        content: t(`${prefix}_body`, undefined, locale),
-      }],
-    },
+    elements: [{
+      tag: 'markdown',
+      content: t(`${prefix}_body`, undefined, locale),
+    }],
   });
 }

@@ -9,10 +9,12 @@ describe('session control pending card', () => {
     const card = JSON.parse(buildSessionControlPendingCard(action, 'zh'));
 
     expect(card).toMatchObject({
-      schema: '2.0',
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { content: expect.stringContaining(title) } },
-      body: { elements: [{ tag: 'markdown' }] },
+      elements: [{ tag: 'markdown' }],
     });
+    expect(card.schema).toBeUndefined();
+    expect(card.body).toBeUndefined();
     expect(JSON.stringify(card)).not.toContain('"tag":"button"');
     expect(JSON.stringify(card)).toContain('无需重复点击');
   });

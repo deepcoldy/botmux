@@ -11,6 +11,7 @@ import {
   durableLarkSessionControlPartitionPrefix,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
+import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 
 const tempDirs: string[] = [];
 
@@ -279,6 +280,45 @@ describe('durable session control consumer', () => {
     now = 510;
     expect(await store.claimNextInbox({
       workerId: 'retry-owner',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toMatchObject({ attempts: 2 });
+    await store.close();
+  });
+
+  it('requeues an owner handoff quickly instead of paying the backend retry delay', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
+      ownerHandoffRetryDelayMs: 100,
+      retryDelayMs: 5_000,
+      intervalMs: 60_000,
+      concurrency: 1,
+      now: () => now,
+      dispatch: async () => {
+        throw new DurableSessionControlOwnerHandoffError('exact owner still holds the lease');
+      },
+    });
+    await consumer.ready;
+    await consumer.stop();
+
+    now = 109;
+    expect(await store.claimNextInbox({
+      workerId: 'too-early',
+      lane: 'session-control',
+      partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      leaseDurationMs: 100,
+    })).toBeUndefined();
+    now = 110;
+    expect(await store.claimNextInbox({
+      workerId: 'exact-owner',
       lane: 'session-control',
       partitionKeys: [durableLarkSessionControlPartition('cli_test', 'session-a')],
       leaseDurationMs: 100,
