@@ -8,6 +8,11 @@ const LABELS: Record<string, RegExp> = {
   xhigh: /^(Extra high|Very high)\b/i, max: /^Max\b/i, ultra: /^Ultra\b/i,
 };
 
+/** Safety bound for paging the model list. Codex 0.162 ships ~15 models, so
+ *  this is only a guard against a screen that never settles; the real stop
+ *  condition is the viewport no longer changing after Down. */
+const MODEL_MENU_SCROLL_MAX = 60;
+
 /** Model-identity key shared by row matching and receipt verification.
  *  The startup config slug is preserved verbatim by `turn_context`, while the
  *  picker renders display spacing (`GPT-6.1 Sol` vs slug `GPT-6.1-Sol`) and
@@ -88,6 +93,12 @@ export async function applyCodexEffortMenu(
   let confirmed = false;
   let previousAction: string | undefined;
   let selected = false;
+  // Last model-page viewport and Down count for scrolling to an off-screen
+  // target. Without a (current) marker the CLI neither marks nor auto-scrolls
+  // to the current model, so a long list opens on rows 1..N and the target can
+  // be below the fold; we move the cursor Down until it appears.
+  let modelFrame: string | undefined;
+  let modelScrolls = 0;
   const alive = () => io.isCurrent() && !io.signal.aborted && now() < io.deadline;
   try {
     const initial = await io.screen();
@@ -118,6 +129,21 @@ export async function applyCodexEffortMenu(
           ? isCurrentModelRow(row.label) : LABELS[effort]!.test(row.label));
         if (target < 0 && menu.kind === 'effort' && ['max', 'ultra'].includes(effort)) {
           target = menu.rows.findIndex(row => /^More reasoning(?:…|\.\.\.)/.test(row.label));
+        }
+        if (target < 0 && menu.kind === 'model') {
+          // Target is not in the current viewport. Page Down to reveal more
+          // rows (this also moves the highlight). When the frame stops
+          // changing the list has reached its end without a match, or the
+          // scroll bound is hit — either way fail closed with invalid.
+          const frame = JSON.stringify(menu.rows);
+          if (frame === modelFrame || modelScrolls >= MODEL_MENU_SCROLL_MAX) {
+            return { status: 'invalid', choices: Object.keys(LABELS).filter(level => menu.rows.some(row => LABELS[level]!.test(row.label))) };
+          }
+          modelFrame = frame;
+          modelScrolls++;
+          io.key('Down');
+          await delay(80);
+          continue;
         }
         if (target < 0) return { status: 'invalid', choices: Object.keys(LABELS).filter(level => menu.rows.some(row => LABELS[level]!.test(row.label))) };
         const action = JSON.stringify([menu.kind, menu.rows]);

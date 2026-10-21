@@ -44,8 +44,11 @@ function fixture(opts: FixtureOpts = {}) {
       keys.push(key);
       if (opts.frozen) return;
       if (key === 'Escape') { page = 'idle'; return; }
-      if (key === 'Down') selected++;
-      else if (key === 'Up') selected--;
+      // A real picker is bounded: Down/Up on the last/first row is a no-op and
+      // the viewport stops changing (the controller detects end-of-list).
+      const rowMax = page === 'model' ? modelRows.length - 1 : page === 'effort' ? 2 : 1;
+      if (key === 'Down') selected = Math.min(selected + 1, rowMax);
+      else if (key === 'Up') selected = Math.max(selected - 1, 0);
       else if (key === 'Enter' && page === 'model') { page = 'effort'; selected = 1; }
       else if (key === 'Enter' && page === 'effort') { page = 'advanced'; selected = 0; }
       else if (key === 's') { applied = true; page = 'idle'; }
@@ -152,15 +155,80 @@ describe('Codex CLI effort menu', () => {
     expect(keys).toEqual(['Enter', 'Down', 'Enter', 's']);
   });
 
-  it('still refuses a model page without either a (current) marker or a matching row name', async () => {
+  it('pages the model list to the end then refuses when no row matches', async () => {
     const { io, keys } = fixture({
       model: 'gpt-6.1-sol',
       modelRows: ['GPT-6-Sol', 'GPT-7-Ultra'],
       modelSelected: 0,
     });
     expect(await applyCodexEffortMenu(io, 'gpt-6.1-sol', 'max')).toMatchObject({ status: 'invalid' });
-    // No navigation keys: only the cleanup Escape that dismisses the opened model page.
-    expect(keys).toEqual(['Escape']);
+    // It tries to reveal more rows (Down on each row) but never commits; the
+    // final Escape dismisses the opened model page after end-of-list is reached.
+    expect(keys.filter(k => k === 'Enter' || k === 's')).toEqual([]);
+    expect(keys.at(-1)).toBe('Escape');
+  });
+
+  it('scrolls a long model list to reach the current model below the first viewport (no (current) marker)', async () => {
+    // Real Codex 0.162 layout (captured at 160x50): without a (current) marker
+    // the picker opens on rows 1..8 and does not auto-scroll; the configured
+    // model is row 15, shown with a description column.
+    const MODELS = [
+      'GPT-5.5', 'GPT-5.4', 'GPT-5.3', 'GPT-5.2', 'GPT-5.1', 'GPT-5.0', 'GPT-5.6', 'GPT-5.7',
+      'GPT-6.0', 'GPT-6-Ultra', 'GPT-6-Luna', 'GPT-6-Astra', 'GPT-6-Sol', 'GPT-6-Terra',
+      'GPT-6.1 Sol   GPT-6.1 Sol via Codex Bridge.',
+    ];
+    const PAGE = 8;
+    let page = 'idle';
+    let modelSel = 0;
+    let effortSel = 1;
+    let applied = false;
+    let time = 0;
+    const keys: string[] = [];
+    const abort = new AbortController();
+    const numbered = (labels: string[], sel: number, offset: number): string =>
+      labels.map((label, i) => `${offset + i === sel ? '›' : ' '} ${offset + i + 1}. ${label}`).join('\n');
+    const modelScreen = (): string => {
+      const start = Math.max(0, Math.min(modelSel, MODELS.length - PAGE));
+      return `Select Model and Effort\n${numbered(MODELS.slice(start, start + PAGE), modelSel, start)}`
+        + '\nenter select · esc back';
+    };
+    const levelScreen = (kind: 'effort' | 'advanced'): string => {
+      const labels = kind === 'effort' ? ['Low', 'High (current)', 'More reasoning…'] : ['Max', 'Ultra'];
+      return `${kind === 'effort' ? 'Select Reasoning Level for GPT-6.1 Sol' : 'Advanced Reasoning'}\n`
+        + `${numbered(labels, effortSel, 0)}\nenter default · s session · esc back`;
+    };
+    const io: CodexEffortMenuIO = {
+      signal: abort.signal, deadline: 5_000, now: () => time,
+      delay: async ms => { time += ms; }, isCurrent: () => true,
+      screen: async () => page === 'model' ? modelScreen()
+        : page === 'effort' ? levelScreen('effort')
+          : page === 'advanced' ? levelScreen('advanced') : idle,
+      command: vi.fn(async () => { page = 'model'; }),
+      key: key => {
+        keys.push(key);
+        if (key === 'Escape') { page = 'idle'; return; }
+        if (key === 'Down') {
+          if (page === 'model') modelSel = Math.min(modelSel + 1, MODELS.length - 1);
+          else effortSel++;
+          return;
+        }
+        if (key === 'Up') { effortSel--; return; }
+        if (key === 'Enter' && page === 'model') { page = 'effort'; effortSel = 1; return; }
+        if (key === 'Enter' && page === 'effort') { page = 'advanced'; effortSel = 0; return; }
+        if (key === 's') { applied = true; page = 'idle'; return; }
+        throw new Error('Unexpected key: ' + key);
+      },
+      settings: () => applied
+        ? { model: 'GPT-6.1-Sol', reasoningEffort: 'max', serviceTier: 'default' } : undefined,
+    };
+    expect(await applyCodexEffortMenu(io, 'gpt-6.1-sol', 'max'))
+      .toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    // Fourteen Downs walk the highlight from row 1 onto row 15 (the viewport
+    // follows), then Enter opens levels, Down/Enter reach Max via More reasoning,
+    // and s applies it session-only — matching the real CLI key sequence.
+    expect(keys).toEqual([
+      ...Array(14).fill('Down'), 'Enter', 'Down', 'Enter', 's',
+    ]);
   });
 
   it('normalizes model identity across casing and display spacing, keeping dots significant', () => {
