@@ -645,6 +645,46 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it.each(['preparing', 'uncertain'] as const)(
+    'keeps a latched mojo %s close fence when the provider exits (fence clearing is remote-runner-only)',
+    async phase => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/repo',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker });
+      ds.session.cliId = 'mojo';
+      ds.session.backendType = 'mojo';
+      ds.remoteCloseState = { phase, requestId: 'mojo-close-req', taskId: 'sid-mojo' };
+      __testOnly_setupWorkerHandlers(ds, worker, {
+        ready: true,
+        failureNotified: false,
+      } as any);
+
+      worker.emit('message', {
+        type: 'claude_exit',
+        code: 1,
+        signal: null,
+      });
+      await flush();
+
+      // The dead provider worker is still retired, but the mojo close verdict
+      // must survive for durable journal reconciliation: clearing an in-flight
+      // fence on provider exit is deliberately scoped to remote-runner.
+      expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(ds.worker).toBeNull();
+      expect(ds.remoteCloseState).toEqual({
+        phase,
+        requestId: 'mojo-close-req',
+        taskId: 'sid-mojo',
+      });
+    },
+  );
+
   it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, workerPort: 9999 });
