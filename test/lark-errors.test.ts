@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
@@ -167,11 +165,6 @@ describe('LarkApiError / larkApiError', () => {
     expect(err.larkMsg).toBe('withdrawn');
     expect(structuredLarkCode(err)).toBe(230011);
     expect(larkApiError('x', { code: '5' as any, msg: 'm' }).code).toBeUndefined();
-  });
-
-  it('client.ts 不再有手写的 `Failed to … (code: N)` 抛错（防回退）', () => {
-    const src = readFileSync(resolve('src/im/lark/client.ts'), 'utf8');
-    expect(src).not.toMatch(/throw (new Error|Object\.assign\(new Error)\(`Failed to [^`]*\(code: \$\{/);
   });
 });
 

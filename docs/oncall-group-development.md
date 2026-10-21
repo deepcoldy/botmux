@@ -112,7 +112,7 @@ bun run test test/oncall-group.test.ts test/oncall-group-callback.test.ts \
 ```bash
 bun run test test/skill-feedback-card.test.ts test/skill-feedback-callback.test.ts \
   test/feedback-policy.test.ts test/command-handler.test.ts \
-  test/cli-identity.test.ts test/dashboard-feedback-settings.test.ts \
+  test/cli-identity.test.ts test/dashboard-daemon-proxy-routes.test.ts \
   test/daemon-lifecycle-env.test.ts test/tmux-backend-env.test.ts
 ```
 

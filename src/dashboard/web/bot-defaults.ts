@@ -168,6 +168,7 @@ export type BotDefaultsRow = {
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
+  senderTagHideEmail?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {
@@ -223,6 +224,8 @@ export type BotDefaultsRow = {
   envKeys?: string[];
   envPolicy?: { mode: 'inherit' | 'strict'; inherit?: string[] };
   riff?: Record<string, unknown> | null;
+  /** herdr 后端放置配置；null = 未配置（默认 botmux 宿主 + workspace 放置）。 */
+  herdr?: import('../../adapters/backend/types.js').HerdrBackendConfig | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
   autoStartOnGroupJoin?: boolean;
@@ -233,6 +236,7 @@ export type BotDefaultsRow = {
   groupJoinCommandEnabled?: boolean;
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
+  chatManagerEnabled?: boolean;
   autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

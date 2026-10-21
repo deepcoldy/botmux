@@ -106,6 +106,19 @@ export interface PiBridgeEvent {
  *  gate for stop/length — see drainPiTranscript). `toolUse` is never terminal. */
 type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
+/** Pi could not obtain the provider credential, so the request never left the
+ *  machine. A models.json `"apiKey": "!<command>"` is re-run before EVERY model
+ *  request, uncached, under a hard 10s timeout (pi-coding-agent
+ *  resolve-config-value.js); on a loaded box the token helper overruns and Pi
+ *  writes `API key auth failed for provider X: Failed to resolve API key …`.
+ *  Pi treats that as an auth error and does not retry, so the turn ends. The
+ *  shared classifier files it as a generic task failure (no 401/"invalid key"
+ *  token), whose notice reads like a hard fault; this code lets the notice say
+ *  what it is — a credential fetch that usually succeeds on resend. Pi-only on
+ *  purpose, like codexRolloutFailureCode: the shared taxonomy stays untouched. */
+export const PI_CREDENTIAL_ERROR_CODE = 'pi_credential_unavailable';
+const PI_CREDENTIAL_ERROR_RE = /\bAPI key auth failed\b|\bFailed to resolve API key\b/i;
+
 /** Map Pi's terminal stopReason to best-effort attribution metadata carried on
  *  the assistant_final. NOT a durable-delivery receipt (Pi has no
  *  reliableTurnTerminal — see pi.ts); the worker uses these only for
@@ -117,8 +130,9 @@ type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
  *    = Cancelled by backend" from the model gateway), classify it through the
  *    shared Codex-family classifier so the failure card names the real cause
  *    (gateway/connection/auth/…) and carries a redacted summary instead of
- *    the opaque "no error summary" fallback. Without an errorMessage the code
- *    stays `pi_turn_error`.
+ *    the opaque "no error summary" fallback. A credential that could not be
+ *    resolved gets its own `PI_CREDENTIAL_ERROR_CODE` first. Without an
+ *    errorMessage the code stays `pi_turn_error`.
  *  - `aborted` → `ambiguous` (`pi_turn_aborted`): a user Esc can land AFTER a
  *    tool's side effect already completed, so we don't assert it "did not
  *    happen" — same audit semantic as Codex/TraeX `turn_aborted`.
@@ -139,7 +153,9 @@ function piTerminalOutcome(
       const summary = safeFailureSummary(errorMessage);
       return {
         terminalStatus: 'failed',
-        terminalErrorCode: codexTaskFailureCode(errorMessage),
+        terminalErrorCode: PI_CREDENTIAL_ERROR_RE.test(errorMessage)
+          ? PI_CREDENTIAL_ERROR_CODE
+          : codexTaskFailureCode(errorMessage),
         ...(summary ? { terminalErrorSummary: summary } : {}),
       };
     }
@@ -274,7 +290,13 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
  *  that was followed by the same turn continuing saw the next record within
  *  18.8s at p50, 90.3s at p95 and 165.6s at the maximum. 300s clears that
  *  maximum with room to spare, so a recovering turn is never reported early;
- *  a genuinely dead turn is reported late rather than never. */
+ *  a genuinely dead turn is reported late rather than never. The clock only
+ *  covers that gap: the first later assistant record of the turn drops the
+ *  hold (see drainPiTranscript), so a recovery that keeps working for an hour
+ *  is not mistaken for a turn that went quiet. The flip side: a turn that
+ *  recovers and is THEN killed without a marker gets no failure from this
+ *  reader — the same as a turn killed before any error record. The hold is
+ *  evidence about one failed request, not a liveness probe for the process. */
 export const PI_TURN_BOUNDARY_TIMEOUT_MS = 300_000;
 
 /** Per-transcript state that must survive across drain calls: a turn's records
@@ -513,7 +535,8 @@ export function drainPiTranscript(
     //     posted a "gateway failure" card — and @mentioned a human — for turns
     //     that then succeeded. So an error record is HELD: it closes the turn
     //     only once the turn-boundary marker says the turn really settled that
-    //     way (see the `custom` branch above and `flushPiPendingError`).
+    //     way (see the `custom` branch above and `flushPiPendingError`), and
+    //     any later assistant record of the turn drops it.
     //   - `stop`/`length` end the turn ONLY when the message has NO tool calls.
     //     Both can carry tool calls mid-turn: agent-loop runs the batch and
     //     keeps looping unless it terminates (`length` → failToolCallsFrom-
@@ -544,8 +567,8 @@ export function drainPiTranscript(
           : undefined;
 
     if (stopReason === 'error') {
-      // Hold the newest error of this turn. If the turn recovers, the later
-      // `stop`/`length` terminal drops it; if the turn really failed, the
+      // Hold the newest error of this turn. If the turn recovers, its next
+      // assistant record drops it; if the turn really failed, the
       // boundary marker flushes exactly this one as the turn's failure. Any
       // partial text stays attached so a failed turn can still show what the
       // model managed to say.
@@ -558,6 +581,13 @@ export function drainPiTranscript(
       continue;
     }
 
+    // Any later assistant record — a tool step as much as a terminal — means
+    // Pi retried and the turn moved past the held error. Clearing only on
+    // stop/length left the hold armed through a long tool-driven recovery, and
+    // the backstop then reported a failure (card flipped to failed) for a turn
+    // that was still working.
+    pending.error = undefined;
+
     // Emit before the terminal so the queue attributes the activity while the
     // turn is still collecting. A distinct UUID prevents the cosmetic record
     // from consuming the final's dedup key when both come from the same line.
@@ -568,9 +598,6 @@ export function drainPiTranscript(
     });
 
     if (!isHardTerminal && !isTextTerminal) continue;
-
-    // A real terminal supersedes any held error: the turn moved past it.
-    pending.error = undefined;
 
     events.push({
       uuid: `${path}:${lineStart}`,

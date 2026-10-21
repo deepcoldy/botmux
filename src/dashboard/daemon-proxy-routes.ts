@@ -120,6 +120,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   },
   // riff：`{ riff: string }`（原始 JSON 文本，'' = 清除）。
   putBotConfig('riff'),
+  // herdr：`{ herdr: string }`（原始 JSON 文本，'' = 清除）。
+  putBotConfig('herdr'),
   // sandbox-network-policy：与其它 PUT 不同，空 body 不回落为 '{}'，原样转发空串。
   {
     ...putBotConfig('sandbox-network-policy', { kind: 'raw', emptyAs: '' }),

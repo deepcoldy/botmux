@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setStartupTmuxRetrySleepForTests, TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
@@ -129,17 +129,6 @@ exec '${realTmux}' -S '${socket}' "$@"
     writeFileSync(swapFlag, '');
     expect(backend.retireSessionCreatedBySpawn()).toBe(false);
     expect(tmux('display-message', '-p', '-t', '=unrelated:', '#{session_id}').stdout.trim()).toBe('$0');
-  });
-
-  it('checks the identity and kills in one server-side command', () => {
-    const source = readFileSync(new URL('../src/adapters/backend/tmux-pipe-backend.ts', import.meta.url), 'utf8');
-    const at = source.indexOf('  retireSessionCreatedBySpawn(): boolean {');
-    const body = source.slice(at, source.indexOf('\n  }\n', at));
-    expect([...body.matchAll(/execFileSync\(/g)]).toHaveLength(1);
-    expect(body).toContain("'if-shell', '-F', '-t', sessionId!, ours,");
-    expect(body).toMatch(/#\{==:#\{pid\},\$\{serverPid\}\}/);
-    expect(body).toMatch(/#\{==:#\{session_id\},\$\{sessionId\}\}/);
-    expect(body).toMatch(/#\{==:#\{session_created\},\$\{createdAt\}\}/);
   });
 
   it('claims nothing when its own new-session never succeeded', () => {

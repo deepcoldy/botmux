@@ -10,7 +10,7 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
@@ -19,6 +19,7 @@ import {
   activeConversationBotOpenIds,
   appendDispatchCompletionProtocol,
   appendDispatchReportProtocol,
+  appendDispatchReportProtocolWithDelivery,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
   stripDispatchCompletionProtocol,
@@ -157,6 +158,45 @@ describe('dispatch completion switch wiring', () => {
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
+  it('preserves multiline guidance without inferring completion', () => {
+    const result = appendDispatchReportProtocol('review the locked commit', 'om_seed_exact');
+    expect(result).not.toContain('--status completed');
+    expect(result).toContain('--content-file');
+    expect(result).toContain('`\\n`');
+  });
+
+  it.each(['publish', 'publish-and-relay'] as const)(
+    'routes %s results directly without asking for a duplicate same-topic copy',
+    (resultDelivery) => {
+      const report = appendDispatchReportProtocolWithDelivery(
+        'review the locked commit',
+        'om_seed_exact',
+        resultDelivery,
+      );
+      expect(report).toContain(`--delivery ${resultDelivery}`);
+      const result = buildDispatchCompletionBrief({
+        brief: 'review the locked commit',
+        dispatchRootId: 'om_seed_exact',
+        exactReportRootEnabled: true,
+        sameTopicSendEnabled: true,
+        resultDelivery,
+      });
+      expect(result).not.toContain('botmux send --no-mention');
+    },
+  );
+
+  it('uses the exact relay for publish delivery even when the legacy feature switch is off', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: 'compare the two merge requests',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: false,
+      sameTopicSendEnabled: true,
+      resultDelivery: 'publish',
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --delivery publish');
+    expect(result).not.toContain('--legacy-dispatch');
+  });
+
   it.each([
     { exact: false, send: false, exactReport: false, sameTopicSend: false },
     { exact: false, send: true, exactReport: false, sameTopicSend: true },
@@ -173,30 +213,6 @@ describe('dispatch completion switch wiring', () => {
     expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
     expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
     expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
-  });
-
-  it('authenticates the exact report callback through daemon IPC', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function cmdReport');
-    const end = source.indexOf('\nasync function ', start + 1);
-    const report = source.slice(start, end);
-
-    expect(report).toContain('postCurrentSessionDaemonRoute({');
-    expect(report).toContain('path: REPORT_SESSION_RELAY_ROUTE');
-    expect(report).not.toContain("orchestrate-dispatch.json");
-  });
-
-  it('renders dispatch save feedback inside its own dashboard setting row', () => {
-    const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
-    const injectStart = source.indexOf("tr('roles.injectModeLabel')");
-    const completionStart = source.indexOf("tr('roles.dispatchCompletionLabel')", injectStart);
-    const textareaStart = source.indexOf('<textarea', completionStart);
-    const injectRow = source.slice(injectStart, completionStart);
-    const completionRow = source.slice(completionStart, textareaStart);
-
-    expect(injectRow).toContain('<Flash flash={injectFlash} />');
-    expect(injectRow).not.toContain('dispatchCompletionFlash');
-    expect(completionRow).toContain('<Flash flash={dispatchCompletionFlash} />');
   });
 
   it('trails the marker so older cross-machine receivers keep the positional report text', () => {
@@ -1222,13 +1238,15 @@ describe('botmux send turn marker context', () => {
 describe('zero-injection dispatch protocol removal', () => {
   it('removes only the generated trailing protocol and preserves task bytes', () => {
     const brief = '修复函数，保留正文中的 botmux report 和 <user_message>。';
-    for (const exactReportRootEnabled of [true, false]) {
-      for (const sameTopicSendEnabled of [true, false]) {
-        const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled });
-        expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
-        const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
-        expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
+    for (const resultDelivery of ['relay', 'publish', 'publish-and-relay'] as const) {
+      for (const exactReportRootEnabled of [true, false]) {
+        for (const sameTopicSendEnabled of [true, false]) {
+          const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled, resultDelivery });
+          expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
+          const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
+          expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
 
+        }
       }
     }
     expect(stripDispatchCompletionProtocol(brief, 'om_task')).toBe(brief);

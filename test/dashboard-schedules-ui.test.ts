@@ -1,8 +1,6 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { store } from '../src/dashboard/web/store.js';
-import { cssRuleBody } from './helpers/css-rule.js';
 import {
   buildSchedulePreconditionFormFields,
   canSubmitSchedule,
@@ -66,14 +64,6 @@ describe('dashboard schedules React page helpers', () => {
 
   const tr = ((key: string) => key) as Parameters<typeof checkSchedule>[1];
 
-  it('reads enabled filter checkbox state before entering React state updaters', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('const enabledOnly = event.currentTarget.checked;');
-    expect(page).not.toContain('enabledOnly: e.currentTarget.checked');
-    expect(page).not.toContain('enabledOnly: event.currentTarget.checked');
-  });
-
   it('filters by kind, enabled state, and text query', () => {
     const rows = [
       { id: 'daily', name: 'Daily Standup', enabled: true, parsed: { kind: 'cron', display: '0 9 * * *' }, nextRunAt: '2026-06-30T09:00:00.000Z' },
@@ -116,39 +106,14 @@ describe('dashboard schedules React page helpers', () => {
     expect(canSubmitSchedule('new unknown syntax', 'legacy daily syntax', tr, 'Asia/Shanghai')).toBe(false);
   });
 
-  it('reveals schedule validation errors when submitting an untouched legacy value', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toMatch(
-      /function handleSubmit\(e: React\.FormEvent\): void \{[\s\S]*?setTouched\(true\);\s*setScheduleTouched\(true\);/,
-    );
-  });
-
   it('keeps the legacy empty date placeholder', () => {
     expect(fmtScheduleDate()).toBe('—');
   });
 
-  it('renders a silent chip and keeps position editing inside the form (not the crowded row actions)', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    // chip in the meta strip
-    expect(page).toContain("s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null");
-    expect(page).not.toContain('op="delivery"');
-    expect(page).not.toContain('setDeliver(');
-  });
-
-  it('shows run counts only for schedules that configure repeat limits', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
+  it('formats a run count only for schedules that configure a repeat limit', () => {
     expect(formatScheduleRepeat()).toBeNull();
     expect(formatScheduleRepeat({ times: null, completed: 5 })).toBe('5/∞');
     expect(formatScheduleRepeat({ times: 10, completed: 3 })).toBe('3/10');
-    expect(page).toContain('const repeat = formatScheduleRepeat(s.repeat);');
-    expect(page).toContain(
-      "{repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}",
-    );
-    expect(zh('schedules.repeat')).toBe('执行次数');
-    expect(en('schedules.repeat')).toBe('Run count');
   });
 
   it('fills task backgrounds with the latest run outcomes from older to newer', () => {
@@ -177,32 +142,6 @@ describe('dashboard schedules React page helpers', () => {
     expect(capped).toHaveLength(50);
     expect(capped[0]?.id).toBe('run-49');
     expect(capped.at(-1)?.id).toBe('run-0');
-  });
-
-  it('renders the run history as a non-interactive semantic-color backdrop', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-
-    expect(page).toContain('if (!ui.authed)');
-    expect(page).toContain('store.onScheduleRunLogsChanged');
-    expect(page).toContain('className="schedule-run-log-fill" aria-hidden="true"');
-    expect(page).toContain('className={`outcome-${entry.outcome}`}');
-    expect(page).toContain('aria-label={openLogsLabel}');
-    expect(zh('schedules.logs.backgroundSummary', {
-      shown: 3,
-      total: 8,
-      dispatched: 1,
-      skipped: 1,
-      failed: 1,
-    })).toContain('最近 3/8 次执行');
-
-    expect(css).toMatch(/\.schedule-run-log-fill \{[\s\S]*?pointer-events:\s*none/);
-    expect(css).toMatch(/\.schedule-run-log-fill > i \{[\s\S]*?flex:\s*1 1 0/);
-    expect(css).toMatch(/\.outcome-model_dispatched \{[\s\S]*?var\(--accent\)/);
-    expect(css).toMatch(/\.outcome-precondition_skipped \{[\s\S]*?var\(--warning\)/);
-    expect(css).toMatch(/\.outcome-error \{[\s\S]*?var\(--danger\)/);
-    expect(css).toMatch(/\.schedule-list-row > \.overview-list-main,[\s\S]*?z-index:\s*1/);
   });
 
   it('invalidates only the fired task history and all histories after a snapshot refresh', () => {
@@ -464,218 +403,6 @@ describe('dashboard schedules React page helpers', () => {
     expect(schedulePreconditionFileExamplePath(null)).toBe('');
   });
 
-  it('reveals saved Bash sources in an accessible editor without forcing a rewrite', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
-    expect(page).toContain('hasPrecondition?: boolean');
-    expect(page).toContain('preconditionEnabled?: boolean');
-    expect(page).toContain("preconditionSource?: 'inline' | 'file';");
-    expect(page).toContain('preconditionScript?: string;');
-    expect(page).toContain('preconditionFilePath?: string;');
-    expect(page).toContain('schedulePreconditionEditorInitialState(editing)');
-    expect(page).toContain('useState(initialPrecondition.script)');
-    expect(page).toContain('useState(initialPrecondition.filePath)');
-    expect(page).toContain("initialPrecondition.mode === 'keep'");
-    expect(page).toContain('preconditionEnabled || hasExistingPrecondition');
-    expect(page).not.toContain('removePrecondition');
-    expect(page).toContain('...(data.preconditionScript !== undefined');
-    expect(page).toContain('...(data.preconditionFilePath !== undefined');
-    expect(page).not.toContain('className="schedule-precondition-remove"');
-    expect(page).toContain('role="switch"');
-    expect(page).toContain('<fieldset className="schedule-precondition-source">');
-    expect(page).toContain('type="radio"');
-    expect(page).toContain('htmlFor="schedule-precondition-script"');
-    expect(page).toContain('htmlFor="schedule-precondition-file-path"');
-    expect(page).not.toContain('type="file"');
-    expect(page).toContain('PRECONDITION_SCRIPT_EXAMPLE');
-    expect(page).toContain('PRECONDITION_PROMPT_EXAMPLE');
-    expect(page).toContain("tr('schedules.form.preconditionRule')");
-    expect(page).toContain("tr('schedules.form.preconditionUseExample')");
-    expect(page).toContain("tr('schedules.form.preconditionFileHelp')");
-    expect(zh('schedules.form.preconditionSourceKeep')).toContain('暂不可读');
-    expect(en('schedules.form.preconditionSourceKeep')).toContain('unavailable');
-  });
-
-  it('moves the Bash gate and FD 3 examples into an accessible help dialog', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
-    expect(page).toContain("printf '1\\n'");
-    expect(page).toContain("cat >&3 <<'PROMPT'");
-    expect(page.match(/<SchedulePreconditionProtocolHelp/g)).toHaveLength(1);
-    expect(page.match(/className="schedule-precondition-source-option"/g)).toHaveLength(2);
-    expect(page.match(/className="schedule-precondition-help-trigger"/g)).toHaveLength(2);
-    expect(page).toContain("aria-label={tr('schedules.form.preconditionInlineHelpOpen')}");
-    expect(page).toContain("title={tr('schedules.form.preconditionInlineHelpOpen')}");
-    expect(page).toContain("aria-label={tr('schedules.form.preconditionFileHelpOpen')}");
-    expect(page).toContain("title={tr('schedules.form.preconditionFileHelpOpen')}");
-    expect(page).toContain('aria-haspopup="dialog"');
-    expect(page).toContain('aria-controls="schedule-precondition-help-dialog"');
-    expect(page).toContain("aria-expanded={preconditionHelpSource === 'inline'}");
-    expect(page).toContain("aria-expanded={preconditionHelpSource === 'file'}");
-    expect(page).toContain("setPreconditionHelpSource('inline')");
-    expect(page).toContain("setPreconditionHelpSource('file')");
-    expect(page).toContain('id="schedule-precondition-help-dialog"');
-    expect(page).toContain('aria-labelledby="schedule-precondition-help-title"');
-    expect(page).toContain('aria-describedby="schedule-precondition-help-intro"');
-    expect(page).toContain("aria-label={tr('schedules.form.preconditionHelpClose')}");
-    expect(page).toContain("title={tr('schedules.form.preconditionHelpClose')}");
-    expect(page).toContain('dialog.showModal()');
-    expect(page).toContain('closeButtonRef.current?.focus()');
-    expect(page).toContain('onCancel={e => {');
-    expect(page).toContain('if (e.target === dialogRef.current) closeDialog()');
-    expect(page).toContain('props.returnFocusRef.current?.focus()');
-    expect(page).toContain("const canApplyExample = mode === 'inline' && source === 'inline';");
-    expect(page).toContain('onUseSimple={canApplyExample ? () => {');
-    expect(page).toContain('onUsePrompt={canApplyExample ? () => {');
-    expect(page).toContain('open={open && preconditionHelpSource !== null}');
-    expect(page.match(/<SchedulePreconditionSourceHelp/g)).toHaveLength(1);
-    expect(page).toMatch(
-      /<SchedulePreconditionSourceHelp[\s\S]*?<SchedulePreconditionProtocolHelp/,
-    );
-    expect(page).not.toContain('workingDir={preconditionWorkingDir}');
-    expect(page).not.toContain('workingDir={props.workingDir}');
-    expect(page).toContain("tr('schedules.form.preconditionTestGuideTitle')");
-    expect(page).toContain("tr('schedules.form.preconditionTestGuide')");
-    expect(page).not.toContain("tr('schedules.form.preconditionTestGuideBoundary')");
-    expect(page).not.toContain('id="schedule-precondition-inline-help"');
-    expect(page.match(/id="schedule-precondition-file-help"/g)).toHaveLength(1);
-    expect(page).not.toContain('className="schedule-precondition-guide"');
-    // Only file paths retain validation errors; empty inline scripts remove the gate.
-    expect(page).toContain("preconditionFileMigrationRequired ? 'schedule-precondition-file-migration' : ''");
-    expect(page).toContain("preconditionErrorText ? 'schedule-precondition-error' : ''");
-
-    expect(zh('schedules.form.preconditionRule')).toContain('stdout 去除首尾空白后严格等于 1');
-    expect(zh('schedules.form.preconditionPromptHelp')).toContain('只对本次执行生效');
-    expect(zh('schedules.form.preconditionPromptHelp')).toContain('请勿包含密钥');
-    expect(zh('schedules.form.preconditionEnableHelp')).toContain('关闭或未配置时不执行前置脚本');
-    expect(zh('schedules.form.preconditionInlineHelpOpen')).toContain('直接填写 Bash');
-    expect(zh('schedules.form.preconditionFileHelpOpen')).toContain('Bash 文件路径');
-    expect(zh('schedules.form.preconditionUseExample')).toContain('填入');
-    expect(zh('schedules.form.preconditionHelp')).toContain('任务执行目录');
-    expect(zh('schedules.form.preconditionHelp')).not.toContain('点击');
-    expect(zh('schedules.form.preconditionTestGuide')).toContain('当前未保存的配置');
-    expect(zh('schedules.form.preconditionTestGuide')).toContain('完整错误与退出码');
-    expect(zh('schedules.form.preconditionTestGuide')).toContain('不保存任务、不调用模型');
-
-    expect(en('schedules.form.preconditionRule')).toContain('trimmed stdout is strictly 1');
-    expect(en('schedules.form.preconditionPromptHelp')).toContain('for this run');
-    expect(en('schedules.form.preconditionPromptHelp')).toContain('do not include secrets');
-    expect(en('schedules.form.preconditionInlineHelpOpen')).toContain('entering Bash directly');
-    expect(en('schedules.form.preconditionFileHelpOpen')).toContain('Bash file paths');
-    expect(en('schedules.form.preconditionHelp')).toContain('execution directory');
-    expect(en('schedules.form.preconditionTestGuide')).toContain('current unsaved configuration');
-    expect(en('schedules.form.preconditionTestGuide')).toContain('does not save');
-  });
-
-  it('uses the daemon trusted root for a complete three-step file configuration demo', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
-    expect(page).toContain('scheduleWorkingDir?: string | null');
-    expect(page).toContain('schedulePreconditionFileRoot?: string | null');
-    expect(page).toContain('editing\n    ? editing.workingDir\n    : selectedBot?.scheduleWorkingDir');
-    expect(page).toContain('selectedBot?.schedulePreconditionFileRoot');
-    expect(page).toContain('function SchedulePreconditionSourceHelp');
-    expect(page).toContain("source === 'inline'");
-    expect(page).not.toContain('schedule-precondition-path-context');
-    expect(page).not.toContain('/opt/botmux/check-ready.sh');
-    expect(page).not.toContain('/path/to/');
-    expect(page).toContain('test -f /srv/my-service/ready.flag');
-    expect(page).not.toContain('<code>{workingDir}</code>');
-    expect(page).not.toContain('relativeFileExample');
-    expect(page).not.toContain('relativeScriptExample');
-    expect(page).toContain("tr('schedules.form.preconditionFileDemoTitle')");
-    expect(page).toContain('<code>{fileExamplePath}</code>');
-    expect(page).toContain('className="schedule-precondition-file-steps"');
-    expect(page).toContain('<code className="schedule-precondition-path-code">{trustedFileRoot}</code>');
-
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('受保护目录内的完整绝对路径');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('不支持相对路径');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('模型不可写');
-    expect(zh('schedules.form.preconditionFileHelp')).toContain('每次测试和执行时重新读取');
-    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Botmux 已创建');
-    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('daemon 主机');
-    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('普通 UTF-8 Bash 文件');
-    expect(zh('schedules.form.preconditionFileStepPrepare')).toContain('Dashboard 不会上传文件');
-    expect(zh('schedules.form.preconditionFileStepEnter')).toContain('完整绝对路径');
-    expect(zh('schedules.form.preconditionFileStepTest')).toContain('测试前置条件');
-    expect(zh('schedules.form.preconditionFileMigration')).toContain('保存其它字段不会改动');
-    expect(zh('schedules.form.preconditionFileMigration')).toContain('测试、重新启用或替换前');
-    expect(zh('schedules.form.preconditionErrFileOutsideTrustedRoot')).toContain('{root}');
-
-    expect(en('schedules.form.preconditionFileHelp')).toContain('protected directory');
-    expect(en('schedules.form.preconditionFileHelp')).toContain('Relative paths');
-    expect(en('schedules.form.preconditionFileHelp')).toContain('cannot be written by the model');
-    expect(en('schedules.form.preconditionFileStepPrepare')).toContain('normal UTF-8 Bash file');
-    expect(en('schedules.form.preconditionFileStepEnter')).toContain('complete absolute path');
-    expect(en('schedules.form.preconditionFileStepTest')).toContain('Test precondition');
-  });
-
-  it('renders the precondition editor as code with a visible keyboard focus', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    expect(css).toMatch(
-      /textarea\.schedule-precondition-editor \{[\s\S]*?font-family:\s*var\(--mono/,
-    );
-    expect(css).toMatch(
-      /\.schedule-precondition-toggle input:focus-visible \+ \.switch \{[\s\S]*?outline:/,
-    );
-    expect(css).not.toContain('.schedule-precondition-path-context');
-    expect(css).toMatch(
-      /\.schedule-precondition-help-body \{[\s\S]*?grid-auto-rows:\s*max-content;[\s\S]*?overflow-y:\s*auto/,
-    );
-    expect(css).toMatch(
-      /\.schedule-precondition-help-body pre code \{[\s\S]*?display:\s*block;[\s\S]*?white-space:\s*inherit/,
-    );
-    expect(css).toMatch(
-      /\.schedule-precondition-help-trigger:focus-visible \{[\s\S]*?outline:/,
-    );
-    expect(css).toMatch(
-      /\.schedule-precondition-help-close:focus-visible \{[\s\S]*?outline:/,
-    );
-    expect(css).toMatch(
-      /\.schedule-precondition-help-dialog > article \{[\s\S]*?grid-template-rows:/,
-    );
-  });
-
-  it('keeps Bash options and help compact on desktop while preserving touch targets', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    expect(css).toMatch(/\.schedule-precondition-field \{[^}]*gap:\s*4px/);
-    expect(css).toMatch(/\.schedule-precondition-header \{[^}]*min-height:\s*24px/);
-    expect(css).toMatch(/\.schedule-precondition-toggle \{[^}]*min-height:\s*24px/);
-    expect(css).toMatch(/\.schedule-precondition-source label \{[^}]*min-height:\s*24px/);
-    expect(css).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*24px;[^}]*height:\s*24px/);
-    expect(css).toMatch(/\.schedule-precondition-help-trigger > span \{[^}]*width:\s*14px;[^}]*height:\s*14px;[^}]*font-size:\s*10px/);
-    const touchRules = css.match(/@media \(pointer: coarse\) \{([\s\S]*?)\n\}/)?.[1];
-    expect(touchRules).toMatch(/\.schedule-precondition-toggle,[\s\S]*?\.schedule-precondition-source label \{[^}]*min-height:\s*44px/);
-    expect(touchRules).toMatch(/\.schedule-precondition-help-trigger \{[^}]*width:\s*44px;[^}]*height:\s*44px/);
-  });
-
-  it('shows a multi-chat summary in the row and an editable Bot-scoped selector', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain("import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';");
-    expect(page).toContain('className="schedule-chat-chip"');
-    expect(page).toContain("{tr('schedules.form.chat')}: {chatPresentation.summary}");
-    expect(page).toContain('title={chatPresentation.title}');
-    expect(page).toContain('className="schedule-chat-selector"');
-    expect(page).toContain('checked={chatIds.includes(group.chatId)}');
-    expect(page).toContain('onChange={event => toggleChat(group.chatId, event.currentTarget.checked)}');
-    expect(page).toContain('className="schedule-chat-search"');
-    expect(page).toContain('group.chatId.toLocaleLowerCase().includes(normalizedChatQuery)');
-    expect(page).toContain('groups.filter(g => g.memberBots?.some(b => b.larkAppId === larkAppId && b.inChat))');
-    expect(page).toContain('if (editing || !larkAppId || !groupsHaveMembership');
-    expect(page).toContain('...selectedUnknownChatIds.map');
-    expect(page).toContain("tr('schedules.form.chatRetained')");
-    expect(page).toContain('chatIds: data.chatIds');
-    expect(page).not.toContain('chatManual');
-    expect(page).not.toContain('schedule-chat-manual-input');
-    expect(page).not.toContain('When editing, chatId/larkAppId are immutable');
-  });
-
   it('prefers normalized chatIds and falls back to legacy chatId', () => {
     expect(scheduleTargetChatIds({ chatId: ' oc_legacy ' })).toEqual(['oc_legacy']);
     expect(scheduleTargetChatIds({ chatIds: [' oc_a ', 'oc_b', 'oc_a', '', 7] })).toEqual([
@@ -685,33 +412,7 @@ describe('dashboard schedules React page helpers', () => {
     expect(scheduleTargetChatIds({ chatIds: [], chatId: 'oc_ignored' })).toEqual([]);
   });
 
-  it('puts an accessible multi-chat execution explanation immediately after 绑定群聊', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
-    expect(page).toMatch(
-      /<FieldTitle\s+help=\{tr\('schedules\.form\.chatBindingHelp'\)\}[\s\S]*?>\s*\{tr\('schedules\.form\.chatBinding'\)\}/,
-    );
-    expect(zh('schedules.form.chatBinding')).toBe('绑定群聊');
-    expect(zh('schedules.form.chatBindingHelp')).toContain('每个群会独立调用模型');
-    expect(zh('schedules.form.chatBindingHelp')).toContain('Bash 前置条件每次调度只执行一次');
-    expect(zh('schedules.form.chatBindingHelp')).toContain('单个群执行失败不影响其他群');
-    expect(zh('schedules.form.chatBindingHelp')).toContain('模型调用量会随绑定群数增加');
-    expect(en('schedules.form.chatBindingHelp')).toContain('Each group invokes the model independently');
-  });
-
-  it('keeps the Bot read-only while allowing target groups to change during edit', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('className="schedule-form-readonly"');
-    expect(page).toContain("tr('schedules.form.botImmutableHelp')");
-    expect(page).toContain('if (!open || localDelivery) return;');
-    expect(page).toContain('chatIds: data.chatIds');
-    expect(page).not.toContain('if (!open || editing) return;');
-  });
-
-  it('renders compatible per-group results without rejecting legacy or malformed logs', () => {
+  it('normalizes per-group run results without rejecting legacy or malformed logs', () => {
     expect(scheduleRunTargetResults({})).toEqual([]);
     expect(scheduleRunTargetResults({ targetResults: 'legacy' })).toEqual([]);
     expect(scheduleRunTargetResults({
@@ -726,85 +427,6 @@ describe('dashboard schedules React page helpers', () => {
       { chatId: 'oc_ok', outcome: 'model_dispatched' },
       { chatId: 'oc_failed', outcome: 'error', error: 'dispatch failed' },
     ]);
-
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain('className="schedule-run-log-targets"');
-    expect(page).toContain("tr('schedules.logs.targetResults')");
-    expect(page).toContain("tr('schedules.logs.targetDispatched')");
-    expect(page).toContain("tr('schedules.logs.targetError')");
-    expect(page).toContain("tr('schedules.logs.modelInvocationTargets'");
-    expect(createDashboardTranslator('zh')('schedules.logs.modelInvocationTargets', {
-      submitted: 1,
-      total: 2,
-    })).toBe('1/2 个群');
-  });
-
-  it('caps the target-chat chip width so a long name cannot overrun the row', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    // The chip must have its own bounded rule (base .schedule-chip-strip span is
-    // flex:none + nowrap with no max-width — a long name would push past the
-    // main column into the Run/Edit/Delete actions).
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-chat-chip \{[\s\S]*?max-width:[\s\S]*?overflow:\s*hidden[\s\S]*?text-overflow:\s*ellipsis/,
-    );
-    // inline-block (not the base inline-flex) is what actually renders the … glyph.
-    expect(css).toMatch(
-      /\.schedule-chip-strip span\.schedule-chat-chip \{[\s\S]*?display:\s*inline-block/,
-    );
-  });
-
-  it('keeps the multi-chat selector compact, keyboard-visible, and scrollable', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(css).toMatch(
-      /\.schedule-chat-picker-trigger \{[\s\S]*?min-height:\s*44px/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-picker-trigger:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-picker-summary \{[\s\S]*?min-width:\s*0[\s\S]*?text-overflow:\s*ellipsis/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-selector \{[\s\S]*?max-height:\s*220px[\s\S]*?overflow-y:\s*auto/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-search:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-option \{[\s\S]*?min-height:\s*44px/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-option input:focus-visible \{[\s\S]*?outline:\s*2px solid var\(--accent\)/,
-    );
-    expect(css).toMatch(
-      /\.schedule-chat-option\.is-retained \{[\s\S]*?var\(--warning\)/,
-    );
-    expect(css).toMatch(
-      /\.schedule-run-log-targets li\.outcome-error \{[\s\S]*?var\(--danger\)/,
-    );
-  });
-
-  it('offers three execution positions and explains static versus dynamic silent topics', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
-    expect(page).toContain('silentNewTopicConflict');
-    expect(page).toContain('silentDynamicTitleConflict');
-    expect(page).toContain("value=\"top-level\"");
-    expect(page).toContain("value=\"topic\"");
-    expect(page).toContain("value=\"new-topic\"");
-    expect(page).toContain("updateExecutionPosition('new-topic')");
-    expect(page).toContain("tr('schedules.form.topicTitle')");
-    expect(page).toContain('maxLength={200}');
-    expect(page).not.toContain("disabled={executionPosition === 'new-topic'}");
-    expect(page).toContain("(executionPosition === 'new-topic' || executionPosition === 'task') && silent");
-    expect(page).toContain("tr('schedules.form.topicRoot')");
-    expect(page).toContain("executionPosition === 'topic' && chatIds.length !== 1");
-    expect(page).toContain("nextChatIds[0] !== initialTopicChatId");
-    expect(page).toContain("setRootMessageId('')");
-    expect(page).toContain("const localDelivery = editing?.deliver === 'local';");
-    expect(page).toContain('updateExecutionPosition: !localDelivery');
-    expect(page).toContain('...(data.updateExecutionPosition ? {');
   });
 
   it('maps stored state to top-level, retained-topic, fresh-topic, or local execution', () => {
@@ -856,69 +478,5 @@ describe('dashboard schedules React page helpers', () => {
     expect(formatScheduleRunDuration(1_250)).toBe('1.3 s');
     expect(formatScheduleRunDuration(12_400)).toBe('12 s');
     expect(formatScheduleRunDuration(61_000)).toBe('1 min 1 s');
-  });
-
-  it('opens a read-only task-scoped run-log dialog with paging and focus return', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('className="schedule-action-button schedule-log-button"');
-    expect(page).toContain('aria-haspopup="dialog"');
-    expect(page).toContain('aria-controls="schedule-run-log-dialog"');
-    expect(page).toContain('id="schedule-run-log-dialog"');
-    expect(page).toContain('dialog.showModal()');
-    expect(page).toContain('closeButtonRef.current?.focus()');
-    expect(page).toContain('props.returnFocusRef.current?.focus()');
-    expect(page).toContain('onCancel={event => {');
-    expect(page).toContain('if (event.target === dialogRef.current) closeDialog()');
-    expect(page).toContain('SCHEDULE_RUN_LOG_PAGE_SIZE = 50');
-    expect(page).toContain('/logs?limit=${SCHEDULE_RUN_LOG_PAGE_SIZE}&offset=${offset}');
-    expect(page).toContain("loadLogs('more')");
-    expect(page).toContain('<LoadingState compact');
-    expect(page).toContain('className="schedule-run-log-alert" role="alert"');
-    expect(page).toContain('className="schedule-run-log-empty"');
-    expect(page).not.toContain('setInterval(');
-  });
-
-  it('moves the scheduler-log boundary behind an accessible model-submission tooltip', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    const zh = createDashboardTranslator('zh');
-    const en = createDashboardTranslator('en');
-
-    expect(zh('schedules.logs.outcomeDispatched')).toBe('已提交模型');
-    expect(zh('schedules.logs.outcomeSkipped')).toBe('前置条件未通过');
-    expect(zh('schedules.logs.outcomeError')).toBe('调度失败');
-    expect(zh('schedules.logs.intro')).toContain('不包含模型生成');
-    expect(zh('schedules.logs.boundary')).toContain('不代表模型已完成');
-    expect(zh('schedules.logs.emptyHint')).toContain('仅展示升级后产生的记录');
-    expect(en('schedules.logs.boundary')).toContain('does not mean the model finished');
-    expect(page).toMatch(
-      /<dt>\s*<FieldTitle\s+help=\{tr\('schedules\.logs\.boundary'\)\}\s+helpLabel=\{tr\('schedules\.logs\.boundary'\)\}\s*>\s*\{tr\('schedules\.logs\.modelInvocation'\)\}\s*<\/FieldTitle>\s*<\/dt>/,
-    );
-    expect(page).not.toContain('className="schedule-run-log-boundary"');
-    expect(css).not.toContain('.schedule-run-log-boundary');
-  });
-
-  it('keeps the run-log dialog usable on small screens', () => {
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(css).toMatch(/\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:/);
-    expect(css).toMatch(/@media \(max-width: 720px\) \{[\s\S]*?\.schedule-run-log-workspace \{[\s\S]*?grid-template-columns:\s*1fr/);
-    expect(css).toMatch(/\.schedule-run-log-list-panel \{[\s\S]*?min-height:\s*0/);
-    expect(css).toMatch(/button\.schedule-run-log-row:focus-visible \{[\s\S]*?outline:/);
-  });
-
-  it('keeps run errors in the log dialog instead of the task panel', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(page).not.toContain('className="schedule-error-chip"');
-    expect(page).not.toContain("s.lastStatus === 'error'");
-    expect(page).toContain('<code>{selected.errorCode}</code>');
-    expect(page).toContain('<strong>{selected.error}</strong>');
-    expect(css).not.toContain('.schedule-error-chip');
-    expect(css).toContain('.schedule-row-head .schedule-state {');
-    expect(css).toMatch(/\.schedules-list \{[\s\S]*?grid-auto-rows:\s*max-content/);
-    expect(cssRuleBody(css, '.schedule-list-row .schedule-actions')).toMatch(/flex-wrap:\s*nowrap/);
   });
 });

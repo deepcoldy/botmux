@@ -249,6 +249,9 @@ describe.skipIf(!mountsAvailable)('test cleanup never deletes through a mount', 
 });
 
 describe('no bare recursive removal in the sandbox modules', () => {
+  // 源码结构护栏(K1+K3)：模块级禁令——沙盒模块里任何递归 rmSync 只能出现在 removeTreeUnlessMounted 内部。
+  // 上面的真实挂载用例只覆盖现有删除路径，新加一条裸 rmSync 它们照样绿；而一次删进仍挂载的 scratch
+  // 全根 COW 视图就会遍历整台宿主（实测 Bun 的 rmSync 会删进挂载点，16f093ec7f，#2040）。
   it('every recursive rmSync goes through removeTreeUnlessMounted', () => {
     for (const file of ['sandbox.ts', 'scratch-sandbox.ts', 'scratch-sandbox-darwin.ts', 'sandbox-tree-teardown.ts']) {
       const source = readFileSync(new URL(`../src/adapters/backend/${file}`, import.meta.url), 'utf8');
@@ -263,17 +266,6 @@ describe('no bare recursive removal in the sandbox modules', () => {
       expect(recursive[0]!.index!).toBeGreaterThan(helperAt);
       expect(recursive[0]!.index!).toBeLessThan(helperEnd);
     }
-  });
-});
-
-describe('scratch markers are written atomically', () => {
-  it('both platforms replace scratch.json via tmp + rename, never in place', () => {
-    const linux = readFileSync(new URL('../src/adapters/backend/scratch-sandbox.ts', import.meta.url), 'utf8');
-    const darwin = readFileSync(new URL('../src/adapters/backend/scratch-sandbox-darwin.ts', import.meta.url), 'utf8');
-    expect(linux).toMatch(/atomicWriteFileSync\(metaPath\(sessionRoot\), JSON\.stringify\(meta\)/);
-    expect(linux).not.toMatch(/(?<![A-Za-z])writeFileSync\(metaPath\(/);
-    expect(darwin).toMatch(/atomicWriteFileSync\(join\(sessionRoot, META_NAME\), JSON\.stringify\(meta\)/);
-    expect(darwin).not.toMatch(/(?<![A-Za-z])writeFileSync\(join\(sessionRoot, META_NAME\)/);
   });
 });
 

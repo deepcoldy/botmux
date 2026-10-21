@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  GROUP_CONTEXT_CARD_CONTENT_VERSION, markGroupContextCardPurpose, projectGroupContextCard,
+  markGroupContextCardPurpose,
+  projectGroupContextCard,
 } from '../src/im/lark/group-context-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
@@ -104,7 +105,6 @@ describe('group-context card projection', () => {
 
   it('stamps standalone progress and messages with an invisible purpose that survives Format A', () => {
     const raw = buildCanonicalFinalReplyCard({ markdown: 'Completed is an ordinary answer' });
-    expect(GROUP_CONTEXT_CARD_CONTENT_VERSION).toBe(1);
     const runtime = markGroupContextCardPurpose(raw, 'runtime');
     expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
     expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });

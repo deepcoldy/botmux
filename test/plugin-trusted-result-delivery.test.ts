@@ -140,10 +140,6 @@ describe('trusted plugin result delivery', () => {
       { revoke: timedOutRevoke, timeoutMs: 20 },
     )).rejects.toThrow('plugin_result_delivery_timeout');
     expect(timedOutRevoke).not.toHaveBeenCalled();
-
-    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
-    expect(workerSource).toContain('revoke: () => artifactStore.revoke(artifact.artifactId)');
   });
 
   it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {

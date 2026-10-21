@@ -1,6 +1,8 @@
+import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { withPlatformBotOwner } from './core/bot-owner-attribution.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -96,6 +98,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { buildMarkdownCard } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -267,6 +270,34 @@ function trustedCallerForTurn(
     ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
 }
+
+/**
+ * Add a separately attested developer to an ordinary peer-bot turn. Missing
+ * or ambiguous ownership leaves the annotation absent so credential consumers
+ * fail closed without changing bot routing or talk authorization.
+ */
+async function trustedCallerForInboundTurn(
+  larkAppId: string,
+  senderOpenId?: string,
+  senderUnionId?: string,
+  senderIsBot?: boolean,
+): Promise<TrustedCaller | undefined> {
+  const caller = trustedCallerForTurn(
+    larkAppId,
+    senderOpenId,
+    senderUnionId,
+    senderIsBot,
+  );
+  const enriched = await withPlatformBotOwner(caller, config.session.dataDir);
+  if (caller?.senderType === 'bot' && !enriched?.botOwner) {
+    logger.debug(
+      `[bot-owner] no verified platform owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
+      + `target=${larkAppId}; user credentials remain unavailable`,
+    );
+  }
+  return enriched;
+}
+
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import {
@@ -499,7 +530,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -547,7 +578,11 @@ import {
   updateSessionTitle,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
-import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import {
+  renderMessageListenerPrompt,
+  refreshListenerCardTextFromResolved,
+  refreshListenerForwardTextFromParsed,
+} from './services/message-listener.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepOrphanScratchSandboxes } from './adapters/backend/scratch-sandbox.js';
@@ -690,6 +725,9 @@ const dispatchLaunchIpcNonces = createDispatchLaunchIpcNonceStore();
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+export function __testOnly_setDaemonLarkAppId(appId: string | undefined): void {
+  selfDaemonLarkAppId = appId;
+}
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -713,7 +751,7 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -4485,6 +4523,10 @@ async function sessionReply(
     return sendWithHookPolicy(chatId, content, msgType, opts?.uuid);
   }
 
+  if (opts?.placement === 'chat' && ds && opts.sourceSessionId === ds.session.sessionId) {
+    return sendWithHookPolicy(ds.chatId, content, msgType, opts.uuid);
+  }
+
   // Thread-scope (or unknown / legacy): reply in thread.
   if (opts?.replyTarget?.mode === 'plain') {
     throw new Error('plain frozen reply target is invalid for a thread-scoped session');
@@ -5866,11 +5908,18 @@ async function submitQueuedMessage(
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
   if (!isCurrent()) { rollbackReplyContext(); return false; }
+  const trustedCaller = await trustedCallerForInboundTurn(
+    ds.larkAppId,
+    message.senderId,
+    message.senderUnionId,
+    senderIsBot,
+  );
+  if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
   // and carried across runner recovery; user-written text cannot enable it.
   if (!sendWorkerInput(ds, input, message.messageId, {
     notifyRejection: false,
-    trustedCaller: trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot),
+    trustedCaller,
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
@@ -6328,6 +6377,8 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
+  ds.pendingGroupJoinContext = undefined;
+  ds.pendingTrustedCaller = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
 }
@@ -7469,13 +7520,16 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
 });
 
 /** Resolve schedule control from the exact live turn, not the busy/idle hint.
- * The caller must still pass the route's managed-origin proof. Only an actual
- * IM message can recover its caller from reply metadata: synthetic continuation
- * turns may copy that metadata but do not represent a new human request. */
+ * The caller must still pass the route's managed-origin proof. Registry-based
+ * recovery of the caller follows the shared registryTurnMayAuthenticateHuman
+ * rule: real message turns and the daemon-minted auto-start join turn may
+ * resolve their recorded human; recovery continuations (their entry is a copy
+ * of the original turn's, not a new human request) and all other synthetic
+ * prefixes stay excluded. */
 function scheduleCallerForTurn(ds: DaemonSession, turnId: string): TrustedCaller | undefined {
   const active = ds.activeInteractiveTurn;
   if (active?.turnId === turnId) return active.caller;
-  if (!turnId.startsWith('om_')) return undefined;
+  if (!registryTurnMayAuthenticateHuman(ds.session, turnId)) return undefined;
   return dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
 }
 
@@ -7924,13 +7978,15 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   } catch { /* missing/malformed registry fails closed below */ }
 
-  const decision = authorizeReportSessionRelayRequest({
+  const authorize = () => authorizeReportSessionRelayRequest({
     raw,
     trustedHost: isTrustedHostIpcRequest(req),
     session: ds
       ? {
           sessionId: ds.session.sessionId,
           larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          promptInjection: sessionPromptInjection(ds),
           receiver: !!ds.session.vcMeetingReceiver,
           scope: ds.scope ?? ds.session.scope,
           rootMessageId: ds.session.rootMessageId,
@@ -7946,13 +8002,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     registry,
     bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
   });
+  const decision = authorize();
   if (!decision.ok) {
     return jsonRes(res, decision.status, { ok: false, error: decision.error });
   }
 
   const sourceWriteOptions = sessionTopicWriteOptions(ds!, ds!.managedTurnOrigin?.turnId, decision.dispatchRoot);
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
-  if (!targetDaemon) {
+  if (!targetDaemon && decision.delivery === 'relay') {
     return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
   const triggerMeta = {
@@ -7996,14 +8053,47 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   };
   try {
-    const delivered = await deliverReportSessionRelay({
-      decision,
-      triggerMeta,
+    const relay = (meta = triggerMeta) => deliverReportSessionRelay({
+      decision, triggerMeta: meta,
       beforeWrite: sourceWriteOptions.beforeWrite,
-      fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init),
+      fetchTarget: (path, init) => {
+        if (!targetDaemon) throw new Error('orchestrator_daemon_offline');
+        return fetchDaemonIpc(targetDaemon.ipcPort, path, init);
+      },
       postProjectUpdate,
     });
-    return jsonRes(res, delivered.status, delivered.body);
+    const publication = decision.delivery === 'publish' || decision.delivery === 'publish-and-relay';
+    if (publication && (!ds || getBot(ds.larkAppId).config.privateCard
+      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }))) {
+      return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
+    }
+    const publicationCard = publication ? buildMarkdownCard(decision.content, undefined, '') : '';
+    const delivered = publication ? await deliverPublishedReport({
+      dataDir: config.session.dataDir,
+      key: decision.deliveryKey!,
+      cardJson: publicationCard, chatId: ds!.chatId,
+      delivery: decision.delivery as 'publish' | 'publish-and-relay',
+      validate: () => {
+        const fresh = authorize();
+        if (findActiveBySessionId(ds!.session.sessionId) !== ds
+          || !fresh.ok || fresh.deliveryKey !== decision.deliveryKey) throw new Error('turn_provenance_stale');
+      },
+      publish: uuid => sessionReply(sessionAnchorId(ds!), publicationCard,
+        'interactive', ds!.larkAppId, ds!.managedTurnOrigin!.turnId, {
+          sourceSessionId: ds!.session.sessionId, uuid,
+          ...(decision.publishTo === 'chat' ? { placement: 'chat' as const } : {
+            replyTarget: { mode: 'thread' as const, rootMessageId: decision.dispatchRoot },
+          }),
+        }),
+      relay,
+      syncProject: () => postProjectUpdate(decision.target),
+    }) : await relay();
+    return jsonRes(res, delivered.status, {
+      ...delivered.body,
+      ...(publication ? { publicationTarget: decision.publishTo === 'chat'
+        ? { mode: 'top-level', chatId: ds!.chatId }
+        : { mode: 'thread', rootMessageId: decision.dispatchRoot, chatId: ds!.chatId } } : {}),
+    });
   } catch (error) {
     return jsonRes(res, 502, {
       ok: false,
@@ -8417,8 +8507,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         // the SAME native thread, with its own Botmux delivery identity.
         await noteTurnReceived(askSession, turnId, text, sender, turnId);
         if (!isCurrent()) return false;
+        const trustedCaller = await trustedCallerForInboundTurn(
+          boundAsk.larkAppId,
+          by,
+          actor?.memberUnionId,
+          byType,
+        );
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
-          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, actor?.memberUnionId, byType) })) return false;
+          trustedCaller })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);
@@ -19087,6 +19184,7 @@ function buildReservedInitialInput(
       // master: thread the joined-chat context into the opening prompt (group-join
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
+      groupJoinContext: ds.pendingGroupJoinContext,
       // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
       // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
       // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
@@ -19119,6 +19217,8 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingAttachments = undefined;
   ds.pendingMentions = undefined;
   ds.pendingSubstituteTrigger = undefined;
+  ds.pendingGroupJoinContext = undefined;
+  ds.pendingTrustedCaller = undefined;
   ds.pendingSender = undefined;
   ds.pendingCodexAppSteerable = undefined;
   ds.pendingFollowUps = undefined;
@@ -20424,6 +20524,7 @@ function forkReservedInitialSession(
   trustedCaller?: TrustedCaller,
   forkOptions: ForkWorkerOptions = {},
 ): boolean {
+  trustedCaller ??= ds.pendingTrustedCaller;
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
@@ -22252,7 +22353,8 @@ function hasBufferedOpeningInput(ds: DaemonSession): boolean {
     || (ds.pendingFollowUps?.length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
     || (ds.pendingCodexAppFollowUps?.length ?? 0) > 0
-    || ds.pendingChatContext !== undefined;
+    || ds.pendingChatContext !== undefined
+    || ds.pendingGroupJoinContext !== undefined;
 }
 
 /**
@@ -23586,7 +23688,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
-  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId, senderIsBotTriState(parsed.senderType, isForeignBotSender));
+  const trustedCaller = await trustedCallerForInboundTurn(
+    larkAppId,
+    senderOpenId,
+    senderUnionId,
+    senderIsBotTriState(parsed.senderType, isForeignBotSender),
+  );
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -23609,7 +23716,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const botCfg = getBot(larkAppId).config;
   // Upgrade a card match's text/title from the resolved message (button URLs the
   // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
-  if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
+  if (messageListener) {
+    refreshListenerCardTextFromResolved(messageListener, data.message);
+    refreshListenerForwardTextFromParsed(messageListener, parsed.content);
+  }
   const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
   if (listenerPrompt) {
     content = listenerPrompt;
@@ -24810,6 +24920,75 @@ async function handleBotAdded(
     if (chatContext.mode === 'unknown') {
       logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 群模式未知，按普通群路由`);
     }
+    let groupJoinSender: ResolvedSender | undefined;
+    let groupJoinTrustedCaller: TrustedCaller | undefined;
+    let groupJoinGateMatched = false;
+    if (!forced) {
+      const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
+        larkAppId,
+        chatId,
+        operatorOpenId,
+        chatName: chatContext.name,
+        chatDescription: chatContext.description,
+        chatMode: chatContext.mode,
+        chatFetchStatus: chatContext.fetchStatus,
+      }, {
+        // event-dispatcher already emitted the async chat.bot_added observers.
+        // This call consumes only sync adjudicators so observers run exactly once.
+        emitObservers: false,
+      });
+      if (!groupJoinGate.allowed
+        || (botCfg.autoStartOnGroupJoinGateRequired === true && groupJoinGate.matched !== true)) {
+        logger.info(
+          `[auto-start:入群] ${chatId.substring(0, 12)} 同步 gate 未放行，静默跳过`
+          + `${groupJoinGate.reason ? ` (${groupJoinGate.reason})` : ''}`,
+        );
+        return;
+      }
+      groupJoinGateMatched = groupJoinGate.matched === true;
+
+      // Provenance injection (identity resolution, opening caller, and the
+      // <botmux_group_join> prompt block) is opt-in: it happens only for bots
+      // that explicitly require the lifecycle gate. A bot with the legacy
+      // autoStartOnGroupJoin toggle keeps a byte-identical opening turn — no
+      // extra contact lookup, no injected block, no turn caller (zero
+      // breakchange for existing deployments, per the gate's default-off
+      // contract). When gateRequired is true this branch is reached only after
+      // a matching sync hook allowed, so gateMatched is necessarily true here.
+      if (botCfg.autoStartOnGroupJoinGateRequired === true) {
+        // bot.added supplies an operator ID, not a platform sender_type. Read
+        // independent bot evidence before resolving any display name: even an
+        // undefined senderType makes resolveSender write "user" into the cache.
+        const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
+        const operatorIsBot: true | undefined = operatorOpenId
+          && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
+            || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
+          ? true : undefined;
+        if (operatorOpenId) {
+          let name = cachedOperator?.name;
+          if (operatorIsBot) {
+            const resolved = await resolveSender(larkAppId, operatorOpenId, 'app').catch(() => undefined);
+            name = resolved?.name ?? name;
+          }
+          // Preserve the display vocabulary, but never use this model-facing
+          // default as evidence that the operator is an authenticated human.
+          groupJoinSender = {
+            openId: operatorOpenId,
+            type: operatorIsBot ? 'bot' : 'user',
+            ...(name ? { name } : {}),
+          };
+        }
+        // Without bot evidence, caller deliberately has no senderType; it cannot
+        // match a later platform-authenticated user via sameTrustedPrincipal.
+        // Owner continuity instead relies on trustedSessionController's separate
+        // user-typed owner, even for app operators. Turn privileges read caller,
+        // not controller; tightening the latter also requires migrating owner checks.
+        groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
+          ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
+          : undefined;
+      }
+    }
+
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
     // 入群 seed 消息文案：bot 配置了 autoStartOnGroupJoinSeed 用之，否则回退内置 i18n。
@@ -24888,6 +25067,18 @@ async function handleBotAdded(
       // 新建话题：session 刚创建、尚无 cliId / cliLaunchSnapshot（`/cli use` 只能在之后触发），bot 配置是唯一来源。
       pendingCodexAppText: isCodexAppCliId(botCfg.cliId) ? codexAppText : undefined,
       pendingChatContext: chatContext,
+      ...(!forced && botCfg.autoStartOnGroupJoinGateRequired === true ? {
+        pendingGroupJoinContext: {
+          event: 'chat.bot_added' as const,
+          larkAppId,
+          chatId,
+          turnId: joinTurnId,
+          ...(operatorOpenId ? { operatorOpenId } : {}),
+          gateMatched: groupJoinGateMatched,
+        },
+      } : {}),
+      pendingSender: groupJoinSender,
+      pendingTrustedCaller: groupJoinTrustedCaller,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
@@ -24978,10 +25169,26 @@ async function handleBotAdded(
       sharedReplyRootId = undefined;
       void deleteMessage(larkAppId, messageId);
     };
+    // 首轮无真人入站消息，但 bot.added 事件本身携带操作人：把拉 bot 入群的
+    // 人登记为本轮 sender，schedule 等需要当前轮真人身份的命令（创建/管理
+    // 定时任务）据此归属到操作人，与 session.ownerOpenId 一致。
+    // isBot:false 是对 bot.added 操作人的直接断言（事件语义上操作人即拉群的
+    // 真人），不是身份解析结果；下游 schedule 管理路由还有 dashboard 管理员
+    // 名单硬门兜底。
+    // participantsIncomplete 让 --mention-back 保持既有安全方向（窗口不完整 →
+    // 要求显式 @），这条登记不改变回复时的 @ 行为。
+    const joinTurnSenderOpts = operatorOpenId
+      ? {
+          senderOpenId: operatorOpenId,
+          participants: [{ openId: operatorOpenId, isBot: false }],
+          participantsIncomplete: true,
+        }
+      : {};
     const armSharedReplyTarget = (): void => {
       if (!sharedReplyRootId) return;
       ds.pendingTurnId = sharedReplyRootId;
-      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      if (ds.pendingGroupJoinContext) ds.pendingGroupJoinContext.turnId = sharedReplyRootId;
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString(), joinTurnSenderOpts);
       sessionStore.updateSession(ds.session);
     };
     if (needsSharedReply) {
@@ -25021,8 +25228,8 @@ async function handleBotAdded(
 
     // 持久化非 shared 首轮的 turn provenance（shared 路径已由 armSharedReplyTarget
     // 写入）。thread scope 以 seed 为 reply root；chat scope 无根，落 plain chat
-    // 目标且不写 sender——首轮无真人发送者，--mention 回指天然走 incomplete →
-    // 显式指定的安全方向。没有这条记录，worker 虽带 turnId fork，daemon 侧的
+    // 目标。sender 登记为拉 bot 入群的操作人（joinTurnSenderOpts，见上）；
+    // 没有这条记录，worker 虽带 turnId fork，daemon 侧的
     // 首轮回复目标/参与者窗口仍无据可查。
     if (!needsSharedReply) {
       try {
@@ -25031,6 +25238,7 @@ async function handleBotAdded(
           scope === 'thread' ? anchor : undefined,
           joinTurnId,
           new Date(now).toISOString(),
+          joinTurnSenderOpts,
         );
         sessionStore.updateSession(ds.session);
       } catch (err) {
@@ -25078,9 +25286,11 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -25142,9 +25352,11 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录${projects.length > 0 ? '且 repo 卡不可用' : '且无可选项目'}，直接开工`);
     }
   } finally {
@@ -25433,7 +25645,7 @@ async function handlePrincipalLaneLiveMessage(
         const target = liveReference.target;
         const provenance = liveReference.provenance;
         const activeTurn = target?.activeInteractiveTurn;
-        const proposer = trustedCallerForTurn(
+        const proposer = await trustedCallerForInboundTurn(
           ctx.larkAppId,
           parsed.senderId,
           parsed.senderUnionId,
@@ -25693,6 +25905,7 @@ async function handleThreadReplyAdmitted(
   let listenerPrompt: string | undefined;
   if (ctx.messageListener) {
     refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    refreshListenerForwardTextFromParsed(ctx.messageListener, parsed.content);
     listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
   }
   if (listenerPrompt) {
@@ -25790,7 +26003,12 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
-  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
+  const threadTrustedCaller = await trustedCallerForInboundTurn(
+    larkAppId,
+    threadSenderOpenId,
+    threadSenderUnionId,
+    senderIsBotTriState(parsed.senderType, isForeignBot),
+  );
   const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;
@@ -26853,6 +27071,11 @@ async function handleThreadReplyAdmitted(
   // the existing-owner route below, i.e. deliver the message like any other —
   // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
   // message that is not diverted here is also not rejected there.
+  // A join caller without senderType differs from a later authenticated user.
+  // The independent user-typed owner controller preserves that owner's continuity;
+  // if trustedSessionController is tightened, migrate this owner check with it.
+  // App operators retain the existing user-typed owner limitation: later bot
+  // messages do not match it, while downstream owner handling still takes user branches.
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn

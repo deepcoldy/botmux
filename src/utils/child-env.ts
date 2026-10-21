@@ -177,6 +177,13 @@ export const INVOKER_TERMINAL_ENV_KEYS = [
   'TERM_PROGRAM',
   'TERM_PROGRAM_VERSION',
   'TERM_SESSION_ID',
+  // Orca pins these to the relay version that launched the invoking terminal.
+  // Keeping them in a daemon bypasses the updated ~/.orca-relay/bin/orca
+  // defaults after Orca reconnects or upgrades, so /adopt queries a stale socket.
+  'ORCA_RELAY_DIR',
+  'ORCA_RELAY_SOCKET_PATH',
+  'ORCA_RELAY_CREDENTIAL_FILE',
+  'ORCA_RELAY_NODE_PATH',
   // CI / agent-harness flags
   'CI',
   'CODEX_CI',

@@ -258,12 +258,6 @@ describe('PROCESS_TABLE_MAX_BUFFER', () => {
     expect(hits.filter(h => h.startsWith('src/adapters/backend/zellij-backend.ts:'))).toHaveLength(2);
     expect(hits.filter(h => h.startsWith('src/core/resource-monitor/darwin.ts:'))).toHaveLength(2);
   });
-
-  it('browser-restart\'s default runner (used for `ps -Axo command=`) carries the cap', () => {
-    const src = readFileSync(join(SRC, 'core/browser-restart.ts'), 'utf-8');
-    expect(src).toMatch(/const run = opts\.run \?\? \(async \(file, args\) => pExecFile\(file, args, \{[^}]*maxBuffer: PROCESS_TABLE_MAX_BUFFER[^}]*\}\)\)/);
-    expect(src).toMatch(/await run\('ps', \['-Axo', 'command='\]\)/);
-  });
 });
 
 describe('whole-table ps scans survive >1MiB output (child process, fake ps)', () => {

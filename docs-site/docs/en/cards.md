@@ -5,7 +5,7 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 ![Streaming card](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419090587_img_v3_0212a_553ca347-4a93-491f-a2ef-30d00a374cdg.jpg)
 
 - **Live screenshots of the terminal refreshed onto the card**: xterm renders headlessly into an image that **faithfully reproduces the CLI's TUI** (borders and colors are all there), instead of converting output to Markdown. One click to "Show / Hide output," "Export text," and "Half-page up / down."
-- **Live status indicator**: the card's header color *is* the status (a Lark card template, not an emoji dot in the body) — **Starting…** (yellow) → **Working** (blue) → **Waiting for input** (green); when the quota is used up it shows **Limit reached** (red), turning to **Retryable** (green) when it can retry.
+- **Live status indicator**: the card's header color *is* the status (a Lark card template, not an emoji dot in the body) — **Starting…** (yellow) → **Working** (blue) → **Waiting for input** (green); when the quota is used up it shows **Limit reached** (red), turning to **Retryable** (green) when it can retry. When the main turn has ended but background work it started (a background agent, a `run_in_background` Bash, a Monitor; Grok background tasks) is still running, the header reads **⏳ Main turn ended · background tasks running (N)** (light blue), with N matching the background tasks shown in the web terminal; it returns to Working when a finished task wakes the main agent, and only shows the turn as done once everything has finished.
 - **Operate directly from the card**: open the Web terminal, 🔑 grab an operation link, close the session, and — when the quota is retryable — "🔁 Resend last task."
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
@@ -65,6 +65,32 @@ To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot m
 The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Custom card usage segments
+
+You can append your own text to the usage line (`ctx 23% · 5h 18% · 7d 5%`), e.g. gateway account quotas, build status or who is on call. Configure a command on the bot in bots.json:
+
+```json
+"cardFooterExtension": {
+  "command": "~/.botmux/scripts/quota.sh",
+  "refreshSeconds": 60
+}
+```
+
+- The daemon runs `/bin/sh -c <command>` lazily, only while cards are being rendered: when the cached result is at least `refreshSeconds` old (default 60, range 10–3600) a refresh starts in the background. There is no standalone timer, so no command runs while the bot sends no cards, and the first card after a long idle period may still show the previous result for up to 10 minutes; all of the bot's sessions share one result. Rendering a card only reads the cache and never waits for the command
+- Output one segment per line, or JSON `{"segments": ["…", "…"]}`; at most 4 segments of at most 40 characters each, rendered as plain text (markdown is escaped)
+- The environment carries `BOTMUX_LARK_APP_ID`, `BOTMUX_CLI_ID` and `BOTMUX_BOT_NAME` (the **bot-configured** CLI; it does not follow a session's temporary CLI override, since the result is shared per bot); stdin is closed, the timeout is 3 seconds, and a non-zero exit counts as a failure
+- On failure or timeout the last good result is kept; once the last success is older than 10 minutes nothing is shown
+- Works for every CLI; shown wherever `usageDisplay` puts the usage line (live card or reply-card footer) and hidden with it under `off`. Without the setting, cards are byte-for-byte unchanged
+
+Example output:
+
+```
+01 5h 2% 7d 2%
+02 5h 4% 7d 2%
+```
+
+renders as `ctx 14% · 01 5h 2% 7d 2% · 02 5h 4% 7d 2%`.
 
 ## Charts in messages (vega-lite)
 

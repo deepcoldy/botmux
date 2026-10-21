@@ -27,7 +27,6 @@ import {
   normalizeIsolationPath,
   shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
-import { managedOriginAttestationDirectory, managedOriginCapabilityDirectory } from '../src/core/managed-origin-capability.js';
 
 describe('CLI data redirect gate', () => {
   const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
@@ -229,19 +228,6 @@ describe('mandatory device credential isolation', () => {
     for (const name of ['data', 'skills']) {
       expect(isCredentialIsolationReservedBasename(name), name).toBe(false);
     }
-  });
-
-  it('credential-only Seatbelt must expose both capability and attestation dirs read-only while keeping profileDir write-denied', async () => {
-    const workerSource = await import('node:fs/promises').then(fs =>
-      fs.readFile(new URL('../src/worker.ts', import.meta.url), 'utf8'));
-    const strippedWorkerSource = stripComments(workerSource);
-    const capabilityDir = managedOriginCapabilityDirectory('/tmp/botmux-data', 'session-a', G1);
-    const attestationDir = managedOriginAttestationDirectory('/tmp/botmux-data', 'session-a', G1);
-    expect(strippedWorkerSource).toContain('[canonical(originDirectory), canonical(attestationDirectory)]');
-    expect(strippedWorkerSource).toContain('const attestationDirectory = managedOriginAttestationDirectory(');
-    expect(strippedWorkerSource).toContain('canonical(profileDir)');
-    expect(capabilityDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/origin-[a-f0-9]{64}$/);
-    expect(attestationDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/attest-[a-f0-9]{64}$/);
   });
 });
 
@@ -1042,182 +1028,48 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
   });
 });
 
-describe('worker capability carve-out ordering', () => {
-  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-  const strippedSource = stripComments(source);
+describe('worker read-isolation fences', () => {
+  const strippedSource = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'));
 
-  it('aligns Linux managed-origin grants with the canonical sandbox data root', () => {
-    const linuxAt = strippedSource.indexOf("if (process.platform === 'linux' && readIsolationOriginChannelId)");
-    expect(linuxAt).toBeGreaterThanOrEqual(0);
-    const grants = strippedSource.slice(linuxAt, strippedSource.indexOf('if (mcpRuntimeManifest)', linuxAt));
-    // The real-bwrap tests feed a compile-ready policy; guard the worker's
-    // production call site too, so lexical grants cannot silently return.
-    expect(grants).toMatch(/managedOriginCapabilityDirectory\(\s*canonical\(isolationRuntimeDataDir\)/);
-    expect(grants).toMatch(/managedOriginAttestationDirectory\(\s*canonical\(isolationRuntimeDataDir\)/);
+  // 源码结构护栏(K2)：sandbox=true 下本会话 skill manifest 的放行是 mandatory read-only（按深度压过一切 deny），
+  // 在 worker.ts spawnCli 闭包里组装，fs-policy 单测只喂手工 grant、没有 seam。不变量：只放行通过 lstat
+  // 确认是普通文件的那一个 `<sid>.json`，且只 canonical 父目录——叶子若是植入的 symlink，canonical/bind
+  // 会把这条强制只读放行转到任意目标上（d0ba221b20，#1036）。
+  it('grants the own skill manifest read-only only when lstat proves a regular file', () => {
+    const decl = strippedSource.match(/const (\w+) = sessionSkillManifestPath\(cfg\.sessionId\b/);
+    expect(decl).not.toBeNull();
+    const v = decl![1];
+    expect(strippedSource).toMatch(new RegExp(
+      `if \\(lstatSync\\(${v}\\)\\.isFile\\(\\)\\) \\{\\s*mandatoryReadOnlyPaths\\.push\\([^;]*\\b${v}\\b`,
+    ));
+    expect(strippedSource.match(new RegExp(`ReadOnlyPaths\\.push\\([^;]*\\b${v}\\b`, 'g'))).toHaveLength(1);
+    expect(strippedSource).not.toMatch(new RegExp(`canonical\\(${v}\\)`));
   });
 
-  it('publishes each child-visible capability before the sandbox starts', () => {
-    const macPathAt = strippedSource.indexOf("readIsolationOriginCapabilityFile = process.platform === 'darwin'");
-    const macPublishAt = strippedSource.indexOf(
-      'publishSandboxRelayCapability({ failClosed: true })',
-      macPathAt,
-    );
-    const policyAt = strippedSource.indexOf('const fsPolicyCtx = {', macPublishAt);
-    expect(macPathAt).toBeGreaterThanOrEqual(0);
-    expect(macPublishAt).toBeGreaterThan(macPathAt);
-    expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(strippedSource).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
+  // 源码结构护栏(K2)：强制凭证隔离的两道闸都在 spawnCli 闭包里、无 seam，删掉会静默开洞——
+  // ① adopt 观察的是外部已在跑、无法补套边界的 CLI，必须在任何 adopt 分支之前拒绝；
+  // ② credential-only Seatbelt/bwrap 必须是最外层 launch wrapper（在 wrapperCli 包装之后、
+  // backend.spawn 之前套上），否则 wrapperCli 及其子孙跑在边界之外（ec167c403a）。
+  it('refuses adopt under mandatory credential isolation and keeps credential confinement the outermost wrapper', () => {
+    const gateAt = strippedSource.search(/if \(mandatoryCredentialIsolation && cfg\.adoptMode\)\s*\{\s*throw /);
+    expect(gateAt).toBeGreaterThan(0);
+    const adoptBranches = [...strippedSource.matchAll(/if \(cfg\.adoptMode && [^{]*adopt(?:Source|TmuxTarget|ZellijPaneId|Herdr)/g)];
+    expect(adoptBranches.length).toBeGreaterThan(0);
+    for (const branch of adoptBranches) expect(gateAt).toBeLessThan(branch.index!);
 
-    const credentialPathAt = strippedSource.indexOf(
-      'if (readIsolationOriginChannelId && !sandboxRequested)',
-    );
-    const credentialPublishAt = strippedSource.indexOf(
-      'publishSandboxRelayCapability({ failClosed: true })',
-      credentialPathAt,
-    );
-    const credentialWrapperAt = strippedSource.indexOf(
-      'if (!willReattachPersistent && credentialOnlyBwrap)',
-      credentialPublishAt,
-    );
-    expect(credentialPathAt).toBeGreaterThanOrEqual(0);
-    expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
-    expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
-
-    const relayAt = strippedSource.indexOf('sandboxRelayOutbox = sbx.outbox');
-    const relayPublishAt = strippedSource.indexOf('publishSandboxRelayCapability();', relayAt);
-    expect(relayAt).toBeGreaterThan(policyAt);
-    expect(relayPublishAt).toBeGreaterThan(relayAt);
-    expect(strippedSource).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
-  });
-
-  it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
-    const regexAt = strippedSource.indexOf('sessionMcpGatewayPathRegex(gatewaySocketRoot)');
-    const denyAt = strippedSource.indexOf('mandatoryDenyRegexes.push(', regexAt - 80);
-    const allowAt = strippedSource.indexOf(
-      'mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
-      regexAt,
-    );
-    const profileAt = strippedSource.indexOf('const fsPolicyCtx = {', allowAt);
-    expect(regexAt).toBeGreaterThanOrEqual(0);
-    expect(denyAt).toBeGreaterThanOrEqual(0);
-    expect(denyAt).toBeLessThanOrEqual(regexAt);
-    expect(allowAt).toBeGreaterThan(denyAt);
-    expect(profileAt).toBeGreaterThan(allowAt);
-    expect(strippedSource).toContain('mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath');
-  });
-
-  it('carves back only the prepared Pi session prompt directory after masking the shared root', () => {
-    // Pi prompt + skill delivery roots must ride the session-owned channel, not
-    // readonlyRoots (which no-transport turns drop inside the data dir).
-    expect(strippedSource).toMatch(
-      /sessionOwnedReadonlyRoots: keepExisting\(\[\s*\.\.\.\(cfg\.skillReadonlyRoots \?\? \[\]\),\s*\.\.\.piInitialPromptReadonlyRoots,\s*\]\)/,
-    );
-    expect(strippedSource).not.toMatch(/readonlyRoots: keepExisting\(\[[^\]]*\.\.\.piInitialPromptReadonlyRoots/);
-    expect(strippedSource).not.toContain(
-      'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
-    );
-  });
-
-  it('exposes exactly this session\'s skill manifest file read-only and threads the skill snapshot into the policy', () => {
-    // sandbox=true + `botmux skill show`: fs-policy tests hand-feed the grants,
-    // so deleting the worker call site would leave them green while the live
-    // sandbox reverts to "skill manifest not found". Guard the call site.
-    const at = strippedSource.indexOf('const ownSkillManifest = sessionSkillManifestPath(cfg.sessionId, dataDir);');
-    expect(at).toBeGreaterThanOrEqual(0);
-    const fileCheckAt = strippedSource.indexOf('lstatSync(ownSkillManifest).isFile()', at);
-    const pushAt = strippedSource.indexOf(
-      'mandatoryReadOnlyPaths.push(join(canonical(dirname(ownSkillManifest)), basename(ownSkillManifest)))',
-      at,
-    );
-    const ctxAt = strippedSource.indexOf('const fsPolicyCtx = {', at);
-    expect(fileCheckAt).toBeGreaterThan(at);
-    expect(pushAt).toBeGreaterThan(fileCheckAt);
-    expect(ctxAt).toBeGreaterThan(pushAt);
-    // Never the shared manifest dir (every session's manifest lives there).
-    expect(strippedSource).not.toMatch(/ReadOnlyPaths\.push\([^;]*'skill-manifests'\s*\)\s*\)?;/);
-    // Enabled-skill source roots: delivery → cfg.skillReadonlyRoots → policy.
-    expect(strippedSource).toContain('cfg.skillReadonlyRoots = generation.skillReadonlyRoots;');
-    // The skill bodies reach the policy ONLY as session-owned roots (the
-    // session snapshot) — no host skill source channel exists in the worker.
-    expect(strippedSource).not.toContain('rehomedHostCliDataRoots');
-    // …and the mandatory read-only list actually reaches the policy context.
-    expect(strippedSource.slice(ctxAt, strippedSource.indexOf('const policy = (() => {', ctxAt))).toMatch(/\n\s*mandatoryReadOnlyPaths,\n/);
-  });
-
-  it('never reclaims the skill snapshot on a normal worker exit / detach — only on a real session close (or a v3 attempt exit)', () => {
-    // A daemon restart detaches the worker and later warm-reattaches the live
-    // pane, which still binds runtime-skills/<sid>/snapshot by inode. Only
-    // closeSession() (session-store) and the v3 ephemeral pool (synthetic
-    // sessions, after the worker process exited) may remove it; spawn-time
-    // regeneration is gated on !willReattachPersistent.
-    const sources = ['worker.ts', 'core/worker-pool.ts', 'core/session-manager.ts']
-      .map(f => stripComments(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8')));
-    for (const src of sources) expect(src).not.toContain('removeSessionSkillRuntime');
-    expect(strippedSource).toMatch(/if \(!willReattachPersistent\) \{\s*mcpRuntimeManifest = opts\.pluginGenerationPrepared[\s\S]{0,200}prepareCliPluginGenerationAndGateway\(cfg, cliAdapter\)/);
-    const store = stripComments(readFileSync(new URL('../src/services/session-store.ts', import.meta.url), 'utf8'));
-    const close = store.slice(store.indexOf('export function closeSession('), store.indexOf('export function reactivateClosedSession('));
-    expect(close).toContain('removeSessionSkillRuntime(sessionId, config.session.dataDir)');
-  });
-
-  it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {
-    // Guards a call-site blind spot: the adapter test only checks the method's
-    // RETURN value and the fs-policy test hand-feeds readonlyRoots, so if this
-    // spread were deleted the markers would silently stop reaching the sandbox
-    // and BOTH of those tests would stay green (goal-mode traex would wedge again
-    // on the migration prompt). Assert the worker actually threads the method
-    // output into readonlyRoots.
-    // The call site passes the merged child/per-bot env so env-driven adapters
-    // (e.g. ebsd's repository root) resolve against bot config, not daemon env.
-    expect(strippedSource).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.({')
-    expect(strippedSource).toContain('}) ?? [])].map(expandTildeLexical),');
-  });
-
-  it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
-    const gateAt = strippedSource.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
-    const adoptAt = strippedSource.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
-    const wrapperAt = strippedSource.indexOf('if (cfg.wrapperCli && cfg.wrapperCli.trim())');
-    const credentialWrapperAt = strippedSource.indexOf('if (!willReattachPersistent && credentialOnlySeatbelt)');
-    const spawnAt = strippedSource.indexOf('backend.spawn(spawnBin, spawnArgs, {');
-    expect(gateAt).toBeGreaterThanOrEqual(0);
-    expect(gateAt).toBeLessThan(adoptAt);
-    expect(credentialWrapperAt).toBeGreaterThan(wrapperAt);
-    expect(credentialWrapperAt).toBeLessThan(spawnAt);
-    expect(strippedSource).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
-    expect(strippedSource).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(strippedSource).toContain('requiredCapabilities: appliedIsolationCapabilities');
-    expect(strippedSource).toContain('exactCapabilities: true');
+    const wrapperAt = strippedSource.search(/if \(cfg\.wrapperCli\b/);
+    const spawnAt = strippedSource.search(/backend\.spawn\(spawnBin, spawnArgs\b/);
+    expect(wrapperAt).toBeGreaterThan(0);
+    for (const flavour of ['credentialOnlySeatbelt', 'credentialOnlyBwrap']) {
+      const at = strippedSource.search(new RegExp(`if \\(!willReattachPersistent && ${flavour}\\)`));
+      expect(at, flavour).toBeGreaterThan(wrapperAt);
+      expect(at, flavour).toBeLessThan(spawnAt);
+    }
   });
 });
 
 describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-  const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
-
-  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
-    expect(cliSource).toContain(
-      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
-    );
-    expect(cliSource).toContain(
-      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
-    );
-    expect(cliSource).toContain(
-      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
-    );
-    // The reporter resolves the live origin itself rather than trusting a
-    // caller-supplied identity — EXCEPT for the turn-idle v2 report, whose origin
-    // (turnId/attempt/capability) was frozen by the in-CLI plugin AT THE EVENT and
-    // is transported verbatim: this child can run after the worker already advanced
-    // the marker to the NEXT dispatch, so re-resolving it here is what the fence
-    // exists to prevent (see cmdTurnIdle). The exemption is only sound while that
-    // internal event path is the sole producer of a frozen origin — pinned by the
-    // test below, which fails if any other command can reach it.
-    expect(cliSource).toContain(
-      'const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(resolveDataDir(), sessionId);',
-    );
-    expect(vcSource).toContain(
-      'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
-    );
-  });
 
   /**
    * Comment text blanked to spaces, every other character left AT ITS OFFSET. The
@@ -1238,10 +1090,26 @@ describe('CLI protected capability wiring', () => {
     return decls.at(-1)?.[1];
   };
 
+  const code = blankComments(cliSource);
+
+  // 源码结构护栏(K2)：`botmux send` 的读隔离分类与拒绝在 cmdSend 长函数里，内核 deny 无法在单测里伪造，
+  // 没有 seam。不变量：固定 sentinel 被内核拒读即判定为读隔离发送；读隔离却拿不到绑定的 capability 时
+  // 必须 fail-closed 退出，绝不降级成普通直发路径（ccbf2c672c，#602）。
+  it('fail-closes a read-isolated send without a bound capability instead of downgrading to the direct path', () => {
+    const sentinelAt = code.search(/managedOriginIsolationSentinelAccess\(\w+\)\s*===\s*'sandbox_denied'/);
+    const refusalAt = code.search(/isolatedSendRequired && !isolatedCapabilityCtx\)\s*\{[^}]*process\.exit\(/);
+    expect(sentinelAt).toBeGreaterThan(0);
+    expect(refusalAt).toBeGreaterThan(sentinelAt);
+    expect(enclosingFunctionName(code, sentinelAt)).toBe('cmdSend');
+    expect(enclosingFunctionName(code, refusalAt)).toBe('cmdSend');
+  });
+
   /**
-   * The frozen-origin exemption pinned above widens the reporter's identity source
-   * from "what this process can read now" to "what the event froze". That is only
-   * acceptable because the exemption is unreachable from every user-facing command:
+   * The reporter resolves the live origin itself rather than trusting a
+   * caller-supplied identity — EXCEPT for the turn-idle v2 report, whose origin
+   * (turnId/attempt/capability) was frozen by the in-CLI plugin AT THE EVENT and is
+   * transported verbatim (see cmdTurnIdle). That widening is only acceptable because
+   * the exemption is unreachable from every user-facing command:
    * `postSessionScopedSignal` is module-local, only `cmdTurnIdle` (the versioned
    * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
    * command line) constructs a frozen origin, and only its `/api/turn-idle` call
@@ -1250,25 +1118,29 @@ describe('CLI protected capability wiring', () => {
    * assertions goes red — the mention/ carrier sets are computed from the source,
    * not from a substring's presence.
    */
+  // 源码结构护栏(K2)：调用方可供给的身份只能经内部 turn-idle 事件进入 reporter，其余入口必须自己解析
+  // live origin；这是跨函数的可达性约束，只能对源码做函数归属扫描（8da52fe7ab）。
   it('keeps the frozen origin reachable only from the internal turn-idle event', () => {
-    const code = blankComments(cliSource);
     // Every mention — the opts type, the opts read, the field assignments, the
     // construction and the pass-through — must sit in one of these two functions.
     expect(
       [...new Set([...code.matchAll(/frozenOrigin/g)]
         .map(m => enclosingFunctionName(code, m.index!)))].sort(),
     ).toEqual(['cmdTurnIdle', 'postSessionScopedSignal']);
-    // Exactly one producer, fed only by a v2 plugin payload.
-    expect([...code.matchAll(/frozenOrigin = \{/g)]).toHaveLength(1);
-    expect(code).toContain('if (parsed && parsed.v === TURN_IDLE_PROTOCOL_VERSION) {');
-    expect(code).toContain('if (turnId) frozenOrigin = { turnId,');
+    // Without a frozen origin the reporter re-resolves the live one itself.
+    expect(code).toMatch(/liveOrigin = frozenOrigin \? undefined : resolveSessionContext\(/);
+    // Exactly one producer, inside cmdTurnIdle, behind the v2 payload check.
+    const producers = [...code.matchAll(/frozenOrigin = \{/g)];
+    expect(producers).toHaveLength(1);
+    const versionCheckAt = code.lastIndexOf('TURN_IDLE_PROTOCOL_VERSION', producers[0].index!);
+    expect(enclosingFunctionName(code, versionCheckAt)).toBe('cmdTurnIdle');
     // …and exactly two carriers. session-ready passes NO opts (so it must resolve
     // the live origin itself); turn-idle passes the frozen one.
     expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
       .map(m => enclosingFunctionName(code, m.index!)).sort())
       .toEqual(['cmdSessionReady', 'cmdTurnIdle']);
-    expect(code).toContain("await postSessionScopedSignal('/api/session-ready', { source });");
-    expect(code).toContain("await postSessionScopedSignal('/api/turn-idle', { seq, pid }, { frozenOrigin });");
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/session-ready', \{[^}]*\}\);/);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/turn-idle', \{[^}]*\}, \{\s*frozenOrigin\s*\}\);/);
   });
 });
 

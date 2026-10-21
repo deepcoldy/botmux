@@ -63,8 +63,15 @@ describe('RemoteRunnerBackend', () => {
       content: 'hello',
       trustedCaller: {
         requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test_bot',
         requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        senderType: 'bot',
+        botOwner: {
+          openId: 'ou_owner',
+          unionId: 'on_owner',
+          email: 'owner@bytedance.com',
+          source: 'platform_team',
+        },
       },
     })).resolves.toEqual({ submitted: true });
 

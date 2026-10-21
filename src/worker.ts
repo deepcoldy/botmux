@@ -76,7 +76,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -273,6 +273,7 @@ import {
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { PI_CREDENTIAL_ERROR_CODE } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
@@ -389,6 +390,7 @@ import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import {
   isCriticalInterruptKey,
@@ -475,6 +477,7 @@ import type {
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import { herdrConfigForSession } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import {
   IdleDetector,
@@ -3921,6 +3924,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
 
   sandboxRelayCapability = capability;
   sandboxPolicyCapability = policyCapability;
+  writeCliPidMarker();
   if (sessionId) {
     send({
       type: 'managed_turn_origin',
@@ -4170,6 +4174,18 @@ function adoptDisplacedActiveTurn(parsed: {
   });
 }
 
+// PID marker 文件锁（withFileLockSync）不可重入：writeCliPidMarker / restoreQueuedTurns /
+// syncQueuedTurns 在持有的锁内会经 adopt 分支调用 publishSandboxRelayCapability()，而后者
+// 末尾要回写 marker。同一同步调用栈里对「已持有」的 marker 路径直接执行（JS 单线程，同步
+// 临界区内无交错）；不同 marker 路径仍各自加锁。双 marker 遍历固定 cli→rpc 顺序，嵌套也
+// 恒为同序，不存在 ABBA。
+const heldPidMarkerPaths = new Set<string>();
+function withPidMarkerLock<T>(markerPath: string, fn: () => T): T {
+  if (heldPidMarkerPaths.has(markerPath)) return fn();
+  heldPidMarkerPaths.add(markerPath);
+  try { return withFileLockSync(markerPath, fn); } finally { heldPidMarkerPaths.delete(markerPath); }
+}
+
 function writeCliPidMarker(): void {
   if (!sessionId) return;
   // Publish the turn the CLI is actually executing, for the trigger-user
@@ -4191,11 +4207,11 @@ function writeCliPidMarker(): void {
       currentBotmuxCallerOpenId,
     );
   }
-  // NOTE: withFileLockSync is NOT re-entrant. Do NOT acquire marker locks within this block.
+  // 读-采纳-改写在 per-marker 文件锁内（经 withPidMarkerLock，锁内回写 marker 不会自锁）。
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath) continue;
     try {
-      withFileLockSync(markerPath, () => {
+      const runWrite = () => {
         if (existsSync(markerPath)) {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
@@ -4276,8 +4292,12 @@ function writeCliPidMarker(): void {
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
           ...(procStart ? { procStart } : {}),
           ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
-        }));
-      });
+          ...(sandboxRelayCapability && sandboxRelayCapability.turnId === currentBotmuxTurnId
+            && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
+            ? { capability: sandboxRelayCapability.token } : {}),
+        }), { mode: 0o600, followTargetSymlink: false });
+      };
+      withPidMarkerLock(markerPath, runWrite);
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }
@@ -4287,7 +4307,7 @@ function writeCliPidMarker(): void {
 function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
   if (!existsSync(markerPath)) return;
   try {
-    withFileLockSync(markerPath, () => {
+    withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
@@ -4325,7 +4345,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath || !existsSync(markerPath)) continue;
     try {
-      withFileLockSync(markerPath, () => {
+      withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
@@ -5502,6 +5522,7 @@ let bridgeStalePidStateSessionId: string | undefined;
  *  the queue against the right turn, and prune the entry once no pending
  *  turn references the path anymore. */
 const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
+let orcaClaudeWebHistorySignature: string | undefined;
 let bridgeOffset = 0;
 const bridgeQueue = new BridgeTurnQueue(
   notifyTerminalTurnStarted,
@@ -5511,12 +5532,59 @@ const bridgeQueue = new BridgeTurnQueue(
   },
   notifyNativeTranscriptConsumedLarkTurn,
 );
-/** Counts background Agent/Task dispatches whose completion notification has
- *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
- *  turn that only went quiet because it is awaiting a background sub-agent must
- *  keep the session card `working`, not flip it to idle (which Lark surfaces as
- *  「已完成」) and then back to 「进行中」when the `<task-notification>` re-wakes it. */
+/** Background work (Agent / Bash / Monitor; Grok bash / monitor) launched by
+ *  the CLI and not yet stopped, plus whether the main turn is open.
+ *  - `pendingTurnAgents()`, at the PTY idle edge (markPromptReady): a main turn
+ *    that only went quiet because it is awaiting a background sub-agent must
+ *    keep the session card `working`, not flip it to idle (which Lark surfaces
+ *    as 「已完成」) and then back to 「进行中」when the `<task-notification>`
+ *    re-wakes it;
+ *  - `backgroundWait()`: the count the card shows while the main turn has
+ *    ended but background work is still running (see backgroundWaitTasks). */
 const backgroundTaskTracker = new BackgroundTaskTracker();
+/** Background tasks shown on the card as 「主回合已结束 · 后台子任务运行中（N）」;
+ *  0 otherwise. Mirrors backgroundTaskTracker.backgroundWait(), re-read after
+ *  every transcript drain and sampler tick; the sampler publishes a change.
+ *  Display only: it rides on screen_update and changes no status decision. */
+let backgroundWaitTasks = 0;
+
+function backgroundWaitPayload(): { backgroundTasks?: number } {
+  return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
+}
+
+function refreshBackgroundWait(): void {
+  const next = backgroundTaskTracker.backgroundWait();
+  if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
+  if (next === 0) backgroundStopScanOffsets.clear();
+  backgroundWaitTasks = next;
+}
+
+/** Sibling Claude transcripts already read for background-task stops, and
+ *  when the current wait began (see settleBackgroundTasksFromSiblings). */
+const backgroundStopScanOffsets = new Map<string, number>();
+let backgroundStopScanSinceMs = 0;
+
+/** While the card shows background work, also read task stops from the other
+ *  transcripts in this project directory. After a /clear typed in the
+ *  terminal, Claude reports a task's stop into its new session file, and the
+ *  bridge does not re-bind to that file until the next Lark message (the pid
+ *  it watches is the program-status relay's, not Claude's), so the count
+ *  would otherwise stay up until then. Only ids this session tracks can
+ *  settle. */
+function settleBackgroundTasksFromSiblings(): void {
+  if (backgroundWaitTasks === 0 || !bridgeJsonlDir || !bridgeJsonlPath) return;
+  for (const taskId of backgroundTaskStopsInSiblingTranscripts(
+    bridgeJsonlDir, bridgeJsonlPath, backgroundStopScanSinceMs, backgroundStopScanOffsets,
+  )) {
+    backgroundTaskTracker.settle(taskId);
+  }
+}
+
+/** Fold Claude transcript events into the background-task tracker. */
+function observeClaudeBackgroundTasks(events: readonly TranscriptEvent[]): void {
+  for (const ev of events) backgroundTaskTracker.observe(ev);
+  refreshBackgroundWait();
+}
 /** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
  *  process, and only on the FIRST baseline this process runs. Rationale: the
  *  journal exists to recover a turn that a *cross-process* death (daemon
@@ -5887,7 +5955,9 @@ function failedBridgeFailureText(errorCode?: string, summary?: string): string {
         ? 'worker.empty_final_failed_connection'
         : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
           ? 'worker.empty_final_failed_upstream'
-          : 'worker.empty_final_failed';
+          : errorCode === PI_CREDENTIAL_ERROR_CODE
+            ? 'worker.empty_final_failed_credential'
+            : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
   return failure;
 }
@@ -6394,6 +6464,24 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
   herdrAdoptBridgeQuietTimer.unref?.();
 }
 
+function setOrcaClaudeWebHistory(events: TranscriptEvent[]): void {
+  if (!(backend instanceof OrcaBackend) || lastInitConfig?.cliId !== 'claude-code') return;
+  const history = extractAssistantTurns(events).flatMap(turn => [
+    { kind: 'user', text: turn.userText },
+    { kind: 'assistant_final', text: turn.assistantText },
+  ]);
+  backend.setWebHistory(renderOrcaTranscriptHistory(history));
+}
+
+function refreshOrcaClaudeWebHistory(): void {
+  if (!(backend instanceof OrcaBackend) || !bridgeJsonlPath) return;
+  const paths = [...new Set([...bridgeSecondaryPaths.keys(), bridgeJsonlPath])];
+  const signature = transcriptFilesSignature(paths);
+  if (signature === orcaClaudeWebHistorySignature) return;
+  orcaClaudeWebHistorySignature = signature;
+  setOrcaClaudeWebHistory(paths.flatMap(path => drainTranscript(path, 0).events));
+}
+
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
   // The transcript file exists (or just appeared): this CLI session HAS
@@ -6422,6 +6510,7 @@ function bridgeAbsorbBaseline(): void {
   bridgeOffset = result.newOffset;
   bridgeQueue.absorb(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
+  setOrcaClaudeWebHistory(result.events);
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
@@ -6860,6 +6949,10 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
   observeModelFallbackEvents(newPath, result.events);
+  // Background tasks survive /clear and report their stop into the NEW file,
+  // possibly before this switch noticed it. Launches replayed from an older
+  // CLI process are ignored by the tracker itself.
+  observeClaudeBackgroundTasks(result.events);
   bridgeBaselineDone = true;
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
 
@@ -7160,10 +7253,9 @@ function bridgeIngest(): void {
     cliTranscriptEverExisted = true;
   }
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
-  // Fold background Agent/Task dispatch and their `<task-notification>`
-  // completions so the idle edge (markPromptReady) knows whether this turn is
-  // only quiet because it is awaiting a background sub-agent.
-  for (const ev of result.events) backgroundTaskTracker.observe(ev);
+  // Fold background task launches / stops and the main turn's start / end, so
+  // the idle edge (markPromptReady) and the card know what is still running.
+  observeClaudeBackgroundTasks(result.events);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -7398,6 +7490,7 @@ function stopBridgeWatcher(): void {
   bridgeKnownSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
+  orcaClaudeWebHistorySignature = undefined;
   bridgeFingerprintScanLastMs.clear();
   // Attribution belongs to the CLI generation whose transcript we watched.
   // A fresh backend must not inherit a terminal/fingerprint from the exited
@@ -7504,6 +7597,7 @@ function bridgeDrainAndMaybeEmit(): void {
   if (!bridgeJsonlPath) return;
   bridgeIngest();
   emitReadyTurns();
+  refreshOrcaClaudeWebHistory();
   // Prune AFTER emit so a path is only retired once its turn has actually
   // been published. During non-idle ticks (fs.watch / 1s poll) we never
   // emit, so we never prune — the path stays put until idle resolves it.
@@ -7799,7 +7893,7 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   // Same reasoning for background-task bookkeeping: a dispatch launch-ack or a
   // `<task-notification>` can land on the trailing bytes of a rotating path and
   // reach the tracker nowhere else.
-  for (const ev of result.events) backgroundTaskTracker.observe(ev);
+  observeClaudeBackgroundTasks(result.events);
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -8233,6 +8327,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     if (journalPath) {
       codexAdoptRecoveryAttempted = true;
       structuredBridgeRecoveryAttempted = true;
+    }
+    if (backend instanceof OrcaBackend) {
+      backend.setWebHistory(renderOrcaTranscriptHistory([...history, ...live]));
     }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
@@ -9116,7 +9213,11 @@ function codexBridgeIngest(opts: {
     maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  if (backend instanceof OrcaBackend) {
+    backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
+  }
   codexBridgeQueue.ingest(result.events);
+  observeStructuredBackgroundTasks(result);
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
     if (turns.some(turn => turn.started && turn.finalText === undefined)) {
@@ -9149,6 +9250,22 @@ function codexBridgeIngest(opts: {
     && result.events.some(event => event.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
   }
+}
+
+/** Background tasks a structured drainer reported (Grok's updates.jsonl, see
+ *  drainGrokUpdates). The main turn is open from a user chunk — a prompt, or
+ *  the wake-up Grok injects when a task stops — to its `assistant_final`. */
+function observeStructuredBackgroundTasks(result: StructuredBridgeDrainResult): void {
+  const bg = result.backgroundTasks;
+  if (bg) {
+    for (const task of bg.launched) backgroundTaskTracker.launch(task.taskId, task.kind, { atMs: task.atMs });
+    for (const taskId of bg.settled) backgroundTaskTracker.settle(taskId);
+  }
+  for (const event of result.events) {
+    if (event.kind === 'user') backgroundTaskTracker.noteMainTurn(true);
+    else if (event.kind === 'assistant_final') backgroundTaskTracker.noteMainTurn(false);
+  }
+  refreshBackgroundWait();
 }
 
 /** Confirm an OMP file-tail terminal only after one complete quiet bridge tick
@@ -10509,6 +10626,10 @@ function beginCliWriteCycle(): void {
     setPromptReady: ready => { isPromptReady = ready; },
     resetIdleDetector: () => { idleDetector?.reset(); },
   });
+  // Input is about to reach the CLI: the main agent's turn starts here, before
+  // its transcript record lands (a turn terminal record ends it again).
+  backgroundTaskTracker.noteMainTurn(true);
+  backgroundWaitTasks = 0;
 }
 
 /** Serialize one adopted-pane message from transcript baseline/mark through
@@ -10620,28 +10741,29 @@ async function writeAdoptMessage(
   //     journal (a transparent pass-through on every non-ZMX backend).
   //   - raw sendText+Enter runs inside the same transaction for identical
   //     commit-journal atomicity.
+  // Refuse before prepareAdoptWrite marks the turn: this is a proven non-write,
+  // not an ambiguous submission. Orca refreshes draft state synchronously here
+  // so the first 700ms screen-poll window cannot append onto a local draft.
+  const composerConflict = adoptComposerConflict(adoptBackend);
+  if (composerConflict) {
+    log(`Refused ${lastInitConfig?.adoptSource ?? 'external'} adopt input: ${composerConflict}`);
+    scheduleSubmitFailureNotify(
+      content,
+      undefined,
+      t('worker.transcriptLabel'),
+      undefined,
+      composerConflict,
+      turnSeq,
+      { turnId, dispatchAttempt },
+      'failed',
+    );
+    return 'completed';
+  }
+
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
     const submissionBackend = adoptBackend;
     let recoveryFailureReason: string | undefined;
     let deliveryQuarantine: InputDeliveryQuarantine | null = null;
-    // Refuse adopt input while the local composer still holds an unsubmitted
-    // human draft, BEFORE any bridge attribution or terminal write — otherwise
-    // the Lark message would be appended onto the human's half-typed line.
-    const composerConflict = codexAdoptComposerConflict(submissionBackend);
-    if (composerConflict) {
-      log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
-      scheduleSubmitFailureNotify(
-        content,
-        undefined,
-        t('worker.transcriptLabel'),
-        undefined,
-        composerConflict,
-        turnSeq,
-        { turnId, dispatchAttempt },
-        'failed',
-      );
-      return 'completed';
-    }
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
@@ -13114,7 +13236,13 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
-function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
+function adoptComposerConflict(target: SessionBackend): string | undefined {
+  if (target instanceof OrcaBackend) {
+    const state = target.inspectDraftSync();
+    if (state === 'draft') return t('worker.orca_composer_conflict');
+    if (state === 'unknown') return t('worker.orca_composer_check_failed');
+    return undefined;
+  }
   if (lastInitConfig?.cliId !== 'codex' || !lastInitConfig.adoptMode) return undefined;
   const state = detectCodexComposerState(target.captureInputState?.());
   if (state !== 'draft') return undefined;
@@ -13771,6 +13899,7 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     type: 'screen_update',
     content,
     ...statusPayload,
+    ...backgroundWaitPayload(),
     turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
     dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
   });
@@ -14270,7 +14399,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   //
   // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy)
-  // or a background sub-agent is still in flight (backgroundTaskTracker.pending()):
+  // or a background sub-agent is still in flight (backgroundTaskTracker.pendingTurnAgents()):
   // for these the FIRST/this ready is not a turn boundary — the argv-baked first
   // prompt is still running, or the turn is only quiet awaiting a background
   // <task-notification>. isPromptReady was just set true above, so this generic
@@ -14280,12 +14409,14 @@ function markPromptReady(): void {
   // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  refreshBackgroundWait();
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
       content,
       ...usageLimitTracker.classify(content, projectedRuntimeScreenStatus()),
+      ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
@@ -14326,7 +14457,7 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
-    } else if (backgroundTaskTracker.pending() > 0) {
+    } else if (backgroundTaskTracker.pendingTurnAgents() > 0) {
       // The main turn is only quiet because it dispatched background
       // sub-agents and is awaiting their `<task-notification>`. Report
       // working (not idle) so the session card is not frozen to 「已完成」
@@ -14337,7 +14468,7 @@ function markPromptReady(): void {
       isPromptReady = false;
       idleDetector?.reset();
       publishScreenStatus('working');
-      log(`Idle prompt while ${backgroundTaskTracker.pending()} background task(s) pending — reporting working until their completion notification arrives`);
+      log(`Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`);
     } else {
       publishScreenStatus('idle');
     }
@@ -16146,6 +16277,7 @@ function startScreenUpdates(): void {
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
+  let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   // Last Claude permission dialog already notified (dedup by projection text;
@@ -16277,12 +16409,18 @@ function startScreenUpdates(): void {
           lastClaudeActionPrompt = '';
         }
       }
-      if (snapshot.changed || usageAware.status !== lastSentStatus) {
+      // A Monitor's deadline can pass with no transcript record to re-read on,
+      // and a stop can land in a transcript the bridge does not follow.
+      settleBackgroundTasksFromSiblings();
+      refreshBackgroundWait();
+      if (snapshot.changed || usageAware.status !== lastSentStatus || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
+        lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',
           content: snapshot.content,
           ...usageAware,
+          ...backgroundWaitPayload(),
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
@@ -16777,6 +16915,11 @@ async function spawnCli(
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
   // so the per-process picker state must be reset here too.
   resetCodexModelMigrationState();
+  // Same for background tasks: they die with the CLI process. Launches the
+  // new process replays from a resumed transcript are older than this mark
+  // (floored to the second — Grok's fallback record timestamp is in seconds).
+  backgroundTaskTracker.reset(Math.floor(Date.now() / 1000) * 1000);
+  backgroundWaitTasks = 0;
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
@@ -16875,6 +17018,50 @@ async function spawnCli(
     }
   }
   // ── Adopt mode: observe the user's existing terminal backend (no attach) ──
+  if (cfg.adoptMode && cfg.adoptSource === 'orca' && cfg.adoptOrcaIdentity) {
+    isTmuxMode = true;
+    isPipeMode = true;
+    const orcaBe = new OrcaBackend(
+      cfg.adoptOrcaIdentity,
+      cfg.cliId === 'traex',
+      cfg.adoptOrcaSizeVerified === true,
+    );
+    effectiveBackendType = 'orca';
+    backend = orcaBe;
+    cliLifetimeNonce++;
+    if (cfg.adoptCliPid) orcaBe.cliPid = cfg.adoptCliPid;
+    orcaBe.cliCwd = cfg.adoptCwd ?? cfg.workingDir;
+    orcaBe.onPaneSizeChange((size) => {
+      const frame = `\x1b]1989;scaled;${size.cols};${size.rows}\x07`;
+      for (const client of wsClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(frame);
+      }
+    });
+    orcaBe.spawn('', [], {
+      cwd: cfg.workingDir,
+      cols: cfg.adoptPaneCols ?? PTY_COLS,
+      rows: cfg.adoptPaneRows ?? PTY_ROWS,
+      env: process.env as Record<string, string>,
+    });
+
+    setupAdoptTranscriptBridges(cfg);
+    setupAdoptInputAdapter(cfg);
+    setupAdoptIdleDetection(cfg, 'orca');
+    backend.onData(onPtyData);
+    backend.onExit((code, signal) => {
+      log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
+      backend = null;
+      isPromptReady = false;
+      stopBridgeWatcher();
+      send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    });
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    publishLocalProcessAttestation(cfg.adoptCliPid);
+    log(`Adopt mode (orca): observing ${cfg.adoptOrcaIdentity.terminalHandle}`);
+    return;
+  }
+
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
     isPipeMode = true;
@@ -17605,6 +17792,9 @@ async function spawnCli(
   );
   const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
   const reuseRecordedHerdrTarget = !sandboxRequested && !hasMcpRuntimeEntries;
+  // `chatTypes` can keep e.g. DM sessions on the default host; retirement and
+  // selection below must see the same decision.
+  const effectiveHerdrConfig = herdrConfigForSession(cfg.backendConfig, cfg.chatType);
   if (effectiveBackend === 'herdr' && !reuseRecordedHerdrTarget) {
     // Isolation/MCP incarnations move historical shared-host agents to the
     // data-root-scoped managed target. Retire the exact old pane before backend
@@ -17614,12 +17804,14 @@ async function spawnCli(
       ownershipScope: isolationRuntimeDataDir,
       reuseRecordedHerdrTarget,
       persistentBackendTarget: cfg.persistentBackendTarget,
+      herdrConfig: effectiveHerdrConfig,
     });
   }
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
@@ -20834,6 +21026,7 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      cliId: cfg.cliId,
       model: cfg.model,
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,
@@ -22965,7 +23158,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) {
-            const pin = `\x1b]1989;${sz.cols};${sz.rows}\x07`;
+            const sizeMode = backend instanceof OrcaBackend && backend.hasAuthoritativePaneSize()
+              ? 'scaled;'
+              : '';
+            const pin = `\x1b]1989;${sizeMode}${sz.cols};${sz.rows}\x07`;
             ws.send(pin);
             adoptWebGridPins.set(ws, pin);
           }
@@ -22977,14 +23173,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
           ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
-        const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
-          ? scrollback
-          : chooseWebTerminalSeed({
-            canCapture: isPipeMode && isObserveBackend(backend),
-            capture: () => (backend as ObserveBackend).captureCurrentScreen(),
-            scrollback,
-            onError: log,
-          });
+        const seed = backend instanceof OrcaBackend
+          ? backend.captureWebHistory()
+          : usesHerdrSnapshotWebHistory() && scrollback.length > 0
+            ? scrollback
+            : chooseWebTerminalSeed({
+              canCapture: isPipeMode && isObserveBackend(backend),
+              capture: () => (backend as ObserveBackend).captureCurrentScreen(),
+              scrollback,
+              onError: log,
+            });
         // A capture-pane seed carries screen cells but no DECSET state: a fresh
         // client xterm never learns the CLI enabled mouse tracking (grok build:
         // 1003+1006), so clicks/double-clicks are silently swallowed instead of
@@ -23929,6 +24127,17 @@ if(typeof ResizeObserver!=='undefined'){
       try{_wbApplyAutoFontSize()}catch(ex){}
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
+    }
+    // Orca supplies a text snapshot at the source grid. A scaled frame is the
+    // plain fixed-grid pin with an attested geometry: resize to the source grid
+    // FIRST, then let the generic fitter size the font for that grid.
+    var _sf=data.match(/\\x1b\\]1989;scaled;(\\d+);(\\d+)\\x07/);
+    if(_sf){
+      var _sc=+_sf[1],_sr=+_sf[2];
+      _setFixedGrid(true);
+      if(_sc>0&&_sr>0){try{term.resize(_sc,_sr)}catch(ex){}}
+      try{_wbApplyAutoFontSize()}catch(ex){}
+      _lastC=_sc;_lastR=_sr;data=data.replace(_sf[0],'');
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).

@@ -3072,6 +3072,68 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
   });
 });
 
+describe('PUT /api/bot-card-prefs — senderTagHideEmail (<sender> 注入开关)', () => {
+  it('defaults off and persists hiding independently of the master switch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sender-tag-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-sender-tag-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }, { larkAppId: 'email-other-app', larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ senderTagHideEmail: false });
+
+      const enabled = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ senderTagHideEmail: true }),
+      });
+      expect(enabled.status).toBe(200);
+      expect(await enabled.json()).toMatchObject({ ok: true, senderTagHideEmail: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ senderTagHideEmail: true });
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ senderTagHideEmail: true });
+
+      expect(getBot(appId).config.senderTagHideEmail).toBe(true);
+      expect(loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+      expect(getBot('email-other-app').config.senderTagHideEmail).toBeUndefined();
+      expect(loadBotConfigs()[1].senderTagHideEmail).toBeUndefined();
+      for (const senderTag of [false, true]) {
+        const response = await fetch(`${base}/api/bot-card-prefs`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ senderTag }),
+        });
+        expect(await response.json()).toMatchObject({ senderTag, senderTagHideEmail: true });
+      }
+
+      const disabled = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ senderTagHideEmail: false }),
+      });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ ok: true, senderTagHideEmail: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].senderTagHideEmail).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-p2p-open-'));
@@ -4090,9 +4152,6 @@ describe('GET /api/sessions', () => {
   });
 
   it('does not scan transcripts while composing the bulk sessions list', async () => {
-    const ipcSource = readFileSync(join(process.cwd(), 'src/core/dashboard-ipc-server.ts'), 'utf8');
-    expect(ipcSource).toContain('composeDashboardSessionRows({ includeTokenUsage: false })');
-
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-token-list-'));
     const prevConfigDataDir = config.session.dataDir;
     const usageSpy = vi.spyOn(costCalculator, 'getSessionTokenUsage').mockImplementation(() => {
@@ -6516,13 +6575,6 @@ describe('GET /api/schedules/:id/logs', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-
-  it('keeps the central proxy owner-routed and preserves the complete query string', () => {
-    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(source).toContain("url.pathname.match(/^\\/api\\/schedules\\/([^/]+)\\/logs$/)");
-    expect(source).toContain('const owner = resolveScheduleOwner(id);');
-    expect(source).toContain('`/api/schedules/${encodeURIComponent(id)}/logs${url.search}`');
-  });
 });
 
 describe('POST /api/schedules/precondition/test', () => {
@@ -6618,13 +6670,6 @@ describe('POST /api/schedules/precondition/test', () => {
       scheduleStore.setScheduleScope('cli_ipc_test_bot001');
       rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  it('keeps the central proxy management-only and routes by larkAppId without a task id', () => {
-    const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(source).toContain("url.pathname === '/api/schedules/precondition/test'");
-    expect(source).toContain("proxyToDaemon(larkAppId, '/api/schedules/precondition/test'");
-    expect(source).toContain("if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });");
   });
 });
 

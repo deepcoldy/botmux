@@ -1485,6 +1485,45 @@ export function findTraexRolloutByPid(
   return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
 }
 
+/** Resolve the user-visible TRAE thread held by a process from its writer lock.
+ * Unlike rollout files, these locks remain addressable when Orca has unlinked
+ * an old rollout that the live process still keeps open. */
+export function findTraexThreadByPid(
+  pid: number,
+): { cliSessionId: string; title?: string } | undefined {
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  const ids = [...new Set(targets.flatMap(target => {
+    const match = /[\\/]thread-writer-locks[\\/]([0-9a-f-]{36})\.lock(?: \(deleted\))?$/i.exec(target);
+    return match?.[1] ? [match[1]] : [];
+  }))];
+  if (ids.length === 0) return undefined;
+  return withTraeDb((db) => {
+    const placeholders = ids.map(() => '?').join(',');
+    let rows: Array<{ id?: string; title?: string; firstMessage?: string; updatedAt?: number; source?: string }>;
+    try {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage, updated_at_ms AS updatedAt, thread_source AS source FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    } catch {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    }
+    const candidates = rows
+      .filter(row => typeof row.id === 'string' && row.source !== 'subagent')
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
+    if (!selected?.id) return undefined;
+    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    const titleChars = Array.from(title);
+    return {
+      cliSessionId: selected.id,
+      ...(title ? { title: titleChars.length > 80 ? `${titleChars.slice(0, 79).join('')}…` : title } : {}),
+    };
+  }) ?? undefined;
+}
+
 /** Lowercased set of TRAE session ids whose rollout the pid holds open. The
  *  ownership gate for a shared-history.jsonl submit match: only a sid this pid
  *  actually owns is safe to accept, so a concurrent sibling pane's identical

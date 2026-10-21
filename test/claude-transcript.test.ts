@@ -21,6 +21,7 @@ import {
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
+  extractAssistantTurns,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
@@ -30,6 +31,7 @@ import {
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
   isTranscriptRateLimitEvent,
+  transcriptFilesSignature,
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
@@ -53,6 +55,15 @@ function appendLine(obj: unknown): void {
 }
 
 describe('drainTranscript', () => {
+  it('changes its transcript signature only when a history input changes', () => {
+    writeFileSync(path, 'first\n');
+    const first = transcriptFilesSignature([path, join(dir, 'missing.jsonl')]);
+    expect(transcriptFilesSignature([path, join(dir, 'missing.jsonl')])).toBe(first);
+
+    appendFileSync(path, 'second\n');
+    expect(transcriptFilesSignature([path, join(dir, 'missing.jsonl')])).not.toBe(first);
+  });
+
   it('returns empty result when file does not exist', () => {
     const r = drainTranscript('/no/such/file.jsonl', 0);
     expect(r.events).toEqual([]);
@@ -1228,6 +1239,20 @@ describe('cronCreateToolUseIds / cronCreateAcks', () => {
 });
 
 describe('extractLastAssistantTurn', () => {
+  it('extracts every completed turn while omitting an unfinished tail', () => {
+    expect(extractAssistantTurns([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt'),
+      assistantEv('second reply'),
+      userEv('still running'),
+      assistantToolUseEv(),
+    ])).toEqual([
+      { userText: 'first prompt', assistantText: 'first reply' },
+      { userText: 'second prompt', assistantText: 'second reply' },
+    ]);
+  });
+
   it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
     const turn = extractLastAssistantTurn([
       userEv('first prompt'),

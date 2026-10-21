@@ -5,6 +5,7 @@ import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
+import { canOperate } from '../im/lark/event-dispatcher.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
@@ -146,6 +147,14 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { readDeferredTopicBinding, writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  DEFERRED_TOPIC_CLAIM_MAX_BYTES,
+  DEFERRED_TOPIC_CLAIM_ROUTE,
+  DeferredTopicClaimRegistry,
+  deferredTopicRootFactsFromDetail,
+  parseDeferredTopicClaimRequest,
+} from './deferred-topic-claim.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
@@ -186,7 +195,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -489,6 +498,8 @@ import {
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
+import { authorizeHumanManager } from './human-manager-authorization.js';
+import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
@@ -1084,7 +1095,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1831,6 +1842,40 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     return result.ok
       ? jsonRes(res, 200, result)
       : jsonRes(res, result.status, { ok: false, error: result.error });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+const deferredTopicClaims = new DeferredTopicClaimRegistry({
+  readBinding: sessionId => readDeferredTopicBinding(config.session.dataDir, sessionId),
+  writeBinding: binding => writeDeferredTopicBinding(config.session.dataDir, binding),
+  lookupRoot: async (larkAppId, rootMessageId) => deferredTopicRootFactsFromDetail(
+    await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false, timeoutMs: 10_000 }),
+  ),
+});
+
+/** First-message claim of a silent fresh-topic schedule run for an isolated
+ * CLI that cannot write the host binding sidecar (see deferred-topic-claim). */
+ipcRoute('POST', `/api/sessions/:sessionId/${DEFERRED_TOPIC_CLAIM_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, DEFERRED_TOPIC_CLAIM_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const request = parseDeferredTopicClaimRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_deferred_topic_request' });
+  try {
+    const result = await deferredTopicClaims.handle(ds, request);
+    return result.ok
+      ? jsonRes(res, 200, result)
+      : jsonRes(res, result.status, result);
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
@@ -3083,6 +3128,40 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
+
+/** Manager mutations require a current human instruction, even on trusted host IPC. */
+ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => ({} as Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 400, { ok: false, error: 'no_feishu_transport' });
+  if (ds.chatType !== 'group' || isSessionGroup(ds.chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
+  }
+  if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
+  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // intentionally left ungated so an admin can always remove the manager / inspect
+  // state even after turning the switch off — the switch gates activation, not removal.
+  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
+    return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
+  }
+  const { getMessageDetail } = await import('../im/lark/client.js');
+  const { effectiveBotDisplayName } = await import('../bot-registry.js');
+  const human = await authorizeHumanManager({
+    sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
+    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
+    readMessage: getMessageDetail,
+    canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
+  });
+  if (!human.ok) return jsonRes(res, 403, human);
+  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
+    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  return jsonRes(res, result.ok ? 200 : 409, result);
+});
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
   const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
@@ -7481,6 +7560,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
+    senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -7490,6 +7570,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
+    chatManagerEnabled: cardPrefs.chatManagerEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
     groupJoinCommand: cardPrefs.groupJoinCommand,
@@ -7629,8 +7710,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
+    chatManagerEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    senderTagHideEmail?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -7645,8 +7728,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
+    chatManagerEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    senderTagHideEmail?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -7689,6 +7774,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
@@ -7717,6 +7803,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
+  if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auto_start_excluded_chats' });
@@ -8189,7 +8276,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
   // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
   // field is optional in the body, so distinguish absent (preserve) from
-  // present-but-empty (clear → runner default) like reasoningEffort does.
+  // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
   const supportsTurnTimeout = selected.cliId === 'dsh';
   const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
   let nextTurnTimeoutMs: number | undefined;
@@ -9124,6 +9211,29 @@ botConfigPutRoute<{ riff?: unknown }>('/api/bot-riff', 'riff', {
     return fieldOk(value);
   },
   respond: value => ({ ok: true, riff: value ? JSON.stringify(redactRiffForClient(value), null, 2) : '' }),
+});
+
+// Per-bot herdr 后端放置配置。Body `{ herdr: string }`（原始 JSON 文本，如
+// `{"sessionName":"default","placement":"split","tab":"3","chatTypes":["group"]}`）：
+// 空白 → 清除；否则按 json kind 经 coerceConfigValue 严格校验（复用
+// normalizeHerdrBackendConfig 归一，非法字段 400 显式拒绝，空对象清除）。走
+// applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），next-session 生效。
+// 仅有效后端为 herdr 时被 dashboard 展示；字段均非秘密，直接回显归一结果。
+botConfigPutRoute<{ herdr?: unknown }>('/api/bot-herdr', 'herdr', {
+  normalize: (body, spec) => {
+    // 传错类型不能被当成「清除」：herdr 块决定话题是否进用户的个人 Herdr
+    // 会话，误删会静默搬走已有会话的放置。只接受字符串；字段缺省（undefined）
+    // 才视为清除。
+    if (body.herdr !== undefined && typeof body.herdr !== 'string') {
+      return fieldInvalid('invalid_herdr_config: herdr 必须是 JSON 文本字符串');
+    }
+    const raw = typeof body.herdr === 'string' ? body.herdr : '';
+    if (!raw.trim()) return fieldOk(null);  // 清除
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return fieldInvalid(coerced.reason);
+    return fieldOk(coerced.value);
+  },
+  respond: value => ({ ok: true, herdr: value ? JSON.stringify(value, null, 2) : '' }),
 });
 
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:

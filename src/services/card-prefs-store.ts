@@ -82,6 +82,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
    *  gated on the tag) and costs two observability signals — see BotConfig.senderTag. */
   senderTag: boolean;
+  /** Hide email only in newly rendered sender tags. Default false. */
+  senderTagHideEmail: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -101,6 +103,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   autoStartOnGroupJoinSeed: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
+  /** 群负责人（默认接待者）开关，默认关。 */
+  chatManagerEnabled: boolean;
   autoStartExcludedChats: string[];
   /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
   groupJoinCommandEnabled: boolean;
@@ -139,6 +143,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       privateCard: c.privateCard === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
+      senderTagHideEmail: c.senderTagHideEmail === true,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
@@ -146,6 +151,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
+      chatManagerEnabled: c.chatManagerEnabled === true,
       autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
       groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
@@ -173,6 +179,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       privateCard: false,
       cotEnabled: true,
       senderTag: true,
+      senderTagHideEmail: false,
       overloadAlert: false,
       botToBotSameDir: true,
       autoInviteOwnerOnGroupAdd: true,
@@ -180,6 +187,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinPrompt: '',
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
+      chatManagerEnabled: false,
       autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
       groupJoinCommand: '',
@@ -296,6 +304,7 @@ async function updateBotCardPrefsInternal(
     if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
+    apply(entry, 'senderTagHideEmail', patch.senderTagHideEmail);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
@@ -303,6 +312,7 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
+    apply(entry, 'chatManagerEnabled', patch.chatManagerEnabled);
     if (patch.autoStartExcludedChats !== undefined) {
       if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
       else delete entry.autoStartExcludedChats;
@@ -333,6 +343,7 @@ async function updateBotCardPrefsInternal(
         privateCard: entry.privateCard === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
+        senderTagHideEmail: entry.senderTagHideEmail === true,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
@@ -340,6 +351,7 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
+        chatManagerEnabled: entry.chatManagerEnabled === true,
         autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
         groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
@@ -404,6 +416,9 @@ async function updateBotCardPrefsInternal(
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.cotEnabled = patch.cotEnabled === false ? false : undefined;
   }
+  if (patch.senderTagHideEmail !== undefined) {
+    bot.config.senderTagHideEmail = patch.senderTagHideEmail || undefined;
+  }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.senderTag = patch.senderTag === false ? false : undefined;
@@ -431,6 +446,9 @@ async function updateBotCardPrefsInternal(
   if (patch.autoStartExcludedChats !== undefined) bot.config.autoStartExcludedChats = patch.autoStartExcludedChats;
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
+  }
+  if (patch.chatManagerEnabled !== undefined) {
+    bot.config.chatManagerEnabled = patch.chatManagerEnabled || undefined;
   }
   if (patch.groupJoinCommandEnabled !== undefined) {
     bot.config.groupJoinCommandEnabled = patch.groupJoinCommandEnabled || undefined;
@@ -478,6 +496,7 @@ async function updateBotCardPrefsInternal(
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
+    `senderTagHideEmail=${r.result.senderTagHideEmail} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +

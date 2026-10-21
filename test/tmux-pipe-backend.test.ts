@@ -349,6 +349,139 @@ describe('TmuxPipeBackend.spawn', () => {
     expect(() => be.spawn('echo', [], spawnOpts())).toThrow();
     expect(newSessionAttempts).toBe(1);
   });
+
+  it.each(['binding-a', 'binding-b', ''])('checks the actual identity before adopting a duplicate on startup retry: %s', actual => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const be = new TmuxPipeBackend('bmx-bound', { createSession: true, ownsSession: true });
+    let attempts = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') return 'tmux 3.3a';
+      if (args[0] === 'new-session') {
+        attempts++;
+        if (attempts === 1) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', status: 1 });
+        throw Object.assign(new Error('duplicate'), { status: 1, signal: null, stderr: 'duplicate session: bmx-bound' });
+      }
+      if (args[0] === 'show-environment' && args.includes('BOTMUX_CODEX_INSTANCE_BINDING')) {
+        return actual ? `BOTMUX_CODEX_INSTANCE_BINDING=${actual}` : '';
+      }
+      return '';
+    }) as typeof execFileSync);
+    const opts = { ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } };
+    try {
+      if (actual === 'binding-a') expect(() => be.spawn('sleep', ['60'], opts)).not.toThrow();
+      else {
+        expect(() => be.spawn('sleep', ['60'], opts)).toThrow(/preserved/);
+        expect(mockedOpenSync).not.toHaveBeenCalled();
+        expect(mockedExecSync.mock.calls.some(([cmd]) => /set-option|pipe-pane/.test(String(cmd)))).toBe(false);
+      }
+      expect(attempts).toBe(2);
+      // tmux >= 3.2 marks atomically with -e and never falls back to set-environment.
+      expect(newSessionArgs().slice(0, newSessionArgs().indexOf('--')))
+        .toEqual(expect.arrayContaining(['-e', 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a']));
+      expect(mockedExecFileSync.mock.calls.some(([, a]) => (a as string[])[0] === 'set-environment')).toBe(false);
+    } finally {
+      be.kill();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('keeps user-owned adopt panes usable without a Botmux identity marker', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    try {
+      expect(() => be.spawn('', [], {
+        ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' },
+      })).not.toThrow();
+      expect(mockedExecFileSync.mock.calls.some(([, args]) => (args as string[]).includes('BOTMUX_CODEX_INSTANCE_BINDING'))).toBe(false);
+    } finally {
+      be.kill();
+    }
+  });
+});
+
+describe('TmuxPipeBackend identity marker vs tmux version (#1959)', () => {
+  const IDENTITY_PRINTED = '1234 $7 5678';
+  const bindingOpts = () => ({ ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } });
+
+  /** Emulates a real tmux that rejects `new-session -e` before 3.2, prints
+   *  the created-session identity on success, and answers the identity fence. */
+  function emulateTmux(versionString: string, opts: { rejectE?: boolean; duplicate?: boolean } = {}) {
+    let attempts = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') return versionString;
+      if (args[0] === 'new-session') {
+        if (opts.rejectE && args.includes('-e')) {
+          throw Object.assign(new Error('flag'), { status: 1, signal: null, stderr: 'command new-session: unknown flag -e' });
+        }
+        attempts += 1;
+        if (opts.duplicate && attempts === 1) {
+          throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', status: 1, signal: null });
+        }
+        if (opts.duplicate) {
+          throw Object.assign(new Error('dup'), { status: 1, signal: null, stderr: 'duplicate session: bmx-ver' });
+        }
+        return IDENTITY_PRINTED;
+      }
+      // has-session (probe) succeeds and the fence reads back our marker.
+      if (args[0] === 'show-environment' && args.includes('BOTMUX_CODEX_INSTANCE_BINDING')) {
+        return 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a';
+      }
+      return '';
+    }) as typeof execFileSync);
+    return () => attempts;
+  }
+
+  const setEnvironmentCalls = () => mockedExecFileSync.mock.calls
+    .filter(([, a]) => (a as string[])[0] === 'set-environment')
+    .map(([, a]) => a as string[]);
+
+  it('uses atomic new-session -e on tmux >= 3.2 and never set-environment', () => {
+    emulateTmux('tmux 3.3a');
+    const be = new TmuxPipeBackend('bmx-ver', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(newSessionArgs()).toEqual(expect.arrayContaining(['-e', 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a']));
+      expect(setEnvironmentCalls()).toEqual([]);
+    } finally { be.kill(); }
+  });
+
+  it('creates the session on a pre-3.2 tmux that rejects -e, then marks with set-environment', () => {
+    const attempts = emulateTmux('tmux 3.1c', { rejectE: true });
+    const be = new TmuxPipeBackend('bmx-ver', { createSession: true, ownsSession: true });
+    try {
+      // Without the version fallback this is a deterministic "unknown flag" failure.
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(attempts()).toBe(1);
+      expect(newSessionArgs().includes('-e')).toBe(false);
+      // set-environment takes NAME and VALUE as separate argv (NAME=VALUE is rejected).
+      expect(setEnvironmentCalls()).toEqual([
+        ['set-environment', '-t', 'bmx-ver', 'BOTMUX_CODEX_INSTANCE_BINDING', 'binding-a'],
+      ]);
+      // Marker is written before the identity fence reads it.
+      const order = mockedExecFileSync.mock.calls.map(([, a]) => (a as string[])[0]);
+      expect(order.indexOf('set-environment')).toBeLessThan(order.indexOf('show-environment'));
+    } finally { be.kill(); }
+  });
+
+  it('never writes set-environment on the duplicate path, even on old tmux', () => {
+    emulateTmux('tmux 2.9', { rejectE: true, duplicate: true });
+    const be = new TmuxPipeBackend('bmx-ver', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(newSessionArgs().includes('-e')).toBe(false);
+      expect(setEnvironmentCalls()).toEqual([]);
+    } finally { be.kill(); }
+  });
+
+  it('treats an unparsable tmux version like the old path (no -e, set-environment fallback)', () => {
+    const attempts = emulateTmux('tmux something-weird', { rejectE: true });
+    const be = new TmuxPipeBackend('bmx-ver', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], bindingOpts())).not.toThrow();
+      expect(newSessionArgs().includes('-e')).toBe(false);
+      expect(attempts()).toBe(1);
+      expect(setEnvironmentCalls()).toHaveLength(1);
+    } finally { be.kill(); }
+  });
 });
 
 describe('TmuxPipeBackend input addressing', () => {

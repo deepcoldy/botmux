@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -14,6 +14,7 @@ import {
   drainTraexRollout,
   findTraexRolloutSetByPid,
   findTraexRolloutBySessionId,
+  findTraexThreadByPid,
   readLatestTraexRuntime,
   traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
@@ -463,6 +464,48 @@ describe('findTraexRolloutBySessionId', () => {
       expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
     } finally {
       vi.useRealTimers();
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+});
+
+describe('findTraexThreadByPid', () => {
+  it.runIf(process.platform === 'linux')('uses the owned user thread and ignores subagent locks', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const lockDir = join(traeHome, 'cli', 'thread-writer-locks');
+    const userId = SID;
+    const subagentId = '00000000-0000-7000-8000-000000000002';
+    mkdirSync(lockDir, { recursive: true });
+    const userLock = join(lockDir, `${userId}.lock`);
+    const subagentLock = join(lockDir, `${subagentId}.lock`);
+    writeFileSync(userLock, '');
+    writeFileSync(subagentLock, '');
+    const userFd = openSync(userLock, 'r');
+    const subagentFd = openSync(subagentLock, 'r');
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT, updated_at_ms INTEGER, thread_source TEXT)');
+    const userTitle = `${'a'.repeat(77)}\n😀bc`;
+    db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)').run(userId, userTitle, 'fallback', 1, 'user');
+    db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)').run(
+      subagentId, '内部子任务', 'internal', 2, 'subagent',
+    );
+    db.close();
+    process.env.TRAE_HOME = traeHome;
+    let userFdOpen = true;
+
+    try {
+      expect(findTraexThreadByPid(process.pid)).toEqual({
+        cliSessionId: userId,
+        title: `${'a'.repeat(77)} 😀…`,
+      });
+      closeSync(userFd);
+      userFdOpen = false;
+      expect(findTraexThreadByPid(process.pid)).toBeUndefined();
+    } finally {
+      if (userFdOpen) closeSync(userFd);
+      closeSync(subagentFd);
       if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
       else process.env.TRAE_HOME = previousTraeHome;
     }

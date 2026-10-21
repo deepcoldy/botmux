@@ -89,7 +89,11 @@ function inlineScripts(html: string): string[] {
 }
 
 describe('getTerminalHtml 发出的内联脚本必须是合法 JS', () => {
-  it('模板字符串里的转义不会在注释中变成真实控制字符', () => {
+  // 源码结构护栏(K1)：整个 Web 终端是 worker.ts 里 getTerminalHtml() 的一个模板字符串，
+  // 该函数未导出、worker.ts 也无法在测试进程里 import，只能按编译器的转义规则从源码还原
+  // 发出的 HTML。守的不变量：发出的每段内联脚本都能解析，且不含裸 CR（注释里的真实回车会
+  // 截断注释 ⇒ 整段脚本 SyntaxError ⇒ 页面白屏，见 ba431e179f / #1267 第 8 条）。
+  it('模板字符串转义后的内联脚本可解析，且注释里没有会截断它的真实回车', () => {
     const html = servedHtml();
     const scripts = inlineScripts(html);
     // If this drops to zero the test would pass vacuously — the exact failure
@@ -101,16 +105,6 @@ describe('getTerminalHtml 发出的内联脚本必须是合法 JS', () => {
       // the remainder parses as the shape it will have in the browser.
       const parseable = script.replace(/\$\{[\s\S]*?\}/g, '0');
       expect(() => new Function(parseable)).not.toThrow();
-    }
-  });
-
-  it('任何 // 注释里都不含真实换行/回车（会截断注释并让整段脚本 SyntaxError）', () => {
-    const html = servedHtml();
-    const scripts = inlineScripts(html);
-    // Same vacuous-pass guard as above: with zero scripts the loop below runs
-    // zero assertions and this test goes green on a broken extractor.
-    expect(scripts.length, '没有解出任何内联脚本，说明提取逻辑坏了').toBeGreaterThan(0);
-    for (const script of scripts) {
       // A CR that is not part of a CRLF pair, anywhere in the emitted script,
       // is the fingerprint: worker.ts writes the whole document with \n.
       const strayCr = /\r(?!\n)/.exec(script);

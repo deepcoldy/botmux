@@ -2,7 +2,7 @@ import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
-import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -228,7 +228,7 @@ export interface CliAdapter {
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
-     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  (dsh). Forwarded as `--turn-timeout-ms` to opt into an idle watchdog;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
@@ -917,6 +917,8 @@ export interface StructuredBridgeDrainResult {
   /** Driver-owned incremental state. The worker hands it back verbatim as
    *  {@link StructuredBridgeDrainContext.state} and never looks inside. */
   state?: unknown;
+  /** Background tasks started / stopped in this byte range (Grok). */
+  backgroundTasks?: BackgroundTaskSignals;
 }
 
 export interface StructuredBridgeDrainContext {

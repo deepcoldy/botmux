@@ -744,8 +744,8 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
 
   it('LEXICAL containment: a leaf declared inside the root is dropped by its DECLARED path, not its realpath', () => {
     // The resolver decides containment purely on the (lexical) strings it's given.
-    // The worker MUST pass lexically-expanded (not realpath'd) paths — asserted in
-    // WIRING GUARD below — so that a symlinked-out leaf like
+    // The worker MUST pass lexically-expanded (not realpath'd) paths — asserted
+    // by the worker lexical-namespace guard below — so that a symlinked-out leaf like
     // ~/.claude/.credentials.json → /external/creds is still judged INSIDE ~/.claude
     // and dropped. If the worker instead realpath'd first, the resolver would see
     // /external/creds (outside the root) and wrongly KEEP it → the real host
@@ -758,62 +758,41 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(resolve4(['/external/creds/claude.json'], ['/home/u/.claude'])).toEqual(['/external/creds/claude.json']);
   });
 
-  it('WIRING GUARD: worker.ts assembles authPaths via resolveRedirectedAdapterAuthPaths, filtered in ONE LEXICAL HOME namespace then keepExisting', () => {
-    // A pure-fn test alone can't catch the worker dropping/reverting the call or
-    // passing wrong roots (the blind spot that let the first cut miss Seed/Relay),
-    // the ORDER bug (realpath before containment leaks a symlinked-out leaf), nor
-    // the NAMESPACE bug (codex #605 P1: expanding declaredAuthPaths with the
-    // CANONICAL home `sandboxHome` while `cliAdapter.claudeDataDir` is lexical →
-    // coversPath misses under a symlinked $HOME → the host credential leaks back in).
-    // Assert the actual call site in worker.ts source: it must (a) produce authPaths
-    // by keepExisting-wrapping the resolver, (b) feed the resolver declared paths
-    // expanded with the LEXICAL home (expandTildeLexical, NOT keepExisting/realpath
-    // first, NOT the canonical expandTilde), (c) thread willRedirectCliData, (d)
-    // build rehomedHostRoots from cliAdapter.claudeDataDir + the LEXICAL codex host
-    // root, also lexically expanded — both sides in the same namespace.
+  // 源码结构护栏(K2)：沙箱 fsPolicyCtx 在 worker spawn 闭包里内联组装，没有可调用的 seam，
+  // 上面的纯函数用例证明不了 worker 真的这样喂参数。守的不变量：重定向 CLI 数据目录时，
+  // authPaths 先在同一个 lexical home 命名空间里做容器判断（declaredAuthPaths 与 rehomedHostRoots
+  // 都经 expandTildeLexical，codex 根取 lexicalHome），之后才 keepExisting（realpath）。
+  // 顺序或命名空间一错，宿主 credential 会被 RW 绑回沙箱（#605 P1，commit 3591c8189）。
+  it('worker filters redirected authPaths in one lexical home namespace before realpath', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
-    // (a) survivors are realpath/existence-filtered AFTER the resolver, not before.
-    expect(src).toMatch(/authPaths:\s*keepExisting\(resolveRedirectedAdapterAuthPaths\(\{/);
-    // (b) declared authPaths reach the resolver via the LEXICAL expander, not keepExisting, not canonical expandTilde.
-    expect(src).toMatch(/declaredAuthPaths:\s*\[\.\.\.\(cliAdapter\.authPaths[\s\S]*?\)\]\.map\(expandTildeLexical\)/);
-    // (c) the redirect flag is threaded in.
-    expect(src).toMatch(/resolveRedirectedAdapterAuthPaths\(\{[\s\S]*?willRedirectCliData,/);
-    // (d) rehomed roots = adapter host data dir + codex host root, LEXICAL home, lexically expanded.
-    expect(src).toMatch(/rehomedHostRoots:\s*\[cliAdapter\.claudeDataDir,\s*isolatedCodexHome\s*\?\s*`\$\{lexicalHome\}\/\.codex`/);
-    expect(src).toMatch(/rehomedHostRoots:[\s\S]*?\.map\(expandTildeLexical\)/);
-    // negative: the resolver must NOT be fed keepExisting/realpath'd paths (the leak-order bug).
-    expect(src).not.toMatch(/declaredAuthPaths:\s*keepExisting\(/);
-    // negative: containment must NOT use the CANONICAL home expander on either side
-    // (the #605 P1 namespace bug — canonical vs lexical divergence under symlinked $HOME).
-    expect(src).not.toMatch(/declaredAuthPaths:\s*\[\.\.\.\(cliAdapter\.authPaths[\s\S]*?\)\]\.map\(expandTilde\)(?!Lexical)/);
-    expect(src).not.toMatch(/isolatedCodexHome\s*\?\s*`\$\{sandboxHome\}\/\.codex`/);
+    const start = src.indexOf('resolveRedirectedAdapterAuthPaths({');
+    expect(start).toBeGreaterThan(-1);
+    const call = src.slice(start, src.indexOf('}))', start));
+    // Survivors are realpath/existence-filtered AFTER containment, never before.
+    expect(src.slice(0, start)).toMatch(/authPaths:\s*keepExisting\($/);
+    expect(call).toMatch(/declaredAuthPaths:[^\n]*\.map\(expandTildeLexical\)/);
+    expect(call).toContain('willRedirectCliData');
+    expect(call).toMatch(/rehomedHostRoots:[\s\S]*\$\{lexicalHome\}\/\.codex[\s\S]*\.map\(expandTildeLexical\)/);
+    // Neither side may be pre-realpath'd or expanded with the canonical home.
+    expect(call).not.toContain('keepExisting');
+    expect(call).not.toContain('sandboxHome');
   });
 
-  it('WIRING GUARD: worker routes exact service credentials through their dedicated policy channel', () => {
+  // 源码结构护栏(K2)：同上，在 worker 闭包里组装、无 seam。守 ebsd/OMP 引入的两道沙箱围栏
+  // （#1041 / #955）：① 固定服务凭证只经 serviceCredentialReadOnlyPaths 专用通道下发（no-transport
+  // 轮次的 authority 过滤只作用于它），ebsd 拒绝 per-bot HOME 覆盖；② 受管会话目录：整个 sessions
+  // 根 mandatory deny，只把当前会话目录切回可写，越界即拒绝启动——否则沙箱内 CLI 可读写兄弟会话。
+  it('worker keeps the service-credential channel and the managed session-dir carve-out', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(src).toContain("import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';");
-    expect(src).toMatch(/const serviceCredentialReadOnlyPaths\s*=\s*resolveServiceSecretReadonlyFiles\([\s\S]*?cliAdapter\.sandboxSecretReadonlyPaths/);
-    expect(src).toMatch(/const fsPolicyCtx[\s\S]*?serviceCredentialReadOnlyPaths,/);
-    expect(src).not.toContain('mandatoryReadOnlyPaths.push(...keepSecretReadonlyFiles');
-    expect(src).toContain("if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);");
-  });
-
-  it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
-    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
-    expect(src).toMatch(/ompCurrentSessionDir\s*=\s*cliAdapter\.id === 'oh-my-pi'[\s\S]*?ompSessionDir\(effectiveAdapterSessionId\)/);
-    // ebsd shares the same exact-session carve-out shape through its own
-    // adapter-owned session dir; both feed the generalized managed dir.
-    expect(src).toMatch(/import \{[^}]*ebsdBotmuxSessionDir[^}]*\} from '\.\/adapters\/cli\/ebsd\.js';/);
-    expect(src).toMatch(/ebsdCurrentSessionDir\s*=\s*cliAdapter\.id === 'ebsd'[\s\S]*?ebsdBotmuxSessionDir\(effectiveAdapterSessionId\)/);
-    expect(src).toContain('const managedCurrentSessionDir = ompCurrentSessionDir ?? ebsdCurrentSessionDir;');
-    const precreate = src.indexOf('if (managedCurrentSessionDir) mkdirSync(managedCurrentSessionDir');
-    const policyAssembly = src.indexOf('const fsPolicyCtx =', precreate);
-    expect(precreate).toBeGreaterThan(-1);
-    expect(policyAssembly).toBeGreaterThan(precreate);
-    expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
-    expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir])');
+    const ctxStart = src.indexOf('const fsPolicyCtx');
+    expect(ctxStart).toBeGreaterThan(-1);
+    const ctx = src.slice(ctxStart, src.indexOf('const policy = ', ctxStart));
+    expect(src).toMatch(/const serviceCredentialReadOnlyPaths\s*=\s*resolveServiceSecretReadonlyFiles\(\s*cliAdapter\.sandboxSecretReadonlyPaths/);
+    expect(ctx).toMatch(/\bserviceCredentialReadOnlyPaths\b/);
+    expect(src).toMatch(/assertEbsdPerBotEnv\(perBotInjectEnv\)/);
+    expect(src).toMatch(/mandatoryDenyPaths\.push\(canonicalManagedSessionsRoot\)/);
+    expect(ctx).toMatch(/extraWritePaths:[^\n]*canonicalManagedSessionDir/);
+    expect(src).toMatch(/relative\(canonicalManagedSessionsRoot,\s*canonicalManagedSessionDir\)/);
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {

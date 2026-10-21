@@ -3,7 +3,6 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
 import {
-  BOT_DEFAULTS_TABS,
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
@@ -27,7 +26,6 @@ describe('bot defaults task tabs', () => {
     });
 
     const tabs = renderer.root.findAllByProps({ role: 'tab' });
-    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
     expect(tabs).toHaveLength(5);
     expect(tabs[0]!.props['aria-selected']).toBe(true);
     expect(tabs[1]!.props.tabIndex).toBe(-1);

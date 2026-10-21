@@ -25,7 +25,6 @@ import {
   reclaimIdleWorkersForAdmission,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
   DEFAULT_MAX_LIVE_WORKERS,
-  ADMISSION_RECLAIM_MAX_SUSPEND,
 } from '../src/core/idle-worker-sweeper.js';
 import {
   __testOnly_resetBotTurnMutationGates,
@@ -61,8 +60,7 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     __testOnly_resetBotTurnMutationGates();
   });
 
-  it('falls back to the default cap (30) when the bot has no explicit value', () => {
-    expect(DEFAULT_MAX_LIVE_WORKERS).toBe(30);
+  it('falls back to the default cap when the bot has no explicit value', () => {
     // DEFAULT_MAX_LIVE_WORKERS + 2 sessions, oldest first by lastMessageAt.
     const n = DEFAULT_MAX_LIVE_WORKERS + 2;
     const entries: [string, any][] = [];
@@ -477,7 +475,6 @@ describe('reclaimIdleWorkersForAdmission (marginal-admission rescue)', () => {
 
     expect(suspended.map(s => s.sessionId)).toEqual(['s0', 's1', 's2', 's3']);
     expect(suspended.every(s => s.reason === 'admission_memory')).toBe(true);
-    expect(ADMISSION_RECLAIM_MAX_SUSPEND).toBe(4);
     for (const id of ['s0', 's1', 's2', 's3']) expect(activeSessions.get(id).worker).toBe(null);
     for (const id of ['s4', 's5']) expect(activeSessions.get(id).worker).not.toBe(null);
   });

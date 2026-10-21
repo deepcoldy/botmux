@@ -35,6 +35,7 @@ export interface AncestorSessionContext {
 
 interface IdentityBoundSessionMarker extends AncestorSessionContext {
   procStart?: string;
+  capability?: string;
 }
 
 export interface AncestorSessionMarkerContext extends AncestorSessionContext {
@@ -42,6 +43,7 @@ export interface AncestorSessionMarkerContext extends AncestorSessionContext {
 }
 
 export interface AuthenticatedAncestorSessionContext extends AncestorSessionContext {
+  capability?: string;
   markerPid: number;
   procStart: string;
 }
@@ -101,6 +103,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       queuedTurnId?: unknown;
       queuedTurns?: unknown;
       steerPromotedTurn?: unknown;
+      capability?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
     const queuedTurns = Array.isArray(parsed.queuedTurns)
@@ -129,6 +132,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ...(queuedTurnId ? { queuedTurnId } : {}),
       ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
       ...(parsed.steerPromotedTurn === true ? { steerPromotedTurn: true } : {}),
+      ...(typeof parsed.capability === 'string' ? { capability: parsed.capability } : {}),
     };
   } catch {
     return { sessionId: '' };
@@ -180,6 +184,7 @@ export function findAuthenticatedAncestorSessionContext(
         turnId: marker.turnId,
         ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
         markerPid: pid,
+        ...(marker.capability ? { capability: marker.capability } : {}),
         procStart: marker.procStart,
         ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
         ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),

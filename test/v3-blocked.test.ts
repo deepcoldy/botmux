@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { validateDag, DagValidationError, DEFAULT_NODE_TIMEOUT_SEC, MAX_NODE_TIMEOUT_SEC } from '../src/workflows/v3/dag.js';
+import { validateDag, DagValidationError, MAX_NODE_TIMEOUT_SEC } from '../src/workflows/v3/dag.js';
 import { decideNext } from '../src/workflows/v3/orchestrator.js';
 import { appendEvent, readJournal, type StoredEvent } from '../src/workflows/v3/journal.js';
 import { materialize } from '../src/workflows/v3/state.js';
@@ -517,8 +517,7 @@ describe('resultSchema — dag 校验子集', () => {
     expect(() => validateDag(node({ resultSchema: { type: 'object', properties: tooMany } }))).toThrow(DagValidationError);
   });
 
-  it('timeoutSec：默认 1800、超 4h 上限拒', () => {
-    expect(DEFAULT_NODE_TIMEOUT_SEC).toBe(1800);
+  it('timeoutSec：超 4h 上限拒', () => {
     expect(() => validateDag(node({ timeoutSec: MAX_NODE_TIMEOUT_SEC + 1 }))).toThrow(DagValidationError);
     expect(validateDag(node({ timeoutSec: 7200 })).nodes[0]!.timeoutSec).toBe(7200);
   });

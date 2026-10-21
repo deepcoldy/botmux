@@ -342,7 +342,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   );
 
   it.each((['bridge', 'local-turn', 'local-turn-headless'] as const).flatMap(kind =>
-    (['minimax', 'traex', 'codex', 'claude-code'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
+    (['minimax', 'traex', 'codex', 'claude-code', 'dsh'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
     const content = ['实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -517,6 +517,22 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
     expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
     expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('retries a transient Lark failure for a DSH final without changing the reply', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'dsh';
+    ds.adoptedFrom = undefined;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, { ...finalOutputMsg(), content: 'DSH completed' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('delivers the body when the automatic image upload fails', async () => {
@@ -1460,7 +1476,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
   });
 
-  it('does not render a reviewers card when every email is unresolved', async () => {
+  it('renders a fail-closed reviewers card when every email is unresolved', async () => {
     resolveAllowedUsersWithMapMock.mockResolvedValue({
       resolved: [],
       map: new Map(),
@@ -1479,7 +1495,83 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
 
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('reuses the last-known-good reviewer id when contact resolution transiently fails', async () => {
+    // Seed a warm cache from a prior healthy send of the same reviewer list.
+    const { writeFeedbackReviewersCache } = await import('../src/utils/feedback-reviewers-cache.js');
+    writeFeedbackReviewersCache(config.session.dataDir, 'app_test', {
+      map: new Map([['oncall@example.com', 'ou_oncall_cached']]),
+      retainKeys: ['oncall@example.com'],
+    });
+    // The contact API now blips: every email staged transient with an empty map.
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The card still ships (control visible) and the snapshot keeps the cached
+    // id, so the configured real reviewer is not rejected.
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_transient_feedback');
+    expect(delivery?.policy?.reviewers).toEqual(['ou_oncall_cached']);
+  });
+
+  it('drops the feedback control on a cold-cache transient failure instead of shipping an empty snapshot', async () => {
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_cold_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('renders a fail-closed reviewers card when no reviewers are configured', async () => {
+    const sessionReply = vi.fn(async () => 'om_empty_reviewers_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    expect((await getSkillFeedbackStore(config.session.dataDir))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
+      .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });
 
   it('keeps feedback disabled by default but still records the turn-completion delivery', async () => {

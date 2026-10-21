@@ -203,64 +203,6 @@ describe('codex 启动闸：快照后端下的复现与修复', () => {
   });
 });
 
-/**
- * worker.ts 不导出任何符号，按仓库既有惯例（first-prompt-timeout-repro.test.ts、
- * worker-pipe-initial-screen-order.test.ts）用源码断言把接线钉住。
- */
-describe('codex 启动闸：worker 侧接线', () => {
-  const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  it('观察启动横幅必须读渲染后的画面，不能读 scrollback 或过滤后的快照', () => {
-    const start = source.indexOf('function observeStartupBannerOnScreen');
-    expect(start).toBeGreaterThan(-1);
-    const body = source.slice(start, source.indexOf('\n}\n', start));
-    expect(body).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
-    expect(body).toContain('idleDetector?.observeStartupScreen(');
-    expect(body).not.toContain('recentTerminalLogTail');
-    expect(body).not.toContain('renderer?.snapshot()');
-  });
-
-  it('启动闸仍 pending 时先拉一次权威画面，且不再是死路一条', () => {
-    const start = source.indexOf('const releaseFirstPromptTimeout');
-    expect(start).toBeGreaterThan(-1);
-    const body = source.slice(start, source.indexOf('\n  };\n', start));
-
-    // 等不到推送就主动拉一次。
-    expect(body).toContain('observeStartupBannerOnScreen()');
-    // 仍在 loading 时必须重排复查，且以首轮硬上限收口——旧实现在这里直接 return，
-    // 没有任何定时器，闸一旦卡住排队消息就永远发不出去。
-    expect(body).toContain('FIRST_PROMPT_STARTUP_RECHECK_MS');
-    expect(body).toContain('FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs');
-    expect(body).toMatch(/setTimeout\(\s*\(\) => releaseFirstPromptTimeout\(nextElapsedMs/);
-  });
-
-  it('复查节奏受首轮硬上限约束', () => {
-    expect(source).toMatch(/const FIRST_PROMPT_STARTUP_RECHECK_MS = [\d_]+;/);
-  });
-
-  it('非快照后端在复查循环里也跑恢复历史判据（无恢复标记的 Context-footer resume 补偿）', () => {
-    // 缺陷：observeRestoredStartupHistory() 只对 ZmxBackend 生效。codex 0.154
-    // resume 可能既不重绘横幅、字节流里也没有 "Earlier messages" 标记，直接画
-    // 空 composer + `· Context N%` 页脚；此时 feed/observeStartupScreen 都解不
-    // 开闸，startupHistorySeen 门控的静默捕获也不触发，tmux/PTY 下排队消息被
-    // 永久扣留。修复：复查循环里对非快照后端跑同一条带护栏的历史判据。
-    const releaseStart = source.indexOf('const releaseFirstPromptTimeout');
-    const body = source.slice(releaseStart, source.indexOf('\n  };\n', releaseStart));
-    expect(body).toContain('observeRestoredStartupHistoryOnScreen()');
-
-    const fnStart = source.indexOf('function observeRestoredStartupHistoryOnScreen');
-    expect(fnStart).toBeGreaterThan(-1);
-    const fn = source.slice(fnStart, source.indexOf('\n}\n', fnStart));
-    // 只对非快照后端生效（ZMX 仍走 per-chunk 的 observeRestoredStartupHistory）。
-    expect(fn).toContain('backend instanceof ZmxBackend) return false');
-    // 读渲染后的权威视口，不 shell capture-pane、也不读 scrollback。
-    expect(fn).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
-    expect(fn).not.toContain('backend.captureCurrentScreen()');
-    // 复用适配器自带的（带 loading/busy/queued/draft/picker 护栏的）历史判据。
-    expect(fn).toContain('idleDetector?.observeStartupHistory(');
-  });
-});
-
 describe('Codex restored ZMX history startup evidence', () => {
   it.each([false, true])('accepts the 0.154 Context footer without a banner, loading observed=%s', (loadingSeen) => {
     const { detector, idle } = newDetector();

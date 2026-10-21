@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DURABLE_INBOX_LANE_SESSION_CONTROL, type InboxClaim } from '../src/services/durable-coordination.js';
+import { normalizeCardActionData } from '../src/im/lark/card-action-data.js';
 import {
   durableDirectSessionControlEvent,
   durableLarkSessionControlEvent,
@@ -148,4 +149,36 @@ describe('durable Lark session control envelope', () => {
       now: 10,
     })).toThrow(error);
   });
+
+  it.each(['object', 'string', 'behaviors', 'envelope', 'envelope-behaviors'] as const)(
+    'accepts normalized %s card callbacks through the strict ingress validation',
+    shape => {
+      const value = { action: 'close' as const, session_id: 'session-1', root_id: 'om_root' };
+      const wrapped = shape === 'envelope' || shape === 'envelope-behaviors';
+      const innerShape = shape === 'envelope' ? 'string' : shape;
+      const inner = {
+        action: innerShape === 'behaviors' || innerShape === 'envelope-behaviors'
+          ? { behaviors: [{ type: 'callback', value }] }
+          : { value: innerShape === 'object' ? value : JSON.stringify(value) },
+        operator: { open_id: 'ou_operator' },
+        context: { open_message_id: 'om_card' },
+      };
+      const payload = wrapped
+        ? normalizeCardActionData({ header: { event_id: 'evt_control_1' }, event: inner })
+        : normalizeCardActionData({ event_id: 'evt_control_1', ...inner });
+      const event = durableLarkSessionControlEvent({
+        larkAppId: 'cli_test',
+        eventId: durableLarkSessionControlEventId('cli_test', 'evt_control_1'),
+        partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+        data: payload,
+        now: 10,
+      });
+      const parsed = parseDurableLarkSessionControlClaim(claim(event));
+      expect(parsed.action).toBe('close');
+      expect(parsed.sessionId).toBe('session-1');
+      expect(parsed.rootId).toBe('om_root');
+      expect(parsed.operatorOpenId).toBe('ou_operator');
+      expect(parsed.cardMessageId).toBe('om_card');
+    },
+  );
 });
