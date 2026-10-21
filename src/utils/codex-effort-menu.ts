@@ -22,10 +22,17 @@ export function sameModelIdentity(a: string | undefined, b: string | undefined):
   return !!a && !!b && modelIdentityKey(a) === modelIdentityKey(b);
 }
 
-/** Picker rows carry trailing markers like `(current)` / `(default)`; drop
- *  the whole trailing run before comparing the display name to the slug. */
+/** Extract the comparable model name from a picker row label.
+ *  Rows can carry:
+ *  - a trailing marker: `GPT-6-Astra (current)`;
+ *  - a description column padded with ≥2 spaces:
+ *    `GPT-6.1 Sol   GPT-6.1 Sol via Codex Bridge.` (Codex 0.162), possibly
+ *    with the marker between name and description.
+ *  Single spaces inside a display name (`GPT-6.1 Sol`) stay significant;
+ *  only the ≥2-space / tab gap marks the column boundary. */
 function modelRowName(label: string): string {
-  return label.replace(/(?:\s*\([^)]*\))+\s*$/, '').trim();
+  const nameColumn = label.split(/ {2,}|\t/)[0]!.trim();
+  return nameColumn.replace(/(?:\s*\([^)]*\))+\s*$/, '').trim();
 }
 
 /** Only recognize the native picker with its footer, never prose in scrollback. */

@@ -123,6 +123,35 @@ describe('Codex CLI effort menu', () => {
     expect(keys).toEqual(['Down', 'Enter', 'Down', 'Enter', 's']);
   });
 
+  it('matches the real picker rows whose name column is followed by a padded description column', async () => {
+    // Real Codex 0.162 rows pad a description after the model name, e.g.
+    // "15. GPT-6.1 Sol   GPT-6.1 Sol via Codex Bridge." — and the
+    // no-(current) name fallback must compare only the name column.
+    const { io, keys, model } = fixture({
+      model: 'gpt-6.1-sol',
+      modelRows: [
+        'GPT-6-Sol   GPT-6-Sol via Codex Bridge.',
+        'GPT-6.1 Sol   GPT-6.1 Sol via Codex Bridge.',
+      ],
+      modelSelected: 0,
+      receiptModel: 'GPT-6.1-Sol',
+    });
+    expect(await applyCodexEffortMenu(io, model, 'max')).toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(keys).toEqual(['Down', 'Enter', 'Down', 'Enter', 's']);
+  });
+
+  it('still recognizes the (current) marker when a description column follows it', async () => {
+    const { io, keys } = fixture({
+      modelRows: [
+        'GPT-6-Sol   GPT-6-Sol via Codex Bridge.',
+        'GPT-6-Astra (current)   GPT-6-Astra via Codex Bridge.',
+      ],
+      modelSelected: 1,
+    });
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max')).toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(keys).toEqual(['Enter', 'Down', 'Enter', 's']);
+  });
+
   it('still refuses a model page without either a (current) marker or a matching row name', async () => {
     const { io, keys } = fixture({
       model: 'gpt-6.1-sol',
