@@ -14,7 +14,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -2076,7 +2076,7 @@ async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
     const fallbackStreak = result.source === 'configured-fallback'
       ? latestVersionCache?.releaseBacked === releaseBacked
         && latestVersionCache.source === 'configured-fallback'
-        ? latestVersionCache.fallbackStreak + 1
+        ? latestVersionCache.fallbackStreak + (force ? 0 : 1)
         : 1
       : 0;
     const ttlMs = !result.version
@@ -4911,7 +4911,6 @@ const server = createServer(async (req, res) => {
         latest,
         versionLookupOk: latestResult.lookupOk,
         latestSource: latestResult.source,
-        latestAuthoritative: latestResult.source !== 'configured-fallback',
         behind: !!latest && isNewerVersion(latest, current),
         runningDaemons,
         ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
@@ -5033,6 +5032,8 @@ const server = createServer(async (req, res) => {
         let blockedByRestart = false;
         let oldVersion = '';
         let newVersion = '';
+        let skipped: string | undefined;
+        let source: string | undefined;
         try {
           const latest = await cachedLatestVersion(false);
           if (!latest.value) {
@@ -5043,11 +5044,15 @@ const server = createServer(async (req, res) => {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            await replaceStandaloneBinary(newVersion, runStrategy.target, {
+            const result = await applyStandaloneUpdate(newVersion, {
+              currentVersion: oldVersion, target: runStrategy.target,
+            }, {
               onProgress: (progress) => {
                 binaryUpdateProgress = { version: newVersion, ...progress };
               },
             });
+            if (result.skipped) { skipped = result.reason; return; }
+            source = result.source;
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
@@ -5058,10 +5063,15 @@ const server = createServer(async (req, res) => {
           binaryUpdateProgress = undefined;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (skipped) return jsonRes(res, 200, {
+          ok: true, oldVersion, newVersion: oldVersion, resolvedVersion: newVersion,
+          changed: false, restartRequired: false, skipped, manager: 'binary',
+        });
         return jsonRes(res, 200, {
           ok: true,
           oldVersion,
           newVersion,
+          source,
           // The swapped binary is on disk but THIS process still runs (and reports)
           // the old baked version, so `changed` cannot be derived by re-reading —
           // it is the version comparison that decided to update at all.

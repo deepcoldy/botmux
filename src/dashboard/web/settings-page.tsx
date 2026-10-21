@@ -132,7 +132,6 @@ interface UpdateStatus {
   current: string;
   latest: string | null;
   latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
-  latestAuthoritative?: boolean;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];

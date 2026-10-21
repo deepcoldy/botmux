@@ -280,17 +280,18 @@ describe('configured registry platform package', () => {
     ));
   });
 
-  it('rejects a mismatched version or malformed integrity', async () => {
-    const response = (body: unknown) => async () => jsonResponse(200, body);
+  it.each([
+    { name: 'botmux-linux-x64', version: '3.48.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.47.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.48.0', integrity: 'sha512-bad', tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.48.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'file:///x' },
+  ])('rejects invalid manifest $name / $version / $integrity / $tarball', async ({ name, version, integrity, tarball }) => {
     await expect(fetchConfiguredPackageArtifact('botmux-darwin-arm64', '3.48.0', {
       registry: 'https://mirror.example.com',
-      fetchImpl: response({
-        name: 'botmux-darwin-arm64',
-        version: '3.47.0',
-        dist: { tarball: 'https://mirror.example.com/pkg.tgz', integrity: 'sha512-bad' },
-      }),
+      fetchImpl: async () => jsonResponse(200, { name, version, dist: { tarball, integrity } }),
     })).resolves.toBeNull();
   });
+
 });
 
 describe('resolveNpmRegistryBase cache policy', () => {

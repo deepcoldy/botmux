@@ -23,6 +23,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
+import { getReleaseStream, resolveHttpProxy } from './release-download.js';
 
 export interface ReleaseNote {
   /** Semver without leading 'v' (e.g. "2.85.1"). */
@@ -267,6 +268,22 @@ export interface FetchOpts {
   registry?: string;
 }
 
+/** Metadata uses the same proxy-aware transport as release assets. The signal
+ * bounds redirects, CONNECT/TLS and body reads, not just receipt of headers. */
+async function fetchRegistryJson(url: string, opts?: FetchOpts): Promise<unknown> {
+  const signal = AbortSignal.timeout(opts?.timeoutMs ?? 8_000);
+  const headers = { Accept: 'application/json', 'User-Agent': 'botmux' };
+  if (opts?.fetchImpl) {
+    const res = await opts.fetchImpl(url, { headers, signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+  const res = await getReleaseStream(url, resolveHttpProxy(), 'botmux', 5, { signal, headers });
+  const chunks: Buffer[] = [];
+  for await (const chunk of res) chunks.push(Buffer.from(chunk));
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
 export type UpdateVersionSource = 'configured' | 'public' | 'configured-fallback';
 
 export interface UpdateVersionLookup {
@@ -399,16 +416,10 @@ export function decideUpgradeArgs(args: readonly string[], localDevInstall: bool
  * null on any failure.
  */
 export async function fetchDistTagVersion(tag: string = 'latest', opts?: FetchOpts): Promise<string | null> {
-  const fetchImpl = opts?.fetchImpl ?? fetch;
   const cleanTag = tag.trim().replace(/^@/, '');
   try {
     const base = await effectiveRegistryBase(opts?.registry);
-    const res = await fetchImpl(registryDistTagUrl(base, cleanTag), {
-      headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
-      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
-    });
-    if (!res.ok) return null;
-    const body = await res.json() as { version?: unknown };
+    const body = await fetchRegistryJson(registryDistTagUrl(base, cleanTag), opts) as { version?: unknown };
     return typeof body?.version === 'string' && parseVersion(body.version) ? body.version : null;
   } catch {
     return null;
@@ -473,15 +484,9 @@ export async function fetchConfiguredPackageArtifact(
   version: string,
   opts?: FetchOpts,
 ): Promise<RegistryPackageArtifact | null> {
-  const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
     const base = await effectiveRegistryBase(opts?.registry);
-    const res = await fetchImpl(registryPackageVersionUrl(base, packageName, version), {
-      headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
-      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
-    });
-    if (!res.ok) return null;
-    const body = await res.json() as {
+    const body = await fetchRegistryJson(registryPackageVersionUrl(base, packageName, version), opts) as {
       name?: unknown;
       version?: unknown;
       dist?: { tarball?: unknown; integrity?: unknown };
@@ -489,7 +494,7 @@ export async function fetchConfiguredPackageArtifact(
     if (body.name !== packageName || body.version !== version) return null;
     if (typeof body.dist?.tarball !== 'string' || typeof body.dist.integrity !== 'string') return null;
     if (!/^https?:\/\/\S+$/.test(body.dist.tarball)) return null;
-    if (!/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(body.dist.integrity)) return null;
+    if (!/^sha512-[A-Za-z0-9+/]{86}==$/.test(body.dist.integrity)) return null;
     return {
       packageName,
       version,

@@ -43,6 +43,7 @@ export function getReleaseStream(
   proxy: string | undefined,
   userAgent: string,
   redirectsLeft = 5,
+  options: { signal?: AbortSignal; headers?: Record<string, string> } = {},
 ): Promise<IncomingMessage> {
   return new Promise((resolve, reject) => {
     let target: URL;
@@ -56,7 +57,7 @@ export function getReleaseStream(
         res.destroy();
         res.socket?.destroy();
         if (redirectsLeft <= 0) { reject(new Error('重定向次数过多')); return; }
-        resolve(getReleaseStream(new URL(res.headers.location, rawUrl).toString(), proxy, userAgent, redirectsLeft - 1));
+        resolve(getReleaseStream(new URL(res.headers.location, rawUrl).toString(), proxy, userAgent, redirectsLeft - 1, options));
         return;
       }
       if (sc !== 200) { res.resume(); reject(new Error(`HTTP ${sc}`)); return; }
@@ -76,20 +77,28 @@ export function getReleaseStream(
       const port = target.port || '443';
       const creq = httpRequest({
         host: p.hostname, port: Number(p.port || 80), method: 'CONNECT', agent: false,
+        signal: options.signal,
         path: `${target.hostname}:${port}`,
         headers: { host: `${target.hostname}:${port}`, ...proxyAuth() },
       });
       creq.on('connect', (cres, socket) => {
-        if (cres.statusCode !== 200) { reject(new Error(`代理 CONNECT 失败: HTTP ${cres.statusCode}`)); return; }
+        if (cres.statusCode !== 200) { socket.destroy(); reject(new Error(`代理 CONNECT 失败: HTTP ${cres.statusCode}`)); return; }
+        if (options.signal?.aborted) { socket.destroy(); reject(options.signal.reason); return; }
         const tls = tlsConnect({ socket, servername: target.hostname }, () => {
           const greq = httpsRequest({
             method: 'GET', path: `${target.pathname}${target.search}`,
-            headers: { host: target.host, 'user-agent': userAgent },
+            headers: { ...options.headers, host: target.host, 'user-agent': userAgent },
+            signal: options.signal,
             createConnection: () => tls,
           }, handle);
           greq.on('error', reject);
           greq.end();
         });
+        // CONNECT relinquishes its request once the tunnel opens. Keep abort
+        // active during the TLS handshake as well as the subsequent HTTP body.
+        const abort = () => tls.destroy(new Error('release request aborted'));
+        options.signal?.addEventListener('abort', abort, { once: true });
+        tls.once('close', () => options.signal?.removeEventListener('abort', abort));
         tls.on('error', reject);
       });
       creq.on('error', reject);
@@ -101,7 +110,8 @@ export function getReleaseStream(
       // Plain HTTP via proxy: send the absolute-form request line to the proxy.
       const greq = httpRequest({
         host: p.hostname, port: Number(p.port || 80), method: 'GET', path: rawUrl,
-        headers: { host: target.host, 'user-agent': userAgent, ...proxyAuth() },
+        headers: { ...options.headers, host: target.host, 'user-agent': userAgent, ...proxyAuth() },
+        signal: options.signal,
       }, handle);
       greq.on('error', reject);
       greq.end();
@@ -110,7 +120,9 @@ export function getReleaseStream(
 
     // Direct (no proxy).
     const mod = isHttps ? httpsRequest : httpRequest;
-    const greq = mod(rawUrl, { headers: { 'user-agent': userAgent } }, handle);
+    const greq = mod(rawUrl, {
+      headers: { ...options.headers, 'user-agent': userAgent }, signal: options.signal,
+    }, handle);
     greq.on('error', reject);
     greq.end();
   });

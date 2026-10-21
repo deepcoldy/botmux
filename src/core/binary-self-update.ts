@@ -77,6 +77,9 @@ import { GITHUB_REPO } from './restart-report.js';
 import { getReleaseStream, resolveHttpProxy } from './release-download.js';
 import {
   fetchConfiguredPackageArtifact,
+  parseUpdateTarget,
+  shouldApplySelfUpdate,
+  type ParsedUpdateTarget,
   type RegistryPackageArtifact,
 } from './update-check.js';
 
@@ -226,6 +229,8 @@ export interface BinarySelfUpdateDeps {
 }
 
 function extractRegistryBinaryWithTar(archive: string, destinationDir: string): string {
+  // SHA-512 pins the archive to the registry manifest. Intermediate archive
+  // members rely on the host tar's path protections; check the final file below.
   const result = spawnSync('tar', [
     '-xzf', archive,
     '-C', destinationDir,
@@ -245,6 +250,31 @@ function extractRegistryBinaryWithTar(archive: string, destinationDir: string): 
     throw new Error('registry package candidate is not a regular file');
   }
   return candidate;
+}
+
+/** Shared direction guard for implicit latest updates, before any download or
+ * filesystem mutation. Explicit versions may reinstall or roll back. */
+export async function applyStandaloneUpdate(
+  version: string,
+  request: {
+    currentVersion: string;
+    target?: string;
+    updateTarget?: ParsedUpdateTarget;
+  },
+  deps: BinarySelfUpdateDeps = {},
+): Promise<({ skipped: false } & BinarySelfUpdateResult) | {
+  skipped: true;
+  reason: 'already_latest' | 'already_at_target';
+}> {
+  const updateTarget = request.updateTarget ?? parseUpdateTarget()!;
+  const decision = shouldApplySelfUpdate(updateTarget, version, request.currentVersion);
+  const reinstall = version === request.currentVersion
+    && updateTarget.isExplicit && !updateTarget.isChannel;
+  if (!decision.proceed && !reinstall) {
+    return { skipped: true, reason: decision.reason! };
+  }
+  const result = await replaceStandaloneBinary(version, request.target, deps);
+  return { skipped: false, ...result };
 }
 
 /**

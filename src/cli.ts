@@ -260,13 +260,13 @@ import {
 } from './utils/global-install.js';
 import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
 import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
-import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
+import { currentUpdateStrategy, applyStandaloneUpdate } from './core/binary-self-update.js';
 import {
   decideUpgradeArgs,
   fetchReleaseLatestVersion,
   fetchReleaseVersion,
-  isNewerVersion,
   multipleUpgradeTargetsMessage,
+  parseUpdateTarget,
   shouldApplySelfUpdate,
 } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -3533,11 +3533,10 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
       }
       const current = resolveCurrentVersion();
       const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
-      // install-release 允许同版本平迁到官方版；无参数 update 时当前自构版本若
-      // 不低于官方最新版则不隐式降级，切换旧版需显式指定目标版本。
-      const releaseMigration = strategy.kind === 'install-release'
-        && !isNewerVersion(current, resolvedVersion);
-      if (!decision.proceed && !releaseMigration) {
+      // Reinstall/migration is an explicit version operation; an implicit
+      // latest lookup must never replace an equal or newer running build.
+      const reinstall = target.isExplicit && !target.isChannel && current === resolvedVersion;
+      if (!decision.proceed && !reinstall) {
         if (strategy.kind === 'install-release') {
           console.log(`✅ 当前自部署版本 ${current} 不低于官方最新版 ${resolvedVersion}，未执行更新；如需切换到官方版请显式指定：botmux update ${resolvedVersion}`);
         } else if (decision.reason === 'already_latest') {
@@ -3557,14 +3556,17 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
       try {
         await withFileLock(lockTarget, async () => {
           acquired = true;
-          const r = await replaceStandaloneBinary(resolvedVersion, strategy.target);
+          const r = await applyStandaloneUpdate(resolvedVersion, {
+            currentVersion: current, target: strategy.target, updateTarget: target,
+          });
+          if (r.skipped) return;
           // install-release 的新二进制落在默认 launcher 路径，shell 里的 botmux
           // 可能仍解析到旧自构二进制（PATH 顺序或 launcher 不在 PATH），这里必须
           // 给出绝对路径，让 restart driver 确定是新版本，fleet 才会整体迁移。
           const restartCommand = strategy.kind === 'install-release'
             ? `"${r.target}" restart`
             : 'botmux restart';
-          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 ${restartCommand} 以应用更新。`);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}，source=${r.source}）。运行 ${restartCommand} 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
         // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
@@ -17782,7 +17784,7 @@ if (__entrySubcommand) {
 if (command === '__self-update') {
   const requested = process.argv[3] || 'latest';
   try {
-    const { replaceStandaloneBinary, currentBinaryInstallShape } = await import('./core/binary-self-update.js');
+    const { applyStandaloneUpdate, currentBinaryInstallShape } = await import('./core/binary-self-update.js');
     if (currentBinaryInstallShape() !== 'curl-binary') {
       // Fail closed rather than write into a tree a package manager owns.
       console.error('__self-update: 当前不是独立二进制安装（install.sh 形态），拒绝自替换');
@@ -17799,11 +17801,20 @@ if (command === '__self-update') {
     if (lookup.source === 'configured-fallback') {
       console.warn(`__self-update: 公共源暂不可用，使用当前配置镜像版本 ${version}`);
     }
-    const r = await replaceStandaloneBinary(version);
+    const current = resolveCurrentVersion();
+    const updateTarget = parseUpdateTarget(requested === 'latest' ? undefined : requested);
+    if (!updateTarget) throw new Error('非法的更新目标');
+    const r = await applyStandaloneUpdate(version, { currentVersion: current, updateTarget });
+    if (r.skipped) {
+      console.log(`BOTMUX_SELF_UPDATE_SKIPPED=${r.reason}`);
+      console.log(`BOTMUX_SELF_UPDATE_VERSION=${current}`);
+      console.log(`__self-update: skipped ${r.reason} (current=${current}, resolved=${version}, source=${lookup.source ?? 'explicit'})`);
+      process.exit(0);
+    }
     // The caller parses this line: after a self-replace the running process still
     // reports its OWN baked version, so it cannot discover the new one by re-reading.
     console.log(`BOTMUX_SELF_UPDATE_VERSION=${version}`);
-    console.log(`__self-update: ${r.asset} → ${r.target} (${r.bytes} bytes)`);
+    console.log(`__self-update: ${r.asset} → ${r.target} (${r.bytes} bytes, source=${r.source})`);
     process.exit(0);
   } catch (error) {
     console.error(`__self-update: ${error instanceof Error ? error.message : error}`);

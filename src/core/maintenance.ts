@@ -284,7 +284,7 @@ export async function applyBotmuxUpdate(
   }
   if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target}` };
+    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target} (source=${r.source})` };
   }
   const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
   const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
@@ -655,6 +655,10 @@ export function runSelfReplaceBlocking(version = 'latest'): string {
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || '').trim().split('\n').slice(-3).join('; ');
     throw new Error(`self-update exited with ${result.status ?? result.signal ?? 'unknown status'}${detail ? `: ${detail}` : ''}`);
+  }
+  // The child is captured, so forward its outcome/source for scheduled updates.
+  for (const line of `${result.stdout || ''}\n${result.stderr || ''}`.split('\n')) {
+    if (line.startsWith('__self-update:')) logger.info(`[maintenance] ${line}`);
   }
   const m = /BOTMUX_SELF_UPDATE_VERSION=(\S+)/.exec(result.stdout || '');
   return m?.[1] ?? '';

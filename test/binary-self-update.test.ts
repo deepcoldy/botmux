@@ -36,7 +36,8 @@ import {
   mainPackageRootForSubpackageBinary,
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
-import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
+import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary, applyStandaloneUpdate } from '../src/core/binary-self-update.js';
+import { parseUpdateTarget } from '../src/core/update-check.js';
 import type { BinaryUpdateProgress } from '../src/core/binary-self-update.js';
 import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation, verifyBinaryRestartTarget } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
@@ -830,6 +831,40 @@ describe('self-deployed release installation', () => {
   });
 });
 
+describe('applyStandaloneUpdate', () => {
+  it.each(['3.47.0', '3.48.0'])('skips implicit latest %s without downloads or disk writes', async (version) => {
+    const target = join(tmp(), 'botmux');
+    writeFileSync(target, 'CURRENT');
+    let downloads = 0;
+    const result = await applyStandaloneUpdate(version, { currentVersion: '3.48.0', target }, {
+      fetchStream: async () => { downloads++; return Readable.from([]); },
+    });
+    expect(result).toEqual({ skipped: true, reason: 'already_latest' });
+    expect(downloads).toBe(0);
+    expect(readFileSync(target, 'utf8')).toBe('CURRENT');
+  });
+
+  it.each([
+    { version: '3.49.0', explicit: false },
+    { version: '3.47.0', explicit: true },
+    { version: '3.48.0', explicit: true },
+  ])('installs an allowed target $version (explicit=$explicit)', async ({ version, explicit }) => {
+    const target = join(tmp(), 'botmux');
+    writeFileSync(target, 'CURRENT');
+    const payload = Buffer.alloc(1_100_000, 0x41);
+    const result = await applyStandaloneUpdate(version, {
+      currentVersion: '3.48.0', target,
+      updateTarget: parseUpdateTarget(explicit ? version : undefined)!,
+    }, {
+      fetchStream: async () => Readable.from([payload]),
+      fetchChecksum: async () => createHash('sha256').update(payload).digest('hex'),
+      probeBinary: () => ({ status: 0, stdout: version }),
+    });
+    expect(result).toMatchObject({ skipped: false, source: 'github-release' });
+    expect(readFileSync(target)).toEqual(payload);
+  });
+});
+
 describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   const BIG = 1_100_000; // over the "this is an error page, not a binary" floor
   const probeOk = () => ({ status: 0, stdout: '3.99.0\n' });
@@ -885,6 +920,7 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     const archive = Buffer.from('tampered registry fixture');
     const payload = fakeAsset(0x47);
     let githubFetches = 0;
+    let extractions = 0;
     const r = await replaceStandaloneBinary('3.99.0', target, {
       resolveRegistryArtifact: async (packageName, version) => ({
         packageName,
@@ -893,8 +929,11 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
         integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
       }),
       fetchRegistryStream: async () => Readable.from([archive]),
-      extractRegistryBinary: () => {
-        throw new Error('must not extract an integrity mismatch');
+      extractRegistryBinary: (_archive, destinationDir) => {
+        extractions++;
+        const candidate = join(destinationDir, 'botmux');
+        writeFileSync(candidate, payload);
+        return candidate;
       },
       fetchStream: async () => {
         githubFetches++;
@@ -905,6 +944,7 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     });
     expect(r.source).toBe('github-release');
     expect(githubFetches).toBe(1);
+    expect(extractions).toBe(0);
     expect(statSync(target).size).toBe(BIG);
   });
 

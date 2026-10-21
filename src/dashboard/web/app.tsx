@@ -76,7 +76,6 @@ type BotmuxUpdateStatus = {
   latest: string | null;
   versionLookupOk: boolean;
   latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
-  latestAuthoritative?: boolean;
   behind: boolean;
   localDevInstall: boolean;
   updateSupported: boolean;
