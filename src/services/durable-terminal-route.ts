@@ -8,6 +8,21 @@ import type {
 export const DURABLE_TERMINAL_ROUTE_VERSION = 1 as const;
 export const DURABLE_TERMINAL_ROUTE_TTL_MS = 45_000;
 
+export function durableTerminalRoutePort(
+  env: Readonly<{
+    BOTMUX_TERMINAL_ROUTE_PORT?: string;
+    BOTMUX_DASHBOARD_PORT?: string;
+  }>,
+): number | undefined {
+  const explicit = env.BOTMUX_TERMINAL_ROUTE_PORT?.trim();
+  const raw = explicit || env.BOTMUX_DASHBOARD_PORT?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 1 && value <= 65_535
+    ? value
+    : undefined;
+}
+
 export interface DurableTerminalRoute {
   version: typeof DURABLE_TERMINAL_ROUTE_VERSION;
   type: 'botmux.terminal-route';

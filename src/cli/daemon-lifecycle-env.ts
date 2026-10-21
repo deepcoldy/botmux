@@ -35,6 +35,7 @@ export const DAEMON_ENV_KEYS = [
   // Provider-neutral address published for cross-instance terminal routing.
   // Platform-specific discovery belongs in the deployment layer.
   'BOTMUX_TERMINAL_ROUTE_HOST',
+  'BOTMUX_TERMINAL_ROUTE_PORT',
   'BOTMUX_DAEMON_IPC_BASE_PORT',
   'BOTMUX_DASHBOARD_PUBLIC_READONLY',
   // Closed local companion control surface. The values are lifecycle settings:

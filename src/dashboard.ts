@@ -190,7 +190,10 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
-import { createDurableTerminalRouteRegistry } from './services/durable-terminal-route.js';
+import {
+  createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
+} from './services/durable-terminal-route.js';
 import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
@@ -906,10 +909,10 @@ const terminalFrontProxy = createTerminalFrontProxy({
 });
 
 const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
-const terminalRoutePort = Number(process.env.BOTMUX_DASHBOARD_PORT);
+const terminalRoutePort = durableTerminalRoutePort(process.env);
 let terminalRoutePublishInFlight: Promise<void> | undefined;
 async function publishLiveTerminalRoutes(): Promise<void> {
-  if (!terminalRouteRegistry || !terminalRouteHost || !Number.isSafeInteger(terminalRoutePort)) return;
+  if (!terminalRouteRegistry || !terminalRouteHost || terminalRoutePort === undefined) return;
   await Promise.all(aggregator.getSessions().map(async row => {
     if (row.status === 'closed'
         || row.status === 'dormant'

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   appendDurablePrimaryInputCommit,
   durablePrimaryExistingTurnDisposition,
+  durablePrimaryRejectedLiveSendDisposition,
+  shouldPersistTriggeredMessage,
 } from '../src/services/durable-primary-turn-admission.js';
 
 function state(overrides: Record<string, unknown> = {}) {
@@ -70,6 +72,29 @@ describe('durable primary existing-turn admission', () => {
 
   it('admits an uncommitted turn only on an idle ready worker', () => {
     expect(durablePrimaryExistingTurnDisposition(state(), 'om_next')).toBe('ready');
+  });
+
+  it('retries a primary live send until the worker proves acceptance', () => {
+    expect(durablePrimaryRejectedLiveSendDisposition(true)).toBe('retry');
+    expect(durablePrimaryRejectedLiveSendDisposition(false)).toBe('ignored');
+  });
+
+  it('does not persist triggered-message dedupe for an unadmitted primary retry', () => {
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: true,
+      handlerCompleted: true,
+      admitted: false,
+    })).toBe(false);
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: true,
+      handlerCompleted: true,
+      admitted: true,
+    })).toBe(true);
+    expect(shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: false,
+      handlerCompleted: true,
+      admitted: false,
+    })).toBe(true);
   });
 
   it('dedupes commit markers and retains only the newest bounded history', () => {

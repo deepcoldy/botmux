@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import {
   createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
   durableTerminalRouteKey,
   durableTerminalRouteSessionKey,
   liveDurableTerminalRoute,
@@ -9,6 +10,20 @@ import {
 } from '../src/services/durable-terminal-route.js';
 
 describe('durable terminal route registry', () => {
+  it('publishes through an explicit route port without changing the dashboard listener port', () => {
+    expect(durableTerminalRoutePort({
+      BOTMUX_TERMINAL_ROUTE_PORT: '11419',
+      BOTMUX_DASHBOARD_PORT: '7891',
+    })).toBe(11419);
+    expect(durableTerminalRoutePort({ BOTMUX_DASHBOARD_PORT: '7891' })).toBe(7891);
+    expect(durableTerminalRoutePort({
+      BOTMUX_TERMINAL_ROUTE_PORT: 'invalid',
+      BOTMUX_DASHBOARD_PORT: '7891',
+    })).toBeUndefined();
+    expect(durableTerminalRoutePort({ BOTMUX_TERMINAL_ROUTE_PORT: '65536' }))
+      .toBeUndefined();
+  });
+
   it('publishes a fenced literal-IP route and resolves it from another replica', async () => {
     let now = 100;
     const store = new SqliteDurableCoordinationStore(':memory:', { now: () => now });

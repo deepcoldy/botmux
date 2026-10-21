@@ -109,6 +109,7 @@ import {
   durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
+import { shouldPersistTriggeredMessage } from '../../services/durable-primary-turn-admission.js';
 import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 
 function vcMeetingEventPayloadForLog(data: any): string {
@@ -3230,7 +3231,11 @@ async function dispatchHumanMessageViaHandlers(
   } finally {
     // A pre-admission failure can be retried by a later edit. Once admitted,
     // even a subsequent presentation error must not allow the task to run again.
-    if (messageId && (completed || payload.ctx.ingressAdmission?.admitted)) {
+    if (messageId && shouldPersistTriggeredMessage({
+      durablePrimaryDispatch: !!payload.ctx.durablePrimaryDispatch,
+      handlerCompleted: completed,
+      admitted: payload.ctx.ingressAdmission?.admitted === true,
+    })) {
       markMessageTriggered(appId, messageId);
     }
     if (key) pendingMessageTriggers.delete(key);
