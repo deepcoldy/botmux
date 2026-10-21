@@ -840,6 +840,73 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   function sha256(buf: Buffer): string {
     return createHash('sha256').update(buf).digest('hex');
   }
+  function sha512Integrity(buf: Buffer): string {
+    return `sha512-${createHash('sha512').update(buf).digest('base64')}`;
+  }
+
+  it('prefers a verified configured-registry package over the GitHub asset', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const archive = Buffer.from('compressed registry fixture');
+    const payload = fakeAsset(0x52);
+    let githubFetches = 0;
+    const r = await replaceStandaloneBinary('3.99.0', target, {
+      resolveRegistryArtifact: async (packageName, version) => ({
+        packageName,
+        version,
+        tarball: 'https://mirror.example.com/botmux.tgz',
+        integrity: sha512Integrity(archive),
+      }),
+      fetchRegistryStream: async () => Readable.from([archive]),
+      extractRegistryBinary: (_archive, destinationDir) => {
+        const packageDir = join(destinationDir, 'package');
+        mkdirSync(packageDir, { recursive: true });
+        const candidate = join(packageDir, 'botmux');
+        writeFileSync(candidate, payload);
+        return candidate;
+      },
+      fetchStream: async () => {
+        githubFetches++;
+        return Readable.from([payload]);
+      },
+      probeBinary: probeOk,
+    });
+    expect(r.source).toBe('registry-package');
+    expect(r.bytes).toBe(BIG);
+    expect(githubFetches).toBe(0);
+    expect(statSync(target).size).toBe(BIG);
+  });
+
+  it('falls back to GitHub when the registry package integrity is invalid', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const archive = Buffer.from('tampered registry fixture');
+    const payload = fakeAsset(0x47);
+    let githubFetches = 0;
+    const r = await replaceStandaloneBinary('3.99.0', target, {
+      resolveRegistryArtifact: async (packageName, version) => ({
+        packageName,
+        version,
+        tarball: 'https://mirror.example.com/botmux.tgz',
+        integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
+      }),
+      fetchRegistryStream: async () => Readable.from([archive]),
+      extractRegistryBinary: () => {
+        throw new Error('must not extract an integrity mismatch');
+      },
+      fetchStream: async () => {
+        githubFetches++;
+        return Readable.from([payload]);
+      },
+      fetchChecksum: async () => sha256(payload),
+      probeBinary: probeOk,
+    });
+    expect(r.source).toBe('github-release');
+    expect(githubFetches).toBe(1);
+    expect(statSync(target).size).toBe(BIG);
+  });
 
   it('verifies the published checksum and lands the new bytes', async () => {
     const dir = tmp();

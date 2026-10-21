@@ -3,14 +3,15 @@
  * release notes accumulated since the running version. Powers the Settings
  * "version & update" card (manual update flow) — see dashboard.ts /api/update/*.
  *
- * The `latest` lookup MUST go through the registry npm is actually configured
- * to use (`npm config get registry`): the update button installs with the
- * owning package manager, which resolves through that same .npmrc family.
- * Checking the public registry while installing through a lagging mirror made
- * the card advertise upgrades that could never install. The public registry is
- * only a fallback for when the npm config can't be read (npm missing/unusual
- * PATH). The ROLLBACK packument lookup, by contrast, deliberately stays
- * public: the rollback install pins the registry to public too
+ * Package-manager-owned installs MUST query the registry npm is configured to
+ * use (`npm config get registry`), because that is where their update command
+ * installs from. Release-backed binaries are different: they install a GitHub
+ * Release asset, so they query the public npm dist-tag first and use the
+ * configured registry only as a source-labelled fallback. Once a concrete
+ * version is selected, the configured registry's exact platform package may be
+ * used as a faster transport, with integrity + runtime verification and GitHub
+ * fallback. The ROLLBACK packument lookup deliberately stays public: the
+ * rollback install pins its registry to public too
  * (`withGlobalInstallRegistry` in global-install.ts, rollback-only opt-in),
  * and the allow-list validated against this packument must match the source
  * that pin installs from.
@@ -266,6 +267,37 @@ export interface FetchOpts {
   registry?: string;
 }
 
+export type UpdateVersionSource = 'configured' | 'public' | 'configured-fallback';
+
+export interface UpdateVersionLookup {
+  version: string | null;
+  source: UpdateVersionSource | null;
+}
+
+export interface RegistryPackageArtifact {
+  packageName: string;
+  version: string;
+  tarball: string;
+  integrity: string;
+}
+
+const MIRROR_FALLBACK_RETRY_MS = [
+  60_000,
+  5 * 60_000,
+  15 * 60_000,
+  30 * 60_000,
+] as const;
+
+/** Retry schedule after the public source failed but the configured mirror
+ *  succeeded. The first fallback heals quickly; a persistent public outage
+ *  backs off to the normal 30-minute cache ceiling. */
+export function mirrorFallbackRetryMs(streak: number): number {
+  const normalized = Number.isFinite(streak) ? Math.max(1, Math.floor(streak)) : 1;
+  return MIRROR_FALLBACK_RETRY_MS[
+    Math.min(normalized - 1, MIRROR_FALLBACK_RETRY_MS.length - 1)
+  ];
+}
+
 export interface ParsedUpdateTarget {
   raw: string;
   tag: string;
@@ -390,6 +422,83 @@ export async function fetchDistTagVersion(tag: string = 'latest', opts?: FetchOp
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   return fetchDistTagVersion('latest', opts);
+}
+
+/**
+ * Resolve a release-backed update target.
+ *
+ * Standalone/self-deployed binaries install GitHub Release assets, so the
+ * public npm dist-tag is the authoritative version index. A configured npm
+ * mirror is only a transparent fallback when the public registry is
+ * unavailable; callers must surface that weaker provenance instead of claiming
+ * the result is the global latest version.
+ */
+export async function fetchReleaseVersion(
+  tag: string = 'latest',
+  opts?: FetchOpts,
+): Promise<UpdateVersionLookup> {
+  const publicVersion = await fetchDistTagVersion(tag, {
+    ...opts,
+    registry: PUBLIC_REGISTRY,
+  });
+  if (publicVersion) return { version: publicVersion, source: 'public' };
+
+  const configuredRegistry = await effectiveRegistryBase(opts?.registry);
+  if (configuredRegistry === PUBLIC_REGISTRY) return { version: null, source: null };
+
+  const fallbackVersion = await fetchDistTagVersion(tag, {
+    ...opts,
+    registry: configuredRegistry,
+  });
+  return fallbackVersion
+    ? { version: fallbackVersion, source: 'configured-fallback' }
+    : { version: null, source: null };
+}
+
+export function fetchReleaseLatestVersion(opts?: FetchOpts): Promise<UpdateVersionLookup> {
+  return fetchReleaseVersion('latest', opts);
+}
+
+export function registryPackageVersionUrl(base: string, packageName: string, version: string): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`;
+}
+
+/** Resolve the exact platform package from the configured registry. This is a
+ * transport optimization only: the caller has already chosen `version`.
+ * Malformed manifests fail closed so the binary updater can fall back to the
+ * GitHub Release asset. */
+export async function fetchConfiguredPackageArtifact(
+  packageName: string,
+  version: string,
+  opts?: FetchOpts,
+): Promise<RegistryPackageArtifact | null> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  try {
+    const base = await effectiveRegistryBase(opts?.registry);
+    const res = await fetchImpl(registryPackageVersionUrl(base, packageName, version), {
+      headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as {
+      name?: unknown;
+      version?: unknown;
+      dist?: { tarball?: unknown; integrity?: unknown };
+    };
+    if (body.name !== packageName || body.version !== version) return null;
+    if (typeof body.dist?.tarball !== 'string' || typeof body.dist.integrity !== 'string') return null;
+    if (!/^https?:\/\/\S+$/.test(body.dist.tarball)) return null;
+    if (!/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(body.dist.integrity)) return null;
+    return {
+      packageName,
+      version,
+      tarball: body.dist.tarball,
+      integrity: body.dist.integrity,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -263,7 +263,8 @@ import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-displ
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import {
   decideUpgradeArgs,
-  fetchDistTagVersion,
+  fetchReleaseLatestVersion,
+  fetchReleaseVersion,
   isNewerVersion,
   multipleUpgradeTargetsMessage,
   shouldApplySelfUpdate,
@@ -3521,10 +3522,14 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
   if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     try {
-      const resolvedVersion = await fetchDistTagVersion(target.tag);
+      const lookup = await fetchReleaseVersion(target.tag);
+      const resolvedVersion = lookup.version;
       if (!resolvedVersion) {
         console.error(`❌ 无法获取目标版本（${target.tag}）信息（网络不可达、版本不存在或 registry 异常）。`);
         process.exit(1);
+      }
+      if (lookup.source === 'configured-fallback') {
+        console.warn(`⚠️ 公共源暂不可用，使用当前配置镜像解析目标版本：${resolvedVersion}`);
       }
       const current = resolveCurrentVersion();
       const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
@@ -17783,11 +17788,16 @@ if (command === '__self-update') {
       console.error('__self-update: 当前不是独立二进制安装（install.sh 形态），拒绝自替换');
       process.exit(1);
     }
-    const { fetchLatestVersion } = await import('./core/update-check.js');
-    const version = requested === 'latest' ? await fetchLatestVersion() : requested;
+    const lookup = requested === 'latest'
+      ? await fetchReleaseLatestVersion()
+      : { version: requested, source: null };
+    const version = lookup.version;
     if (!version) {
       console.error('__self-update: 无法解析最新版本（网络不可达或 registry 异常）');
       process.exit(1);
+    }
+    if (lookup.source === 'configured-fallback') {
+      console.warn(`__self-update: 公共源暂不可用，使用当前配置镜像版本 ${version}`);
     }
     const r = await replaceStandaloneBinary(version);
     // The caller parses this line: after a self-replace the running process still

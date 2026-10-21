@@ -43,6 +43,7 @@ describe('dashboard update errors', () => {
         mock.module('./src/core/update-check.js', () => ({
           ...updateCheck,
           fetchLatestVersion: async () => '3.41.0',
+          fetchReleaseLatestVersion: async () => ({ version: '3.41.0', source: 'public' }),
         }));
         const maintenance = { ...await import('./src/core/maintenance.js') };
         mock.module('./src/core/maintenance.js', () => ({

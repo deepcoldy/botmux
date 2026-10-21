@@ -75,6 +75,8 @@ type BotmuxUpdateStatus = {
   current: string;
   latest: string | null;
   versionLookupOk: boolean;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
+  latestAuthoritative?: boolean;
   behind: boolean;
   localDevInstall: boolean;
   updateSupported: boolean;
@@ -829,6 +831,7 @@ function TopbarVersionControl(props: {
 
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
+  const mirrorFallback = status.latestSource === 'configured-fallback';
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
   // Older backends omit rollbackSupported; retain their update capability fallback.
   const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
@@ -1095,10 +1098,14 @@ function TopbarVersionControl(props: {
           ? t('update.topbarRefreshFailed')
           : behind
           ? automatic
-            ? t('update.versionUpgradePrompt', { version: latestVersion })
+            ? mirrorFallback
+              ? t('update.mirrorVersionUpgradePrompt', { version: latestVersion })
+              : t('update.versionUpgradePrompt', { version: latestVersion })
             : unavailableReason
           : status.latest
-            ? t('update.upToDate')
+            ? mirrorFallback
+              ? t('update.mirrorUpToDate')
+              : t('update.upToDate')
             : t('update.checkUnavailable');
   const action = !automatic
     ? t('update.topbarReview')
