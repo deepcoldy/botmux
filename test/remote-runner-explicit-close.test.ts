@@ -220,6 +220,36 @@ describe('remote runner explicit close', () => {
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
   });
 
+  it('retires an exited provider so the next close can reconcile through a fresh control worker', async () => {
+    const { ds, worker } = createFixture(true);
+
+    worker!.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.worker).toBeNull();
+    expect(worker!.kill).toHaveBeenCalledWith('SIGTERM');
+
+    const wake = vi.fn(async (target: DaemonSession) => {
+      const replacement = createFakeWorker();
+      target.worker = replacement as never;
+      target.workerReady = true;
+      __testOnly_setupWorkerHandlers(target, replacement as never);
+      return true;
+    });
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(wake).toHaveBeenCalledOnce();
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+  });
+
   it('keeps a provider-proven retryable close active without latching a fence', async () => {
     const { ds, worker } = createFixture(true);
     worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {

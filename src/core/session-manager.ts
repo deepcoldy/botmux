@@ -18,7 +18,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -4024,10 +4024,6 @@ export async function resumeSession(
       const current = sessionStore.getOwnedSession(sessionId);
       if (!current || current.status !== 'active') return current?.status === 'closed';
       if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
-        logger.error(
-          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
-          + 'leaving the row active for explicit reconciliation',
-        );
         return false;
       }
       try {
@@ -4051,13 +4047,26 @@ export async function resumeSession(
       });
       return true;
     };
+    const reconcileStartedRemoteResumeExit = async (): Promise<boolean> => {
+      if (rollbackUnstartedRemoteResume()) return true;
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} provider exited after advancing lineage; `
+        + 'running an authoritative close before canonical activation',
+      );
+      const closed = await closeSessionForBackgroundCleanup(
+        sessionId,
+        'remote resume provider-exit rollback',
+      );
+      const current = sessionStore.getOwnedSession(sessionId);
+      return closed.ok && current?.status === 'closed';
+    };
     let started = false;
     try {
       started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
         onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
-        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+        onRemoteBackendStartupExit: reconcileStartedRemoteResumeExit,
       });
     } catch (error) {
       logger.warn(

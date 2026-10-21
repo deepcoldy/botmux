@@ -161,6 +161,7 @@ describe('durable session control consumer', () => {
       workerId: 'control-failover',
       ownedPartitionKeys: () => [],
       partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 0,
       dispatch: async control => {
         dispatched.push(control.sessionId);
         return { kind: 'settled' };
@@ -171,6 +172,46 @@ describe('durable session control consumer', () => {
     await consumer.ready;
     expect(dispatched).toEqual(['session-a']);
     await consumer.stop();
+    await store.close();
+  });
+
+  it('gives the exact owner one interval before prefix failover can steal a fresh control', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const standbyDispatch = vi.fn();
+    const standby = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-standby',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      fallbackClaimIntervalMs: 1_000,
+      dispatch: standbyDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await standby.ready;
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    const ownerDispatch = vi.fn(async () => ({ kind: 'settled' as const }));
+    const owner = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-owner',
+      ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      dispatch: ownerDispatch,
+      concurrency: 1,
+      intervalMs: 60_000,
+      now: () => now,
+    });
+    await owner.ready;
+    expect(ownerDispatch).toHaveBeenCalledOnce();
+    expect(standbyDispatch).not.toHaveBeenCalled();
+
+    now += 1_000;
+    await owner.stop();
+    await standby.stop();
     await store.close();
   });
 

@@ -462,7 +462,8 @@ describe('worker-pool lifecycle hook integration', () => {
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
     ds.session.backendType = 'remote-runner';
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     __testOnly_setupWorkerHandlers(ds, worker, {
       ready: true,
       failureNotified: false,
@@ -482,7 +483,7 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
-  it('disarms remote rebuild reconciliation after backend state is durable', async () => {
+  it('keeps remote rebuild reconciliation armed while canonical commit is pending', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     ds.session.cliId = 'remote-runner';
@@ -492,6 +493,7 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
+    ds.suppressRecoveryCard = true;
     const reconcile = vi.fn(() => true);
     const startupState = {
       ready: true,
@@ -512,8 +514,42 @@ describe('worker-pool lifecycle hook integration', () => {
     await flush();
 
     expect(ds.session.remoteBackendState?.generation).toBe(3);
-    expect(startupState.onRemoteBackendStartupExit).toBeUndefined();
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
     expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('retires an exited remote provider after canonical commit without replaying startup rollback', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.suppressRecoveryCard = undefined;
+    const reconcile = vi.fn(async () => true);
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    } as any);
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0]?.[1]).toEqual(expect.stringContaining('不支持重启'));
   });
 
   it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
@@ -533,7 +569,8 @@ describe('worker-pool lifecycle hook integration', () => {
       provider: 'reference',
       generation: 2,
     };
-    const reconcile = vi.fn(() => true);
+    ds.suppressRecoveryCard = true;
+    const reconcile = vi.fn(async () => true);
     const startupState = {
       ready: true,
       failureNotified: false,
