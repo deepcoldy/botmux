@@ -54,6 +54,7 @@ import {
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -2815,7 +2816,9 @@ function SessionsPage(): React.JSX.Element {
   const [idleCleanupBusy, setIdleCleanupBusy] = useState(false);
   const [idleCleanupHours, setIdleCleanupHours] = useState<IdleCleanupHours>(24);
   const [idleCleanupStatus, setIdleCleanupStatus] = useState('');
-  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
+  // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -3986,7 +3989,10 @@ function SessionsPage(): React.JSX.Element {
 
       <Drawer
         row={drawerRow}
-        onClose={() => setDrawerSessionId(null)}
+        onClose={() => {
+          setDrawerSessionId(null);
+          clearHashQueryParam('session');
+        }}
         locateSession={locateSession}
         openHistory={openHistoryModal}
         resumeSession={resumeSession}

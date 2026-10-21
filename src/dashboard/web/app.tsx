@@ -2,7 +2,7 @@
 import type React from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
 import {
@@ -58,6 +58,8 @@ import {
   NO_WORKBENCH_CAPABILITIES,
   parseWorkbenchCapabilities,
 } from './agent-workbench-capabilities.js';
+import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
+import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -219,6 +221,14 @@ const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
 let pinnedPluginNavItems: NavItem[] = [];
 
 let isAuthed = true;
+/**
+ * `/api/settings` 明确回答了登录态（200 或带身份语义的 401）才置位。请求失败（网络错误 /
+ * 5xx）时 isAuthed 只是默认的 true，不能据此去拉管理数据——公开只读访客会吃到 401 弹登录浮层。
+ */
+let authStateKnown = false;
+/** 上一次探 /api/settings 的时间；登录态未知时唤起面板会再探，但至少间隔 AUTH_REPROBE_MS。 */
+let lastAuthProbeAt = 0;
+const AUTH_REPROBE_MS = 10_000;
 let publicReadOnly = false;
 let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
@@ -280,6 +290,25 @@ function sidebarNavItems(): NavItem[] {
     ...pinnedPluginNavItems,
     ...builtInItems.slice(pluginIndex + 1),
   ];
+}
+
+/** ⌘K 面板的「页面」条目：与侧边栏同一份可见性（权限 / 客户端壳 / pinned 插件）。 */
+function paletteNavPages(): PalettePageEntry[] {
+  const groupOf = new Map<string, string>();
+  for (const group of NAV_GROUPS) for (const id of group.items) groupOf.set(id, group.labelKey);
+  return sidebarNavItems()
+    .filter(item => isAuthed || !item.manage)
+    .map(item => {
+      const groupKey = groupOf.get(item.plugin ? 'plugins' : item.id);
+      return {
+        id: item.id,
+        href: item.href,
+        label: labelOf(item),
+        labelKey: item.labelKey,
+        groupLabel: groupKey ? t(groupKey) : undefined,
+        icon: item.icon,
+      };
+    });
 }
 
 function navClassName(item: NavItem): string | undefined {
@@ -475,6 +504,59 @@ function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.E
         <span>{t('overview.openSessions')}</span>
       </div>
     </div>
+  );
+}
+
+// ── ⌘K 全局搜索 ─────────────────────────────────────────────────────────────
+// 壳层只负责唤起（快捷键 + 顶栏入口）；面板本体是独立 chunk，首次唤起或空闲时预取。
+const PALETTE_MAC = typeof navigator !== 'undefined' && isMacLike(
+  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || '',
+);
+type CommandPaletteModule = typeof import('./command-palette.js');
+let commandPaletteModule: Promise<CommandPaletteModule> | null = null;
+
+function loadCommandPalette(): Promise<CommandPaletteModule> {
+  commandPaletteModule ??= import('./command-palette.js').catch(error => {
+    commandPaletteModule = null;
+    throw error;
+  });
+  return commandPaletteModule;
+}
+
+/** 当前 hash 是否落在无边框工作台壳上（没有顶栏 / 侧栏，也不挂 ⌘K 面板）；见 DashboardShell 里的说明。 */
+function framelessWorkbenchSurface(hash: string): 'dock' | 'appCenter' | null {
+  if (!readDashboardClientShell() && !readDashboardWorkbenchShell()) return null;
+  if (hash.startsWith('#/agent-workbench-dock')) return 'dock';
+  if (hash.startsWith('#/agent-workbench')) return 'appCenter';
+  return null;
+}
+
+function preloadCommandPalette(): void {
+  void loadCommandPalette().catch(() => { /* 真正唤起时再报错 */ });
+}
+
+function openCreateBotFromPalette(): void {
+  void openBotOnboarding();
+}
+
+function CommandPaletteTrigger(props: { onOpen(): void }): React.JSX.Element {
+  const shortcut = paletteShortcutLabel(PALETTE_MAC);
+  return (
+    <button
+      type="button"
+      className="topbar-search-trigger"
+      aria-haspopup="dialog"
+      aria-keyshortcuts={PALETTE_MAC ? 'Meta+K' : 'Control+K'}
+      aria-label={`${t('palette.dialogLabel')} (${shortcut})`}
+      title={`${t('palette.dialogLabel')} (${shortcut})`}
+      onPointerEnter={preloadCommandPalette}
+      onFocus={preloadCommandPalette}
+      onClick={props.onOpen}
+    >
+      {icon(<><circle cx="7" cy="7" r="4.6" /><path d="m10.4 10.4 3.6 3.6" /></>)}
+      <span className="topbar-search-text">{t('palette.triggerPlaceholder')}</span>
+      <kbd className="topbar-search-kbd" aria-hidden="true">{shortcut}</kbd>
+    </button>
   );
 }
 
@@ -1341,6 +1423,35 @@ function DashboardShell(): React.JSX.Element {
   const [statusAutoOpen, setStatusAutoOpen] = useState(false);
   const previousAttentionRef = useRef(statusSummary.attention);
   const statusAutoOpenTimerRef = useRef<number | null>(null);
+  // 每次唤起 seq+1 作为面板的 key：重新挂载 = 查询 / 分类 / 选中项从零开始。
+  const [palette, setPalette] = useState<{ open: boolean; seq: number }>({ open: false, seq: 0 });
+  const [PaletteView, setPaletteView] = useState<CommandPaletteModule['CommandPalette'] | null>(null);
+  const paletteOpenRef = useRef(false);
+  const paletteEnabledRef = useRef(true);
+  paletteOpenRef.current = palette.open;
+
+  const closePalette = useCallback(() => setPalette(prev => (prev.open ? { ...prev, open: false } : prev)), []);
+  // 允许叠在会话详情抽屉等原生模态框之上：面板 showModal 后是 top layer 最上层，
+  // Esc 只关它自己；选中跳转会换 hash 重挂载页面，底下的抽屉随之卸掉。
+  const openPalette = useCallback(() => {
+    // 首屏 /api/settings 失败（网络错误 / 5xx）时登录态未知，面板不拉 Skill / Agent；唤起时再探
+    // （限频：服务端持续出错时反复开关面板不该线性放大请求）。
+    if (!authStateKnown && Date.now() - lastAuthProbeAt >= AUTH_REPROBE_MS) void loadAuthState().then(renderShell);
+    void loadCommandPalette()
+      .then(mod => {
+        setPaletteView(() => mod.CommandPalette);
+        setPalette(prev => (prev.open ? prev : { open: true, seq: prev.seq + 1 }));
+      })
+      .catch(error => {
+        if (maybeReloadBrowserForStaleRouteChunk(error, {
+          href: window.location.href,
+          hash: location.hash || '#/',
+          getSessionStorage: () => window.sessionStorage,
+          reload: () => window.location.reload(),
+        })) return;
+        console.error('botmux command palette failed to load', error);
+      });
+  }, []);
 
   const clearStatusAutoOpenTimer = () => {
     if (statusAutoOpenTimerRef.current === null) return;
@@ -1364,6 +1475,19 @@ function DashboardShell(): React.JSX.Element {
   useEffect(() => {
     return () => clearStatusAutoOpenTimer();
   }, []);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || !isPaletteHotkey(event, PALETTE_MAC)) return;
+      if (!paletteEnabledRef.current) return;
+      // 宿主终端（xterm）里 Ctrl+K 是 readline 删到行尾，xterm 自己处理后会拦下；这里再兜一层。
+      if (event.target instanceof Element && event.target.closest('.xterm')) return;
+      event.preventDefault();
+      if (paletteOpenRef.current) closePalette();
+      else openPalette();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [closePalette, openPalette]);
   useEffect(() => {
     const previousAttention = previousAttentionRef.current;
     previousAttentionRef.current = statusSummary.attention;
@@ -1392,13 +1516,18 @@ function DashboardShell(): React.JSX.Element {
   // core/workbench-shell.ts）。从侧边栏等网页入口点进 #/agent-workbench 时必须保持
   // 正常壳，否则导航一去不回。两种标记都可能挂在 search 或 hash（为过登录重定向把
   // 标记放在 hash 里，启动时再提升进 search），reader 两种都认。
-  const workbenchSurface = (readDashboardClientShell() || readDashboardWorkbenchShell())
-    ? activeHash.startsWith('#/agent-workbench-dock')
-      ? 'dock'
-      : activeHash.startsWith('#/agent-workbench')
-        ? 'appCenter'
-        : null
-    : null;
+  const workbenchSurface = framelessWorkbenchSurface(activeHash);
+  // 无边框工作台壳没有顶栏，也不挂面板。
+  paletteEnabledRef.current = !workbenchSurface;
+  // 壳层随每条 SSE 重渲染；context 换新对象会让面板重建全部条目并重跑整次搜索。
+  // 只有页面清单可能变化时才换：开关面板、切语言、登录态、置顶插件、宿主终端权限。
+  const paletteContext = useMemo<PaletteShellContext>(() => ({
+    pages: palette.open ? paletteNavPages() : [],
+    manageDataReady: authStateKnown && isAuthed,
+    setLocale,
+    openCreateSession: requestOpenCreateSession,
+    openCreateBot: openCreateBotFromPalette,
+  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, ui.hostTerminal]);
   if (workbenchSurface) {
     return (
       <>
@@ -1436,6 +1565,9 @@ function DashboardShell(): React.JSX.Element {
               </a>
               <TopbarVersionControl status={botmuxUpdateStatus} onRefresh={() => checkUpdateBadge(true)} />
             </div>
+          </div>
+          <div className="topbar-center">
+            <CommandPaletteTrigger onOpen={openPalette} />
           </div>
           <div className="topbar-actions">
             <TopbarStatusMenu summary={statusSummary} autoOpen={statusAutoOpen} />
@@ -1528,6 +1660,15 @@ function DashboardShell(): React.JSX.Element {
         loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
         onClose={closeAuthExpired}
       />
+      {PaletteView ? (
+        <PaletteView
+          key={palette.seq}
+          open={palette.open}
+          onClose={closePalette}
+          mac={PALETTE_MAC}
+          context={paletteContext}
+        />
+      ) : null}
       {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关） */}
       <ToastStack />
       <ConfirmModalRoot />
@@ -1611,6 +1752,7 @@ async function loadWorkbenchCapabilities(): Promise<void> {
 }
 
 async function loadAuthState(): Promise<void> {
+  lastAuthProbeAt = Date.now();
   // 能力探测与 /api/settings 并行：两者互不依赖，也都在首次 route() 之前完成。
   const capabilitiesProbe = loadWorkbenchCapabilities();
   try {
@@ -1626,6 +1768,7 @@ async function loadAuthState(): Promise<void> {
       ui.hostTerminal = isAuthed && j.hostTerminal === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
+      authStateKnown = true;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     } else if (r.status === 401 && r.headers.get('x-botmux-auth-scope') === 'workbench') {
@@ -1637,11 +1780,13 @@ async function loadAuthState(): Promise<void> {
       ui.hostTerminal = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
+      authStateKnown = true;
     } else if (r.status === 401) {
       isAuthed = false;
       ui.authed = false;
       ui.workbenchAuthed = false;
       ui.hostTerminal = false;
+      authStateKnown = true;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
     }
@@ -1855,6 +2000,11 @@ void (async () => {
   }
   void loadNameMaps().then(renderShell);
   void loadGroupsSnapshot().then(renderShell);
+  // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络；无边框工作台壳不挂面板，不白取。
+  if (!framelessWorkbenchSurface(location.hash || '#/')) {
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(preloadCommandPalette, { timeout: 5_000 });
+    else window.setTimeout(preloadCommandPalette, 3_000);
+  }
   // A page with unsaved edits can hold a navigation back (see leave-guard.ts).
   window.addEventListener('hashchange', createHashChangeHandler({
     applyLocale: applyShellLocaleFromHash,

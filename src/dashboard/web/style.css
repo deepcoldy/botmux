@@ -35922,3 +35922,497 @@ html.terminal-immersive-lock body {
     max-height: min(560px, calc(var(--vv-height, 100dvh) - 56px));
   }
 }
+
+/* ═══ ⌘K 全局搜索 ════════════════════════════════════════════════════════════
+   顶栏中列放一个搜索框外观的入口（窄屏收成圆形图标），面板是顶部锚定的原生
+   <dialog>：搜索行 → 分类 rail → 分组结果 → 快捷键提示栏。 */
+.topbar-center {
+  grid-column: 2;
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+button.topbar-search-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  width: min(420px, 100%);
+  min-width: 0;
+  height: var(--topbar-control-size);
+  min-height: var(--topbar-control-size);
+  padding: 0 7px 0 14px;
+  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: var(--muted);
+  box-shadow: none;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: text;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+button.topbar-search-trigger:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+  color: var(--fg);
+}
+button.topbar-search-trigger svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.topbar-search-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-search-kbd,
+.cmdk kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+.topbar-search-kbd {
+  flex: none;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: var(--radius-full);
+  border-bottom-width: 1px;
+}
+
+dialog.command-palette-dialog {
+  width: min(680px, calc(100vw - 24px));
+  max-width: none;
+  max-height: min(600px, calc(100vh - 20vh));
+  margin: 12vh auto auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--modal-shadow), 0 0 0 1px color-mix(in srgb, var(--accent) 6%, transparent);
+}
+dialog.command-palette-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  animation: cmdk-in 160ms cubic-bezier(.2, .8, .2, 1);
+}
+dialog.command-palette-dialog::backdrop {
+  background: color-mix(in srgb, var(--modal-backdrop) 72%, transparent);
+  backdrop-filter: blur(2px);
+  animation: cmdk-fade 160ms ease-out;
+}
+@keyframes cmdk-in {
+  from { opacity: 0; transform: translateY(-8px) scale(.985); }
+}
+@keyframes cmdk-fade {
+  from { opacity: 0; }
+}
+.cmdk {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.cmdk-search {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  padding: 0 14px 0 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.cmdk-search-icon svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.command-palette-dialog input.cmdk-input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  outline: none;
+  color: var(--fg);
+  font-size: 15px;
+  font-weight: 500;
+}
+.cmdk-input::placeholder {
+  color: var(--faint);
+  font-weight: 400;
+}
+.command-palette-dialog button.cmdk-scope-pill {
+  flex: none;
+  min-height: 0;
+  height: 26px;
+  gap: 6px;
+  padding: 0 8px 0 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 650;
+}
+.command-palette-dialog button.cmdk-scope-pill span {
+  font-size: 14px;
+  line-height: 1;
+  opacity: .7;
+}
+.cmdk-esc {
+  flex: none;
+}
+.cmdk-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  overflow: hidden;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent) no-repeat;
+  background-size: 40% 100%;
+  animation: cmdk-progress 1.1s ease-in-out infinite;
+}
+@keyframes cmdk-progress {
+  from { background-position: -40% 0; }
+  to { background-position: 140% 0; }
+}
+.cmdk-scopes {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-soft);
+  scrollbar-width: none;
+}
+.cmdk-scopes::-webkit-scrollbar { display: none; }
+.command-palette-dialog button.cmdk-scope {
+  flex: none;
+  min-height: 0;
+  height: 28px;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+.command-palette-dialog button.cmdk-scope:hover {
+  border-color: transparent;
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+.command-palette-dialog button.cmdk-scope.is-active {
+  background: var(--surface-muted);
+  border-color: var(--border-soft);
+  color: var(--accent);
+}
+.cmdk-scope-count {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+}
+.cmdk-scope.is-active .cmdk-scope-count {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cmdk-list {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 8px 8px;
+  scroll-padding: 34px 0 8px;
+}
+.cmdk-group + .cmdk-group {
+  margin-top: 4px;
+}
+.cmdk-group-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: .02em;
+}
+.cmdk-group-count {
+  color: var(--faint);
+  font-weight: 500;
+}
+.cmdk-item {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 46px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  user-select: none;
+}
+.cmdk-item.is-active {
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.cmdk-item-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+.cmdk-item-icon.has-avatar {
+  background: transparent;
+}
+.cmdk-item-icon svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.cmdk-item.is-active .cmdk-item-icon:not(.has-avatar) {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  color: var(--accent);
+}
+.cmdk-item-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.cmdk-item-title,
+.cmdk-item-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmdk-item-title {
+  color: var(--fg);
+  font-size: 13.5px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+.cmdk-item-sub {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.cmdk-item mark {
+  padding: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 700;
+}
+.cmdk-item-tail {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cmdk-meta {
+  color: var(--faint);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cmdk-badge {
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.cmdk-badge.tone-need { border-color: color-mix(in srgb, var(--st-need) 30%, transparent); background: var(--st-need-soft); color: var(--st-need); }
+.cmdk-badge.tone-work { border-color: color-mix(in srgb, var(--st-work) 26%, transparent); background: var(--st-work-soft); color: var(--st-work); }
+.cmdk-badge.tone-idle { background: var(--st-idle-soft); color: var(--muted); }
+.cmdk-badge.tone-closed { background: transparent; color: var(--faint); }
+.cmdk-badge.tone-current { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent); }
+.cmdk-enter {
+  visibility: hidden;
+}
+.cmdk-item.is-active .cmdk-enter {
+  visibility: visible;
+}
+.cmdk-more .cmdk-item-title {
+  color: var(--accent);
+  font-size: 12.5px;
+}
+.cmdk-more {
+  min-height: 38px;
+}
+.cmdk-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 180px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+.cmdk-empty strong {
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+}
+.cmdk-empty-icon svg {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke: var(--faint);
+  stroke-width: 1.3;
+  stroke-linecap: round;
+}
+.cmdk-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 40px;
+  padding: 0 16px;
+  overflow: hidden;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cmdk-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.cmdk-hint kbd + kbd {
+  margin-left: -1px;
+}
+.cmdk-hint kbd:last-of-type {
+  margin-right: 3px;
+}
+.cmdk-hint-end {
+  margin-left: auto;
+}
+.cmdk-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+/* 设置页深链落点：区块 / 字段行闪一下（outline 外扩，不挤动布局）。 */
+.settings-search-flash {
+  border-radius: var(--radius-lg);
+  outline: 2px solid transparent;
+  outline-offset: 6px;
+  animation: settings-search-flash 2.2s ease-out;
+}
+@keyframes settings-search-flash {
+  0%, 35% { outline-color: var(--accent); background-color: color-mix(in srgb, var(--accent) 7%, transparent); }
+  100% { outline-color: transparent; background-color: transparent; }
+}
+
+@media (max-width: 980px) {
+  button.topbar-search-trigger {
+    width: min(320px, 100%);
+  }
+}
+@media (max-width: 720px) {
+  .topbar-center {
+    justify-content: flex-end;
+  }
+  button.topbar-search-trigger {
+    width: var(--topbar-control-size);
+    padding: 0;
+    justify-content: center;
+    cursor: pointer;
+  }
+  .topbar-search-text,
+  .topbar-search-kbd {
+    display: none;
+  }
+  button.topbar-search-trigger {
+    flex: none;
+    min-width: var(--topbar-control-size);
+  }
+  dialog.command-palette-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 24px);
+    margin-top: 12px;
+  }
+  .cmdk-footer,
+  .cmdk-esc {
+    display: none;
+  }
+}
+/* 手机宽度下顶栏放不下第六个圆钮：把最低频的「文档」让给搜索图标——
+   文档在 ⌘K 面板的「打开文档」里仍是一步可达。 */
+@media (max-width: 440px) {
+  .topbar-tool-group .topbar-docs-link {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  dialog.command-palette-dialog[open],
+  dialog.command-palette-dialog::backdrop,
+  .cmdk-progress,
+  .settings-search-flash {
+    animation: none;
+  }
+}

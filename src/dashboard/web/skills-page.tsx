@@ -3,6 +3,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { FieldTitle, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { ModalDialog } from './modal-dialog.js';
 import { SkillPacksTab } from './skills/skill-packs-tab.js';
 import { detectSourceType, SkillLibraryTab } from './skills/skill-library-tab.js';
@@ -889,7 +890,12 @@ export function SkillsPage() {
   // Cross-tab navigation: a chip click in one table jumps to another tab with
   // context (search prefill / focused entity). The target tab consumes the
   // intent once so it doesn't re-apply on later visits.
-  const [navIntent, setNavIntent] = useState<SkillsNavIntent | null>(null);
+  // `#/skills?skill=<name>`（⌘K 全局搜索）：落在 Skill 库并只看这一个（可清除的名字筛选）。
+  const [navIntent, setNavIntent] = useState<SkillsNavIntent | null>(() => {
+    const skill = hashQueryParam('skill');
+    return skill ? { tab: 'library', libraryFilterSkills: [skill] } : null;
+  });
+  useEffect(() => { clearHashQueryParam('skill'); }, []);
   // Sticky install target: when a missing skill sends the user to the install
   // wizard, the discovery result preselects just that skill. Prefill only —
   // installing still requires the user to point at a source and confirm.
