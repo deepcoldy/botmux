@@ -109,7 +109,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -146,9 +150,16 @@ describe('cli_install_changed', () => {
   let sessionReply: ReturnType<typeof vi.fn>;
   beforeEach(() => {
     vi.clearAllMocks();
+    // TmuxBackend is mocked as an empty class below; suspend now verifies the
+    // backing via a daemon-side kill + post-probe. These cases test the
+    // install-change queueing semantics, so the verifier is stubbed exactly as
+    // in the other suspendWorker suites (the real verifier has its own tests).
+    __testOnly_setSuspendBackingVerifier(() => true);
     sessionReply = vi.fn(async () => 'om_notice');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
   });
+
+  afterEach(() => __testOnly_setSuspendBackingVerifier());
 
   it('suspends an idle session right away and says why, once', async () => {
     const worker = makeFakeWorker();
