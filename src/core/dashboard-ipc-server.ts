@@ -3110,13 +3110,60 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
 
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
+  appId: string;
   /** Human who approved this grant, frozen at request creation. The live origin
    *  of a later auth-status call may already belong to another turn or another
    *  person; this frozen id is the only safe same-principal reference. */
   callerOpenId: string;
+  authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+  /** Creating-turn closure: true only while the exact originating turn is live. */
   isCurrent: () => boolean;
+  /** Session/app liveness used to keep or retire the daemon-side background poll. */
+  isValid: () => boolean;
+  status: 'pending' | 'ready' | 'failed';
+  expiresAt: number;
   poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+  dispose: () => void;
 }>();
+
+// The daemon owns device-grant completion. Ending an Agent turn must not abandon
+// a link already sent to its verified user. This never dispatches a new turn or
+// injects credentials: those actions still require a fresh current-actor proof.
+function trackSessionAuthorization(
+  requestId: string,
+  entry: Omit<NonNullable<ReturnType<typeof sessionAuthRequests.get>>, 'status' | 'expiresAt' | 'poll' | 'dispose'>,
+): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const request = {
+    ...entry,
+    status: 'pending' as 'pending' | 'ready' | 'failed',
+    expiresAt: Date.now() + entry.authorization.expiresIn * 1_000,
+    poll: async () => {
+      const result = await entry.authorization.poll();
+      request.status = result.status;
+      return result;
+    },
+    dispose: () => { disposed = true; clearTimeout(timer); clearTimeout(expiry); },
+  };
+  const tick = async () => {
+    if (disposed) return;
+    if (!entry.isValid()) {
+      request.dispose();
+      sessionAuthRequests.delete(requestId);
+      return;
+    }
+    try { await request.poll(); }
+    catch { request.status = 'failed'; }
+    if (!disposed && request.status === 'pending') timer = setTimeout(tick, 2_000).unref();
+  };
+  const expiry = setTimeout(() => {
+    request.dispose();
+    sessionAuthRequests.delete(requestId);
+  }, entry.authorization.expiresIn * 1_000).unref();
+  sessionAuthRequests.set(requestId, request);
+  timer = setTimeout(tick, 2_000).unref();
+}
 
 for (const action of ['auth-request', 'auth-status']) {
   ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
@@ -3194,29 +3241,26 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
       && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
-    // The authorization may outlive the turn that started it: the same human's
-    // follow-up message rotates the turn while they are tapping the approval
-    // link. Keep polling (and accept the granted token) as long as the session's
-    // live caller is still THAT human. A different caller stays a hard failure.
-    const samePrincipalActive = (): boolean => {
-      const live = findActiveBySessionId(params.sessionId);
-      return live === ds && ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
-        && requestingUser() === callerOpenId;
-    };
-    const authorizationCurrent = (): boolean => isCurrent() || samePrincipalActive();
+    // An accepted grant outlives its originating turn: the daemon-side poll
+    // keeps completing it while the session/app stay valid (isAuthorizationValid),
+    // and auth-status publishes the token only to a live turn whose caller is
+    // the same human (frozen on the request). A different caller stays refused.
     if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
 
     if (action === 'auth-status') {
       const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
-      if (!request || request.sessionId !== params.sessionId) {
+      if (!request || request.sessionId !== params.sessionId || request.appId !== ds.larkAppId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       // A different human (including a different human behind the same bot)
       // must not poll or publish the previous person's grant.
       if (request.callerOpenId !== callerOpenId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      if (!request.isValid()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -3280,18 +3324,55 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
+    // Issuance is turn-bound; an accepted grant belongs to this app/user and
+    // session until its own deadline. A different speaker cannot claim it.
+    const appId = cfg.larkAppId;
+    const requestId = randomBytes(32).toString('hex');
+    const brand = normalizeBrand(cfg.brand);
+    const appSecret = cfg.larkAppSecret;
+    let accepted = false;
+    const isAuthorizationValid = () => {
+      // During issuance the originating turn must still be the live one.
+      if (!accepted) return isCurrent();
+      const tracked = sessionAuthRequests.get(requestId);
+      if (!tracked || tracked.expiresAt <= Date.now()) return false;
+      const live = findActiveBySessionId(params.sessionId);
+      if (live !== ds || ds.session.status !== 'active' || !ds.worker || ds.worker.killed
+        || ds.larkAppId !== appId || sessionTransportDisabled(ds)) return false;
+      // While no turn is live (the gap after the Agent ended the originating
+      // turn), the daemon may keep completing the grant server-side. Once a new
+      // turn has an effective user — including a delegated target — it must be
+      // the same human frozen on this request; a dispatch bot or another human
+      // retires the grant.
+      const liveCaller = requestingUser();
+      if (liveCaller !== undefined && liveCaller !== callerOpenId) return false;
+      try {
+        const currentConfig = getBot(ds.larkAppId).config;
+        return currentConfig.larkAppSecret === appSecret && normalizeBrand(currentConfig.brand) === brand
+          && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
+      } catch { return false; }
+    };
+    for (const [requestId, request] of sessionAuthRequests) {
+      if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
+        && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
+        && request.expiresAt > Date.now()
+        && scopes.every(scope => request.authorization.scopes.includes(scope))) {
+        return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
+          scopes: request.authorization.scopes, expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
+      }
+    }
     let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
     try {
       authorization = await requestUserAuthorization(
-        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, authorizationCurrent,
+        cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
       );
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
     if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
-    const requestId = randomBytes(32).toString('hex');
-    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, callerOpenId, isCurrent, poll: authorization.poll });
-    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    accepted = true;
+    trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
+      callerOpenId, authorization, isCurrent, isValid: isAuthorizationValid });
     return jsonRes(res, 200, {
       ok: true, authUrl: authorization.authUrl, requestId,
       scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
@@ -10158,7 +10239,11 @@ export function startIpcServer(opts: {
     workspaceRecycleRuntime.start();
     void (opts.ready ?? Promise.resolve()).then(() => workspaceRecycleRuntime.recoverDeferred())
       .catch(error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`));
-    server.once('close', () => workspaceRecycleRuntime.stop());
+    server.once('close', () => {
+      workspaceRecycleRuntime.stop();
+      for (const request of sessionAuthRequests.values()) request.dispose();
+      sessionAuthRequests.clear();
+    });
     return {
     port,
     close: () => new Promise<void>(r => server.close(() => r())),

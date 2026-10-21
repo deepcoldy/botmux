@@ -88,6 +88,18 @@ describe('buildCredentialBoundaryBlock', () => {
     expect(zh).toContain('/login');
   });
 
+  it.each(['zh', 'en'] as const)('bundles only the planned task permissions after missing_scope in %s', locale => {
+    const prompt = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'] }, locale);
+    expect(prompt).not.toContain('base:field:read base:record:read');
+    // The contributor guide does not ship in the npm package, so the injected
+    // prompt must not point users at a path they cannot open.
+    expect(prompt).not.toContain('docs/guide/lark-device-authorization.md');
+    expect(prompt).toContain(locale === 'zh' ? '不要重跑普通 /login' : 'do not repeat ordinary /login');
+    expect(prompt).toContain(locale === 'zh' ? '一次合并所需权限' : 'request them together');
+    expect(prompt).toContain(locale === 'zh' ? '不申请无关或未经核实的权限' : 'never request unrelated or unverified scopes');
+    expect(prompt).toContain('botmux auth wait --request-id &lt;requestId&gt; --json');
+  });
+
   it('covers forwarding, not just reading', () => {
     // Reading is one leak path; pasting a token the agent legitimately holds
     // into a message or a commit is another, and far easier to do by accident.
