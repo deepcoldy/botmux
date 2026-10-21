@@ -22,11 +22,13 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   selectIdleSuspendCandidates,
   sweepIdleWorkers,
+  sweepIdleWorkersAsync,
   sweepIdleWorkersAfterTurnDrain,
   sweepIdleWorkersByAge,
   sweepIdleWorkersByAgeAsync,
   sweepIdleWorkersByAgeAfterTurnDrain,
   reclaimIdleWorkersForAdmission,
+  reclaimIdleWorkersForAdmissionAsync,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
   DEFAULT_MAX_LIVE_WORKERS,
 } from '../src/core/idle-worker-sweeper.js';
@@ -705,6 +707,129 @@ describe('sweepIdleWorkers (per-bot idle TTL)', () => {
     ]);
 
     expect(sweepIdleWorkers(activeSessions, { idleTtlMs: ttlMs, now })).toEqual([]);
+  });
+});
+
+describe('automatic idle worker async variants', () => {
+  beforeEach(() => {
+    __testOnly_resetBotTurnMutationGates();
+  });
+
+  it('yields before each cap candidate and re-reads every candidate before suspending', async () => {
+    const a = ds('async-a', 'tmux', now - 90 * 60_000);
+    const b = ds('async-b', 'tmux', now - 80 * 60_000);
+    const c = ds('async-c', 'tmux', now - 70 * 60_000);
+    const activeSessions = new Map<string, any>([['a', a], ['b', b], ['c', c]]);
+    let yields = 0;
+
+    const suspended = await sweepIdleWorkersAsync(
+      activeSessions,
+      { maxLiveWorkers: 1 },
+      () => {
+        yields++;
+        if (yields === 2) b.lastScreenStatus = 'working';
+        return Promise.resolve();
+      },
+    );
+
+    expect(yields).toBe(3);
+    expect(suspended).toEqual([
+      { sessionId: 'async-a', reason: 'live_worker_cap' },
+      { sessionId: 'async-c', reason: 'live_worker_cap' },
+    ]);
+    expect(b.worker).not.toBe(null);
+  });
+
+  it('does not transfer an old candidate to a replacement generation with the same session id', async () => {
+    const old = { ...ds('same-id', 'tmux', now - 90 * 60_000), idleSinceAt: now - 40 * 60_000 };
+    const recent = ds('recent', 'tmux', now - 2 * 60_000);
+    const activeSessions = new Map<string, any>([['same', old], ['recent', recent]]);
+    const replacement = { ...ds('same-id', 'tmux', now - 1 * 60_000), idleSinceAt: now - 40 * 60_000 };
+    let yielded = false;
+
+    const suspended = await sweepIdleWorkersAsync(
+      activeSessions,
+      { idleTtlMs: 30 * 60_000, now },
+      () => {
+        if (!yielded) activeSessions.set('same', replacement);
+        yielded = true;
+        return Promise.resolve();
+      },
+    );
+
+    expect(suspended).toEqual([]);
+    expect(old.worker).not.toBe(null);
+    expect(replacement.worker).not.toBe(null);
+  });
+
+  it('isolates one failed admission candidate and continues with unrelated safe candidates', async () => {
+    const a = ds('fail-a', 'tmux', now - 90 * 60_000);
+    const b = ds('safe-b', 'tmux', now - 80 * 60_000);
+    const c = ds('safe-c', 'tmux', now - 70 * 60_000);
+    const activeSessions = new Map<string, any>([['a', a], ['b', b], ['c', c]]);
+    __testOnly_setSuspendBackingVerifier((target: any) => {
+      if (target.session.sessionId === 'fail-a') throw new Error('candidate failure');
+      return true;
+    });
+
+    const suspended = await reclaimIdleWorkersForAdmissionAsync(
+      activeSessions,
+      { maxSuspend: 2 },
+      () => Promise.resolve(),
+    );
+
+    expect(suspended).toEqual([
+      { sessionId: 'safe-b', reason: 'admission_memory' },
+      { sessionId: 'safe-c', reason: 'admission_memory' },
+    ]);
+    expect(a.worker).not.toBe(null);
+  });
+
+  it('isolates one failed cap candidate and still reaches the cap with later safe candidates', async () => {
+    const a = ds('cap-fail-a', 'tmux', now - 90 * 60_000);
+    const b = ds('cap-safe-b', 'tmux', now - 80 * 60_000);
+    const c = ds('cap-safe-c', 'tmux', now - 70 * 60_000);
+    const activeSessions = new Map<string, any>([['a', a], ['b', b], ['c', c]]);
+    __testOnly_setSuspendBackingVerifier((target: any) => {
+      if (target.session.sessionId === 'cap-fail-a') throw new Error('candidate failure');
+      return true;
+    });
+
+    const suspended = await sweepIdleWorkersAsync(
+      activeSessions,
+      { maxLiveWorkers: 1 },
+      () => Promise.resolve(),
+    );
+
+    expect(suspended).toEqual([
+      { sessionId: 'cap-safe-b', reason: 'live_worker_cap' },
+      { sessionId: 'cap-safe-c', reason: 'live_worker_cap' },
+    ]);
+    expect(a.worker).not.toBe(null);
+  });
+
+  it('keeps the cap/TTL AfterTurnDrain path asynchronous and skips drift before the first kill', async () => {
+    const due = { ...ds('auto-ttl', 'tmux', now - 90 * 60_000), idleSinceAt: now - 40 * 60_000 };
+    const activeSessions = new Map<string, any>([['due', due]]);
+    setImmediate(() => { due.lastScreenStatus = 'working'; });
+
+    await expect(sweepIdleWorkersAfterTurnDrain('cli_auto_ttl_async', activeSessions, {
+      idleTtlMs: 30 * 60_000,
+      now,
+    })).resolves.toEqual([]);
+    expect(due.worker).not.toBe(null);
+  });
+
+  it('keeps the admission AfterTurnDrain path asynchronous and skips drift before the first kill', async () => {
+    const candidate = ds('auto-admission', 'tmux', now - 90 * 60_000);
+    const activeSessions = new Map<string, any>([['candidate', candidate]]);
+    setImmediate(() => { candidate.lastScreenStatus = 'working'; });
+
+    await expect(reclaimIdleWorkersForAdmissionAfterTurnDrain(
+      'cli_auto_admission_async',
+      activeSessions,
+    )).resolves.toEqual([]);
+    expect(candidate.worker).not.toBe(null);
   });
 });
 

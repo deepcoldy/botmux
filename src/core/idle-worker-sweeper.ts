@@ -340,6 +340,50 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 }
 
+function isCurrentSuspendableIdleCandidate(
+  activeSessions: Map<string, DaemonSession>,
+  candidate: DaemonSession,
+): boolean {
+  // Require the exact generation object selected before the async boundary.
+  // A replacement generation with the same durable session id is new work and
+  // must wait for a later sweep instead of inheriting this candidate snapshot.
+  // Reuse the selector itself so later guard additions cannot drift between
+  // initial selection and the pre-kill recheck.
+  return suspendableIdleCandidates(activeSessions).includes(candidate);
+}
+
+function idleTtlExpiredNow(ds: DaemonSession, opts: IdleWorkerSweepOptions): boolean {
+  return opts.idleTtlMs !== undefined
+    && ds.idleSinceAt !== undefined
+    && ds.idleSinceAt + opts.idleTtlMs <= (opts.now ?? Date.now());
+}
+
+const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
+
+function suspendAutomaticCandidate(
+  ds: DaemonSession,
+  reason: string,
+  policy: 'cap_ttl' | 'admission',
+): boolean {
+  try {
+    const suspended = suspendWorker(ds, reason);
+    if (!suspended) {
+      logger.warn(
+        `[idle-worker-sweeper] candidate refused session=${ds.session.sessionId} `
+        + `policy=${policy} reason=${reason}`,
+      );
+    }
+    return suspended;
+  } catch (error) {
+    logger.error(
+      `[idle-worker-sweeper] candidate failed session=${ds.session.sessionId} `
+      + `policy=${policy} reason=${reason}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
 /**
  * Count-based live-worker cap plus optional idle TTL. When this bot has more
  * live workers than its configured `maxLiveWorkers`, its longest-idle (by
@@ -395,6 +439,40 @@ export function sweepIdleWorkers(
 }
 
 /**
+ * Event-loop-friendly automatic cap/TTL sweep. The synchronous API above stays
+ * available for explicit callers and legacy tests; daemon automatic paths use
+ * this variant so each candidate gets an I/O turn and a fresh generation/state
+ * check immediately before its synchronous kill + post-probe.
+ */
+export async function sweepIdleWorkersAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleWorkerSweepOptions = {},
+  yieldBetweenCandidates: () => Promise<void> = yieldToEventLoop,
+): Promise<IdleWorkerSweepResult[]> {
+  const cap = opts.maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS;
+  const ttlEnabled = opts.idleTtlMs !== undefined;
+  const initialRunning = liveWorkers(activeSessions);
+  const initiallyOverCap = cap > 0 ? initialRunning.length > cap : false;
+  const initiallyTtlDue = ttlEnabled && initialRunning.some(ds => idleTtlExpiredNow(ds, opts));
+  if (!initiallyOverCap && !initiallyTtlDue) return [];
+
+  const candidates = suspendableIdleCandidates(activeSessions);
+  const suspended: IdleWorkerSweepResult[] = [];
+  for (const candidate of candidates) {
+    await yieldBetweenCandidates();
+    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate)) continue;
+
+    const isTtl = idleTtlExpiredNow(candidate, opts);
+    const isOverCap = cap > 0 && liveWorkers(activeSessions).length > cap;
+    if (!isTtl && !isOverCap) continue;
+    const reason = isTtl ? IDLE_TTL_REASON : 'live_worker_cap';
+    if (!suspendAutomaticCandidate(candidate, reason, 'cap_ttl')) continue;
+    suspended.push({ sessionId: candidate.session.sessionId, reason });
+  }
+  return suspended;
+}
+
+/**
  * Reclaim idle workers to rescue a fork that was rejected in the marginal
  * memory band (available memory below reserve by ≤10%). Same candidate guards
  * as {@link sweepIdleWorkers}, but the count cap is IGNORED: admission rescue is
@@ -413,6 +491,31 @@ export function reclaimIdleWorkersForAdmission(
     if (opts.excludeSessionId !== undefined && ds.session.sessionId === opts.excludeSessionId) continue;
     if (!suspendWorker(ds, ADMISSION_RECLAIM_REASON)) continue;
     suspended.push({ sessionId: ds.session.sessionId, reason: ADMISSION_RECLAIM_REASON });
+  }
+  return suspended;
+}
+
+/** Async automatic admission reclaim with per-candidate revalidation/isolation. */
+export async function reclaimIdleWorkersForAdmissionAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: ReclaimIdleWorkersOptions = {},
+  yieldBetweenCandidates: () => Promise<void> = yieldToEventLoop,
+): Promise<IdleWorkerSweepResult[]> {
+  const maxSuspend = opts.maxSuspend ?? ADMISSION_RECLAIM_MAX_SUSPEND;
+  if (maxSuspend <= 0) return [];
+  const candidates = suspendableIdleCandidates(activeSessions);
+  const suspended: IdleWorkerSweepResult[] = [];
+  for (const candidate of candidates) {
+    if (suspended.length >= maxSuspend) break;
+    await yieldBetweenCandidates();
+    if (!isCurrentSuspendableIdleCandidate(activeSessions, candidate)) continue;
+    if (opts.excludeSessionId !== undefined
+      && candidate.session.sessionId === opts.excludeSessionId) continue;
+    if (!suspendAutomaticCandidate(candidate, ADMISSION_RECLAIM_REASON, 'admission')) continue;
+    suspended.push({
+      sessionId: candidate.session.sessionId,
+      reason: ADMISSION_RECLAIM_REASON,
+    });
   }
   return suspended;
 }
@@ -438,7 +541,7 @@ export function sweepIdleWorkersAfterTurnDrain(
   return tryWithBotTurnMutation(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
-    () => sweepIdleWorkers(activeSessions, opts),
+    () => sweepIdleWorkersAsync(activeSessions, opts),
   ).then(result => result.acquired ? result.value : []);
 }
 
@@ -456,6 +559,6 @@ export function reclaimIdleWorkersForAdmissionAfterTurnDrain(
   return tryWithBotTurnMutation(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
-    () => reclaimIdleWorkersForAdmission(activeSessions, opts),
+    () => reclaimIdleWorkersForAdmissionAsync(activeSessions, opts),
   ).then(result => result.acquired ? result.value : []);
 }

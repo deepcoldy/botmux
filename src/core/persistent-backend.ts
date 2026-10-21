@@ -212,10 +212,17 @@ export function resolvePersistentBackendTarget(
 ): PersistentBackendTarget {
   if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
     if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
-      return persisted;
+      // Herdr's old exclusive host carries no agent identity. Keep the complete
+      // owner beside the resolved (ephemeral) target so destructive lifecycle
+      // work can distinguish `bmx-<sid8>` from shared/custom host sessions.
+      return persisted.backendType === 'herdr' && persisted.agentName === undefined
+        ? { ...persisted, sessionId }
+        : persisted;
     }
   }
-  return { backendType, sessionName: persistentSessionName(backendType, sessionId) };
+  const sessionName = persistentSessionName(backendType, sessionId);
+  if (backendType === 'herdr') return { backendType, sessionName, sessionId };
+  return { backendType, sessionName };
 }
 
 export function persistentBackendTargetForSession(ds: DaemonSession): PersistentBackendTarget | undefined {
@@ -244,17 +251,34 @@ export function managedTargetsForCliChange(
     ));
 }
 
+/**
+ * The only agent-less Herdr target that Botmux may own as a whole session is
+ * its deterministic legacy host. Shared `botmux` / custom hosts and malformed
+ * rows stay fail-closed even when their names merely resemble a managed name.
+ */
+function isExclusiveAgentlessHerdrTarget(
+  target: Extract<PersistentBackendTarget, { backendType: 'herdr' }>,
+): boolean {
+  return target.agentName === undefined
+    && typeof target.sessionId === 'string'
+    && target.sessionId.length > 0
+    && target.sessionId === target.sessionId.trim()
+    && target.sessionName === persistentSessionName('herdr', target.sessionId);
+}
+
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
   }
   if (target.backendType === 'herdr') {
-    // A managed Herdr resource is an AGENT inside a host session. A target
-    // without its agent name cannot be probed precisely — probing the host
-    // session would answer for unrelated agents — so stay indeterminate and
-    // let exact-target callers fail closed.
-    if (!target.agentName || !target.agentName.trim()) return 'unknown';
-    return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+    if (target.agentName?.trim()) {
+      return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+    }
+    // Legacy exclusive hosts are safe to probe as a whole session only with
+    // complete ownership proof. Shared/custom/malformed targets stay unknown.
+    return isExclusiveAgentlessHerdrTarget(target)
+      ? HerdrBackend.probeSession(target.sessionName)
+      : 'unknown';
   }
   return probePersistentSession(target.backendType, target.sessionName);
 }
@@ -275,13 +299,15 @@ export function killPersistentBackendTarget(
     return;
   }
   if (target.backendType === 'herdr') {
-    // Never collapse an agent-less Herdr target to a whole-session stop/delete:
-    // host sessions are shared ('botmux') or user-owned, and the recorded
-    // target is missing precisely the identity that scopes this kill. Refuse.
-    if (!target.agentName || !target.agentName.trim()) {
-      throw new Error('Herdr teardown requires the recorded managed agent name');
+    if (target.agentName?.trim()) {
+      HerdrBackend.killAgent(target.sessionName, target.agentName);
+      return;
     }
-    HerdrBackend.killAgent(target.sessionName, target.agentName);
+    if (!isExclusiveAgentlessHerdrTarget(target)
+      || (sessionId !== undefined && sessionId !== target.sessionId)) {
+      throw new Error('Herdr whole-session teardown requires an exact exclusive owner target');
+    }
+    HerdrBackend.killSession(target.sessionName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
@@ -349,6 +375,7 @@ export function persistentBackendTargetKey(target: PersistentBackendTarget): str
     target.backendType,
     target.sessionName,
     target.backendType === 'herdr' ? target.agentName ?? '' : '',
+    target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
     target.backendType === 'zmx' ? target.socketDir ?? '' : '',
   ]);
 }
@@ -361,7 +388,10 @@ export function probePersistentBackendTargets(
   const groups = new Map<string, Map<string, PersistentBackendTarget>>();
   for (const target of targets) {
     const key = persistentBackendTargetKey(target);
-    if (target.backendType === 'herdr' && target.agentName) {
+    // Both agent-scoped and legacy exclusive Herdr targets require the same
+    // ownership-aware single-target classifier. Never downgrade either kind to
+    // the name-only batch probe used by whole-session backends.
+    if (target.backendType === 'herdr') {
       if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
       continue;
     }

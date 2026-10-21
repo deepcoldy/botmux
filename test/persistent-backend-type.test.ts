@@ -135,41 +135,64 @@ describe('shared Herdr persistent target', () => {
     killSession.mockRestore();
   });
 
-  it('fails closed on a Herdr target without an agent name: unknown probe, throwing kill', () => {
-    // Legacy/malformed rows resolve to an agent-less whole-session target.
-    // Probing the host session would answer for unrelated agents and deleting it
-    // could destroy a shared ('botmux') or user-owned session, so exact-target
-    // teardown must refuse rather than collapse to whole-session semantics.
-    const resolved = resolvePersistentBackendTarget('herdr', 'abcdef123456', undefined);
-    expect(resolved).toEqual({ backendType: 'herdr', sessionName: 'bmx-abcdef12' });
-    expect('agentName' in resolved).toBe(false);
-
+  it('allows an agent-less deterministic Herdr host only with its complete owner id', () => {
+    const sessionId = 'abcdef123456';
+    const resolved = resolvePersistentBackendTarget('herdr', sessionId, undefined);
+    expect(resolved).toEqual({
+      backendType: 'herdr',
+      sessionName: 'bmx-abcdef12',
+      sessionId,
+    });
     const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
     const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
     const probeSession = vi.spyOn(HerdrBackend, 'probeSession').mockReturnValue('exists');
     const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
+    expect(probePersistentBackendTarget(resolved)).toBe('exists');
+    const batch = probePersistentBackendTargets([resolved]);
+    expect(batch.get(persistentBackendTargetKey(resolved))).toBe('exists');
+    killPersistentBackendTarget(resolved, sessionId);
 
-    expect(probePersistentBackendTarget(resolved)).toBe('unknown');
-    expect(() => killPersistentBackendTarget(resolved, 'abcdef123456')).toThrow(/agent name/);
-
+    expect(probeSession).toHaveBeenCalledTimes(2);
+    expect(probeSession).toHaveBeenNthCalledWith(1, 'bmx-abcdef12');
+    expect(probeSession).toHaveBeenNthCalledWith(2, 'bmx-abcdef12');
+    expect(killSession).toHaveBeenCalledWith('bmx-abcdef12');
     expect(probeAgent).not.toHaveBeenCalled();
     expect(killAgent).not.toHaveBeenCalled();
-    expect(killSession).not.toHaveBeenCalled();
     probeSession.mockRestore();
     probeAgent.mockRestore();
     killAgent.mockRestore();
     killSession.mockRestore();
   });
 
-  it('fails closed on a Herdr target with a blank agent name', () => {
-    const target = { backendType: 'herdr' as const, sessionName: 'botmux', agentName: '   ' };
+  it('keeps shared/custom/missing-owner/mismatched/blank-agent Herdr targets fail-closed', () => {
+    const sessionId = 'abcdef123456';
+    const targets = [
+      { backendType: 'herdr' as const, sessionName: 'botmux', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'team-shared', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12' },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12-extra', sessionId },
+      { backendType: 'herdr' as const, sessionName: 'bmx-abcdef12', agentName: '   ', sessionId },
+    ];
     const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
     const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+    const probeSession = vi.spyOn(HerdrBackend, 'probeSession').mockReturnValue('exists');
+    const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
 
-    expect(probePersistentBackendTarget(target)).toBe('unknown');
-    expect(() => killPersistentBackendTarget(target, 'abcdef123456')).toThrow(/agent name/);
+    for (const target of targets) {
+      expect(probePersistentBackendTarget(target)).toBe('unknown');
+      const batch = probePersistentBackendTargets([target]);
+      expect(batch.get(persistentBackendTargetKey(target))).toBe('unknown');
+      expect(() => killPersistentBackendTarget(target, sessionId)).toThrow(/exact exclusive owner/);
+    }
+    const exclusive = resolvePersistentBackendTarget('herdr', sessionId, undefined);
+    expect(() => killPersistentBackendTarget(exclusive, 'different-owner')).toThrow(/exact exclusive owner/);
+
+    expect(probeAgent).not.toHaveBeenCalled();
+    expect(probeSession).not.toHaveBeenCalled();
     expect(killAgent).not.toHaveBeenCalled();
     expect(killSession).not.toHaveBeenCalled();
+    probeAgent.mockRestore();
+    probeSession.mockRestore();
     killAgent.mockRestore();
     killSession.mockRestore();
   });

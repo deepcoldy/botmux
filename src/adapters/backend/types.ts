@@ -159,7 +159,17 @@ export type PersistentBackendTarget =
   | { backendType: 'tmux' | 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
-  | { backendType: 'herdr'; sessionName: string; agentName?: string };
+  | {
+    backendType: 'herdr';
+    sessionName: string;
+    agentName?: string;
+    /**
+     * Full Botmux owner id attached by the lifecycle resolver. It is required
+     * before an agent-less legacy `bmx-<sid8>` target may be treated as an
+     * exclusive whole-session resource; persisted/shared targets may omit it.
+     */
+    sessionId?: string;
+  };
 
 /**
  * Tri-state result of probing whether a named backing session exists.
