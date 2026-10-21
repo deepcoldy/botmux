@@ -508,8 +508,9 @@ export interface DaemonSession {
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** `backgroundTasks` of the last working/idle screen_update: the main turn
-   *  ended while this many background tasks kept running. Card label only
-   *  (see streamCardLabel). In-memory only. */
+   *  ended while this many background tasks kept running. Card label (see
+   *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
+   *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`

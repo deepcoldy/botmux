@@ -72,6 +72,20 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     });
   });
 
+  it('reports a Lark turn whose own user record reached the transcript, and only that', () => {
+    const q = new CodexBridgeQueue();
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'review PR 1650', 100);
+    q.ingest([userEv('something else', 'u-other', 150)]);
+    expect(started).toEqual([]);
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
+    // Re-ingesting the same record does not report it again.
+    q.ingest([userEv('review PR 1650', 'u-1', 200)]);
+    expect(started).toEqual(['t1']);
+  });
+
   it('rejects CoT from a different native provider turn', () => {
     const q = new CodexBridgeQueue();
     const seen: string[] = [];

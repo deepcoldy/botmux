@@ -389,6 +389,8 @@ import {
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
+  reconcileRestoredStreamingCardStatus,
+  sweepStaleWorkingCards,
   isSessionTransferring,
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
@@ -450,7 +452,7 @@ import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
-import { saveFrozenCards } from './services/frozen-card-store.js';
+import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -1064,6 +1066,25 @@ function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
   });
 }
 
+/** Cards of sessions whose CLI did not come back may still read 「工作中」
+ *  (re-attached sessions are re-rendered by their first screen_update); then,
+ *  once per bot, withdraw untracked 「工作中」 cards older builds left behind. */
+function scheduleRestoredStreamingCardStatusAlignment(larkAppId: string, restoredAt: number): void {
+  const warn = (err: unknown) => logger.warn(
+    `[card] startup card status alignment failed for ${larkAppId}: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  );
+  queueMicrotask(() => {
+    try {
+      Promise.resolve(reconcileRestoredStreamingCardStatus(larkAppId))
+        .then(() => sweepStaleWorkingCards(larkAppId, restoredAt))
+        .catch(warn);
+    } catch (err) {
+      warn(err);
+    }
+  });
+}
+
 async function restoreSessionsAndScheduleStartupRecovery(opts: {
   larkAppId: string;
   restoreSessions: () => Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined>;
@@ -1072,8 +1093,10 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
   const restoredQuarantineNotices = await opts.restoreSessions();
+  const restoredAt = Date.now();
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
+  scheduleRestoredStreamingCardStatusAlignment(opts.larkAppId, restoredAt);
   opts.markSessionsRestored();
   queueMicrotask(() => {
     const groups = new Set<string>();
@@ -5733,7 +5756,10 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     scheduleCardPatch(ds, frozenCard);
 
     if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
-      if (!ds.frozenCards) ds.frozenCards = new Map();
+      // Lazy-load like parkStreamCard: after a restart the in-memory Map is
+      // absent, and saving a fresh one would drop the earlier turns' entries
+      // from disk — leaving those cards in the thread with nothing to recall them.
+      if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
       ds.parkedStreamCardNonce = ds.streamCardNonce;
       ds.frozenCards.set(ds.streamCardNonce, {
         messageId: ds.streamCardId,

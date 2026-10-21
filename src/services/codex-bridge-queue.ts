@@ -146,6 +146,9 @@ export class CodexBridgeQueue {
    * any CoT on the successor. Let the UI close that exact abandoned timeline;
    * this notification is not evidence that the work completed. */
   private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
+  /** A Lark turn's own user record reached the transcript: the CLI has its
+   *  input. Never affects attribution; exceptions are swallowed. */
+  private turnStartObserver?: (turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
@@ -556,6 +559,10 @@ export class CodexBridgeQueue {
     this.cotSupersededObserver = fn;
   }
 
+  setTurnStartObserver(fn: (turn: CodexPendingTurn) => void): void {
+    this.turnStartObserver = fn;
+  }
+
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
@@ -813,6 +820,7 @@ export class CodexBridgeQueue {
           next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
         }
         this.collecting = next!;
+        try { this.turnStartObserver?.(next!); } catch { /* observer only */ }
       } else if (willSynthLocal) {
         // Adopt mode local input: user typed in iTerm, no Lark
         // fingerprint match. Synthesise a local turn so the assistant

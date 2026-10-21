@@ -6,6 +6,7 @@ import { validateCodexServiceTier } from '../src/services/codex-service-tier-cat
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
 }));
+import type { ChildProcess } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
@@ -949,6 +950,24 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
     await Promise.allSettled(pending.map(({ response }) => response));
   }, 5_000);
 
+  // These two cases run the real hook by cold-starting src/cli.ts from source. On CI the
+  // first cold start alone measured 5.8s in a passing run, so the old 6s hook deadline
+  // left no headroom and timed out under any runner load (#2080). The test budget adds
+  // its own margin for the setup before the spawn (one case first fills the proof quota
+  // with 64 IPC calls), so the hook deadline, which reports the child's stderr, fires first.
+  const REAL_HOOK_DEADLINE_MS = 25_000;
+  const REAL_HOOK_TEST_TIMEOUT_MS = REAL_HOOK_DEADLINE_MS + 15_000;
+  async function waitForRealHookExit(child: ChildProcess, stderr: Buffer[]): Promise<number | null> {
+    return await new Promise<number | null>((resolveExit, reject) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`hook did not exit within ${REAL_HOOK_DEADLINE_MS}ms; stderr:\n${Buffer.concat(stderr).toString('utf8')}`));
+      }, REAL_HOOK_DEADLINE_MS);
+      child.once('exit', code => { clearTimeout(timer); resolveExit(code); });
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+    });
+  }
+
   it('denies a real hook when nonce-store capacity is full but a proof-backed 429 can still be written', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-native-runtime-capacity-'));
     const previousDataDir = config.session.dataDir;
@@ -1012,11 +1031,7 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
       const stderr: Buffer[] = [];
       child.stdout!.on('data', chunk => stdout.push(Buffer.from(chunk)));
       child.stderr!.on('data', chunk => stderr.push(Buffer.from(chunk)));
-      const status = await new Promise<number | null>((resolveExit, reject) => {
-        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('hook timed out')); }, 6_000);
-        child.once('exit', code => { clearTimeout(timer); resolveExit(code); });
-        child.once('error', reject);
-      });
+      const status = await waitForRealHookExit(child, stderr);
 
       expect(status).toBe(0);
       expect(JSON.parse(Buffer.concat(stdout).toString('utf8'))).toEqual({
@@ -1033,7 +1048,7 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
       workerPool.setActiveSessionsRegistry(new Map());
       rmSync(dataDir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, REAL_HOOK_TEST_TIMEOUT_MS);
 
   it('fails open for a real hook when response-proof quota is exhausted and no new trusted proof can be written', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-native-runtime-proof-quota-'));
@@ -1112,11 +1127,7 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
       const stderr: Buffer[] = [];
       child.stdout!.on('data', chunk => stdout.push(Buffer.from(chunk)));
       child.stderr!.on('data', chunk => stderr.push(Buffer.from(chunk)));
-      const status = await new Promise<number | null>((resolveExit, reject) => {
-        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('hook timed out')); }, 6_000);
-        child.once('exit', code => { clearTimeout(timer); resolveExit(code); });
-        child.once('error', reject);
-      });
+      const status = await waitForRealHookExit(child, stderr);
 
       expect(status).toBe(0);
       expect(Buffer.concat(stdout).toString('utf8')).toBe('');
@@ -1126,7 +1137,7 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
       workerPool.setActiveSessionsRegistry(new Map());
       rmSync(dataDir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, REAL_HOOK_TEST_TIMEOUT_MS);
 
   it('serves the authoritative absent or invalid in-memory policy snapshot', async () => {
     installRuntimeSession();

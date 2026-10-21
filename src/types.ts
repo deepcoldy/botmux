@@ -2220,7 +2220,8 @@ export type WorkerToDaemon =
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
-       *  otherwise. Display only — no status decision reads it. */
+       *  otherwise. Never changes the reported status; the card shows it and the
+       *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
    * `entries` is the FULL cumulative list so far (not a delta) — each entry

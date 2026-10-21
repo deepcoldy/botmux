@@ -1144,6 +1144,95 @@ describe('BridgeTurnQueue', () => {
       expect(peek[0].assistantUuids).toEqual(['a1']);
     });
 
+    // Real Claude Code 2.1+ shape of a message typed while a turn runs: the
+    // attachment carries the full botmux envelope, rendered to the model as a
+    // system reminder. No `role:user` line follows it.
+    function absorbedQueued(uuid: string, prompt: string, timestamp: string): TranscriptEvent {
+      return {
+        type: 'attachment',
+        uuid,
+        timestamp,
+        attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+        renderedRole: 'system',
+        rendered: [{ content: `<system-reminder>\nThe user sent a new message while you were working:\n${prompt}\n</system-reminder>` }],
+      } as any;
+    }
+
+    it('binds a type-ahead mark to its mid-turn absorbed input and ends it with the host turn', () => {
+      const started: string[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, evidence) => {
+        started.push(`${turn.turnId}:${evidence.fullContentMatch}`);
+      });
+      const promptB = '<user_message>用pil 再看一遍</user_message>';
+      q.mark('tA', makeFingerprint('进度如何'), 100, normaliseForFingerprint('进度如何'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '进度如何'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'both answered'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+
+      // Not split: the running turn keeps collecting the reply.
+      expect(q.peek().map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(q.peek()[0].assistantUuids).toEqual(['a-final']);
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', assistantUuids: [] });
+      expect(started).toEqual(['tA:true', 'tB:true']);
+
+      // A pruning pass cannot expire it any more: it is started.
+      expect(q.pruneExpired(0, 10_000_000)).toEqual([]);
+
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(ready[1].terminalObserved).toBe(true);
+      expect(ready[1].terminalOutcome).toEqual({ status: 'completed' });
+      expect(ready[1].markTimeMs).toBe(5000);
+      expect(q.size()).toBe(0);
+    });
+
+    it('absorbed input stays queued until its host turn closes', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+      ]);
+      expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+    });
+
+    it('an absorbed reminder that matches no pending mark changes nothing', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('first request'));
+      q.mark('tB', makeFingerprint('unrelated pending prompt'));
+      q.ingest([
+        user('uA', 'first request'),
+        assistant('a1', 'working'),
+        absorbedQueued('q-absorbed', 'typed directly in the terminal', new Date(5000).toISOString()),
+      ]);
+      expect(q.peek().map(t => [t.turnId, t.started])).toEqual([['tA', true], ['tB', false]]);
+      expect(q.peek()[0].absorbedTurns).toBeUndefined();
+    });
+
+    it('with nothing collecting, the absorbed input collects the rest of the turn', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'follow-up after a worker restart';
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'answer'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tB']);
+      expect(ready[0].assistantUuids).toEqual(['a-final']);
+      expect(ready[0].absorbedIntoTurnId).toBeUndefined();
+    });
+
     it('protects turn with assistant activity from HOL drop even without visible text', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1', makeFingerprint('task 1'));

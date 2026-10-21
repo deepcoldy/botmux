@@ -1541,24 +1541,39 @@ export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined
  *  isMeaningfulUserEvent's defenses (sidechain, empty / synthetic-prefix
  *  prompts) so a queued slash command can't false-start a Lark turn. */
 export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  if (!isSubmittedQueuedCommand(ev)) return false;
+  // Mid-turn absorbed message: intra-turn context, NOT a new conversation
+  // turn boundary (see isMidTurnAbsorbedQueuedCommand).
+  return !isMidTurnAbsorbedRendering(ev);
+}
+
+/** A submitted prompt that Claude Code (2.1+) folded into the turn already
+ *  running instead of starting a new one: the user typed while a turn was in
+ *  progress, and the attachment(queued_command) is rendered to the model as a
+ *  system reminder (`renderedRole: "system"`, `<system-reminder>`). Not a turn
+ *  boundary — but it is the moment that input entered the conversation, and it
+ *  is the only transcript record it gets (no `role:user` line follows). */
+export function isMidTurnAbsorbedQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  return isSubmittedQueuedCommand(ev) && isMidTurnAbsorbedRendering(ev);
+}
+
+function isSubmittedQueuedCommand(ev: TranscriptEvent | null | undefined): ev is TranscriptEvent {
   if (!ev || typeof ev !== 'object') return false;
   if (ev.type !== 'attachment') return false;
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
-  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
-  // a turn is running, Claude Code logs an attachment(queued_command) rendered
-  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
-  // This is intra-turn context, NOT a new conversation turn boundary.
-  if ((ev as any).renderedRole === 'system') return false;
-  const rendered = (ev as any).rendered;
-  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
-    return false;
-  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
   return true;
+}
+
+function isMidTurnAbsorbedRendering(ev: TranscriptEvent): boolean {
+  if ((ev as any).renderedRole === 'system') return true;
+  const rendered = (ev as any).rendered;
+  return Array.isArray(rendered)
+    && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'));
 }
 
 export interface AdoptPreamble {

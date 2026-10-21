@@ -58,9 +58,10 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
+import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
@@ -135,7 +136,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
-import type { PersistentBackendTarget } from '../adapters/backend/types.js';
+import type { PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import { resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import {
@@ -152,7 +153,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, probePersistentBackendTargets, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -4710,6 +4711,168 @@ export function reconcileRestoredStreamingCardPins(larkAppId: string): void {
     running: false,
   });
   trackPinStreamingCardTask(drainBotStreamingCardReconcileQueue(larkAppId));
+}
+
+const RESTORED_CARD_STATUS_CONCURRENCY = 4;
+
+/** Which restored, worker-less sessions' CLI is provably not running, so a card
+ *  claiming 「工作中」 is wrong. A pty CLI dies with its worker; a pane the probe
+ *  reports missing took its CLI with it (one batched probe for all of them). An
+ *  inconclusive probe, an adopted foreign process or a remote runner may still
+ *  be working — those are left out. */
+function restoredSessionsWithCliGone(sessions: readonly DaemonSession[]): Set<DaemonSession> {
+  const gone = new Set<DaemonSession>();
+  const targets = new Map<DaemonSession, PersistentBackendTarget>();
+  for (const ds of sessions) {
+    if (ds.worker || ds.adoptedFrom || isRemoteBackendSession(ds)) continue;
+    if (!getSessionPersistentBackendType(ds)) {
+      gone.add(ds);
+      continue;
+    }
+    try {
+      const target = persistentBackendTargetForSession(ds);
+      if (target) targets.set(ds, target);
+    } catch { /* unresolvable target: not provably gone */ }
+  }
+  if (targets.size === 0) return gone;
+  let probes: ReadonlyMap<string, SessionProbe>;
+  try {
+    probes = probePersistentBackendTargets(targets.values());
+  } catch {
+    return gone;
+  }
+  for (const [ds, target] of targets) {
+    if (probes.get(persistentBackendTargetKey(target)) === 'missing') gone.add(ds);
+  }
+  return gone;
+}
+
+/** Restart-time status alignment for surviving cards whose CLI did not come
+ *  back. Re-attached sessions need nothing here: their first screen_update
+ *  re-renders the card even under suppressRecoveryCard. For the rest the card
+ *  header is read back from Lark, and only a card still claiming work is
+ *  touched — PATCHed to 「等待输入」, or withdrawn once Lark's 14-day edit window
+ *  has closed (the next turn's card would withdraw it anyway). No card is
+ *  posted and nobody is mentioned. */
+export async function reconcileRestoredStreamingCardStatus(larkAppId: string): Promise<void> {
+  if (!activeSessionsRegistry) return;
+  const candidates = [...new Set(activeSessionsRegistry.values())].filter(ds =>
+    ds.larkAppId === larkAppId
+    && ds.session.status === 'active'
+    && isRealStreamingCardId(ds.streamCardId)
+    && !ds.streamCardPending);
+  const owns = (ds: DaemonSession, messageId: string): boolean =>
+    ds.session.status === 'active'
+    && ds.streamCardId === messageId
+    && !ds.streamCardPending
+    && !ds.worker
+    && !isSessionTransferring(ds)
+    && activeSessionsRegistry?.get(activeSessionKey(ds)) === ds
+    && retainsLarkStreamingCardTransport(ds)
+    && !streamingCardDisabled(ds);
+  const cliGone = restoredSessionsWithCliGone(candidates.filter(ds => owns(ds, ds.streamCardId!)));
+  const reconcileOne = async (ds: DaemonSession): Promise<void> => {
+    const messageId = ds.streamCardId!;
+    if (!cliGone.has(ds) || !owns(ds, messageId)) return;
+    let title: string | undefined;
+    try {
+      title = cardMessageTitle(await getTopicMessageDetail(ds.larkAppId, messageId, { timeoutMs: 10_000 }));
+    } catch (err) {
+      logger.debug(`[${tag(ds)}] restored card status read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!streamingCardTitleClaimsWork(title) || !owns(ds, messageId)) return;
+    try {
+      await updateMessage(ds.larkAppId, messageId, buildStreamingCardJson(ds, 'idle'), { beforeWrite: () => {
+        if (!owns(ds, messageId)) throw new Error('Restored card no longer owned by a worker-less session');
+      } });
+      logger.info(`[${tag(ds)}] Restored card ${messageId.substring(0, 12)} still claimed work with no CLI running — set to idle`);
+    } catch (err) {
+      if (!(err instanceof MessageUpdateExpiredError) && !(err instanceof MessageWithdrawnError)) {
+        logger.debug(`[${tag(ds)}] restored card status PATCH failed: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (err instanceof MessageUpdateExpiredError && owns(ds, messageId)) {
+        await deleteMessage(ds.larkAppId, messageId).catch(() => { /* best-effort */ });
+        logger.info(`[${tag(ds)}] Withdrew restored card ${messageId.substring(0, 12)}: claims work, past Lark's edit window`);
+      }
+      if (ds.streamCardId === messageId) {
+        forgetPublishedStreamingCardIdentity(ds, messageId);
+        forgetStreamCardDisplayTarget(ds, messageId);
+        ds.streamCardId = undefined;
+        persistStreamCardState(ds);
+      }
+    }
+  };
+  for (let offset = 0; offset < candidates.length; offset += RESTORED_CARD_STATUS_CONCURRENCY) {
+    await Promise.allSettled(candidates.slice(offset, offset + RESTORED_CARD_STATUS_CONCURRENCY).map(reconcileOne));
+  }
+}
+
+/** Messages scanned per session container by the one-time stale-card sweep. */
+const STALE_WORKING_CARD_SCAN = 300;
+const STALE_WORKING_CARD_SWEEP_CONCURRENCY = 2;
+
+function staleWorkingCardSweepMarker(larkAppId: string): string {
+  return join(config.session.dataDir, 'card-sweeps', `${larkAppId}.stale-working-v1`);
+}
+
+/** One-time cleanup (per bot, marker file) of streaming cards older builds left
+ *  in active sessions' threads still reading 「工作中」 although no session owns
+ *  them any more — see staleWorkingCardIds. Each is withdrawn, as the normal
+ *  flow withdraws an old turn's card once its successor is live. Live and
+ *  frozen (to-be-recalled) cards of every session of this bot are kept, and so
+ *  is anything posted at or after `postedBefore` (the restore boundary).
+ *
+ *  This is a migration, not a continuous sweep: the marker is written after the
+ *  first pass whatever it found, so it never runs again for this bot. That pass
+ *  only sees the containers of sessions active at that startup, the newest
+ *  STALE_WORKING_CARD_SCAN messages of each, and skips a container whose listing
+ *  fails. The fixes in this change stop new orphans from being produced. */
+export async function sweepStaleWorkingCards(larkAppId: string, postedBefore: number = Date.now()): Promise<void> {
+  if (!activeSessionsRegistry) return;
+  const marker = staleWorkingCardSweepMarker(larkAppId);
+  if (existsSync(marker)) return;
+  const sessions = [...new Set(activeSessionsRegistry.values())].filter(ds =>
+    ds.larkAppId === larkAppId && ds.session.status === 'active');
+  const liveCardIds = new Set<string>();
+  for (const ds of sessions) {
+    for (const id of snapshotStreamingCardIds(ds)) liveCardIds.add(id);
+  }
+  const containers = new Map<string, () => Promise<unknown[]>>();
+  for (const ds of sessions) {
+    if (!retainsLarkStreamingCardTransport(ds) || ds.session.deferredScheduleRun) continue;
+    if (ds.scope === 'chat') {
+      containers.set(`chat:${ds.chatId}`, () => listChatMessages(larkAppId, ds.chatId, STALE_WORKING_CARD_SCAN));
+    } else if (ds.session.rootMessageId) {
+      const rootId = ds.session.rootMessageId;
+      containers.set(`thread:${rootId}`, () => listThreadMessages(larkAppId, ds.chatId, rootId, STALE_WORKING_CARD_SCAN));
+    }
+  }
+  let withdrawn = 0;
+  const sweepOne = async ([key, list]: [string, () => Promise<unknown[]>]): Promise<void> => {
+    let ids: string[];
+    try {
+      ids = staleWorkingCardIds(await list(), { larkAppId, liveCardIds, postedBefore });
+    } catch (err) {
+      logger.debug(`[${larkAppId}] stale-card sweep list failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    for (const id of ids) {
+      if (await deleteMessage(larkAppId, id).catch(() => false)) withdrawn++;
+    }
+  };
+  const entries = [...containers.entries()];
+  for (let offset = 0; offset < entries.length; offset += STALE_WORKING_CARD_SWEEP_CONCURRENCY) {
+    await Promise.allSettled(entries.slice(offset, offset + STALE_WORKING_CARD_SWEEP_CONCURRENCY).map(sweepOne));
+  }
+  try {
+    mkdirSync(dirname(marker), { recursive: true });
+    atomicWriteFileSync(marker, JSON.stringify({ sweptAt: new Date(postedBefore).toISOString(), containers: entries.length, withdrawn }));
+  } catch (err) {
+    logger.debug(`[${larkAppId}] stale-card sweep marker write failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (withdrawn > 0) logger.info(`[${larkAppId}] Withdrew ${withdrawn} stale 「工作中」 streaming card(s) left by earlier builds`);
 }
 
 export function __testOnly_resetPinStreamingCardReconcileQueue(): void {
@@ -15565,9 +15728,10 @@ function setupWorkerHandlers(
         }
 
         // Restart recovery: stay silent in the group. The session was restored
-        // after a daemon restart; don't auto-post/patch a streaming card here.
-        // The owner gets a private DM summary instead, and the surviving card
-        // (if any) is left untouched. The next real user turn clears this flag
+        // after a daemon restart; don't post a streaming card or re-render the
+        // surviving one as 「启动中」 here. The owner gets a private DM summary
+        // instead; the surviving card (if any) is brought to the real status
+        // by the first screen_update. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
           // Startup Pin recovery owns the only safe provenance decision for a
@@ -16475,10 +16639,15 @@ function setupWorkerHandlers(
         if (hasPendingTriggerStreamingCard(ds, msg.turnId)) break;
         if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }
 
-        // Restart recovery: a restored worker may emit screen updates as the CLI
-        // redraws on resume. Stay silent (no post/patch) until the first real
-        // user turn clears the flag. Dashboard SSE above still reflects status.
-        if (ds.suppressRecoveryCard) { clearUsageRefreshTimer(ds); break; }
+        // Restart recovery: silent means no NEW card until the first real user
+        // turn clears the flag. The surviving card still follows status edges
+        // (same-turn PATCH below) — otherwise a card left at 「工作中」 by the
+        // restart stays there until the next human message.
+        if (ds.suppressRecoveryCard
+          && (ds.streamCardPending || !ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL)) {
+          clearUsageRefreshTimer(ds);
+          break;
+        }
 
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);

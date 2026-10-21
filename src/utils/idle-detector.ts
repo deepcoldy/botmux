@@ -126,6 +126,8 @@ export class IdleDetector {
   private programStatusFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private programStatusBlockInfo: ProgramStatusBlock | null = null;
   private programStatusErrorMsg: string | undefined;
+  /** Wall clock of the last accepted OSC 7501 report (0 = none yet). */
+  private programStatusLastAtMs = 0;
 
   constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
     this.completionPattern = cli.completionPattern;
@@ -383,6 +385,7 @@ export class IdleDetector {
   observeProgramStatus(event: ProgramStatusEvent): void {
     if (!PROGRAM_STATUS_STATES.has(event.state)) return;
     if (event.id !== undefined && !isProgramStatusId(event.id)) return;
+    this.programStatusLastAtMs = Date.now();
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
@@ -433,6 +436,45 @@ export class IdleDetector {
 
   programStatusActive(): boolean {
     return this.programStatusAuthority;
+  }
+
+  /** OSC 7501 currently holds the session busy with a `working` record (a
+   *  `blocked` one waits on a human and is reported separately). */
+  programStatusHeldWorking(): boolean {
+    if (!this.programStatusAuthority || this.isIdle) return false;
+    let working = this.evictedBusyIds.size > 0;
+    for (const rec of this.programStatusRecords.values()) {
+      if (rec.state === 'blocked') return false;
+      if (rec.state === 'working') working = true;
+    }
+    return working;
+  }
+
+  /** Milliseconds since the last accepted OSC 7501 report. */
+  programStatusQuietMs(now: number = Date.now()): number {
+    return this.programStatusLastAtMs === 0 ? Number.POSITIVE_INFINITY : now - this.programStatusLastAtMs;
+  }
+
+  /**
+   * Drop a `working` hold the caller has proven stale from other evidence: the
+   * CLI's transcript closed the turn with nothing written since, and the
+   * screen shows its idle prompt. OSC 7501 has no heartbeat, so a lost
+   * terminal report (or a child id that never reports back) would otherwise
+   * keep the session busy forever. Leaves authority mode — the next report
+   * re-engages it, and until then a busy redraw can still flip the session
+   * back through idleToBusyPattern. Never releases a `blocked` record.
+   */
+  releaseStaleProgramStatus(): boolean {
+    if (!this.programStatusHeldWorking() || this.isStartupPending()) return false;
+    this.programStatusAuthority = false;
+    this.programStatusRecords.clear();
+    this.evictedBusyIds.clear();
+    this.programStatusBlockInfo = null;
+    this.programStatusErrorMsg = undefined;
+    this.clearProgramStatusFallback();
+    this.markStartupComplete();
+    this.markIdle('external');
+    return true;
   }
 
   /** Latest blocked record, for a later wait-card. Never logged here. */

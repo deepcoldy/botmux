@@ -14,10 +14,19 @@
  *   - fresh CLI spawning (spawnCli, non-adopt)     → takeCarryOver() and
  *     unshift the result back into pendingMessages
  *
- * Trade-off: if the CLI accepted the input and died mid-turn, re-delivery
- * makes the restarted CLI see the prompt twice — a duplicate ask beats a
- * silently lost message. A false-idle blip mid-turn clears the in-flight set
- * early and degrades to the old lose-on-crash behavior for that turn only.
+ * Once the CLI's own transcript shows an input's turn started (its user
+ * record landed — onTurnStarted), the input is no longer replayed into a CLI
+ * that RESUMES the conversation: it is already in that history, and replaying
+ * it re-ran the whole request (10-21: a Pi review replayed twice across tmux
+ * restarts). The restart note (services/restart-interruption) tells the CLI to
+ * continue instead. A FRESH respawn has no such history, so started inputs are
+ * still re-delivered there (takeStartedCarryOver).
+ *
+ * Trade-off for inputs with no start evidence: if the CLI accepted one and
+ * died mid-turn, re-delivery makes the restarted CLI see it twice — a
+ * duplicate ask beats a silently lost message. A false-idle blip mid-turn
+ * clears the in-flight set early and degrades to the old lose-on-crash
+ * behavior for that turn only.
  */
 
 import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
@@ -39,7 +48,10 @@ export type InflightItem = {
 
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
+  /** Written, and the CLI's transcript shows the turn started; not finished. */
+  private started: InflightItem[] = [];
   private carryOver: InflightItem[] = [];
+  private startedCarryOver: InflightItem[] = [];
 
   /** Something written to the PTY has not been consumed yet (no idle since). */
   hasUnacked(): boolean {
@@ -56,16 +68,22 @@ export class InflightInputTracker {
    * backend-exit handoff that may already have moved it to carryOver. */
   forget(item: InflightItem): void {
     this.unacked = this.unacked.filter(candidate => candidate !== item);
+    this.started = this.started.filter(candidate => candidate !== item);
     this.carryOver = this.carryOver.filter(candidate => candidate !== item);
+    this.startedCarryOver = this.startedCarryOver.filter(candidate => candidate !== item);
   }
 
   /** Retire one exact write whose transport outcome is ambiguous and must not
    * be replayed automatically. Other type-ahead items remain tracked. */
   retire(item: InflightItem): boolean {
-    const index = this.unacked.indexOf(item);
-    if (index < 0) return false;
-    this.unacked.splice(index, 1);
-    return true;
+    for (const list of [this.unacked, this.started]) {
+      const index = list.indexOf(item);
+      if (index >= 0) {
+        list.splice(index, 1);
+        return true;
+      }
+    }
+    return false;
   }
 
   /** A caller acknowledged an exact-turn interrupt. Drop that turn from both
@@ -73,7 +91,17 @@ export class InflightInputTracker {
    * Unrelated type-ahead inputs still belong to the next CLI generation. */
   retireTurn(turnId: string): void {
     this.unacked = this.unacked.filter(item => item.turnId !== turnId);
+    this.started = this.started.filter(item => item.turnId !== turnId);
     this.carryOver = this.carryOver.filter(item => item.turnId !== turnId);
+    this.startedCarryOver = this.startedCarryOver.filter(item => item.turnId !== turnId);
+  }
+
+  /** The CLI's transcript shows this turn's input arrived (its user record).
+   *  Inputs of an unknown turn stay unacked. */
+  onTurnStarted(turnId: string): void {
+    const keep: InflightItem[] = [];
+    for (const item of this.unacked) (item.turnId === turnId ? this.started : keep).push(item);
+    this.unacked = keep;
   }
 
   /** CLI is back at its idle prompt — everything written has been consumed
@@ -81,6 +109,7 @@ export class InflightInputTracker {
    *  type-ahead queue). Nothing is in flight anymore. */
   onTurnComplete(): void {
     this.unacked.length = 0;
+    this.started.length = 0;
   }
 
   /** CLI process died. Stash whatever was in flight for the next spawn.
@@ -91,6 +120,7 @@ export class InflightInputTracker {
     const exiting = this.unacked.splice(0);
     const carried = exiting.filter(shouldCarry);
     if (carried.length > 0) this.carryOver.push(...carried);
+    this.startedCarryOver.push(...this.started.splice(0).filter(shouldCarry));
     return carried.length;
   }
 
@@ -100,6 +130,13 @@ export class InflightInputTracker {
    *  a detach-style kill). */
   takeCarryOver(): InflightItem[] {
     this.unacked.length = 0;
+    this.started.length = 0;
     return this.carryOver.splice(0);
+  }
+
+  /** Inputs whose turn had started when the CLI died. Re-deliver them only to
+   *  a FRESH respawn (no history); a resumed CLI already has them. */
+  takeStartedCarryOver(): InflightItem[] {
+    return this.startedCarryOver.splice(0);
   }
 }

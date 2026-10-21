@@ -252,6 +252,7 @@ describe('maintenance idle suspension', () => {
     ['tui prompt processing', (d: any) => { d.tuiPromptProcessing = true; }],
     ['agent attention', (d: any) => { d.agentAttention = { kind: 'decision', reason: 'pick', at: now }; }],
     ['usage limit', (d: any) => { d.usageLimit = { kind: 'rate_limited' }; }],
+    ['background tasks still running', (d: any) => { d.backgroundTaskCount = 2; }],
     ['final output delivery', (d: any) => { d.finalOutputDeliveriesInFlight = new Set([Promise.resolve()]); }],
     ['queued suspend reason', (d: any) => { d.pendingSuspendReason = 'manual_suspend'; }],
     ['queued suspend generation', (d: any) => { d.pendingSuspendGeneration = 0; }],
@@ -439,6 +440,33 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(suspended.map(s => s.sessionId)).toEqual(['e', 'f']);
     expect(activeSessions.get('a').worker).not.toBe(null);
     expect(activeSessions.get('d').worker).not.toBe(null);
+  });
+
+  it('never suspends an idle session whose background tasks are still running (cap, TTL and admission rescue)', () => {
+    // 'waiting' ended its turn but its CI monitor still runs (the card shows
+    // 「后台子任务运行中（1）」): killing the CLI would kill the monitor.
+    const make = () => new Map<string, any>([
+      ['waiting', { ...ds('waiting', 'tmux', now - 90 * 60_000), backgroundTaskCount: 1, idleSinceAt: now - 90 * 60_000 }],
+      ['idle', { ...ds('idle', 'tmux', now - 80 * 60_000), idleSinceAt: now - 80 * 60_000 }],
+      ['recent', ds('recent', 'tmux', now - 10 * 60_000)],
+    ]);
+
+    let activeSessions = make();
+    expect(sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1 }).map(s => s.sessionId)).toEqual(['idle', 'recent']);
+    expect(activeSessions.get('waiting').worker).not.toBe(null);
+
+    activeSessions = make();
+    expect(sweepIdleWorkers(activeSessions, { maxLiveWorkers: 0, idleTtlMs: 30 * 60_000, now })
+      .map(s => s.sessionId)).toEqual(['idle']);
+
+    activeSessions = make();
+    expect(reclaimIdleWorkersForAdmission(activeSessions, { maxSuspend: 4 }).map(s => s.sessionId)).toEqual(['idle', 'recent']);
+
+    // Once the task stops (the next screen_update carries no count), it is an
+    // ordinary idle candidate again.
+    activeSessions = make();
+    activeSessions.get('waiting').backgroundTaskCount = undefined;
+    expect(sweepIdleWorkers(activeSessions, { maxLiveWorkers: 2 }).map(s => s.sessionId)).toEqual(['waiting']);
   });
 
   it('never suspends adopt sessions even when oldest and over cap', () => {
