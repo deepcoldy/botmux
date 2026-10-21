@@ -162,3 +162,52 @@ export function diagnoseBackendSubmitFailure(input: BackendSubmitFailureInput): 
     activeWindowMs: input.activeWindowMs,
   });
 }
+
+/** Claude Code writes the first prompt's transcript record only after all of
+ *  its SessionStart hooks finish. On a loaded host that took minutes
+ *  (2026-10-20: prompt submitted 17:46:26, hooks reported 17:49:00, record
+ *  17:49:01), so a missing record before botmux's own SessionStart hook has
+ *  reported is expected, not a failed submit. This bounds the wait in case the
+ *  hook never reports at all. */
+export const SUBMIT_SESSION_START_WAIT_MAX_MS = 10 * 60_000;
+/** The record followed the SessionStart report within ~1s in the sample above;
+ *  leave a loaded disk an order of magnitude before concluding. */
+export const SUBMIT_POST_SESSION_START_GRACE_MS = 10_000;
+/** Floor for any verdict, independent of PTY activity: slow UserPromptSubmit
+ *  hooks defer the record by 5–15s, and two 20s rechecks is the budget the
+ *  weak-activity path granted before PTY activity stopped counting. */
+export const SUBMIT_GATED_MIN_WAIT_MS = 40_000;
+
+/**
+ * Verdict for a deferred submit recheck that still finds no transcript record,
+ * for a spawn whose CLI reports a deterministic SessionStart signal (Claude
+ * family with botmux's hook installed). Only that signal and the transcript
+ * decide; PTY activity counts for nothing either way, because a CLI waiting on
+ * its hooks and a composer holding an unsubmitted paste both keep redrawing:
+ * on 2026-10-20 "pty-output shows the CLI is active" postponed the warning for
+ * a prompt stuck in the composer three times, and still let a false warning
+ * through for a prompt that Claude was merely holding until its hooks finished.
+ */
+export function decideSessionStartGatedSubmitWarning(state: {
+  /** When the SessionStart signal arrived for this spawn; undefined = not yet. */
+  sessionStartAtMs: number | undefined;
+  /** When this submission's confirmation chain started. */
+  waitingSinceMs: number;
+  nowMs: number;
+  graceMs?: number;
+  minWaitMs?: number;
+  maxWaitMs?: number;
+}): { warn: false; reason: 'session-start-pending' | 'post-session-start-grace' | 'min-wait' }
+  | { warn: true; reason: 'record-missing-after-session-start' | 'session-start-never-reported' } {
+  const waitedMs = state.nowMs - state.waitingSinceMs;
+  if (state.sessionStartAtMs === undefined) {
+    return waitedMs >= (state.maxWaitMs ?? SUBMIT_SESSION_START_WAIT_MAX_MS)
+      ? { warn: true, reason: 'session-start-never-reported' }
+      : { warn: false, reason: 'session-start-pending' };
+  }
+  if (state.nowMs - state.sessionStartAtMs < (state.graceMs ?? SUBMIT_POST_SESSION_START_GRACE_MS)) {
+    return { warn: false, reason: 'post-session-start-grace' };
+  }
+  if (waitedMs < (state.minWaitMs ?? SUBMIT_GATED_MIN_WAIT_MS)) return { warn: false, reason: 'min-wait' };
+  return { warn: true, reason: 'record-missing-after-session-start' };
+}

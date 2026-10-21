@@ -17783,6 +17783,10 @@ function setupWorkerHandlers(
           message: msg.message,
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (msg.kind === 'input_not_submitted' && ownsLifecycleMutation()
+          && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
+          scheduleActiveRuntimePatch(ds);
+        }
         // Mute ONLY the Lark push for the per-bot opt-out: checked against the
         // LIVE registry so an already-stalled turn is silenced the moment the
         // config lands. The lifecycle hook above and the dashboard stalled

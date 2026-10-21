@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  decideSessionStartGatedSubmitWarning,
   diagnoseSubmitFailure,
   diagnoseBackendSubmitFailure,
   SUBMIT_FAILURE_ACTIVE_WINDOW_MS,
@@ -357,5 +358,45 @@ describe('diagnoseBackendSubmitFailure worker seam', () => {
   it('still uses the activity clock on ZMX after the screen is blanked', () => {
     const loginScreen = 'please run /login';
     expect(diagnoseBackendSubmitFailure({ backendType: 'zmx', cliId: 'claude-code', capturedScreenText: loginScreen, lastActivityAtMs: NOW, nowMs: NOW })).toEqual({ reason: 'still_active', evidence: 'activity' });
+  });
+});
+
+describe('decideSessionStartGatedSubmitWarning (2026-10-20 incident timelines)', () => {
+  const at = (hms: string) => Date.parse(`2026-10-20T${hms}Z`);
+
+  it('8c6fc852: no warning while Claude holds the record until its late SessionStart', () => {
+    // Prompt submitted 17:46:26, in-band confirm gave up 17:46:35; every 20s
+    // recheck saw only PTY activity; SessionStart reported 17:49:00, record 17:49:01.
+    const waitingSinceMs = at('17:46:35');
+    for (const recheck of ['17:46:55', '17:47:15', '17:47:35', '17:47:55', '17:48:15', '17:48:35', '17:48:55']) {
+      expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at(recheck) }))
+        .toEqual({ warn: false, reason: 'session-start-pending' });
+    }
+    // A recheck right after the report still leaves the record time to land.
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: at('17:49:00'), waitingSinceMs, nowMs: at('17:49:05') }))
+      .toEqual({ warn: false, reason: 'post-session-start-grace' });
+  });
+
+  it('f2eaabca: a prompt stuck in the composer is still reported once SessionStart has come and gone', () => {
+    const waitingSinceMs = at('17:46:31');
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at('17:47:31') }).warn)
+      .toBe(false);
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: at('17:49:09'), waitingSinceMs, nowMs: at('17:49:31') }))
+      .toEqual({ warn: true, reason: 'record-missing-after-session-start' });
+  });
+
+  it('a mid-session turn waits at least the minimum budget, regardless of PTY activity', () => {
+    const sessionStartAtMs = at('10:00:00');
+    const waitingSinceMs = at('12:00:00');
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs, waitingSinceMs, nowMs: at('12:00:20') }))
+      .toEqual({ warn: false, reason: 'min-wait' });
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs, waitingSinceMs, nowMs: at('12:00:40') }).warn).toBe(true);
+  });
+
+  it('warns eventually when the SessionStart hook never reports', () => {
+    const waitingSinceMs = at('12:00:00');
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at('12:09:59') }).warn).toBe(false);
+    expect(decideSessionStartGatedSubmitWarning({ sessionStartAtMs: undefined, waitingSinceMs, nowMs: at('12:10:00') }))
+      .toEqual({ warn: true, reason: 'session-start-never-reported' });
   });
 });

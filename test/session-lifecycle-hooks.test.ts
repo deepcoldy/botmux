@@ -352,6 +352,36 @@ describe('worker-pool lifecycle hook integration', () => {
     restoreGetBot.mockRestore();
   });
 
+  it('repaints the status card from current state when an input was not submitted', async () => {
+    const { buildStreamingCard } = await import('../src/im/lark/card-builder.js');
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    // The working→idle edge already happened; only its card PATCH was lost.
+    const ds = makeDs({ worker, workerReady: true, lastScreenStatus: 'idle', currentTurnId: 'om_turn' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'user_notify', message: 'plain warning', turnId: 'om_turn' });
+    await flush();
+    expect(buildStreamingCard).not.toHaveBeenCalled();
+
+    worker.emit('message', { type: 'user_notify', kind: 'input_not_submitted', message: 'not submitted', turnId: 'om_turn' });
+    await flush();
+    expect(buildStreamingCard).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(buildStreamingCard).mock.calls[0]![5]).toBe('idle');
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    // A late notice about an older turn must not repaint the current turn's card.
+    worker.emit('message', { type: 'user_notify', kind: 'input_not_submitted', message: 'stale', turnId: 'om_older' });
+    await flush();
+    expect(buildStreamingCard).toHaveBeenCalledTimes(1);
+  });
+
   it('emits session.requires_attention from user_notify IPC', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });

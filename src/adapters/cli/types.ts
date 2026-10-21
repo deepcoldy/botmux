@@ -432,6 +432,15 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Optional deterministic evidence that a slash-command LINE typed into the
+   *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.
+   *  Claude Code's transcript `<command-name>/effort</command-name>` record.
+   *  Called right before the line is typed so the adapter can take its
+   *  baseline; the returned probe is polled afterwards and must be cheap.
+   *  Returns undefined when no such evidence is available — the worker then
+   *  falls back to PTY evidence (output after the submit key, then the prompt). */
+  commandExecutionProbe?(pty: PtyHandle, commandLine: string): (() => boolean) | undefined;
+
   /** Optional structured input path for adapters whose protocol can keep
    * application context out of the visible user message. The worker calls this
    * only when a typed sidecar is present; every other adapter continues through

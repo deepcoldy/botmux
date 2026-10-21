@@ -2261,7 +2261,12 @@ export type WorkerToDaemon =
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number; /** Identifies the Codex App no-progress nudge so the daemon can apply the
       * per-bot `noProgressNotify.enabled` mute against the LIVE registry (an
       * already-stalled turn is silenced immediately, no worker round-trip). */
-      kind?: 'codex_app_no_progress' }
+      kind?: 'codex_app_no_progress'
+        /** The turn's input was held or given up before submission. The daemon
+         *  re-renders the status card from its current state: a single
+         *  working→idle edge PATCH may have been lost, and nothing else would
+         *  ever correct a card still claiming the unsubmitted turn runs. */
+        | 'input_not_submitted' }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
