@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { config } from '../src/config.js';
 
 const APP_ID = 'cli_config_routes_test';
 
@@ -34,6 +35,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-max-live-workers', LEGACY],
   ['/api/bot-idle-suspend-minutes', LEGACY],
   ['/api/bot-riff', LEGACY],
+  ['/api/bot-herdr', LEGACY],
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
@@ -95,6 +97,22 @@ const CASES: readonly Case[] = [
   ['/api/bot-riff', '{"riff":"   "}', 200, { ok: true, riff: '' }, { riff: undefined }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"sandboxCluster\\":\\"nope\\"}"}', 400, { ok: false, error: 'invalid_sandbox_cluster' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"ftp://x\\"}"}', 400, { ok: false, error: 'invalid_base_url' }],
+  // herdr：合法值经 normalizeHerdrBackendConfig 归一落盘；非法字段显式拒绝；空串 / 空对象清除。
+  ['/api/bot-herdr', '{"herdr":"{\\"placement\\":\\"tab\\"}"}', 200, { ok: true }, { herdr: { placement: 'tab' } }],
+  ['/api/bot-herdr', '{"herdr":"   "}', 200, { ok: true, herdr: '' }, { herdr: undefined }],
+  ['/api/bot-herdr', '{"herdr":"{}"}', 200, { ok: true, herdr: '' }, { herdr: undefined }],
+  ['/api/bot-herdr', '{"herdr":"{\\"placement\\":\\"nope\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"session\\":\\"default\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"chatTypes\\":[\\"group\\",\\"x\\"]}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"[1,2]"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  // 激活条件：无 sessionName/placement 时只填 tab/workspace/splitDirection/chatTypes，
+  // 叠加全局 env 后仍不生效 → 拒绝，杜绝「保存成功但零效果」。
+  ['/api/bot-herdr', '{"herdr":"{\\"tab\\":\\"3\\"}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-herdr', '{"herdr":"{\\"chatTypes\\":[\\"group\\"]}"}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  // 重复 chatTypes 与 bots.json/env 门一致，去重后接受。
+  ['/api/bot-herdr', '{"herdr":"{\\"sessionName\\":\\"default\\",\\"chatTypes\\":[\\"group\\",\\"group\\"]}"}', 200, { ok: true }, { herdr: { sessionName: 'default', chatTypes: ['group'] } }],
+  // 非字符串 body 不能静默当清除（破坏性字段类型门）。
+  ['/api/bot-herdr', '{"herdr":{"tab":"3"}}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
   ['/api/bot-skills', '{"action":"set","policy":null}', 200, { ok: true, skills: null }],
   ['/api/bot-skills', '{"action":"x"}', 400, { ok: false, error: 'invalid_action' }],
   ['/api/bot-skills', '{"action":"attach"}', 400, { ok: false, error: 'name_required' }],
@@ -134,6 +152,7 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
   });
 
   afterEach(async () => {
+    delete (config.daemon as { herdr?: unknown }).herdr;
     if (handle) await handle.close();
     handle = null;
     setLarkAppId('');
@@ -199,6 +218,71 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     expect(clear.status).toBe(200);
     expect(await clear.json()).toEqual({ ok: true, env: '', envKeys: [] });
     expect(persistedBot()).not.toHaveProperty('env');
+  });
+
+  it('/api/bot-herdr normalizes a full block, echoes it pretty-printed, then clears', async () => {
+    // 重复 chatTypes 与 bots.json/env 门一致：去重接受，不报错。
+    const dedupBody = JSON.stringify({
+      herdr: JSON.stringify({
+        sessionName: ' default ',  // trim
+        placement: 'split',
+        workspace: '',              // empty after trim → dropped
+        tab: '3',
+        splitDirection: 'right',
+        chatTypes: ['group', 'group'],  // duplicated → deduped
+      }),
+    });
+    const save = await put('/api/bot-herdr', dedupBody);
+    expect(save.status).toBe(200);
+    const savedBody = await save.json();
+    expect(savedBody.ok).toBe(true);
+    expect(JSON.parse(savedBody.herdr)).toEqual({
+      sessionName: 'default',
+      placement: 'split',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    });
+    expect(persistedBot().herdr).toEqual({
+      sessionName: 'default',
+      placement: 'split',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    });
+    // 缺激活字段：只填 tab 被拒且不落盘。
+    const inert = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '9' }) }));
+    expect(inert.status).toBe(400);
+    expect((await inert.json()).error).toContain('invalid_herdr_config');
+    // 非字符串 body：拒绝，不当清除。
+    const wrongType = await put('/api/bot-herdr', JSON.stringify({ herdr: { tab: '9' } }));
+    expect(wrongType.status).toBe(400);
+    expect(persistedBot().herdr).toBeDefined();
+
+    const clear = await put('/api/bot-herdr', JSON.stringify({ herdr: '' }));
+    expect(clear.status).toBe(200);
+    expect(await clear.json()).toMatchObject({ ok: true, herdr: '' });
+    expect(persistedBot()).not.toHaveProperty('herdr');
+  });
+
+  it('/api/bot-herdr accepts partial bot overrides when the env already activates placement', async () => {
+    // 全局 env 已提供 placement（BOTMUX_HERDR_PLACEMENT），bot 块只覆盖 tab 是
+    // 合法的字段级叠加，不能被「需至少 sessionName/placement」误杀。
+    const daemon = config.daemon as { herdr?: unknown };
+    daemon.herdr = { placement: 'split', chatTypes: ['group'] };
+    try {
+      const save = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '3' }) }));
+      expect(save.status).toBe(200);
+      expect(JSON.parse((await save.json()).herdr)).toEqual({ tab: '3' });
+      expect(persistedBot().herdr).toEqual({ tab: '3' });
+      // env 只放了非激活字段时，bot 部分覆盖仍不生效 → 拒绝。
+      daemon.herdr = { chatTypes: ['group'] };
+      const inert = await put('/api/bot-herdr', JSON.stringify({ herdr: JSON.stringify({ tab: '3' }) }));
+      expect(inert.status).toBe(400);
+      expect((await inert.json()).error).toContain('invalid_herdr_config');
+    } finally {
+      delete daemon.herdr;
+    }
   });
 
   it('never reaches the spec_missing branch: every field key resolves in the config store', async () => {

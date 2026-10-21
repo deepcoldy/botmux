@@ -36,7 +36,7 @@ import {
   existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import type { BackgroundTaskSignals, CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import {
@@ -333,6 +333,7 @@ export function drainGrokUpdates(
   let agentParts: string[] = [];
   let openTurnStartOffset: number | null = null;
   let openTurnSessionId: string | undefined;
+  let backgroundTasks: BackgroundTaskSignals | undefined;
 
   for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let obj: any;
@@ -361,6 +362,29 @@ export function drainGrokUpdates(
           text: textContent,
           sourceSessionId: sessionId,
         });
+      }
+      continue;
+    }
+
+    // Background tasks (bash / monitor). Grok writes the launch, a full
+    // `background_tasks` list on every change, and `task_completed` when one
+    // stops; a task can outlive the turn and wake the agent later. Passive for
+    // the reply: these never touch the buffered agent group.
+    if (su === 'task_backgrounded' || su === 'background_tasks' || su === 'task_completed') {
+      const bg = (backgroundTasks ??= { launched: [], settled: [] });
+      if (su === 'task_backgrounded' && typeof update.task_id === 'string' && update.task_id) {
+        bg.launched.push({ taskId: update.task_id, kind: update.monitor_description ? 'monitor' : 'shell', atMs: timestampMs });
+      } else if (su === 'background_tasks' && Array.isArray(update.tasks)) {
+        for (const task of update.tasks) {
+          if (typeof task?.task_id !== 'string' || !task.task_id) continue;
+          if (task.status === 'running') {
+            bg.launched.push({ taskId: task.task_id, kind: task.kind === 'monitor' ? 'monitor' : 'shell', atMs: timestampMs });
+          } else {
+            bg.settled.push(task.task_id);
+          }
+        }
+      } else if (su === 'task_completed' && typeof update.task_snapshot?.task_id === 'string' && update.task_snapshot.task_id) {
+        bg.settled.push(update.task_snapshot.task_id);
       }
       continue;
     }
@@ -468,7 +492,7 @@ export function drainGrokUpdates(
     ? openTurnStartOffset
     : step.window.newOffset;
 
-  return { events, newOffset, pendingTail };
+  return { events, newOffset, pendingTail, ...(backgroundTasks ? { backgroundTasks } : {}) };
 }
 
 /** Current file size helper for submit-verify baseByte. */

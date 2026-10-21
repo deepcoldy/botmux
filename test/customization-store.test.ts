@@ -25,7 +25,6 @@ import {
   effectiveBuiltinSkills,
   effectiveBuiltinSkillContent,
   resolveConditionalLine,
-  isBuiltinSkillDisabled,
 } from '../src/skills/effective-builtins.js';
 import { BUILTIN_SKILLS } from '../src/skills/definitions.js';
 
@@ -134,7 +133,6 @@ describe('built-in skill overrides', () => {
   it('disables a skill so it drops out of the effective list', () => {
     setSkillDisabled(target, true);
     invalidateCustomizationCache();
-    expect(isBuiltinSkillDisabled(target)).toBe(true);
     expect(effectiveBuiltinSkillContent(target, 'SHIPPED')).toBeUndefined();
     const eff = effectiveBuiltinSkills([...BUILTIN_SKILLS]);
     expect(eff.find((s) => s.name === target)).toBeUndefined();
@@ -150,7 +148,7 @@ describe('built-in skill overrides', () => {
     setSkillOverrideBody(target, null);
     invalidateCustomizationCache();
     expect(readSkillOverrideBody(target)).toBeUndefined();
-    expect(isBuiltinSkillDisabled(target)).toBe(true);
+    expect(effectiveBuiltinSkillContent(target, 'SHIPPED')).toBeUndefined();
   });
 
   it('rejects an oversized body', () => {

@@ -232,6 +232,54 @@ export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
   updatedAt?: string;
 }
 
+/** Whether `turnId`'s per-turn registry entry may authenticate schedule /
+ * workflow mutations as a human caller. Shared by the daemon
+ * (scheduleCallerForTurn) and the CLI-side provenance resolver so both enforce
+ * ONE rule:
+ * - `om_` turns are real Lark messages — the daemon writes their entry at turn
+ *   begin with the real sender;
+ * - `join_<uuid>` is the daemon-minted auto-start-on-join first turn — its
+ *   entry is written at session birth with the operator who added the bot;
+ * - recovery-minted continuations are excluded STRUCTURALLY, never by prefix:
+ *   ordinary auto-recovery clones the original entry under a new turn id
+ *   (ordinaryTurnRecovery.currentTurnId ≠ logicalTurnId), failed-turn recovery
+ *   re-dispatches as failedTurnRecovery.turnId, and readonly task continuation
+ *   clones the same way (readonlyTaskContinuation.currentTurnId ≠
+ *   logicalTurnId). A copied identity is not a new human request —
+ *   user-triggered retry included (fail-closed until a maintainer decides
+ *   explicit retry should re-authenticate). The `!== logicalTurnId` half is
+ *   load-bearing in all three: an ARMED-but-not-yet-continued recovery state
+ *   keeps logicalTurnId === currentTurnId on the live turn;
+ * - every other synthetic mint (trg_, bmx-*, …) is refused here regardless of
+ *   what its registry entry carries. */
+export function registryTurnMayAuthenticateHuman(
+  s: {
+    ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
+    failedTurnRecovery?: { turnId: string };
+    readonlyTaskContinuation?: { logicalTurnId: string; currentTurnId: string };
+  },
+  turnId: string,
+): boolean {
+  if (!turnId.startsWith('om_') && !turnId.startsWith('join_')) return false;
+  const ordinary = s.ordinaryTurnRecovery;
+  if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
+  if (s.failedTurnRecovery?.turnId === turnId) return false;
+  const readonly = s.readonlyTaskContinuation;
+  if (readonly && readonly.currentTurnId === turnId && turnId !== readonly.logicalTurnId) return false;
+  return true;
+}
+
+/** Whether a per-turn registry entry proves a human opened its turn — the same
+ * rule dispatchCallerFromReply applies daemon-side: the sender must appear in
+ * the turn's own participant window as a non-bot. Entries predating the
+ * participant window (or written without it) fail closed. */
+export function registryEntryProvesHumanSender(
+  entry: Pick<ReplyTargetEntry, 'senderOpenId' | 'participants'> | undefined,
+): entry is ReplyTargetEntry & { senderOpenId: string } {
+  const sender = entry?.senderOpenId;
+  return !!sender && !!entry?.participants?.some(p => p.openId === sender && p.isBot === false);
+}
+
 /** Reply context for one exact turn. The per-turn entry is authoritative. Old
  * persisted sessions may fall back to the single slots only when those slots
  * explicitly identify the requested turn. */

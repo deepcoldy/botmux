@@ -17,6 +17,11 @@ export const STREAM_STATUS_TEMPLATE_MAP = {
 
 export type StreamStatusTemplate = typeof STREAM_STATUS_TEMPLATE_MAP[keyof typeof STREAM_STATUS_TEMPLATE_MAP];
 
+/** Header for 「主回合已结束 · 后台子任务运行中（N）」. Not a status of its own (the
+ *  session is `working` or `idle` underneath), so it stays out of the map and its
+ *  icon set; one colour keeps the label looking the same over either. */
+export const BACKGROUND_WAIT_TEMPLATE = 'wathet';
+
 export const STREAM_STATUS_TEMPLATE_ICON: Record<StreamStatusTemplate, string> = {
   yellow: '🟡',
   blue: '🔵',

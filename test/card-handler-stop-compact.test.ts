@@ -96,6 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 

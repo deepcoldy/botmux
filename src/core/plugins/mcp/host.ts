@@ -6,6 +6,7 @@ import { createServer, type Server as NetServer, type Socket } from 'node:net';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   PluginMcpGateway,
+  type GatewayLinkRefRegistrationHandler,
   type GatewayTrustedResultDeliveryHandler,
   type GatewayTrustedTurnIdentityProvider,
 } from './gateway.js';
@@ -123,6 +124,7 @@ export async function startSessionMcpGatewayHost(opts: {
   dataDir: string;
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -156,6 +158,7 @@ export async function startSessionMcpGatewayHost(opts: {
       }, {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
+        linkRefRegistration: opts.linkRefRegistration,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

@@ -25,7 +25,6 @@ import {
   createReplyCard,
   DEFAULT_BRAND_LABEL,
   extractFirstReplyCardHeading,
-  hasMarkdown,
   normalizeLocalHomeLinks,
   REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
@@ -1371,15 +1370,6 @@ describe('buildReplyCardFooter', () => {
     );
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
-});
-
-describe('hasMarkdown', () => {
-  it('detects fences', () => expect(hasMarkdown('a\n```\nx\n```')).toBe(true));
-  it('detects headings', () => expect(hasMarkdown('# title')).toBe(true));
-  it('detects bold', () => expect(hasMarkdown('hello **world**')).toBe(true));
-  it('detects pipe tables', () => expect(hasMarkdown('| a | b |\n| - | - |')).toBe(true));
-  it('returns false for plain text', () => expect(hasMarkdown('just words here')).toBe(false));
-  it('returns false for empty', () => expect(hasMarkdown('')).toBe(false));
 });
 
 // ─── Footer brand label (per-bot configurable) ────────────────────────────

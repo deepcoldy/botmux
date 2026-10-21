@@ -7,9 +7,13 @@
  *
  *  - `isPromptReady`  — the CLI is idle and waiting for input.
  *  - `isFlushing`     — a drain loop is already running; let it pick this up.
- *  - type-ahead       — the adapter (Codex/CoCo/Claude) can accept input while
- *                       BUSY: the TUI parks it in its own queue / steers it into
- *                       the active turn.
+ *  - type-ahead       — the adapter (Codex/CoCo/Claude/antigravity) can accept
+ *                       input while BUSY: the TUI parks it, or steers it into
+ *                       the active turn. Antigravity's Queue waits for the turn
+ *                       to end; Send Immediately forwards without cancelling
+ *                       the current tool. That Enter is unsafe on agy's
+ *                       permission dialog, so the policy drops type-ahead when
+ *                       the bot disables the approval bypass.
  *
  * The catch the type-ahead case must respect: parking only works once the TUI
  * is actually up. During STARTUP (and tmux re-attach) the input box doesn't

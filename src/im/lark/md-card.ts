@@ -184,6 +184,9 @@ export interface CardUsageSnapshot {
    *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
    *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
   quota?: StatuslineQuota | null;
+  /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
+   *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
+  extensionSegments?: string[];
 }
 
 export interface ReplyCardFooter {
@@ -553,6 +556,11 @@ export function cardUsageFooterSegment(
     if (fiveHour !== undefined) parts.push(`${t('card.usage.quota_5h', undefined, locale)} ${fiveHour}%`);
     const sevenDay = quotaPercent(quota.sevenDayPercent);
     if (sevenDay !== undefined) parts.push(`${t('card.usage.quota_7d', undefined, locale)} ${sevenDay}%`);
+  }
+  // 自定义扩展段（cardFooterExtension）：footer 与 streaming 都渲染，排在账号配额之后。
+  for (const segment of usage.extensionSegments ?? []) {
+    const text = segment.trim();
+    if (text) parts.push(escapeCardPlainText(text));
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
@@ -1517,28 +1525,6 @@ export function buildImageCardElements(
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
   return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
-}
-
-/**
- * Heuristic: does `text` contain markdown syntax that renders badly as plain
- * text in Feishu (code fences, headings, lists, bold, inline code, links,
- * tables, blockquotes, hr)? Callers use this to decide between an interactive
- * card and a plain post.
- */
-export function hasMarkdown(text: string): boolean {
-  if (!text) return false;
-  return (
-    /```/.test(text) ||
-    /^#{1,6}\s/m.test(text) ||
-    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
-    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
-    /\*\*[^*\n]+\*\*/.test(text) ||
-    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
-    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
-    /^\s*\|.+\|\s*$/m.test(text) ||
-    /^>\s/m.test(text) ||
-    /^(?:---|\*\*\*|___)\s*$/m.test(text)
-  );
 }
 
 /**

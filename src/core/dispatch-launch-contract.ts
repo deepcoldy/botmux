@@ -14,7 +14,6 @@ export const DISPATCH_LAUNCH_SCHEMA_VERSION = 1 as const;
 export const DISPATCH_LAUNCH_POLICY_SCHEMA_VERSION = 1 as const;
 export const DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION = 1 as const;
 export const DISPATCH_LAUNCH_ADMISSION_SCHEMA_VERSION = 1 as const;
-export const DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION = 1 as const;
 
 export const DISPATCH_LAUNCH_ID_RE = /^dl_[0-9a-f]{32}$/;
 export const DISPATCH_LAUNCH_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -291,16 +290,6 @@ export interface DispatchLaunchAdmissionReceiptV1 {
   releasedAt?: string;
 }
 
-export interface DispatchLaunchOverrideSnapshotV1 {
-  schemaVersion: typeof DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION;
-  provenanceId: string;
-  dispatchId?: string;
-  inheritedFromDispatchId?: string;
-  effective: DispatchLaunchEffectiveOverride;
-  launchIdentity: DispatchLaunchIdentityV1;
-  createdAt: string;
-}
-
 const nonEmptyString = z.string().trim().min(1);
 const identifierSchema = nonEmptyString
   .max(DISPATCH_LAUNCH_CONTROL_LIMITS.identifierChars)
@@ -562,23 +551,6 @@ export const DispatchLaunchAdmissionReceiptSchema = z.object({
   releasedAt: timestampSchema.optional(),
 }).strict();
 
-export const DispatchLaunchOverrideSnapshotSchema = z.object({
-  schemaVersion: z.literal(DISPATCH_LAUNCH_OVERRIDE_SCHEMA_VERSION),
-  provenanceId: nonEmptyString,
-  dispatchId: dispatchIdSchema.optional(),
-  inheritedFromDispatchId: dispatchIdSchema.optional(),
-  effective: effectiveOverrideSchema,
-  launchIdentity: launchIdentitySchema,
-  createdAt: timestampSchema,
-}).strict().superRefine((value, context) => {
-  if ((value.dispatchId === undefined) === (value.inheritedFromDispatchId === undefined)) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'exactly one of dispatchId or inheritedFromDispatchId is required',
-    });
-  }
-});
-
 function normalizeLf(value: string): string {
   return value.replace(/\r\n?/g, '\n');
 }
@@ -816,14 +788,6 @@ export function parseDispatchLaunchAdmissionReceipt(raw: unknown): DispatchLaunc
     throw new Error('invalid dispatch launch admission receipt: released receipt must not be committed');
   }
   return parsed;
-}
-
-export function parseDispatchLaunchOverrideSnapshot(raw: unknown): DispatchLaunchOverrideSnapshotV1 {
-  return parsedOrThrow(
-    DispatchLaunchOverrideSnapshotSchema,
-    raw,
-    'dispatch launch override snapshot',
-  );
 }
 
 export function dispatchLaunchRequestedOverrideSatisfied(

@@ -22,8 +22,8 @@
  * assistant/message events and delivered to botmux as a `final` control
  * frame; tool calls render as progress lines.
  *
- * The SDK protocol has no cancel: a wedged turn is reaped by the turn
- * watchdog, which kills the child and exits so botmux restarts the runner
+ * The SDK protocol has no cancel: an explicitly configured turn watchdog
+ * reaps wedged turns, killing the child so botmux restarts the runner
  * (the in-memory session is lost; sessions persist on disk under
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
@@ -37,15 +37,26 @@ import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
 import { errorMessage } from './utils/error-message.js';
-import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
+import { createRunnerTerminal } from './runner-common.js';
+import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
+import { appendPendingNotification } from './dsh-runner-pending.js';
 
 const DSH_MARKER = '::botmux-dsh:';
-const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
-// Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
-// ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
-// runner re-validates its own argv so a hand-crafted invocation can't arm an
-// overflowing (effectively ~1ms) turn timeout. Mirrors MAX_TURN_TIMEOUT_MS.
-const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
+/**
+ * Total-duration cap for an explicitly armed watchdog, as a multiple of the
+ * configured idle window. The idle timer alone is refreshable forever — a turn
+ * that emits a tool event every cycle would never be reaped — so the hard cap
+ * bounds even chatty turns. A surviving turn must produce at least one
+ * tool/assistant event per idle window, hence the cap is expressed in windows:
+ * 4 windows is the budget for a long but bounded tool chain (e.g. a 10-minute
+ * idle setting caps the turn at 40 minutes). The number is an operations
+ * ceiling, not a protocol constant: operators tighten it by configuring a
+ * smaller idle timeout, which shrinks the hard cap proportionally.
+ */
+const MAX_TURN_DURATION_MULTIPLIER = 4;
+/** Upper bound on notifications buffered while waiting for this turn's inbox
+ *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
@@ -61,19 +72,6 @@ const DSH_TOOL_ASK_USER_PACKAGE = '@deepseek-ai/dsh-tool-ask-user';
 const DSH_SDK_JSONRPC_SERVER_DEP = '^0.1.1-rc.1';
 const DSH_TOOL_ASK_USER_DEP = '^0.1.1-rc.1';
 
-interface Args {
-  sessionId: string;
-  dshBin: string;
-  cwd?: string;
-  botName?: string;
-  botOpenId?: string;
-  locale?: string;
-  model?: string;
-  dshProfile?: string;
-  bridgePatch?: string;
-  turnTimeoutMs: number;
-}
-
 interface PendingTurn {
   resolve: () => void;
   reject: (err: Error) => void;
@@ -81,7 +79,8 @@ interface PendingTurn {
   textBuffer: string;
   usage?: DshUsage;
   toolNames: Map<string, string>;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  hardTimer?: NodeJS.Timeout;
   /** Set from the session/prompt ACK; the turn only owns events at/after
    *  the matching agent/inbox/spliced receipt. */
   messageId?: string;
@@ -102,30 +101,6 @@ interface DshUsage {
 
 const output = new RunnerControlWriter();
 const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
-
-function parseArgs(argv: string[]): Args {
-  const out: Args = { sessionId: '', dshBin: '', turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS };
-  parseRunnerFlags(argv, out, {
-    '--session-id': 'sessionId',
-    '--dsh-bin': 'dshBin',
-    '--cwd': 'cwd',
-    '--bot-name': 'botName',
-    '--bot-open-id': 'botOpenId',
-    '--locale': 'locale',
-    '--model': 'model',
-    '--dsh-profile': 'dshProfile',
-    '--bridge-patch': 'bridgePatch',
-    '--turn-timeout-ms': (target, val) => {
-      const n = Number(val);
-      // Accept only a positive integer within the arm-able bound; anything else
-      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
-      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
-    },
-  });
-  if (!out.sessionId) throw new Error('--session-id is required');
-  if (!out.dshBin) throw new Error('--dsh-bin is required');
-  return out;
-}
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -557,6 +532,7 @@ function buildPreamble(): string {
     '<botmux_identity>',
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
+    '- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。',
     `- 工作目录：${cwd}。语言：${locale}。`,
     ...(() => {
       const prompt = larkToolPromptFromEnv(locale);
@@ -644,12 +620,17 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
 
 function processTurnNotification(turn: PendingTurn, method: string, p: Record<string, unknown>): void {
   if (method === 'session.event') {
+    const type = (p.event as { type?: unknown } | undefined)?.type;
+    if (type === 'tool/call' || type === 'tool/result' || type === 'assistant/message') {
+      refreshTurnIdleWatchdog(turn);
+    }
     handleSessionEvent(turn, p.event);
     return;
   }
   if (method === 'session.status' && p.status === 'idle' && activeTurn === turn) {
     activeTurn = undefined;
     clearTimeout(turn.timer);
+    clearTimeout(turn.hardTimer);
     lastTurnText = turn.textBuffer;
     lastTurnUsage = turn.usage;
     lastTurnError = turn.turnError;
@@ -667,7 +648,9 @@ function handleNotification(method: string, params: unknown): void {
     // Buffer until the spliced receipt for our messageId: stale notifications
     // from a previous turn (notably a late idle) must not settle this one.
     if (!turn.receiptReceived) {
-      turn.pending.push({ method, params: p });
+      // Bound the buffer (protocol drift: receipt never comes). See
+      // appendPendingNotification for why the oldest entry is dropped.
+      appendPendingNotification(turn.pending, { method, params: p });
       tryClaimReceipt(turn);
       return;
     }
@@ -692,6 +675,24 @@ let lastTurnText = '';
 let lastTurnUsage: DshUsage | undefined;
 let lastTurnError: string | undefined;
 
+function timeoutTurn(turn: PendingTurn, timeoutMs: number, hardLimit: boolean): void {
+  if (activeTurn !== turn) return;
+  activeTurn = undefined;
+  clearTimeout(turn.timer);
+  clearTimeout(turn.hardTimer);
+  turn.reject(new Error(`dsh turn timed out after ${timeoutMs}ms${hardLimit ? ' (hard limit)' : ''}`));
+}
+
+function refreshTurnIdleWatchdog(turn: PendingTurn): void {
+  if (activeTurn !== turn || args.turnTimeoutMs === undefined) return;
+  clearTimeout(turn.timer);
+  const timeoutMs = args.turnTimeoutMs;
+  const timer = setTimeout(() => {
+    if (turn.timer === timer) timeoutTurn(turn, timeoutMs, false);
+  }, timeoutMs);
+  turn.timer = timer;
+}
+
 async function runTurn(content: string): Promise<void> {
   const startedAtMs = Date.now();
   writeLine();
@@ -703,11 +704,7 @@ async function runTurn(content: string): Promise<void> {
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
 
   const turnPromise = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (activeTurn?.timer === timer) activeTurn = undefined;
-      reject(new Error(`dsh turn timed out after ${args.turnTimeoutMs}ms`));
-    }, args.turnTimeoutMs);
-    activeTurn = {
+    const turn: PendingTurn = {
       resolve,
       reject,
       startedAtMs,
@@ -715,8 +712,14 @@ async function runTurn(content: string): Promise<void> {
       toolNames: new Map(),
       pending: [],
       receiptReceived: false,
-      timer,
     };
+    activeTurn = turn;
+    if (args.turnTimeoutMs !== undefined) {
+      const timeoutMs = args.turnTimeoutMs;
+      const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, timeoutMs * MAX_TURN_DURATION_MULTIPLIER);
+      turn.timer = setTimeout(() => timeoutTurn(turn, timeoutMs, false), timeoutMs);
+      turn.hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
+    }
   });
 
   try {
@@ -738,6 +741,7 @@ async function runTurn(content: string): Promise<void> {
   } catch (err) {
     if (activeTurn) {
       clearTimeout(activeTurn.timer);
+      clearTimeout(activeTurn.hardTimer);
       activeTurn = undefined;
     }
     throw err;
@@ -746,8 +750,9 @@ async function runTurn(content: string): Promise<void> {
   await turnPromise;
 
   const completedAtMs = Date.now();
-  const finalText = lastTurnText
-    || (lastTurnError ? `dsh 执行出错：${lastTurnError}` : '');
+  const finalText = lastTurnText.trim()
+    ? lastTurnText
+    : lastTurnError ? `dsh 执行出错：${lastTurnError}` : EMPTY_TURN_REPLY;
   const finalUsage = lastTurnUsage;
   emitMarker('final', {
     content: finalText,
@@ -755,7 +760,7 @@ async function runTurn(content: string): Promise<void> {
     startedAtMs,
     completedAtMs,
   });
-  if (!finalText.trim()) writeLine('[dsh] completed without text output.');
+  if (finalText === EMPTY_TURN_REPLY) writeLine('[dsh] completed without text output; sent a diagnostic reply.');
 }
 
 function isFatalRunnerError(err: unknown): boolean {
@@ -848,7 +853,9 @@ async function main(): Promise<void> {
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
-    BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)),
+    ...(args.turnTimeoutMs !== undefined
+      ? { BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) }
+      : {}),
   }, cwd);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {
@@ -859,6 +866,7 @@ async function main(): Promise<void> {
       const turn = activeTurn;
       activeTurn = undefined;
       clearTimeout(turn.timer);
+      clearTimeout(turn.hardTimer);
       turn.reject(new Error(message));
     }
     setTimeout(() => process.exit(1), 100);

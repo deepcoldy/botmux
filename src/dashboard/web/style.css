@@ -3047,6 +3047,36 @@ button.primary {
   min-width: 0;
 }
 
+.sessions-scroll-host-contents { display: contents; }
+.sessions-table-scroll-host { position: relative; min-width: 0; min-height: 0; }
+/* Keep the interactive hit strip outside the scrolling content: even a partly
+   clipped row checkbox at the viewport edge must retain native hit testing. */
+.sessions-table-scroll-host > .sessions-view-stage { height: calc(100% - 6px); }
+@media (max-width: 720px) {
+  .sessions-table-scroll-host > .sessions-view-stage { height: auto; }
+}
+.session-horizontal-scrollbar {
+  position: absolute;
+  bottom: 0;
+  height: 6px;
+  z-index: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+:where(.sessions-table-scroll-host:hover) .session-horizontal-scrollbar:not([hidden]),
+.session-horizontal-scrollbar:not([hidden]).is-visible { opacity: .54; pointer-events: auto; }
+.session-horizontal-scrollbar:not([hidden]).is-active { opacity: .78; }
+.session-horizontal-scrollbar.is-dragging { transition: none; }
+.session-horizontal-scrollbar .floating-scrollbar-thumb { height: 100%; }
+.session-horizontal-scrollbar:hover .floating-scrollbar-thumb,
+.session-horizontal-scrollbar.is-active .floating-scrollbar-thumb { background: var(--scrollbar-thumb-hover); }
+[inert] .session-horizontal-scrollbar { visibility: hidden; pointer-events: none; }
+.sessions-view-stage[inert] ~ .session-horizontal-scrollbar { visibility: hidden; pointer-events: none; }
+
 .sessions-view-stage-enter {
   animation: dashboard-page-enter 0.35s ease both;
 }
@@ -7560,9 +7590,6 @@ dialog.onboarding-dialog::backdrop {
   color: var(--faint);
   flex: 1 1 240px;
   min-width: 160px;
-}
-.roles-editor-switch {
-  align-self: flex-start;
 }
 .roles-listener-editor {
   display: flex;
@@ -34353,24 +34380,171 @@ a.card-menu-item {
   min-height: 0;
 }
 
+/* Tab bar on top, one panel below it. On desktop the workspace has a fixed
+   height and every panel scrolls internally, so the tab bar and each panel's
+   save row never scroll away. */
 .message-listener-workspace {
-  display: block;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 
-.message-listener-global,
-.message-listener-groups {
-  display: block;
-  padding: 0;
-}
-
-.message-listener-global {
+.message-listener-tab-bar {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  min-height: 52px;
+  padding: 0 16px;
   border-bottom: 1px solid var(--border);
-  position: relative;
 }
 
-.message-listener-section-head,
+.message-listener-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+}
+
+.message-listener-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.message-listener-tab::after {
+  position: absolute;
+  right: 10px;
+  bottom: -1px;
+  left: 10px;
+  height: 2px;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: transparent;
+  content: "";
+  transform: scaleX(0.55);
+  transition: background-color 150ms ease, transform 180ms ease;
+}
+
+.message-listener-tab:hover { color: var(--fg); background: transparent; }
+.message-listener-tab.active { color: var(--accent-strong); }
+.message-listener-tab.active::after { background: var(--accent); transform: scaleX(1); }
+.message-listener-tab:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 66%, transparent);
+  outline-offset: -6px;
+}
+
+.message-listener-tab-count,
+.message-listener-tab-state {
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: var(--radius-full);
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.message-listener-tab.active .message-listener-tab-count { background: var(--accent-soft); color: var(--accent-strong); }
+.message-listener-tab-state.on { background: color-mix(in srgb, var(--success) 13%, transparent); color: var(--success); }
+
+.message-listener-tab-dirty {
+  width: 7px;
+  height: 7px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.message-listener-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.message-listener-panel[hidden] { display: none; }
+
+/* The split fills the panel on wide screens; once it stacks (≤820px) it can
+   outgrow the panel, which then scrolls as a whole. */
+.message-listener-groups.message-listener-panel { overflow-y: auto; }
+
+.message-listener-panel:not([hidden]) { animation: message-listener-panel-enter 180ms ease-out both; }
+
+@keyframes message-listener-panel-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-listener-panel:not([hidden]) { animation: none; }
+  .message-listener-tab::after { transition: none; }
+}
+
+.message-listener-panel-head {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 14px 24px;
+}
+
+.message-listener-panel-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.message-listener-panel-head p b { color: var(--fg); }
+
+.message-listener-mode-counts {
+  color: var(--faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.message-listener-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.message-listener-panel-actions > button { min-width: 72px; }
+
+.message-listener-unsaved {
+  color: var(--warning);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.message-listener-global .message-listener-panel-head { border-bottom: 1px solid var(--border-soft); }
+
+.message-listener-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .message-listener-detail-head {
   display: flex;
   align-items: flex-start;
@@ -34378,83 +34552,19 @@ a.card-menu-item {
   gap: 16px;
 }
 
-.message-listener-drawer-head {
+.message-listener-detail-actions {
   display: flex;
+  flex: none;
   align-items: center;
-  justify-content: flex-start;
-  gap: 10px;
-  width: 100%;
-  margin: 0;
-  padding: 20px 24px;
-  border: 0;
-  border-radius: 0;
-  outline: none;
-  background: transparent;
-  color: var(--fg);
-  text-align: left;
+  gap: 12px;
 }
 
-.message-listener-drawer-head:hover { background: var(--bg-soft); }
-.message-listener-drawer-head:focus,
-.message-listener-drawer-head:focus-visible {
-  outline: none;
-  box-shadow: none;
-  border-color: transparent;
-}
-.message-listener-drawer-head:focus-visible > span:last-child strong { color: var(--accent); }
-.message-listener-drawer-head > span:last-child { display: grid; gap: 4px; min-width: 0; text-align: left; }
-.message-listener-drawer-head strong { font-size: 18px; line-height: 1.25; }
-.message-listener-drawer-head small { color: var(--muted); font-size: 12px; line-height: 1.45; }
-.message-listener-drawer-icon {
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  color: var(--muted);
-  font-size: 21px;
-  line-height: 1;
-  transform: rotate(0deg);
-  transition: transform 150ms ease;
-}
+.message-listener-detail-actions > button { min-width: 72px; }
 
-.message-listener-drawer-head[aria-expanded="true"] .message-listener-drawer-icon { transform: rotate(90deg); }
-
-.message-listener-drawer-actions {
-  display: flex;
-  justify-content: flex-end;
-  padding: 16px 32px 4px 24px;
-}
-
-.message-listener-global .roles-editor-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.message-listener-global .roles-editor-actions > button {
-  box-sizing: border-box;
-  height: 36px;
-  min-height: 36px;
-  padding: 0 12px;
-  justify-content: center;
-}
-
-.message-listener-global .roles-editor-actions > button:not(.primary) {
-  width: 132px;
-  min-width: 132px;
-}
-
-.message-listener-global .roles-editor-actions > button.primary {
-  width: 72px;
-  min-width: 72px;
-}
-
-.message-listener-section-head h2,
 .message-listener-detail-head h3 {
   margin: 0;
 }
 
-.message-listener-section-head p,
 .message-listener-detail-head p {
   margin: 5px 0 0;
   color: var(--muted);
@@ -34475,9 +34585,9 @@ a.card-menu-item {
 
 .message-listener-split {
   display: grid;
+  flex: 1 1 auto;
   grid-template-columns: 300px minmax(0, 1fr);
   min-height: 420px;
-  height: min(720px, calc(100vh - 260px));
   margin: 0 24px 24px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -34488,7 +34598,6 @@ a.card-menu-item {
 .message-listener-group-list {
   display: flex;
   flex-direction: column;
-  min-height: 0;
   min-height: 0;
   padding: 12px;
   border-right: 1px solid var(--border);
@@ -34547,11 +34656,84 @@ a.card-menu-item {
 .message-listener-group-status.disabled { border-color: color-mix(in srgb, var(--danger) 44%, var(--border-soft)); color: var(--danger); }
 .message-listener-group-status.custom { border-color: color-mix(in srgb, var(--success) 44%, var(--border-soft)); color: var(--success); }
 
+.message-listener-group-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+/* What the group does right now (from saved settings), next to how it is set. */
+.message-listener-effective {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+.message-listener-effective::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+.message-listener-effective.on { color: var(--success); }
+
+.message-listener-unsaved-tag {
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.message-listener-banner {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin: 0 24px 14px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 38%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.message-listener-banner .message-listener-link { margin-top: 0; }
+
+.message-listener-load-error {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+}
+.message-listener-load-error p { margin: 0; }
+
+/* Head stays put while the body scrolls, keeping a custom group's save
+   button reachable from the bottom of its long form. */
 .message-listener-group-detail {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  padding: 24px;
+  min-height: 0;
   background: var(--surface);
   text-align: left;
+  overflow: hidden;
+}
+
+.message-listener-group-detail > .message-listener-detail-head {
+  flex: none;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.message-listener-detail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 24px 24px;
   overflow-y: auto;
 }
 
@@ -34618,28 +34800,13 @@ a.card-menu-item {
 .message-listener-mode.disabled { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .message-listener-mode.custom { color: var(--success); background: color-mix(in srgb, var(--success) 13%, transparent); }
 
-.message-listener-mode-picker { margin-top: 22px; }
+.message-listener-mode-picker { margin-top: 18px; }
 .message-listener-mode-picker button.active {
   background: transparent;
   color: var(--accent);
   box-shadow: inset 0 -2px 0 var(--accent);
 }
-.message-listener-custom-form { position: relative; margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-soft); }
-
-.message-listener-floating-save {
-  position: absolute;
-  top: 18px;
-  right: 0;
-  z-index: 2;
-  min-width: 72px;
-}
-
-/* Global save belongs to the drawer chrome, aligned with the sample-chat row,
-   rather than to the long form body below it. */
-.message-listener-global .message-listener-floating-save {
-  top: 132px;
-  right: 24px;
-}
+.message-listener-custom-form { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-soft); }
 
 .message-listener-inherit-summary,
 .message-listener-disabled-summary {
@@ -34671,8 +34838,23 @@ a.card-menu-item {
 .message-listener-disabled-summary p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
 .message-listener-disabled-summary { display: block; border-color: color-mix(in srgb, var(--danger) 30%, var(--border-soft)); }
 
+.message-listener-link {
+  min-height: 0;
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.message-listener-link:hover { background: transparent; color: var(--accent-strong); text-decoration: underline; }
+
 @media (max-width: 820px) {
   .message-listener-split {
+    flex: none;
     grid-template-columns: 1fr;
     height: auto;
     min-height: 0;
@@ -34685,6 +34867,19 @@ a.card-menu-item {
     border-bottom: 1px solid var(--border);
     overflow: hidden;
   }
+}
+
+@media (max-width: 720px) {
+  /* Re-assert the roles-page single column: the 252px roster column above has
+     the same specificity and comes later, so it would otherwise squeeze the
+     workspace into a sliver on phones. */
+  .message-listener-page .roles-layout { grid-template-columns: minmax(0, 1fr); }
+  .message-listener-tab-bar { padding: 0 8px; overflow-x: auto; overscroll-behavior-x: contain; }
+  .message-listener-panel-head { padding: 12px 16px; }
+  .message-listener-split { margin: 0 12px 16px; }
+  .message-listener-banner { margin: 0 12px 12px; }
+  .message-listener-sample { margin: 16px 16px 0; }
+  .message-listener-global-form { margin: 16px; }
 }
 
 .group-default-models-row {

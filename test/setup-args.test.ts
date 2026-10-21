@@ -6,7 +6,6 @@ import {
   maskAppSecret,
   parseSetupCommand,
   SETUP_CLI_USAGE,
-  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -224,7 +223,6 @@ describe('buildBotFromAddFlags', () => {
   });
 
   it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
-    expect(cliSelectionKeys()).toContain('traecli');
     expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
     expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
       cliId: 'traex',

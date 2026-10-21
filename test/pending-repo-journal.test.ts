@@ -78,6 +78,7 @@ describe('pending repository setup journal', () => {
     expect(ds.session.queuedCodexAppMessageContext).toBe('<trusted>message</trusted>');
     expect(ds.session.pendingRepoSetup).toEqual({
       mode: 'auto_worktree',
+      linkRefMode: 'disabled',
       prompt: 'OPENING_N',
       rawInput: '/goal exact raw',
       turnId: 'turn-n',
@@ -100,6 +101,7 @@ describe('pending repository setup journal', () => {
       sender: { openId: 'ou_owner', type: 'user', name: '晓雪' },
     });
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(ds.pendingLinkRefMode).toBe('disabled');
   });
 
   it('rolls every durable field back when setup persistence fails', () => {
@@ -157,6 +159,26 @@ describe('pending repository setup journal', () => {
     expect(restored.pendingAttachments).not.toBe(ds.session.pendingRepoSetup?.attachments);
     expect(restored.pendingMentions).toEqual(ds.pendingMentions);
     expect(restored.pendingMentions).not.toBe(ds.session.pendingRepoSetup?.mentions);
+  });
+
+  it('persists and restores the admission-time LinkRef mode for the pending opening', () => {
+    const ds = makeDs();
+    stagePendingRepoSetup(ds, {
+      mode: 'picker',
+      turnId: 'turn-link-ref',
+      linkRefMode: 'enabled',
+    });
+
+    expect(ds.session.pendingRepoSetup?.linkRefMode).toBe('enabled');
+    expect(ds.pendingLinkRefMode).toBe('enabled');
+
+    const restored = {
+      ...makeDs(),
+      session: structuredClone(ds.session),
+      pendingLinkRefMode: undefined,
+    } as DaemonSession;
+    expect(restorePendingRepoRuntime(restored)).toBe(true);
+    expect(restored.pendingLinkRefMode).toBe('enabled');
   });
 
   it('restores the previous card id if its persistence fails', () => {

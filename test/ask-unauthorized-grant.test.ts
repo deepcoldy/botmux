@@ -21,7 +21,7 @@ import {
   requestGrantForAskClicker,
   type AskGrantRequestDeps,
 } from '../src/im/lark/ask-grant-request.js';
-import { _resetForTest as _resetPending, isThrottled, markDenied } from '../src/im/lark/grant-pending.js';
+import { _resetForTest as _resetPending, _simulateRestartForTest, checkNonce, isThrottled, markDenied } from '../src/im/lark/grant-pending.js';
 import { DEFAULT_GRANT_QUOTA, DEFAULT_GRANT_DURATION_MS } from '../src/services/grant-policy.js';
 
 const ASK = {
@@ -88,6 +88,34 @@ describe('requestGrantForAskClicker', () => {
     expect(flat).not.toContain('grant_global');
     // 目标是点击者本人。
     expect(flat).toContain('ou_pm');
+  });
+
+  // 接线钉：卡发出去之后才落盘，daemon 重启后 owner 照样能点；发卡失败则什么都不留。
+  it('发卡成功 → 卡片落盘，daemon 重启后 nonce 仍有效', async () => {
+    let sent: string | undefined;
+    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+      deliverCard: async (_t, json) => { sent = json; },
+    }));
+    await vi.waitFor(() => expect(sent).toBeDefined());
+    const nonce = /"nonce":"([^"]+)"/.exec(sent!)?.[1];
+    expect(nonce).toBeTruthy();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    _simulateRestartForTest();
+    expect(checkNonce('cli_ask', 'oc_chat', 'ou_pm', nonce!)).toBe(true);
+    expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(true);
+  });
+
+  it('发卡失败 → 不落盘，daemon 重启后不留节流', async () => {
+    let attempted: string | undefined;
+    requestGrantForAskClicker(ASK, 'ou_pm', okDeps({
+      deliverCard: async (_t, json) => { attempted = json; throw new Error('send failed'); },
+    }));
+    await vi.waitFor(() => expect(attempted).toBeDefined());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const nonce = /"nonce":"([^"]+)"/.exec(attempted!)?.[1];
+    _simulateRestartForTest();
+    expect(checkNonce('cli_ask', 'oc_chat', 'ou_pm', nonce!)).toBe(false);
+    expect(isThrottled('cli_ask', 'oc_chat', 'ou_pm')).toBe(false);
   });
 
   it('已 pending / 冷却期 → pending（不重复发卡）', () => {

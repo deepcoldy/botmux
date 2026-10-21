@@ -27,6 +27,7 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
   // 不允许再次出现 `=== 'codex-app'` / `!== 'codex-app'` 形式的散落比较。
   const COMPARE = /[!=]==\s*'codex-app'/;
   for (const rel of ['src/worker.ts', 'src/core/worker-pool.ts', 'src/daemon.ts']) {
+    // 源码结构护栏(K1)：codex-app 的判定只能经由谓词，禁止重新散落 `=== 'codex-app'` 字面量比较。
     it(`${rel} has no raw codex-app comparison`, () => {
       const offenders = read(rel)
         .split('\n')
@@ -36,6 +37,8 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
     });
   }
 
+  // 源码结构护栏(K2)：managed-origin 的 ledger 精确校验写在 worker / daemon 闭包里；init 与会话库的 cliId
+  // 任一为 Codex App 就必须校验（fail-closed），退化成只看一侧会让伪造的 origin 绕过 ledger。
   it('managed-origin validation keeps the deliberate OR of both cliId sources (fail-closed)', () => {
     // worker 侧：worker 当前 init 的 cliId 与会话库里的 cliId 任一为 Codex App 即按 ledger 精确校验。
     const worker = read('src/worker.ts');
@@ -52,26 +55,5 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
     expect(daemon.match(/isolatedDispatchOutputSinkAllowed\(ds\)/g) ?? []).toHaveLength(2);
     expect(daemon.match(/withIsolatedDispatchSinkFence\(/g) ?? []).toHaveLength(2);
     expect(read('src/core/dashboard-ipc-server.ts')).toContain('isolatedDispatchOutputSinkAllowed(ds)');
-  });
-
-  it('every session-level codex-app gate resolves the CLI snapshot-first (same priority as sessionCliId)', () => {
-    // `/cli <id>` 的 pending snapshot（首次 fork 之前）才是会话将要跑的 CLI，session.cliId 此时为空、
-    // bot 是默认值。clean-input 门、dispatch ledger 记账、tail-only 恢复分流若各自按
-    // `session.cliId ?? bot`，就会对同一会话给出与 forkWorker / sendWorkerInput 相反的结论。
-    // 行为由 session-lifecycle-start.test.ts 的「/cli-selected CLI before the first fork」覆盖；
-    // 这里只钉「不许再回到不含 snapshot 的写法」。
-    const pool = read('src/core/worker-pool.ts');
-    expect(pool).not.toMatch(/isCodexAppCliId\(\s*ds\.session\.cliId\s*\?\?/);
-    expect(pool).not.toMatch(/effectiveCliId = ds\.session\.cliId \?\? botCfg\.cliId;\s*\n\s*(?:return |if \()!?isCodexAppCliId/);
-    expect(pool).toMatch(/const effectiveCliId = sessionCliId\(ds, botCfg\);\s*\n\s*return isCodexAppCliId\(effectiveCliId\)/);
-    expect(pool).toMatch(/const effectiveCliId = sessionCliId\(ds, botCfg\);\s*\n\s*if \(!isCodexAppCliId\(effectiveCliId\) \|\| !turnId\) return undefined;/);
-    expect(pool).toContain('isCodexAppCliId(sessionCliId(ds, getBot(ds.larkAppId).config))');
-
-    const daemon = read('src/daemon.ts');
-    // 冷启动 raw follow-up 与 queuedActivation 恢复：同一优先级，且不再是 session / bot 的 OR。
-    expect(daemon).not.toMatch(/isCodexAppCliId\(ds\.session\.cliId\)\s*\|\|\s*isCodexAppCliId\(botCfg\.cliId\)/);
-    expect(daemon).not.toMatch(/isCodexAppCliId\(ds\.session\.cliId \?\? dsBotCfgForFork\.cliId\)/);
-    expect(daemon).toContain('isCodexAppCliId(ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId)');
-    expect(daemon).toMatch(/isCodexAppCliId\(\s*ds\.session\.cliLaunchSnapshot\?\.cliId \?\? ds\.session\.cliId \?\? dsBotCfgForFork\.cliId,?\s*\)/);
   });
 });

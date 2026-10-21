@@ -195,6 +195,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    chatManagerEnabled: j?.chatManagerEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
@@ -258,6 +259,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
+    herdr: j?.herdr && typeof j.herdr === 'object' && !Array.isArray(j.herdr) ? j.herdr : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

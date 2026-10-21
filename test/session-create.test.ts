@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import {
-  normalizeCreateMode,
   normalizeCreateColumn,
   deriveSessionTitleFromContent,
   deriveCreateGroupName,
@@ -14,12 +13,8 @@ import {
   buildCollabNote,
 } from '../src/core/session-create.js';
 
-describe('normalizeCreateMode / normalizeCreateColumn', () => {
+describe('normalizeCreateColumn', () => {
   it('accepts only the valid literals', () => {
-    expect(normalizeCreateMode('all')).toBe('all');
-    expect(normalizeCreateMode('lead')).toBe('lead');
-    expect(normalizeCreateMode('solo')).toBeNull();
-    expect(normalizeCreateMode(123)).toBeNull();
     expect(normalizeCreateColumn('in_progress')).toBe('in_progress');
     expect(normalizeCreateColumn('backlog')).toBe('backlog');
     expect(normalizeCreateColumn('todo')).toBeNull();

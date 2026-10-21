@@ -1248,23 +1248,6 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Submit-confirmation probe: only a complete user event record appended after
- * `fromOffset` can match. Read-only — drains with `probe` so
- * it never mutates the per-turn agent_message cache the production drainer
- * relies on (a re-drain of the same live rollout at a different offset must
- * not clear pending turn state). Not currently wired into the production
- * submit-confirmation path; kept as a tested probe. */
-export function traexRolloutHasUserInputSince(
-  path: string,
-  fromOffset: number,
-  expectedText: string,
-): boolean {
-  const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
-    event.kind === 'user' && normaliseInputText(event.text) === expected,
-  );
-}
-
 // -- history.jsonl submit-confirmation (submit-time truth) ------------------
 //
 // TRAE writes ~/.trae/cli/history.jsonl at SUBMIT time — one JSON line
@@ -1483,6 +1466,45 @@ export function findTraexRolloutByPid(
   if (!targets) return undefined;
   const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
   return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
+}
+
+/** Resolve the user-visible TRAE thread held by a process from its writer lock.
+ * Unlike rollout files, these locks remain addressable when Orca has unlinked
+ * an old rollout that the live process still keeps open. */
+export function findTraexThreadByPid(
+  pid: number,
+): { cliSessionId: string; title?: string } | undefined {
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  const ids = [...new Set(targets.flatMap(target => {
+    const match = /[\\/]thread-writer-locks[\\/]([0-9a-f-]{36})\.lock(?: \(deleted\))?$/i.exec(target);
+    return match?.[1] ? [match[1]] : [];
+  }))];
+  if (ids.length === 0) return undefined;
+  return withTraeDb((db) => {
+    const placeholders = ids.map(() => '?').join(',');
+    let rows: Array<{ id?: string; title?: string; firstMessage?: string; updatedAt?: number; source?: string }>;
+    try {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage, updated_at_ms AS updatedAt, thread_source AS source FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    } catch {
+      rows = db.prepare(
+        `SELECT id, title, first_user_message AS firstMessage FROM threads WHERE id IN (${placeholders})`,
+      ).all(...ids);
+    }
+    const candidates = rows
+      .filter(row => typeof row.id === 'string' && row.source !== 'subagent')
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    const selected = candidates.find(row => row.source === 'user') ?? candidates[0];
+    if (!selected?.id) return undefined;
+    const title = String(selected.title || selected.firstMessage || '').replace(/\s+/g, ' ').trim();
+    const titleChars = Array.from(title);
+    return {
+      cliSessionId: selected.id,
+      ...(title ? { title: titleChars.length > 80 ? `${titleChars.slice(0, 79).join('')}…` : title } : {}),
+    };
+  }) ?? undefined;
 }
 
 /** Lowercased set of TRAE session ids whose rollout the pid holds open. The

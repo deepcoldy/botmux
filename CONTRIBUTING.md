@@ -50,6 +50,18 @@ bun run test:e2e-browser
 Each invocation writes its replayable report below the gitignored
 `midscene_run/runs/<run-id>/` directory.
 
+## 调试飞书卡片回调
+
+设置 `BOTMUX_CARD_ACTION_DIAGNOSTICS=1` 启动或重启待验证的 daemon，点击卡片后查找
+`[card-action-diagnostics]` 日志。`dispatcher` 记录归一化之前的字段结构，`handler`
+记录进入业务处理时的结构；两者均包含外层是否有 `event`、action 字段名、value 类型，
+以及解析后的 `action`、`result`、`expected_feedback_id`。完整事件载荷、token、用户与
+消息标识、表单正文不会输出。该开关默认关闭，排查结束后取消设置并重启。
+
+归一化必须先于动作分类和去重。回归测试应通过真实反馈存储验证 revision 和同卡更新，
+同时验证下拉/表单字段、身份校验及重复点击行为。卡片定义里的 `behaviors[].value`
+不能代替实际回调载荷；未拿到线上原始结构时，PR 应明确标注尚未完成线上实测。
+
 ## Architecture
 
 ```
@@ -200,15 +212,16 @@ Tests are split into two Vitest projects with different execution profiles
 
 - **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
   Runs with **file parallelism on** (one process per file). This is what
-  `bun run test` runs, so the default is fast (~10s) and needs no real CLI binary
-  or browser.
+  `bun run test` runs; it needs no real CLI binary or browser. The full project
+  takes minutes, not seconds (CI splits it into three shards), so while iterating
+  run only the files you touched: `bun run test -- test/<name>.test.ts`.
 - **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
   runs sequentially. Opt-in only.
 - **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
   `@midscene/test` against a shared daemon and logged-in browser session.
 
 ```bash
-bun run test                # Unit tests only — parallel, ~10s (default)
+bun run test                # Unit tests only — parallel (default)
 bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
 bun run test:e2e-browser    # Feishu browser cases through Midscene Test
@@ -223,6 +236,25 @@ bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 > `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
 > such delay. Filesystem-mocked unit tests set it small to collapse those waits.
 > See [`docs/test-benchmark.md`](docs/test-benchmark.md).
+
+### What Makes a Test Worth Keeping
+
+Tests must prove **behavior**, not photograph the implementation. Before writing
+one, ask: will it fail on a real behavioral regression, and will it stay green
+through a harmless refactor, copy edit or tuning change? The full rules live in
+the "测试原则" section of [`CLAUDE.md`](CLAUDE.md); in short:
+
+- Do not read `src/` files as text and assert on their contents. Extract the
+  logic into an exported function and test that instead. The few genuine
+  structural guards (import boundaries, compiled-binary constraints, security
+  guards without a behavioral seam, high-severity regression tripwires,
+  machine-checkable consistency) must carry a `// 源码结构护栏(Kx)：…` comment
+  (or `// 非文本断言：…` when a src asset is only used as a fixture);
+  `test/test-hygiene.test.ts` rejects unmarked ones.
+- Do not pin documentation wording, UI copy or internal tuning constants.
+  External protocol values and relationships between constants are fine.
+- Do not keep production exports alive just for their tests: wire them in or
+  delete both.
 
 ### Timing-Sensitive Test Contract
 

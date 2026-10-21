@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -14,8 +14,8 @@ import {
   drainTraexRollout,
   findTraexRolloutSetByPid,
   findTraexRolloutBySessionId,
+  findTraexThreadByPid,
   readLatestTraexRuntime,
-  traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
   traexHistorySize,
   traexHistorySidIsOwned,
@@ -469,6 +469,48 @@ describe('findTraexRolloutBySessionId', () => {
   });
 });
 
+describe('findTraexThreadByPid', () => {
+  it.runIf(process.platform === 'linux')('uses the owned user thread and ignores subagent locks', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const lockDir = join(traeHome, 'cli', 'thread-writer-locks');
+    const userId = SID;
+    const subagentId = '00000000-0000-7000-8000-000000000002';
+    mkdirSync(lockDir, { recursive: true });
+    const userLock = join(lockDir, `${userId}.lock`);
+    const subagentLock = join(lockDir, `${subagentId}.lock`);
+    writeFileSync(userLock, '');
+    writeFileSync(subagentLock, '');
+    const userFd = openSync(userLock, 'r');
+    const subagentFd = openSync(subagentLock, 'r');
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT, updated_at_ms INTEGER, thread_source TEXT)');
+    const userTitle = `${'a'.repeat(77)}\n😀bc`;
+    db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)').run(userId, userTitle, 'fallback', 1, 'user');
+    db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)').run(
+      subagentId, '内部子任务', 'internal', 2, 'subagent',
+    );
+    db.close();
+    process.env.TRAE_HOME = traeHome;
+    let userFdOpen = true;
+
+    try {
+      expect(findTraexThreadByPid(process.pid)).toEqual({
+        cliSessionId: userId,
+        title: `${'a'.repeat(77)} 😀…`,
+      });
+      closeSync(userFd);
+      userFdOpen = false;
+      expect(findTraexThreadByPid(process.pid)).toBeUndefined();
+    } finally {
+      if (userFdOpen) closeSync(userFd);
+      closeSync(subagentFd);
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+});
+
 describe('drainTraexRollout', () => {
   it('tags events from a resumed segment with the stable session id', () => {
     const turnId = '00000000-0000-7000-8000-000000000099';
@@ -525,7 +567,6 @@ describe('drainTraexRollout', () => {
     });
     const mutation = canonicalCompletion(input.payload.item, input.timestamp);
     writeFileSync(path, line(mutation) + line(taskCompleteWithError({ message })));
-    expect(traexRolloutHasUserInputSince(path, 0, 'investigate failure')).toBe(true);
     const queue = new CodexBridgeQueue();
     queue.mark('remote-turn', 'investigate failure', Date.parse(input.timestamp) - 1);
     const events = drainTraexRollout(path, 0).events;
@@ -2133,20 +2174,6 @@ describe('drainTraexRollout', () => {
       ]);
   });
 
-  it('does not let an item_completed submit probe consume the production user event', () => {
-    const turnId = '00000000-0000-7000-8000-000000000115';
-    writeFileSync(path, line(itemCompleted({
-      type: 'UserMessage',
-      id: 'msg-user',
-      content: [{ type: 'text', text: 'probe must stay read-only' }],
-    }, turnId)));
-
-    expect(traexRolloutHasUserInputSince(path, 0, 'probe must stay read-only')).toBe(true);
-    expect(drainTraexRollout(path, 0).events).toEqual([
-      expect.objectContaining({ kind: 'user', text: 'probe must stay read-only' }),
-    ]);
-  });
-
   it('ignores internal role=user injections without a user_message event', () => {
     writeFileSync(path, [
       line(userResponseItem('<environment_context>runtime context</environment_context>')),
@@ -2637,52 +2664,6 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
-  it('a probe re-drain does not consume the AgentMessage item final candidate', () => {
-    // The submit-confirmation probe re-drains the same live rollout; its
-    // item_completed processing must not record (or clear) the assistant
-    // candidate the production drainer is holding for the still-open turn.
-    const firstBatch = line(user('long turn'))
-      + line(itemCompleted({
-        type: 'AgentMessage',
-        id: 'msg-agent',
-        content: [{ type: 'Text', text: '这是最终答案' }],
-      }));
-    writeFileSync(path, firstBatch);
-    const first = drainTraexRollout(path, 0);
-    expect(first.events.map(event => event.kind)).toEqual(['user']);
-
-    // Submit-confirmation probe re-drains the same rollout.
-    expect(traexRolloutHasUserInputSince(path, 0, 'long turn')).toBe(true);
-
-    // Turn completes; the production drain must still see the cached item.
-    appendFileSync(path, line(taskComplete()));
-    const second = drainTraexRollout(path, first.newOffset);
-    expect(second.events).toEqual([
-      expect.objectContaining({ kind: 'assistant_final', text: '这是最终答案' }),
-    ]);
-  });
-
-  it('a probe re-drain mid-turn does not clear the production pending state', () => {
-    // traexRolloutHasUserInputSince re-drains the same live rollout; its
-    // user_message processing must not delete the commentary the production
-    // drainer is holding for the still-open turn.
-    const firstBatch = line(user('long turn'))
-      + line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary'));
-    writeFileSync(path, firstBatch);
-    const first = drainTraexRollout(path, 0);
-    expect(first.events.map(event => event.kind)).toEqual(['user']);
-
-    // Submit-confirmation probe re-drains the same rollout.
-    expect(traexRolloutHasUserInputSince(path, 0, 'long turn')).toBe(true);
-
-    // Turn completes; the production drain must still see the cached commentary.
-    appendFileSync(path, line(taskComplete()));
-    const second = drainTraexRollout(path, first.newOffset);
-    expect(second.events).toEqual([
-      expect.objectContaining({ kind: 'assistant_final', text: 'BOTMUX_NO_REPLY' }),
-    ]);
-  });
-
   it('maps a 429 task_complete error to the rate-limit failure code', () => {
     writeFileSync(path, [
       line(user('hit the limit')),
@@ -2695,19 +2676,6 @@ describe('drainTraexRollout', () => {
       terminalStatus: 'failed',
       terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
     });
-  });
-});
-
-describe('traexRolloutHasUserInputSince', () => {
-  it('matches only a complete exact user record appended after the baseline', () => {
-    const old = line(user('same thread, old prompt'));
-    writeFileSync(path, old);
-    const baseline = Buffer.byteLength(old);
-    appendFileSync(path, line(user('same thread, later prompt')));
-
-    expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, later prompt')).toBe(true);
-    expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, old prompt')).toBe(false);
-    expect(traexRolloutHasUserInputSince(path, baseline, 'same thread')).toBe(false);
   });
 });
 

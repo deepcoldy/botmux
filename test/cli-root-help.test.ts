@@ -43,6 +43,7 @@ describe('botmux root help workflow surface', () => {
       expect(stdout).toContain('template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]');
       expect(stdout).toContain('v2 历史 run 私有静态归档');
       expect(stdout).toContain('原子迁入 quarantine');
+      expect(stdout).toContain('maintenance suspend-idle [--older-than 7d] --dry-run|--yes');
       expect(stdout).not.toContain('template <run|resume|cancel|ls|tail|validate|show>');
       expect(stdout).not.toContain('v2 执行兼容面');
       expect(stdout).not.toContain('workflow <run|resume|cancel|ls|tail|validate|show>');

@@ -2,15 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   materializeFeedbackReviewers,
   normalizeFeedbackPolicy,
-  resolveFeedbackPolicy,
 } from '../src/services/feedback-policy.js';
 
 describe('feedback policy', () => {
-  it('is disabled when absent or not explicitly enabled', () => {
-    expect(resolveFeedbackPolicy(undefined)).toBeUndefined();
-    expect(resolveFeedbackPolicy({ enabled: false })).toBeUndefined();
-  });
-
   it('normalizes enabled policy with product defaults', () => {
     expect(normalizeFeedbackPolicy({ enabled: true })).toEqual({
       enabled: true,
@@ -108,10 +102,6 @@ describe('feedback policy', () => {
     expect(() => normalizeFeedbackPolicy(input)).toThrow(error);
   });
 
-  it('never resolves feedback for api-only bots', () => {
-    expect(resolveFeedbackPolicy({ enabled: true }, { apiOnly: true })).toBeUndefined();
-  });
-
   describe('reviewers audience', () => {
     it('normalizes a reviewers allowlist and emits it verbatim', () => {
       const policy = normalizeFeedbackPolicy({
@@ -132,9 +122,9 @@ describe('feedback policy', () => {
       expect(policy.reviewers).toEqual(['alice@example.com', 'on_bob']);
     });
 
-    it('fails closed when the reviewers audience has an empty allowlist', () => {
-      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' })).toThrow(/non-empty/);
-      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: [] })).toThrow(/non-empty/);
+    it('keeps an empty reviewers allowlist visible but fail-closed at callback time', () => {
+      expect(normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' }).reviewers).toEqual([]);
+      expect(normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: [] }).reviewers).toEqual([]);
     });
 
     it('rejects a reviewers allowlist paired with a non-reviewers audience', () => {
@@ -169,34 +159,116 @@ describe('feedback policy', () => {
         audience: 'reviewers',
         reviewers: ['alice@example.com', 'ou_bob', 'carol@example.com'],
       });
-      const frozen = await materializeFeedbackReviewers(policy, async entries => {
+      const result = await materializeFeedbackReviewers(policy, async entries => {
         expect(entries).toEqual(['alice@example.com', 'carol@example.com']);
         return new Map([['alice@example.com', 'ou_bob'], ['carol@example.com', 'ou_carol']]);
       });
       // alice resolves to ou_bob which is already listed → deduped to one.
-      expect(frozen.reviewers).toEqual(['ou_bob', 'ou_carol']);
+      expect(result.policy.reviewers).toEqual(['ou_bob', 'ou_carol']);
+      expect(result.freshMap.get('alice@example.com')).toBe('ou_bob');
+      expect(result.transientFailure).toBe(false);
     });
 
-    it('drops an unresolved email rather than shipping a dead entry', async () => {
+    it('drops a definitively unresolved email rather than shipping a dead entry', async () => {
       const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['ghost@example.com', 'ou_bob'] });
-      const frozen = await materializeFeedbackReviewers(policy, async () => new Map());
-      expect(frozen.reviewers).toEqual(['ou_bob']);
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map(),
+        entryStatus: new Map([['ghost@example.com', 'definitive' as const]]),
+      }));
+      expect(result.policy.reviewers).toEqual(['ou_bob']);
+      expect(result.transientFailure).toBe(false);
+      expect(result.definitiveEntries).toEqual(['ghost@example.com']);
     });
 
-    it('fails closed to an empty list when the resolver throws', async () => {
-      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['alice@example.com'] });
-      const frozen = await materializeFeedbackReviewers(policy, async () => { throw new Error('network'); });
-      expect(frozen.reviewers).toEqual([]);
+    it('treats a bare Map miss as definitive', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['ghost@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => new Map(), {
+        previousResolvedMap: { 'ghost@example.com': 'ou_cached' },
+      });
+      expect(result.policy.reviewers).toEqual([]);
+      expect(result.recoveredEntries).toEqual([]);
+    });
+
+    it('never revives a cached reviewer for a definitive miss', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['gone@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map(),
+        entryStatus: new Map([['gone@example.com', 'definitive' as const]]),
+      }), { previousResolvedMap: { 'gone@example.com': 'ou_stale' } });
+      expect(result.policy.reviewers).toEqual([]);
+      expect(result.recoveredEntries).toEqual([]);
+    });
+
+    it('reuses the last-known-good id for a transient miss', async () => {
+      const policy = normalizeFeedbackPolicy({
+        enabled: true,
+        audience: 'reviewers',
+        reviewers: ['oncall@example.com', 'ou_bob'],
+      });
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map(),
+        errored: true,
+        entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+      }), { previousResolvedMap: { 'oncall@example.com': 'ou_oncall' } });
+      // Order follows config: the recovered email entry sits where the email was.
+      expect(result.policy.reviewers).toEqual(['ou_oncall', 'ou_bob']);
+      expect(result.transientFailure).toBe(true);
+      expect(result.recoveredEntries).toEqual(['oncall@example.com']);
+      expect(result.unrecoveredEntries).toEqual([]);
+      expect(result.freshMap.size).toBe(0);
+    });
+
+    it('reports a transient miss without cache instead of silently converging to empty', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['oncall@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map(),
+        errored: true,
+        entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+      }));
+      expect(result.policy.reviewers).toEqual([]);
+      expect(result.transientFailure).toBe(true);
+      expect(result.unrecoveredEntries).toEqual(['oncall@example.com']);
+    });
+
+    it('falls back to transient classification when errored but no per-entry status is given', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['oncall@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map(),
+        errored: true,
+      }), { previousResolvedMap: { 'oncall@example.com': 'ou_oncall' } });
+      expect(result.policy.reviewers).toEqual(['ou_oncall']);
+      expect(result.transientFailure).toBe(true);
+      expect(result.recoveredEntries).toEqual(['oncall@example.com']);
+    });
+
+    it('treats every entry as transient when the resolver throws', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['a@example.com', 'b@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => { throw new Error('network'); }, {
+        previousResolvedMap: { 'a@example.com': 'ou_a', 'b@example.com': 'ou_b' },
+      });
+      expect(result.policy.reviewers).toEqual(['ou_a', 'ou_b']);
+      expect(result.recoveredEntries).toEqual(['a@example.com', 'b@example.com']);
+    });
+
+    it('keeps a fresh resolution authoritatively over a stale cached id', async () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['oncall@example.com'] });
+      const result = await materializeFeedbackReviewers(policy, async () => ({
+        map: new Map([['oncall@example.com', 'ou_fresh']]),
+        entryStatus: new Map([['oncall@example.com', 'resolved' as const]]),
+      }), { previousResolvedMap: { 'oncall@example.com': 'ou_old' } });
+      expect(result.policy.reviewers).toEqual(['ou_fresh']);
+      expect(result.freshMap.get('oncall@example.com')).toBe('ou_fresh');
+      expect(result.recoveredEntries).toEqual([]);
     });
 
     it('never calls the resolver for pure-id, everyone or requester policies', async () => {
       const resolve = async () => { throw new Error('should not be called'); };
       const pureIds = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: ['ou_a', 'on_b'] });
-      expect((await materializeFeedbackReviewers(pureIds, resolve)).reviewers).toEqual(['ou_a', 'on_b']);
+      expect((await materializeFeedbackReviewers(pureIds, resolve)).policy.reviewers).toEqual(['ou_a', 'on_b']);
       const everyone = normalizeFeedbackPolicy({ enabled: true, audience: 'everyone' });
-      expect(await materializeFeedbackReviewers(everyone, resolve)).toBe(everyone);
+      expect((await materializeFeedbackReviewers(everyone, resolve)).policy).toBe(everyone);
       const requester = normalizeFeedbackPolicy({ enabled: true });
-      expect(await materializeFeedbackReviewers(requester, resolve)).toBe(requester);
+      expect((await materializeFeedbackReviewers(requester, resolve)).policy).toBe(requester);
     });
   });
 });

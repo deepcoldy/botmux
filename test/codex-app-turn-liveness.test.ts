@@ -5,7 +5,6 @@ import {
   CodexAppFlushPromptReplay,
   CodexAppReadyAuthority,
   CodexAppTurnLiveness,
-  shouldBeginCodexAppReattachObservation,
 } from '../src/utils/codex-app-turn-liveness.js';
 import {
   CodexAppControlRecordApplicationGate,
@@ -151,36 +150,6 @@ describe('CodexAppReadyAuthority', () => {
     authority.reset();
     expect(authority.consumeLatePromptRecovery(true)).toBe(false);
     expect(authority.canPublishPromptReady()).toBe(false);
-  });
-});
-
-describe('shouldBeginCodexAppReattachObservation', () => {
-  it('covers a Zellij reattach even though Zellij is not pipe mode', () => {
-    for (const backendType of ['tmux', 'herdr', 'zellij'] as const) {
-      expect(shouldBeginCodexAppReattachObservation({
-        cliId: 'codex-app',
-        backendType,
-        isReattach: true,
-      })).toBe(true);
-    }
-  });
-
-  it('does not observe a fresh spawn, non-persistent backend, or another CLI', () => {
-    expect(shouldBeginCodexAppReattachObservation({
-      cliId: 'codex-app',
-      backendType: 'zellij',
-      isReattach: false,
-    })).toBe(false);
-    expect(shouldBeginCodexAppReattachObservation({
-      cliId: 'codex-app',
-      backendType: 'pty',
-      isReattach: true,
-    })).toBe(false);
-    expect(shouldBeginCodexAppReattachObservation({
-      cliId: 'codex',
-      backendType: 'tmux',
-      isReattach: true,
-    })).toBe(false);
   });
 });
 

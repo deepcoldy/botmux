@@ -29,11 +29,6 @@ export function daemonVersionDiffersFromDisk(
     && running !== disk;
 }
 
-/** Shared operator sentence for history staleHint and the version card. */
-export function formatDaemonVersionRestartHint(running: string, disk: string): string {
-  return `运行中的 daemon v${stripBotmuxVersionPrefix(running)} 与磁盘 v${stripBotmuxVersionPrefix(disk)} 不一致，运行 botmux restart 应用`;
-}
-
 export type DaemonVersionGroup = { version: string; count: number };
 
 export function groupDaemonVersions(

@@ -115,7 +115,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
   },
-  { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane'] },
+  { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
     name: '/oncall', sessionPolicy: 'default',
     help: ['help.oncall_bind', 'help.oncall_unbind', 'help.oncall_status'],

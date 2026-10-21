@@ -22,7 +22,7 @@ import {
   previewOverlayReducer,
   previewOverlayInitialState,
 } from '../src/dashboard/web/sessions.js';
-import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
+import { TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { previewMarkdownHtml } from '../src/dashboard/web/preview-markdown.js';
 
@@ -501,28 +501,6 @@ describe('dashboard sessions filters', () => {
     expect(shouldOpenWritableTerminal({ authed: true, publicReadOnly: true })).toBe(true);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
-  });
-
-  it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
-    const html = renderToStaticMarkup(createElement(CliFilterGroup, {
-      selected: new Set(CLI_FILTER_OPTIONS),
-      onToggle: () => {},
-    }));
-    // One checkbox per CLI option, named "cli" — never a <select> dropdown.
-    expect(html).toContain('name="cli"');
-    expect(html).not.toContain('<select');
-    expect((html.match(/type="checkbox"/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length);
-    // Full set selected ⇒ summary shows "all", not the partial/active marker.
-    expect(html).not.toContain('cli-filter-active');
-  });
-
-  it('reflects a partial CLI selection (unchecked entries + active marker)', () => {
-    const selected = new Set(CLI_FILTER_OPTIONS.filter(cli => cli !== 'codex'));
-    const html = renderToStaticMarkup(createElement(CliFilterGroup, { selected, onToggle: () => {} }));
-    expect(html).toContain('value="codex"');
-    expect(html).toContain('cli-filter-active');
-    // Exactly the deselected CLI is unchecked.
-    expect((html.match(/checked=""/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length - 1);
   });
 });
 

@@ -1,4 +1,5 @@
 node_modules
+.worktrees/
 .pnpm-store/
 dist/
 # 编译版单文件二进制（bun build --compile，每个 ~170MB）。CI 与发版都往这里写，

@@ -119,7 +119,7 @@ describe('remote runner protocol', () => {
   });
 
   it('validates a generation-fenced recovered turn on ready', () => {
-    expect(parseRemoteRunnerEventLine(JSON.stringify({
+    const recovered = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'ready',
@@ -132,17 +132,29 @@ describe('remote runner protocol', () => {
         startedAtMs: 1234,
         trustedCaller: {
           requestUserOpenId: 'ou_actor',
+          requestUserUnionId: 'on_bot',
           requestLarkAppId: 'cli_app',
-          senderType: 'user',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
         },
       },
-    }))).toMatchObject({
+    }));
+    expect(recovered).toMatchObject({
       type: 'ready',
-      recoveredTurn: {
-        turnId: 'turn-survived',
-        generation: 7,
-        dispatchAttempt: 3,
-      },
+      recoveredTurn: { turnId: 'turn-survived', generation: 7, dispatchAttempt: 3 },
+    });
+    // botOwner is host-attested on outbound turn commands only. A provider
+    // reporting one back during recovery gets the shape validated but the field
+    // is stripped — it must never become the recovered turn's caller owner.
+    expect(recovered?.recoveredTurn?.trustedCaller).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'bot',
     });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
@@ -151,6 +163,52 @@ describe('remote runner protocol', () => {
       requestId: 'resume-recovery-bad',
       state: { version: 1, provider: 'reference', generation: 7 },
       recoveredTurn: { turnId: 'turn-survived', generation: -1 },
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-forged-owner',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_human',
+          requestLarkAppId: 'cli_app',
+          senderType: 'user',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
+      },
+    }))).toBeUndefined();
+    // A well-formed bot caller still rejects the whole event when the owner's
+    // source tag is not the single host-minted value.
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-forged-owner-source',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_bot',
+          requestLarkAppId: 'cli_app',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'provider_self',
+          },
+        },
+      },
     }))).toBeUndefined();
   });
 

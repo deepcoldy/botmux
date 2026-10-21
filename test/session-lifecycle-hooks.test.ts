@@ -1,8 +1,12 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { emitHookEventMock } = vi.hoisted(() => ({
+const { emitHookEventMock, botConfig } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
+  botConfig: {
+    larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
+    silentTurnReactions: undefined as boolean | undefined,
+  },
 }));
 
 vi.mock('../src/services/hook-runner.js', () => ({
@@ -30,7 +34,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+    config: botConfig,
     resolvedAllowedUsers: [],
     botOpenId: 'ou_bot',
     botName: 'TestBot',
@@ -171,6 +175,7 @@ async function flush(): Promise<void> {
 beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  botConfig.silentTurnReactions = undefined;
   __testOnly_resetSessionLifecycleHooks();
 });
 
@@ -361,7 +366,8 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
-  it('routes accepted steer feedback to its exact turn without raising attention', async () => {
+  it.each([undefined, false, true])('routes accepted steer feedback with silentTurnReactions=%s without raising attention', async (silent) => {
+    botConfig.silentTurnReactions = silent;
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -380,14 +386,18 @@ describe('worker-pool lifecycle hook integration', () => {
     });
     await flush();
 
-    expect(sessionReply).toHaveBeenCalledWith(
-      'om_root',
-      '收到，引导成功',
-      'text',
-      'app_test',
-      'om_exact_steer_message',
-      { sourceSessionId: 'sid-lifecycle-test' },
-    );
+    if (silent) {
+      expect(sessionReply).not.toHaveBeenCalled();
+    } else {
+      expect(sessionReply).toHaveBeenCalledWith(
+        'om_root',
+        '收到，引导成功',
+        'text',
+        'app_test',
+        'om_exact_steer_message',
+        { sourceSessionId: 'sid-lifecycle-test' },
+      );
+    }
     expect(emitHookEventMock).not.toHaveBeenCalledWith(
       'session.requires_attention',
       expect.anything(),

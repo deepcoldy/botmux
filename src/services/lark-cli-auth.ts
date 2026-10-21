@@ -166,12 +166,6 @@ function listUserTokenFiles(home: string): string[] {
   } catch { return []; }
 }
 
-/** Forget one person's lark-cli authorization entirely. */
-export function clearLarkCliAuth(openId: string): void {
-  try { rmSync(larkCliHomeFor(openId), { recursive: true, force: true }); }
-  catch { /* best-effort: absence is the desired state */ }
-}
-
 export interface LarkCliResult {
   ok: boolean;
   stdout: string;
@@ -421,14 +415,6 @@ export async function completeLarkCliLogin(
   // transport error costs one extra link, which the refusal hands over at once.
   clearChallenge(openId);
   return { state: 'failed', detail: raw || undefined };
-}
-
-/** Absolute HOME directory to export for this person's lark-cli calls this turn,
- *  or null when they have no per-person login (caller denies). */
-export function larkCliHomeForTurn(openId: string | undefined): string | null {
-  if (!openId) return null;
-  try { return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null; }
-  catch { return null; }
 }
 
 /**
