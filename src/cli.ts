@@ -14032,6 +14032,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         [--brief "简报" | --brief-file <path>] [--repo <工作目录>] [--standby]
   往已有话题追加（激活待命 bot / 追加协调）:
     botmux dispatch --into <话题根消息id> --bot-app <larkAppId[:角色]> (--brief ... | --brief-file ...)
+  在已有话题、指定目录里换一个全新会话（关掉该话题正在跑的会话，不派简报）:
+    botmux dispatch --into <话题根消息id> --bot <open_id> --repo <工作目录> --standby
 
 说明:
   新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
@@ -14039,6 +14041,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --model / --reasoning-effort: 为唯一 --bot-app 的新话题冻结启动规格；与 --into 冲突。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
+  --into + --repo + --standby: 往已有话题发「@bot /repo <目录>」（与新话题 --standby 同一条文本）。
+            bot 一侧的 /repo 会关掉该话题正在跑的会话，并在同一话题、该目录里起一个全新会话；
+            谁能发 /repo、目录校验沿用 bot 现有规则（需要 --bot <open_id>，--bot-app 不授权 /repo）。
+            回执里的 primeMessageId / threadRootId 只证明消息已发出；新会话是否起来要事后用
+            botmux observe 确认（rootMessageId 等于话题根、closed 为 false、workingDirectory 为目录）。
   返回 JSON：seedMessageId / threadRootId 仍为 om_...；新增 threadId 为 omt_... 或 null。
   普通群和话题群均在话题回复成功后读取 threadId；--standby 在 /repo 回复后读取，--into 读取已有根消息。
   threadId 查询失败、超时或暂不可用时返回 null，不改变派发/接单结果；不要将 om_... 用作话题链接。
@@ -14057,7 +14064,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
                         请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
   --no-delegate schedule:create
                         本次派发不附带来源 Bot 配置的默认 schedule 创建权限
-  --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
+  --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）；
+                        与 --into 同用时只有配合 --standby 才生效，否则仍被忽略
   --model <catalog-id>  目标 Codex 实时目录中的模型；仅新话题、单 Worker
   --reasoning-effort <level>  low|medium|high|xhigh|max|ultra（按模型校验）
   --standby             仅 --repo 待命，不派简报
@@ -14143,8 +14151,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--standby 需要配合 --repo（先定好工作目录把 bot 拉起待命）。');
     process.exit(1);
   }
-  if (standby && intoRoot) {
-    console.error('--standby 与 --into 不能同用。');
+  if (standby && intoRoot && (brief.trim() || briefFile)) {
+    console.error('--into --standby 只是换一个全新会话，不派简报；要派任务请去掉 --standby，或换成后续的 --into --brief。');
     process.exit(1);
   }
   if (standby && steer) {
@@ -14296,7 +14304,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error(`加载 bot 配置失败: ${err?.message ?? err}`);
     process.exit(1);
   }
-  const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage } = await import('./im/lark/client.js');
+  const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage, lookupMessageChatId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
   const parsedBotApps: Array<{ appId: string; role?: string }> = [];
@@ -14403,7 +14411,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief,
+      brief: intoRoot && !standby ? briefWithCompletionProtocol(intoRoot) : brief,
       bots,
     });
   } catch (err: any) {
@@ -14512,8 +14520,46 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     return result.messageId;
   };
 
-  let dispatchRootForLifecycle = intoRoot;
+  // `--into --standby` swaps the topic's session for a fresh one; it is not a
+  // message to the workstream, so it must not rewrite that dispatch's lifecycle
+  // (an accepted task would regress to "dispatched") or its project card.
+  let dispatchRootForLifecycle = standby ? undefined : intoRoot;
   try {
+    // --into --repo --standby: send the same `@bot /repo <path>` prime a new
+    // --standby topic gets, but into the existing topic. The receiving bot's own
+    // /repo switch closes the topic's running session and starts a fresh one on
+    // the same anchor in <path>; who may run /repo and which paths are valid stay
+    // that daemon's decision (canRunDaemonCommand + repo resolution).
+    if (intoRoot && standby) {
+      // The prime is a direct provider write, so — unlike the daemon-routed
+      // kickoff — nothing else ties the root to the validated destination chat.
+      const rootChatId = await lookupMessageChatId(appId, intoRoot);
+      if (rootChatId !== targetChatId) {
+        throw new Error(`dispatch_chat_mismatch: ${intoRoot} is not in ${targetChatId}`);
+      }
+      const prime = buildRepoPrimeText({ path: repo!, bots });
+      const primeId = await replyMessage(appId, intoRoot, prime.text, 'text', true, undefined, undefined, dispatchWriteOptions);
+      console.log(JSON.stringify({
+        success: true,
+        sourceSessionId: sid,
+        targetAppIds: parsedBotApps.map(item => item.appId),
+        transportState: 'dispatched',
+        acceptanceState: 'not_requested',
+        errorCode: null,
+        taskSent: false,
+        mode: 'into-standby',
+        threadRootId: intoRoot,
+        threadId: await resolveDispatchThreadId(appId, intoRoot),
+        primeMessageId: primeId,
+        repo,
+        chatId: targetChatId,
+        bots: built.mentionedOpenIds,
+        // The prime only proves the command was posted. The new session id is
+        // assigned by the target daemon, so confirm with `botmux observe`.
+        freshSession: { confirmVia: 'observe', match: { rootMessageId: intoRoot, closed: false }, requestedRepo: repo },
+      }));
+      return;
+    }
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
       const sentAtMs = Date.now();
@@ -14751,7 +14797,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       sourceSessionId: sid,
       targetAppIds: parsedBotApps.map(item => item.appId),
       chatId: targetChatId,
-      threadRootId: dispatchRootForLifecycle ?? null,
+      threadRootId: dispatchRootForLifecycle ?? intoRoot ?? null,
       threadId: null,
       ...receiptState,
       detail: err?.message ?? String(err),
