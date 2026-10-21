@@ -291,6 +291,8 @@ describe('durable session control consumer', () => {
     let now = 10;
     const store = makeStore(() => now);
     await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const retryInboxClaim = vi.spyOn(store, 'retryInboxClaim');
+    const errors: unknown[] = [];
     const consumer = startDurableSessionControlConsumer({
       store,
       workerId: 'control-standby',
@@ -302,12 +304,17 @@ describe('durable session control consumer', () => {
       intervalMs: 60_000,
       concurrency: 1,
       now: () => now,
+      onError: error => errors.push(error),
       dispatch: async () => {
         throw new DurableSessionControlOwnerHandoffError('exact owner still holds the lease');
       },
     });
     await consumer.ready;
     await consumer.stop();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    expect(retryInboxClaim).toHaveBeenCalledOnce();
+    expect(retryInboxClaim).toHaveBeenCalledWith(expect.objectContaining({ visibleAt: 110 }));
 
     now = 109;
     expect(await store.claimNextInbox({

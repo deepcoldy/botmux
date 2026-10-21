@@ -7603,7 +7603,11 @@ async function prepareLiveRemoteWorkerClose(
       await abortLiveRemoteWorkerClose(ds, requestId, {
         allowAbsentAfterProvenRestore: matchedCloseResult,
       });
-    } else {
+    } else if (ds.remoteCloseState?.requestId === requestId) {
+      // A Remote Runner provider exit retires this worker and clears the
+      // process-local fence so a fresh control provider can reconcile from the
+      // durable backend state. Do not let this stale prepare continuation put
+      // the fence back after that authoritative retirement.
       ds.remoteCloseState = { phase: 'uncertain', requestId };
     }
     logger.warn(
@@ -17432,9 +17436,11 @@ function setupWorkerHandlers(
           if (ds.worker === worker) {
             retireWorkerProcessOnly(ds, 'remote_backend_exit');
           }
-          if (ds.remoteCloseState?.phase === 'uncertain') {
+          const remoteClosePhase = ds.remoteCloseState?.phase;
+          if ((ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner'
+              && (remoteClosePhase === 'preparing' || remoteClosePhase === 'uncertain')) {
             logger.warn(
-              `[${t}] Clearing process-local Remote Runner close uncertainty after provider exit; `
+              `[${t}] Clearing process-local Remote Runner close fence after provider exit; `
               + 'the next close will reconcile through a fresh control provider',
             );
             ds.remoteCloseState = undefined;
