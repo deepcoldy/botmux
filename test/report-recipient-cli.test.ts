@@ -11,6 +11,10 @@ import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
+import {
+  shouldEmitEmptyCompletedBridgeFallback,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 import type { Session } from '../src/types.js';
 
 const APP_ID = 'cli_report_worker';
@@ -136,7 +140,11 @@ async function runReport(options: {
   if (options.turnPlacement) {
     const markers = join(data, '.botmux-cli-pids');
     mkdirSync(markers);
-    writeFileSync(join(markers, String(process.pid)), JSON.stringify({ sessionId: options.chatScope ? source.sessionId : current.sessionId, turnId: 'turn-report' }));
+    writeFileSync(join(markers, String(process.pid)), JSON.stringify({
+      sessionId: options.chatScope ? source.sessionId : current.sessionId,
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+    }));
   }
   const captureFile = join(root, 'outbound.json');
   const topicReadsFile = join(root, 'topic-reads.json');
@@ -195,10 +203,15 @@ async function runReport(options: {
       child.once('close', status => done({ status, stdout, stderr }));
     });
     const outputLine = result.stdout.split('\n').find(line => line.startsWith('{"success":'));
+    const markerPath = join(data, 'turn-sends', `${options.chatScope ? source.sessionId : current.sessionId}.jsonl`);
     return {
       topicReads: existsSync(topicReadsFile) ? JSON.parse(readFileSync(topicReadsFile, 'utf8')) as string[] : [],
       ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests, lookups,
       outbound: existsSync(captureFile) ? JSON.parse(readFileSync(captureFile, 'utf8')) : undefined,
+      bridgeMarkers: existsSync(markerPath)
+        ? readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean)
+          .map(line => JSON.parse(line) as BridgeSendMarker)
+        : [],
     };
   } finally {
     server.closeAllConnections();
@@ -434,6 +447,40 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.requests[0].body.dispatchRoot).toBe('om_relay_seed');
     expect(result.output.recipient.openId).toBe(REVIEWER);
     expect(result.outbound).toBeUndefined();
+  });
+
+  it('records a successful --dispatch-root relay against the exact source turn', async () => {
+    const result = await runReport({
+      turnPlacement: 'thread',
+      recipientRoot: SEED,
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: {
+        ok: true,
+        triggerId: 'trigger-report',
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+      },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      deliveryKind: 'dispatch_report',
+      deliveryId: 'trigger-report',
+      targetSessionId: 'orchestrator',
+      dispatchRootId: 'om_relay_seed',
+    });
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      markTimeMs: undefined,
+      isLocal: false,
+      finalText: 'BOTMUX_NOTHING_TO_SEND',
+      terminalStatus: 'completed',
+    }, undefined, result.bridgeMarkers, false)).toBe(false);
   });
 
   it('retains authenticated orchestrator relay without a Lark fallback', async () => {

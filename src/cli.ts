@@ -33,7 +33,7 @@ import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
@@ -359,11 +359,10 @@ import {
   whiteboardPath,
 } from './services/whiteboard-store.js';
 import {
-  buildBridgeSendMarkerContent,
-  buildBridgeSendPreviewText,
   isFinalBridgeSendMarker,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
+import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
 import {
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
@@ -11753,25 +11752,31 @@ async function cmdSend(rest: string[]): Promise<void> {
       const messageId = voiceDelivery.messageId;
       const sentAtMs = Date.now();
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
-      // 语音也是一次回复：写 bridge fallback marker，否则本轮会被判为"没发 botmux send"
-      // 而触发兜底，多补一张文本卡。与文本/卡片路径同口径：仅同话题回复才记。
-      if ((!sendTopLevel || !!deferredTopicRootMessageIdForOutput)
-        && (!overrideChatId || overrideChatId === s.chatId)
-        && !sendInto) {
+      // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
+      // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
+      if ((!sendTopLevel && !overrideChatId && !sendInto)
+        || !!(originTurnId ?? currentTurnId)
+        || !!deferredTopicRootMessageIdForOutput) {
         try {
-          const markerDir = join(resolveDataDir(), 'turn-sends');
-          if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-          const marker: Record<string, unknown> = {
+          const markerSessionId = originSessionId ?? sid;
+          const markerTurnId = originTurnId ?? currentTurnId;
+          const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
+            || markerSessionId !== sid;
+          recordBridgeReplyMarker({
+            dataDir: resolveDataDir(),
+            sessionId: markerSessionId,
             sentAtMs,
             messageId,
+            deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+            content,
             responseKind: effectiveResponseKind,
             terminalCarrier: 'non_patchable',
-            ...(originTurnId ? { turnId: originTurnId } : {}),
-            ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
-          };
-          const previewText = buildBridgeSendPreviewText(content);
-          if (previewText) marker.previewText = previewText;
-          appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
+            turnId: markerTurnId,
+            dispatchAttempt: originDispatchAttempt,
+            targetChatId: voicePrimaryOutputChatId,
+            targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
+            targetSessionId: sid,
+          });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
       if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
@@ -11889,19 +11894,18 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
-        const markerDir = join(resolveDataDir(), 'turn-sends');
-        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-        const marker: Record<string, unknown> = {
+        recordBridgeReplyMarker({
+          dataDir: resolveDataDir(),
+          sessionId: originSessionId!,
           sentAtMs: Date.now(),
           messageId: docDelivery.messageId,
+          deliveryKind: 'current_session_send',
+          content,
           responseKind: effectiveResponseKind,
           turnId: originTurnId ?? exactDocTarget.turnId,
-          ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
-          contentLength: content.length,
-        };
-        const previewText = buildBridgeSendPreviewText(content);
-        if (previewText) marker.previewText = previewText;
-        appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify(marker) + '\n');
+          dispatchAttempt: originDispatchAttempt,
+          targetSessionId: originSessionId,
+        });
       } catch { /* best-effort：漏记只多一条兜底 */ }
       if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -12361,27 +12365,38 @@ async function cmdSend(rest: string[]): Promise<void> {
     terminalCarrier?: 'standard_reply_card' | 'non_patchable',
   ): void => {
     try {
-      const markerDir = join(resolveDataDir(), 'turn-sends');
-      if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-      const marker: Record<string, unknown> = {
+      const markerSessionId = originSessionId ?? sid;
+      const markerTurnId = originTurnId ?? currentTurnId;
+      const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
+        || markerSessionId !== sid;
+      recordBridgeReplyMarker({
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
         sentAtMs,
         messageId,
+        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+        content: sentContent,
         responseKind: effectiveResponseKind,
-        ...(originTurnId ? { turnId: originTurnId } : {}),
-        ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
-        ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
-        ...(remoteRunnerOutbound && effectiveResponseKind !== 'final'
-          ? { terminalIndependent: true }
-          : {}),
-        ...(terminalCarrier ? { terminalCarrier } : {}),
-      };
-      Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
-      const line = JSON.stringify(marker) + '\n';
-      appendFileSync(join(markerDir, `${sid}.jsonl`), line);
+        turnId: markerTurnId,
+        dispatchAttempt: originDispatchAttempt,
+        replyCardResponseKind: unifiedReplyUsed ? effectiveResponseKind : undefined,
+        terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final'
+          ? true
+          : undefined,
+        terminalCarrier,
+        targetChatId,
+        targetRootMessageId: deferredTopicRootMessageIdForOutput
+          ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
+        targetSessionId: sid,
+      });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
 
-  const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  // A detoured send is still positive user-visible output for its exact source
+  // turn. Require an exact turn before recording a detour so a manually-run,
+  // unattributed publish cannot suppress a real empty reply by timestamp alone.
+  const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto
+    || !!(originTurnId ?? currentTurnId);
   let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
@@ -13215,10 +13230,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
 
-    // Bridge fallback marker — append-only jsonl per session. Same-thread
-    // sends can suppress transcript fallback when their content appears to
-    // cover the same final answer; detoured sends suppress only when they
-    // closed a pending response card for this turn.
+    // Bridge fallback marker — append-only jsonl on the source session. A
+    // successful detour is recorded with explicit destination metadata when an
+    // exact source turn is available; it must not be mistaken for no reply.
     if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
       recordBridgeSendMarker(
         sentAtMs,
@@ -14946,6 +14960,32 @@ async function cmdReport(rest: string[]): Promise<void> {
     await assertMessageTopicAvailable(reportSourceAppId, reportSource.rootMessageId,
       (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
   } };
+  const recordSuccessfulReportMarker = (receipt: {
+    messageId?: string;
+    deliveryId?: string;
+    targetChatId?: string;
+    targetRootMessageId?: string;
+    targetSessionId?: string;
+    dispatchRootId?: string;
+  }): void => {
+    // Report can be invoked with --session-id from an unrelated shell. Only a
+    // fresh process-tree/capability turn is allowed to suppress that turn's
+    // empty-final fallback; an unbound manual report remains visible but earns
+    // no attribution credit.
+    if (!reportContext?.turnId) return;
+    try {
+      recordBridgeReplyMarker({
+        dataDir: resolveDataDir(),
+        sessionId: reportContext.sessionId,
+        sentAtMs: Date.now(),
+        deliveryKind: 'dispatch_report',
+        content,
+        turnId: reportContext.turnId,
+        dispatchAttempt: reportContext.dispatchAttempt,
+        ...receipt,
+      });
+    } catch { /* best-effort: a miss produces the conservative empty-final notice */ }
+  };
 
 
   const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
@@ -15009,6 +15049,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         // 这段文字在平台上无处可放。不发的话验收的人只看到状态变成「待验收」，完全不知道
         // 交付了什么，而 stdout 只有 agent 自己看得到。
         let delivered = false;
+        let reportMessageId: string | undefined;
         try {
           const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
           await registerSelfFromCredFile();
@@ -15017,7 +15058,7 @@ async function cmdReport(rest: string[]): Promise<void> {
           const { issueDetailUrl } = await import('./services/issue-claim-flow.js');
           const { sendMessage: larkSend } = await import('./im/lark/client.js');
           const url = issueDetailUrl(binding.platformBaseUrl, result.issueId);
-          await larkSend(
+          reportMessageId = await larkSend(
             s.larkAppId!,
             binding.chatId ?? binding.anchorId,
             buildIssueDeliveryCard({
@@ -15034,6 +15075,11 @@ async function cmdReport(rest: string[]): Promise<void> {
           // 否则 agent 以为交付说明已经送达。
           console.error(`交付说明未能发回群里（状态已是待验收）：${e?.message ?? e}`);
         }
+        recordSuccessfulReportMarker({
+          ...(reportMessageId ? { messageId: reportMessageId } : {}),
+          deliveryId: result.issueId,
+          targetChatId: binding.chatId,
+        });
         console.log(JSON.stringify({
           success: true,
           delivery: 'issue-in-review',
@@ -15105,6 +15151,21 @@ async function cmdReport(rest: string[]): Promise<void> {
       process.exit(1);
     } else {
       const target = triggerBody.reportTarget;
+      recordSuccessfulReportMarker({
+        ...(typeof triggerBody.publishedMessageId === 'string'
+          ? { messageId: triggerBody.publishedMessageId }
+          : {}),
+        ...(typeof triggerBody.triggerId === 'string'
+          ? { deliveryId: triggerBody.triggerId }
+          : {}),
+        targetChatId: reportDelivery === 'publish' ? s.chatId : undefined,
+        targetRootMessageId: reportDelivery === 'publish'
+          && triggerBody.publicationTarget?.mode !== 'top-level'
+          ? triggerBody.publicationTarget?.rootMessageId
+          : undefined,
+        targetSessionId: reportDelivery === 'publish' ? undefined : target?.sessionId,
+        dispatchRootId: dispatchRootCandidate,
+      });
       console.log(JSON.stringify({
         success: true,
         delivery: reportDelivery === 'publish' ? 'lark-message' : 'orchestrator-session',
@@ -15181,6 +15242,14 @@ async function cmdReport(rest: string[]): Promise<void> {
     const messageTarget = placement.target.mode === 'plain'
       ? { mode: 'top-level', chatId: placement.target.chatId }
       : { mode: placement.target.mode, rootMessageId: placement.target.rootMessageId };
+    recordSuccessfulReportMarker({
+      messageId: msgId,
+      targetChatId: placement.target.mode === 'plain' ? placement.target.chatId : s.chatId,
+      targetRootMessageId: placement.target.mode === 'plain'
+        ? undefined
+        : placement.target.rootMessageId,
+      dispatchRootId: dispatchRootCandidate,
+    });
     console.log(JSON.stringify({
       success: true,
       delivery: 'lark-message',

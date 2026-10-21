@@ -94,7 +94,7 @@ import {
 } from './services/restart-interruption.js';
 import { saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -6587,14 +6587,13 @@ function failedBridgeFailureText(errorCode?: string, summary?: string): string {
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
 //
-// `botmux send` (cli.ts cmdSend) appends a line
-// `{sentAtMs, messageId, contentLength?}\n` to
-// `<DATA_DIR>/turn-sends/<sid>.jsonl` every time the model successfully posts
-// a reply to its OWN session thread. The worker reads these markers at idle
-// and suppresses transcript-driven final_output for any turn whose time window
-// already contains a send that appears to cover the same final answer — i.e.
-// the model didn't forget, no fallback needed. Append-only over a shared file
-// (instead of a per-turn marker) is
+// Successful `botmux send` and `botmux report` commands append a structured
+// delivery marker to `<DATA_DIR>/turn-sends/<source-session>.jsonl`. Current
+// replies, detours, and dispatch reports carry distinct deliveryKind/target
+// metadata while turnId + dispatchAttempt bind new-schema entries to the exact
+// source turn. The worker suppresses transcript fallback only for attributable
+// markers. Legacy turn-less rows retain the bounded time window used during
+// rolling upgrades. Append-only over a shared file (instead of a per-turn marker) is
 // type-ahead safe: type-ahead'd turns each have their own [markTimeMs,
 // nextTurn.markTimeMs) window, and a stray send only fills its own bucket.
 // This relies on each turn's markTimeMs reflecting when it ACTUALLY started
@@ -10641,6 +10640,7 @@ function emitReadyCodexTurns(): void {
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
+      sessionId,
       turnId: turn.turnId,
       dispatchAttempt: turn.dispatchAttempt,
       markTimeMs: turn.markTimeMs,
@@ -10656,6 +10656,25 @@ function emitReadyCodexTurns(): void {
     const fallbackKind = structuredFallbackKind(
       gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIs('codex'), replyDeliveryMode(),
     );
+    if ((turn.finalText ?? '').trim().length === 0) {
+      const attributableMarkers = attributableBridgeReplyMarkers(
+        gateInput,
+        nextBoundaryMs,
+        markers,
+      );
+      const deliveryKinds = [...new Set(attributableMarkers
+        .map(marker => marker.deliveryKind ?? 'legacy'))].join(',') || '-';
+      log('[structured-bridge] empty-final attribution'
+        + ` cliId=${lastInitConfig?.cliId ?? '-'}`
+        + ` sessionId=${sessionId ?? '-'}`
+        + ` turnId=${turn.turnId}`
+        + ` dispatchAttempt=${turn.dispatchAttempt ?? '-'}`
+        + ` markerCount=${attributableMarkers.length}`
+        + ` totalMarkerCount=${markers.length}`
+        + ` finalTextLength=${turn.finalText?.length ?? 0}`
+        + ` deliveryKinds=${deliveryKinds}`
+        + ` decision=${fallbackKind}`);
+    }
     const content = fallbackKind === 'failed'
       ? composeFailedBridgeFallbackContent(
           failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
@@ -10692,7 +10711,7 @@ function emitReadyCodexTurns(): void {
     }
     if (!content) continue;
     if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
-      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
+      log(`Structured bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
         + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this

@@ -1008,6 +1008,93 @@ describe('shouldEmitEmptyCompletedBridgeFallback', () => {
     )).toBe(false);
   });
 
+  it('uses an exact Pi turn/attempt marker even without a transcript time window', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 150,
+      sessionId: 'session-pi',
+      turnId: 'turn-pi',
+      dispatchAttempt: 3,
+      deliveryKind: 'current_session_send',
+      messageId: 'om_pi_reply',
+    };
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      {
+        sessionId: 'session-pi',
+        turnId: 'turn-pi',
+        dispatchAttempt: 3,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: '',
+        terminalStatus: 'completed',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('treats a non-Pi detoured send as exact reply evidence without borrowing it across turns', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 250,
+      sessionId: 'session-grok',
+      turnId: 'turn-grok',
+      dispatchAttempt: 4,
+      deliveryKind: 'detoured_send',
+      targetChatId: 'oc_publish',
+      messageId: 'om_detoured',
+    };
+    const current = {
+      sessionId: 'session-grok',
+      turnId: 'turn-grok',
+      dispatchAttempt: 4,
+      markTimeMs: 100,
+      isLocal: false,
+      finalText: '',
+      terminalStatus: 'completed' as const,
+    };
+    expect(shouldEmitEmptyCompletedBridgeFallback(current, 200, [marker], false)).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...current, turnId: 'turn-next', markTimeMs: 200 },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...current, sessionId: 'another-session' },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
+  it('accepts an exact dispatch report marker while keeping another attempt visible', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 150,
+      sessionId: 'session-report',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      deliveryKind: 'dispatch_report',
+      dispatchRootId: 'om_dispatch',
+      deliveryId: 'trigger-report',
+    };
+    const current = {
+      sessionId: 'session-report',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      markTimeMs: 100,
+      isLocal: false,
+      finalText: '',
+      terminalStatus: 'completed' as const,
+    };
+    expect(shouldEmitEmptyCompletedBridgeFallback(current, undefined, [marker], false)).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...current, dispatchAttempt: 3 },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
   it('does not emit for failed, ambiguous, local, adopt, or non-empty turns', () => {
     expect(shouldEmitEmptyCompletedBridgeFallback(
       { ...turn(100), finalText: '', terminalStatus: 'failed' },
