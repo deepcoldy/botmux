@@ -325,6 +325,96 @@ describe('independent turn terminal receipt', () => {
     );
   });
 
+  it('patches the fallback final card when progress preceded it and the terminal arrives in flight', async () => {
+    const ds = makeDs();
+    const turnId = 'om_turn_progress_then_fallback';
+    bindLarkTurn(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId,
+      messageId: 'om_progress_card',
+      responseKind: 'progress',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+
+    // Hold the transcript fallback delivery AFTER its in-flight registration
+    // but before the Lark round-trip resolves: the fallback final's carrier is
+    // recorded only once this resolves — the exact ordered-IPC window in which
+    // the worker's back-to-back turn_terminal reaches the daemon.
+    let releaseDelivery: ((messageId: string) => void) | undefined;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>(resolve => { releaseDelivery = resolve; }) as any,
+    );
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: 'sid-terminal-receipt',
+      content: '最终答复正文',
+      lastUuid: 'uuid-fallback-final',
+      turnId,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg(turnId));
+
+    // The card render has an async lead-in; wait until the send actually
+    // starts (the Promise executor assigns releaseDelivery synchronously),
+    // not just for the in-flight drain registration.
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(
+      ds.finalOutputDeliveriesByTurn?.get(turnId)?.size ?? 0,
+    ).toBeGreaterThanOrEqual(1);
+    // While the fallback final is still in flight the interim card is not
+    // promoted and no independent strip is posted.
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(getMessageDetail).not.toHaveBeenCalled();
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+
+    releaseDelivery!('om_fallback_final_card');
+
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalledWith(
+      'app_test', 'card_answer', 'botmux_reply_footer',
+      { content: 'brand terminal:completed' }, 1,
+      expect.stringMatching(/^trf_[0-9a-f]{47}$/), 'om_fallback_final_card',
+    ));
+    // The interim progress card is never patched, and the sole sessionReply
+    // call is the fallback card delivery itself — no independent strip.
+    expect(getMessageDetail).not.toHaveBeenCalledWith(
+      'app_test', 'om_progress_card', expect.anything(),
+    );
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    // The claim is taken only after the drain, once the final has landed.
+    expect(ds.terminalReceiptTurnIds?.has(turnId)).toBe(true);
+  });
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'keeps an interim-only %s turn footerless when no fallback final lands',
+    async responseKind => {
+      const ds = makeDs();
+      const turnId = `om_turn_${responseKind}_no_fallback`;
+      bindLarkTurn(ds, turnId);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId,
+        messageId: `om_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      // A bare completed terminal (no final_output and no nothing-to-send
+      // flag, e.g. the RPC hydration window) must not promote the interim card.
+      (ds.worker as any).emit('message', terminalMsg(turnId));
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(patchCardStreamElement).not.toHaveBeenCalled();
+      expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(ds.terminalReceiptTurnIds?.has(turnId)).not.toBe(true);
+    },
+  );
+
   it('treats a suppression sentinel as completed when an explicit body was sent', async () => {
     const ds = makeDs();
     bindLarkTurn(ds, 'om_turn_explicit_then_sentinel');
