@@ -22,6 +22,14 @@ export function piInitialPromptNeedsFile(prompt: string | undefined): boolean {
     // integration can also bypass the PATH launcher, so even short routed
     // Botmux prompts must use Pi's safe @file positional form.
     || /[\x00-\x1f\x7f]/.test(prompt)
+    // Pi parses `pi [@files...] [messages...]`: any positional argument that
+    // starts with `@` is an at-file reference, not a message. Lark renders an
+    // @-mention as leading text, so a short one-line `${'@'}Bot do X` prompt
+    // became `pi "@{Bot} do X"` -> `Error: File not found: <cwd>/{Bot} do X`,
+    // the CLI exited in ~1s with no turn ever running, and the retry spawn
+    // dropped the prompt entirely. Force such prompts through the @file form,
+    // whose argument is a real path.
+    || prompt.trimStart().startsWith('@')
   );
 }
 

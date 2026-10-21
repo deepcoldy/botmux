@@ -9,6 +9,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import {
   PI_INITIAL_PROMPT_ARG_BYTE_LIMIT,
+  piInitialPromptNeedsFile,
   preparePiInitialPromptArg,
 } from '../src/adapters/cli/pi-initial-prompt.js';
 import {
@@ -53,6 +54,36 @@ describe('Pi initial prompt @file delivery', () => {
     expect(result.initialPromptArg).toBe('<user_message>hello Pi</user_message>');
     expect(result.filePath).toBeUndefined();
     expect(result.readonlyRoot).toBeUndefined();
+  });
+
+  it('writes a short first prompt that starts with @ to @file so Pi does not treat it as an at-file reference', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // Lark renders `@Bot do X` as leading text; Pi would parse that as
+      // `pi "{@}Bot do X"` and exit with `File not found` before any turn ran.
+      const prompt = '@韩毅-Bot 前面这个消息也没出发';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-at',
+        sessionDataDir: dataDir,
+      });
+
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(result.initialPromptArg).not.toBe(prompt);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats leading whitespace before @ the same as a leading @', () => {
+    expect(piInitialPromptNeedsFile('  @bot hi')).toBe(true);
+    expect(piInitialPromptNeedsFile('\n@bot hi')).toBe(true);
+    expect(piInitialPromptNeedsFile('你好 @bot hi')).toBe(false);
+    expect(piInitialPromptNeedsFile(undefined)).toBe(false);
   });
 
   it('writes short multiline prompts to @file so Herdr can forward control-free argv on resume', () => {
