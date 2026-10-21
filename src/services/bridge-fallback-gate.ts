@@ -284,6 +284,28 @@ export interface BridgeGateInput {
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
+/** Build one gate input from the worker's exact source-turn identity.
+ *
+ * Both transcript queues and managed Codex App finals already own this tuple;
+ * centralising the projection keeps those production paths from accidentally
+ * falling back to timestamp-only attribution when their marker carries a
+ * turnId. Identity fields are applied last so caller payloads cannot override
+ * the source turn. */
+export function bridgeGateInputForTurn(
+  sessionId: string | undefined,
+  turn: { turnId: string; dispatchAttempt?: number },
+  input: Omit<BridgeGateInput, 'sessionId' | 'turnId' | 'dispatchAttempt'>,
+): BridgeGateInput {
+  return {
+    ...input,
+    ...(sessionId ? { sessionId } : {}),
+    turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined
+      ? { dispatchAttempt: turn.dispatchAttempt }
+      : {}),
+  };
+}
+
 const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
 
 /** Bounded, newline-preserving copy of a `botmux send` body for dashboard

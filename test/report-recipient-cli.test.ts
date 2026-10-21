@@ -572,6 +572,57 @@ describe('report source topic preservation', () => {
 
 
 describe('report issue notice source', () => {
+  it('records an exact visible-reply marker only after the issue card reaches Lark', async () => {
+    const result = await runReport({
+      issueInReview: true,
+      topicPolicy: 'legacy',
+      turnPlacement: 'thread',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      delivery: 'issue-in-review',
+      alreadyInReview: true,
+      reportPostedToChat: true,
+    });
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      deliveryKind: 'dispatch_report',
+      messageId: 'om_report_sent',
+      deliveryId: 'fixture-issue',
+      targetChatId: CHAT,
+    });
+  });
+
+  it('does not record a visible-reply marker when the issue state changed but the Lark card failed', async () => {
+    const result = await runReport({
+      issueInReview: true,
+      topicPolicy: 'stop',
+      unavailableMessage: THREAD,
+      turnPlacement: 'thread',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      success: true,
+      delivery: 'issue-in-review',
+      alreadyInReview: true,
+      reportPostedToChat: false,
+    });
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.bridgeMarkers).toEqual([]);
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      markTimeMs: 100,
+      isLocal: false,
+      finalText: '',
+      terminalStatus: 'completed',
+    }, undefined, result.bridgeMarkers, false)).toBe(true);
+  });
+
   it('retains the settled issue receipt but does not publish its notice after source withdrawal', async () => {
     const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD });
     expect(result.status).toBe(0);

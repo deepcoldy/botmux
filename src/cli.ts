@@ -15075,11 +15075,13 @@ async function cmdReport(rest: string[]): Promise<void> {
           // 否则 agent 以为交付说明已经送达。
           console.error(`交付说明未能发回群里（状态已是待验收）：${e?.message ?? e}`);
         }
-        recordSuccessfulReportMarker({
-          ...(reportMessageId ? { messageId: reportMessageId } : {}),
-          deliveryId: result.issueId,
-          targetChatId: binding.chatId,
-        });
+        if (delivered && reportMessageId) {
+          recordSuccessfulReportMarker({
+            messageId: reportMessageId,
+            deliveryId: result.issueId,
+            targetChatId: binding.chatId,
+          });
+        }
         console.log(JSON.stringify({
           success: true,
           delivery: 'issue-in-review',

@@ -5,6 +5,7 @@ import {
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  bridgeGateInputForTurn,
   bridgePostText,
   composeFailedBridgeFallbackContent,
   hasUserVisibleText,
@@ -327,6 +328,66 @@ describe('buildBridgeSendMarkerContent', () => {
     expect(buildBridgeSendPreviewText('a\n\n\n\nb')).toBe('a\n\nb');
   });
 
+});
+
+describe('production turn identity projection', () => {
+  const finalText = 'The complete result was already delivered to the user.';
+  const exactMarkers: BridgeSendMarker[] = [
+    {
+      sentAtMs: 150,
+      sessionId: 'session-source',
+      turnId: 'turn-source',
+      dispatchAttempt: 4,
+      responseKind: 'progress',
+      deliveryKind: 'current_session_send',
+      ...buildBridgeSendMarkerContent(finalText),
+    },
+    {
+      sentAtMs: 160,
+      sessionId: 'session-source',
+      turnId: 'turn-source',
+      dispatchAttempt: 4,
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      ...buildBridgeSendMarkerContent('A separately rendered final card.'),
+    },
+  ];
+
+  it.each([
+    ['Claude/uuid emitReadyTurns', 100, 200],
+    ['Codex App signed final', 120, 220],
+  ] as const)('%s carries source session/turn/attempt and deduplicates progress/final sends',
+  (_path, markTimeMs, nextBoundaryMs) => {
+    const gate = bridgeGateInputForTurn(
+      'session-source',
+      { turnId: 'turn-source', dispatchAttempt: 4 },
+      { markTimeMs, isLocal: false, finalText },
+    );
+
+    expect(gate).toMatchObject({
+      sessionId: 'session-source',
+      turnId: 'turn-source',
+      dispatchAttempt: 4,
+      markTimeMs,
+      finalText,
+    });
+    expect(shouldSuppressBridgeEmit(gate, nextBoundaryMs, [exactMarkers[0]], false)).toBe(true);
+    expect(shouldSuppressBridgeEmit(gate, nextBoundaryMs, [exactMarkers[1]], false)).toBe(true);
+  });
+
+  it.each([
+    ['wrong session', { sessionId: 'session-other' }],
+    ['wrong turn', { turnId: 'turn-other' }],
+    ['old durable attempt', { dispatchAttempt: 3 }],
+  ] as const)('keeps the transcript final visible for %s', (_label, override) => {
+    const gate = bridgeGateInputForTurn(
+      'session-source',
+      { turnId: 'turn-source', dispatchAttempt: 4 },
+      { markTimeMs: 100, isLocal: false, finalText },
+    );
+    const marker = { ...exactMarkers[1], ...override };
+    expect(shouldSuppressBridgeEmit(gate, 200, [marker], false)).toBe(false);
+  });
 });
 
 describe('shouldSuppressBridgeEmit', () => {
