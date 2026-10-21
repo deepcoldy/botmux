@@ -34,6 +34,7 @@ import { FeedGroupPicker } from './feed-group-picker.js';
 import { ModalDialog } from './modal-dialog.js';
 import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
+import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeSessionsViewMode,
@@ -2913,9 +2914,16 @@ function SessionsPage(): React.JSX.Element {
     }
     const stage = viewStageRef.current;
     if (!stage) return;
+    // The table's local scrollbar is a sibling, excluded from scrollable
+    // overflow. Animate their common host so the stage doesn't retain its own
+    // transform/opacity stacking context beneath the scrollbar after fill:both.
+    // Other views keep the original stage animation (their host is contents).
     stage.classList.remove('sessions-view-stage-enter');
-    void stage.offsetWidth;
-    stage.classList.add('sessions-view-stage-enter');
+    const host = stage.parentElement;
+    host?.classList.remove('sessions-view-stage-enter');
+    const animated = viewMode === 'table' && host ? host : stage;
+    void animated.offsetWidth;
+    animated.classList.add('sessions-view-stage-enter');
   }, [viewStageSignature]);
 
   useEffect(() => {
@@ -3946,11 +3954,13 @@ function SessionsPage(): React.JSX.Element {
         onLock={locked => void runBulkLock(locked)}
       />
 
+      <div className={viewMode === 'table' ? 'sessions-table-scroll-host' : 'sessions-scroll-host-contents'}>
       <div
         ref={viewStageRef}
         className="sessions-view-stage"
         data-view={viewMode}
         data-kanban-group={kanbanGroupBy}
+        data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
         {!bootstrapped ? <SessionsSkeleton /> : null}
         {bootstrapped && viewMode === 'table' ? (
@@ -4045,6 +4055,8 @@ function SessionsPage(): React.JSX.Element {
           />
         </div>
         ) : null}
+      </div>
+      {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
       </div>
 
       <Drawer

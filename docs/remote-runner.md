@@ -147,6 +147,8 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的结构化 Session helper；持久调度写操作还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。自由字符串使用单一 opaque argv token 传递，daemon 对 Remote Runner 请求再次核对当前 Chat、Topic root 和工作目录。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
 
+Bot-authored turn 的 `trustedCaller` 可以携带独立的 `botOwner`。直接调用者仍由 `requestUserOpenId/requestUserUnionId + senderType=bot` 表示；`botOwner` 只在飞书已确认发送者是 Bot、其 union_id 在目标 Bot 的平台团队名册中唯一命中、且平台下发的机器 Owner 能由目标 App 的 Contact API 重新解析时生成。该字段不会从消息正文、Session owner 或最近真人推断；缺失、冲突和解析失败均保持缺失，由需要真人凭据的 provider 失败关闭。`botOwner` 是 host 只在出站 turn 命令里铸造的字段：provider 在 `ready.recoveredTurn` 里回传的同名字段只做形状校验（形状非法仍整包拒绝），不会写回恢复 turn 的 caller，下一条出站 turn 命令会携带重新铸造的值。
+
 Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，schedule 写事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员。`schedule.add` 按该真人 owner/control identity 落盘；`update|remove|pause|resume|run` 只允许管理当前 Chat 中由同一 controller 创建的 direct task，仍拒绝 delegated task、跨 controller、跨群或换代后的请求。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录或运行凭据。
 
 当前 allowlist：

@@ -18,6 +18,43 @@ describe('resolveVerifiedUserIdentity', () => {
     vi.clearAllMocks();
   });
 
+  it('resolves a platform owner union_id into target-app identity', async () => {
+    larkGet.mockResolvedValue({
+      code: 0,
+      data: {
+        user: {
+          open_id: 'ou_target_scope',
+          union_id: 'on_owner',
+          name: 'Owner',
+          enterprise_email: 'owner@bytedance.com',
+        },
+      },
+    });
+    const { resolveVerifiedUserIdentityByUnionId } = await import('../src/im/lark/identity-cache.js');
+
+    await expect(resolveVerifiedUserIdentityByUnionId('cli_target', 'on_owner')).resolves.toEqual({
+      openId: 'ou_target_scope',
+      unionId: 'on_owner',
+      type: 'user',
+      name: 'Owner',
+      email: 'owner@bytedance.com',
+    });
+    expect(larkGet).toHaveBeenCalledWith(
+      { marker: true },
+      '/open-apis/contact/v3/users/on_owner',
+      { user_id_type: 'union_id' },
+    );
+  });
+
+  it('rejects a union_id response that resolves to another principal', async () => {
+    larkGet.mockResolvedValue({
+      code: 0,
+      data: { user: { open_id: 'ou_target_scope', union_id: 'on_other' } },
+    });
+    const { resolveVerifiedUserIdentityByUnionId } = await import('../src/im/lark/identity-cache.js');
+    await expect(resolveVerifiedUserIdentityByUnionId('cli_target', 'on_owner')).resolves.toBeUndefined();
+  });
+
   it('always reads the exact current open_id from the contact API', async () => {
     larkGet.mockResolvedValue({
       code: 0,

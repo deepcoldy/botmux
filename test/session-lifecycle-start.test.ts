@@ -154,6 +154,7 @@ vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
   ensureAskSkill: vi.fn(),
   ensureWhiteboardSkill: vi.fn(),
+  ensureChatManagerSkill: vi.fn(),
   ensureWorkflowSkills: vi.fn(),
   removeGlobalBotmuxSkills: vi.fn(),
 }));
@@ -242,6 +243,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
@@ -3969,6 +3971,30 @@ describe('persistent backend target handoff', () => {
       backendType: 'herdr',
       persistentBackendTarget: target,
     }));
+  });
+
+  it('passes the herdr config when herdr comes from the session stamp rather than the bot', () => {
+    // The bot sets no backendType, so herdr is decided by the stamp (or the
+    // daemon-wide BACKEND_TYPE). The env-level herdr config must still reach
+    // the worker, with the bot's own herdr fields layered over it.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ herdr: { tab: '3' } }));
+    const daemon = config.daemon as { herdr?: unknown };
+    daemon.herdr = { sessionName: 'default', placement: 'split', tab: '9' };
+    try {
+      const ds = makeDs();
+      ds.session.backendType = 'herdr';
+
+      forkWorker(ds, 'resume', true);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+        type: 'init',
+        backendType: 'herdr',
+        backendConfig: { sessionName: 'default', placement: 'split', tab: '3' },
+      }));
+    } finally {
+      delete daemon.herdr;
+    }
   });
 });
 

@@ -387,6 +387,43 @@ export async function resolveVerifiedUserIdentity(
   }
 }
 
+/** Resolve a platform-attested union_id through the receiving bot app. */
+export async function resolveVerifiedUserIdentityByUnionId(
+  larkAppId: string,
+  unionId: string,
+): Promise<{ openId: string; unionId: string; type: 'user'; name?: string; email?: string } | undefined> {
+  if (!unionId.startsWith('on_')) return undefined;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(unionId)}`, {
+      user_id_type: 'union_id',
+    });
+    const user = res?.code === 0 ? res?.data?.user : undefined;
+    const openId = typeof user?.open_id === 'string' ? user.open_id.trim() : '';
+    if (!openId.startsWith('ou_')) return undefined;
+    const returnedUnionId = typeof user?.union_id === 'string' ? user.union_id.trim() : unionId;
+    if (returnedUnionId !== unionId) return undefined;
+    const rawName: unknown = user?.name;
+    const rawEmail: unknown = user?.enterprise_email ?? user?.email;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+    const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+    recordIdentity(larkAppId, {
+      openId,
+      name,
+      email,
+      contactResolvedAt: Date.now(),
+      type: 'user',
+      source: 'contact_api',
+    });
+    return { openId, unionId, type: 'user', name, email };
+  } catch (err: any) {
+    logger.debug(
+      `[identity] strict contact lookup for ${unionId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
+}
+
 /**
  * Resolve sender identity for prompt injection.
  *

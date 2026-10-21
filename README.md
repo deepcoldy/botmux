@@ -94,6 +94,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 ## 支持的 CLI / Agent
 
+可选的 [OpenViking 共享记忆示例](examples/openviking-memory/README.md)让所有具备 shell 的 coding agent 共用用户与项目记忆，自主搜索、读取和保存重要结论。**默认关闭**，通过公共 Skill/CLI 显式绑定本地 Agent 或单用户 Bot；Codex 自动会话采集作为独立可选适配。（该示例仅存在于源码仓库的 `examples/`，npm 包不打包 `examples/`，此链接在 npm 页面不可达。）
+
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
 `claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`([MiniMax Code / mcode](docs/minimax-code.md)，支持文件与 Shell 工具、原生 Skills 和精确会话恢复；`mcode login` / `mcode login --region global` 登录，多账号用 `MINIMAX_DATA_DIR` 隔离) …

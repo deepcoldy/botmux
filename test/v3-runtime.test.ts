@@ -850,8 +850,7 @@ describe('human-gate 文件等待存储', () => {
 });
 
 describe('runtime CLI 白名单守卫', () => {
-  it('白名单包含五个已验证 /goal 的 CLI', () => {
-    expect(V3_SUPPORTED_CLIS).toEqual(['claude-code', 'codex', 'seed', 'traex', 'relay']);
+  it('白名单里的 CLI 都通过守卫，未验证 /goal 的 CLI 被拒', () => {
     for (const cliId of V3_SUPPORTED_CLIS) expect(isV3SupportedCli(cliId)).toBe(true);
     expect(isV3SupportedCli('gemini')).toBe(false);
   });

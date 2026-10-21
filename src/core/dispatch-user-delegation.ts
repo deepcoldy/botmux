@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import type { TrustedCaller, TurnParticipant } from '../types.js';
 import { updateDispatchRegistry } from './dispatch-registry.js';
+import { registryEntryProvesHumanSender } from './reply-target.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export const DISPATCH_USER_DELIVERY_ROUTE = '/api/dispatch-user/deliver';
@@ -97,9 +98,8 @@ export function verifyDispatchUser(secret: string, raw: unknown): DispatchUserPa
 export function dispatchCallerFromReply(appId: string, reply?: {
   senderOpenId?: string; participants?: TurnParticipant[];
 }): TrustedCaller | undefined {
-  const sender = reply?.senderOpenId;
-  if (!sender || !reply?.participants?.some(p => p.openId === sender && p.isBot === false)) return;
-  return { requestLarkAppId: appId, requestUserOpenId: sender, senderType: 'user' };
+  if (!registryEntryProvesHumanSender(reply)) return;
+  return { requestLarkAppId: appId, requestUserOpenId: reply.senderOpenId, senderType: 'user' };
 }
 
 /** Only a daemon-authenticated, current human turn may originate a delegation. */

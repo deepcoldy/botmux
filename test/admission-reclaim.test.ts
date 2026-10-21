@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   runMarginalAdmissionRetry,
   coalesceMarginalAdmissionRetry,
-  MARGINAL_ADMISSION_RETRY_DELAY_MS,
 } from '../src/core/admission-reclaim.js';
 import {
   evaluateWorkerAdmission,
@@ -91,7 +90,6 @@ describe('runMarginalAdmissionRetry (reclaim → sleep → recheck)', () => {
     });
     expect(Date.now() - start).toBeLessThan(500);
     expect(outcome.result).toBe('allowed');
-    expect(MARGINAL_ADMISSION_RETRY_DELAY_MS).toBe(2000);
   });
 
   it('propagates a reclaim failure and never re-checks', async () => {

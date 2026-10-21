@@ -273,6 +273,22 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
   });
 
+  // 接线钉：/grant 卡发出去之后才落盘，daemon 重启后 owner 照样能点；发卡失败则不落盘。
+  it('card delivered → the /grant card survives a daemon restart', async () => {
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    const grantChat = findCardCallbackValue(JSON.parse(replyMock.mock.calls.at(-1)![2]), 'grant_chat');
+    pending._simulateRestartForTest();
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
+  });
+
+  it('card send failed → nothing persisted, the nonce does not survive a restart', async () => {
+    replyMock.mockRejectedValueOnce(new Error('send failed'));
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+    const grantChat = findCardCallbackValue(JSON.parse(replyMock.mock.calls.at(-1)![2]), 'grant_chat');
+    pending._simulateRestartForTest();
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(false);
+  });
+
   it('dedupes while the first send is in flight and preserves its pending nonce', async () => {
     let finishSend!: (id: string) => void;
     replyMock.mockImplementationOnce(() => new Promise<string>(resolve => { finishSend = resolve; }));

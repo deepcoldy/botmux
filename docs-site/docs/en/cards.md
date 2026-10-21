@@ -66,6 +66,32 @@ The card body is a **live screenshot (image)** of the terminal, not text renderi
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
 
+## Custom card usage segments
+
+You can append your own text to the usage line (`ctx 23% · 5h 18% · 7d 5%`), e.g. gateway account quotas, build status or who is on call. Configure a command on the bot in bots.json:
+
+```json
+"cardFooterExtension": {
+  "command": "~/.botmux/scripts/quota.sh",
+  "refreshSeconds": 60
+}
+```
+
+- The daemon runs `/bin/sh -c <command>` lazily, only while cards are being rendered: when the cached result is at least `refreshSeconds` old (default 60, range 10–3600) a refresh starts in the background. There is no standalone timer, so no command runs while the bot sends no cards, and the first card after a long idle period may still show the previous result for up to 10 minutes; all of the bot's sessions share one result. Rendering a card only reads the cache and never waits for the command
+- Output one segment per line, or JSON `{"segments": ["…", "…"]}`; at most 4 segments of at most 40 characters each, rendered as plain text (markdown is escaped)
+- The environment carries `BOTMUX_LARK_APP_ID`, `BOTMUX_CLI_ID` and `BOTMUX_BOT_NAME` (the **bot-configured** CLI; it does not follow a session's temporary CLI override, since the result is shared per bot); stdin is closed, the timeout is 3 seconds, and a non-zero exit counts as a failure
+- On failure or timeout the last good result is kept; once the last success is older than 10 minutes nothing is shown
+- Works for every CLI; shown wherever `usageDisplay` puts the usage line (live card or reply-card footer) and hidden with it under `off`. Without the setting, cards are byte-for-byte unchanged
+
+Example output:
+
+```
+01 5h 2% 7d 2%
+02 5h 4% 7d 2%
+```
+
+renders as `ctx 14% · 01 5h 2% 7d 2% · 02 5h 4% 7d 2%`.
+
 ## Charts in messages (vega-lite)
 
 A ` ```vega-lite ` fence in a `botmux send` body renders as a native Feishu Card 2.0 chart; other channels such as a Web view can render the same Vega-Lite directly. Supported subset:
