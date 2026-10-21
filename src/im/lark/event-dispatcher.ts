@@ -1090,6 +1090,10 @@ const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
   'close',
   'restart',
   'resume',
+  // The display mode is worker-local. In primary multi-replica deployments it
+  // must enter the same owner-routed control lane instead of being applied on
+  // whichever Lark WebSocket happened to receive the click.
+  'toggle_display',
 ]);
 
 function cardActionType(data: any): string | undefined {
@@ -6212,11 +6216,14 @@ export function createLarkEventDispatcherRuntime(
         runtimeOptions.enqueuePrimary
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
+        && (actionType !== 'toggle_display'
+          || (data?.action?.value?.visibility !== 'private'
+            && getBot(larkAppId).config.privateCard !== true))
       ) {
         let authorizedControl = false;
         if (
           runtimeOptions.enqueuePrimaryControl
-          && (actionType === 'close' || actionType === 'resume')
+          && (actionType === 'close' || actionType === 'resume' || actionType === 'toggle_display')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true
         ) {
@@ -6232,7 +6239,7 @@ export function createLarkEventDispatcherRuntime(
         if (
           runtimeOptions.enqueuePrimaryControl
           && authorizedControl
-          && (actionType === 'close' || actionType === 'resume')
+          && (actionType === 'close' || actionType === 'resume' || actionType === 'toggle_display')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true
         ) {

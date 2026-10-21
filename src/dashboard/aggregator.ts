@@ -122,12 +122,18 @@ export class Aggregator {
     return this.sessions.get(sessionId)?.larkAppId;
   }
 
-  /** sessionId → owning bot daemon's terminal reverse-proxy port. Used by the
-   *  dashboard `/s/*` bridge to route a terminal request to the right daemon's
-   *  proxy (each bot daemon runs its own terminal proxy on proxyBasePort+idx).
-   *  undefined when the session is unknown or its daemon's proxy isn't up. */
+  /** sessionId → this replica's live owning daemon terminal reverse-proxy port.
+   * Every daemon row can advertise its process-wide proxyPort, including a
+   * dormant Session loaded from shared storage. Require a live worker webPort
+   * too, otherwise a non-owner replica would route locally and return 404
+   * instead of consulting the durable owner route. */
   terminalProxyPortOf(sessionId: string): number | undefined {
-    return this.sessions.get(sessionId)?.proxyPort as number | undefined;
+    const row = this.sessions.get(sessionId);
+    return row?.status !== 'closed' && row?.status !== 'dormant'
+      && typeof row?.webPort === 'number' && row.webPort > 0
+      && typeof row.proxyPort === 'number' && row.proxyPort > 0
+      ? row.proxyPort
+      : undefined;
   }
 
   /** Whether a session row with this id exists at all in the aggregator,

@@ -60,6 +60,9 @@ export interface DurableLarkSessionControlRuntimeOptions {
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
+  /** Execute an idempotent card-presentation action on the replica that owns
+   * the live worker. The callback returns the same shape as handleCardAction. */
+  handlePresentationControl?(data: DurableJson): Promise<unknown>;
   buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
@@ -78,6 +81,20 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function presentationCardJson(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() ? value : undefined;
+  const object = record(value);
+  if (!object) return undefined;
+  const shaped = record(object.card) ?? record(object.deferredCard);
+  if (shaped) {
+    const raw = shaped.type === 'raw' ? shaped.data : shaped;
+    return typeof raw === 'string' ? raw : JSON.stringify(raw);
+  }
+  // Raw card responses are not wrapped until event-dispatcher ACK shaping.
+  if (object.toast || object.afterAck) return undefined;
+  return JSON.stringify(object);
 }
 
 /** Daemon-facing lifecycle adapter; keeps the daemon itself as thin wiring. */
@@ -113,7 +130,7 @@ export function createDurableLarkSessionControlRuntime(
     const rootId = value?.root_id;
     const operatorOpenId = operator?.open_id;
     const cardMessageId = context?.open_message_id ?? data?.open_message_id;
-    if ((actionType !== 'close' && actionType !== 'resume')
+    if ((actionType !== 'close' && actionType !== 'resume' && actionType !== 'toggle_display')
         || typeof sessionId !== 'string'
         || typeof rootId !== 'string'
         || typeof operatorOpenId !== 'string'
@@ -127,8 +144,14 @@ export function createDurableLarkSessionControlRuntime(
         || session.sessionId !== sessionId
         || session.streamCardId !== cardMessageId
         || (actionType === 'close' && session.status !== 'active')
-        || (actionType === 'resume' && session.status !== 'closed')) return false;
-    return options.canOperate(session.chatId, operatorOpenId);
+        || (actionType === 'resume' && session.status !== 'closed')
+        || (actionType === 'toggle_display'
+          && (session.status !== 'active'
+            || (value?.target_display_mode !== 'hidden'
+              && value?.target_display_mode !== 'screenshot')))) return false;
+    return actionType === 'toggle_display'
+      ? true
+      : options.canOperate(session.chatId, operatorOpenId);
   };
 
   const resolve: DurableSessionControlDispatchOptions['resolve'] = async (control, context) => {
@@ -159,21 +182,29 @@ export function createDurableLarkSessionControlRuntime(
         && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
     }
+    if (control.action === 'toggle_display' && canonicalSession.status !== 'active') {
+      return { kind: 'ignored', reason: 'canonical Session is not active' };
+    }
     if (source === 'lark-card' && canonicalSession.streamCardId !== control.cardMessageId) {
       return {
         kind: 'ignored',
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
       };
     }
-    if (!trustedHost && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
+    if (!trustedHost && control.action !== 'toggle_display'
+        && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
-    if (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom) {
+    if (control.action !== 'toggle_display'
+        && (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom)) {
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
     }
 
     let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
+    if (control.action === 'toggle_display' && !live) {
+      throw new Error('active presentation target is owned by another replica');
+    }
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {
         const remote = normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState);
@@ -224,6 +255,9 @@ export function createDurableLarkSessionControlRuntime(
       rootId: control.rootId,
       operatorOpenId: control.operatorOpenId,
       cardMessageId: control.cardMessageId,
+      ...(control.action === 'toggle_display'
+        ? { targetDisplayMode: record(value)?.target_display_mode }
+        : {}),
     } as unknown as DurableJson;
     const effectiveCardMessageId = source === 'lark-card'
       ? control.cardMessageId
@@ -262,6 +296,16 @@ export function createDurableLarkSessionControlRuntime(
     ): { result: DurableJson; evidence: DurableJson } | undefined => {
       const current = options.getPersistedSession(control.sessionId);
       if (!current) return undefined;
+      if (control.action === 'toggle_display') {
+        const target = record(value)?.target_display_mode;
+        const active = options.findActiveSession(control.sessionId);
+        if (!active || (target !== 'hidden' && target !== 'screenshot')) return undefined;
+        if (active.displayMode !== target) return undefined;
+        return {
+          result: result('active', options.buildActiveCard(active), { displayMode: target }),
+          evidence: { source: 'active-session', status: 'active', displayMode: target },
+        };
+      }
       if (control.action === 'close' && current.status === 'closed') {
         return {
           result: result('closed', closeCard),
@@ -327,6 +371,22 @@ export function createDurableLarkSessionControlRuntime(
           }
           const already = observed();
           if (already) return { kind: 'completed', result: already.result };
+          if (control.action === 'toggle_display') {
+            if (!options.handlePresentationControl) {
+              return { kind: 'not_applied', error: 'presentation control is unavailable' };
+            }
+            const handled = await options.handlePresentationControl(control.data);
+            const cardJson = presentationCardJson(handled);
+            const target = record(value)?.target_display_mode;
+            const current = options.findActiveSession(control.sessionId);
+            if (!cardJson || !current || current.displayMode !== target) {
+              return { kind: 'not_applied', error: 'presentation control did not reach its target mode' };
+            }
+            return {
+              kind: 'completed',
+              result: result('active', cardJson, { displayMode: target }),
+            };
+          }
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
             if (closed.ok) {
@@ -415,6 +475,16 @@ export function createDurableLarkSessionControlRuntime(
           };
         },
         reconcile: async () => {
+          if (control.action === 'toggle_display') {
+            const reconciled = observed();
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : {
+                  kind: 'not_applied',
+                  error: 'presentation target mode is not installed',
+                  evidence: { source: 'active-session', status: 'active' },
+                };
+          }
           const reconciled = observed(true);
           return reconciled
             ? { kind: 'completed', ...reconciled }
@@ -435,6 +505,9 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
+              || (control.action === 'toggle_display'
+                && (status !== 'active'
+                  || (parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');

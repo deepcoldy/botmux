@@ -115,6 +115,127 @@ describe('central terminal front proxy boundary', () => {
     }
   });
 
+  it('routes card terminal HTTP and WebSocket through the current owner Dashboard', async () => {
+    const ownerRequestHeaders: Array<Record<string, string | string[] | undefined>> = [];
+    const worker = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://worker');
+      if (url.searchParams.get('viewToken') !== 'card-view') {
+        res.writeHead(403).end('forbidden');
+        return;
+      }
+      res.writeHead(200).end('owner-terminal');
+    });
+    worker.on('upgrade', (req, socket) => {
+      const url = new URL(req.url ?? '/', 'http://worker');
+      if (url.searchParams.get('viewToken') !== 'card-view') {
+        socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n');
+        return;
+      }
+      socket.write('HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n');
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+    });
+    const workerPort = await listen(worker);
+    const ownerProxy = createTerminalFrontProxy({
+      resolvePort: sessionId => sessionId === 'remote-session' ? workerPort : undefined,
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const owner = createServer((req, res) => {
+      ownerRequestHeaders.push(req.headers);
+      const url = new URL(req.url ?? '/', 'http://owner');
+      if (!ownerProxy.handleHttp(req, res, url)) res.writeHead(404).end();
+    });
+    owner.on('upgrade', (req, socket, head) => {
+      ownerRequestHeaders.push(req.headers);
+      if (!ownerProxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const ownerPort = await listen(owner);
+    const edgeProxy = createTerminalFrontProxy({
+      resolvePort: () => undefined,
+      resolveRemoteTarget: async () => ({ host: '127.0.0.1', port: ownerPort }),
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const edge = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://edge');
+      if (!edgeProxy.handleHttp(req, res, url)) res.writeHead(404).end();
+    });
+    edge.on('upgrade', (req, socket, head) => {
+      if (!edgeProxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const edgePort = await listen(edge);
+    let client: Socket | undefined;
+    try {
+      const url = `http://127.0.0.1:${edgePort}/s/remote-session/?viewToken=card-view`;
+      const response = await fetch(url, {
+        headers: {
+          authorization: 'Bearer must-not-cross-pods',
+          cookie: 'botmux_session=must-not-cross-pods',
+          'x-forwarded-for': '203.0.113.10',
+        },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('owner-terminal');
+      expect(ownerRequestHeaders[0]?.authorization).toBeUndefined();
+      expect(ownerRequestHeaders[0]?.cookie).toBeUndefined();
+      expect(ownerRequestHeaders[0]?.['x-forwarded-for']).toBeUndefined();
+      expect(ownerRequestHeaders[0]?.['x-botmux-terminal-route-hop']).toBe('1');
+
+      client = connect(edgePort, '127.0.0.1');
+      const upgraded = new Promise<string>((resolve, reject) => {
+        let raw = '';
+        client!.on('data', chunk => {
+          raw += chunk.toString();
+          if (raw.includes('101 Switching Protocols')) resolve(raw);
+        });
+        client!.on('error', reject);
+        setTimeout(() => reject(new Error(`no remote 101 upgrade\n${raw}`)), 4_000).unref();
+      });
+      client.write(
+        'GET /s/remote-session/?viewToken=card-view HTTP/1.1\r\nHost: edge\r\n'
+        + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+      );
+      await upgraded;
+    } finally {
+      client?.destroy();
+      edge.closeAllConnections?.();
+      owner.closeAllConnections?.();
+      worker.closeAllConnections?.();
+      await close(edge);
+      await close(owner);
+      await close(worker);
+    }
+  });
+
+  it('never follows a peer-routed terminal request a second time', async () => {
+    let remoteResolutions = 0;
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => undefined,
+      resolveRemoteTarget: async () => {
+        remoteResolutions += 1;
+        return { host: '127.0.0.1', port: 65535 };
+      },
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const front = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://front');
+      if (!proxy.handleHttp(req, res, url)) res.writeHead(404).end();
+    });
+    const frontPort = await listen(front);
+    try {
+      const response = await fetch(`http://127.0.0.1:${frontPort}/s/s1/?viewToken=card`, {
+        headers: { 'x-botmux-terminal-route-hop': '1' },
+      });
+      expect(response.status).toBe(404);
+      expect(remoteResolutions).toBe(0);
+    } finally {
+      await close(front);
+    }
+  });
+
   it('attaches a client error handler synchronously on early failure paths', () => {
     const proxy = createTerminalFrontProxy({
       resolvePort: () => undefined,

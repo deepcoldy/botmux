@@ -4,6 +4,7 @@ import {
   type IncomingMessage,
   type RequestOptions,
 } from 'node:http';
+import { isIP } from 'node:net';
 
 /** Literal-only loopback target primitives shared by the terminal and session
  * preview reverse proxies. Keeping DNS names out of this module makes it
@@ -29,6 +30,20 @@ export function requestLiteralLoopback(
   callback?: (response: IncomingMessage) => void,
 ): ClientRequest {
   if (!isLiteralLoopbackHost(target.host)) throw new Error('remote_host_forbidden');
+  if (!isTcpPort(target.port)) throw new Error('invalid_port');
+  return httpRequest({ ...options, host: target.host, port: target.port }, callback);
+}
+
+/** Runtime-checked HTTP/WS dial for a control-plane-discovered peer Pod.
+ * Hostnames stay forbidden so a poisoned shared route can never become a DNS
+ * rebinding SSRF primitive. Callers must additionally authenticate/fence the
+ * route record before it reaches this boundary. */
+export function requestLiteralIp(
+  target: { host: string; port: number },
+  options: Omit<RequestOptions, 'host' | 'hostname' | 'port'>,
+  callback?: (response: IncomingMessage) => void,
+): ClientRequest {
+  if (isIP(target.host) === 0) throw new Error('non_literal_ip_forbidden');
   if (!isTcpPort(target.port)) throw new Error('invalid_port');
   return httpRequest({ ...options, host: target.host, port: target.port }, callback);
 }

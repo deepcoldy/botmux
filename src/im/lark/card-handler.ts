@@ -3962,8 +3962,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
+      const requestedDisplayMode: DisplayMode | undefined =
+        value?.target_display_mode === 'hidden' || value?.target_display_mode === 'screenshot'
+          ? value.target_display_mode
+          : undefined;
       const nextMode = (current: DisplayMode): DisplayMode =>
-        current === 'hidden' ? 'screenshot' : 'hidden';
+        requestedDisplayMode ?? (current === 'hidden' ? 'screenshot' : 'hidden');
 
       if (needsPatchContractMigration) {
         const legacyMessageId = cardMessageId
