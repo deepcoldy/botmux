@@ -61,7 +61,7 @@ describe('Pi initial prompt @file delivery', () => {
     try {
       // Lark renders `@Bot do X` as leading text; Pi would parse that as
       // `pi "{@}Bot do X"` and exit with `File not found` before any turn ran.
-      const prompt = '@韩毅-Bot 前面这个消息也没出发';
+      const prompt = '@Bot 前面这个消息也没出发';
       expect(piInitialPromptNeedsFile(prompt)).toBe(true);
 
       const result = preparePiInitialPromptArg({
@@ -79,10 +79,37 @@ describe('Pi initial prompt @file delivery', () => {
     }
   });
 
-  it('treats leading whitespace before @ the same as a leading @', () => {
+  it('writes a short first prompt that starts with - to @file so Pi does not treat it as an option', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // Pi parses a positional starting with `-` as an option: `pi "- do X"`
+      // exits with `Unknown option: - do X` before any turn ran.
+      const prompt = '- 帮我看看这个报错';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-dash',
+        sessionDataDir: dataDir,
+      });
+
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(result.initialPromptArg).not.toBe(prompt);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats leading whitespace before @ or - the same as the bare prefix, without widening to mid-text occurrences', () => {
     expect(piInitialPromptNeedsFile('  @bot hi')).toBe(true);
     expect(piInitialPromptNeedsFile('\n@bot hi')).toBe(true);
     expect(piInitialPromptNeedsFile('你好 @bot hi')).toBe(false);
+    expect(piInitialPromptNeedsFile('- 帮我看看这个报错')).toBe(true);
+    expect(piInitialPromptNeedsFile('  - 帮我看看这个报错')).toBe(true);
+    expect(piInitialPromptNeedsFile('--- a/x')).toBe(true);
+    expect(piInitialPromptNeedsFile('你好 - 帮我看看这个报错')).toBe(false);
     expect(piInitialPromptNeedsFile(undefined)).toBe(false);
   });
 
