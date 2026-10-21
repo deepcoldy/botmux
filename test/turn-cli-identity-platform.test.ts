@@ -37,7 +37,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
-const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+const { __setPlatformCredentialDepsForTest, noteInboundSenderUnionId, noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -230,6 +230,67 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), undefined);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(grantCalls).toHaveLength(0);
+  });
+});
+
+describe('union id learned from the inbound event', () => {
+  // The contact API answers only for people inside the bot app's contact range
+  // (41050 otherwise); every message event carries the sender's union_id anyway.
+  const inbound = (openId: string, unionId: string, senderType = 'user') =>
+    ({ sender: { sender_type: senderType, sender_id: { open_id: openId, union_id: unionId } } });
+  let contactLookups: string[];
+  beforeEach(() => {
+    contactLookups = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => (bound ? BINDING : null),
+      resolveUnionId: async (_app, openId) => { contactLookups.push(openId); return null; },
+      requestGrant: async (req) => { grantCalls.push(req); return typeof grantResponse === 'function' ? grantResponse(req) : grantResponse; },
+    });
+  });
+
+  it('a sender outside the contact range still gets their platform grant', async () => {
+    grantResponse = granted('lark-cli');
+    noteInboundSenderUnionId(APP, inbound(ALICE, 'on_alice'));
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('user');
+    expect(grantCalls[0]).toMatchObject({ tool: 'lark-cli', unionId: 'on_alice' });
+    expect(contactLookups).toHaveLength(0);
+  });
+
+  it('without an event the contact lookup is still the fallback, and its failure stays unavailable', async () => {
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(contactLookups).toEqual([ALICE]);
+    expect(grantCalls).toHaveLength(0);
+  });
+
+  it('ignores bot senders and malformed ids', async () => {
+    noteInboundSenderUnionId(APP, inbound(ALICE, 'on_alice', 'app'));
+    noteInboundSenderUnionId(APP, inbound(ALICE, '../on_alice'));
+    noteInboundSenderUnionId(APP, inbound('not-an-open-id', 'on_alice'));
+    noteInboundSenderUnionId(APP, inbound(ALICE, ALICE)); // an open_id is never a union_id
+    noteSenderUnionId(APP, ALICE, 'ou_someone');
+    noteInboundSenderUnionId(APP, null);
+    noteInboundSenderUnionId(APP, { sender: { sender_type: 'user' } });
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(grantCalls).toHaveLength(0);
+  });
+
+  it('is scoped to the app that received the event (open_id is app-scoped)', async () => {
+    noteInboundSenderUnionId('cli_other_bot', inbound(ALICE, 'on_someone_else'));
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(grantCalls).toHaveLength(0);
+  });
+
+  it('a pair from a trusted host record (scheduled run) seeds the same way', async () => {
+    grantResponse = granted('bytedcli');
+    noteSenderUnionId(APP, ALICE, 'on_alice');
+    const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE);
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
+    expect(grantCalls[0]).toMatchObject({ tool: 'bytedcli', unionId: 'on_alice' });
+    expect(contactLookups).toHaveLength(0);
   });
 });
 

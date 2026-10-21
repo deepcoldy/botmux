@@ -213,6 +213,7 @@ import {
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
@@ -8350,10 +8351,15 @@ describe('im.message.receive_v1 — p2p from a non-allowed user (grantRequestToO
     const [, replyTo, ack] = mockReplyMessage.mock.calls[0] as any[];
     expect(replyTo).toBe('msg-dm-stranger-1');
     expect(ack).not.toContain(OWNER);
-    // pending 已开：同一人继续发不会重复发卡
+    // pending 已开：同一人继续发不会重复发卡，只回一句「还在等确认」
     await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-2'));
     await flushEventWork();
     expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+    expect((mockReplyMessage.mock.calls[1] as any[]).slice(1, 3)).toEqual([
+      'msg-dm-stranger-2',
+      t('card.grant.request_still_pending', undefined, localeForBot(MY_APP_ID)),
+    ]);
   });
 
   it('autoGrantRequestCards=false wins over grantRequestToOwnerDm (silent drop)', async () => {
@@ -8382,6 +8388,75 @@ describe('im.message.receive_v1 — p2p from a non-allowed user (grantRequestToO
     await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-retry'));
     await flushEventWork();
     expect(mockSendUserMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('im.message.receive_v1 — blocked @ while the grant request card is pending', () => {
+  const OWNER = 'ou_owner_group';
+  const STRANGER = 'ou_stranger_group';
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockReset().mockResolvedValue('msg-id');
+    mockGetOwnerOpenId.mockReset().mockReturnValue(OWNER);
+    mockGetUserProfile.mockReset().mockResolvedValue({ name: '访客甲' });
+    mockGetCachedChatMode.mockReset().mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockResolveSiblingBot.mockReset().mockResolvedValue({ ok: false, reason: 'default_no_sibling' });
+    mockReadFileSync.mockReturnValue('{}');
+    setupBotState({ allowedUsers: [OWNER] });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  const mention = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
+  const replyShapes = () => mockReplyMessage.mock.calls.map((c: any[]) => [c[1], c[3] ?? 'text']);
+
+  it('human: first @ sends the card, the next @ gets one reminder, nothing reaches a session', async () => {
+    for (const id of ['om_stranger_1', 'om_stranger_2', 'om_stranger_3']) {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: STRANGER,
+        content: JSON.stringify({ text: '@_bot_a 帮忙查一下' }),
+        messageId: id,
+        chatId: 'oc_group_pending',
+        chatType: 'group',
+        rootId: 'om_topic_root',
+        mentions: mention,
+      }));
+      await flushEventWork();
+    }
+
+    expect(replyShapes()).toEqual([
+      ['om_stranger_1', 'interactive'],
+      ['om_stranger_2', 'text'],
+    ]);
+    expect((mockReplyMessage.mock.calls[1] as any[])[2])
+      .toBe(t('card.grant.request_still_pending', undefined, localeForBot(MY_APP_ID)));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('external bot: card once, then silent (bots get no reminder replies)', async () => {
+    for (const id of ['om_bot_1', 'om_bot_2']) {
+      await capturedHandlers['im.message.receive_v1'](makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+        content: JSON.stringify({ text: '@_bot_a 帮忙查一下' }),
+        messageId: id,
+        chatId: 'oc_group_pending',
+        rootId: 'om_topic_root',
+        mentions: mention,
+      }));
+      await flushEventWork();
+    }
+
+    expect(replyShapes()).toEqual([['om_bot_1', 'interactive']]);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });
 

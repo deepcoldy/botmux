@@ -65,6 +65,11 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     // The pid-probed id must come from traex's own (segment-aware) parser.
     // A resumed-segment rollout (#1854): the codex parser cannot read it, so
     // persisting through it silently dropped the session id on pid-probe adopt.
+    // This assertion is the load-bearing guard for the intentionally strict,
+    // zero-production-caller codexSessionIdFromRolloutPath — see its doc block
+    // in src/services/codex-transcript.ts for why it must not be deleted or
+    // relaxed (the same shape is a Codex generation, read only via
+    // codexGenerationSessionIdFromRolloutPath on Codex-scoped paths).
     const sid = '00000000-0000-7000-8000-000000000001';
     const segmented = `/h/.trae/sessions/2026/10/14/rollout-2026-10-14T08-00-00-${sid}_00000000-0000-7000-8000-000000000099.jsonl`;
     expect(codexSessionIdFromRolloutPath(segmented)).toBeUndefined();

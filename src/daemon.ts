@@ -489,6 +489,7 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
+import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -802,6 +803,7 @@ import {
   registerAsk as registerAskBroker,
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
+  startHookAskReclaim,
   findPendingAskByAnchor,
   listPendingAsksByAnchor,
   askAnswerActorFor,
@@ -4124,6 +4126,9 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     && caller.requestUserOpenId
     && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId, caller.requestUserUnionId)
     ? caller.requestUserOpenId : undefined;
+  // A scheduled run has no inbound event to learn the union_id from; the host
+  // authority recorded it when the task was created by that same person.
+  if (senderOpenId) noteSenderUnionId(ds.larkAppId, senderOpenId, caller?.requestUserUnionId);
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
@@ -23448,6 +23453,10 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
 }
 
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
+  // Before any turn identity is published: the platform credential path keys on
+  // union_id, and the event is the only source that works for senders outside
+  // the bot app's contact range. Synchronous, so admission timing is unchanged.
+  noteInboundSenderUnionId(ctx.larkAppId, data);
   if (handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
@@ -25845,6 +25854,7 @@ async function handleThreadReplyAdmitted(
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+  noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
@@ -26228,6 +26238,8 @@ async function handleThreadReplyAdmitted(
   // 'unauthorized'，这里 fall through 到正常路由。卡片由 broker.onSettle 自动 PATCH。
   // 「哪些消息算纯文字答复」收口在 askCustomReplyCandidate（含带资源消息与 grill
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
+  // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
+  // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
   const askCandidate = askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
@@ -31369,6 +31381,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // mutations delegate to this daemon.  Release those queued IPC calls only
   // after every durable owner is visible in the canonical registry.
   markIpcReady();
+  // Restored `botmux ask` hook asks: their hooks' re-POSTs were held at the
+  // ready gate until now. Any hook that doesn't re-attach within the grace is
+  // gone with its CLI, so its ask is invalidated instead of lingering to
+  // capture later chat messages as answers.
+  startHookAskReclaim();
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
   if (durableCoordinationRuntime?.mode === 'primary') {

@@ -38,7 +38,7 @@ export interface CommandSpec {
   /** 别名（fallthrough case），含前导 `/`。 */
   readonly aliases?: readonly string[];
   /** 仅指定 CLI 由 daemon 处理；不加入全局命令集合，保留其它 CLI 的透传行为。 */
-  readonly cliId?: string;
+  readonly cliId?: string | readonly string[];
   /**
    * 仅在**无会话**时由 botmux 认领；话题/群里已有会话时按未知命令原样转发给 CLI（保留 CLI
    * 自带同名命令）。同 `cliId` 命令一样不进全局集合：不遮蔽自定义透传、不进 canTalk 名单。
@@ -179,7 +179,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: 'codex-app', sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
   {
     name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
     notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
@@ -205,6 +205,18 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 }
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
+
+/** 一条命令的 **CLI 限定值** 是否匹配当前会话 CLI：字符串精确相等，数组命中其一。
+ *  调用方负责先判空——`cliId === undefined` 是全局命令（不排除任何 CLI），
+ *  语义不是「匹配某 CLI」。路由闸与原生 slash 面板目录共用这一个口径。 */
+export function commandCliIdMatches(
+  specCliId: string | readonly string[],
+  cliId: string | undefined,
+): boolean {
+  return typeof specCliId === 'string'
+    ? specCliId === cliId
+    : specCliId.includes(cliId ?? '');
+}
 
 const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId && !s.claimWithoutSessionOnly);
 

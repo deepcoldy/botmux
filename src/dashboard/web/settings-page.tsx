@@ -4,6 +4,7 @@ import { DropdownMenu, FieldTitle, LoadingState, ToggleRow as BaseToggleRow, dro
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { store } from './store.js';
 import {
   updateResponseNeedsRestart,
@@ -320,6 +321,22 @@ function SettingsPage() {
   const [autostartError, setAutostartError] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
+  // `#/settings?section=<区块 id>&field=<字段标题 i18n key>`（⌘K 全局搜索）：区块要等
+  // /api/settings 回来才渲染，所以在 settings 首次就绪后滚过去并闪烁定位，然后清掉参数。
+  const focusTargetRef = useRef<{ section: string; field: string | null } | null>(null);
+  if (focusTargetRef.current === null && !settings) {
+    const section = hashQueryParam('section');
+    if (section) focusTargetRef.current = { section, field: hashQueryParam('field') };
+  }
+  useEffect(() => {
+    const target = focusTargetRef.current;
+    if (!settings || !target) return;
+    focusTargetRef.current = null;
+    clearHashQueryParam('section');
+    clearHashQueryParam('field');
+    window.requestAnimationFrame(() => focusSettingsTarget(target.section, target.field ? tr(target.field) : null));
+  }, [settings, tr]);
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -1022,7 +1039,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+        <SettingsBlock id="settings-workflow" title={tr('settings.sectionWorkflow')}>
           <ToggleRow
             title={tr('settings.workflowEnable')}
             help={tr('settings.workflowEnableHelp')}
@@ -1033,7 +1050,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionMultiTopic')}>
+        <SettingsBlock id="settings-multi-topic" title={tr('settings.sectionMultiTopic')}>
           <ToggleRow
             title={tr('settings.multiTopicEnable')}
             help={tr('settings.multiTopicEnableHelp')}
@@ -1213,6 +1230,24 @@ function SettingsBody(props: {
       </div>
     </div>
   );
+}
+
+/** 滚到区块（有字段标题时定位到那一行）并闪一下，让人一眼看到落点。 */
+function focusSettingsTarget(sectionId: string, fieldTitle: string | null): void {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  let target: HTMLElement = section;
+  if (fieldTitle) {
+    const title = [...section.querySelectorAll<HTMLElement>('.ui-field-title-text')]
+      .find(el => el.textContent?.trim() === fieldTitle);
+    const row = title?.closest<HTMLElement>('.toggle-row, .settings-field-row, .settings-subfield') ?? title;
+    if (row) target = row;
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: target === section ? 'start' : 'center' });
+  target.classList.remove('settings-search-flash');
+  void target.offsetWidth;
+  target.classList.add('settings-search-flash');
+  window.setTimeout(() => target.classList.remove('settings-search-flash'), 2_400);
 }
 
 function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
@@ -2058,7 +2093,7 @@ function AutostartCard(props: {
     content = null;
   }
 
-  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
+  return <SettingsBlock id="settings-autostart" title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
 function UpdateCard(props: {

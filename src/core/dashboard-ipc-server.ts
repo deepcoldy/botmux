@@ -470,6 +470,7 @@ import { refreshSessionIdentity } from './cli-identity.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
+import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES,
@@ -3097,15 +3098,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!user || user.type !== 'user' || user.openId !== sender) {
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
-  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
+  // The bot application's own grant first (the owner keeps its wider scopes);
+  // anyone else can only get credentials through the platform, since a bot
+  // app's availability range normally excludes them.
+  const resolved = await resolveBoundLarkUserCredential({
+    bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
+    botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
+  });
   if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
     || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
-  if (!token) return jsonRes(res, 403, { ok: false, error: delegated
+  if (!resolved.ok && resolved.reason === 'platform') {
+    return jsonRes(res, 403, { ok: false, error: resolved.error, ...(resolved.authorizeUrl ? { authorizeUrl: resolved.authorizeUrl } : {}) });
+  }
+  if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
-  return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
+  return jsonRes(res, 200, {
+    ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,
+    ...(resolved.issuer ? { issuer: resolved.issuer } : {}),
+  });
 });
 
 const sessionAuthRequests = new Map<string, {
@@ -3324,6 +3337,21 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
+    // A person with no grant to this bot's application usually cannot give one
+    // (the app's availability range excludes them); their lark-cli identity
+    // comes from the platform, so send them there instead of a dead link.
+    const platformRedirect = await platformAuthRequestRedirect({
+      bot: cfg, openId: callerOpenId, delegated: !!delegated,
+      botAppToken: openId => resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), openId),
+    });
+    if (platformRedirect) {
+      return jsonRes(res, 409, {
+        ok: false, error: 'platform_authorization_required', message: platformRedirect.error,
+        ...(platformRedirect.authorizeUrl ? { authUrl: platformRedirect.authorizeUrl } : {}),
+      });
+    }
+    // The check above awaited; the turn may have moved on meanwhile.
+    if (!isCurrent()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     // Issuance is turn-bound; an accepted grant belongs to this app/user and
     // session until its own deadline. A different speaker cannot claim it.
     const appId = cfg.larkAppId;
@@ -9227,7 +9255,7 @@ botConfigPutRoute<{ startupCommands?: unknown }>('/api/bot-startup-commands', 's
 });
 
 // Per-bot 透传 slash 命令 customPassthroughCommands。Body `{ customPassthroughCommands: string }`
-// （原始文本，逗号/空格分隔；空白＝清除→回仅内置白名单）。走 stringList 的
+// （原始文本，逗号/换行或“空格+/”分隔，名字内空格归一为连字符；空白＝清除→回仅内置白名单）。走 stringList 的
 // coerceConfigValue（用字段自带 parseList，与 /botconfig 同口径）+ applyConfigField
 // （写盘 + 内存热更新），immediate 生效。回包 space-joined 供输入框回填。
 botConfigPutRoute<{ customPassthroughCommands?: unknown }>('/api/bot-custom-passthrough', 'customPassthroughCommands', {

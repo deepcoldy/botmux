@@ -161,7 +161,7 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   acceptVcMeetingDelivery,
@@ -3005,6 +3005,138 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_original_bot></at>');
   });
 
+  describe('zero-injection reply that names a peer bot in prose', () => {
+    // A zero-injection CLI cannot pass --mention; the daemon renders its final
+    // reply. A Pi bot wrote "@Dev(Claude) 请执行合并" for a turn a human started,
+    // and the card @-ed that human while the named bot never woke up.
+    function seedPeerBots(): void {
+      writeFileSync(join(config.session.dataDir, 'bots-info.json'), JSON.stringify([
+        { larkAppId: 'app_test', botName: 'Reviewer(pi)', cliId: 'pi', botOpenId: 'ou_bot' },
+        { larkAppId: 'cli_claude', botName: 'Dev(Claude)', cliId: 'claude-code', botOpenId: 'ou_claude_selfview' },
+        { larkAppId: 'cli_codex', botName: 'Dev(codex)', cliId: 'codex', botOpenId: 'ou_codex_selfview' },
+        { larkAppId: 'cli_unseen', botName: 'Other(pi)', cliId: 'pi', botOpenId: 'ou_unseen_selfview' },
+      ]));
+      // Open_ids as THIS app sees the peers; the self-view ids above are the wrong scope.
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({
+        'Dev(Claude)': 'ou_claude_here',
+        'Dev(codex)': 'ou_codex_here',
+      }));
+    }
+
+    function zeroPromptDs(initiator: { openId: string; isBot: boolean }): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliId = 'pi';
+      ds.session.promptInjection = 'none';
+      ds.session.turnReplyContexts = { 'turn-1': {
+        target: { mode: 'thread', rootMessageId: 'om_root' },
+        replyTargetSenderOpenId: initiator.openId, replyTargetSenderIsBot: initiator.isBot,
+      } };
+      return ds;
+    }
+
+    async function deliver(ds: DaemonSession, content: string, extra: Partial<Extract<WorkerToDaemon, { type: 'final_output' }>> = {}) {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content, ...extra }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      return { card: String(sessionReply.mock.calls[0][1]), onZeroPromptFinal };
+    }
+
+    const ats = (card: string) => [...card.matchAll(/<at id=([^>]+)><\/at>/g)].map(m => m[1]);
+
+    it('@s the named bot where it is written instead of the human who started the turn', async () => {
+      seedPeerBots();
+      const content = '复审结论：可合。\n\n@Dev(Claude) 请按合码人口径执行合并。';
+      const { card, onZeroPromptFinal } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), content);
+      expect(card).toContain('<at id=ou_claude_here></at> 请按合码人口径执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      // The automatic dispatch report still carries the model's own text.
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ content }));
+    });
+
+    it('still resolves the named bot when bots-info.json carries malformed rows', async () => {
+      seedPeerBots();
+      const path = join(config.session.dataDir, 'bots-info.json');
+      writeFileSync(path, JSON.stringify([
+        null,
+        { larkAppId: 'cli_bad', botName: 42 },
+        { larkAppId: 'cli_bad_cli', botName: 'Bad(cli)', cliId: 42 },
+        ...JSON.parse(readFileSync(path, 'utf8')),
+      ]));
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), '@Dev(Claude) 请执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+    });
+
+    it('keeps a bot initiator known only from the cross-ref when bots-info.json carries a null row', async () => {
+      seedPeerBots();
+      const path = join(config.session.dataDir, 'bots-info.json');
+      writeFileSync(path, JSON.stringify([null, ...JSON.parse(readFileSync(path, 'utf8'))]));
+      const ds = zeroPromptDs({ openId: 'ou_claude_here', isBot: true });
+      // No recorded bot flag: whether the initiator is a bot comes from the cross-ref alone.
+      delete ds.session.turnReplyContexts!['turn-1'].replyTargetSenderIsBot;
+      const { card } = await deliver(ds, '@Dev(codex) 你那条也核实了');
+      expect(ats(card).sort()).toEqual(['ou_claude_here', 'ou_codex_here']);
+    });
+
+    it('@s nobody rather than the human when the named bot cannot be resolved', async () => {
+      seedPeerBots();
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), '@Other(pi) 请执行合并');
+      expect(card).toContain('@Other(pi) 请执行合并');
+      expect(ats(card)).toEqual([]);
+    });
+
+    it('keeps the @ of a bot initiator alongside the bot the reply names', async () => {
+      seedPeerBots();
+      const { card, onZeroPromptFinal } = await deliver(
+        zeroPromptDs({ openId: 'ou_claude_here', isBot: true }), '复审通过。@Dev(codex) 你那条也核实了');
+      expect(card).toContain('<at id=ou_codex_here></at> 你那条也核实了');
+      expect(ats(card).sort()).toEqual(['ou_claude_here', 'ou_codex_here']);
+      // The initiating bot still receives the result through its @, not a second HTTP report.
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+    });
+
+    it('@s a bot initiator named in the reply only once', async () => {
+      seedPeerBots();
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_claude_here', isBot: true }), '@Dev(Claude) 复审通过');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      expect(card).toContain('<at id=ou_claude_here></at> 复审通过');
+    });
+
+    it('leaves replies that name no peer bot exactly as before', async () => {
+      seedPeerBots();
+      const content = '示例 `@Dev(Claude)`，我是 @Reviewer(pi)，邮件 a@Dev(Claude)';
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), content);
+      expect(ats(card)).toEqual(['ou_human']);
+    });
+
+    it('keeps the requester-only feedback control when the reply is addressed to a bot', async () => {
+      seedPeerBots();
+      const ds = zeroPromptDs({ openId: 'ou_human', isBot: false });
+      ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+      const { card } = await deliver(ds, '@Dev(Claude) 请执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      expect(card).toContain('botmux_feedback');
+    });
+
+    it('does not change failed turns, private chats or ordinary sessions', async () => {
+      seedPeerBots();
+      const failed = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }),
+        '⚠️ 执行失败 @Dev(Claude)', { turnFailed: true });
+      expect(ats(failed.card)).toEqual(['ou_human']);
+
+      const p2p = zeroPromptDs({ openId: 'ou_human', isBot: false });
+      p2p.chatType = 'p2p';
+      expect(ats((await deliver(p2p, '@Dev(Claude) 请执行合并')).card)).toEqual(['ou_human']);
+
+      const ordinary = makeDs();
+      ordinary.session.ownerOpenId = 'ou_owner';
+      expect(ats((await deliver(ordinary, '@Dev(Claude) 请执行合并')).card)).toEqual(['ou_owner']);
+    });
+  });
+
   it('addresses Mira daemon fallback output back to the bot dispatcher', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -3189,6 +3321,29 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(2000);
       expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
       expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('does not @ the dispatcher even when the zero-prompt reply names it', async () => {
+      await bindTopicToDispatcher();
+      writeFileSync(join(config.session.dataDir, 'bots-info.json'), JSON.stringify([
+        { larkAppId: 'cli_orchestrator', botName: 'Orchestrator', cliId: 'claude-code', botOpenId: 'ou_orch_selfview' },
+      ]));
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({ Orchestrator: 'ou_dispatcher_bot' }));
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '@Orchestrator 做完了' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: '@Orchestrator 做完了', dispatchRoot: 'om_root' });
     });
 
     it('falls back to the bot admin for a failed zero-prompt turn in a dispatched topic', async () => {

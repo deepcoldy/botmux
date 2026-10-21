@@ -140,6 +140,9 @@ function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
     || !!ds.tuiPromptProcessing
     || !!ds.agentAttention
     || !!ds.usageLimit
+    // Background tasks still running die with the CLI (same guard as the
+    // cap / TTL / admission candidates in suspendableIdleCandidates).
+    || (ds.backgroundTaskCount ?? 0) > 0
     || (ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0
     || !!ds.pendingSuspendReason
     || ds.pendingSuspendGeneration !== undefined
@@ -319,7 +322,8 @@ export function sweepIdleWorkersByAgeAfterTurnDrain(
  *    observe/bridge session into a normal botmux session on resume), and
  *  - its backend survives a kill + cold resume (tmux/herdr/zellij/zmx only;
  *    pty/riff/mojo are skipped), and
- *  - it is currently idle (never cut off an in-flight reply).
+ *  - it is currently idle (never cut off an in-flight reply), and
+ *  - no background task it launched is still running.
  * Ordered least-recently-messaged first so all policies evict LRU.
  */
 function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
@@ -337,6 +341,11 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
     // Correctness guard (not a timeout): never suspend a session that is
     // currently producing output — that would cut off an in-flight reply.
     .filter(ds => ds.lastScreenStatus === 'idle')
+    // Same guard for work the turn left running: a CI monitor or test run in
+    // the background (the card's 「后台子任务运行中（N）」) dies with the CLI and
+    // a cold resume cannot bring it back, so the session would never hear its
+    // result. Such a session counts as busy until the task stops.
+    .filter(ds => !(ds.backgroundTaskCount && ds.backgroundTaskCount > 0))
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 }
 
@@ -395,8 +404,9 @@ function suspendAutomaticCandidate(
  *
  * The count policy deliberately has NO idle-time threshold: while resources
  * allow, an old session is never timed out by the cap. A session mid-turn
- * (`lastScreenStatus !== 'idle'`) is never suspended. If every over-cap session
- * is busy, none are count-suspended this round and the next sweep retries.
+ * (`lastScreenStatus !== 'idle'`), or one whose background tasks still run, is
+ * never suspended. If every over-cap session is busy, none are count-suspended
+ * this round and the next sweep retries.
  */
 export function sweepIdleWorkers(
   activeSessions: Map<string, DaemonSession>,

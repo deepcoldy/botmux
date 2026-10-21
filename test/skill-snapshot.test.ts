@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  __testOnly_snapshotNofollowFlags,
   __testOnly_setSnapshotRaceHook,
   defaultSkillSnapshotTrust,
   plausibleConfiguredBotmuxHome,
@@ -88,6 +89,10 @@ describe('session skill snapshots (botmux-managed sources only)', () => {
   const store = (name: string) => join(home, '.botmux', 'skills', 'store', name);
   const snapRoot = (sessionId: string) => sessionSkillSnapshotRoot(sessionId, dataDir);
   const snap = (sessionId: string) => realpathSync(snapRoot(sessionId));
+
+  it('uses the macOS all-components no-follow flag without the incompatible final-only flag', () => {
+    expect(__testOnly_snapshotNofollowFlags('darwin')).toBe(0x20000000);
+  });
 
   it('copies exactly the enabled store skills (content, nesting, exec bit) and points the manifest at the snapshot', () => {
     write(join(store('deploy'), 'SKILL.md'), '# Deploy');

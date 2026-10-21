@@ -113,6 +113,7 @@ import {
 import {
   detachWorkerForTransfer,
   updateCodexAppEffort,
+  updateCodexCliEffort,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
@@ -775,5 +776,96 @@ describe('Codex App effort IPC', () => {
     ds.cliReady = false;
     expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
     expect(worker.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('Codex CLI effort IPC', () => {
+  function fixture() {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true, activeReasoningEffort: 'high' });
+    ds.session.cliId = 'codex';
+    ds.session.backendType = 'tmux';
+    ds.session.reasoningEffort = 'high';
+    ds.session.cliLaunchSnapshot = { cliId: 'codex', reasoningEffort: 'high' } as any;
+    ds.initConfig = { cliId: 'codex', backendType: 'tmux', reasoningEffort: 'high' } as any;
+    return { worker, ds };
+  }
+
+  it('persists confirmed future effort without changing the running turn or killing it', async () => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    expect(request).toMatchObject({ type: 'codex_cli_effort', effort: 'max' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only' });
+    expect(ds.session.reasoningEffort).toBe('max');
+    expect(ds.session.cliLaunchSnapshot?.reasoningEffort).toBe('max');
+    expect(ds.initConfig?.reasoningEffort).toBe('max');
+    expect(ds.activeReasoningEffort).toBe('high');
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the saved preference if durable storage rejects the update', async () => {
+    const { worker, ds } = fixture();
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+    expect(ds.session.cliLaunchSnapshot?.reasoningEffort).toBe('high');
+    expect(ds.initConfig?.reasoningEffort).toBe('high');
+    expect(ds.codexCliEffortConfirmed).toBeUndefined();
+  });
+
+  it('allows explicit sandbox off and rejects active sandbox modes before IPC', async () => {
+    const { worker, ds } = fixture();
+    for (const sandbox of [true, 'oncall', 'scratch'] as const) {
+      ds.initConfig!.sandbox = sandbox;
+      expect(await updateCodexCliEffort(ds, 'max')).toMatchObject({ status: 'unavailable' });
+    }
+    expect(worker.send).not.toHaveBeenCalled();
+    ds.initConfig!.sandbox = 'off';
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toMatchObject({ status: 'future_only' });
+  });
+
+  it.each(['workerGeneration', 'cliSessionId'])('rejects a receipt after the session %s changes', async field => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    Object.assign(ds.session, { [field]: field === 'workerGeneration' ? 2 : 'replacement-thread' });
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+  });
+
+  it('rejects stale worker receipts without changing the launch preference', async () => {
+    const { worker, ds } = fixture();
+    const pending = updateCodexCliEffort(ds, 'max');
+    const request = worker.send.mock.calls[0][0];
+    ds.worker = makeFakeWorker();
+    worker.emit('message', { type: 'codex_cli_effort_result', requestId: request.requestId, status: 'future_only', reason: 'cli_next_turn' });
+    expect(await pending).toEqual({ status: 'error' });
+    expect(ds.session.reasoningEffort).toBe('high');
+  });
+
+  it('serializes requests and cancels timed-out menu operations', async () => {
+    vi.useFakeTimers();
+    try {
+      const { worker, ds } = fixture();
+      const pending = updateCodexCliEffort(ds, 'max', 100);
+      expect(await updateCodexCliEffort(ds, 'low')).toMatchObject({ status: 'unavailable' });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await pending).toEqual({ status: 'error' });
+      expect(worker.send.mock.calls.at(-1)[0]).toMatchObject({ type: 'codex_cli_effort_cancel' });
+      expect(ds.session.reasoningEffort).toBe('high');
+      expect(worker.listenerCount('message')).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

@@ -32,6 +32,8 @@ import {
   LARK_CODE_USER_SCOPE_MISSING,
   larkApiError,
   structuredLarkCode,
+  classifyContactErrorCode,
+  type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
@@ -664,22 +666,11 @@ export async function resolveUnionIdFromOpenIdStrict(
 /** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
  *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
  *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时
- *  错误会把合法用户长期钉成「查不到」。 */
-type DefinitiveProfileMiss = 'cross_app' | 'not_visible' | 'invalid_id';
+ *  错误会把合法用户长期钉成「查不到」。分类器在零依赖的 lark-errors.ts，
+ *  body 与 throw 两种返回形状共用同一口径。 */
+type DefinitiveProfileMiss = DefinitiveContactErrorCode;
 const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | DefinitiveProfileMiss>();
 const USER_PROFILE_CACHE_MAX = 1000;
-
-/** Contact API 确定性失败码 → 类别（重试也不会变）：99992361 open_id 属其他
- *  应用；41050 无权限看该用户（不在通讯录可见范围）；41012 user id 无效 /
- *  40001 参数无效。其余非零码（如 40003 internal error）与网络异常视为瞬时。
- *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
- *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
-function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
-  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
-  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
-  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
-  return undefined;
-}
 
 export type UserProfileLookup =
   | { status: 'ok'; profile: { name: string; avatarUrl?: string } }

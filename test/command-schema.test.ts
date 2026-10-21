@@ -62,8 +62,8 @@ describe('command schema ↔ 冻结的 legacy 集合', () => {
     for (const n of all) expect(n).toMatch(/^\/[a-z][a-z0-9-]*$/);
     expect(commandSpec('/G')?.name).toBe('/group');
   });
-  it('/effort 仅为 Codex App 注册，不遮蔽其它 CLI 的透传', () => {
-    expect(commandSpec('/effort')).toMatchObject({ cliId: 'codex-app', sessionPolicy: 'existingOnly' });
+  it('/effort 为 Codex CLI 与 App 注册，不遮蔽其它 CLI 的透传', () => {
+    expect(commandSpec('/effort')).toMatchObject({ cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly' });
     expect(DAEMON_COMMANDS.has('/effort')).toBe(false);
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/effort')).toBe(false);
     expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(true);

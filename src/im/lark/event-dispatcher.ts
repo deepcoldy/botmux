@@ -54,7 +54,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -2331,7 +2331,10 @@ export function canRunDaemonCommand(
 
 /**
  * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
- * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
+ * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
+ * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
+ * 只回一次，见 claimThrottleNotice）；bot 发送方不传，保持静默，免得两个 bot 互相回话。
+ * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
  * p2p 不发卡。开启 grantRequestToOwnerDm 后投递位置见 resolveGrantRequestRoute：会话里有管理员 →
@@ -2342,14 +2345,26 @@ export function canRunDaemonCommand(
  */
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
+  opts?: { notifyThrottledRequester?: boolean },
 ): Promise<void> {
   // 黑名单用户静默：不弹授权申请卡、不开 pending、不触发任何回复（P1c）。
   // 必须在 autoGrantRequestCards / owner / 节流等一切判定之前短路。
   if (requesterOpenId && evaluateTalk(larkAppId, chatId, requesterOpenId).reason === 'blocked') return;
-  if (getBot(larkAppId).config.autoGrantRequestCards === false) return;
+  // 下面两种拦截对申请人是静默的，info 日志是 owner 排查「别人 @ 没反应」的唯一线索。
+  if (getBot(larkAppId).config.autoGrantRequestCards === false) {
+    logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'autoGrantRequestCards is off');
+    return;
+  }
+  if (!requesterOpenId) return;
   const owner = getOwnerOpenId(larkAppId);
-  if (!owner || !requesterOpenId) return;
-  if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  if (!owner) {
+    logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'no resolved admin in allowedUsers');
+    return;
+  }
+  if (isThrottled(larkAppId, chatId, requesterOpenId)) {
+    if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+    return;
+  }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
   const forwardToOwnerDm = getBot(larkAppId).config.grantRequestToOwnerDm === true;
   // 未开转投时 p2p 维持不发卡：卡 reply 回来只会发给申请人自己（按钮又是 owner 专属）且暴露 owner。
@@ -2424,6 +2439,31 @@ export async function maybeSendGrantRequestCard(
   }
   // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
   markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
+}
+
+function logSilentGrantDrop(
+  larkAppId: string, chatId: string, requesterOpenId: string | undefined, reason: string,
+): void {
+  logger.info(`[grant:${larkAppId}] blocked @ from ${requesterOpenId?.substring(0, 12) ?? '?'} in ${chatId.substring(0, 12)}: no request card (${reason})`);
+}
+
+/** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。 */
+async function replyThrottledRequester(
+  larkAppId: string, message: any, chatId: string, requesterOpenId: string,
+): Promise<void> {
+  const notice = claimThrottleNotice(larkAppId, chatId, requesterOpenId);
+  if (!notice) return;
+  const text = t(
+    notice.reason === 'pending' ? 'card.grant.request_still_pending' : 'card.grant.request_recently_denied',
+    undefined,
+    localeForBot(larkAppId),
+  );
+  try {
+    await replyMessage(larkAppId, message.message_id, text);
+  } catch (err) {
+    notice.release();
+    logger.debug(`grant throttle notice failed: ${err}`);
+  }
 }
 
 /** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方撤 pending。 */
@@ -5674,8 +5714,9 @@ export function createLarkEventDispatcherRuntime(
           if (access === 'not_allowed') {
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
+            // 卡已在等处理 / 刚被拒绝时不再发卡，改回申请人一句原因（每张卡一次）。
             if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
             logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
             return;
           }
@@ -5713,10 +5754,11 @@ export function createLarkEventDispatcherRuntime(
         // 私聊被挡默认静默：owner 不在这个 p2p 会话里，把授权申请卡 reply 回来只会发给陌生人
         // 自己（卡上的按钮又是 owner 专属），既不可用又泄露 owner。开了 grantRequestToOwnerDm
         // 才把申请卡转投 owner 自己的私聊（owner 维度节流），申请人只收到一句中性回执，
-        // 授权后重放这条消息；blocked / autoGrantRequestCards=false / 节流中仍静默。
+        // 授权后重放这条消息；blocked / autoGrantRequestCards=false 仍静默，节流中按真人路径
+        // 回一句原因（每张卡一次）。
         if (getBot(larkAppId).config.grantRequestToOwnerDm === true) {
           if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-          await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+          await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
           return;
         }
         logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);

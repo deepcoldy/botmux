@@ -2,8 +2,13 @@
  * card-footer-extension — bots.json `cardFooterExtension`：配置校验、输出解析、
  * 按 bot 缓存的后台刷新（不阻塞、失败沿用、陈旧隐藏），以及卡片渲染与 IPC 规范化。
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { execFileSync, type spawn } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer, connect, type Socket } from 'node:net';
+import { join } from 'node:path';
+import { PassThrough, type Readable } from 'node:stream';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 import {
@@ -12,6 +17,8 @@ import {
   normalizeCardFooterExtension,
   parseCardFooterExtensionOutput,
   runCardFooterExtensionCommand,
+  COMMAND_TIMEOUT_MS,
+  EXIT_DRAIN_MS,
   STALE_MS,
   type CardFooterExtensionRunner,
 } from '../src/services/card-footer-extension.js';
@@ -132,6 +139,42 @@ function killMarker(marker: string): void {
   try { execFileSync('pkill', ['-9', '-f', `${marker}$`], { stdio: 'ignore' }); } catch { /* 无残留 */ }
 }
 
+/** 受控的假子进程：exit 与 stdout 输出谁先到由测试决定（真实进程给不出确定顺序）。 */
+function fakeChild<T extends Readable>(stdout: T) {
+  const child = Object.assign(new EventEmitter(), { pid: undefined, stdout, stderr: null, unref() {} });
+  return Object.assign(child, { spawn: (() => child) as unknown as typeof spawn });
+}
+
+/** 同步占住事件循环：期间不会轮询任何 I/O，也不会跑任何定时器。 */
+function blockEventLoop(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { /* busy-wait */ }
+}
+
+/**
+ * Unix socket 的两端：writer 写入时数据同步进入 reader 的内核接收队列（和管道一样），
+ * reader 要等事件循环轮询 I/O 才读得到。目录放 /tmp 下：sun_path 只有 108 字节，长 TMPDIR 会超。
+ */
+async function unixSocketPair(): Promise<{ reader: Socket; writer: Socket; close: () => void }> {
+  const dir = mkdtempSync('/tmp/cfe-');
+  const path = join(dir, 's');
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(path, resolve));
+  const accepted = once(server, 'connection');
+  const writer = connect(path);
+  const [[reader]] = await Promise.all([accepted, once(writer, 'connect')]) as [[Socket], unknown[]];
+  return {
+    reader,
+    writer,
+    close: () => {
+      writer.destroy();
+      reader.destroy();
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 const hasSetsid = isPosix && (() => {
   try { execFileSync('sh', ['-c', 'command -v setsid'], { stdio: 'ignore' }); return true; }
   catch { return false; }
@@ -196,6 +239,65 @@ describe('runCardFooterExtensionCommand', () => {
       .resolves.toBe('done\n');
     expect(Date.now() - startedAt).toBeLessThan(3_000);
   }, 10_000);
+
+  it('keeps output that is delivered after the exit event', async () => {
+    // Node 文档写明 exit 时 stdio 可能仍开着；两种运行时的 CI 都出现过 exit 先到、输出后到，
+    // 在 exit 当场结算就拿到空串（#2096）。
+    const child = fakeChild(new PassThrough());
+    const result = runCardFooterExtensionCommand('echo done', {}, child.spawn);
+    child.emit('exit', 0, null);
+    child.stdout.end('done\n');
+    expect(await result).toBe('done\n');
+  });
+
+  it.skipIf(!isPosix)('reads output already in the pipe before settling, even when the event loop stalls past the drain cap', async () => {
+    // 逃逸者持着写端（EOF 不来），exit 之后、读到输出之前事件循环又被同步任务卡住超过上限：
+    // 上限到点时输出已在内核缓冲区，必须先轮询一次 I/O 把它读出来再结算。
+    // exit 放在一次 I/O 回调里发（真实的 exit 也是：Bun 靠 pidfd、Node 靠 SIGCHLD 信号管道）：
+    // 两种运行时接下来都先跑到点的定时器、后轮询 I/O；放在 setImmediate 里的话，Bun 会先轮询
+    // I/O，测不出这一步。
+    const { reader, writer, close } = await unixSocketPair();
+    try {
+      const child = fakeChild(reader);
+      const result = runCardFooterExtensionCommand('echo done', {}, child.spawn);
+      writer.once('data', () => {
+        writer.write('done\n');
+        child.emit('exit', 0, null);
+        blockEventLoop(EXIT_DRAIN_MS * 3);
+      });
+      reader.write('go');
+      expect(await result).toBe('done\n');
+    } finally {
+      close();
+    }
+  });
+
+  it('does not turn a successful exit into a timeout while waiting for EOF', async () => {
+    // 命令在超时前一刻正常退出，逃逸者持着写端、EOF 不来：剩下的等待跨过 COMMAND_TIMEOUT_MS 时，
+    // 已经结束的命令不能再被判成超时（超时只管命令本身还在跑）。
+    vi.useFakeTimers();
+    try {
+      const child = fakeChild(new PassThrough());
+      const result = runCardFooterExtensionCommand('echo done', {}, child.spawn);
+      await vi.advanceTimersByTimeAsync(COMMAND_TIMEOUT_MS - EXIT_DRAIN_MS / 2);
+      child.emit('exit', 0, null);
+      child.stdout.write('done\n');
+      await vi.advanceTimersByTimeAsync(EXIT_DRAIN_MS * 2);
+      await expect(result).resolves.toBe('done\n');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still rejects a non-zero exit when stdout reaches EOF first', async () => {
+    // 'end' 先到只说明输出读完了，结论要等 exit：不能把随后的非 0 退出当成功吞掉。
+    const child = fakeChild(new PassThrough());
+    const result = runCardFooterExtensionCommand('echo done', {}, child.spawn);
+    child.stdout.end('done\n');
+    await once(child.stdout, 'end');
+    child.emit('exit', 3, null);
+    await expect(result).rejects.toThrow(/exited with 3/);
+  });
 
   it.skipIf(!isPosix)('an in-flight command does not keep the parent event loop alive', () => {
     // child / 管道 / 定时器任一忘了 unref，父进程都会等到 3s 超时才退出。

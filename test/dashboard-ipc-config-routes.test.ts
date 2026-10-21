@@ -62,6 +62,8 @@ const CASES: readonly Case[] = [
   ['/api/bot-startup-commands', '{"startupCommands":"/effort high, /foo"}', 200, { ok: true, startupCommands: '/effort high\n/foo' }, { startupCommands: ['/effort high', '/foo'] }],
   ['/api/bot-startup-commands', '{"startupCommands":"   "}', 200, { ok: true, startupCommands: '' }, { startupCommands: undefined }],
   ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/a /b"}', 200, { ok: true, customPassthroughCommands: '/a /b' }, { customPassthroughCommands: ['/a', '/b'] }],
+  ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/Ultra Goal"}', 200, { ok: true, customPassthroughCommands: '/ultra-goal' }, { customPassthroughCommands: ['/ultra-goal'] }],
+  ['/api/bot-custom-passthrough', '{"customPassthroughCommands":"/goal ; /export"}', 200, { ok: true, customPassthroughCommands: '/goal /export' }, { customPassthroughCommands: ['/goal', '/export'] }],
   ['/api/bot-custom-passthrough', '{"customPassthroughCommands":""}', 200, { ok: true, customPassthroughCommands: '' }, { customPassthroughCommands: undefined }],
   ['/api/bot-cantalk-daemon-commands', '{"canTalkDaemonCommands":"/status /clear"}', 200, { ok: true, canTalkDaemonCommands: '/status' }, { canTalkDaemonCommands: ['/status'] }],
   ['/api/bot-cantalk-daemon-commands', '{"canTalkDaemonCommands":"nonsense"}', 400, { ok: false, error: 'empty' }],
@@ -283,6 +285,21 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     } finally {
       delete daemon.herdr;
     }
+  });
+
+  it('customPassthroughCommands stays stable on space-joined refill round-trip', async () => {
+    const save = await put('/api/bot-custom-passthrough', JSON.stringify({ customPassthroughCommands: '/Ultra Goal, /export\n/goal /x y' }));
+    expect(save.status).toBe(200);
+    const saved = await save.json() as { customPassthroughCommands: string };
+    expect(saved.customPassthroughCommands).toBe('/ultra-goal /export /goal /x-y');
+    expect(persistedBot().customPassthroughCommands).toEqual(['/ultra-goal', '/export', '/goal', '/x-y']);
+
+    // 输入框用 space-joined 值回填后再次保存：含空格名字已归一为连字符 token，
+    // 每条都以 `/` 开头，按「空格+下一条 /」切分，结果必须与首次落盘完全一致。
+    const resave = await put('/api/bot-custom-passthrough', JSON.stringify({ customPassthroughCommands: saved.customPassthroughCommands }));
+    expect(resave.status).toBe(200);
+    expect(await resave.json()).toMatchObject({ ok: true, customPassthroughCommands: '/ultra-goal /export /goal /x-y' });
+    expect(persistedBot().customPassthroughCommands).toEqual(['/ultra-goal', '/export', '/goal', '/x-y']);
   });
 
   it('never reaches the spec_missing branch: every field key resolves in the config store', async () => {

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -322,6 +322,29 @@ describe('daemon current actor attestation', () => {
       procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
     expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a mid-ancestor stat between peer and trusted root is unreadable', async () => {
+    // Lineage: peer 101 -> 102 -> trusted CLI root 100. The walk must not skip
+    // an unreadable hop to "find" the root above it; the peer's own stat stays
+    // readable so this exercises the in-walk catch, not peer resolution.
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 102, 100, '1200');
+    writeProc(procRoot, 101, 102, '1100');
+    const input = {
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '1100' },
+      findSession: () => activeSession(),
+      procRoot,
+    };
+    // Positive control: the same chain is attested while the hop is readable.
+    expect(resolveDaemonCurrentExecution(input)).toMatchObject({
+      schema: 'botmux.current-execution.v1', status: 'verified', sessionId: 's1', turnId: 'om_turn',
+    });
+    rmSync(join(procRoot, '102', 'stat'), { force: true });
+    expect(resolveDaemonCurrentExecution(input)).toBeNull();
   });
 
   it('rejects a new descendant reached through an old-turn child', async () => {

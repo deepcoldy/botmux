@@ -80,7 +80,7 @@ describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {
   });
 });
 
-describe('Codex App /effort routing', () => {
+describe('Codex App / CLI /effort routing', () => {
   const input: SlashRouteInput = {
     text: '/effort high', context: 'thread', phase: 'none',
     passthrough: new Set(), coldStartPassthrough: new Set(),
@@ -91,8 +91,11 @@ describe('Codex App /effort routing', () => {
     expect(classifySlash({ ...input, context: 'new-topic' })).toEqual(classifySlash(input));
     expect(classifySlash({ ...input, phase: 'running', passthrough: PT })).toEqual(classifySlash(input));
   });
-  it('preserves other CLIs, bot gating, and discussion text', () => {
-    expect(classifySlash({ ...input, cliId: 'codex', passthrough: PT }).kind).toBe('passthrough');
+  it('routes the Codex CLI native-menu lane too, while preserving other CLIs, bot gating, and discussion text', () => {
+    // Codex CLI /effort drives its native model menu (existing sessions only);
+    // the passthrough set must not win over the CLI-scoped daemon registration.
+    expect(classifySlash({ ...input, cliId: 'codex', passthrough: PT }))
+      .toEqual({ kind: 'daemon', cmd: '/effort', content: '/effort high', sessionPolicy: 'existing_only' });
     expect(classifySlash({ ...input, cliId: 'claude-code', passthrough: PT }).kind).toBe('passthrough');
     expect(classifySlash({ ...input, cliId: 'dsh' })).toEqual({ kind: 'forward', reason: 'unknown_slash', cmd: '/effort' });
     expect(classifySlash({ ...input, cliId: undefined })).toEqual({ kind: 'forward', reason: 'unknown_slash', cmd: '/effort' });

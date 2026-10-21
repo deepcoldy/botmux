@@ -170,11 +170,17 @@ step_model_switching = true
 
 未开启时，运行中发送命令仍可保存后续轮次设置，并明确提示当前轮因未开特性而未更新；目标轮次已经结束或不可用时会给出不同提示。只有原生接口返回 `applied` 才确认服务端接受当前轮更新；已经发出的模型请求保持原参数，当前轮也可能没有后续推理步骤。
 
-普通 Codex CLI、Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
+## Codex CLI 会话内调整推理强度
+
+在已有的本地 Codex CLI 会话中发送 `/effort low|medium|high|xhigh|max|ultra`，Botmux 会操作原生 `/model` 菜单，保留当前模型，并以 **session-only** 方式选择档位。成功后保存当前会话的启动设置，回执明确说明 **从下一轮生效，正在执行的这一轮保持原强度**；即使启用了 `step_model_switching`，菜单路径也不会更新当前轮。
+
+此功能支持受 Botmux 管理的本地 PTY / tmux 会话，要求原生菜单提供 `s session` 操作和 `thread_settings_applied` 设置确认记录（已在 Codex 0.162.1 验证）。RPC 输入、远程后端、wrapper、adopt、sandbox/read-isolation 不使用此路径。遇到未发送草稿、其它菜单、输入冲突或无法确认的界面时会拒绝操作；不会清空草稿或重启任务。用户仍可直接使用 `/model` 手动选择。
+
+Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex App 的 `/effort` 例外，见上文）。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 

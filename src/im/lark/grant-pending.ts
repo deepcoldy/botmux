@@ -23,6 +23,7 @@ import { dirname, join } from 'node:path';
 import { config } from '../../config.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { BoundedMap } from '../../utils/bounded-map.js';
 import { errorMessage } from '../../utils/error-message.js';
 import { isJsonObject, readJsonFileSoft } from '../../utils/json-file.js';
 import { logger } from '../../utils/logger.js';
@@ -441,9 +442,9 @@ export function markDenied(larkAppId: string, chatId: string, target: string): b
   return denyPending(larkAppId, chatId, [target]);
 }
 
-/** 入口 A 节流判断：pending 中、或 denied 冷却未过 → true（静默不发卡）。
- *  只需要「要不要发卡」的布尔（对话路径静默丢弃，无需区分原因）；要给用户回话、
- *  需要区分「等 owner 处理」和「已被拒绝」时用 throttleReason。 */
+/** 入口 A 节流判断：pending 中、或 denied 冷却未过 → true（不再发卡）。
+ *  只需要「要不要发卡」的布尔；要给用户回话、需要区分「等 owner 处理」和「已被拒绝」时用
+ *  throttleReason，对话路径给申请人的一次性提示用 claimThrottleNotice。 */
 export function isThrottled(larkAppId: string, chatId: string, target: string): boolean {
   return throttleReason(larkAppId, chatId, target) !== null;
 }
@@ -452,9 +453,9 @@ export function isThrottled(larkAppId: string, chatId: string, target: string): 
  * 节流原因（null = 未节流，可发卡）。
  *
  * 与 isThrottled 的关系：后者是本函数的布尔化封装。拆开是因为两者的**消费方式**不同——
- * 对话路径（maybeSendGrantRequestCard）节流时静默 return，用户看不到任何反馈，所以
- * pending 与 denied 混成一个 true 无害；而 ask 卡片点击必须回一句 toast，混用会在
- * owner **已经拒绝**后仍告诉点击者「等 owner 处理」，把已决事项说成待决（pi review F1）。
+ * 只问「要不要发卡」时 pending 与 denied 混成一个 true 无害；而给人回话（ask 卡片点击的
+ * toast、对话路径的 claimThrottleNotice）必须区分，混用会在 owner **已经拒绝**后仍告诉
+ * 对方「等 owner 处理」，把已决事项说成待决（pi review F1）。
  *
  * 顺带回收无效条目（与旧 isThrottled 行为一致，不能丢）：废弃的 pending 过 24h、
  * 冷却已过的 denied，都即时删除，让同一发送方能重新申请。磁盘上的同一条加载时会按
@@ -476,6 +477,39 @@ export function throttleReason(
   if (!isExpired(e, Date.now())) return e.state;
   map.delete(k);
   return null;
+}
+
+/** 已就某个节流状态提示过申请人的记录：(bot, chat:target) → 状态实例（pending 按 nonce，
+ *  denied 按拒绝时刻）。纯内存：重启后同一状态最多再提示一次，无害；有上限，不随申请人数无限增长。 */
+const throttleNoticeMarks = new BoundedMap<string, string>(2000);
+
+/**
+ * 申请人在节流期间又来找 bot 时，要不要回一句「为什么没反应」——同一张申请卡（nonce）/ 同一次
+ * 拒绝只返回一次原因，其余返回 null（继续静默）。提示没发出去时调返回的 release 退还，下次再提示；
+ * release 只撤自己这次记下的标记，期间换了新卡 / 新拒绝写下的标记不受影响。
+ *
+ * pending 只认**已确认送达**的卡：卡还在发的途中就说「在等管理员处理」，发卡失败撤掉 pending 后
+ * 这句话就是错的。
+ */
+export function claimThrottleNotice(
+  larkAppId: string,
+  chatId: string,
+  target: string,
+): { reason: 'pending' | 'denied'; release: () => void } | null {
+  const reason = throttleReason(larkAppId, chatId, target);
+  if (!reason) return null;
+  const e = tableFor(larkAppId).get(key(chatId, target));
+  if (!e || (e.state === 'pending' && e.delivered !== true)) return null;
+  const mark = e.state === 'pending' ? `pending:${e.nonce}` : `denied:${e.ts}`;
+  const markKey = `${larkAppId}:${key(chatId, target)}`;
+  if (throttleNoticeMarks.get(markKey) === mark) return null;
+  throttleNoticeMarks.set(markKey, mark);
+  return {
+    reason,
+    release: () => {
+      if (throttleNoticeMarks.get(markKey) === mark) throttleNoticeMarks.delete(markKey);
+    },
+  };
 }
 
 /** owner 维度节流：转投 owner 私聊的申请卡，每个 (bot, owner) 滑动窗口内最多发这么多张。
@@ -522,6 +556,7 @@ export function _simulateRestartForTest(): void {
   tables.clear();
   unrevokedOnDisk.clear();
   ownerDmSent.clear();
+  throttleNoticeMarks.clear();
   lastPrunedAt = 0;
 }
 /** 彻底清空：内存 + 当前 dataDir 下的全部落盘文件。 */

@@ -1129,9 +1129,11 @@ export function buildStreamingCard(
       })),
       value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
     }] });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
-      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
-    ) + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '') }] });
+    const effortScope = effortControl.pending && effortControl.nextTurn
+      ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
+      : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
+        + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: effortScope }] });
   }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────

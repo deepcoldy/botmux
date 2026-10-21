@@ -1922,12 +1922,8 @@ function InsightsPage() {
   }, [modal.turnIndex, palette.open]);
 
   useEffect(() => {
+    // ⌘K 归全局搜索（command-palette）；本页的跳转面板只从标题区「跳转」按钮打开。
     const onKey = (event: KeyboardEvent) => {
-      if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
-        event.preventDefault();
-        setPalette(p => p.open ? { open: false, q: '', idx: 0 } : { open: true, q: '', idx: 0, anchor: undefined });
-        return;
-      }
       if (palette.open) {
         if (event.isComposing || event.keyCode === 229) return;
         if (event.key === 'Escape') {

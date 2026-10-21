@@ -61,6 +61,10 @@ export interface PendingCliInput {
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
   taskContinuation?: TaskContinuationDispatchMarker;
+  /** `content` as it was before a restart note was put in front of it (see
+   *  services/restart-interruption.ts). Lets a replay of this input after a
+   *  second restart carry only the newest note. */
+  restartNoteOriginalContent?: string;
 }
 
 /**

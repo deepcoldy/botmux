@@ -62,7 +62,7 @@ import {
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -335,7 +335,6 @@ import {
   knownBotOpenIdsFromCrossRef,
   loadBotMentionIdentityMap,
   orderedFooterRecipients,
-  stripCodeSpans,
 } from './utils/bot-routing.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
@@ -12687,26 +12686,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       // --slash 同理跳过：斜杠命令正文（如 `/clear`）不该被扫成 @，收件人只认
       // 显式 --mention（下面的 slash 分支只用 explicit mentions 拼 <at> 前缀）。
       if (!noMention && !isSlashSend && !customCard && !vcMeetingManagedSendOrigin) {
-      const alreadyMentioned = new Set(mentions.map(m => m.open_id));
-      // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
-      // fenced block (e.g. an example `botmux send --mention @Bot …` or an
-      // explanatory `@Bot`) is not auto-injected as a real handoff — that spurious
-      // <at> would wake a bot the model never meant to @. Explicit --mention still
-      // works (it doesn't go through this prose scan).
-      const textForBotScan = stripCodeSpans(text);
-      // Sort by name length desc so longer names ("Claude分身") win over their
-      // prefix ("Claude") when both could match — break-on-first-hit otherwise
-      // routes "@Claude分身" to Claude.
-      const sortedEntries = [...botEntries].sort(
-        (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
-      );
-      const selfAliases = new Set(
-        botEntries
-          .filter(entry => entry.larkAppId === appId)
-          .flatMap(entry => [entry.botName, entry.cliId])
-          .filter((name): name is string => !!name)
-          .map(name => name.toLowerCase()),
-      );
       // Bots actively in THIS conversation (thread root for thread-scope, chat for
       // chat-scope). Used to gate the type-generic `cliId` alias so prose "@codex"
       // resolves to the codex bot collaborating HERE, not every same-type bot
@@ -12720,42 +12699,20 @@ async function cmdSend(rest: string[]): Promise<void> {
           : (!!s.rootMessageId && sess.rootMessageId === s.rootMessageId);
         if (here) convoBotAppIds.add(sess.larkAppId);
       }
-      for (const entry of sortedEntries) {
-        if (!entry.botName || entry.larkAppId === appId) continue;
-        const names = eligibleAutoMentionAliases({
-          botName: entry.botName,
-          cliId: entry.cliId ?? undefined,
-          larkAppId: entry.larkAppId ?? undefined,
-          selfAliases,
-          convoBotAppIds,
-        });
-        for (const name of names) {
-          const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          // Boundary: lookbehind blocks only ASCII word chars (so `user@Claude`
-          // is rejected but `看看@CoCo` is accepted — CJK prefix is normal in
-          // Chinese text). Lookahead blocks any Unicode letter/digit so
-          // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
-          // either-half-match.
-          const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
-          if (!re.test(textForBotScan)) continue;
-          // Lark open_id is per-app scoped. Use sender-scoped id from cross-ref
-          // only — falling back to entry.botOpenId would feed Lark a wrong-scope
-          // id (target's self-scoped) and the API would reject it. Skip + warn
-          // so the missing cross-ref is observable instead of silently dropped.
-          const senderScopedId = crossRef[entry.botName];
-          if (!senderScopedId) {
-            console.error(`[botmux send] no cross-ref entry for "${entry.botName}" in app ${appId}, skipping auto-mention (cross-ref populates after the sender app first sees the target bot)`);
-            break;
-          }
-          if (alreadyMentioned.has(senderScopedId)) break;
-          // Prose `@OtherBot` auto-injection: inject normally. (The off-topic
-          // sub-bot guard used to DROP this; we now let the model @ freely and
-          // pick the destination with --into instead of being silently dropped.)
-          mentions.push({ open_id: senderScopedId, name: entry.botName });
-          alreadyMentioned.add(senderScopedId);
-          break;
-        }
+      // Code is not scanned, names match as whole words, and only the sender-
+      // scoped cross-ref id is used (see resolveProseBotMentions). A named bot with no
+      // cross-ref entry is skipped with a warning so the gap is observable.
+      // Prose `@OtherBot` injects normally. (The off-topic sub-bot guard used to
+      // DROP this; we now let the model @ freely and pick the destination with
+      // --into instead of being silently dropped.)
+      const prose = resolveProseBotMentions({
+        text, botEntries, crossRef, selfAppId: appId, convoBotAppIds,
+        alreadyMentioned: mentions.map(m => m.open_id),
+      });
+      for (const name of prose.unresolved) {
+        console.error(`[botmux send] no cross-ref entry for "${name}" in app ${appId}, skipping auto-mention (cross-ref populates after the sender app first sees the target bot)`);
       }
+      mentions.push(...prose.mentions);
       }
     } catch { /* best-effort */ }
 

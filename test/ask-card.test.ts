@@ -35,7 +35,7 @@ import {
   normalizeAskOptionLayout,
   setAskOptionLayoutLookup,
 } from '../src/im/lark/ask-option-layout.js';
-import { getDefaultLocale, setDefaultLocale } from '../src/i18n/index.js';
+import { getDefaultLocale, setDefaultLocale, t as tr } from '../src/i18n/index.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
@@ -280,6 +280,25 @@ describe('buildAskCard', () => {
     });
     expect(text).toContain('超时');
   });
+
+  it.each(['claimant_gone', 'answer_undelivered'] as const)(
+    'settled 态（invalidated:%s）：渲染该失效原因的本地化说明，不贴内部 reason、不留按钮',
+    (failureCode) => {
+      const text = buildAskCard(makePending(), {
+        kind: 'invalidated',
+        reason: 'internal reason text',
+        failureCode,
+        selected: null,
+        by: null,
+        comment: null,
+        timedOut: false,
+      });
+      expect(text).toContain(tr('card.ask.invalidated'));
+      expect(text).toContain(tr(`card.ask.invalidated_${failureCode}`));
+      expect(text).not.toContain('internal reason text');
+      expect(text).not.toContain('ask_submit');
+    },
+  );
 
   it('长问题正文（>512 字符）完整渲染，不附加截断标记', () => {
     // 回归：ask 卡片曾对每个 q.prompt 做 512 字符截断（无飞书硬限制依据），

@@ -1857,11 +1857,13 @@ export interface PendingRepoSetup {
 export interface CodexAppEffortResult {
   status: 'applied' | 'future_only' | 'invalid' | 'unavailable' | 'error';
   choices?: string[];
-  reason?: 'step_model_switching_disabled' | 'target_unavailable';
+  reason?: 'step_model_switching_disabled' | 'target_unavailable' | 'cli_next_turn' | 'cli_menu_unavailable';
 }
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
+  | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
+  | { type: 'codex_cli_effort_cancel'; requestId: string }
   | { type: 'codex_app_effort'; requestId: string; effort: string }
   | { type: 'worker_ipc_probe' }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
@@ -2056,6 +2058,7 @@ export interface ModelFallbackState {
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
+  | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'worker_ipc_ready' }
   | ({ type: 'link_ref_register'; requestId: string } & import('./core/link-ref-ipc.js').McpLinkRefRegistrationRequest)
   | ({ type: 'link_ref_resolve'; requestId: string } & import('./core/link-ref-ipc.js').McpHostDeliveryLinkRefRequest)
@@ -2217,7 +2220,8 @@ export type WorkerToDaemon =
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
-       *  otherwise. Display only — no status decision reads it. */
+       *  otherwise. Never changes the reported status; the card shows it and the
+       *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
    * `entries` is the FULL cumulative list so far (not a delta) — each entry

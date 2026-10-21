@@ -3788,14 +3788,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
 
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
-    // 自动补前导 `/`、按 /^\/[a-z0-9][a-z0-9:_-]*$/ 过滤、去重。非法/缺省 → undefined。
+    // 名字内空白按 `-` 连接（/Ultra Goal → /ultra-goal）、自动补前导 `/`、
+    // 按 /^\/[a-z0-9][a-z0-9:_-]*$/ 过滤、去重。非法/缺省 → undefined。
     // 注意：与 daemon 命令的冲突过滤放在 resolvePassthroughCommands（运行时合并）做，
     // 这里只保证条目本身格式合法，避免在解析期耦合 command-handler 的命令清单。
     let customPassthroughCommands: string[] | undefined;
     if (Array.isArray(entry.customPassthroughCommands)) {
       const normalized = entry.customPassthroughCommands
         .filter((x: any): x is string => typeof x === 'string')
-        .map((x: string) => x.trim().toLowerCase())
+        .map((x: string) => x.trim().toLowerCase().replace(/\s+/g, '-'))
         .map((x: string) => (x.startsWith('/') ? x : `/${x}`))
         .filter((x: string) => /^\/[a-z0-9][a-z0-9:_-]*$/.test(x));
       const uniq = [...new Set<string>(normalized)];

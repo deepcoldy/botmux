@@ -14,7 +14,7 @@ import { logger } from '../utils/logger.js';
 import { gateHumanDecisionAttempt } from './human-decision-store.js';
 import {
   askKeyFor,
-  dispatchUuidForKey,
+  dispatchUuidForAsk,
   HANDOFF_RETENTION_MS,
   type AskPersistStore,
   type PersistedAsk,
@@ -35,6 +35,14 @@ import { AskDispatchError } from './ask-types.js';
  *  on restart (no claimant) and a PTY-backend hook doesn't survive, so those
  *  must NOT persist/handoff — else they leave orphan records (codex P1-4). */
 const RESUMABLE_ORIGINS = new Set(['hook']);
+
+/** How long a dormant hook ask waits for its hook to re-attach before the CLI
+ *  is treated as no longer waiting. A live hook re-POSTs with backoff capped at
+ *  5s (cli.ts runHook); after a restart its requests are held behind the IPC
+ *  ready gate, and this clock only starts once that gate opens. So a hook that
+ *  is still there re-attaches within seconds — 60s leaves ≥12 retries of
+ *  headroom on a loaded host. */
+const HOOK_RECLAIM_GRACE_MS = 60_000;
 
 interface InternalPending extends Omit<PendingAsk, 'selections'> {
   /** Stable identity = larkAppId.sessionId.originKind.requestId (see
@@ -78,6 +86,10 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    *  stash + on restore-of-a-stashed-answer; fires at answeredAt + retention to
    *  reap memory + disk together. Cleared when the hook claims the stash. */
   handoffExpiryHandle?: NodeJS.Timeout;
+  /** Reclaim deadline for a dormant hook ask: fires if no hook re-attaches in
+   *  time, invalidating the ask (and any stashed answer nobody can claim).
+   *  Cleared on re-attach or settle. */
+  reclaimHandle?: NodeJS.Timeout;
   /**
    * 按问题序号（questionIndex）累积的勾选 key 集合。
    */
@@ -99,6 +111,13 @@ let persistStore: AskPersistStore | null = null;
  *  or fake-timer gymnastics around the async dispatch loop. */
 let handoffRetentionMs: number = HANDOFF_RETENTION_MS;
 
+/** Effective reclaim grace (tests shrink it via `_setHookReclaimGraceForTest`). */
+let hookReclaimGraceMs: number = HOOK_RECLAIM_GRACE_MS;
+
+/** Restored asks only start their reclaim clock once the daemon can actually
+ *  serve the hook's re-POST (see startHookAskReclaim). */
+let reclaimClockStarted = false;
+
 /** Wire the durable persist store. Called once at daemon bootstrap with the
  *  real dir; tests inject a temp store (and only clean their own sentinel dir). */
 export function setAskPersistStore(store: AskPersistStore | null): void {
@@ -110,6 +129,12 @@ export function setAskPersistStore(store: AskPersistStore | null): void {
  *  default by `_resetForTest`. */
 export function _setHandoffRetentionForTest(ms: number): void {
   handoffRetentionMs = ms;
+}
+
+/** Shrink the dormant-hook reclaim grace — for tests only. Restored to the
+ *  default by `_resetForTest`. */
+export function _setHookReclaimGraceForTest(ms: number): void {
+  hookReclaimGraceMs = ms;
 }
 
 /** Optional actor context for the talk check. Card-click paths (toggle/submit)
@@ -357,8 +382,11 @@ function attachWaiter(
     if (ask.resumable) {
       // Reuse restart handoff semantics: preserve the original deadline and
       // stash any answer until the same authenticated invocation reconnects.
+      // The daemon is up, so a live hook re-POSTs within its backoff; one that
+      // died with its CLI never does — the reclaim deadline invalidates it.
       ask.dormant = true;
       persistFromInternal(ask);
+      armHookReclaim(ask);
     } else {
       settle(ask.askId, disconnectedResult());
     }
@@ -410,7 +438,7 @@ const CARD_DISPATCH_BACKOFF_MS = 500;
 const CARD_DISPATCH_BACKOFF_CAP_MS = 4_000;
 
 /** Dispatch (or idempotently re-dispatch) the card and record its messageId. The
- *  dispatcher gets a stable `dispatchUuid` (derived from the scoped key) so any
+ *  dispatcher gets a stable `dispatchUuid` (scoped key + askId) so any
  *  re-send — a bounded transient retry here, or a restart re-attach — returns the
  *  ORIGINAL message_id instead of posting a duplicate (codex P1-1/P1-3).
  *
@@ -510,6 +538,8 @@ function findByKey(askKey: string): InternalPending | undefined {
  *    absolute deadline; re-send the card if it was never confirmed sent.
  */
 function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<AskResult> {
+  clearTimeout(ask.reclaimHandle); // the hook is back — the CLI is still waiting
+  ask.reclaimHandle = undefined;
   if (ask.answeredResult) {
     const result = ask.answeredResult;
     ask.dormant = false;
@@ -712,6 +742,10 @@ export function submitAsk(args: {
  * 不需要 nonce：调用方（daemon 消息路由）用 `findPendingAskByAnchor` 从在线
  * pending 表按话题 anchor 查到 askId，本身就排除了「重启后的陈旧卡片」场景。
  *
+ * 没有 hook 连着的 dormant hook ask 不收文字（返回 `'stale'`）：此刻没有 CLI 在等
+ * 这个答案，收下只会把一条普通消息存进没人认领的暂存区。调用方据此按普通消息投递。
+ * 卡片按钮不受影响——点击仍可暂存，等重连的 hook 认领。
+ *
  * `actor`：文字作答路径拿得到完整消息事件，把 bot / union context 传进来，让 talk
  * 判定与 dispatcher 外层闸 / quota 复查同源（bot → evaluateBotTalk，人 → evaluateTalk
  * 的 teamMember union 腿）。不传则退化为纯 open_id 判定（与卡片点击一致）。
@@ -728,7 +762,7 @@ export function submitCustomReply(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { by: args.by, actor: args.actor });
   if (gate !== 'ready') return gate;
-  if (!ask) return 'stale';
+  if (!ask || isUnclaimedHookAsk(ask)) return 'stale';
   const text = args.text.trim();
   if (!text) return 'stale';
 
@@ -754,6 +788,9 @@ export function submitCustomReply(args: {
  *
  * 命中多个时返回最先注册的（实践中同一 anchor 同时最多一个 pending ask，因为发起
  * ask 的 CLI 此刻正阻塞等待结果）。返回 snapshot，改它不影响 broker 状态。
+ *
+ * 跳过没有 hook 连着的 dormant hook ask（见 submitCustomReply）：这条文字应按普通
+ * 消息进会话，而不是被当成一张没人在等的问题卡的答案。
  */
 export function findPendingAskByAnchor(args: {
   larkAppId: string;
@@ -761,21 +798,35 @@ export function findPendingAskByAnchor(args: {
   anchor: string;
 }): PendingAsk | undefined {
   for (const ask of pending.values()) {
-    if (ask.settled) continue;
-    if (ask.larkAppId !== args.larkAppId) continue;
-    if (ask.chatId !== args.chatId) continue;
-    const matches =
-      ask.rootMessageId === null ? true : ask.rootMessageId === args.anchor;
-    if (matches) return snapshot(ask);
+    if (!anchorMatches(ask, args)) continue;
+    if (isUnclaimedHookAsk(ask)) {
+      logger.info?.(
+        `ask-broker: ask ${ask.askId} has no hook attached (dormant) — text is not taken as its answer`,
+      );
+      continue;
+    }
+    return snapshot(ask);
   }
   return undefined;
 }
 
 /** Snapshot all live candidates, without changing the legacy first-match API. */
 export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: string; anchor: string }): PendingAsk[] {
-  return [...pending.values()].filter(ask => !ask.settled
-    && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
-    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor)).map(snapshot);
+  return [...pending.values()]
+    .filter(ask => anchorMatches(ask, args) && !isUnclaimedHookAsk(ask))
+    .map(snapshot);
+}
+
+function anchorMatches(ask: InternalPending, args: { larkAppId: string; chatId: string; anchor: string }): boolean {
+  return !ask.settled && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
+    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor);
+}
+
+/** A hook ask whose hook connection is gone: no CLI is blocked on it right now.
+ *  Its only possible consumer is a hook that re-attaches by the same key.
+ *  Host-owned asks are excluded — the daemon itself is their claimant. */
+function isUnclaimedHookAsk(ask: InternalPending): boolean {
+  return ask.dormant === true && RESUMABLE_ORIGINS.has(ask.originKind);
 }
 
 /** A DM answer must quote the exact document card. Never consume unrelated
@@ -861,7 +912,10 @@ export function invalidateAll(reason: string): number {
  * surviving CLI hook reconnects and re-registers (findDormantByKey →
  * reattachDormantAsk installs a fresh resolve). Each dormant ask arms a timer to
  * its ORIGINAL absolute deadline so it can't linger forever if the CLI never
- * comes back. Called once during daemon bootstrap. Returns the count restored.
+ * comes back; hook asks are additionally invalidated if their hook doesn't
+ * re-attach within the reclaim grace once startHookAskReclaim runs. Until then a
+ * dormant hook ask takes card clicks but not free text (findPendingAskByAnchor).
+ * Called once during daemon bootstrap. Returns the count restored.
  *
  * Idempotent-ish: an askKey already present (e.g. re-invoked) is skipped.
  */
@@ -945,6 +999,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // P1-4): a SECOND restart before the hook claims must still reap memory +
     // disk at the ORIGINAL answeredAt + retention, not restart the clock.
     if (hasStashedAnswer) armHandoffExpiry(ask);
+    if (reclaimClockStarted) armHookReclaim(ask);
     restored++;
     logger.info?.(
       `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
@@ -958,6 +1013,80 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     (larkAppId ? ` for ${larkAppId}` : ''),
   );
   return restored;
+}
+
+/**
+ * Start verifying restored hook asks: each must be re-claimed by its hook within
+ * the reclaim grace, or the CLI is no longer waiting and the ask is invalidated
+ * (card → expired). Called by the daemon when its IPC server starts serving —
+ * before that, a live hook's re-POST is held at the ready gate, so starting the
+ * clock at restore time would charge boot time against the hook. Asks restored
+ * after this call arm immediately. Returns how many restored asks were armed.
+ */
+export function startHookAskReclaim(): number {
+  reclaimClockStarted = true;
+  let armed = 0;
+  for (const ask of pending.values()) {
+    if (isUnclaimedHookAsk(ask) && !ask.reclaimHandle) {
+      armHookReclaim(ask);
+      armed++;
+    }
+  }
+  if (armed > 0) {
+    logger.info?.(
+      `ask-broker: waiting ${Math.round(hookReclaimGraceMs / 1000)}s for ${armed} restored hook ask(s) to re-attach`,
+    );
+  }
+  return armed;
+}
+
+/** Arm (or re-arm) the reclaim deadline for a dormant hook ask. No-op for any
+ *  other ask — host-owned asks have the daemon as claimant. */
+function armHookReclaim(ask: InternalPending): void {
+  if (!isUnclaimedHookAsk(ask)) return;
+  clearTimeout(ask.reclaimHandle);
+  ask.reclaimHandle = setTimeout(() => abandonUnclaimedHookAsk(ask.askId), hookReclaimGraceMs);
+  ask.reclaimHandle.unref?.();
+}
+
+/**
+ * No hook re-attached within the grace: the CLI that asked is no longer waiting
+ * (it exited, was restarted, or its turn ended). Invalidate the ask so it can't
+ * capture later answers, drop it from memory + disk, and flip the card to
+ * expired. A stashed answer (card clicked while dormant) was never delivered —
+ * the card says so instead of showing it as accepted.
+ *
+ * The entry is removed rather than retained as settled: a hook that does show
+ * up later then gets a fresh card instead of a terminal `invalidated` replay
+ * (which would drop it into the CLI's native picker). The new ask has its own
+ * askId, hence its own dispatch uuid, so Feishu doesn't dedupe it onto this
+ * expired card.
+ */
+function abandonUnclaimedHookAsk(askId: string): void {
+  const ask = pending.get(askId);
+  if (!ask || !isUnclaimedHookAsk(ask)) return;
+  const undelivered = ask.answeredResult !== undefined;
+  const result: AskResult = {
+    kind: 'invalidated',
+    reason: undelivered
+      ? 'the asking CLI stopped waiting before this answer could be delivered'
+      : 'the asking CLI is no longer waiting for an answer',
+    failureCode: undelivered ? 'answer_undelivered' : 'claimant_gone',
+    selected: null, by: null, comment: null, timedOut: false,
+  };
+  clearTimeout(ask.timeoutHandle);
+  clearTimeout(ask.handoffExpiryHandle);
+  clearTimeout(ask.reclaimHandle);
+  pending.delete(askId);
+  persistStore?.remove(ask.askKey);
+  logger.info?.(
+    `ask-broker: no hook re-attached to dormant ask ${askId} within ${Math.round(hookReclaimGraceMs / 1000)}s — ` +
+    `invalidated${undelivered ? ' (stashed answer not delivered)' : ''} (key=${ask.askKey})`,
+  );
+  notifyOnSettle({
+    ...ask, settled: true, settledAt: Date.now(), dormant: false,
+    answeredResult: undefined, terminalResult: result,
+  }, result);
 }
 
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
@@ -981,7 +1110,9 @@ function settle(askId: string, result: AskResult): void {
   // the terminal result and KEEP the persisted record so the reconnecting hook
   // can claim it (reattachDormantAsk delivers + removes). Only answered results
   // are worth stashing — a dormant ask that timed out / was invalidated has no
-  // consumer to hand off to, so it settles+cleans normally.
+  // consumer to hand off to, so it settles+cleans normally. A hook ask's reclaim
+  // deadline keeps running across the stash: if the hook never comes back, the
+  // stash is reaped and the card says the answer was not delivered.
   if (ask.dormant && ask.waiters.length === 0 && (result.kind === 'answered' || ask.originKind === 'host_explicit')) {
     ask.settled = true;
     ask.settledAt = Date.now();
@@ -1007,6 +1138,7 @@ function settle(askId: string, result: AskResult): void {
   // The answered-stash branch above keeps dormant until its answer is claimed.
   ask.dormant = false;
   clearTimeout(ask.timeoutHandle);
+  clearTimeout(ask.reclaimHandle);
   // The durable record's job is done the moment the ask leaves the pending
   // state (delivered to live waiters, or a terminal non-answer) — drop it so a
   // later restart doesn't resurrect a settled ask.
@@ -1071,7 +1203,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   const {
     // Runtime-only / broker-internal fields excluded from the IM contract:
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
-    handoffExpiryHandle: _he,
+    handoffExpiryHandle: _he, reclaimHandle: _rh,
     timeoutMs: _tm, timeoutStartsAfterDelivery: _td, timeoutStartedAt: _ts,
     askKey: _ak, requestId: _rid, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
@@ -1084,11 +1216,12 @@ function snapshot(ask: InternalPending): PendingAsk {
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded
     // retry re-sends the card, and a re-send without a uuid posts a DUPLICATE on
-    // the Feishu side. The uuid is the card's dedupe identity for THIS broker
-    // lifetime — derived from the scoped askKey, independent of persistence.
+    // the Feishu side. The uuid is this ask's card identity — derived from the
+    // scoped askKey + askId (see dispatchUuidForAsk), so it survives a restore
+    // and a later ask under the same key gets its own card.
     // `resumable` gates only cross-restart persistence, NOT intra-process
     // dispatch idempotency, so explicit / PTY asks (which also retry) dedupe too.
-    dispatchUuid: dispatchUuidForKey(ask.askKey),
+    dispatchUuid: dispatchUuidForAsk(ask.askKey, ask.askId),
   };
 }
 
@@ -1222,11 +1355,14 @@ export function _resetForTest(): void {
   for (const ask of pending.values()) {
     clearTimeout(ask.timeoutHandle);
     clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.reclaimHandle);
   }
   pending.clear();
   dispatcher = null;
   canTalkChecker = null;
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
+  hookReclaimGraceMs = HOOK_RECLAIM_GRACE_MS;
+  reclaimClockStarted = false;
   // Detach the injected store — never delete files here (codex P1-4: a helper
   // reaping a shared dataDir could wipe a LIVE pending ask). Tests own their
   // temp dir's cleanup via their own teardown.

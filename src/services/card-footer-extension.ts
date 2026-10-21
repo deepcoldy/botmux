@@ -33,6 +33,14 @@ export const MAX_SEGMENTS = 4;
 export const MAX_SEGMENT_CHARS = 40;
 export const COMMAND_TIMEOUT_MS = 3_000;
 export const MAX_OUTPUT_BYTES = 16 * 1024;
+/**
+ * 命令退出后等 stdout 读到 EOF 的上限。正常命令退出时 stdout 随之 EOF，按 'end' 当场
+ * 结算，用不到它；只有后台 / setsid 逃逸的进程还持着写端、EOF 不来时才等满。退出前写进
+ * 管道的输出已在内核缓冲区，一次 I/O 轮询就能读完，到点后还会再让出一次轮询，所以
+ * 这个值不决定会不会丢输出，只决定逃逸者持管时多等多久：取 100ms，比 COMMAND_TIMEOUT_MS
+ * 和最短刷新间隔小一到两个数量级，只推迟这一次后台刷新。
+ */
+export const EXIT_DRAIN_MS = 100;
 /** 上次成功超过这么久就不再显示。 */
 export const STALE_MS = 10 * 60_000;
 
@@ -102,13 +110,27 @@ function unrefStream(stream: Readable | Writable | null): void {
  * stdio `'close'`：命令若 setsid / 双 fork 逃出进程组，组 kill 打不到它，
  * 而它仍继承着管道写端，等 close 会让这次刷新永久挂起。范式见
  * core/update-check.ts 的 spawnNpmConfigRegistry。
+ *
+ * 正常退出（0）则等 stdout 读到 EOF 再结算：'exit' 可以先于管道里最后一段输出
+ * 递到 'data'（Node 文档写明 exit 时 stdio 可能仍开着，两种运行时的 CI 都出现过
+ * 拿到空串），在 exit 当场结算就会丢掉命令的全部输出。逃逸者持着写端、EOF 不来时，
+ * 最多再等 EXIT_DRAIN_MS，原有的「不被逃逸者拖住」不变。
+ *
+ * `spawnImpl` 只给测试换成受控的子进程：exit 与输出谁先到，真实进程给不出确定顺序。
  */
-export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command, env) =>
+export const runCardFooterExtensionCommand = (
+  command: string,
+  env: NodeJS.ProcessEnv,
+  spawnImpl: typeof spawn = spawn,
+): Promise<string> =>
   new Promise((resolve, reject) => {
     let settled = false;
     let stdout = '';
+    let stdoutEnded = false;
+    let exited = false;
     let child: ChildProcess;
     let timer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
 
     const killGroup = () => {
       if (child.pid === undefined) return;
@@ -125,6 +147,7 @@ export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       // 释放读端：逃出进程组的孙进程可能仍持有写端，不 destroy 会吊住 event loop。
       try { child.stdout?.destroy(); } catch { /* already closed */ }
       try { child.stderr?.destroy(); } catch { /* already closed */ }
@@ -133,7 +156,7 @@ export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command
     };
 
     try {
-      child = spawn('/bin/sh', ['-c', command], {
+      child = spawnImpl('/bin/sh', ['-c', command], {
         env,
         // POSIX 下让 sh 当新进程组 leader，超时才能连它的后代一起杀。
         detached: process.platform !== 'win32',
@@ -158,12 +181,34 @@ export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command
         finish(new Error('cardFooterExtension output exceeded the size limit'));
       }
     });
+    // EOF：退出前写进管道的输出都已读到。
+    child.stdout?.on('end', () => {
+      stdoutEnded = true;
+      if (exited) finish(null, stdout);
+    });
     child.stderr?.resume();
     child.on('error', (error) => finish(error));
-    // 从 exit 结算（不等 close）：setsid 逃逸者持管时 close 可能永远不来。
+    // 不等 close（setsid 逃逸者持管时 close 可能永远不来），只等 stdout EOF，且有上限。
     child.on('exit', (code, signal) => {
-      if (code === 0) finish(null, stdout);
-      else finish(new Error(`cardFooterExtension command exited with ${code ?? signal}`));
+      if (code !== 0) {
+        finish(new Error(`cardFooterExtension command exited with ${code ?? signal}`));
+        return;
+      }
+      exited = true;
+      if (stdoutEnded || !child.stdout) {
+        finish(null, stdout);
+        return;
+      }
+      // 命令已结束，不再需要超时杀组：剩下的等待只由 drain 上限约束。
+      if (timer) clearTimeout(timer);
+      drainTimer = setTimeout(() => {
+        // 到点后再隔一个定时器才结算：定时器回调里新排的定时器，Node 与 Bun 都要等事件
+        // 循环先轮询一次 I/O 才会执行（setImmediate 在 Bun 下排在 I/O 之前，不能用）。
+        // 这样事件循环被同步任务卡住超过上限时，管道里已有的输出也先读完。
+        drainTimer = setTimeout(() => finish(null, stdout), 0);
+        drainTimer.unref();
+      }, EXIT_DRAIN_MS);
+      drainTimer.unref();
     });
 
     timer = setTimeout(() => {
