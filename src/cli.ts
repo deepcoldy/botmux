@@ -10026,8 +10026,19 @@ async function sendDryRun(rest: string[]): Promise<void> {
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
-  // `--help` wins over every other flag and over all content resolution.
-  // It must stay the FIRST statement in cmdSend: content resolution below
+  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
+  // Provider values are opaque argv tokens, but flag-shaped mention values can
+  // otherwise trigger the help/dry-run early exits below before the outbound
+  // policy guard runs. Reject them at the final CLI boundary as well as in the
+  // Remote Runner protocol parser so direct/replayed invocations fail closed.
+  if (remoteRunnerOutbound
+    && argValues(rest, '--mention').some(value => /^--?\w/.test(value))) {
+    console.error('botmux send refused: --remote-runner-outbound mention values must not look like CLI flags');
+    process.exit(2);
+  }
+  // `--help` wins over every ordinary flag and over all content resolution.
+  // It must stay the first generic early exit after the narrow provider-value
+  // shape check above: content resolution below
   // falls through to readStdin() when there is no positional/--content-file,
   // and positionals() filters `--help` out as a flag, so anything placed
   // after it turns `botmux send --help` into a stdin wait instead of help —
@@ -10045,7 +10056,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
-  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Workflow subagents cannot own chat-facing effects: those belong to a
   // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
   // of both the sandbox relay and VC-origin store reads; neither path may turn
