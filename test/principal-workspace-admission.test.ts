@@ -4,10 +4,7 @@ import {
   legacyPrincipalWorkspaceGroupId,
   parsePrincipalWorkspaceGroup,
   parsePrincipalWorkspaceMember,
-  parsePrincipalWorkspaceTicket,
-  parsePrincipalWorkspaceTicketSequence,
   principalWorkspaceGroupIdV2,
-  principalWorkspaceTicketIdV1,
   validPrincipalWorkspaceGroupIdentity,
 } from '../src/core/principal-workspace-admission.js';
 
@@ -88,42 +85,5 @@ describe('principal workspace admission identity', () => {
     expect(parsePrincipalWorkspaceMember(member)).toEqual({ ok: true, value: member });
     expect(parsePrincipalWorkspaceMember({ ...member, workspaceEpoch: 0 }))
       .toEqual({ ok: false, error: 'invalid_member_metadata' });
-  });
-
-  it('derives and validates deterministic ticket, locator, and counter identities', () => {
-    const identity = {
-      groupId: principalWorkspaceGroupIdV2('app-a', '/repo'),
-      sourceSessionId: 'source-a', laneId: 'lane-a', sessionId: 'session-a', turnId: 'turn-a',
-    };
-    const ticketId = principalWorkspaceTicketIdV1(identity);
-    expect(ticketId).toMatch(/^principal-workspace-ticket:v1:[a-f0-9]{64}$/);
-    expect(ticketId).toBe(principalWorkspaceTicketIdV1(identity));
-    const locator = {
-      namespaceVersion: 1 as const,
-      namespace: `plq_v1_${'1'.repeat(64)}`,
-      recordVersion: 1 as const,
-      recordId: `plr_v1_${'2'.repeat(64)}`,
-      turnId: identity.turnId,
-      payloadEncoding: 'canonical-json-utf8-base64' as const,
-      payloadHash: `sha256:${'3'.repeat(64)}`,
-      exactFileLength: 512,
-    };
-    const ticket = {
-      version: 1 as const, ticketId, ...identity, sequence: 7,
-      workspaceEpoch: 2, status: 'queued' as const, revision: 1, locator,
-      createdAt: now, updatedAt: now,
-    };
-    expect(parsePrincipalWorkspaceTicket(ticket)).toEqual({ ok: true, value: ticket });
-    expect(parsePrincipalWorkspaceTicket({ ...ticket, ticketId: `${ticketId}x` }))
-      .toEqual({ ok: false, error: 'ticket_id_mismatch' });
-    expect(parsePrincipalWorkspaceTicket({ ...ticket, locator: { ...locator, turnId: 'other' } }))
-      .toEqual({ ok: false, error: 'ticket_turn_mismatch' });
-    const counter = {
-      version: 1 as const, groupId: identity.groupId, lastSequence: 7,
-      revision: 3, createdAt: now, updatedAt: now,
-    };
-    expect(parsePrincipalWorkspaceTicketSequence(counter)).toEqual({ ok: true, value: counter });
-    expect(parsePrincipalWorkspaceTicketSequence({ ...counter, lastSequence: -1 }))
-      .toEqual({ ok: false, error: 'invalid_ticket_sequence' });
   });
 });

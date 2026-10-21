@@ -316,7 +316,8 @@ vi.mock('../src/setup/owner-identity.js', () => ({
 
 vi.mock('../src/im/lark/client.js', () => ({
   // ou_ passes through literally (the reason the owner-identity probe exists);
-  // on_xxx → ou_xxx (except on_ghost). Used by the real setBotAllowedUsers behind /botconfig.
+  // on_xxx → ou_xxx (except on_ghost); emails/mobiles stay unresolved here
+  // (modeling a definitive miss). Used by the real setBotAllowedUsers behind /botconfig.
   resolveAllowedUsersWithMap: vi.fn(async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
     const entryStatus = new Map<string, 'resolved' | 'transient' | 'definitive'>();
@@ -327,7 +328,8 @@ vi.mock('../src/im/lark/client.js', () => ({
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = raw.filter(v => entryStatus.get(v) === 'definitive');
+    return { resolved, map, entryStatus, definitiveMisses };
   }),
   updateMessage: vi.fn(async () => {}),
   MessageWithdrawnError: class extends Error {},
@@ -1604,6 +1606,17 @@ describe('/botconfig set allowedUsers surfaces owner-identity verdicts', () => {
     expect(replies).toHaveLength(1);
     expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
     expect(replies[0]).toContain(t('cmd.config.allow_warn_union', { items: 'on_ghost' }, 'zh'));
+  });
+
+  it('writes but warns in /botconfig when an email/mobile definitively fails to resolve', async () => {
+    // 邮箱确定性解析失败：照常落盘（可能临时不可见），回复里点名未生效条目，
+    // 且不与 union_id 告警串台。
+    const { replies, stored } = await runAllow('/botconfig set allowedUsers ou_sender, ghost@corp.com 确认', []);
+    expect(stored).toEqual(['ou_sender', 'ghost@corp.com']);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
+    expect(replies[0]).toContain(t('cmd.config.allow_warn_contacts', { items: 'ghost@corp.com' }, 'zh'));
+    expect(replies[0]).not.toContain('union_id');
   });
 });
 
@@ -3421,11 +3434,28 @@ describe('handleCommand', () => {
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
     it('reports successful deletion privately rather than to the deleted group', async () => {
-      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed' });
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), deps, LARK_APP_ID);
-      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'));
+      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'), 'interactive');
+      // A main checkout is never offered for deletion.
+      expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID, worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task', safetyFingerprint: 'clean-state',
+      }));
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({ action: 'dismiss_cleanup_wt', job_ids: 'cleanup-123', invoker_open_id: 'ou_sender' });
+      expect(JSON.stringify(card)).toContain('/home/testuser/project-wt-task');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
     });
     it('rejects unsupported arguments without executing', async () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --yes', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
@@ -4746,6 +4776,8 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
       expect(replyContent).toContain('/login');
+      expect(replyContent).toContain('/adopt orca:<terminal>');
+      expect(replyContent).toContain('实验性');
       expect(replyContent).toContain('/workflow <目标>');
       expect(replyContent).toContain('/workflow run <名称>');
       expect(replyContent).toContain('/workflow save last');

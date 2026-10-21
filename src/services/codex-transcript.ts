@@ -891,6 +891,17 @@ export interface CodexDrainResult {
    *  `nextOffset` binds the turn lower bound to the exact cursor it follows,
    *  so truncation or an unrelated seek cannot reuse stale state. */
   state?: CodexDrainState;
+  /** Background tasks the CLI started or saw stop in this byte range. Only a
+   *  drainer whose CLI runs background tasks sets it (Grok). */
+  backgroundTasks?: BackgroundTaskSignals;
+}
+
+/** Background-task changes read from a structured transcript. `atMs` is when
+ *  the launch was written, so a launch replayed from an earlier CLI process
+ *  can be told apart from a live one. */
+export interface BackgroundTaskSignals {
+  launched: Array<{ taskId: string; kind: 'shell' | 'monitor'; atMs: number }>;
+  settled: string[];
 }
 
 export interface CodexDrainState {

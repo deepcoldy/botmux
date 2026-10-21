@@ -95,9 +95,14 @@ describe('bridge turn journal file ops', () => {
   });
 
   it('appends, reads back, removes per turn, and clears', () => {
-    appendBridgeTurnJournalEntry(path, entry({ turnId: 't1', markTimeMs: 1 }));
+    appendBridgeTurnJournalEntry(path, entry({
+      turnId: 't1', markTimeMs: 1, linkRefMode: 'enabled',
+    }));
     appendBridgeTurnJournalEntry(path, entry({ turnId: 't2', markTimeMs: 2, dispatchAttempt: 3 }));
-    expect(readBridgeTurnJournal(path).map(e => e.turnId)).toEqual(['t1', 't2']);
+    expect(readBridgeTurnJournal(path)).toMatchObject([
+      { turnId: 't1', linkRefMode: 'enabled' },
+      { turnId: 't2', dispatchAttempt: 3 },
+    ]);
 
     removeBridgeTurnJournalEntry(path, 't1');
     expect(readBridgeTurnJournal(path).map(e => e.turnId)).toEqual(['t2']);
@@ -273,7 +278,7 @@ describe('restore semantics against the real queue + gate', () => {
       markTimeMs,
       normaliseForFingerprint(larkMessage),
       undefined,
-      { restoredFromJournal: true },
+      { restoredFromJournal: true, linkRefMode: 'enabled' },
     );
     const { history, live } = splitTranscriptEventsByCutoff(events, cutoffMs);
     q.absorb(history);
@@ -296,6 +301,7 @@ describe('restore semantics against the real queue + gate', () => {
     expect(ready).toHaveLength(1);
     expect(ready[0].turnId).toBe('turn-interrupted');
     expect(ready[0].restoredFromJournal).toBe(true);
+    expect(ready[0].linkRefMode).toBe('enabled');
     // Only the interrupted turn's assistant text — the old turn was absorbed.
     expect(ready[0].assistantUuids).toEqual(['cur-a']);
   });

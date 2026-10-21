@@ -241,7 +241,7 @@ botmux preview <port>
 
 除了飞书卡片按钮，owner 还能在工作台里直接取到常驻链接本体，收藏进浏览器书签长期使用。
 
-**谁能取：** 只有本机完整管理身份（`botmux dashboard` 的 `?t=` 链接，或点 `/dashboard` 卡片按钮后种下的那枚 cookie）。飞书 H5 用户、平台 owner/teammate/guest 看不到这个入口——服务端对它们一律 404。
+**谁能取：** 只有本机完整管理身份（`botmux dashboard` 的 `?t=` 链接，或点 `/dashboard` 卡片按钮后种下的那枚 cookie）。从中心平台打开的机器 Dashboard（`m-` 子域）不带平台角色，同样按本机管理员处理（见 6.1），能取到。飞书 H5 用户、带平台角色的身份（owner/teammate/guest，如终端分享子域 `t-`）看不到这个入口——服务端对它们一律 404。
 
 **怎么取：**
 
@@ -293,7 +293,7 @@ botmux preview <port>
 
 | 身份 | 怎么来的 | 能干什么 |
 |---|---|---|
-| **本机管理员** | `botmux dashboard` 的 `?t=` 链接，或 `/dashboard` 卡片按钮（常驻链接） | 全功能：Dashboard 管理 + 工作台全部操作（含「定位」、「常驻链接」自取） |
+| **本机管理员** | `botmux dashboard` 的 `?t=` 链接，或 `/dashboard` 卡片按钮（常驻链接）；从中心平台打开的机器 Dashboard（`m-` 子域）也算——平台在这条反代上不注入角色，机器主人和协管者在本机都按本机管理员处理 | 全功能：Dashboard 管理 + 工作台全部操作（含「定位」、「常驻链接」自取） |
 | **飞书 H5 用户** | H5 免登（白名单 open_id） | 工作台功能：看会话、只读终端、接管租约、预览解锁；碰不到设置/排程/宿主终端（管理 → 终端）等管理功能 |
 | **平台身份** | 中心化平台注入（owner/teammate/guest） | owner 同 H5 用户的操作能力；teammate/guest 只读观看 |
 

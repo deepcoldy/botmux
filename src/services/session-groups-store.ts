@@ -202,9 +202,3 @@ export function removeSessionGroup(chatId: string): void {
   load();
   if (entries.delete(chatId)) persist();
 }
-
-export function listSessionGroups(): Array<{ chatId: string } & SessionGroupEntry> {
-  if (!currentAppId) return [];
-  load();
-  return Array.from(entries.entries()).map(([chatId, v]) => ({ chatId, ...v }));
-}

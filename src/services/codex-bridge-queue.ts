@@ -68,6 +68,7 @@ export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
 export interface CodexPendingTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -269,10 +270,12 @@ export class CodexBridgeQueue {
     markTimeMs: number = this.now(),
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+    linkRefMode?: 'observe' | 'enabled',
   ): void {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
@@ -290,6 +293,7 @@ export class CodexBridgeQueue {
     turnId: string;
     fingerprint: string;
     markTimeMs: number;
+    linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
     offsetAtMark?: number;
   }[]): void {
@@ -299,6 +303,7 @@ export class CodexBridgeQueue {
       if (existing.has(entry.turnId)) continue;
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
+        ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,

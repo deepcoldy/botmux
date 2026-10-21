@@ -1,6 +1,6 @@
 /**
- * Unit tests for async-trigger-store: recordPending, recordCompleted, lookup,
- * deleteResults — the durable backing that lets trigger-result survive a daemon
+ * Unit tests for async-trigger-store: recordPending, recordCompleted, lookup —
+ * the durable backing that lets trigger-result survive a daemon
  * restart (design A).
  *
  * Uses a real temp directory with vi.mock to redirect config.session.dataDir,
@@ -36,7 +36,6 @@ import {
   recordInterruptedStrict,
   lookup,
   lookupStrict,
-  deleteResults,
   recordSteerParked,
   followSteerParkedChain,
 } from '../src/services/async-trigger-store.js';
@@ -263,21 +262,6 @@ describe('owner stamping (cross-bot isolation)', () => {
   });
 });
 
-describe('deleteResults', () => {
-  it('removes the persisted file', () => {
-    recordPending('sess1', 'trg_a', 1000, 'cli_test');
-    const fp = join(tempDir, 'async-triggers', 'sess1.json');
-    expect(existsSync(fp)).toBe(true);
-    deleteResults('sess1');
-    expect(existsSync(fp)).toBe(false);
-    expect(lookup('sess1')).toBeUndefined();
-  });
-
-  it('does not throw when the file is absent', () => {
-    expect(() => deleteResults('never')).not.toThrow();
-  });
-});
-
 describe('robustness', () => {
   it('atomic write leaves no .tmp behind', () => {
     recordPending('sess1', 'trg_a', 1000, 'cli_test');
@@ -295,9 +279,6 @@ describe('robustness', () => {
     recordCompleted('sess1', 'trg_a', 'one', 1, 'cli_test');
     recordCompleted('sess2', 'trg_b', 'two', 2, 'cli_test');
     expect(lookup('sess1')?.result.content).toBe('one');
-    expect(lookup('sess2')?.result.content).toBe('two');
-    deleteResults('sess1');
-    expect(lookup('sess1')).toBeUndefined();
     expect(lookup('sess2')?.result.content).toBe('two');
   });
 

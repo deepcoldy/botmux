@@ -38,7 +38,6 @@ import {
   codexAppPosixControlRoot,
   codexAppPosixOwnerLeaseDirectory,
   codexAppPosixProcessProbeEnv,
-  codexAppControlStatePathForPlatform,
   codexAppWindowsOwnerPipeEndpoint,
   codexAppWindowsControlRoot,
   consumeCodexAppControlBootstrap,
@@ -420,9 +419,6 @@ describe('Windows Codex App control root, locator, and filesystem policy', () =>
     };
     const root = codexAppWindowsControlRoot(options);
     expect(root).toBe('C:\\Users\\alice\\AppData\\Local\\Botmux\\codex-app-control');
-    const state = codexAppControlStatePathForPlatform('Z:\\shared\\untrusted', 'session-win', options);
-    expect(state.startsWith(root)).toBe(true);
-    expect(state).not.toContain('shared');
     expect(codexAppControlLocatorPath(root, 'session-win', 'win32').startsWith(root)).toBe(true);
     expect(codexAppWindowsOwnerPipeEndpoint('session-win'))
       .toMatch(/^\\\\\?\\pipe\\botmux-codex-app-owner-[a-f0-9]{64}$/);

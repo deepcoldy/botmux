@@ -86,12 +86,6 @@ export function getTeam(dataDir: string, teamId: string): Team | null {
   return readFile(dataDir).teams.find(t => t.id === teamId) ?? null;
 }
 
-/** All teams the given identity belongs to (matches any identifier). */
-export function listTeamsForMember(dataDir: string, id: MemberIdentity): Team[] {
-  if (!id.unionId && !id.openId && !id.email) return [];
-  return readFile(dataDir).teams.filter(t => t.members.some(m => sameMember(m, id)));
-}
-
 /**
  * The default (implicit single-deployment) team. Read-only: returns the first
  * persisted team, else a synthesized empty default that is NOT written. Use

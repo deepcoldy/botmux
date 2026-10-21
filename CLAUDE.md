@@ -39,7 +39,7 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.3**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+发版编译用的 Bun 版本**钉在 1.4.3**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 

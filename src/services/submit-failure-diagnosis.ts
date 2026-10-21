@@ -13,7 +13,7 @@ import { stripAnsiScreenText } from '../utils/idle-detector.js';
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
   | 'interactive_menu'  // 菜单/迁移/hooks review/确认框等键盘选择界面
-  | 'draft_parked'      // 正文已粘贴进 composer 但没提交（[Pasted Content N chars]）
+  | 'draft_parked'      // 正文停在 composer，尚未提交
   | 'still_active'      // CLI 仍有持续活动证据（弱证据，只用于有限度静默，不用于下结论）
   | 'unknown';
 
@@ -30,6 +30,8 @@ export interface SubmitFailureDiagnosisInput {
   screenText?: string;
   /** 最近一次 PTY/结构化活动的 epoch ms；0/undefined 表示无 */
   lastActivityAtMs?: number;
+  /** Claude-only composer parsing; avoid interpreting other CLI prompts as drafts. */
+  cliId?: string;
   nowMs?: number;                       // 测试注入
   activeWindowMs?: number;              // 默认 SUBMIT_FAILURE_ACTIVE_WINDOW_MS
 }
@@ -81,6 +83,32 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
   return undefined;
 }
 
+// Claude Code ≥2.1 renders a multi-line bracketed paste that is parked in the
+// composer as a collapsed chip ("[Pasted text #2 +3 lines]") until pasted
+// again. BotMux delivers exactly one bracketed frame, so the expanded
+// `<user_message>` shape never appears on its own — the chip is the only
+// on-screen evidence the payload is stuck unsubmitted.
+const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s*\]/i;
+
+function claudeComposerDraftMatch(screen: string): string | undefined {
+  const rows = screen.split(/\r?\n/);
+  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
+  // Only the last input box, bounded by two full-width rules, is evidence.
+  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
+    if (!separator(rows[bottom])) continue;
+    let top = bottom - 1;
+    while (top >= 0 && !separator(rows[top])) top--;
+    if (top < 0) continue;
+    const body = rows.slice(top + 1, bottom);
+    if (!/^\s*❯/.test(body[0] ?? '')) continue;
+    const bodyText = body.join('\n');
+    if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
+    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
+  }
+  return undefined;
+}
+
 export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): SubmitFailureDiagnosis {
   // 优先级（高到低）：logged_out > interactive_menu > draft_parked >
   // still_active > unknown。屏幕门证据优先于活跃度。
@@ -91,6 +119,10 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   if (interactiveMenu) return { reason: 'interactive_menu', evidence: 'screen', matched: interactiveMenu };
   const draftParked = matchScreenRule(DRAFT_PARKED_RULES, screen);
   if (draftParked) return { reason: 'draft_parked', evidence: 'screen', matched: draftParked };
+  if (input.cliId === 'claude-code') {
+    const composerDraft = claudeComposerDraftMatch(screen);
+    if (composerDraft) return { reason: 'draft_parked', evidence: 'screen', matched: composerDraft };
+  }
 
   const nowMs = input.nowMs ?? Date.now();
   const activeWindowMs = input.activeWindowMs ?? SUBMIT_FAILURE_ACTIVE_WINDOW_MS;
@@ -102,4 +134,31 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
     return { reason: 'still_active', evidence: 'activity' };
   }
   return { reason: 'unknown', evidence: 'none' };
+}
+
+/** Worker-side inputs: the backend decides whether a captured screen is even
+ *  authoritative. ZMX pane history is not a live view, so its text must never
+ *  trip a screen gate (logged-out / menu / parked draft). */
+export interface BackendSubmitFailureInput {
+  backendType?: string;
+  /** Current viewport/backend screen (may contain ANSI). Ignored for ZMX. */
+  capturedScreenText?: string;
+  /** Session CLI id — the Claude composer rules are claude-code-only. */
+  cliId?: string;
+  lastActivityAtMs?: number;
+  nowMs?: number;
+  activeWindowMs?: number;
+}
+
+/** Assemble the worker's pre-card diagnosis in one testable place: blanks the
+ *  screen for backends whose history is non-authoritative, then delegates to
+ *  the pure classifier. */
+export function diagnoseBackendSubmitFailure(input: BackendSubmitFailureInput): SubmitFailureDiagnosis {
+  return diagnoseSubmitFailure({
+    cliId: input.cliId,
+    screenText: input.backendType === 'zmx' ? '' : input.capturedScreenText,
+    lastActivityAtMs: input.lastActivityAtMs,
+    nowMs: input.nowMs,
+    activeWindowMs: input.activeWindowMs,
+  });
 }

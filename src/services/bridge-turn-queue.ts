@@ -58,6 +58,7 @@ function assistantHasVisibleText(content: unknown): boolean {
 export interface BridgePendingTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   started: boolean;
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
@@ -265,11 +266,12 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean },
+    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
   ): string {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(opts?.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
       started: false,
       assistantUuids: [],
       contentFingerprint,

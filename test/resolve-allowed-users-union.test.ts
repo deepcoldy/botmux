@@ -248,6 +248,93 @@ describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', (
   });
 });
 
+// 确定性 miss（code-0 批量响应缺条目：账号不存在 / 对本应用不可见）此前连 WARN
+// 都没有，条目静默从运行时名单消失。resolver 现在必须：(a) 在 definitiveMisses
+// 里按配置顺序列出原始条目（literal ou_ 永不列入）；(b) 打 WARN 点名条目与 app。
+// 瞬态失败不能进 definitiveMisses（重试仍可能恢复）。
+describe('resolveAllowedUsersWithMap — definitiveMisses surfacing', () => {
+  it('email code-0 batch omitting an entry → definitiveMisses contains it + WARN names entry and app', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_alice', email: 'alice@corp.com' }] } }),
+    );
+
+    const { definitiveMisses, resolved, entryStatus, errored } = await resolveAllowedUsersWithMap(
+      APP, ['alice@corp.com', 'ghost@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['ghost@corp.com']);
+    expect(resolved).toEqual(['ou_alice']);
+    expect(entryStatus.get('ghost@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy(); // 确定性，不是瞬态
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ghost@corp.com'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(APP));
+    warn.mockRestore();
+  });
+
+  it('mobile code-0 batch omitting an entry → definitiveMisses contains the RAW config entry', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_bob', mobile: '13800000000' }] } }),
+    );
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(
+      APP, ['13800000000', '13900000000'],
+    );
+
+    expect(definitiveMisses).toEqual(['13900000000']);
+    expect(resolved).toEqual(['ou_bob']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('13900000000'));
+    warn.mockRestore();
+  });
+
+  it('union_id code-0 without open_id → definitiveMisses contains the on_ entry', async () => {
+    stubClient(async ({ path }: any) => ({ code: 0, data: { user: { union_id: path.user_id } } }));
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(APP, ['on_ghost']);
+
+    expect(definitiveMisses).toEqual(['on_ghost']);
+  });
+
+  it('literal ou_ entries NEVER appear in definitiveMisses (always kept as resolved)', async () => {
+    // 跨 app ou_（99992361）按设计原样保留；写入路径的身份校验另由
+    // detectUnusableOwnerEntries 负责，resolver 不把它列为 miss。
+    stubClient(async () => ({ code: 99992361, msg: 'cross app' }));
+
+    const { definitiveMisses, resolved } = await resolveAllowedUsersWithMap(APP, ['ou_other_app']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(resolved).toEqual(['ou_other_app']);
+  });
+
+  it('transient batch failure (code!=0) → definitiveMisses stays empty (entries are transient, retry-eligible)', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 500, msg: 'batch down' }),
+    );
+
+    const { definitiveMisses, errored } = await resolveAllowedUsersWithMap(APP, ['a@corp.com', 'b@corp.com']);
+
+    expect(definitiveMisses).toEqual([]);
+    expect(errored).toBe(true);
+  });
+
+  it('definitiveMisses preserves raw config order and excludes resolved entries', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [{ user_id: 'ou_keep', email: 'keep@corp.com' }] } }),
+    );
+
+    const { definitiveMisses } = await resolveAllowedUsersWithMap(
+      APP, ['gone1@corp.com', 'keep@corp.com', 'gone2@corp.com'],
+    );
+
+    expect(definitiveMisses).toEqual(['gone1@corp.com', 'gone2@corp.com']);
+  });
+});
+
 // End-to-end: resolver → applyAllowedUsersResolve → cache decision, for the exact
 // scenario codex flagged — an email-only owner + a batch-wide error (incl 40001)
 // must NOT be locked out. The whole-request error is transient, so the pure fn

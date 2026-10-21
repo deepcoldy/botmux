@@ -6,7 +6,6 @@ import {
   attachScratchSession,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
-  scratchMergedRootFor,
   scratchViewPath,
   scratchViewPathSingle,
   scratchLinuxMappings,
@@ -37,10 +36,6 @@ describe('Linux scratch host-view mapping', () => {
 
   it('keeps the back-compat alias identical', () => {
     expect(remapIntoMerged(merged, '/root/x')).toBe(scratchHostView(merged, '/root/x'));
-  });
-
-  it('derives the merged root deterministically from dataDir + sid', () => {
-    expect(scratchMergedRootFor('/data', 'sid')).toBe('/data/sandboxes/sid/root');
   });
 
   it('builds the single full-root linux mapping', () => {

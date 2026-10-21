@@ -96,12 +96,28 @@ export function appendLegacyDispatchReportProtocol(brief: string): string {
 
 /** Bind a stable local dispatch to its exact report destination. */
 export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
+  return appendDispatchReportProtocolWithDelivery(brief, dispatchRootId, 'relay');
+}
+
+export type DispatchResultDelivery = 'relay' | 'publish' | 'publish-and-relay';
+
+export function appendDispatchReportProtocolWithDelivery(
+  brief: string,
+  dispatchRootId: string,
+  delivery: DispatchResultDelivery,
+): string {
   const root = dispatchRootId.trim();
   if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  const deliveryFlag = delivery === 'relay' ? '' : ` --delivery ${delivery}`;
   return brief.trimEnd()
     + '\n\n— 完成回报 —\n'
-    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
-    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    + `干完后运行 \`botmux report --dispatch-root ${root}${deliveryFlag} "子项目完成 + 产出位置/摘要"\`。`
+    + (delivery === 'relay'
+      ? '结果将回传到派单来源会话；不要在本话题 @ 来源 bot（那会另起一个没有上下文的新会话）。'
+      : delivery === 'publish'
+        ? '结果内容将保持 Markdown 结构发布到当前派单话题，不再回传来源会话。'
+        : '结果内容将保持 Markdown 结构发布到当前派单话题，并同时回传来源会话。')
+    + '\n多行、表格或代码块必须通过 stdin 或 `--content-file` 传入，不得把字面量 `\\n` 拼进位置参数。';
 }
 
 /** Additionally ask the assignee to leave a human-visible copy in the task topic. */
@@ -118,11 +134,13 @@ export function buildDispatchCompletionBrief(input: {
   dispatchRootId: string;
   exactReportRootEnabled: boolean;
   sameTopicSendEnabled: boolean;
+  resultDelivery?: DispatchResultDelivery;
 }): string {
-  const withReport = input.exactReportRootEnabled
-    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
+  const resultDelivery = input.resultDelivery ?? 'relay';
+  const withReport = input.exactReportRootEnabled || resultDelivery !== 'relay'
+    ? appendDispatchReportProtocolWithDelivery(input.brief, input.dispatchRootId, resultDelivery)
     : appendLegacyDispatchReportProtocol(input.brief);
-  return input.sameTopicSendEnabled
+  return input.sameTopicSendEnabled && resultDelivery === 'relay'
     ? appendDispatchCompletionProtocol(withReport)
     : withReport;
 }
@@ -131,19 +149,21 @@ export function buildDispatchCompletionBrief(input: {
  * dispatch binding. Never strip user-authored XML or arbitrary instructions. */
 export function stripDispatchCompletionProtocol(content: string, dispatchRoot: string): string {
   const trimmed = content.trimEnd();
-  for (const exactReportRootEnabled of [true, false]) {
-    for (const sameTopicSendEnabled of [true, false]) {
-      const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
-        exactReportRootEnabled, sameTopicSendEnabled });
-      // Rich-post parsing drops empty paragraphs and trims each line. Accept
-      // that exact representation too; an optional role footer is task data.
-      const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
-      for (const candidate of [suffix, postSuffix]) {
-        const start = trimmed.lastIndexOf(candidate);
-        if (start < 0) continue;
-        const tail = trimmed.slice(start + candidate.length);
-        if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
-          return trimmed.slice(0, start) + tail;
+  for (const resultDelivery of ['relay', 'publish', 'publish-and-relay'] as const) {
+    for (const exactReportRootEnabled of [true, false]) {
+      for (const sameTopicSendEnabled of [true, false]) {
+        const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
+          exactReportRootEnabled, sameTopicSendEnabled, resultDelivery });
+        // Rich-post parsing drops empty paragraphs and trims each line. Accept
+        // that exact representation too; an optional role footer is task data.
+        const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+        for (const candidate of [suffix, postSuffix]) {
+          const start = trimmed.lastIndexOf(candidate);
+          if (start < 0) continue;
+          const tail = trimmed.slice(start + candidate.length);
+          if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
+            return trimmed.slice(0, start) + tail;
+          }
         }
       }
     }
@@ -429,19 +449,6 @@ export function activeConversationBotOpenIds(input: {
   return openIds;
 }
 
-/** Resolve the stable Review/orchestrator addressee independently of placement. */
-export function resolveReportRecipient(input: {
-  creatorOpenId?: string;
-  ownerOpenId?: string;
-  quoteTargetSenderOpenId?: string;
-}): string | undefined {
-  return [
-    input.creatorOpenId,
-    input.ownerOpenId,
-    input.quoteTargetSenderOpenId,
-  ].find(value => !!value?.trim())?.trim();
-}
-
 export interface ReportRecipientSession {
   sessionId?: string;
   larkAppId?: string;
@@ -526,29 +533,6 @@ export function resolveReportRecipientForSession(input: {
   return { source: 'none' };
 }
 
-/**
- * Compatibility view of registry coordinates plus recipient.
- *
- * `cmdReport` no longer treats these coordinates as the ordinary no-registry
- * placement. It uses them only to preserve a matching dispatch route; otherwise
- * {@link resolveReportPlacement} inherits the executing conversation turn.
- */
-export function resolveReportTarget(input: {
-  registryEntry?: { orchChatId?: string; orchScope?: string; orchRoot?: string };
-  sessionChatId?: string;
-  creatorOpenId?: string;
-  ownerOpenId?: string;
-  quoteTargetSenderOpenId?: string;
-}): { orchChatId?: string; orchScope: string; orchRoot: string; orchOpenId?: string } {
-  const e = input.registryEntry;
-  return {
-    orchChatId: e?.orchChatId ?? input.sessionChatId,
-    orchScope: e?.orchScope ?? 'chat',
-    orchRoot: e?.orchRoot ?? '',
-    orchOpenId: resolveReportRecipient(input),
-  };
-}
-
 export type ReportPlacementSource =
   | 'explicit-into'
   | 'explicit-top-level'
@@ -561,7 +545,7 @@ export type ReportPlacementSource =
  * Resolve only the visible placement of a `botmux report`.
  *
  * The report recipient is intentionally resolved separately by
- * {@link resolveReportRecipient}: choosing where the message is shown must never
+ * {@link resolveReportRecipientForSession}: choosing where the message is shown must never
  * change who is @-mentioned. Explicit placement wins, a dispatch registry keeps
  * its existing orchestrator-return semantics, and an explicitly marked legacy
  * cross-machine dispatch without a local registry keeps the old top-level
@@ -615,57 +599,6 @@ export function resolveReportPlacement(input: {
     }),
     source: input.currentTurnId ? 'current-turn' : 'session-default',
   };
-}
-
-export interface DispatchRegistryEntry {
-  orchChatId?: string;
-  orchScope?: string;
-  orchRoot?: string;
-  orchAppId?: string;
-  orchSessionId?: string;
-  createdAt?: string;
-}
-
-/**
- * Resolve the dispatch record for either a normal thread session or a
- * regular-group chat-scope session folded from a dispatch topic.
- *
- * Folded sessions are keyed by chatId, while the registry is keyed by the seed
- * message id. Their currentReplyTarget is usable only when it belongs to the
- * CLI's executing turn. Historical replyThreadAliases deliberately do not
- * participate: they have no turn id and could route a later ordinary report
- * back into a stale dispatch.
- */
-export function findDispatchRegistryEntry(input: {
-  registry: Record<string, DispatchRegistryEntry>;
-  dispatchRootId?: string;
-  sessionScope?: 'thread' | 'chat';
-  rootMessageId?: string;
-  currentReplyTargetRootId?: string;
-  currentReplyTargetTurnId?: string;
-  currentTurnId?: string;
-}): { key: string; entry: DispatchRegistryEntry } | undefined {
-  if (input.dispatchRootId) {
-    const entry = input.registry[input.dispatchRootId];
-    return entry ? { key: input.dispatchRootId, entry } : undefined;
-  }
-  const ordered: string[] = [];
-  const add = (value: string | undefined) => {
-    if (value && !ordered.includes(value)) ordered.push(value);
-  };
-  if (
-    input.currentTurnId
-    && input.currentReplyTargetTurnId === input.currentTurnId
-  ) {
-    add(input.currentReplyTargetRootId);
-  }
-  // Chat-scope rootMessageId is traceability metadata, not a routing anchor.
-  if (input.sessionScope !== 'chat') add(input.rootMessageId);
-  for (const key of ordered) {
-    const entry = input.registry[key];
-    if (entry) return { key, entry };
-  }
-  return undefined;
 }
 
 export interface DispatchAcceptanceSession {

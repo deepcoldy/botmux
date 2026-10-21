@@ -5,6 +5,7 @@
 ## 配置位置
 
 - `bots.json` 单个机器人：`"herdr": { ... }`
+- Dashboard：Bot 配置 → 高级 → 会话后端选择 herdr 后，旁边出现「Herdr 放置配置」区块
 - 全局环境变量：`BOTMUX_HERDR_SESSION_NAME`、`BOTMUX_HERDR_PLACEMENT`、`BOTMUX_HERDR_WORKSPACE`、`BOTMUX_HERDR_TAB`、`BOTMUX_HERDR_SPLIT_DIRECTION`、`BOTMUX_HERDR_CHAT_TYPES`（逗号分隔）
 
 两处都写时按字段叠加：机器人里写了的字段覆盖环境变量，没写的沿用环境变量；空的 `"herdr": {}` 不改变任何东西。叠加后既没有 `sessionName` 也没有 `placement` 时，配置不生效，等同于没配。

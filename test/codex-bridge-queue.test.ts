@@ -1233,6 +1233,25 @@ describe('CodexBridgeQueue', () => {
     expect(ready.map(t => t.finalText)).toEqual(['first reply', 'second reply']);
   });
 
+  it('keeps each type-ahead turn LinkRef mode frozen on its own final', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t-enabled', 'first prompt', 100, undefined, undefined, 'enabled');
+    q.mark('t-disabled', 'second prompt', 100);
+    q.ingest([
+      userEv('first prompt', 'u-enabled', 5_000),
+      asstEv('first reply', 'a-enabled', 6_000),
+      userEv('second prompt', 'u-disabled', 12_000),
+      asstEv('second reply', 'a-disabled', 13_000),
+    ]);
+
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([
+      { turnId: 't-enabled', linkRefMode: 'enabled', finalText: 'first reply' },
+      { turnId: 't-disabled', finalText: 'second reply' },
+    ]);
+    expect(ready[1]).not.toHaveProperty('linkRefMode');
+  });
+
   it('Codex steer-merge: user2 steered into active turn before any final → t1 dropped, t2 gets merged final, no wedge', () => {
     // codex-cli 0.134.0 active-turn steer (verified empirically): when msg1's
     // turn runs a tool_call, msg2 is steered into the SAME turn and codex emits

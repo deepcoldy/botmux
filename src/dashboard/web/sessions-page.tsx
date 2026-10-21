@@ -34,6 +34,7 @@ import { FeedGroupPicker } from './feed-group-picker.js';
 import { ModalDialog } from './modal-dialog.js';
 import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
+import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeSessionsViewMode,
@@ -583,81 +584,6 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
         if (ok) setCooldown(30);
       }}
     />
-  );
-}
-
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
-  const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
-  const detailsRef = useRef<HTMLDetailsElement>(null);
-  const [query, setQuery] = useState('');
-
-  useEffect(() => {
-    const close = () => {
-      if (detailsRef.current?.open) detailsRef.current.open = false;
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (details?.open && !details.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, []);
-
-  const q = query.trim().toLowerCase();
-  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
-
-  return (
-    <details className="filter-cli" ref={detailsRef}>
-      <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
-        {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
-      </b></summary>
-      <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        <div className="filter-cli-head">
-          <input
-            type="search"
-            className="filter-cli-search"
-            placeholder={t('sessions.cliSearch')}
-            value={query}
-            autoFocus
-            onChange={event => setQuery(event.currentTarget.value)}
-            onClick={event => event.stopPropagation()}
-          />
-          <div className="filter-cli-bulk">
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
-            >{t('sessions.cliSelectAll')}</button>
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
-            >{t('sessions.cliClear')}</button>
-          </div>
-        </div>
-        <div className="filter-cli-options">
-          {visible.length === 0 ? (
-            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
-          ) : visible.map(cli => (
-            <label key={cli} className="filter-check">
-              <input
-                type="checkbox"
-                name="cli"
-                value={cli}
-                checked={props.selected.has(cli)}
-                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-              />
-              <span>{cli}</span>
-            </label>
-          ))}
-        </div>
-      </div>
-    </details>
   );
 }
 
@@ -2913,9 +2839,16 @@ function SessionsPage(): React.JSX.Element {
     }
     const stage = viewStageRef.current;
     if (!stage) return;
+    // The table's local scrollbar is a sibling, excluded from scrollable
+    // overflow. Animate their common host so the stage doesn't retain its own
+    // transform/opacity stacking context beneath the scrollbar after fill:both.
+    // Other views keep the original stage animation (their host is contents).
     stage.classList.remove('sessions-view-stage-enter');
-    void stage.offsetWidth;
-    stage.classList.add('sessions-view-stage-enter');
+    const host = stage.parentElement;
+    host?.classList.remove('sessions-view-stage-enter');
+    const animated = viewMode === 'table' && host ? host : stage;
+    void animated.offsetWidth;
+    animated.classList.add('sessions-view-stage-enter');
   }, [viewStageSignature]);
 
   useEffect(() => {
@@ -3946,11 +3879,13 @@ function SessionsPage(): React.JSX.Element {
         onLock={locked => void runBulkLock(locked)}
       />
 
+      <div className={viewMode === 'table' ? 'sessions-table-scroll-host' : 'sessions-scroll-host-contents'}>
       <div
         ref={viewStageRef}
         className="sessions-view-stage"
         data-view={viewMode}
         data-kanban-group={kanbanGroupBy}
+        data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
         {!bootstrapped ? <SessionsSkeleton /> : null}
         {bootstrapped && viewMode === 'table' ? (
@@ -4045,6 +3980,8 @@ function SessionsPage(): React.JSX.Element {
           />
         </div>
         ) : null}
+      </div>
+      {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
       </div>
 
       <Drawer

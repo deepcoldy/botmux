@@ -16,7 +16,7 @@
  * Run: npx vitest run --project unit test/lark-cli-auth.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -24,9 +24,7 @@ import {
   completeLarkCliLogin,
   larkCliHomeFor,
   hasLarkCliHome,
-  clearLarkCliAuth,
   pendingLarkCliChallenge,
-  larkCliHomeForTurn,
   resolveLarkCliHomeForTurn,
   LARK_CLI_DEVICE_SCOPES,
   __setLarkCliHomeRootForTest,
@@ -110,14 +108,12 @@ describe('lark-cli per-person HOME layout', () => {
     await beginLarkCliLogin(OPEN);
     // begin seeded the HOME and stored a challenge, but no token file yet.
     expect(hasLarkCliHome(OPEN)).toBe(false);
-    expect(larkCliHomeForTurn(OPEN)).toBeNull();
   });
 
   it('becomes authorized only once a per-person token file exists', () => {
     seedMachine();
     simulateUserToken();
     expect(hasLarkCliHome(OPEN)).toBe(true);
-    expect(larkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
   });
 
   it('isolates two people: B has no token while A does', () => {
@@ -125,8 +121,6 @@ describe('lark-cli per-person HOME layout', () => {
     simulateUserToken(OPEN);
     expect(hasLarkCliHome(OPEN)).toBe(true);
     expect(hasLarkCliHome(OPEN_B)).toBe(false);
-    // No shared token leaks across: B's turn gets nothing.
-    expect(larkCliHomeForTurn(OPEN_B)).toBeNull();
   });
 });
 
@@ -229,7 +223,7 @@ describe('begin / complete device flow', () => {
     }));
     await completeLarkCliLogin(OPEN, 'dc-1');
     // A later re-login (e.g. expired) mints fresh because the old challenge is gone.
-    clearLarkCliAuth(OPEN);
+    rmSync(larkCliHomeFor(OPEN), { recursive: true, force: true });
     expect((await beginLarkCliLogin(OPEN))?.authUrl).toBeDefined();
   });
 
@@ -366,17 +360,5 @@ describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
     __setLarkCliRunnerForTest(runner);
     expect(await resolveLarkCliHomeForTurn(undefined)).toBeNull();
     expect(runner).not.toHaveBeenCalled();
-  });
-});
-
-describe('clear', () => {
-  it('removes only that person’s HOME', () => {
-    seedMachine();
-    simulateUserToken(OPEN);
-    simulateUserToken(OPEN_B);
-    expect(hasLarkCliHome(OPEN)).toBe(true);
-    clearLarkCliAuth(OPEN);
-    expect(hasLarkCliHome(OPEN)).toBe(false);
-    expect(hasLarkCliHome(OPEN_B)).toBe(true); // B untouched
   });
 });

@@ -14,7 +14,7 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './bot-config-editor.js';
-import { CLI_SELECT_OPTIONS, CLI_SELECTION_ALIASES, resolveCliSelection } from './cli-selection.js';
+import { resolveCliSelection } from './cli-selection.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
@@ -409,11 +409,6 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
   if (flags.lang !== undefined) input.lang = flags.lang;
   return input;
-}
-
-/** 合法 --cli 取值（报错提示用）。 */
-export function cliSelectionKeys(): string[] {
-  return [...CLI_SELECT_OPTIONS.map(o => o.key), ...Object.keys(CLI_SELECTION_ALIASES)];
 }
 
 /** list --json 输出前的 secret 脱敏（CLI 输出可能被贴进聊天/日志）。 */

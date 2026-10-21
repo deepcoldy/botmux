@@ -30,6 +30,7 @@ export function checkpointCodexAdoptTurns(
       : undefined;
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
+      ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
       offsetAtMark: prior?.offsetAtMark ?? capturedOffset ?? safeOffsetAtMark }];
   });
   if (JSON.stringify(previous) === JSON.stringify(entries)) return;

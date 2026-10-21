@@ -113,6 +113,32 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it.each(['darwin', 'linux'] as const)('keeps the LinkRef ledger host-only on %s', (platform) => {
+    const homeDir = platform === 'darwin' ? '/Users/u' : '/home/u';
+    const botmuxHome = `${homeDir}/.botmux`;
+    const sessionDataDir = `${botmuxHome}/data`;
+    const linkRefRoot = `${sessionDataDir}/link-refs`;
+    const p = buildFsPolicy(ctx({
+      platform,
+      homeDir,
+      botmuxHome,
+      sessionDataDir,
+      botHome: `${botmuxHome}/bots/cli_self`,
+      workingDir: `${homeDir}/proj`,
+      userPaths: { readWrite: [sessionDataDir, `${linkRefRoot}/nested`] },
+    }));
+
+    for (const path of [
+      linkRefRoot,
+      `${linkRefRoot}/link-refs.sqlite`,
+      `${linkRefRoot}/link-refs.sqlite-wal`,
+      `${linkRefRoot}/link-refs.sqlite-shm`,
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('deny');
+    }
+    expect(accessForPath(p.rules, `${sessionDataDir}/turn-send-ledger/s`).access).toBe('readWrite');
+  });
+
   it('keeps daemon host-only roots denied even under broad or nested allows', () => {
     const root = '/Users/u/.botmux/data/schedule-preconditions';
     const externalServiceCredential = '/Users/u/.service/credential.json';

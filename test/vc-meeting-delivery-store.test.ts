@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -20,7 +20,6 @@ import {
   listVcMeetingMemberProjections,
   markVcMeetingDeliveryAmbiguous,
   markVcMeetingDeliveryDispatched,
-  pruneVcMeetingDeliveryState,
   reconcileVcMeetingDeliveriesOnBoot,
   type VcMeetingDeliveryAcceptInput,
   type VcMeetingMemberProjectionInput,
@@ -1193,21 +1192,6 @@ describe('vc meeting delivery store', () => {
       expect(r.ok).toBe(true);
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('corrupt state'));
       expect(readdirSync(storeDir).some((f) => f.includes('.corrupt.'))).toBe(true);
-    });
-
-    it('prunes whole meetings past TTL and keeps fresh ones', () => {
-      applyVcMeetingMemberProjection(dir, projection(), 1_000);
-      applyVcMeetingMemberProjection(
-        dir,
-        projection({ meetingId: 'meeting-fresh' }),
-        50_000,
-      );
-
-      const removed = pruneVcMeetingDeliveryState(dir, { ttlMs: 10_000 }, 60_000);
-      expect(removed).toBe(1);
-      expect(getVcMeetingMemberProjection(dir, KEY)).toBeUndefined();
-      expect(getVcMeetingMemberProjection(dir, { ...KEY, meetingId: 'meeting-fresh' })).toBeDefined();
-      expect(existsSync(join(dir, 'vc-meeting-delivery'))).toBe(true);
     });
   });
 });

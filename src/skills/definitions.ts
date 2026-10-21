@@ -1,3 +1,7 @@
+// 群负责人技能内容定义在独立模块；此处转出以便注入/安装层与其他内置技能同构引用。
+// 该技能默认不在 BUILTIN_SKILLS 中无条件安装，仅在 bot 开启 chatManagerEnabled 时注入。
+export { CHAT_MANAGER_SKILL } from './chat-manager.js';
+
 /**
  * Canonical skill definitions shipped with botmux.
  *
@@ -1850,6 +1854,8 @@ export const ASK_SKILL_NAME = 'botmux-ask';
  *  worker-pool's `ensureCliSkills`. Disabled → the skill dir is removed so the
  *  agent never sees a skill for a turned-off capability. */
 export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
+/** 群负责人技能名；默认不随内置清单无条件安装，仅在 bot 开启 chatManagerEnabled 时注入。 */
+export const CHAT_MANAGER_SKILL_NAME = 'botmux-chat-manager';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },

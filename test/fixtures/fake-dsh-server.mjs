@@ -31,6 +31,9 @@ import { appendFileSync } from 'node:fs';
  *                     turn/end with reason.error — the runner must surface it
  *   empty           - tool calls only, no assistant text (empty final)
  *   hang            - never goes idle (exercises the turn watchdog)
+ *   progressive     - tool progress outlasts the idle watchdog, then completes
+ *   endless-progress - tool progress never completes (exercises the hard limit)
+ *   unclaimed-progress - tool notifications without a matching inbox receipt
  */
 
 const scenario = process.env.FAKE_DSH_SCENARIO ?? 'happy';
@@ -202,6 +205,45 @@ function runEmptyTurn(sessionId, messageId) {
   notify('session.status', { sessionId, status: 'idle' });
 }
 
+function runProgressiveTurn(sessionId, messageId, endless = false) {
+  sendInboxReceipt(sessionId, messageId);
+  let count = 0;
+  const interval = setInterval(() => {
+    const callId = `call_progress_${++count}`;
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId, name: 'bash', arguments: '{"command":"echo progress"}' },
+    });
+    sessionEvent(sessionId, {
+      type: 'tool/result',
+      data: {
+        message: {
+          source: { callId },
+          content: [{ type: 'tool-result', content: [], isError: false }],
+        },
+      },
+    });
+    if (count === 9 && !endless) {
+      clearInterval(interval);
+      sessionEvent(sessionId, {
+        type: 'assistant/message',
+        data: { message: { role: 'assistant', content: [{ type: 'text', text: finalText }] } },
+      });
+      notify('session.status', { sessionId, status: 'idle' });
+    }
+  }, 90);
+}
+
+function runUnclaimedProgress(sessionId) {
+  let count = 0;
+  setInterval(() => {
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId: `unclaimed_${++count}`, name: 'bash', arguments: '{}' },
+    });
+  }, 90);
+}
+
 function handleLine(line) {
   let msg;
   try {
@@ -258,6 +300,10 @@ function handleLine(line) {
       else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
       else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
       else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
+      else if (scenario === 'progressive' || scenario === 'endless-progress') {
+        runProgressiveTurn(sessionId, messageId, scenario === 'endless-progress');
+      }
+      else if (scenario === 'unclaimed-progress') runUnclaimedProgress(sessionId);
       else runHappyTurn(sessionId, messageId);
     });
     return;

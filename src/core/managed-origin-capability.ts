@@ -21,6 +21,7 @@ export interface ManagedOriginCapabilityClaim {
   bootInstanceId?: string;
   turnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   /** Current daemon port, host-written on every capability rotation. */
   ipcPort?: number;
 }
@@ -632,6 +633,7 @@ export function readManagedOriginCapability(
       policyCapability?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
+      linkRefMode?: unknown;
       ipcPort?: unknown;
       channelId?: unknown;
       larkAppId?: unknown;
@@ -661,6 +663,9 @@ export function readManagedOriginCapability(
       && parsed.dispatchAttempt > 0
       ? parsed.dispatchAttempt
       : undefined;
+    const linkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
+      ? parsed.linkRefMode
+      : undefined;
     const ipcPort = typeof parsed.ipcPort === 'number'
       && Number.isSafeInteger(parsed.ipcPort)
       && parsed.ipcPort > 0 && parsed.ipcPort <= 65_535
@@ -688,6 +693,7 @@ export function readManagedOriginCapability(
       ...(bootInstanceId ? { bootInstanceId } : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(linkRefMode ? { linkRefMode } : {}),
       ...(ipcPort !== undefined ? { ipcPort } : {}),
     };
   } catch {

@@ -19,6 +19,7 @@ import {
   activeConversationBotOpenIds,
   appendDispatchCompletionProtocol,
   appendDispatchReportProtocol,
+  appendDispatchReportProtocolWithDelivery,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
   stripDispatchCompletionProtocol,
@@ -27,16 +28,13 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
-  findDispatchRegistryEntry,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
   foldableChatSessionAppIds,
   recordDispatchInputCommit,
   resolveReportPlacement,
-  resolveReportRecipient,
   resolveReportRecipientForSession,
-  resolveReportTarget,
   resolveSendTarget,
   threadRootForReachability,
 } from '../src/core/dispatch.js';
@@ -155,6 +153,45 @@ describe('dispatch completion switch wiring', () => {
     expect(completion).toContain('botmux send --no-mention');
     expect(completion).toContain('除上述 botmux report 回报外');
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
+  });
+
+  it('preserves multiline guidance without inferring completion', () => {
+    const result = appendDispatchReportProtocol('review the locked commit', 'om_seed_exact');
+    expect(result).not.toContain('--status completed');
+    expect(result).toContain('--content-file');
+    expect(result).toContain('`\\n`');
+  });
+
+  it.each(['publish', 'publish-and-relay'] as const)(
+    'routes %s results directly without asking for a duplicate same-topic copy',
+    (resultDelivery) => {
+      const report = appendDispatchReportProtocolWithDelivery(
+        'review the locked commit',
+        'om_seed_exact',
+        resultDelivery,
+      );
+      expect(report).toContain(`--delivery ${resultDelivery}`);
+      const result = buildDispatchCompletionBrief({
+        brief: 'review the locked commit',
+        dispatchRootId: 'om_seed_exact',
+        exactReportRootEnabled: true,
+        sameTopicSendEnabled: true,
+        resultDelivery,
+      });
+      expect(result).not.toContain('botmux send --no-mention');
+    },
+  );
+
+  it('uses the exact relay for publish delivery even when the legacy feature switch is off', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: 'compare the two merge requests',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: false,
+      sameTopicSendEnabled: true,
+      resultDelivery: 'publish',
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --delivery publish');
+    expect(result).not.toContain('--legacy-dispatch');
   });
 
   it.each([
@@ -614,45 +651,6 @@ describe('offTopicSubBotTopic', () => {
   });
 });
 
-describe('resolveReportTarget', () => {
-  it('uses the registry entry when present (same-machine, precise thread routing)', () => {
-    const r = resolveReportTarget({
-      registryEntry: { orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_root' },
-      sessionChatId: 'oc_sub', creatorOpenId: 'ou_orch',
-    });
-    expect(r).toEqual({ orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_root', orchOpenId: 'ou_orch' });
-  });
-
-  it('keeps the legacy no-registry coordinate fallback for compatibility callers', () => {
-    const r = resolveReportTarget({ registryEntry: undefined, sessionChatId: 'oc_sub', creatorOpenId: 'ou_orch' });
-    expect(r).toEqual({ orchChatId: 'oc_sub', orchScope: 'chat', orchRoot: '', orchOpenId: 'ou_orch' });
-  });
-
-  it('orchOpenId prefers creatorOpenId, then ownerOpenId, then quoteTargetSenderOpenId', () => {
-    expect(resolveReportTarget({ creatorOpenId: 'c', ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('c');
-    expect(resolveReportTarget({ ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('o');
-    expect(resolveReportTarget({ quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('q');
-  });
-});
-
-describe('resolveReportRecipient', () => {
-  it('keeps the stable creator as recipient regardless of message placement', () => {
-    expect(resolveReportRecipient({
-      creatorOpenId: 'ou_reviewer',
-      ownerOpenId: 'ou_owner',
-      quoteTargetSenderOpenId: 'ou_latest_sender',
-    })).toBe('ou_reviewer');
-  });
-
-  it('skips empty legacy identity fields', () => {
-    expect(resolveReportRecipient({
-      creatorOpenId: '  ',
-      ownerOpenId: 'ou_owner',
-      quoteTargetSenderOpenId: 'ou_latest_sender',
-    })).toBe('ou_owner');
-  });
-});
-
 describe('resolveReportRecipientForSession', () => {
   const reviewer = 'ou_reviewer';
   const user = 'ou_user';
@@ -856,79 +854,6 @@ describe('resolveReportPlacement', () => {
       target: { mode: 'thread', rootMessageId: 'om_session_topic' },
       source: 'session-default',
     });
-  });
-});
-
-describe('findDispatchRegistryEntry', () => {
-  const registry = {
-    om_seed_old: { orchRoot: 'om_orch_old', orchSessionId: 's_old' },
-    om_seed_new: { orchRoot: 'om_orch_new', orchSessionId: 's_new' },
-  };
-
-  it('uses the thread root for a normal thread-scoped dispatched session', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'thread',
-      rootMessageId: 'om_seed_new',
-    })).toEqual({
-      key: 'om_seed_new',
-      entry: registry.om_seed_new,
-    });
-  });
-
-  it('uses currentReplyTarget for a chat-scope session folded from a dispatch topic', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_current',
-      currentTurnId: 'om_turn_current',
-    })).toEqual({ key: 'om_seed_new', entry: registry.om_seed_new });
-  });
-
-  it('prefers the immutable turn root when the chat-scope session has advanced to a newer dispatch', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      dispatchRootId: 'om_seed_old',
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_new',
-      currentTurnId: 'om_turn_new',
-    })).toEqual({ key: 'om_seed_old', entry: registry.om_seed_old });
-  });
-
-  it('fails closed when an explicit turn root is absent instead of falling through to the latest alias', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      dispatchRootId: 'om_seed_missing',
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_new',
-      currentReplyTargetTurnId: 'om_turn_current',
-      currentTurnId: 'om_turn_current',
-    })).toBeUndefined();
-  });
-
-  it('ignores a stale currentReplyTarget whose turn id does not match', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'oc_group',
-      currentReplyTargetRootId: 'om_seed_old',
-      currentReplyTargetTurnId: 'om_turn_old',
-      currentTurnId: 'om_turn_new',
-    })).toBeUndefined();
-  });
-
-  it('does not treat a chat-scope trace root as a dispatch route', () => {
-    expect(findDispatchRegistryEntry({
-      registry,
-      sessionScope: 'chat',
-      rootMessageId: 'om_seed_old',
-      currentTurnId: 'om_turn_new',
-    })).toBeUndefined();
   });
 });
 
@@ -1198,13 +1123,15 @@ describe('botmux send turn marker context', () => {
 describe('zero-injection dispatch protocol removal', () => {
   it('removes only the generated trailing protocol and preserves task bytes', () => {
     const brief = '修复函数，保留正文中的 botmux report 和 <user_message>。';
-    for (const exactReportRootEnabled of [true, false]) {
-      for (const sameTopicSendEnabled of [true, false]) {
-        const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled });
-        expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
-        const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
-        expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
+    for (const resultDelivery of ['relay', 'publish', 'publish-and-relay'] as const) {
+      for (const exactReportRootEnabled of [true, false]) {
+        for (const sameTopicSendEnabled of [true, false]) {
+          const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled, resultDelivery });
+          expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
+          const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
+          expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
 
+        }
       }
     }
     expect(stripDispatchCompletionProtocol(brief, 'om_task')).toBe(brief);

@@ -9,7 +9,7 @@ import { isBotAdmin } from './grant-owner.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPendingMulti } from './grant-pending.js';
+import { markPendingDelivered, openPendingMulti } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -231,10 +231,11 @@ export async function tryHandleGrantCommand(
   if (!claimGrantCommand(larkAppId, messageId)) return true;
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
+  const targetIds = targets.map(tgt => tgt.openId);
   const nonce = openPendingMulti(
     larkAppId,
     chatId,
-    targets.map(tgt => tgt.openId),
+    targetIds,
     quota,
     undefined,
     durationMs,
@@ -252,6 +253,8 @@ export async function tryHandleGrantCommand(
     loc,
   );
   await replyMessage(larkAppId, messageId, card, 'interactive')
+    // 卡已送达才落盘：daemon 重启后 owner 照样能点这张卡。
+    .then(() => markPendingDelivered(larkAppId, chatId, targetIds, nonce))
     .catch(err => logger.debug(`grant card reply failed: ${err}`));
   logger.info(`[grant:${larkAppId}] owner /grant card for ${targets.length} target(s) in ${chatId}`);
   return true;

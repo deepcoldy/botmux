@@ -40,6 +40,7 @@ export interface ManagedOriginAttestation {
   /** Optional for old daemons; only the protected proof can authorize a creator. */
   scheduleCreator?: ScheduleCreatorAuthorization;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   requiresCodexAppLedger: boolean;
 }
 
@@ -167,6 +168,9 @@ function validateProof(input: {
       && (typeof proof.larkAppId !== 'string'
         || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(proof.larkAppId)))
     || (proof.scheduleCreator !== undefined && !isScheduleCreatorAuthorization(proof.scheduleCreator))
+    || (proof.linkRefMode !== undefined
+      && proof.linkRefMode !== 'observe'
+      && proof.linkRefMode !== 'enabled')
     || typeof proof.issuedAtMs !== 'number' || !Number.isFinite(proof.issuedAtMs)
     || proof.issuedAtMs > input.nowMs + 1_000
     || input.nowMs - proof.issuedAtMs > MANAGED_ORIGIN_PROOF_TTL_MS
@@ -188,6 +192,9 @@ function validateProof(input: {
     ...(typeof proof.larkAppId === 'string' ? { larkAppId: proof.larkAppId } : {}),
     ...(isScheduleCreatorAuthorization(proof.scheduleCreator) ? { scheduleCreator: proof.scheduleCreator } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(proof.linkRefMode === 'observe' || proof.linkRefMode === 'enabled'
+      ? { linkRefMode: proof.linkRefMode }
+      : {}),
     requiresCodexAppLedger: proof.requiresCodexAppLedger,
   };
 }

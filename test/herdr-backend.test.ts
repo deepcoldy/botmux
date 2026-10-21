@@ -33,7 +33,7 @@ vi.mock('node-pty', () => ({
 
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
-import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe } from '../src/adapters/backend/herdr-backend.js';
+import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes } from '../src/adapters/backend/herdr-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -1367,6 +1367,14 @@ describe('HerdrBackend message writing', () => {
     be.kill();
   });
 
+  it('explicit bracketed paste uses one raw frame with literal newlines', () => {
+    const be = spawnBackend('5-5');
+    expect(be.sendBracketedPaste('first\n中文 second')).toBe(true);
+    expect(herdrCall('pane', 'send-text', '5-5', '\x1b[200~first\n中文 second\x1b[201~')).toBeDefined();
+    expect(herdrCall('pane', 'send-keys', '5-5', 'Enter')).toBeUndefined();
+    be.kill();
+  });
+
   it('sendSpecialKeys() invokes `pane send-keys` with each key', () => {
     const be = spawnBackend('5-5');
     be.sendSpecialKeys('Enter', 'C-c');
@@ -1394,6 +1402,76 @@ describe('HerdrBackend message writing', () => {
     expect(be.sendText('after-exit')).toBe(false);
     const call = herdrCall('pane', 'send-text');
     expect(call).toBeUndefined();
+  });
+
+  // Linux MAX_ARG_STRLEN caps one execve argv element at 131071 bytes; a longer
+  // `pane send-text` dies with E2BIG and the whole message is lost. Oversized
+  // frames must be split into argv-safe pieces, written in order, and aborted
+  // as soon as one piece is rejected.
+  it('splits an oversized send-text into argv-safe ordered pieces (E2BIG guard)', () => {
+    const be = spawnBackend('5-5');
+    const payload = 'A'.repeat(300_000);
+    expect(be.write(payload)).toBe(true);
+
+    const textCalls = mockedExecFileSync.mock.calls.filter(
+      call => call[0] === 'herdr' && (call[1] as string[]).includes('send-text'),
+    );
+    expect(textCalls.length).toBeGreaterThan(1);
+    // Every argv element stays under the 131071-byte single-argument cap.
+    for (const call of textCalls) {
+      for (const arg of call[1] as string[]) {
+        expect(Buffer.byteLength(arg, 'utf8')).toBeLessThan(131071);
+      }
+    }
+    // Pieces are ordered and concatenate back to the exact payload. The
+    // payload is the trailing argv element of each `pane send-text` call.
+    const sent = textCalls.map(call => (call[1] as string[]).at(-1) ?? '').join('');
+    expect(sent).toBe(payload);
+    be.kill();
+  });
+
+  it('stops and reports failure mid-split once a piece is rejected (no partial success claim)', () => {
+    const be = spawnBackend('5-5');
+    let seen = 0;
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd === 'herdr' && (args as string[]).includes('send-text')) {
+        seen += 1;
+        if (seen === 2) throw new Error('E2BIG');
+      }
+      return '' as any;
+    }) as any);
+    const payload = 'B'.repeat(300_000);
+    expect(be.write(payload)).toBe(false);
+    const textCalls = mockedExecFileSync.mock.calls.filter(
+      call => call[0] === 'herdr' && (call[1] as string[]).includes('send-text'),
+    );
+    // Stopped on the second piece; later pieces were never attempted.
+    expect(textCalls).toHaveLength(2);
+    be.kill();
+  });
+});
+
+describe('chunkByUtf8Bytes', () => {
+  it('returns one piece for short/empty input', () => {
+    expect(chunkByUtf8Bytes('abc', 10)).toEqual(['abc']);
+    expect(chunkByUtf8Bytes('', 10)).toEqual(['']);
+  });
+
+  it('never splits a multibyte character and honours the UTF-8 byte cap', () => {
+    // 中 is 3 bytes in UTF-8; cap of 4 bytes yields at most one 中 per piece.
+    const pieces = chunkByUtf8Bytes('中中中', 4);
+    expect(pieces).toEqual(['中', '中', '中']);
+    for (const p of pieces) expect(Buffer.byteLength(p, 'utf8')).toBeLessThanOrEqual(4);
+    expect(pieces.join('')).toBe('中中中');
+  });
+
+  it('cuts an ASCII string at the exact byte boundary', () => {
+    const pieces = chunkByUtf8Bytes('abcdef', 4);
+    expect(pieces).toEqual(['abcd', 'ef']);
+  });
+
+  it('rejects an unusable cap', () => {
+    expect(() => chunkByUtf8Bytes('a', 3)).toThrow(RangeError);
   });
 });
 

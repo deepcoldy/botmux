@@ -11,6 +11,7 @@ import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sa
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
+import { normalizeHerdrBackendConfig, resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
 import type { BotConfig } from '../bot-registry.js';
@@ -136,7 +137,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
-  { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
+  { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
@@ -144,6 +145,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
+  { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
@@ -178,6 +180,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
   { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
+  { key: 'herdr', configKey: 'herdr', kind: 'json', effect: 'next-session', clearable: true, hint: 'herdr 后端放置配置 JSON，仅 backendType=herdr 时生效，字段全部可选：sessionName（宿主 Herdr 会话名，默认 botmux，指向别的会话时该会话必须已在运行）/placement（workspace=每话题新工作区，默认｜tab=目标工作区新开 Tab｜split=目标 Tab 分屏）/workspace（目标工作区 id 或标签）/tab（目标 Tab id 或标签）/splitDirection（right，默认｜down）/chatTypes（group/p2p 数组，缺省对所有会话生效）；非法字段会被拒绝，空对象或 unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -640,6 +643,13 @@ export type SetAllowedUsersResult =
      * resolve 的 entryStatus，保证告警与实际生效名单一致。
      */
     unresolvedUnionIds?: string[];
+    /**
+     * resolver 本次判为 definitive 而丢弃的邮箱 / 手机号条目（账号不存在或对本
+     * 应用不可见；非瞬态，不会自动重试）。同样照常落盘（可能只是临时不可见，
+     * 且 self-lockout 防护已保证发起人仍在名单内），由调用方在 /botconfig 回复里
+     * 提示，而不是让条目静默消失。on_ 走 {@link unresolvedUnionIds}，不重复列。
+     */
+    unresolvedEmailsAndMobiles?: string[];
   }
   | { ok: false; reason: 'unusable_owner_entries'; entries: string[] }
   | { ok: false; reason: 'bot_not_registered' | 'bot_not_in_config' | 'self_lockout' | 'empty_resolved' | string };
@@ -684,7 +694,7 @@ export async function setBotAllowedUsers(
     }
   }
 
-  const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
+  const { resolved, map, entryStatus, definitiveMisses } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
   if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
   if (senderOpenId && !resolved.includes(senderOpenId)) return { ok: false, reason: 'self_lockout' };
 
@@ -712,6 +722,14 @@ export async function setBotAllowedUsers(
     else if (status === 'transient') anyTransient = true;
   }
   const unresolvedUnionIds = definitiveEntries.filter(e => e.startsWith('on_'));
+  // 邮箱/手机号的确定性 miss：resolver 已逐条打 WARN，这里只把条目带回给调用方
+  // 在 /botconfig 回复里提示。优先用 resolver 返回的 definitiveMisses（与本次
+  // 热更新同一次解析）；部分 mock / 旧调用方没返回时从 entryStatus 兜底推导。
+  // on_ 已在 unresolvedUnionIds 里，ou_ 恒为 resolved，都不在此列。
+  // 用户可见提示按条目去重（同一条邮箱/手机号在命令里写多次只提示一次），
+  // 与走 Map 天然去重的 unresolvedUnionIds 口径一致。
+  const misses = definitiveMisses ?? definitiveEntries;
+  const unresolvedEmailsAndMobiles = [...new Set(misses.filter(e => !e.startsWith('on_') && !e.startsWith('ou_')))];
   writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
     map,
     // sidecar 同时承载 blockedUsers 的缓存：retainKeys 取并集，不得剪掉黑名单条目。
@@ -725,9 +743,15 @@ export async function setBotAllowedUsers(
   // contact API does, instead of silently staying dropped until the next restart.
   if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
+  if (unresolvedEmailsAndMobiles.length > 0) {
+    logger.warn(`[config:${larkAppId}] allowedUsers set: email/mobile entr${unresolvedEmailsAndMobiles.length === 1 ? 'y' : 'ies'} `
+      + `definitively unresolved (kept, not effective, no retry): ${unresolvedEmailsAndMobiles.join(', ')}`);
+  }
   if (unresolvedUnionIds.length > 0) {
     logger.warn(`[config:${larkAppId}] allowedUsers set: union_id(s) not resolvable by this app (kept, not effective): ${unresolvedUnionIds.join(', ')}`);
-    return { ok: true, raw: rawEntries, resolved, unresolvedUnionIds };
+  }
+  if (unresolvedUnionIds.length > 0 || unresolvedEmailsAndMobiles.length > 0) {
+    return { ok: true, raw: rawEntries, resolved, unresolvedUnionIds: unresolvedUnionIds.length ? unresolvedUnionIds : undefined, unresolvedEmailsAndMobiles: unresolvedEmailsAndMobiles.length ? unresolvedEmailsAndMobiles : undefined };
   }
   return { ok: true, raw: rawEntries, resolved };
 }
@@ -878,7 +902,62 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
+
+/** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
+export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
+
+/**
+ * Dashboard / `/config` 写 herdr 块的严格门。落值复用与 bots.json 解析同一个
+ * {@link normalizeHerdrBackendConfig}（trim、剔除空值、全空 → undefined），但非法
+ * 输入显式报错而不是静默剔除（与 mojo 同形）：一个拼错的 placement 若被默默丢掉，
+ * 用户会得到「保存成功但没生效」的配置。空对象 / 全空字段归一为 null（清除整份
+ * 覆盖块，回落到默认 botmux 宿主与 workspace 放置）。
+ */
+export function coerceHerdrBackendConfigInput(parsed: unknown): CoerceResult {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'invalid_herdr_config: herdr 配置必须是 JSON 对象' };
+  }
+  const r = parsed as Record<string, unknown>;
+  const known = new Set<string>(HERDR_FIELD_NAMES);
+  const errors: string[] = [];
+  for (const key of Object.keys(r)) {
+    if (!known.has(key)) errors.push(`herdr.${key} 不是可识别字段`);
+  }
+  for (const key of ['sessionName', 'workspace', 'tab'] as const) {
+    const v = r[key];
+    if (v !== undefined && typeof v !== 'string') errors.push(`herdr.${key} 必须是字符串`);
+  }
+  if (r.placement !== undefined && r.placement !== 'workspace' && r.placement !== 'tab' && r.placement !== 'split') {
+    errors.push('herdr.placement 必须是 workspace、tab 或 split');
+  }
+  if (r.splitDirection !== undefined && r.splitDirection !== 'right' && r.splitDirection !== 'down') {
+    errors.push('herdr.splitDirection 必须是 right 或 down');
+  }
+  if (r.chatTypes !== undefined) {
+    // 元素必须合法；重复值与 bots.json/env 门一致，交由 normalizer 去重，不报错。
+    if (!Array.isArray(r.chatTypes) || r.chatTypes.some(t => t !== 'group' && t !== 'p2p')) {
+      errors.push('herdr.chatTypes 必须是仅含 group、p2p 的字符串数组');
+    }
+  }
+  if (errors.length > 0) return { ok: false, reason: `invalid_herdr_config: ${errors.join('；')}` };
+  return { ok: true, value: normalizeHerdrBackendConfig(parsed) ?? null };
+}
+
+/**
+ * 激活门（两个写入门共用：Dashboard PUT 与 IM `/config set`）：形状合法之后，
+ * 必须在与全局 BOTMUX_HERDR_* 叠加后仍含 sessionName 或 placement，worker 才会
+ * 采纳这份配置；否则它会「保存成功但零效果」。env 已提供放置方式时，bot 块只
+ * 覆盖 tab 等子字段是合法叠加，照常放行。bots.json 启动解析走
+ * normalizeHerdrBackendConfig，不经此门（宽松语义保持不变）。
+ */
+export function assertHerdrConfigActivates(value: unknown): string | null {
+  const effective = resolveHerdrBackendConfig(config.daemon.herdr,
+    (value ?? undefined) as import('../adapters/backend/types.js').HerdrBackendConfig | undefined);
+  return effective
+    ? null
+    : 'invalid_herdr_config: 需至少设置「宿主会话名」或「放置方式」，单独填写目标工作区 / 目标 Tab / 分屏方向 / 生效聊天类型不会生效（若已用 BOTMUX_HERDR_SESSION_NAME / BOTMUX_HERDR_PLACEMENT 全局设置，则可只覆盖其余字段）';
+}
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -974,6 +1053,15 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
               reason: `invalid_remote_runner_config: ${error instanceof Error ? error.message : String(error)}`,
             };
           }
+        }
+        if (spec.configKey === 'herdr') {
+          const result: CoerceResult = coerceHerdrBackendConfigInput(parsed);
+          if (!result.ok) return result;
+          if (result.value !== null) {
+            const activationError = assertHerdrConfigActivates(result.value);
+            if (activationError) return { ok: false, reason: activationError } as CoerceResult;
+          }
+          return result;
         }
         if (spec.configKey === 'triggerUserAuth') {
           // Same SHARED parser as the bots.json door, so the two cannot drift.

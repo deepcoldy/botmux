@@ -44,6 +44,35 @@ server.setRequestHandler(ListToolsRequestSchema, request => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, request => {
+  if (serverName === 'link-ref') {
+    const authorizationUrl = 'https://auth.example.test/authorize'
+      + '?code=code-value&token=token-value&signature=sig-value&state=state-value'
+      + '&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback';
+    return {
+      content: [
+        { type: 'text', text: `permission required: ${authorizationUrl}` },
+        {
+          type: 'resource',
+          resource: {
+            uri: 'demo://embedded',
+            mimeType: 'text/plain',
+            text: `documentation ${authorizationUrl}`,
+          },
+        },
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+      structuredContent: {
+        authorization: { url: authorizationUrl },
+        documentation_url: authorizationUrl,
+        headers: { Authorization: 'Bearer do-not-register' },
+        access_token: 'https://credential.example.test/secret',
+        excluded: {
+          _meta: { 'botmux/linkRefPolicy': 'exclude' },
+          url: 'https://excluded.example.test/path',
+        },
+      },
+    };
+  }
   if (serverName === 'delivery') {
     const outbound = join(process.env.BOTMUX_PLUGIN_HOME, 'outbound');
     mkdirSync(outbound, { recursive: true });
@@ -88,7 +117,17 @@ server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
 }));
 
 server.setRequestHandler(ReadResourceRequestSchema, request => ({
-  contents: [{ uri: request.params.uri, text: `${serverName}:${request.params.uri}` }],
+  contents: serverName === 'link-ref'
+    ? [{
+        uri: request.params.uri,
+        mimeType: 'application/json',
+        text: JSON.stringify({
+          authorization_url: 'https://auth.example.test/approve'
+            + '?state=resource-state&code=resource-code',
+          password: 'https://credential.example.test/password',
+        }),
+      }]
+    : [{ uri: request.params.uri, text: `${serverName}:${request.params.uri}` }],
 }));
 
 server.setRequestHandler(SubscribeRequestSchema, () => ({}));

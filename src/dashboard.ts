@@ -918,9 +918,10 @@ aggregator.on(ev => {
 const hostTerminalManager = createHostTerminalManager({
   getActiveToken: currentDashboardToken,
   // WS 升级不经 HTTP auth gate，所以在这里把 `/api/host-terminal` 那条 `legacyAuthed`
-  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
-  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把宿主 shell
-  // 开放给平台上的任何人。
+  // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，带平台角色头（X-Botmux-Role）
+  // 的请求不算——它带的也是本机活跃 cookie，只比 cookie 会把宿主 shell 开放给终端分享
+  // 链接上的 guest。平台机器 Dashboard（`m-`）反代不注入角色头，那里进来的机器主人和
+  // 协管者解析成 legacy 身份、可以用（见 host-terminal.ts 顶注）。
   isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
   // `bmx-<sessionId 前 8 位>`（TmuxBackend.sessionName）→ 「bot · 话题」，让终端页的
   // tmux 列表里托管会话有个人话名字。
@@ -4719,8 +4720,9 @@ const server = createServer(async (req, res) => {
         settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
-        // 「终端」页只对本机 legacy 管理身份开放（同 /api/host-terminal 门禁），协管者
-        // 虽然 authed 也看不到这个入口。
+        // 「终端」页只对本机 legacy 管理身份开放（同 /api/host-terminal 门禁）：带平台角色头
+        // 的协管者虽然 authed 也看不到入口。平台机器 Dashboard（`m-`）反代不注入角色头，
+        // 那里进来的机器主人和协管者都解析成 legacy 身份，能看到。
         hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
       });

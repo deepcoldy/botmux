@@ -276,33 +276,11 @@ function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
-function removeCodexEntry(path: string): boolean {
-  if (!existsSync(path)) return false;
-  const current = readFileSync(path, 'utf-8');
-  const nextBody = stripCodexBotmuxSections(dropMarkerLines(current, GATEWAY_START, GATEWAY_END));
-  const next = nextBody ? `${nextBody}\n` : '';
-  if (next === current) return false;
-  atomicWriteFileSync(path, next, { mode: 0o600 });
-  return true;
-}
-
 function isOwnedJsonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const env = (value as Record<string, unknown>).env;
   return !!env && typeof env === 'object' && !Array.isArray(env)
     && (env as Record<string, unknown>)[MCP_GATEWAY_OWNER_ENV] === '1';
-}
-
-function removeClaudeEntry(path: string): boolean {
-  if (!existsSync(path)) return false;
-  const data = parseJsonConfig(path);
-  if (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers)) return false;
-  const servers = data.mcpServers as Record<string, unknown>;
-  if (!isOwnedJsonEntry(servers.botmux)) return false;
-  delete servers.botmux;
-  data.mcpServers = servers;
-  atomicWriteFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  return true;
 }
 
 function configPath(spec: McpGatewayInstallSpec): string {
@@ -321,25 +299,6 @@ export function ensureGatewayEntry(
       ? ensureCodexEntry(path, entry)
       : ensureClaudeEntry(path, entry);
     return { cliId: adapter.id, state: changed ? 'installed' : 'unchanged', configPath: path };
-  } catch (err) {
-    return {
-      cliId: adapter.id,
-      state: 'adapter-required',
-      configPath: path,
-      warning: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-export function removeGatewayEntry(
-  adapter: Pick<CliAdapter, 'id' | 'mcpGateway'>,
-): GatewayEntryReport {
-  const spec = adapter.mcpGateway;
-  if (!spec) return { cliId: adapter.id, state: 'adapter-required' };
-  const path = configPath(spec);
-  try {
-    const removed = spec.format === 'codex-toml' ? removeCodexEntry(path) : removeClaudeEntry(path);
-    return { cliId: adapter.id, state: removed ? 'removed' : 'absent', configPath: path };
   } catch (err) {
     return {
       cliId: adapter.id,

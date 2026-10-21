@@ -2,6 +2,11 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { __setLoopbackTransportForTests } from '../../src/core/loopback-fetch.js';
+import {
+  MANAGED_ORIGIN_PROOF_DOMAIN,
+  writeManagedOriginAttestationProof,
+} from '../../src/core/managed-origin-attestation.js';
+import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -37,6 +42,10 @@ const topicLookups = new Map<string, number>();
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: { message_id: 'om_separate_message' } };
+  } else if (url.pathname.includes('/cardkit/v1/cards/') && method === 'PUT') {
+    const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
+    console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
+    data = { code: 0, data: {} };
   } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATE) {
     const state = process.env.BOTMUX_TEST_TOPIC_STATE;
     data = { code: 0, data: { items: state === 'missing' ? [] : [{
@@ -68,10 +77,74 @@ const topicLookups = new Map<string, number>();
   }
   return { data, status: 200, statusText: 'OK', headers: {}, config };
 };
-if (process.env.BOTMUX_TEST_DURABLE_SEND === '1') {
+if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK_REF_URL) {
   __setLoopbackTransportForTests(async (url, init) => {
     const target = new URL(url);
     const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    if (target.pathname.endsWith('/api/session-origin/attest')
+      && process.env.BOTMUX_TEST_MANAGED_ORIGIN === '1') {
+      console.log('CAPTURE_ATTEST=' + JSON.stringify({ method: init.method, path: target.pathname, body }));
+      writeManagedOriginAttestationProof({
+        dataDir: process.env.SESSION_DATA_DIR!,
+        proof: {
+          domain: MANAGED_ORIGIN_PROOF_DOMAIN,
+          version: 1,
+          nonce: body.nonce,
+          channelId: body.channelId,
+          sessionId: body.sessionId,
+          turnId: process.env.BOTMUX_TURN_ID!,
+          ...(process.env.BOTMUX_TEST_ATTEST_LINK_REF_MODE === 'none'
+            ? {}
+            : { linkRefMode: 'enabled' as const }),
+          requiresCodexAppLedger: false,
+          issuedAtMs: Date.now(),
+        },
+      });
+      return new Response(null, { status: 200 });
+    }
+    if (target.pathname.endsWith('/link-refs/resolve')) {
+      console.log('CAPTURE_LINK_REF_RESOLVE=' + JSON.stringify({
+        method: init.method,
+        path: target.pathname,
+        body,
+      }));
+      const exactUrl = process.env.BOTMUX_TEST_LINK_REF_URL;
+      const acceptedRef = process.env.BOTMUX_TEST_LINK_REF_ID;
+      const resolved = new Map(exactUrl && acceptedRef ? [[acceptedRef, exactUrl]] : []);
+      const expand = (value: string): string => findExecutableLinkRefs(value).expand(resolved);
+      const walk = (value: unknown): unknown => {
+        if (typeof value === 'string') return expand(value);
+        if (Array.isArray(value)) return value.map(walk);
+        if (!value || typeof value !== 'object') return value;
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, walk(entry)]));
+      };
+      try {
+        const payload = body?.payload ?? {};
+        return new Response(JSON.stringify({
+          ok: true,
+          payload: {
+            ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
+            ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
+            ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
+            ...(payload.completionProposal === undefined
+              ? {}
+              : { completionProposal: walk(payload.completionProposal) }),
+            ...(payload.expectedLinks === undefined
+              ? {}
+              : { expectedLinks: payload.expectedLinks.map(expand) }),
+            refCount: 1,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error
+          ? String((error as { code: unknown }).code)
+          : 'link_ref_unknown';
+        return new Response(JSON.stringify({ ok: false, error: code }), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    }
     console.log('CAPTURE_DURABLE=' + JSON.stringify({
       method: init.method,
       path: target.pathname,

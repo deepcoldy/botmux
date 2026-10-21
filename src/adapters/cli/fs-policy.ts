@@ -645,7 +645,10 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
-  const hostOnlyRoots = (ctx.hostOnlyDenyPaths ?? [])
+  const hostOnlyRoots = [
+    `${ctx.sessionDataDir}/link-refs`,
+    ...(ctx.hostOnlyDenyPaths ?? []),
+  ]
     .map(normalizeFsPath)
     .filter((p): p is string => p !== null);
   const suppressedHostOnlyPaths: string[] = [];

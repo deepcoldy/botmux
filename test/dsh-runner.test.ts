@@ -285,6 +285,7 @@ describe('dsh-runner', () => {
     const secondText = prompts[1].prompt.contentBlocks[0].text;
     expect(firstText).toContain('<botmux_identity>');
     expect(firstText).toContain('TestBot');
+    expect(firstText).toContain('部署成功必须有实际观测依据');
     expect(firstText).toContain('第一句');
     expect(secondText).not.toContain('<botmux_identity>');
     expect(secondText).toBe('第二句');
@@ -301,7 +302,7 @@ describe('dsh-runner', () => {
     expect(final.payload.content).toContain('boom');
   });
 
-  it('emits an empty final when the agent produces no text', async () => {
+  it('sends a diagnostic final when the agent produces no text', async () => {
     h = spawnRunner('empty');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
@@ -309,8 +310,9 @@ describe('dsh-runner', () => {
     await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
 
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
-    expect(final.payload.content).toBe('');
-    expect(h.stdout).toContain('completed without text output');
+    expect(final.payload.content).toContain('没有生成最终回复');
+    expect(final.payload.content).toContain('无法确认任务是否成功');
+    expect(h.stdout).toContain('sent a diagnostic reply');
   });
 
   it('takes only the last assistant message as the final text and accumulates usage', async () => {
@@ -435,6 +437,57 @@ describe('dsh-runner', () => {
 
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('timed out');
+  }, 30_000);
+
+  it('does not arm a watchdog when the turn timeout is not configured', async () => {
+    h = spawnRunner('hang');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('等待外部部署'));
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 750));
+
+    expect(parseMarkers(h.stdout).filter(m => m.kind === 'final')).toHaveLength(0);
+    expect(h.child.exitCode).toBeNull();
+  }, 30_000);
+
+  it('keeps an active turn alive while its correlated tools make progress', async () => {
+    h = spawnRunner('progressive', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('long-running task'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('你好，我是 dsh。');
+    expect(h.child.exitCode).toBeNull();
+  }, 30_000);
+
+  it('still terminates a turn that emits progress forever', async () => {
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('never-ending task'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('hard limit');
+  }, 30_000);
+
+  it('does not extend the watchdog for notifications without this turn receipt', async () => {
+    h = spawnRunner('unclaimed-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('unclaimed events'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('timed out after 300ms');
+    expect(finals[0].payload.content).not.toContain('hard limit');
   }, 30_000);
 
   // -------------------------------------------------------------------------

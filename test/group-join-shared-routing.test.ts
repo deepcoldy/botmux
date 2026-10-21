@@ -286,6 +286,116 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
+  it('首轮登记拉 bot 入群的操作人为 sender（schedule 身份），且保持 mention 安全方向', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_sender';
+    const chatId = 'oc_join_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-sender'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
+  it('操作人缺失时首轮登记保持无 sender（fail-closed）', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_no_operator';
+    const chatId = 'oc_join_no_operator';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir('repo-join-no-operator'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toBeDefined();
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+  });
+
+  it('chat 模式（非 shared）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_sender';
+    const chatId = 'oc_join_chat_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-chat-sender'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entries = Object.entries(ds?.session.replyTargets ?? {});
+    const joinEntry = entries.find(([turnId]) => turnId.startsWith('join_'));
+    expect(joinEntry?.[1]).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+    // chat 顶层无根：join_ 首轮不带 rootMessageId。
+    expect(joinEntry?.[1]?.rootMessageId).toBeUndefined();
+  });
+
+  it('话题群（thread scope）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_sender';
+    const chatId = 'oc_join_topic_sender';
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-topic-sender'),
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.replyTargets?.om_join_seed).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
   it.each(['peer', 'bot', 'app'] as const)('keeps %s operator bot evidence through opening and identity-cache resolution', async (evidence) => {
     const { daemon, registry, identities, types } = modules;
     const appId = `app_join_bot_${evidence}`;

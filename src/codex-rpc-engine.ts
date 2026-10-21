@@ -37,6 +37,7 @@ import {
 import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
 import { pidIsSignalable } from './utils/process-alive.js';
+import { PROCESS_TABLE_MAX_BUFFER } from './utils/exec-limits.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
@@ -622,7 +623,7 @@ export class CodexRpcEngine {
     let argv = '';
     try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
       catch { return false; }
     }
     if (!/\bapp-server\b/.test(argv)) return false;

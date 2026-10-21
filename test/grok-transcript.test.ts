@@ -236,6 +236,57 @@ describe('drainGrokUpdates', () => {
     expect(result.events.at(-1)).toMatchObject({ text: 'First part, second part.', terminalStatus: 'completed' });
   });
 
+  it('reports background task launches and stops without touching the buffered reply', () => {
+    // Record shapes as Grok 1.x writes them (command / cwd / output paths omitted).
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const bg = (update: Record<string, unknown>, eventId: string, ts: number) => ({
+      timestamp: Math.floor(ts / 1000),
+      method: '_x.ai/session/update',
+      params: { sessionId: sid, update, _meta: { eventId, agentTimestampMs: ts } },
+    });
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'run it in the background', 'user'),
+      agentChunk(sid, 'Started ', 'a1'),
+      bg({ sessionUpdate: 'task_backgrounded', tool_call_id: 'call-1', task_id: 'call-1' }, 'launch', 1_000_110),
+      bg({ sessionUpdate: 'task_backgrounded', tool_call_id: 'call-2', task_id: 'call-2', monitor_description: 'watch CI' }, 'launch-2', 1_000_115),
+      bg({ sessionUpdate: 'background_tasks', tasks: [
+        { task_id: 'call-1', kind: 'bash', status: 'running', started_at: '2026-09-18T00:00:32Z' },
+        { task_id: 'call-2', kind: 'monitor', status: 'running', started_at: '2026-09-18T00:00:33Z' },
+        { task_id: 'call-0', kind: 'bash', status: 'completed', started_at: '2026-09-18T00:00:01Z' },
+      ] }, 'list', 1_000_120),
+      agentChunk(sid, 'it.', 'a2'),
+      turnDone(sid, 'done'),
+    ]);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(first.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(first.events.at(-1)).toMatchObject({ text: 'Started it.' });
+    expect(first.backgroundTasks).toEqual({
+      launched: [
+        { taskId: 'call-1', kind: 'shell', atMs: 1_000_110 },
+        { taskId: 'call-2', kind: 'monitor', atMs: 1_000_115 },
+        { taskId: 'call-1', kind: 'shell', atMs: 1_000_120 },
+        { taskId: 'call-2', kind: 'monitor', atMs: 1_000_120 },
+      ],
+      settled: ['call-0'],
+    });
+
+    appendFileSync(path, [
+      bg({ sessionUpdate: 'task_completed', task_snapshot: { task_id: 'call-1', kind: 'bash', exit_code: 0, is_backgrounded: true }, will_wake: true }, 'done-1', 1_000_300),
+      bg({ sessionUpdate: 'background_tasks', tasks: [
+        { task_id: 'call-1', kind: 'bash', status: 'completed' },
+        { task_id: 'call-2', kind: 'monitor', status: 'running' },
+      ] }, 'list-2', 1_000_301),
+    ].map(line => JSON.stringify(line)).join('\n') + '\n');
+    const second = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    expect(second.events).toEqual([]);
+    expect(second.backgroundTasks).toEqual({
+      launched: [{ taskId: 'call-2', kind: 'monitor', atMs: 1_000_301 }],
+      settled: ['call-1', 'call-1'],
+    });
+    // A range with no background records carries no field at all.
+    expect(drainGrokUpdates(path, second.newOffset).backgroundTasks).toBeUndefined();
+  });
+
   it.each(['pre_tool_use', 'post_tool_use', 'post_tool_use_failure', 'session_end'])(
     'emits interrupted narration once and releases its cursor on %s', hook => {
       const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
