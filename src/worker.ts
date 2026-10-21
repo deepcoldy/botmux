@@ -271,7 +271,8 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -497,7 +498,11 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
-import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
+import {
+  inspectPostTerminalComposer,
+  isTypeAheadBlockedByBypass,
+  resolvePtyInputPolicy,
+} from './utils/pty-input-policy.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -9647,6 +9652,7 @@ function codexBridgeMarkPendingTurn(
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
+  structuredTurnsWithSubmitNotice.delete(turnId);
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
   codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark, linkRefMode);
   checkpointCodexAdoptRecovery();
@@ -9940,6 +9946,23 @@ function retireRpcLifecycleFromStructuredTerminal(
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
+/** An ordinary Lark turn whose transcript start never arrived is a reply the
+ *  bridge can no longer deliver: its head is gone, so even if the CLI answers,
+ *  the final has nothing to attach to. Until now that was one INFO log line and
+ *  the card simply went idle ("waiting for input"), so the sender reasonably
+ *  assumed the CLI had nothing to say. Tell the thread instead; which turns
+ *  qualify is decided by `uncollectedTurnsNeedingNotice`. */
+function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): void {
+  for (const turn of turns) {
+    log(`Structured bridge could not collect turn ${turn.turnId}: no transcript start before the pre-start lease expired; notifying the thread`);
+    send({
+      type: 'user_notify',
+      message: t('worker.structured_turn_not_collected', { cliName: cliName() }),
+      turnId: turn.turnId,
+    });
+  }
+}
+
 /** Expire confirmed or attribution-only unstarted queue heads at an explicit worker
  *  lifecycle boundary. Pruning can replay a buffered successor user+final and
  *  thereby produce an immediately emittable completion, so query/projection
@@ -9947,6 +9970,7 @@ function retireRpcLifecycleFromStructuredTerminal(
  *  through this helper and drains ready output in the same call stack. */
 function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   let fenceCurrentRpcEngine = false;
+  const settledByTerminal = new Set<CodexPendingTurn>();
   const dropped = pruneExpiredPreStartHeadsAndEmit(
     codexBridgeQueue,
     emitReadyCodexTurns,
@@ -9955,7 +9979,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
       // A bounded pre-start lease is also the terminal boundary for a durable
       // delivery attempt that the CLI accepted but never wrote to transcript.
       // Settle N before the prune replay drains successor N+1; ordinary IM
-      // turns have no dispatchAttempt and remain log-only as before.
+      // turns have no dispatchAttempt and get the thread notice below instead.
       for (const turn of turns) {
         const identity: CodexRpcTurnIdentity = {
           turnId: turn.turnId,
@@ -9992,6 +10016,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
               : 'structured_start_timeout',
             turn.dispatchAttempt,
           );
+          settledByTerminal.add(turn);
         }
         // Publish/retire N before a synchronous immediate restart can clear the
         // current exact identity in killCli(). The callback still installs the
@@ -10008,6 +10033,15 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   );
   if (dropped.length === 0) return false;
   log(`${source}: expired ${dropped.length} structured head(s) without transcript start (${dropped.map(turn => turn.turnId).join(', ')})`);
+  notifyUncollectedStructuredTurns(uncollectedTurnsNeedingNotice(dropped, {
+    settledByTerminal,
+    hasOwnNotice: turn => structuredTurnsWithSubmitNotice.delete(turn.turnId)
+      || submitFailureChains.has({
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+        cliGeneration: cliSpawnGeneration,
+      }),
+  }));
   if (fenceCurrentRpcEngine) log('Fenced ambiguous Codex RPC generation before structured successor replay');
   // A rejected prompt-ready signal may be waiting on this exact pre-start
   // lease. Re-evaluate it after both the queue mark and its separate RPC
@@ -14923,6 +14957,12 @@ let unscopedSubmitFailureChainSequence = 0;
  *  instead of stacking a second one, so a logical submission/attempt can never
  *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
 const submitFailureChains = createSubmitFailureChainController();
+/** Structured-bridge turns whose ordinary write threw. The throw path already
+ *  tells the user (submit failure / ambiguous recovery / ZMX hold), and the
+ *  bytes may never have reached the CLI, so their later lease expiry must not
+ *  add a "sent, but not collected" notice. Reset when the turn is marked again
+ *  for a new write; consumed on expiry or when the mark is dropped. */
+const structuredTurnsWithSubmitNotice = new Set<string>();
 // A warning settles its bounded notification chain, but cannot abandon the
 // daemon's durable activation journal. Keep observing only the original receipt.
 const queuedActivationReceipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
@@ -14953,6 +14993,7 @@ function notifyAmbiguousSubmissionRecovery(
  *  and any verified pre-start lease is bounded and owns its expiry re-drive. */
 function dropFailedBridgeMark(bridgeTurnId?: string, dispatchAttempt?: number): void {
   if (!bridgeTurnId) return;
+  structuredTurnsWithSubmitNotice.delete(bridgeTurnId);
   const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId, dispatchAttempt);
   const droppedStructured = codexBridgeQueue.dropPendingTurn(bridgeTurnId, dispatchAttempt);
   if (dropped) {
@@ -15352,6 +15393,7 @@ function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
     cliAdapter ?? {},
     backendScreenEvidenceIsAuthoritativeForMutation(),
     codexAppRuntimeTypeAheadReady(),
+    isTypeAheadBlockedByBypass(cliAdapter ?? { id: lastInitConfig?.cliId }, lastInitConfig?.disableCliBypass),
   );
 }
 
@@ -16175,6 +16217,7 @@ async function flushPending(): Promise<void> {
             undefined,
             item.dispatchAttempt,
           );
+          structuredTurnsWithSubmitNotice.add(bridgeTurnId);
         }
         log(`writeInput threw: ${err?.message ?? err}`);
         if (blockedBeforeWrite && submissionBackend) {

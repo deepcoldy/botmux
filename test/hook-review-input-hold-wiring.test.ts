@@ -20,4 +20,12 @@ describe('Hook review input hold', () => {
     const rawGate = raw.slice(0, raw.indexOf('deliverRawInput('));
     expect(rawGate).toMatch(/refreshHookReviewInputHold\([\s\S]*\bhookReviewInputHold\b[\s\S]*\.enqueueRaw\(/);
   });
+
+  it('wires disableCliBypass into the runtime type-ahead policy', () => {
+    const start = worker.indexOf('function runtimePtyInputPolicy');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const fn = worker.slice(start, worker.indexOf('\n}', start));
+    expect(fn).toContain('isTypeAheadBlockedByBypass(');
+    expect(fn).toContain('lastInitConfig?.disableCliBypass');
+  });
 });

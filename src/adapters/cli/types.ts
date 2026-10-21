@@ -644,7 +644,14 @@ export interface CliAdapter {
    *  (0.134.0+) parks it too but STEERS it into the active turn — a tool-running
    *  turn can merge the queued input into one final (rollout: user1 → user2 →
    *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
-   *  correct for both shapes. */
+   *  correct for both shapes. Antigravity (`agy`) records the Enter in
+   *  `history.jsonl` immediately while busy: `queue` holds it until the turn
+   *  ends (`Auto-flushing` at turn end, strictly interleaved), whereas
+   *  `send-immediately` forwards it into the active conversation without
+   *  cancelling the in-flight tool (a merged turn's final is attributed to the
+   *  later message). Requires approval bypass on `agy`; `resolvePtyInputPolicy`
+   *  suppresses type-ahead when `disableCliBypass` is enabled because Enter
+   *  approves `agy`'s blocking permission dialog. */
   readonly supportsTypeAhead?: boolean;
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext

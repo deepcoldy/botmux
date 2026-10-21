@@ -1930,6 +1930,7 @@ export const messages: Record<string, string> = {
   'worker.interrupt_recovery_web': 'Retry, or open the Web Terminal and interrupt it manually.',
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
+  'worker.structured_turn_not_collected': '⚠️ This message was sent to {cliName}, but the turn never showed up in its session transcript, so botmux cannot collect the reply and it will not be forwarded here automatically. If {cliName} answered in the terminal, open the Web terminal to read it; resend only if it was not processed.',
 
   // Restart / maintenance report (bot-0 DM to owner)
   'restart.updated_restarted': '🔄 **botmux updated & restarted**',
