@@ -2,7 +2,7 @@ import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
-import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -17,6 +17,9 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
+   * Unlike pasteText, this capability guarantees the boundary markers. */
+  sendBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
@@ -228,7 +231,7 @@ export interface CliAdapter {
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
-     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  (dsh). Forwarded as `--turn-timeout-ms` to opt into an idle watchdog;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
@@ -917,6 +920,8 @@ export interface StructuredBridgeDrainResult {
   /** Driver-owned incremental state. The worker hands it back verbatim as
    *  {@link StructuredBridgeDrainContext.state} and never looks inside. */
   state?: unknown;
+  /** Background tasks started / stopped in this byte range (Grok). */
+  backgroundTasks?: BackgroundTaskSignals;
 }
 
 export interface StructuredBridgeDrainContext {

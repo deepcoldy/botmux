@@ -9,6 +9,7 @@ import {
   resolveLoopbackPeerProcesses,
 } from '../src/core/current-actor-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { __resetLoopbackPeersCacheForTest } from '../src/utils/loopback-peers.js';
 
 function procStat(pid: number, ppid: number, start: string): string {
   const tail = ['S', String(ppid), '1', '1', '0', '-1', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', start];
@@ -85,6 +86,33 @@ describe('daemon current actor attestation', () => {
     expect(resolveLoopbackPeerProcesses({
       remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951,
     })).toEqual({ ok: false, reason: 'not_loopback' });
+  });
+
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-env-'));
+    mkdirSync(join(procRoot, 'net'), { recursive: true });
+    // No client-side tuple in this host's tables → a remote peer could never
+    // pass; an env-allowed LOCAL peer that reaches here gets peer_unresolved,
+    // proving the address ring (not the inode ring) was relaxed.
+    writeFileSync(join(procRoot, 'net', 'tcp'), 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n');
+    writeFileSync(join(procRoot, 'net', 'tcp6'), '');
+    const prev = process.env.BOTMUX_LOOPBACK_PEERS;
+    process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.1';
+    __resetLoopbackPeersCacheForTest();
+    try {
+      expect(resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'peer_unresolved' });
+      expect(resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.2', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'not_loopback' });
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_LOOPBACK_PEERS;
+      else process.env.BOTMUX_LOOPBACK_PEERS = prev;
+      __resetLoopbackPeersCacheForTest();
+      unlinkSync(join(procRoot, 'net', 'tcp'));
+      unlinkSync(join(procRoot, 'net', 'tcp6'));
+    }
   });
 
   it('binds a live client descendant to the in-memory turn caller', async () => {

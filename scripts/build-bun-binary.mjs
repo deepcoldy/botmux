@@ -35,6 +35,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { makeNativeEmbedPlugin } from './bun-native-embed-plugin.mjs';
+import { warnIfBunVersionDrifts } from './check-bun-version.mjs';
 
 const require = createRequire(import.meta.url);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -345,6 +346,8 @@ async function main() {
     console.error('This script must be run with Bun: `bun scripts/build-bun-binary.mjs ...`');
     process.exit(1);
   }
+  // 编译产物随 bun 版本走，是最该与 CI 对齐的一步（只告警，不拦截）。
+  warnIfBunVersionDrifts();
   const args = parseArgs(process.argv.slice(2));
   if (args.all) {
     for (const target of RELEASE_TARGETS) await buildOne({ target, out: undefined });

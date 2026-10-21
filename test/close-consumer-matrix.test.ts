@@ -195,6 +195,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Injects the raw typed close result into the durable card-control runtime; '
       + 'that runtime durably replies with refusal/residual details before settling.',
   },
+  'daemon.ts::closeCompletedSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Listener auto-close waits for final delivery outside the Bot mutation gate; '
+      + 'the background wrapper logs refusal and residual, and refusal never reports success.',
+  },
   'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Document-comment admission rollback has no direct user surface; the '

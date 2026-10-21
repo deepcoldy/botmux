@@ -27,6 +27,7 @@ import { config } from '../src/config.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
 import { saveFrozenCards } from '../src/services/frozen-card-store.js';
+import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 const tempDirs: string[] = [];
@@ -73,8 +74,35 @@ describe('closeSession leaves the streaming card alone', () => {
   });
   afterEach(() => {
     workerPool.setActiveSessionsRegistry(new Map());
+    setLinkRefRuntime(undefined);
     sessionStore.init('test-app');
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('deletes LinkRef rows only after the durable close commits', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-link-ref-'));
+    tempDirs.push(dataDir);
+    const prev = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    const deleteSession = vi.fn(() => 1);
+    setLinkRefRuntime({ deleteSession } as unknown as LinkRefRuntime);
+    try {
+      const s = sessionStore.createSession('oc_close_link_ref', 'om_close_link_ref', 'close refs', 'group');
+      s.larkAppId = 'app-close-card';
+      sessionStore.updateSession(s);
+      workerPool.setActiveSessionsRegistry(new Map());
+
+      await expect(workerPool.closeSession(s.sessionId)).resolves.toMatchObject({
+        ok: true,
+        outcome: 'closed',
+      });
+
+      expect(deleteSession).toHaveBeenCalledOnce();
+      expect(deleteSession).toHaveBeenCalledWith('app-close-card', s.sessionId);
+    } finally {
+      config.session.dataDir = prev;
+    }
   });
 
   // Close is not a card-cleanup step for an opt-out bot: the streaming card
@@ -316,6 +344,8 @@ describe('closeSession leaves the streaming card alone', () => {
     const prev = config.session.dataDir;
     config.session.dataDir = dataDir;
     sessionStore.init('app-close-card');
+    const deleteSession = vi.fn(() => 1);
+    setLinkRefRuntime({ deleteSession } as unknown as LinkRefRuntime);
     try {
       const s = sessionStore.createSession('oc_closecard', 'om_closecard', 'closecard', 'group');
       s.larkAppId = 'app-close-card';
@@ -328,6 +358,7 @@ describe('closeSession leaves the streaming card alone', () => {
       await expect(workerPool.closeSession(s.sessionId)).rejects.toThrow('disk full');
       await workerPool.__testOnly_waitForPinStreamingCardIdle();
       expect(unpinMessage).not.toHaveBeenCalled();
+      expect(deleteSession).not.toHaveBeenCalled();
       failingClose.mockRestore();
     } finally {
       config.session.dataDir = prev;

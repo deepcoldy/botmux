@@ -38,7 +38,6 @@ import {
   markSessionGroupTitled,
   markSessionGroupTitleFailed,
   removeSessionGroup,
-  listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
 import {
@@ -141,7 +140,6 @@ describe('session-groups-store', () => {
     registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
     removeSessionGroup('oc_a');
     expect(isSessionGroup('oc_a')).toBe(false);
-    expect(listSessionGroups()).toHaveLength(0);
   });
 
   it('never throws when not initialised', async () => {
@@ -150,7 +148,6 @@ describe('session-groups-store', () => {
     initSessionGroups('cli_testapp');
     expect(isSessionGroup('oc_x')).toBe(false);
     expect(getSessionGroup('oc_x')).toBeUndefined();
-    expect(listSessionGroups()).toEqual([]);
   });
 });
 

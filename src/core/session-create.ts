@@ -33,12 +33,6 @@ export interface Coworker {
   openId?: string;
 }
 
-export function normalizeCreateMode(value: unknown): CreateSessionMode | null {
-  return typeof value === 'string' && (CREATE_SESSION_MODES as readonly string[]).includes(value)
-    ? (value as CreateSessionMode)
-    : null;
-}
-
 export function normalizeCreateColumn(value: unknown): CreateSessionColumn | null {
   return typeof value === 'string' && (CREATE_SESSION_COLUMNS as readonly string[]).includes(value)
     ? (value as CreateSessionColumn)

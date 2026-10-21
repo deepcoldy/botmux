@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
-import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
@@ -39,7 +39,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
     findActiveBySessionId: () => ds, authorizeSessionScopedIpc,
-    pickTurnReplyTarget, dispatchCallerFromReply,
+    pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,

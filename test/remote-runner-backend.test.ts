@@ -63,8 +63,15 @@ describe('RemoteRunnerBackend', () => {
       content: 'hello',
       trustedCaller: {
         requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test_bot',
         requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        senderType: 'bot',
+        botOwner: {
+          openId: 'ou_owner',
+          unionId: 'on_owner',
+          email: 'owner@bytedance.com',
+          source: 'platform_team',
+        },
       },
     })).resolves.toEqual({ submitted: true });
 
@@ -140,7 +147,7 @@ describe('RemoteRunnerBackend', () => {
       mention: 'explicit',
       mentions: ['ou_target:Target'],
       content: 'final payload',
-    }));
+    }), {});
   });
 
   it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
@@ -557,6 +564,7 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-survived',
       dispatchAttempt: 4,
     });
+    expect(backend.setRecoveredTurnHostContext('turn-survived', {})).toBe(true);
     expect(progress.join('')).toContain('recovered progress');
     await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
       .resolves.toMatchObject({ submitted: false });

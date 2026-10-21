@@ -105,6 +105,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   buildStreamingCardJson: vi.fn(),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
 }));
 
 const rememberLastCliInputMock = vi.fn();

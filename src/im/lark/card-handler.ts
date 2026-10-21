@@ -4,6 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection } from '../../core/prompt-injection.js';
+import { normalizeCardActionData } from './card-action-data.js';
+import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
@@ -30,10 +32,8 @@ import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import {
   checkNonce,
-  clearPending,
-  getPendingGrantLimits,
-  getPendingMessage,
-  markDenied,
+  claimPendingGrant,
+  denyPending,
   updatePendingGrantLimits,
 } from './grant-pending.js';
 import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../../services/grant-policy.js';
@@ -81,7 +81,7 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -95,10 +95,19 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { repinSessionWorkingDir } from '../../core/session-cwd.js';
+import { workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
-import { DISMISS_CONFIRM_ACTION, buildDismissSubmittedCard } from './dismiss-card.js';
+import {
+  DISMISS_CLEANUP_WT_ACTION,
+  DISMISS_CONFIRM_ACTION,
+  buildDismissSubmittedCard,
+  buildWorktreeCleanupResultCard,
+  buildWorktreeCleanupRunningCard,
+} from './dismiss-card.js';
+import { runWorktreeCleanupJob } from '../../core/worktree-cleanup-run.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -160,7 +169,7 @@ export interface CardHandlerDeps {
 }
 
 /**
- * Lark card action callback envelope.
+ * Normalized Lark card action data (see normalizeCardActionData).
  *
  * Exported so module-specific dashboard handlers can share the callback type
  * without redeclaring it.
@@ -502,6 +511,59 @@ function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string 
  * directory-entry form. Extracted to module scope so the form-submit branch can
  * reuse the exact same spawn/switch path instead of duplicating it.
  */
+type RepoCommitContext = Parameters<typeof commitRepoSelection>[0];
+
+/** The recovery card outlived its purpose (the directory came back, or `/cd`
+ *  moved the session): say so and take the card down. */
+async function retireMootRecoveryCard(ctx: RepoCommitContext): Promise<void> {
+  const { ds, rootId, cardMessageId, larkAppId, sessionReply } = ctx;
+  const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+  markRepoCardConsumed(ds, cardToWithdraw);
+  ds.repoCardMessageId = undefined;
+  ds.workingDirRecovery = undefined;
+  await sessionReply(rootId, t('card.repo.recovery_resolved', undefined, localeForBot(ds.larkAppId)));
+  deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+}
+
+/** Point a session whose directory was deleted at `dirPath`, keeping the
+ *  session and its CLI conversation: the same retirement as `/cd`, so nothing
+ *  keeps running against the old path — a backing pane left over from before
+ *  the deletion would otherwise be re-attached instead of a CLI started here.
+ *  The next message resumes in `dirPath`. */
+async function moveSessionForRecovery(
+  ctx: RepoCommitContext,
+  dirPath: string,
+  riffRepoDirs?: string[],
+): Promise<boolean> {
+  const { ds, rootId, cardMessageId, larkAppId, activeSessions, sessionReply } = ctx;
+  const targetSessionId = ds.session.sessionId;
+  const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+  const outcome = await withBotTurnMutation(ds.larkAppId, async () => {
+    const current = [...activeSessions.values()].find(
+      candidate => candidate.session.sessionId === targetSessionId
+        && candidate.session.status === 'active',
+    );
+    if (!current || current !== ds) return 'gone' as const;
+    if (hasProtectedSessionMutationOwnership(current)) return 'pending' as const;
+    const suspended = !current.adoptedFrom && suspendWorker(current, 'working_dir_changed');
+    if (!suspended) killWorker(current);
+    repinSessionWorkingDir(current, dirPath);
+    current.session.riffRepoDirs = riffRepoDirs;
+    sessionStore.updateSession(current.session);
+    markRepoCardConsumed(current, cardToWithdraw);
+    current.repoCardMessageId = undefined;
+    current.workingDirRecovery = undefined;
+    return 'moved' as const;
+  });
+  if (outcome === 'pending') {
+    await sessionReply(rootId, '当前会话仍有待提交消息，暂不能切换仓库；请等待提交完成或关闭会话。');
+    return false;
+  }
+  if (outcome === 'gone') return false;
+  deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+  return true;
+}
+
 export async function commitRepoSelection(
   ctx: {
     ds: DaemonSession;
@@ -568,6 +630,26 @@ export async function commitRepoSelection(
       '当前会话仍有待提交消息，暂不能切换仓库；请等待提交完成或关闭会话。',
     );
     return false;
+  }
+
+  // The working-directory recovery card moves the SAME session (like `/cd`);
+  // it must never reach the mid-session switch below, which closes it.
+  if (!ds.pendingRepo && cardMessageId !== undefined
+    && ds.workingDirRecovery?.cardMessageId === cardMessageId) {
+    if (!workingDirRecoveryPending(ds)) {
+      await retireMootRecoveryCard(ctx);
+      return false;
+    }
+    const moved = await moveSessionForRecovery(ctx, dirPath, opts?.riffRepoDirs);
+    if (moved) {
+      await sessionReply(rootId, t(
+        opts?.suppressConfirmReply ? 'card.repo.recovery_resend_hint' : 'card.repo.recovery_switched',
+        { path: dirPath },
+        locTarget,
+      ));
+      logger.info(`[${tag(ds)}] Working directory recovered: session moved to ${dirPath}`);
+    }
+    return moved;
   }
 
   if (ds.pendingRepo) {
@@ -1239,7 +1321,9 @@ async function cardReplyOptions(
   }
 }
 
-export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
+export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
+  const data = normalizeCardActionData(input);
+  logCardActionDiagnostics('handler', input, data);
   const { activeSessions, lastRepoScan } = deps;
   // turnId is forwarded only when the caller actually has a turn anchor
   // (e.g. the pendingRepo confirmation) — most card actions have none.
@@ -1441,21 +1525,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ? { durationMs: parsed ?? null }
           : { quota: parsed ?? null },
       );
-      return updated
-        ? { toast: { type: 'success', content: t('card.grant.toast_limit_staged', undefined, loc) } }
-        : { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+      if (updated === 'ok') return { toast: { type: 'success', content: t('card.grant.toast_limit_staged', undefined, loc) } };
+      return { toast: { type: 'error', content: t(updated === 'unsaved' ? 'card.grant.toast_unsaved' : 'card.grant.toast_expired', undefined, loc) } };
     }
     // 拒绝：只把卡更新成「已拒绝」+ 全部目标进 deny 冷却，绝不触碰 grant-store。
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
-      for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
+      // 拒绝落不了盘就不显示「已拒绝」：否则重启后旧卡复活，授权按钮能推翻这次拒绝。
+      if (!denyPending(larkAppId, grantChatId, targets)) {
+        return { toast: { type: 'error', content: t('card.grant.toast_unsaved', undefined, loc) } };
+      }
       if (delivery) {
         const denyNames: string[] = Array.isArray(value.target_names) ? value.target_names : [];
         notifyGrantRequesterInOrigin(larkAppId, grantChatId, 'deny', delivery, targets, denyNames, loc);
       }
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
+    // 新卡在授权按钮的 form_submit 里一次提交有效期和额度（undefined = 永久 / 不限），
+    // 优先于 pending 上暂存的限制（那是旧卡下拉 callback 的暂存）。
     const formValue = action?.form_value;
+    let formLimits: { quota: number | undefined; durationMs: number | undefined } | undefined;
     if (formValue) {
       const duration = normalizeGrantDurationOption(formValue.grant_duration);
       const quota = normalizeGrantQuotaOption(
@@ -1467,12 +1556,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (duration === null) {
         return { toast: { type: 'error', content: t('card.grant.toast_bad_limit', undefined, loc) } };
       }
-      if (!updatePendingGrantLimits(larkAppId, grantChatId, targets, nonce, {
-        durationMs: duration ?? null,
-        quota: quota ?? null,
-      })) {
-        return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
-      }
+      formLimits = { quota, durationMs: duration };
     }
     // 授权（talk-only）：grant_chat 写本群 chatGrants，grant_global 写全局 globalGrants，
     // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。逐个落库，统计成功/失败。
@@ -1480,34 +1564,44 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const names: string[] = Array.isArray(value.target_names) ? value.target_names : [];
     const idToName = new Map<string, string>();
     targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
-    // 限制挂在 pending 上；确认时生成绝对 expiresAt，多目标共享同一组限制。
-    const limits = getPendingGrantLimits(larkAppId, grantChatId, targets[0]);
-    if (!limits) {
-      return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+    // 先核销整张卡的 nonce（内存 + 磁盘）再落授权：核销落不了盘就不授权，否则旧 nonce 会在
+    // daemon 重启后复活，迟到的回调能再授权一次、把额度和有效期重置。
+    const claim = claimPendingGrant(larkAppId, grantChatId, targets, nonce);
+    if (!claim.ok) {
+      return { toast: { type: 'error', content: t(claim.reason === 'unsaved' ? 'card.grant.toast_unsaved' : 'card.grant.toast_expired', undefined, loc) } };
     }
-    const quota = limits.quota;
-    const expiresAt = limits.durationMs === undefined ? undefined : Date.now() + limits.durationMs;
+    // 确认时生成绝对 expiresAt，多目标共享同一组限制。
+    const quota = formLimits ? formLimits.quota : claim.quota;
+    const durationMs = formLimits ? formLimits.durationMs : claim.durationMs;
+    const expiresAt = durationMs === undefined ? undefined : Date.now() + durationMs;
     // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
     // 自助申请卡每次只对应一个 target，取第一个即可。
-    const pendingMessage = getPendingMessage(larkAppId, grantChatId, targets[0]);
+    const pendingMessage = claim.messageData;
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
-      const res = kind === 'global'
-        ? await addGlobalGrant(larkAppId, tt, quota, expiresAt)
-        : await addChatGrant(larkAppId, grantChatId, tt, quota, expiresAt);
-      if (res.ok) { clearPending(larkAppId, grantChatId, tt); granted.push(tt); }
+      // grant-store 抛异常（bots.json 读写失败、锁超时等）按落库失败处理，否则走不到下面的
+      // restore，卡上的 nonce 已核销、却什么都没授权，管理员再点只会看到「已失效」。
+      let res: { ok: true } | { ok: false; reason: string };
+      try {
+        res = kind === 'global'
+          ? await addGlobalGrant(larkAppId, tt, quota, expiresAt)
+          : await addChatGrant(larkAppId, grantChatId, tt, quota, expiresAt);
+      } catch (err) {
+        res = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+      if (res.ok) granted.push(tt);
       else { failed.push({ openId: tt, reason: res.reason }); logger.warn(`Grant action "${value.action}" store failed for ${tt}: ${res.reason}`); }
     }
-    // 全部失败：保留 pending + 不撤卡（owner 可点原卡重试），toast 报错。
+    // 全部失败：放回 pending + 不撤卡（owner 可点原卡重试），toast 报错。
     if (granted.length === 0) {
+      claim.restore();
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
     }
-    // 部分成功：失败 target 的 pending 必须立刻清掉——卡马上要撤回（owner 无法再点原卡重试），
-    // 而 pending 无 TTL，isThrottled 会永久挡住失败 target 后续的自助申请直到 daemon 重启。
-    // 清掉后失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
+    // 部分成功：失败 target 的 pending 已随核销一起清掉——卡马上要变终态（owner 无法再点原卡重试），
+    // 留着的话 isThrottled 会挡住失败 target 后续的自助申请直到 pending 过期（已落盘，重启也清不掉）。
+    // 失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
     // 不做「撤卡 + 静默失败 + pending 永久卡住」。
-    for (const f of failed) clearPending(larkAppId, grantChatId, f.openId);
     // 一次查通讯录判定哪些 grantee 是真人（vs bot），结果同时供下面两处复用：
     //   1. observed 花名册自动登记（只收 bot，剔真人）；
     //   2. 通知卡 @ 渲染（只 @ 真人，bot 用纯文本名字 —— 见下方注释）。
@@ -1649,6 +1743,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         lastRepoScan,
         getActiveCount: () => activeSessions.size,
       }, larkAppId),
+    };
+  }
+
+  if (value?.action === DISMISS_CLEANUP_WT_ACTION) {
+    const loc = localeForBot(larkAppId);
+    const ids = String(value.job_ids ?? '').split(',');
+    if (!larkAppId || !operatorOpenId || ids.length > 20 || !ids.every(id => /^[a-f0-9]{16}$/.test(id))) {
+      return { toast: { type: 'warning', content: t('cmd.dismiss.cleanup_expired', undefined, loc) } };
+    }
+    if (String(value.invoker_open_id ?? '') !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_not_invoker', undefined, loc) } };
+    }
+    if (!canOperate(larkAppId, undefined, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc) } };
+    }
+    // Same deletion path as `/cleanup-wt <id>`: identity, idleness and the
+    // receipt-time fingerprint are re-proven under the worktree lock.
+    return {
+      card: { type: 'raw', data: buildWorktreeCleanupRunningCard(loc) },
+      afterAck: async () => {
+        const results = [];
+        for (const id of ids) results.push({ id, run: await runWorktreeCleanupJob(larkAppId, id) });
+        const resultCard = buildWorktreeCleanupResultCard(results, loc);
+        if (cardMessageId) await updateMessage(larkAppId, cardMessageId, resultCard);
+        else await sendUserMessage(larkAppId, operatorOpenId, resultCard, 'interactive');
+      },
     };
   }
 
@@ -2660,6 +2780,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets } = await import('../../core/session-discovery.js');
     const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
     async function resolveLive() {
+      if (entryKey!.startsWith('live:orca:')) {
+        const { discoverAdoptableOrcaSessionByHandle } = await import('../../core/orca-adopt-discovery.js');
+        const handle = entryKey!.slice('live:orca:'.length);
+        const target = await discoverAdoptableOrcaSessionByHandle(
+          handle,
+          botCfg.cliId,
+          botCfg.cliRuntime?.executable,
+        );
+        return target && adoptLiveKey(target) === entryKey ? target : undefined;
+      }
       // Zellij keys carry "live:zellij:" — resolve from the zellij backend.
       if (entryKey!.startsWith('live:zellij:')) {
         return discoverAdoptableZellijSessions(botCfg.cliId, botCfg.cliRuntime?.executable)
@@ -3359,7 +3489,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
-          idleCardLabel(ds),
+          streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -3930,7 +4060,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       };
       const buildToggleCard = (
         mode: DisplayMode,
-        opts: { canReceiveFreshFrame: boolean; serviceTierBadge: string | undefined; idleLabel: ReturnType<typeof idleCardLabel> },
+        opts: { canReceiveFreshFrame: boolean; serviceTierBadge: string | undefined; idleLabel: ReturnType<typeof streamCardLabel> },
       ): { cardJson: string; unavailable: boolean } => {
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
@@ -4005,7 +4135,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             // Fresh frames only ever target the current card.
             canReceiveFreshFrame: false,
             serviceTierBadge: codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            idleLabel: idleCardLabel(ds),
+            idleLabel: streamCardLabel(ds),
           });
           // Callback-only: an extra updateMessage here is an unqueued second
           // channel to the same message — a delayed PATCH from this click
@@ -4070,7 +4200,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const { cardJson, unavailable } = buildToggleCard(next, {
         canReceiveFreshFrame: isCurrentTarget && displayModeIpcDelivered && canExpectFreshStreamingScreenshot(ds),
         serviceTierBadge: codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-        idleLabel: idleCardLabel(ds),
+        idleLabel: streamCardLabel(ds),
       });
       if (isCurrentTarget
         && scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
@@ -4154,7 +4284,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          idleCardLabel(ds),
+          streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -4232,7 +4362,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          idleCardLabel(ds),
+          streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -4326,7 +4456,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          idleCardLabel(ds),
+          streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -4374,6 +4504,58 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         deferRepoCardWithdraw(larkAppId, cardMessageId);
         ds.repoCardMessageId = undefined;
       }
+    }
+
+    // 「🔧 重建 worktree」on the working-directory recovery card: put the deleted
+    // worktree back at its path on its branch, then resume the same session
+    // there. Git can take many seconds, so ack with a toast and finish async.
+    if (actionType === 'repo_rebuild_worktree' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const recovery = ds.workingDirRecovery;
+      if (!cardMessageId || !isActiveRepoCard(ds, cardMessageId) || recovery?.cardMessageId !== cardMessageId) {
+        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      }
+      if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
+        return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
+      }
+      // Same refusal the other recovery outlets get from commitRepoSelection:
+      // a remote lineage is retired only through its explicit close.
+      if (isRemoteBackendSession(ds)) {
+        await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, locDs));
+        return;
+      }
+      const commitCtx = { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply };
+      if (!workingDirRecoveryPending(ds)) {
+        await retireMootRecoveryCard(commitCtx);
+        return;
+      }
+      const origin = recovery.rebuild;
+      if (!origin) return;
+      ds.worktreeCreating = true;
+      void (async () => {
+        try {
+          let creation;
+          try {
+            creation = await restoreDeletedWorktree(origin, recovery.path);
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            logger.warn(`[${tag(ds)}] Rebuilding deleted worktree ${recovery.path} failed: ${errMsg}`);
+            await sessionReply(rootId, t('card.repo.recovery_rebuild_failed', { error: errMsg }, locDs));
+            return;
+          }
+          // A `/cd` while git ran already moved the session; leave it there.
+          if (ds.workingDirRecovery !== recovery || getSessionWorkingDir(ds) !== recovery.path) return;
+          if (await moveSessionForRecovery(commitCtx, creation.path)) {
+            await sessionReply(rootId, t('card.repo.recovery_rebuilt', { path: creation.path, branch: creation.branch }, locDs));
+            logger.info(`[${tag(ds)}] Rebuilt deleted worktree ${creation.path} on ${creation.branch}`);
+          }
+        } catch (e) {
+          logger.warn(`[${tag(ds)}] Worktree rebuild flow failed: ${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+          ds.worktreeCreating = false;
+        }
+      })();
+      return { toast: { type: 'info', content: t('card.repo.toast_rebuilding', undefined, locDs) } };
     }
 
     // Manual working-directory entry from the repo card form. The project scan
@@ -4426,7 +4608,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const r = await applyConfigField(ds.larkAppId, spec, next);
       if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
       const projects = lastRepoScan.get(ds.chatId) ?? [];
-      const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
+      const recovery = ds.workingDirRecovery?.cardMessageId === cardMessageId ? ds.workingDirRecovery : undefined;
+      const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next,
+        recovery ? { missingPath: recovery.path, rebuildBranch: recovery.rebuild?.branch } : undefined);
       const oldCardMessageId = ds.repoCardMessageId;
       let newCardMessageId: string;
       try {
@@ -4452,6 +4636,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: err instanceof Error ? err.message : String(err) }, locDs) } };
       }
       ds.repoCardMessageId = newCardMessageId;
+      if (recovery) recovery.cardMessageId = newCardMessageId;
       // The fresh ID is now durable. Withdrawal is best-effort and cannot
       // invalidate the new authority if Lark reports the old card missing.
       try { await deleteMessage(ds.larkAppId, oldCardMessageId); }

@@ -62,7 +62,7 @@ Explicit message listeners, no-@ commands, substitute triggers and auto-start on
 5. **The mode is `ambient` and the message does not @-mention anyone else**.
 6. **The mode is `topic` and the message is inside a topic the bot owns**.
 7. **No-@ slash commands**: commands configured in `commandTriggers` (e.g. `/solve` in some groups) also fire when sent bare in a regular group (top-level or inside an in-group thread); it only opens up allowlisted commands, not the whole group.
-8. **1-person-1-bot group**: @ is not required by default; disable this exception with `soloGroupMentionBypass` / `chatSoloGroupMentionBypass` above. When enabled, group membership decides; mentioning another member immediately disables the exception, preventing the old bot from grabbing the turn in the cache window right after a new bot is pulled in.
+8. **1-person-1-bot group**: @ is not required by default; disable this exception with `soloGroupMentionBypass` / `chatSoloGroupMentionBypass` above. When enabled, group membership decides; when a message mentions another member, the cached member count is not trusted and membership is re-queried, preventing the old bot from grabbing the turn in the cache window right after a new bot is pulled in. If the mentioned person is not in the group (Lark allows mentioning non-members) and the re-query still shows one human and one bot, the exception still applies.
 
 Except for the message listener (clause 3), every clause still requires the sender to **have talk access**. In multi-bot groups where you want the bots not to talk over each other, prefer `ambient`: whoever is named answers.
 

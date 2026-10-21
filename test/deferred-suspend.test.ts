@@ -131,6 +131,32 @@ describe('runPendingSuspendIfSettled', () => {
   // 或 backend 不可挂起。拒绝是**暂时**的，吃掉标志会让这次请求一路丢到下一个
   // `suspend all` 周期才补回来。routing transfer 的门是模块私有的，这里用同样走
   // 「早退且零副作用」的 pty 分支来钉住「拒绝 ⇒ 标志保留」这条不变式。
+  // A CLI whose install was replaced under it must not take another turn, and a
+  // pty session has no dormant state: the worker is retired the way /cd does,
+  // so the next message cold-starts with resume.
+  it('retires a pty worker for an install-change claim instead of waiting forever', () => {
+    const { ds, worker } = busySession('idle', { pending: 'cli_install_changed' });
+    ds.initConfig = { backendType: 'pty' };
+    ds.hasHistory = false;
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+    expect(ds.worker).toBe(null);
+    expect(ds.hasHistory).toBe(true);
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('keeps an install-change claim on a pty worker that is still producing', () => {
+    const { ds, worker } = busySession('working', { pending: 'cli_install_changed' });
+    ds.initConfig = { backendType: 'pty' };
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+  });
+
   it('keeps the flag queued when suspendWorker refuses', () => {
     const { ds, worker } = busySession('idle');
     ds.initConfig = { backendType: 'pty' };

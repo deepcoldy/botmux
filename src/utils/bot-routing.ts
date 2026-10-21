@@ -35,19 +35,6 @@ export function loadOncallChatsByApp(botsJsonPath?: string): Map<string, Set<str
   return map;
 }
 
-export function pickBotEntryByName<T extends { larkAppId: string; botName: string | null }>(
-  botEntries: T[],
-  name: string,
-  targetChatId: string | undefined,
-  oncallChatsByApp: Map<string, Set<string>>,
-): T | undefined {
-  const lower = name.toLowerCase();
-  const candidates = botEntries.filter(e => e.botName?.toLowerCase() === lower);
-  if (candidates.length === 0) return undefined;
-  if (candidates.length === 1 || !targetChatId) return candidates[0];
-  return candidates.find(e => oncallChatsByApp.get(e.larkAppId)?.has(targetChatId)) ?? candidates[0];
-}
-
 export type BotMentionEntry = {
   larkAppId: string;
   botOpenId?: string | null;

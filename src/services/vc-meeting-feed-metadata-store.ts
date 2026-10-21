@@ -6,7 +6,7 @@
  * or chat body: only item identity, revision, semantic hash, and timestamps.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -383,32 +383,4 @@ export function getVcMeetingFeedMetadataState(
   ensureDir(dataDir);
   const path = statePath(dataDir, key);
   return withFileLockSync(path, () => structuredClone(readState(dataDir, key, now)));
-}
-
-export function listVcMeetingFeedMetadataAfter(
-  dataDir: string,
-  key: VcMeetingFeedMetadataKey,
-  ingestSeqExclusive: number,
-): VcMeetingFeedItemMetadata[] {
-  if (!Number.isSafeInteger(ingestSeqExclusive) || ingestSeqExclusive < 0) {
-    throw new Error('ingestSeqExclusive must be a non-negative safe integer');
-  }
-  const state = getVcMeetingFeedMetadataState(dataDir, key);
-  return Object.values(state.items)
-    .filter(item => item.ingestSeq > ingestSeqExclusive)
-    .sort((a, b) => a.ingestSeq - b.ingestSeq)
-    .map(item => structuredClone(item));
-}
-
-export function removeVcMeetingFeedMetadata(
-  dataDir: string,
-  key: VcMeetingFeedMetadataKey,
-): boolean {
-  ensureDir(dataDir);
-  const path = statePath(dataDir, key);
-  return withFileLockSync(path, () => {
-    if (!existsSync(path)) return false;
-    unlinkSync(path);
-    return true;
-  });
 }

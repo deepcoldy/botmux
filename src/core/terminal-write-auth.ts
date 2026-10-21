@@ -218,32 +218,6 @@ function readLiveDashboardToken(getDashboardToken: () => string | null): string 
 }
 
 /**
- * Resolve terminal write for one request: extract the `X-Botmux-Role` header
- * (a duplicated/array header is treated as absent), verify the request came
- * through the platform proxy (dashboard-token cookie matches this machine's
- * active token), and gate the role's trust on the machine's platform binding.
- *
- * Both `isPlatformBound` and `getDashboardToken` are thunks evaluated on EVERY
- * call — never snapshotted. `botmux bind`/unbind and `botmux dashboard rotate`
- * rewrite state that the dashboard hot-reloads WITHOUT restarting live workers;
- * a cached value would go stale — keep trusting a request after an unbind / token
- * rotation, or deny legitimate platform writes after a bind.
- */
-export function resolveTerminalWriteForRequest(
-  headers: Record<string, string | string[] | undefined>,
-  tokenMatches: boolean,
-  isPlatformBound: () => boolean,
-  getDashboardToken: () => string | null,
-): { hasWrite: boolean; platformReadonly: boolean } {
-  const rawRole = headers['x-botmux-role'];
-  const role = typeof rawRole === 'string' ? rawRole : undefined;
-  const cookieToken = readDashboardCookie(headers['cookie']);
-  const activeToken = readLiveDashboardToken(getDashboardToken);
-  const platformProxied = !!activeToken && safeTerminalTokenEqual(cookieToken, activeToken);
-  return resolveTerminalWrite({ role, tokenMatches, platformBound: isPlatformBound(), platformProxied });
-}
-
-/**
  * Request-level terminal access gate.  Unlike the legacy write-only resolver,
  * this explicitly denies observation unless the caller has a view/write
  * capability or an authenticated dashboard cookie.

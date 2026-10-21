@@ -2,14 +2,13 @@
  * Per-session isolated workspace + daemon reaping (review P0/P1).
  *
  * The tests here must prove ISOLATION, not directory bookkeeping: T1 asserts
- * the daemon-id derivation actually distinguishes two sessions (and collapses
- * for a shared realpath — the reason symlinks were rejected), T5/T6 drive the
+ * the workspace derivation actually distinguishes two sessions, T5/T6 drive the
  * reaper through a fully mocked registry.
  *
  * Run:  pnpm vitest run test/mojo-isolated-workspace.test.ts
  */
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, realpathSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +20,6 @@ import {
   cleanupMojoIsolatedWorkspace,
   ensureMojoIsolatedWorkspace,
   mojoIsolatedWorkspacePath,
-  mojoWorkspaceHash,
   reapMojoIsolatedDaemon,
   type MojoDaemonReapDeps,
 } from '../src/adapters/backend/mojo-isolated-workspace.js';
@@ -36,21 +34,6 @@ describe('T1: daemon-id derivation distinguishes sessions', () => {
     const a = ensureMojoIsolatedWorkspace('session-aaaa', home);
     const b = ensureMojoIsolatedWorkspace('session-bbbb', home);
     expect(a).not.toBe(b);
-    // The property the whole fix rests on: distinct realpaths → distinct
-    // daemon ids → per-session daemons with per-session env.
-    expect(mojoWorkspaceHash(a)).not.toBe(mojoWorkspaceHash(b));
-  });
-
-  it('symlinks to a shared target collapse into ONE hash (why real dirs are mandatory)', () => {
-    const home = tmpRoot();
-    const shared = join(home, 'shared-repo');
-    mkdirSync(shared);
-    symlinkSync(shared, join(home, 'linkA'));
-    symlinkSync(shared, join(home, 'linkB'));
-    // mojo's daemon keys on process.cwd(), which is the kernel realpath — both
-    // links resolve to the same string, i.e. the same shared daemon.
-    expect(mojoWorkspaceHash(realpathSync(join(home, 'linkA'))))
-      .toBe(mojoWorkspaceHash(realpathSync(join(home, 'linkB'))));
   });
 
   it('ensure is idempotent and returns a realpath', () => {

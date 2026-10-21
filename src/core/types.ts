@@ -279,6 +279,19 @@ export interface DaemonSession {
    * In-memory only; not persisted.
    */
   consumedRepoCardMessageIds?: string[];
+  /**
+   * The session's working directory was gone when a CLI start was attempted
+   * (forkWorker refuses instead of starting it elsewhere), and a recovery card
+   * was published for it. `cardMessageId` is unset while that card is still
+   * being built. `rebuild` is where the deleted worktree came from, when git
+   * still knows. In-memory only: after a restart the next refused start
+   * publishes a fresh card.
+   */
+  workingDirRecovery?: {
+    path: string;
+    cardMessageId?: string;
+    rebuild?: { repo: string; branch: string };
+  };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
   /** Exact Lark message id whose user input is waiting for the first worker
@@ -341,6 +354,8 @@ export interface DaemonSession {
    * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
    * bot-added / scheduler / system bootstrap) never infers it. */
   pendingCodexAppSteerable?: true;
+  /** LinkRef mode frozen when a pending-repository opening was admitted. */
+  pendingLinkRefMode?: import('../services/link-ref-types.js').LinkRefMode;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
@@ -492,6 +507,10 @@ export interface DaemonSession {
   turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** `backgroundTasks` of the last working/idle screen_update: the main turn
+   *  ended while this many background tasks kept running. Card label only
+   *  (see streamCardLabel). In-memory only. */
+  backgroundTaskCount?: number;
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -535,6 +554,8 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Successful listener terminal evidence; idle alone never authorizes closing. */
+  messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
   /**
@@ -775,6 +796,8 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
+    linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;
@@ -853,10 +876,10 @@ export interface DaemonSession {
    *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
-   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;       // e.g. "0:2.0" — user's original tmux pane
     zellijSession?: string;    // zellij session name (zellij backend)
     zellijPaneId?: string;     // e.g. "terminal_1" — observe/drive target
@@ -865,6 +888,17 @@ export interface DaemonSession {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    /** Display snapshot from adoption; the handle remains the stable identity. */
+    orcaTerminalTitle?: string;
+    /** Orca control route; absent = desktop relay for legacy rows. */
+    orcaInstance?: import('../services/orca-cli.js').OrcaInstance;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type

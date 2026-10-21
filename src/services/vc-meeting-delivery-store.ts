@@ -18,7 +18,7 @@
  * read-modify-write 经 withFileLockSync 跨进程串行化。不引 SQLite。
  * 会议正文不落盘——这里只有位置、身份与 hash（§12.1）。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -1439,31 +1439,4 @@ export function listVcMeetingActiveProjectionsForReceiverSession(
     || a.meetingId.localeCompare(b.meetingId)
     || a.memberId.localeCompare(b.memberId)
     || a.memberEpoch - b.memberEpoch);
-}
-
-/**
- * TTL 清理：整场会议粒度删除。保留期下限由调用方保证 ≥
- * max(hub assignment TTL, meeting runtime TTL, sender retry horizon) + 时钟偏移
- * （§9.3）——低于该值 GET 404 会被误当 never-accept 证据。
- */
-export function pruneVcMeetingDeliveryState(
-  dataDir: string,
-  input: { ttlMs: number },
-  now = Date.now(),
-): number {
-  const dir = join(dataDir, DIR_NAME);
-  if (!existsSync(dir)) return 0;
-  let removed = 0;
-  for (const name of readdirSync(dir)) {
-    if (!name.endsWith('.json')) continue;
-    const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFile(fp);
-      if (!state) return;
-      if (now - state.updatedAt <= input.ttlMs) return;
-      rmSync(fp, { force: true });
-      removed += 1;
-    });
-  }
-  return removed;
 }

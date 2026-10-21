@@ -87,6 +87,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   return {
   forkWorker: vi.fn(),
   killWorker: vi.fn(),
+  suspendWorker: vi.fn(() => false),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   scheduleCardPatch: vi.fn(),
   parkStreamCard: vi.fn(),
@@ -136,6 +137,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  restoreDeletedWorktree: vi.fn(),
   removeRepoWorktree: vi.fn(async () => {}),
   pushWorktreeBranch: vi.fn(async () => {}),
   dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
@@ -175,7 +177,7 @@ import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClo
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
-import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree, restoreDeletedWorktree } from '../src/services/git-worktree.js';
 import { maybeCreateDefaultWorktree, AutoWorktreeFailClosedError } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
@@ -2449,5 +2451,178 @@ describe('repo select card — manual directory entry', () => {
     expect(res?.toast?.content).toContain('已有一个 worktree 正在创建');
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true);
+  });
+});
+
+describe('repo select card — working-directory recovery', () => {
+  // forkWorker refused to start this session because its worktree is gone and
+  // published the recovery card (om_card). Every way out keeps the SAME session
+  // — unlike a mid-session switch on an ordinary card, which closes it.
+  const GONE = '/gone/botmux-wt-review-pr-1809';
+
+  function makeRecoveryDs(overrides?: Partial<DaemonSession>): DaemonSession {
+    return makeDs({
+      pendingRepo: false,
+      worker: null,
+      workingDir: GONE,
+      workingDirRecovery: {
+        path: GONE,
+        cardMessageId: 'om_card',
+        rebuild: { repo: '/repos/alpha', branch: 'wt/review-pr-1809' },
+      },
+      ...overrides,
+    });
+  }
+
+  /** Every text the handler posted, joined — replies carry rootId + content first. */
+  function repliedText(sessionReply: ReturnType<typeof vi.fn>): string {
+    return sessionReply.mock.calls.map(call => String(call[1])).join('\n');
+  }
+
+  function makeRebuildEvent(cardId = 'om_card') {
+    return {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'repo_rebuild_worktree', root_id: ROOT_ID } },
+      context: { open_message_id: cardId },
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(getSessionWorkingDir).mockImplementation((ds?: DaemonSession) => ds?.workingDir ?? '/tmp');
+  });
+  afterEach(() => {
+    vi.mocked(getSessionWorkingDir).mockReset().mockReturnValue('/tmp');
+  });
+
+  it('a dropdown switch moves the same session (no close, no new session, no fork)', async () => {
+    const ds = makeRecoveryDs();
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    // Same retirement as /cd: no worker, so the leftover backing pane goes.
+    expect(killWorker).toHaveBeenCalledWith(ds);
+    expect(ds.session.sessionId).toBe('uuid-old');
+    expect(ds.workingDir).toBe('/repos/beta');
+    expect(ds.session.workingDir).toBe('/repos/beta');
+    expect(ds.workingDirRecovery).toBeUndefined();
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(deps.activeSessions.get(sessionKey(ROOT_ID, APP_ID))).toBe(ds);
+    expect(repliedText(sessionReply)).toContain('/repos/beta');
+  });
+
+  it('a manually entered directory also keeps the session', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-recovery-manual-'));
+    try {
+      const ds = makeRecoveryDs();
+      const { deps } = makeDeps(ds);
+
+      await handleCardAction(makeManualEvent(dir), deps, APP_ID);
+
+      expect(createSession).not.toHaveBeenCalled();
+      expect(ds.session.sessionId).toBe('uuid-old');
+      expect(ds.session.workingDir).toBe(dir);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a card left over after /cd moved the session is retired, not turned into a session switch', async () => {
+    const ds = makeRecoveryDs({ workingDir: '/repos/alpha' });
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDir).toBe('/repos/alpha');
+    expect(ds.workingDirRecovery).toBeUndefined();
+    expect(repliedText(sessionReply)).toContain('无需再处理');
+  });
+
+  it('「重建 worktree」puts the worktree back at its path and resumes the same session there', async () => {
+    const ds = makeRecoveryDs();
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(restoreDeletedWorktree).mockResolvedValue({ path: GONE, branch: 'wt/review-pr-1809', baseRef: 'wt/review-pr-1809' });
+
+    const result = await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+    expect(result).toMatchObject({ toast: { type: 'info' } });
+    await vi.waitFor(() => expect(ds.workingDirRecovery).toBeUndefined());
+
+    expect(restoreDeletedWorktree).toHaveBeenCalledWith({ repo: '/repos/alpha', branch: 'wt/review-pr-1809' }, GONE);
+    expect(killWorker).toHaveBeenCalledWith(ds);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(ds.session.workingDir).toBe(GONE);
+    expect(ds.worktreeCreating).toBe(false);
+    expect(repliedText(sessionReply)).toContain('wt/review-pr-1809');
+  });
+
+  it('a failed rebuild says why and leaves the card usable', async () => {
+    const ds = makeRecoveryDs();
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(restoreDeletedWorktree).mockRejectedValue(new Error("'wt/review-pr-1809' is already checked out"));
+
+    await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(repliedText(sessionReply)).toContain('already checked out');
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDirRecovery?.cardMessageId).toBe('om_card');
+    expect(ds.repoCardMessageId).toBe('om_card');
+  });
+
+  it('rebuilding is refused for a remote-backend session, like every other recovery outlet', async () => {
+    const ds = makeRecoveryDs({ initConfig: { backendType: 'riff' } as any });
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+
+    expect(restoreDeletedWorktree).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDirRecovery?.cardMessageId).toBe('om_card');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('a rebuild click from a stale card does nothing', async () => {
+    const ds = makeRecoveryDs();
+    const { deps } = makeDeps(ds);
+
+    const result = await handleCardAction(makeRebuildEvent('om_old_card'), deps, APP_ID);
+
+    expect(result).toMatchObject({ toast: { type: 'info' } });
+    expect(restoreDeletedWorktree).not.toHaveBeenCalled();
+  });
+
+  it('rebuilding needs operate permission (mid-session management action)', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeRecoveryDs();
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeRebuildEvent(), deps, APP_ID);
+
+    expect(restoreDeletedWorktree).not.toHaveBeenCalled();
+  });
+
+  it('toggling the worktree picker mode keeps the recovery form', async () => {
+    const ds = makeRecoveryDs();
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockResolvedValueOnce('om_card_2');
+
+    await handleCardAction({
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    }, deps, APP_ID);
+
+    const [, cardJson] = sessionReply.mock.calls.find(([, , msgType]) => msgType === 'interactive')!;
+    expect(cardJson).toContain('repo_rebuild_worktree');
+    expect(cardJson).not.toContain('skip_repo');
+    expect(ds.repoCardMessageId).toBe('om_card_2');
+    expect(ds.workingDirRecovery?.cardMessageId).toBe('om_card_2');
   });
 });

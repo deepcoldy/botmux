@@ -1016,21 +1016,3 @@ export function eventSeqFromId(eventId: string): number {
   const n = Number(eventId.slice(dash + 1));
   return Number.isFinite(n) ? n : 0;
 }
-
-export function extractEventContext(
-  payload: unknown,
-): { nodeId?: string; activityId?: string; errorCode?: string } {
-  if (!payload || typeof payload !== 'object' || 'ref' in (payload as object)) {
-    return {};
-  }
-  const p = payload as Record<string, unknown>;
-  const out: { nodeId?: string; activityId?: string; errorCode?: string } = {};
-  if (typeof p.nodeId === 'string') out.nodeId = p.nodeId;
-  if (typeof p.activityId === 'string') out.activityId = p.activityId;
-  if (typeof p.failedNodeId === 'string') out.nodeId = p.failedNodeId;
-  const err = p.error;
-  if (err && typeof err === 'object' && 'errorCode' in err) {
-    out.errorCode = String((err as { errorCode: unknown }).errorCode);
-  }
-  return out;
-}

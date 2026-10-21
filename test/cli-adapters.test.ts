@@ -3422,14 +3422,16 @@ describe('idleToBusyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
   });
 
-  it('pi opts in with the same Working... marker as its busyPattern', () => {
-    // Pi's `Working...` is an ephemeral status line (never part of transcript
+  it('pi opts in with the same busy-line marker as its busyPattern', () => {
+    // Pi's busy line is an ephemeral status line (never part of transcript
     // history redraws), so idle→busy recovery is safe: a falsely published
     // ready self-heals when the marker renders again.
     const adapter = createPiAdapter('/bin/pi');
     expect(adapter.idleToBusyPattern).toBeDefined();
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
+    // Pi 1.3.0 frame as it appears in the ANSI-stripped PTY stream.
+    expect(adapter.idleToBusyPattern!.test('── ⠙ Working ──')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
   });
 

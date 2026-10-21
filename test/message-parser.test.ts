@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -1452,11 +1452,11 @@ describe('mergeCardText', () => {
   });
 });
 
-describe('wrapResolvedCardText sentinel', () => {
+describe('resolved card text sentinel', () => {
   it('extractCardContent returns the merged text verbatim through parseApiMessage', () => {
     const text = '[卡片: 报警]\n值班人: 赵方涛田大露\n' + CARD_EMBEDDED_PLACEHOLDER;
     const msg = makeMsg('interactive', {});
-    msg.body.content = wrapResolvedCardText(text);
+    msg.body.content = JSON.stringify({ __botmux_card_text__: text });
     expect(parseApiMessage(msg).content).toBe(text);
   });
 

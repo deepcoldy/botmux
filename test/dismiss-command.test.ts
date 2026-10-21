@@ -79,7 +79,7 @@ describe('dismissSessionGroup', () => {
   });
   it('closes the exact session before deleting only its current group', async () => {
     const state = await confirmation();
-    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed' });
+    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed', workingDirs: [] });
     expect(h.close).toHaveBeenCalledWith('s1');
     expect(h.disband).toHaveBeenCalledWith(APP, CHAT);
     expect(h.close.mock.invocationCallOrder[0]).toBeLessThan(h.disband.mock.invocationCallOrder[0]);
@@ -118,10 +118,13 @@ describe('dismissSessionGroup', () => {
     expect(h.close).not.toHaveBeenCalled(); expect(h.ipc).not.toHaveBeenCalled();
   });
   it('closes co-resident sessions of this and peer bots before the resident, then disbands', async () => {
+    h.rows[0].workingDir = '/repo-wt-a';
     h.rows.push({ ...h.rows[0], sessionId: 's3', scope: 'thread', rootMessageId: 'om_topic' });
-    h.peers = [peer('s2')];
+    h.peers = [{ ...peer('s2'), workingDir: '/repo-wt-b' }];
     const state = await confirmation();
-    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed' });
+    // Every closed session's working dir, once each, for the receipt's cleanup offer.
+    expect(await dismissSessionGroup({ ...request, confirmedState: state }))
+      .toEqual({ status: 'dismissed', workingDirs: ['/repo-wt-a', '/repo-wt-b'] });
     expect(h.close.mock.calls.map(c => c[0])).toEqual(['s3', 's1']);
     expect(h.ipc).toHaveBeenCalledWith(4100, '/api/sessions/s2/close', expect.objectContaining({ method: 'POST' }));
     expect(h.online).toHaveBeenCalledWith('cli_other');
@@ -219,7 +222,7 @@ describe('dismissSessionGroup', () => {
     h.peers = [{ ...h.rows[0], larkAppId: 'cli_other' }];
     const { sessions, state } = await confirmed();
     expect(sessions.map(s => [s.larkAppId, s.resident])).toEqual([[APP, true], ['cli_other', false]]);
-    expect(await dismissSessionGroup({ ...request, confirmedState: state })).toEqual({ status: 'dismissed' });
+    expect((await dismissSessionGroup({ ...request, confirmedState: state })).status).toBe('dismissed');
     expect(h.ipc).toHaveBeenCalledWith(4100, '/api/sessions/s1/close', expect.anything());
     expect(h.close).toHaveBeenCalledTimes(1);
   });

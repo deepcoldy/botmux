@@ -17,7 +17,6 @@ import {
   normalizeWorkbenchLayout,
   paneTreeForLayout,
   parseWorkbenchHash,
-  safeWorkbenchReturnTo,
   workbenchExternalTerminalHref,
   workbenchListItemHeight,
   workbenchPreviewHref,
@@ -47,8 +46,6 @@ describe('Agent Workbench pure model', () => {
     expect(parseWorkbenchHash('#/agent-workbench/a%2Fb%20c')).toEqual({ surface: 'main', sessionId: 'a/b c' });
     expect(parseWorkbenchHash('#/agent-workbench-dock/a%2Fb%20c')).toEqual({ surface: 'dock', sessionId: 'a/b c' });
     expect(parseWorkbenchHash('#/agent-workbench/%E0%A4%A')).toBeNull();
-    expect(safeWorkbenchReturnTo('/#/agent-workbench-dock/a%2Fb')).toBe('/#/agent-workbench-dock/a%2Fb');
-    expect(safeWorkbenchReturnTo('/#/settings')).toBe('/');
   });
 
   it('keeps a 200px default rail, clamps persistence, and limits the pane tree to Terminal/Web', () => {

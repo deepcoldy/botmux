@@ -191,13 +191,6 @@ export function turnRetryOffer(
   return 'caveated';
 }
 
-/** Convenience for call sites that only need "is there a button at all". */
-export function mayOfferTurnRetry(
-  turn: TurnFailureNoticeInput & { retryable?: boolean },
-): boolean {
-  return turnRetryOffer(turn) !== 'none';
-}
-
 /**
  * What to actually submit when the user presses the failure card's button.
  *

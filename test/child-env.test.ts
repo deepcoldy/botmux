@@ -135,6 +135,19 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes host-authorized LinkRef relay controls from ordinary children', () => {
+    const out = redactChildEnv({
+      BOTMUX_LINK_REF_TURN_MODE: 'enabled',
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      KEEP: 'v',
+    });
+    for (const key of ['BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED']) {
+      expect(key in out, key).toBe(false);
+      expect(REDACTED_CHILD_ENV_KEYS, key).toContain(key);
+    }
+    expect(out.KEEP).toBe('v');
+  });
+
   it('removes the Dashboard Feishu H5 credential family from child env', () => {
     // BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET is a full Feishu app credential: the
     // daemon dotenv-loads ~/.botmux/.env wholesale, so before this scrub every
@@ -215,6 +228,12 @@ describe('redactChildEnv()', () => {
     // neighbors) rather than an import, so guard against the two definitions
     // drifting apart if the env var is ever renamed.
     expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  });
+
+  it('keeps the daemon-only LinkRef rollout setting out of CLI children', () => {
+    const out = redactChildEnv({ BOTMUX_LINK_REFS_MODE: 'enabled', KEEP: 'v' });
+    expect(out.BOTMUX_LINK_REFS_MODE).toBeUndefined();
+    expect(out.KEEP).toBe('v');
   });
 
   // Two REAL-CHILD guards for the same leak vector, split by transport.
@@ -459,6 +478,7 @@ describe('scrubInvokerTerminalEnv()', () => {
       LANG: 'en_US.UTF-8',
       SSH_AUTH_SOCK: '/tmp/agent.sock',
       HTTPS_PROXY: 'http://proxy:8080',
+      ORCA_REMOTE_CLI_BIN_DIR: '/home/me/.orca-relay/bin',
     };
 
     scrubInvokerTerminalEnv(env);
@@ -471,6 +491,9 @@ describe('scrubInvokerTerminalEnv()', () => {
     expect(env.LANG).toBe('en_US.UTF-8');
     expect(env.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
     expect(env.HTTPS_PROXY).toBe('http://proxy:8080');
+    // Machine-local bridge discovery survives; only one terminal's relay
+    // connection is transient and must be rediscovered through the wrapper.
+    expect(env.ORCA_REMOTE_CLI_BIN_DIR).toBe('/home/me/.orca-relay/bin');
   });
 
   it('pins the observed agent-shell fingerprints that turned the fleet colorless', () => {
@@ -484,6 +507,18 @@ describe('scrubInvokerTerminalEnv()', () => {
     // TERMINFO_DIRS is machine-level terminfo search-path config on
     // NixOS/custom-ncurses hosts, not an invoker fingerprint — never scrub it.
     expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('TERMINFO_DIRS');
+  });
+
+  it('removes stale Orca relay pointers without removing the bridge location', () => {
+    for (const key of [
+      'ORCA_RELAY_DIR',
+      'ORCA_RELAY_SOCKET_PATH',
+      'ORCA_RELAY_CREDENTIAL_FILE',
+      'ORCA_RELAY_NODE_PATH',
+    ]) {
+      expect(INVOKER_TERMINAL_ENV_KEYS).toContain(key);
+    }
+    expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('ORCA_REMOTE_CLI_BIN_DIR');
   });
 });
 

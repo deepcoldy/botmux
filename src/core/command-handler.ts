@@ -28,7 +28,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persist
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
-import { buildDismissConfirmCard } from '../im/lark/dismiss-card.js';
+import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dismiss-card.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -62,8 +62,11 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
+import { publishWorkingDirRecovery } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
-import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
+import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
+import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
+import { adoptedFromForTarget, isOrcaAdoptTarget, isZellijAdoptTarget, type LiveAdoptTarget } from './adopt-target.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
@@ -141,7 +144,8 @@ import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
-import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
 
@@ -1163,6 +1167,9 @@ async function applyAllowedUsersSet(
     return;
   }
   let msg = t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc);
+  if (r.unresolvedEmailsAndMobiles?.length) {
+    msg += '\n' + t('cmd.config.allow_warn_contacts', { items: r.unresolvedEmailsAndMobiles.join(', ') }, loc);
+  }
   if (r.unresolvedUnionIds?.length) {
     msg += '\n' + t('cmd.config.allow_warn_union', { items: r.unresolvedUnionIds.join(', ') }, loc);
   }
@@ -1945,48 +1952,15 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
           break;
         }
-        let job;
-        try {
-          job = getWorktreeCleanupJob(config.session.dataDir, cleanupId);
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ 无法读取 worktree 清理任务：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        if (!job || job.larkAppId !== appId) {
-          await sessionReply(rootId, '未找到该 worktree 清理任务。');
-          break;
-        }
-        try {
-          const containingRoot = await worktreeRootFor(job.worktreeDir);
-          const main = containingRoot ? await mainWorktreeFor(containingRoot) : undefined;
-          if (!containingRoot || resolve(containingRoot) !== resolve(job.worktreeDir)
-            || resolve(main ?? '') !== resolve(job.worktreeMain)
-            || !(await isLinkedWorktree(containingRoot))) {
-            await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
-            break;
-          }
-          const refusal = await withWorktreeTargetLock(job.worktreeDir, async () => {
-            const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
-            if (active.length > 0) {
-              return `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`;
-            }
-            const safety = await worktreeSafetyStatus(job.worktreeDir);
-            if (safety.fingerprint !== job.safetyFingerprint) {
-              return '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。';
-            }
-            await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
-            deleteWorktreeCleanupJob(config.session.dataDir, job.id);
-            return undefined;
-          });
-          if (refusal) {
-            await sessionReply(rootId, refusal);
-            break;
-          }
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
+        const run = await runWorktreeCleanupJob(appId, cleanupId);
+        const reply = run.status === 'unreadable' ? `⚠️ 无法读取 worktree 清理任务：${run.error}`
+          : run.status === 'not_found' ? '未找到该 worktree 清理任务。'
+          : run.status === 'identity_changed' ? '⚠️ worktree 身份已变化，拒绝重试删除。'
+          : run.status === 'busy' ? `⚠️ worktree 仍有 ${run.activeCount} 个活动会话，暂不删除。`
+          : run.status === 'changed' ? '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。'
+          : run.status === 'failed' ? `⚠️ worktree 清理重试失败，任务已保留：${run.error}`
+          : `🧹 已重试并移除 worktree：\`${run.dir}\``;
+        await sessionReply(rootId, reply);
         break;
       }
 
@@ -2290,9 +2264,13 @@ export async function handleCommand(
           confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
-          // The deleted group cannot receive the receipt; notify privately.
-          try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
-          catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+          // The deleted group cannot receive the receipt; notify privately,
+          // offering one-click cleanup of the worktrees those sessions used.
+          try {
+            const offers = await offerWorktreeCleanup(appId, result.workingDirs);
+            await sendUserMessage(appId, message.senderId,
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+          } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
         } else if (result.status === 'confirm') {
           await sessionReply(rootId, buildDismissConfirmCard({
             chatId,
@@ -3516,6 +3494,15 @@ export async function handleCommand(
         const scanDirs = getProjectScanDirs(ds);
         const invalidDirs = invalidConfiguredWorkingDirs(ds, ds?.larkAppId ?? larkAppId);
         if (invalidDirs.length > 0) {
+          // The session's own directory is gone (typically a deleted worktree),
+          // not a bots.json problem: bring up the recovery card instead.
+          if (ds?.workingDir && !ds.pendingRepo) {
+            await publishWorkingDirRecovery(ds, getSessionWorkingDir(ds), {
+              sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
+              lastRepoScan,
+            }, { force: true });
+            break;
+          }
           await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
           break;
         }
@@ -4625,7 +4612,9 @@ export async function handleCommand(
           // ("session:paneId" / "session/paneId") against the merged list.
           const zellijNorm = directTarget.replace('/', ':');
           const target = sessions.find(s =>
-            'zellijPaneId' in s
+            'orcaTerminalHandle' in s
+              ? directTarget === `orca:${s.orcaTerminalHandle}` || directTarget === s.orcaTerminalHandle
+              : 'zellijPaneId' in s
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
@@ -6261,6 +6250,7 @@ export async function handleCommand(
           t('help.heading_adopt', undefined, loc),
           t('help.adopt', undefined, loc),
           t('help.adopt_pane', undefined, loc),
+          t('help.adopt_orca', undefined, loc),
           t('help.resume', { cliName }, loc),
           t('help.detach', undefined, loc),
           '',
@@ -6383,11 +6373,6 @@ async function handleCodexAppAdoptCommand(
 }
 
 // ─── Adopt session helper ────────────────────────────────────────────────────
-
-/** Discriminate a zellij adopt candidate from tmux/herdr candidates. */
-function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is ZellijAdoptableSession {
-  return 'zellijPaneId' in t;
-}
 
 /**
  * Refuse a takeover (`/adopt`, Codex App thread, disk resume import) while the
@@ -6530,7 +6515,7 @@ export async function startCodexAppThreadSession(
 }
 
 export async function startAdoptSession(
-  target: AdoptableSession | ZellijAdoptableSession,
+  target: LiveAdoptTarget,
   ds: DaemonSession,
   deps: CommandHandlerDeps,
   larkAppId?: string,
@@ -6546,14 +6531,16 @@ export async function startAdoptSession(
 
   if (await blockRiffTakeover(ds, sessionReply)) return;
 
-  const zellij = isZellijTarget(target);
-  if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
+  const orca = isOrcaAdoptTarget(target);
+  const zellij = !orca && isZellijAdoptTarget(target);
+  const paneTarget = !orca && !zellij ? target as AdoptableSession : undefined;
+  if (paneTarget?.source === 'herdr' && paneTarget.herdrSessionName && paneTarget.herdrAgentName) {
     const occupied = [...deps.activeSessions.values()].some(active => {
       if (active.session.sessionId === ds.session.sessionId || active.session.status !== 'active' || active.adoptedFrom) return false;
       const owned = active.session.persistentBackendTarget;
       return owned?.backendType === 'herdr'
-        && owned.sessionName === target.herdrSessionName
-        && owned.agentName === target.herdrAgentName;
+        && owned.sessionName === paneTarget.herdrSessionName
+        && owned.agentName === paneTarget.herdrAgentName;
     });
     if (occupied) {
       await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
@@ -6582,8 +6569,9 @@ export async function startAdoptSession(
   // and offer a one-tap close so the user retires it and re-adopts cleanly.
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
-  const valid = zellij
-    ? validateZellijAdoptTarget(
+  const valid = orca
+    ? validateOrcaAdoptTarget(target) === 'alive'
+    : zellij ? validateZellijAdoptTarget(
       target.zellijSession,
       target.zellijPaneId,
       target.cliPid,
@@ -6597,7 +6585,9 @@ export async function startAdoptSession(
   }
 
   const project = target.cwd.split('/').pop() || target.cwd;
-  const pane = zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
+  const pane = orca
+    ? adoptTargetLabel(target)
+    : zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
   const targetSessionId = ds.session.sessionId;
   const adopted = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(
@@ -6612,23 +6602,7 @@ export async function startAdoptSession(
     current.session.workingDir = target.cwd;
     current.session.title = `Adopt: ${project}`;
     current.session.serviceTier = 'inherit';
-    current.adoptedFrom = {
-      source: zellij ? 'zellij' : target.source,
-      tmuxTarget: zellij ? undefined : target.tmuxTarget,
-      zellijSession: zellij ? target.zellijSession : undefined,
-      zellijPaneId: zellij ? target.zellijPaneId : undefined,
-      herdrSessionName: zellij ? undefined : target.herdrSessionName,
-      herdrTarget: zellij ? undefined : target.herdrTarget,
-      herdrPaneId: zellij ? undefined : target.herdrPaneId,
-      herdrAgentName: zellij ? undefined : target.herdrAgentName,
-      herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
-      originalCliPid: target.cliPid,
-      sessionId: target.sessionId,
-      cliId: target.cliId,
-      cwd: target.cwd,
-      paneCols: target.paneCols,
-      paneRows: target.paneRows,
-    };
+    current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
     sessionStore.updateSession(current.session);
     forkAdoptWorker(current);

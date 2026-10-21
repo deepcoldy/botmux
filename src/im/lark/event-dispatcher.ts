@@ -4,6 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { normalizeCardActionData } from './card-action-data.js';
+import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
@@ -49,9 +51,10 @@ import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
+import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -1267,7 +1270,7 @@ export function __resetEventClaimsForTest(): void {
 export async function getGroupStats(
   larkAppId: string,
   chatId: string,
-  options: { requireFresh?: boolean } = {},
+  options: { requireFresh?: boolean; revalidateSolo?: boolean } = {},
 ): Promise<{ userCount: number; botCount: number }> {
   const cacheKey = `${larkAppId}:${chatId}`;
   const cached = chatStatsCache.get(cacheKey);
@@ -1276,7 +1279,14 @@ export async function getGroupStats(
   // cannot authorize the solo-group bypass from their process-local cache.
   // A required fresh read also refuses the stale fallback on API failure and
   // safely degrades to "multi-member: require @mention".
-  if (!options.requireFresh && cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
+  //
+  // revalidateSolo：调用方手里有「缓存可能已过期」的证据（消息 @ 了别的成员——
+  // 可能是刚拉进群的新 bot，别的 bot 进群没有推给本 app 的事件），此时缓存里的
+  // 1人1bot 不可信，必须重查；重查失败同样不回落到这份 solo 缓存。缓存已是多人/
+  // 多 bot 时结论只会是「需要 @」，照用缓存，不为多 bot 群里的每条 @ 多打 API。
+  const cachedIsSolo = !!cached && cached.userCount <= 1 && cached.botCount <= 1;
+  const mustRefresh = options.requireFresh || (options.revalidateSolo && cachedIsSolo);
+  if (!mustRefresh && cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
     return { userCount: cached.userCount, botCount: cached.botCount };
   }
   try {
@@ -1287,7 +1297,7 @@ export async function getGroupStats(
     // Soft failure — the fallback below assumes worst case (multi-user,
     // multi-bot → require @mention). No user-visible regression, so debug.
     logger.debug(`Failed to get chat stats for ${chatId}, using safe fallback: ${err}`);
-    if (!options.requireFresh && cached) return { userCount: cached.userCount, botCount: cached.botCount };
+    if (!mustRefresh && cached) return { userCount: cached.userCount, botCount: cached.botCount };
     // Fallback: assume multi-person, multi-bot → require @mention to be safe.
     return { userCount: 999, botCount: 999 };
   }
@@ -2382,6 +2392,8 @@ export async function maybeSendGrantRequestCard(
       larkAppId, chatId, requesterOpenId, name: String(name), approver, nonce, quota, durationMs, delivery,
     });
     if (sentToDm) {
+      // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
+      markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
       await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc))
         .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
       return;
@@ -2401,13 +2413,17 @@ export async function maybeSendGrantRequestCard(
     },
     loc,
   );
-  await replyMessage(larkAppId, message.message_id, card, 'interactive')
-    .catch(err => {
-      // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
-      // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
-      clearPending(larkAppId, chatId, requesterOpenId);
-      logger.debug(`grant request card send failed: ${err}`);
-    });
+  try {
+    await replyMessage(larkAppId, message.message_id, card, 'interactive');
+  } catch (err) {
+    // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
+    // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
+    clearPending(larkAppId, chatId, requesterOpenId);
+    logger.debug(`grant request card send failed: ${err}`);
+    return;
+  }
+  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
+  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
 }
 
 /** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方撤 pending。 */
@@ -2479,17 +2495,32 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
+  // An owner-selected manager adds top-level addressing only, not permissions
+  // or ownership of independent topics. Explicit mentions keep their usual path.
+  // Gated per bot by `chatManagerEnabled` (default off): a disabled bot stops
+  // answering un-@ messages as manager without touching the group name/marker.
+  if (isAllowed && getBot(larkAppId).config.chatManagerEnabled === true
+    && message.chat_type === 'group' && !message.root_id && !message.thread_id
+    && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId)) {
+    return 'allowed';
+  }
+
   // No @mention — the enabled solo-group bypass requires both a sole human
   // and a sole bot. With multiple bots, require @mention to disambiguate.
   //
-  // 若消息 @ 了别的具体成员（mentionsAnotherMember），群必然不是 1人1bot——
-  // 只有群成员能被 @，多出的那个 @ 本身就是人数变化的证据。上游可能还抱着
-  // 陈旧缓存 {1,1}（刚拉了新 bot 的 TTL 窗口），这会直接跳过人数查询落到
-  // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
-  // 在调用方（relax 条款）已先行结算，这里不受影响。
-  if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId) && !mentionsAnotherMember(larkAppId, message)) {
+  // 若消息 @ 了别的具体成员（mentionsAnotherMember），缓存里的 {1,1} 不可信：
+  // 可能是刚拉进新 bot 的 TTL 窗口（「用户 @ 新 bot、老 bot 跟着回复」），所以
+  // 带 revalidateSolo 重查真实人数，重查失败按多人处理。但 @ 本身不能当作
+  // 「群不是 1人1bot」的证据——飞书允许 @ 群外的人（比如在正文里交代「review
+  // 完让 @某人 合码」），重查后仍是 1人1bot 就照常放行。调用方（relax 条款）
+  // 传来的 snapshot 已按同样规则取得。群聊 @ 策略 never/ambient 在 relax 条款
+  // 已先行结算，这里不受影响。
+  if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId)) {
     const { userCount, botCount } = groupStatsOptions?.snapshot
-      ?? await getGroupStats(larkAppId, chatId, groupStatsOptions);
+      ?? await getGroupStats(larkAppId, chatId, {
+        requireFresh: groupStatsOptions?.requireFresh,
+        revalidateSolo: mentionsAnotherMember(larkAppId, message),
+      });
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
@@ -5538,14 +5569,14 @@ export function createLarkEventDispatcherRuntime(
       if (chatType === 'group') {
         const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
         const soloGroupMentionBypass = isSoloGroupMentionBypassEnabled(larkAppId, chatId);
-        // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
-        // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
-        // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
-        // 拦截老 bot 的同时不再为它反复刷新陈旧缓存。
+        // 消息里 @ 了别的具体成员时,缓存里的 1人1bot 可能已过期（「刚拉了新 bot、
+        // 用户 @ 新 bot」窗口）,用 revalidateSolo 重查真实人数;但 @ 不等于对方在
+        // 群里——飞书允许 @ 群外的人,重查后仍是 1人1bot 就照常走末条 solo 放行。
+        // 缓存已是多人/多 bot 时直接用缓存,多 bot 群里的 @ 不会多打 API。
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
-        if (soloGroupMentionBypass && ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
-          stats = await getGroupStats(larkAppId, chatId, { requireFresh: !!primary });
+        if (soloGroupMentionBypass && ownsSession && !replyRootId && mentionMode !== 'never') {
+          stats = await getGroupStats(larkAppId, chatId, { requireFresh: !!primary, revalidateSolo: mentionsOther });
         }
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
         // 的免@，只放开配置里那几条命令，所以 mentionMode 留在默认 'always' 的群
@@ -5609,10 +5640,10 @@ export function createLarkEventDispatcherRuntime(
         // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
         // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
         // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
-        // 末条 solo 放行另有 `!mentionsOther` 守卫：消息 @ 了别的具体成员时,
-        // 群必然不是 1人1bot（只有群成员能被 @），且是指给别人的——拦住「刚拉新 bot、
-        // 缓存仍是陈旧 {1,1} 时老 bot 跟着回复」的误放行。never 条款在前已短路,
-        // 故该守卫不影响「群聊 @ 策略」配置的 never 语义。
+        // 末条 solo 放行不看 mentionsOther：消息 @ 了别的具体成员时,上面已用
+        // revalidateSolo 重查过人数——「刚拉新 bot、缓存仍是陈旧 {1,1}」会查出多 bot
+        // 而不放行；重查后仍是 1人1bot,说明被 @ 的人不在群里（飞书允许 @ 群外的人）,
+        // 唯一能接话的就是本 bot,照常放行。
         const relax = (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || !!messageListener
@@ -5620,7 +5651,7 @@ export function createLarkEventDispatcherRuntime(
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
-          || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
+          || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
@@ -5856,8 +5887,17 @@ export function createLarkEventDispatcherRuntime(
 
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。
    *  绕过消息去重（原消息在拦截时已 claim 过），直接重新走消息处理流程。
-   *  用 setImmediate 异步执行，不阻塞卡片回调。 */
+   *  用 setImmediate 异步执行，不阻塞卡片回调。
+   *
+   *  durable primary 不重放：primary 下入站消息必须经 durable Inbox + canonical Session 所有权，
+   *  这里没有 primary 上下文，直接重放等于绕开它们本地派发（primary 本身也不发申请卡，见
+   *  ignoredUnsupportedPrimarySideEffect('grant request cards')）。能走到这里的只会是 primary
+   *  之前发出、落盘后跨重启恢复的旧卡：授权照常生效，申请人按授权结果卡的提示再 @ 一次即可。 */
   function replayMessageEvent(data: any): void {
+    if (runtimeOptions.enqueuePrimary) {
+      logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
+      return;
+    }
     setImmediate(() => {
       void processMessageEvent(data)
         .catch(err => logger.error(`Error replaying message event after grant: ${err}`));
@@ -6055,8 +6095,8 @@ export function createLarkEventDispatcherRuntime(
       // "Load the assigned bot (one daemon per bot)")——同群其他 bot 的缓存在
       // 别的进程,这里够不到,只能清自己的 key。覆盖增量其实很小:新添进群
       // 时本 bot 此前若恰有该群条目（曾被移出又拉回),避免带着上轮陈旧数放行。
-      // 「拉了别的 bot 进群→存量 bot 陈旧」方向无事件信号,靠 relax 末条款的
-      // mentionsAnotherMember 守卫 + TTL 兜底。
+      // 「拉了别的 bot 进群→存量 bot 陈旧」方向无事件信号,靠「消息 @ 了别的
+      // 成员时 revalidateSolo 重查人数」+ TTL 兜底。
       if (chatIdForKey) invalidateChatStats(larkAppId, chatIdForKey);
       scheduleAckSafeEvent(eventKey, async () => {
       try {
@@ -6122,6 +6162,9 @@ export function createLarkEventDispatcherRuntime(
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
     'card.action.trigger': async (data: any) => {
+      const normalized = normalizeCardActionData(data);
+      logCardActionDiagnostics('dispatcher', data, normalized);
+      data = normalized;
       const actionType = cardActionType(data);
       if (
         runtimeOptions.enqueuePrimary

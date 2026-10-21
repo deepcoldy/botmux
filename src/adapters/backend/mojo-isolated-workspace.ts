@@ -63,14 +63,6 @@ export function ensureMojoIsolatedWorkspace(sessionId: string, home: string = ho
     return realpathSync(raw);
 }
 
-/** mojo's workspace-hash (reverse-engineered, byte-verified against the live
- *  registry): h = h*31 + charCode | 0 over the string, unsigned, base36. */
-export function mojoWorkspaceHash(workspace: string): string {
-    let h = 0;
-    for (const c of workspace) h = h * 31 + c.charCodeAt(0) | 0;
-    return (h >>> 0).toString(36);
-}
-
 export type MojoDaemonReapResult =
     | { outcome: 'killed'; daemonId: string; pid: number; forced: boolean }
     | { outcome: 'not-found'; reason: string }

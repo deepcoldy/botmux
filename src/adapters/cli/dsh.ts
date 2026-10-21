@@ -87,7 +87,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       // present; custom profiles may intentionally carry their own provider.
       const bridge = profile === 'botmux' ? bridgePatch() : null;
       pushOpt(args, '--bridge-patch', bridge?.patchPath);
-      // Per-bot turn timeout override; undefined → runner default (10 min).
+      // No default turn timeout; admins may opt into an idle timeout per bot.
       pushOpt(args, '--turn-timeout-ms', typeof turnTimeoutMs === 'number' && turnTimeoutMs > 0
         ? String(turnTimeoutMs)
         : undefined);

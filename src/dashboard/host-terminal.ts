@@ -23,8 +23,14 @@
 //
 // 安全边界：这是一个**可写宿主 shell**。HTTP 路由挂在 dashboard auth gate 之后并额外要求
 // `legacyAuthed`（dashboard.ts）；WS upgrade 不经 HTTP 门禁，在本模块内显式校验「管理
-// cookie **且** legacy 管理身份」，平台隧道注入的角色（含平台 owner）一律拒，`Origin: null`
-// 拒死。可信 Origin 档位见 dashboard/control-csrf.ts 的 classifyManagementUpgrade。
+// cookie **且** legacy 管理身份」，带平台角色头（`X-Botmux-Role`，如 `t-` 终端分享子域）的
+// 请求一律拒（角色头只在本机已绑定平台、且值是 owner/teammate/guest 之一时生效，见
+// request-identity.ts），`Origin: null` 拒死。可信 Origin 档位见 dashboard/control-csrf.ts 的
+// classifyManagementUpgrade。
+//
+// 注意：中心平台的机器 Dashboard（`m-` 子域）反代**故意不注入角色头**（平台侧决定：协管者
+// 与机器主人等能力），所以从那里进来的机器主人和协管者在本机都解析成 legacy 管理身份，
+// 能用宿主终端——与原调试终端、write-link 等 legacy-only 的面同一口径。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -131,8 +137,8 @@ export interface HostTerminalDeps {
   /**
    * 本请求是否解析成 **legacy-dashboard 管理身份**——与 `/api/host-terminal` 的 HTTP 门禁
    * （dashboard.ts 的 `legacyAuthed`）同一口径。只比 cookie 不够：中心化平台隧道会剥掉
-   * 浏览器 Cookie、注入本机活跃 cookie，真实角色放在 `X-Botmux-Role`；cookie 对上只说明
-   * 走了平台隧道，不说明发起人是本机 owner。必填（不给默认值），漏接线在类型层报错。
+   * 浏览器 Cookie、注入本机活跃 cookie，带 `X-Botmux-Role` 的请求（终端分享子域等）cookie
+   * 也对得上，但身份是平台角色、不是本机管理身份。必填（不给默认值），漏接线在类型层报错。
    */
   isLegacyManagementRequest: (req: IncomingMessage) => boolean;
   /** `bmx-*` tmux session 对应的 bot / 话题名，列表里给托管会话起个人话名字。 */
