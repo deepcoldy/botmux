@@ -1107,9 +1107,10 @@ describe('startLarkEventDispatcher — connection wiring', () => {
 describe('Lark event dispatcher — durable primary processor', () => {
   const processPrimary = (
     runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
-    data: ReturnType<typeof makeUserMessageEvent>,
+    data: ReturnType<typeof makeUserMessageEvent> | ReturnType<typeof makeBotMessageEvent>,
     messageId: string,
     queuePostAdmissionOutput?: (output: unknown) => void,
+    queuePostAdmissionControl?: (event: unknown) => void,
   ) => runtime.processDurableMessage({
     eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
@@ -1129,6 +1130,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     },
     signal: new AbortController().signal,
     queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
+    queuePostAdmissionControl: queuePostAdmissionControl ?? (() => undefined),
   });
 
   it('persists recalled-message events before applying the local tombstone', async () => {
@@ -1343,6 +1345,53 @@ describe('Lark event dispatcher — durable primary processor', () => {
       content: 'blocked',
       providerUuid: 'primary_output',
     });
+    runtime.close();
+  });
+
+  it('exposes the canonical post-admission control queue to a mentioned bot sender', async () => {
+    setupBotState({ allowedUsers: [OTHER_BOT_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(true);
+    const control = {
+      eventId: `lark-command.session-control:${MY_APP_ID}:om_primary_bot_close`,
+      lane: 'session-control',
+      partitionKey: `lark-session-control:${MY_APP_ID}:session-primary-bot-close`,
+      payload: { type: 'botmux.session.control' },
+      visibleAt: 1,
+      createdAt: 1,
+    };
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.queuePostAdmissionControl(control);
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-bot-close', chatId: 'chat-primary', rootMessageId: 'om_primary_root',
+      scope: 'thread', title: 'Primary bot close', status: 'active',
+      createdAt: '2026-10-22T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const queuedControl = vi.fn();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA /close' }),
+      messageId: 'om_primary_bot_close',
+      rootId: 'om_primary_root',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(
+      runtime,
+      data,
+      'om_primary_bot_close',
+      undefined,
+      queuedControl,
+    )).resolves.toMatchObject({ kind: 'admitted' });
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(queuedControl).toHaveBeenCalledWith(control);
     runtime.close();
   });
 
