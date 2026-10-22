@@ -806,8 +806,10 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    prepareTriggerPresentation(target, willFork || !!(stableTurnId || loudTurnId
-      || req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId));
+    // Every accepted external input owns its generated turn, including quiet
+    // report follow-ups on an already-running worker. Keep its reply anchor
+    // independent of presentation and final-output suppression options.
+    prepareTriggerPresentation(target, true);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -1569,7 +1571,7 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
+      const accepted = sendWorkerInput(target, content, triggerId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
