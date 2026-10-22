@@ -7647,7 +7647,7 @@ ipcRoute('POST', '/api/bot-slash-commands/delete', async (req, res) => {
 // (UI shows "上次启用时间").
 
 ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => {
-  const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
+  const { defaultOncall, autoboundChats, oncallChatCount } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
   let replyStyle: ReplyStyleConfig | null = null;
@@ -7846,7 +7846,10 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
+    // 「自动绑定机会已用过」的群数（含已解绑 / 切模式释放的），不是当前绑定数；
+    // 当前绑定数是 oncallChatCount。
     autoboundChatCount: autoboundChats.length,
+    oncallChatCount,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     replyStyle,
     askOptionLayout,

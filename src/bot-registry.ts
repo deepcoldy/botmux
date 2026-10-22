@@ -2920,6 +2920,13 @@ export function findOncallChat(larkAppId: string, chatId: string): OncallChat | 
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
 
+/** All oncall bindings currently recorded for a bot, with the same disk
+ *  freshness as {@link findOncallChat}. */
+export function listOncallChats(larkAppId: string): OncallChat[] {
+  refreshRegisteredOncallChatsFromDisk();
+  return [...(bots.get(larkAppId)?.config.oncallChats ?? [])];
+}
+
 /**
  * The bot's effective default working dir for a NEW session, as a raw
  * (possibly `~`-prefixed) path — the caller still expands + validates it.

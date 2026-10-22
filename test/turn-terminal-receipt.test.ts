@@ -3,8 +3,11 @@
  * These tests drive the real worker IPC handler so the receipt cannot regress
  * into a prompt convention that depends on the model emitting visible output.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const botConfig: Record<string, unknown> = {
   larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex',
@@ -63,10 +66,15 @@ vi.mock('../src/bot-registry.js', () => ({
   resolveUsageDisplay: vi.fn(() => 'footer'),
 }));
 
+// Fresh per run, not a fixed path: a reply-card record left by an earlier run
+// already carries a messageId, so the unified case would PATCH locally where a
+// fresh CI runner POSTs — and that late POST is what this file must wait for.
+const dataDir = mkdtempSync(join(tmpdir(), 'botmux-terminal-receipt-'));
+
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-terminal-receipt' },
+    session: { get dataDir() { return dataDir; } },
     daemon: { backendType: 'pty', cliId: 'traex' },
   },
 }));
@@ -93,12 +101,14 @@ import {
   __testOnly_setupWorkerHandlers,
   recordTurnExplicitMention,
 } from '../src/core/worker-pool.js';
-import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
 import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
+
+const sessions: DaemonSession[] = [];
 
 function makeDs(): DaemonSession {
   const fakeWorker = new EventEmitter() as any;
@@ -108,7 +118,7 @@ function makeDs(): DaemonSession {
   fakeWorker.pid = 99999;
   fakeWorker.stdout = new EventEmitter();
   fakeWorker.stderr = new EventEmitter();
-  return {
+  const ds = {
     session: {
       sessionId: 'sid-terminal-receipt',
       rootMessageId: 'om_root',
@@ -133,6 +143,28 @@ function makeDs(): DaemonSession {
     lastMessageAt: Date.now(),
     hasHistory: false,
   } as any;
+  sessions.push(ds);
+  return ds;
+}
+
+/** Invoke the real worker IPC handler exactly as EventEmitter#emit does —
+ * synchronously, back to back, in listener order — but keep each async
+ * listener's promise, so a test waits for the handler instead of a guessed delay. */
+function deliver(ds: DaemonSession, ...msgs: WorkerToDaemon[]): Promise<void> {
+  const worker = ds.worker as unknown as EventEmitter;
+  return Promise.all(msgs.flatMap(msg =>
+    worker.listeners('message').map(listener => listener.call(worker, msg)),
+  )).then(() => undefined);
+}
+
+/** Wait until every deferred receipt pipeline the handler fenced (strip
+ * retries, the interim re-decision) has finished. After the handler has
+ * returned, a strip that was going to be posted has been posted by now.
+ * Only work registered through beginFinalOutputDelivery is covered: the
+ * unified reply-card publication runs outside that fence, so its test waits
+ * for the POST itself — any new unfenced background write needs the same. */
+async function settle(ds: DaemonSession): Promise<void> {
+  expect(await waitForFinalOutputDeliveryDrain(ds, Date.now() + 10_000)).toBe(true);
 }
 
 function bindLarkTurn(ds: DaemonSession, turnId: string, root = 'om_exact_root'): void {
@@ -176,9 +208,16 @@ describe('independent turn terminal receipt', () => {
     } as any);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // A fenced delivery still running here would land in the next test, after
+    // its mockReset, and be counted against that test's assertions.
+    await Promise.all(sessions.splice(0).map(settle));
     vi.useRealTimers();
     vi.clearAllMocks();
+  });
+
+  afterAll(() => {
+    rmSync(dataDir, { recursive: true, force: true });
   });
 
   it('posts one completed strip for an ordinary Lark turn', async () => {
@@ -235,18 +274,17 @@ describe('independent turn terminal receipt', () => {
       bindLarkTurn(ds, `om_turn_${responseKind}`);
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-      (ds.worker as any).emit('message', {
+      await deliver(ds, {
         type: 'explicit_reply_observed',
         turnId: `om_turn_${responseKind}`,
         messageId: `om_${responseKind}_card`,
         responseKind,
         terminalCarrier: 'standard_reply_card',
-      } satisfies WorkerToDaemon);
-      (ds.worker as any).emit('message', terminalMsg(`om_turn_${responseKind}`, {
+      }, terminalMsg(`om_turn_${responseKind}`, {
         outputDisposition: 'nothing_to_send',
       }));
+      await settle(ds);
 
-      await new Promise(resolve => setTimeout(resolve, 20));
       expect(patchCardStreamElement).not.toHaveBeenCalled();
       expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
       expect(sessionReplyMock).not.toHaveBeenCalled();
@@ -396,18 +434,17 @@ describe('independent turn terminal receipt', () => {
       bindLarkTurn(ds, turnId);
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-      (ds.worker as any).emit('message', {
+      // A bare completed terminal (no final_output and no nothing-to-send
+      // flag, e.g. the RPC hydration window) must not promote the interim card.
+      await deliver(ds, {
         type: 'explicit_reply_observed',
         turnId,
         messageId: `om_${responseKind}_card`,
         responseKind,
         terminalCarrier: 'standard_reply_card',
-      } satisfies WorkerToDaemon);
-      // A bare completed terminal (no final_output and no nothing-to-send
-      // flag, e.g. the RPC hydration window) must not promote the interim card.
-      (ds.worker as any).emit('message', terminalMsg(turnId));
+      }, terminalMsg(turnId));
+      await settle(ds);
 
-      await new Promise(resolve => setTimeout(resolve, 20));
       expect(patchCardStreamElement).not.toHaveBeenCalled();
       expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
       expect(sessionReplyMock).not.toHaveBeenCalled();
@@ -587,9 +624,9 @@ describe('independent turn terminal receipt', () => {
       bindLarkTurn(ds, `om_turn_${status}`);
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-      (ds.worker as any).emit('message', terminalMsg(`om_turn_${status}`, { status }));
+      await deliver(ds, terminalMsg(`om_turn_${status}`, { status }));
+      await settle(ds);
 
-      await new Promise(resolve => setTimeout(resolve, 20));
       expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
     },
   );
@@ -600,12 +637,15 @@ describe('independent turn terminal receipt', () => {
     const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_ordered');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_ordered'));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await deliver(ds, terminalMsg('om_turn_ordered'));
+    // The handler has returned with the strip claimed, yet nothing is posted
+    // while the same turn's answer is still in flight.
+    expect(ds.terminalReceiptTurnIds?.has('om_turn_ordered')).toBe(true);
     expect(sessionReplyMock).not.toHaveBeenCalled();
 
     finishAnswer();
-    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    await settle(ds);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
   });
 
   it('deduplicates duplicate terminal events with one stable provider UUID', async () => {
@@ -626,11 +666,12 @@ describe('independent turn terminal receipt', () => {
     const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_old');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_old'));
+    const handled = deliver(ds, terminalMsg('om_turn_old'));
     ds.currentTurnId = 'om_turn_new';
     finishAnswer();
 
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await handled;
+    await settle(ds);
     expect(sessionReplyMock).not.toHaveBeenCalled();
     expect(ds.terminalReceiptTurnIds?.has('om_turn_old')).toBe(true);
   });
@@ -645,9 +686,9 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(ds, 'om_turn_excluded');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_excluded'));
+    await deliver(ds, terminalMsg('om_turn_excluded'));
+    await settle(ds);
 
-    await new Promise(resolve => setTimeout(resolve, 20));
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
@@ -679,9 +720,17 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(ds, 'om_turn_unified');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_unified'));
-
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await deliver(ds, terminalMsg('om_turn_unified'));
+    await settle(ds);
+    // The unified reply card owns the terminal UI and publishes it in the
+    // background (store lock + durable write, then POST). Wait for that POST —
+    // the reply-card transport is the sender that passes a beforeWrite guard;
+    // left running, it lands in the next test after its mockReset.
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledWith(
+      expect.anything(), expect.any(String), 'interactive', 'app_test', 'om_turn_unified',
+      expect.objectContaining({ beforeWrite: expect.any(Function) }),
+    ), { timeout: 5_000, interval: 20 });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
   });
 
@@ -690,20 +739,21 @@ describe('independent turn terminal receipt', () => {
     bindLarkTurn(schedule, 'schedule:task:fire');
     armSilentScheduledTurn(schedule, 'schedule:task:fire');
     __testOnly_setupWorkerHandlers(schedule, schedule.worker as any);
-    (schedule.worker as any).emit('message', terminalMsg('schedule:task:fire'));
+    const scheduleHandled = deliver(schedule, terminalMsg('schedule:task:fire'));
 
     const vc = makeDs();
     (vc.session as any).vcMeetingReceiver = true;
     bindLarkTurn(vc, 'om_turn_vc');
     __testOnly_setupWorkerHandlers(vc, vc.worker as any);
-    (vc.worker as any).emit('message', terminalMsg('om_turn_vc'));
+    const vcHandled = deliver(vc, terminalMsg('om_turn_vc'));
 
     const api = makeDs();
     api.currentTurnId = 'trigger-api';
     __testOnly_setupWorkerHandlers(api, api.worker as any);
-    (api.worker as any).emit('message', terminalMsg('trigger-api'));
+    const apiHandled = deliver(api, terminalMsg('trigger-api'));
 
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await Promise.all([scheduleHandled, vcHandled, apiHandled]);
+    await Promise.all([schedule, vc, api].map(settle));
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 

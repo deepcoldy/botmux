@@ -1887,6 +1887,39 @@ describe('POST /api/session-origin/attest', () => {
   }, 5_000);
 });
 
+describe('GET /api/bot-default-oncall — oncall chat counts', () => {
+  it('reports live bindings (oncallChats) apart from the autobound tombstone list', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-oncall-counts-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-oncall-counts-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        // oc_live is still bound; the other two were unbound / released and only
+        // remain in the "auto-bind already used" list.
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+        defaultOncallAutoboundChats: ['oc_live', 'oc_unbound', 'oc_released'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ autoboundChatCount: 3, oncallChatCount: 1 });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('GET /api/bot-default-oncall — schedule host paths', () => {
   it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));

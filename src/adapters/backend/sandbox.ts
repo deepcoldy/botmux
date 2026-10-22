@@ -1767,9 +1767,12 @@ export function startOutboxWatcher(
   const staging = join(dirname(outbox), 'relay-staging');
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
+    // 先消费请求、再发布响应：任何人看到 res.json 时，req.json 都已不在。
+    // 反过来的话，两步之间这条已执行完的请求看上去仍在排队，接手同一 outbox
+    // 的 watcher（restore / transfer 之后）会把它再执行一遍。
+    try { rmSync(reqPath, { force: true }); } catch { /* */ }
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
     try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
-    try { rmSync(reqPath, { force: true }); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };

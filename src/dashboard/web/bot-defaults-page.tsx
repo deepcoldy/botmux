@@ -904,6 +904,29 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
   );
 }
 
+/**
+ * 名字行右侧的 oncall 群计数。autoboundChatCount 是自动绑定名单（tombstone）的长度：
+ * 已解绑、切出 oncall 模式被释放的群都还在里面，单独显示会被读成「还绑着这么多群」，
+ * 所以和当前绑定数并排给出，并在悬浮说明里讲清名单里的群不会再自动绑定。
+ */
+export function OncallChatCounts(props: { bot: Pick<BotDefaultsRow, 'autoboundChatCount' | 'oncallChatCount'> }) {
+  const tr = useT();
+  const autobound = props.bot.autoboundChatCount ?? 0;
+  // 旧 daemon 不报当前绑定数（null）：只显示自动绑定过的数量，不猜。
+  const bound = typeof props.bot.oncallChatCount === 'number' ? props.bot.oncallChatCount : null;
+  if (autobound <= 0 && !bound) return null;
+  const parts = [
+    ...(bound !== null ? [tr('botDefaults.oncallBound', { count: bound })] : []),
+    ...(autobound > 0 ? [tr('botDefaults.autobound', { count: autobound })] : []),
+  ];
+  return (
+    <small data-oncall-chat-counts>
+      {parts.join(' · ')}
+      {autobound > 0 ? <InfoTip>{tr('botDefaults.autoboundHelp')}</InfoTip> : null}
+    </small>
+  );
+}
+
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
   bots: BotDefaultsRow[];
@@ -961,7 +984,7 @@ function BotDefaultsCard(props: {
                     : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
                     : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
-                  {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
+                  <OncallChatCounts bot={bot} />
                 </>
               )}
             />
