@@ -138,6 +138,7 @@ import {
   validateCodexAppManagedSendOrigin,
 } from './utils/codex-app-dispatch-ledger.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
+import { isCliFlagShapedRemoteRunnerValue } from './adapters/backend/remote-runner-protocol.js';
 import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
@@ -10033,9 +10034,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Provider values are opaque argv tokens, but flag-shaped mention values can
   // otherwise trigger the help/dry-run early exits below before the outbound
   // policy guard runs. Reject them at the final CLI boundary as well as in the
-  // Remote Runner protocol parser so direct/replayed invocations fail closed.
+  // Remote Runner protocol parser so direct/replayed outbound mention values
+  // fail closed.
   if (remoteRunnerOutbound
-    && argValues(rest, '--mention').some(value => /^--?\w/.test(value))) {
+    && argValues(rest, '--mention').some(isCliFlagShapedRemoteRunnerValue)) {
     console.error('botmux send refused: --remote-runner-outbound mention values must not look like CLI flags');
     process.exit(2);
   }

@@ -292,6 +292,7 @@ describe('remote runner protocol', () => {
       { mention: 'explicit', mentions: ['ou_target:Target', ''] },
       { mention: 'explicit', mentions: ['ou_target\0Target'] },
       { mention: 'explicit', mentions: ['--help'] },
+      { mention: 'explicit', mentions: [' --help'] },
       { mention: 'explicit', mentions: ['-h'] },
       { mention: 'explicit', mentions: ['--dry-run'] },
       { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },

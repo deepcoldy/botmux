@@ -90,8 +90,10 @@ describe('send --dry-run', () => {
     expect(result.stdout).toContain('--dry-run');
     expect(result.stdout).toContain('```vega-lite');
   });
+});
 
-  it.each(['--help', '-h', '--dry-run'])(
+describe('send --remote-runner-outbound mention guard', () => {
+  it.each(['--help', ' --help', '-h', '--dry-run'])(
     'rejects a flag-shaped Remote Runner mention value %s before early exits',
     flag => {
       const result = run([
