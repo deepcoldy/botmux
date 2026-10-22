@@ -14,7 +14,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -203,13 +203,16 @@ import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-displ
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
+  fetchReleaseLatestVersion,
   fetchReleasesSince,
   fetchRollbackVersions,
   compareVersions,
   isCanonicalStableVersion,
   isNewerVersion,
+  mirrorFallbackRetryMs,
   type ChangelogResult,
   type RollbackVersionsResult,
+  type UpdateVersionSource,
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
 import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
@@ -2028,36 +2031,76 @@ let pendingLocalDevRestart: { dir: string; head: string } | undefined;
 const LATEST_TTL_MS = 30 * 60_000;
 const CHANGELOG_TTL_MS = 15 * 60_000;
 const FAILURE_TTL_MS = 60_000;
-type LatestVersionCache = { value: string | null; at: number; lookupOk: boolean };
+type LatestVersionCache = {
+  value: string | null;
+  source: UpdateVersionSource | null;
+  at: number;
+  ttlMs: number;
+  lookupOk: boolean;
+  releaseBacked: boolean;
+  fallbackStreak: number;
+};
 let latestVersionCache: LatestVersionCache | null = null;
-let latestVersionLookupInFlight: Promise<LatestVersionCache> | null = null;
+let latestVersionLookupInFlight: {
+  releaseBacked: boolean;
+  value: Promise<LatestVersionCache>;
+} | null = null;
 let changelogCache: { key: string; value: ChangelogResult; at: number } | null = null;
 let rollbackVersionCache: { current: string; value: RollbackVersionsResult; at: number } | null = null;
 let rollbackVersionLookupInFlight: { current: string; value: Promise<RollbackVersionsResult> } | null = null;
 
 async function cachedLatestVersion(force = false): Promise<LatestVersionCache> {
   const now = Date.now();
-  const ttl = latestVersionCache?.lookupOk ? LATEST_TTL_MS : FAILURE_TTL_MS;
-  if (!force && latestVersionCache && now - latestVersionCache.at < ttl) return latestVersionCache;
+  const strategy = currentUpdateStrategy(botmuxInstallRoot());
+  const releaseBacked = strategy.kind === 'self-replace' || strategy.kind === 'install-release';
+  if (!force
+    && latestVersionCache?.releaseBacked === releaseBacked
+    && now - latestVersionCache.at < latestVersionCache.ttlMs) {
+    return latestVersionCache;
+  }
   // When forcing a refresh, don't piggy-back on an in-flight lookup that may
   // have started before the user asked for a refresh — start a fresh one so
   // the result reflects the current upstream state, not a stale query.
-  if (!force && latestVersionLookupInFlight) return latestVersionLookupInFlight;
+  if (!force && latestVersionLookupInFlight?.releaseBacked === releaseBacked) {
+    return latestVersionLookupInFlight.value;
+  }
 
   const lookup = (async () => {
-    const value = await fetchLatestVersion();
+    const result: { version: string | null; source: UpdateVersionSource | null } = releaseBacked
+      ? await fetchReleaseLatestVersion()
+      : {
+          version: await fetchLatestVersion(),
+          source: 'configured',
+        };
+    if (!result.version) result.source = null;
+    const fallbackStreak = result.source === 'configured-fallback'
+      ? latestVersionCache?.releaseBacked === releaseBacked
+        && latestVersionCache.source === 'configured-fallback'
+        ? latestVersionCache.fallbackStreak + (force ? 0 : 1)
+        : 1
+      : 0;
+    const ttlMs = !result.version
+      ? FAILURE_TTL_MS
+      : result.source === 'configured-fallback'
+        ? mirrorFallbackRetryMs(fallbackStreak)
+        : LATEST_TTL_MS;
     latestVersionCache = {
-      value: value ?? latestVersionCache?.value ?? null,
+      value: result.version ?? latestVersionCache?.value ?? null,
+      source: result.source ?? latestVersionCache?.source ?? null,
       at: Date.now(),
-      lookupOk: value !== null,
+      ttlMs,
+      lookupOk: result.version !== null,
+      releaseBacked,
+      fallbackStreak,
     };
     return latestVersionCache;
   })();
-  latestVersionLookupInFlight = lookup;
+  const inFlight = { releaseBacked, value: lookup };
+  latestVersionLookupInFlight = inFlight;
   try {
     return await lookup;
   } finally {
-    if (latestVersionLookupInFlight === lookup) latestVersionLookupInFlight = null;
+    if (latestVersionLookupInFlight === inFlight) latestVersionLookupInFlight = null;
   }
 }
 
@@ -4867,6 +4910,7 @@ const server = createServer(async (req, res) => {
         ...(diskVersion ? { diskVersion } : {}),
         latest,
         versionLookupOk: latestResult.lookupOk,
+        latestSource: latestResult.source,
         behind: !!latest && isNewerVersion(latest, current),
         runningDaemons,
         ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
@@ -4988,6 +5032,8 @@ const server = createServer(async (req, res) => {
         let blockedByRestart = false;
         let oldVersion = '';
         let newVersion = '';
+        let skipped: string | undefined;
+        let source: string | undefined;
         try {
           const latest = await cachedLatestVersion(false);
           if (!latest.value) {
@@ -4998,11 +5044,15 @@ const server = createServer(async (req, res) => {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            await replaceStandaloneBinary(newVersion, runStrategy.target, {
+            const result = await applyStandaloneUpdate(newVersion, {
+              currentVersion: oldVersion, target: runStrategy.target,
+            }, {
               onProgress: (progress) => {
                 binaryUpdateProgress = { version: newVersion, ...progress };
               },
             });
+            if (result.skipped) { skipped = result.reason; return; }
+            source = result.source;
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
@@ -5013,10 +5063,15 @@ const server = createServer(async (req, res) => {
           binaryUpdateProgress = undefined;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        if (skipped) return jsonRes(res, 200, {
+          ok: true, oldVersion, newVersion: oldVersion, resolvedVersion: newVersion,
+          changed: false, restartRequired: false, skipped, manager: 'binary',
+        });
         return jsonRes(res, 200, {
           ok: true,
           oldVersion,
           newVersion,
+          source,
           // The swapped binary is on disk but THIS process still runs (and reports)
           // the old baked version, so `changed` cannot be derived by re-reading —
           // it is the version comparison that decided to update at all.

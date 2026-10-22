@@ -8,6 +8,7 @@ import type {
   DurableSessionControlDispatchContext,
   DurableSessionControlDispatchResult,
 } from './durable-session-control-consumer.js';
+import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 
 export type DurableSessionControlEffectResult =
   | { kind: 'completed'; result: DurableJson }
@@ -106,7 +107,9 @@ export function createDurableSessionControlDispatch(
       leaseDurationMs,
     });
     if (acquired.kind === 'occupied') {
-      throw new Error(`durable session control Session is occupied by ${acquired.ownerId}`);
+      throw new DurableSessionControlOwnerHandoffError(
+        `durable session control Session is occupied by ${acquired.ownerId}`,
+      );
     }
     const inserted = await options.store.enqueueControlOperation({
       lease: acquired.lease,

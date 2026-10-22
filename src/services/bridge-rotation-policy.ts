@@ -135,6 +135,46 @@ export function pidRotationHistoryCutoffMs(input: PidRotationCutoffInput): numbe
   return cutoff;
 }
 
+// ─── Recording the conversation Claude moved to ────────────────────────────
+
+export interface PidStateSessionRecordInput {
+  /** Session id Claude's pid-state record names, for the transcript the bridge
+   *  reads now. */
+  observedSessionId: string;
+  /** What a cold start would resume: the recorded CLI session id, else the
+   *  botmux session id the CLI was launched with. */
+  resumeSessionId: string;
+  /** An adopted CLI: botmux never relaunches it (the session closes when its
+   *  pane goes away), so there is no resume target to keep current. */
+  adopted: boolean;
+  /** Whether the observed session's transcript holds a conversation
+   *  `--resume` can open. Reads the file, so it is asked last. */
+  transcriptResumable: () => boolean;
+}
+
+/**
+ * Should the worker record the session id Claude's pid-state record names as
+ * the one to resume?
+ *
+ * Claude 2.1.305+ rewrites `sessions/<pid>.json` the moment it moves to
+ * another conversation — `/clear`, an in-pane `/resume`, `/branch` (`/compact`
+ * stays in the same one). Otherwise the id is reported only around a Lark
+ * message's submit, so after a `/clear` followed by local turns alone the next
+ * cold start (`--resume <recorded id>`) brought back the conversation the user
+ * had just cleared.
+ *
+ * Only once its transcript holds a conversation: `--resume` of an id without
+ * one makes Claude exit ("No conversation found"). A `--fork-session` launch
+ * names its new id before the file exists, and the file starts out as a few
+ * metadata records before the conversation lands in it (2.1.308). Until then
+ * the recorded id stays what it was — which is what the next start resumes, or
+ * forks from again.
+ */
+export function shouldRecordPidStateSessionId(input: PidStateSessionRecordInput): boolean {
+  if (input.adopted || input.observedSessionId === input.resumeSessionId) return false;
+  return input.transcriptResumable();
+}
+
 // ─── Two-phase fingerprint-fallback decision ───────────────────────────────
 
 /** UUID-shaped Claude jsonl filename (sessionId.jsonl). Duplicated from

@@ -30,11 +30,174 @@ export function parseBotDefaultsTab(value: string | null | undefined): BotDefaul
   return value && (BOT_DEFAULTS_TABS as readonly string[]).includes(value) ? value as BotDefaultsTab : null;
 }
 
-/** `#/bot-defaults?bot=<appId>&tab=<分类>` 深链；都不给就是 Bot 配置页本身。 */
-export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab } = {}): string {
+/**
+ * Bot 配置页各分类网格里的区块，⌘K 按它生成「区块」与「配置项」条目。页面上每个格子挂
+ * `id={botDefaultsSectionDomId(id)}`；覆盖测试要求格子与这张表一一对应、页面里每个区块
+ * 标题都在表里——新加区块忘了登记会直接红。
+ */
+export interface BotDefaultsSection {
+  id: string;
+  tab: BotDefaultsTab;
+  titleKey: string;
+  /** 和别的区块合放在同一个格子里时，那个格子的 id（落地时先找格子，再按标题找区块）。 */
+  tile?: string;
+  /** 区块里的配置项标题：⌘K 直达，落地时在区块里按文字定位到那一行。 */
+  fieldKeys?: readonly string[];
+}
+
+export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
+  {
+    id: 'agent',
+    tab: 'common',
+    titleKey: 'botDefaults.sectionAgent',
+    fieldKeys: [
+      'botDefaults.agentModel', 'botDefaults.agentReasoningEffort', 'botDefaults.agentServiceTier',
+      'botDefaults.agentModelBackendVariant', 'botDefaults.agentTurnTimeout', 'botDefaults.cliConfigDir',
+      'botDefaults.skillInjection', 'botDefaults.nativeSubagentTitle', 'botDefaults.runtimeTitle',
+      'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
+      'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
+    ],
+  },
+  {
+    id: 'working-dir',
+    tab: 'common',
+    titleKey: 'botDefaults.sectionWorkingDir',
+    fieldKeys: [
+      'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
+      'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
+      'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
+    ],
+  },
+  { id: 'role', tab: 'common', titleKey: 'botDefaults.sectionRole', fieldKeys: ['botDefaults.profileRoles', 'roles.injectModeLabel'] },
+  {
+    id: 'session-mode',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionSessionMode',
+    fieldKeys: [
+      'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
+      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle',
+    ],
+  },
+  {
+    id: 'substitute',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionSubstitute',
+    fieldKeys: [
+      'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
+      'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
+      'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+    ],
+  },
+  {
+    id: 'command-trigger',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionCommandTrigger',
+    fieldKeys: [
+      'botDefaults.commandTriggerEnabled', 'botDefaults.commandTriggerCommands', 'botDefaults.commandTriggerScope',
+      'botDefaults.commandTriggerChats', 'botDefaults.commandTriggerExcludedChats',
+    ],
+  },
+  { id: 'cross-bot', tab: 'sessions', titleKey: 'botDefaults.sectionCrossBot', fieldKeys: ['botDefaults.botToBotSameDir'] },
+  { id: 'session-cap', tab: 'sessions', titleKey: 'botDefaults.sectionSessionCap', fieldKeys: ['botDefaults.maxLiveWorkers', 'botDefaults.idleSuspendMinutes'] },
+  { id: 'startup-commands', tab: 'sessions', titleKey: 'botDefaults.sectionStartupCommands' },
+  { id: 'summary-trigger', tab: 'sessions', titleKey: 'botDefaults.sectionSummaryTrigger', fieldKeys: ['botDefaults.summaryMemory'] },
+  { id: 'sandbox', tab: 'security', titleKey: 'botDefaults.sectionSandbox' },
+  { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
+  { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth' },
+  { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle'] },
+  { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
+  {
+    id: 'grant',
+    tab: 'security',
+    titleKey: 'botDefaults.sectionGrant',
+    fieldKeys: [
+      'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
+      'botDefaults.grantRequestToOwnerDm', 'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
+    ],
+  },
+  { id: 'blocked-users', tab: 'security', titleKey: 'blocked.sectionTitle' },
+  {
+    id: 'slash-commands',
+    tab: 'security',
+    titleKey: 'botDefaults.sectionSlashCommands',
+    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough'],
+  },
+  {
+    id: 'card-behavior',
+    tab: 'cards',
+    titleKey: 'botDefaults.sectionCard',
+    fieldKeys: [
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
+      'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
+      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
+    ],
+  },
+  { id: 'feedback', tab: 'cards', titleKey: 'botDefaults.sectionFeedback' },
+  {
+    id: 'reply-style',
+    tab: 'cards',
+    titleKey: 'botDefaults.sectionReplyStyle',
+    fieldKeys: [
+      'botDefaults.replyStyleTheme', 'botDefaults.replyStyleLayouts', 'botDefaults.replyStyleLayoutShell',
+      'botDefaults.replyStyleRecipes', 'botDefaults.replyStyleRecipePrompt',
+    ],
+  },
+  { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
+  { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
+  { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel'] },
+  {
+    id: 'herdr',
+    tab: 'advanced',
+    titleKey: 'botDefaults.sectionHerdr',
+    fieldKeys: [
+      'botDefaults.herdrWorkspace', 'botDefaults.herdrTab', 'botDefaults.herdrSessionName',
+      'botDefaults.herdrPlacement', 'botDefaults.herdrSplitDirection', 'botDefaults.herdrChatTypes',
+    ],
+  },
+  {
+    id: 'codex-app-display',
+    tab: 'advanced',
+    titleKey: 'botDefaults.sectionCodexAppDisplay',
+    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify'],
+  },
+  { id: 'envelope-injection', tab: 'advanced', titleKey: 'botDefaults.envelopeInjection', fieldKeys: ['botDefaults.envelopeInjectionAuto'] },
+  { id: 'prompt-injection', tab: 'advanced', titleKey: 'botDefaults.promptInjection', fieldKeys: ['botDefaults.promptInjectionToggle'] },
+  { id: 'reply-delivery', tab: 'advanced', titleKey: 'botDefaults.replyDelivery', tile: 'prompt-injection', fieldKeys: ['botDefaults.replyDeliveryTranscript'] },
+  { id: 'sender-tag', tab: 'advanced', titleKey: 'botDefaults.senderTag', fieldKeys: ['botDefaults.senderTagInject', 'botDefaults.senderTagHideEmail'] },
+  {
+    id: 'quota-fallback',
+    tab: 'advanced',
+    titleKey: 'botDefaults.quotaFallbackTitle',
+    fieldKeys: ['botDefaults.quotaFallbackEnabled', 'botDefaults.quotaFallbackTarget', 'botDefaults.quotaFallbackMessage'],
+  },
+  {
+    id: 'runtime-env',
+    tab: 'advanced',
+    titleKey: 'botDefaults.sectionRuntimeEnv',
+    fieldKeys: ['botDefaults.sectionEnv', 'botDefaults.sectionLaunchShell', 'botDefaults.envPolicyLabel'],
+  },
+  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText'] },
+];
+
+export function botDefaultsSectionDomId(id: string): string {
+  return `bd-section-${id}`;
+}
+
+export function findBotDefaultsSection(id: string | null | undefined): BotDefaultsSection | null {
+  return (id && BOT_DEFAULTS_SECTIONS.find(section => section.id === id)) || null;
+}
+
+/**
+ * `#/bot-defaults?bot=<appId>&tab=<分类>&section=<区块>&field=<配置项>` 深链；都不给就是 Bot 配置页本身。
+ * 给了区块就不必再给分类，页面按区块所在的分类切过去。
+ */
+export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {}): string {
   const params = new URLSearchParams();
   if (target.bot) params.set('bot', target.bot);
   if (target.tab) params.set('tab', target.tab);
+  if (target.section) params.set('section', target.section);
+  if (target.field) params.set('field', target.field);
   const query = params.toString();
   return `#/bot-defaults${query ? `?${query}` : ''}`;
 }

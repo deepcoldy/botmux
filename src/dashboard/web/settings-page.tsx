@@ -131,6 +131,7 @@ interface CliRuntimeUpdateStatus {
 interface UpdateStatus {
   current: string;
   latest: string | null;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
@@ -2218,10 +2219,15 @@ export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) 
   );
 }
 
-function UpdateBadge(props: { status: UpdateStatus }) {
+export function UpdateBadge(props: { status: UpdateStatus }) {
   const tr = useT();
   const s = props.status;
   if (!s.latest) return <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>;
+  if (s.latestSource === 'configured-fallback') {
+    return s.behind
+      ? <span className="update-badge update-badge-new">{tr('update.mirrorNewAvailable', { version: `v${s.latest}` })}</span>
+      : <span className="update-badge update-badge-ok">{tr('update.mirrorUpToDate')}</span>;
+  }
   return s.behind
     ? <span className="update-badge update-badge-new">{tr('update.newAvailable', { version: `v${s.latest}` })}</span>
     : <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>;

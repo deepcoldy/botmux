@@ -35,6 +35,7 @@ import { logger } from './utils/logger.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
@@ -3873,15 +3874,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       );
     }
 
-    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai|minimax，
-    // 三类凭证为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 →
-    // undefined。深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig
-    // / resolveAsrConfig 做，这里只挡明显垃圾（如 minimax.region 拼错）。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
       const eng = (rawVoice as any).engine;
-      if (eng === undefined || eng === 'sami' || eng === 'openai' || eng === 'minimax') {
+      if (eng === undefined || eng === 'sami' || eng === 'openai' || eng === 'minimax' || eng === 'volcengine') {
         const v: VoiceConfig = {};
         if (eng) v.engine = eng;
         if (typeof (rawVoice as any).speaker === 'string') v.speaker = (rawVoice as any).speaker;
@@ -3905,7 +3902,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
           ...(typeof a.language === 'string' ? { language: a.language } : {}),
         };
-        if (v.engine || v.sami || v.openai || v.minimax || v.speaker || v.asr) voice = v;
+        if ('volcengine' in rawVoice) v.volcengine = parseVolcengineConfig(rawVoice.volcengine);
+        if (v.engine || v.sami || v.openai || v.minimax || v.speaker !== undefined || v.rate !== undefined
+          || v.asr || v.volcengine !== undefined) voice = v;
       }
     }
 

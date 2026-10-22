@@ -816,9 +816,10 @@ type WorkerStartupState = {
   onPreReadyExit?: () => void;
   /** Explicit Remote Runner rebuilds cross two readiness boundaries: the Node
    * worker can initialize before the provider returns its rebuild `ready`
-   * state. Keep this callback armed across worker `ready` and consume it only
-   * when the backend either publishes that state or exits first. */
-  onRemoteBackendStartupExit?: () => boolean;
+   * state. Keep this callback armed across worker `ready` and backend-state
+   * publication; canonical lifecycle commit releases it through the recovery
+   * presentation gate, while an earlier backend exit consumes it. */
+  onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   /** Init turn attribution frozen at fork. A durable VC delivery is dispatched
    *  (queued) into a not-yet-ready worker; if that worker dies before ready
    *  (fork ENOENT, syntax/import crash, abrupt exit) the fork-level `error` and
@@ -7644,7 +7645,11 @@ async function prepareLiveRemoteWorkerClose(
       await abortLiveRemoteWorkerClose(ds, requestId, {
         allowAbsentAfterProvenRestore: matchedCloseResult,
       });
-    } else {
+    } else if (ds.remoteCloseState?.requestId === requestId) {
+      // A Remote Runner provider exit retires this worker and clears the
+      // process-local fence so a fresh control provider can reconcile from the
+      // durable backend state. Do not let this stale prepare continuation put
+      // the fence back after that authoritative retirement.
       ds.remoteCloseState = { phase: 'uncertain', requestId };
     }
     logger.warn(
@@ -13344,7 +13349,7 @@ export type ForkWorkerOptions = {
   onPreReadyExit?: () => void;
   /** Called once when an admitted Remote Runner worker survives startup but
    * its backend exits before publishing the rebuilt backend state. */
-  onRemoteBackendStartupExit?: () => boolean;
+  onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   deferDuringDeviceIsolation?: boolean;
   /**
    * Restore re-attach to a backing session probed alive: its CLI is already
@@ -17385,17 +17390,28 @@ function setupWorkerHandlers(
           break;
         }
         let remoteBackendStartupReconciled = false;
-        if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+        if (isRemoteBackendSession(ds)
+            && startupState.onRemoteBackendStartupExit
+            && ds.suppressRecoveryCard === true) {
           const reconcile = startupState.onRemoteBackendStartupExit;
           startupState.onRemoteBackendStartupExit = undefined;
+          // The provider child is already gone. Retire the stale Node worker
+          // before reconciliation so an authoritative close can materialize a
+          // fresh control-only provider from durable state instead of asking
+          // the dead backend for an ACK.
+          retireWorkerProcessOnly(ds, 'remote_rebuild_provider_exit');
           try {
-            remoteBackendStartupReconciled = reconcile() === true;
+            remoteBackendStartupReconciled = await reconcile() === true;
           } catch (error) {
             logger.error(
               `[${t}] Failed to reconcile remote backend startup exit: `
               + `${error instanceof Error ? error.message : String(error)}`,
             );
           }
+        } else if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+          // Canonical activation already cleared the recovery presentation gate.
+          // The rollback belongs only to that provisional lifecycle.
+          startupState.onRemoteBackendStartupExit = undefined;
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
@@ -17491,6 +17507,23 @@ function setupWorkerHandlers(
             break;
           }
           const retirementPhase = remoteRetirementAdmissionPhase(ds);
+          // A remote provider cannot restart inside the same worker without
+          // replacing its lineage. Keeping that worker registered leaves the
+          // Session looking active while every later close talks to a dead
+          // backend and latches `uncertain`. Retire it; explicit close can then
+          // reattach a fresh control provider to the same durable state.
+          if (ds.worker === worker) {
+            retireWorkerProcessOnly(ds, 'remote_backend_exit');
+          }
+          const remoteClosePhase = ds.remoteCloseState?.phase;
+          if ((ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner'
+              && (remoteClosePhase === 'preparing' || remoteClosePhase === 'uncertain')) {
+            logger.warn(
+              `[${t}] Clearing process-local Remote Runner close fence after provider exit; `
+              + 'the next close will reconcile through a fresh control provider',
+            );
+            ds.remoteCloseState = undefined;
+          }
           logger.warn(
             `[${t}] Remote backend exited; automatic restart is unsupported`
             + (retirementPhase ? ` (${retirementPhase})` : ''),
@@ -17731,9 +17764,6 @@ function setupWorkerHandlers(
           break;
         }
         const prior = ds.session.remoteBackendState;
-        const rebuildGenerationAdvanced = startupState.onRemoteBackendStartupExit !== undefined
-          && prior !== undefined
-          && state.generation > prior.generation;
         if (prior && state.provider !== prior.provider) {
           logger.error(`[${t}] Ignored remote backend state from a different provider`);
           break;
@@ -17757,15 +17787,12 @@ function setupWorkerHandlers(
         try {
           sessionStore.updateSession(ds.session);
           // RemoteRunnerBackend publishes its normalized ready state before
-          // firing onReady. For an explicit rebuild this is the durable proof
-          // that the provider crossed its second (backend) startup boundary.
-          // onBackendState immediately replays the CONSTRUCTOR'S initial state
-          // when the callback is registered. That same-generation replay is not
-          // provider readiness and must not disarm rollback: otherwise a child
-          // exit during resume leaves the Session ghost-active with no backend.
-          if (rebuildGenerationAdvanced) {
-            startupState.onRemoteBackendStartupExit = undefined;
-          }
+          // firing onReady. The advanced generation proves startup progress,
+          // but not stability: keep the rollback callback armed while the
+          // durable-control presentation gate is still set. Canonical commit
+          // clears suppressRecoveryCard; a later provider exit then follows the
+          // ordinary retire-and-reconcile path instead of rolling back a
+          // committed lifecycle.
         } catch (err) {
           ds.session.remoteBackendState = prior;
           ds.session.remoteRunnerUsage = priorUsage;

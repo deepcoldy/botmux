@@ -16,7 +16,7 @@ import {
 import { createDashboardTranslator, type DashboardLocale } from './i18n.js';
 import { THEME_OPTIONS } from './theme-menu.js';
 import { sourceLabel } from './skills/shared.js';
-import { BOT_DEFAULTS_TABS, BOT_DEFAULTS_TAB_LABEL_KEYS, botDefaultsHref } from './bot-defaults.js';
+import { BOT_DEFAULTS_SECTIONS, BOT_DEFAULTS_TABS, BOT_DEFAULTS_TAB_LABEL_KEYS, botDefaultsHref } from './bot-defaults.js';
 import { BOT_DEFAULTS_ALIASES } from './nav-items.js';
 import type { SkillRow } from './skills/types.js';
 import type { PaletteItem, PaletteTone } from './command-palette-model.js';
@@ -74,6 +74,11 @@ function bilingual(key: string): string[] {
 function bilingualPath(parent: { label: string; labelKey?: string }, childKey: string): string[] {
   const path = (tr: (key: string) => string) => `${parent.labelKey ? tr(parent.labelKey) : parent.label} › ${tr(childKey)}`;
   return [...new Set([path(translators.zh), path(translators.en)])];
+}
+
+/** 多级路径「A › B › C」在两种语言下的写法（去重），按文案键逐级翻译。 */
+function bilingualTrail(keys: readonly string[]): string[] {
+  return [...new Set([translators.zh, translators.en].map(tr => keys.map(key => tr(key)).join(' › ')))];
 }
 
 function compact(text: unknown, limit = 140): string {
@@ -274,6 +279,53 @@ export function buildBotDefaultsTabItems(): PaletteItem[] {
     iconId: 'bot',
     primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ tab }) },
   }));
+}
+
+/**
+ * Bot 配置页各分类里的区块和区块里的配置项，按 BOT_DEFAULTS_SECTIONS 生成。标题同样带「Bot 配置 ›」：
+ * 「模型」「沙盒」这类短名单独做标题会抢主页面的首条。但这段前缀只算上下文（titleContext）：
+ * 搜「Bot 配置」时五个分类在前，搜「new bot」时「新建机器人」不被配置项挤下去。
+ * 区块不拿分类名做副标题，否则搜「常用」「高级」时区块会全等命中、排在分类本身前面。
+ * 同一区块里译文重复的配置项只收第一个。
+ */
+export function buildBotDefaultsSectionItems(): PaletteItem[] {
+  if (!ui.authed) return [];
+  const botConfig = t('nav.botDefaults');
+  const titleContext = `${botConfig} › `.length;
+  const items: PaletteItem[] = [];
+  for (const section of BOT_DEFAULTS_SECTIONS) {
+    const tabKey = BOT_DEFAULTS_TAB_LABEL_KEYS[section.tab];
+    const sectionTitle = t(section.titleKey);
+    items.push({
+      key: `setting:bot-defaults-section:${section.id}`,
+      kind: 'setting',
+      title: `${botConfig} › ${sectionTitle}`,
+      titleContext,
+      keywords: bilingualTrail(['nav.botDefaults', tabKey, section.titleKey]),
+      // 同分时分类排在区块前面、区块排在配置项前面。
+      boost: -0.1,
+      iconId: 'bot',
+      primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ section: section.id }) },
+    });
+    const seen = new Set([sectionTitle]);
+    for (const field of section.fieldKeys ?? []) {
+      const fieldTitle = t(field);
+      if (seen.has(fieldTitle)) continue;
+      seen.add(fieldTitle);
+      items.push({
+        key: `setting:bot-defaults-field:${section.id}:${field}`,
+        kind: 'setting',
+        title: `${botConfig} › ${fieldTitle}`,
+        titleContext,
+        subtitle: `${t(tabKey)} › ${sectionTitle}`,
+        keywords: bilingualTrail(['nav.botDefaults', tabKey, section.titleKey, field]),
+        boost: -0.15,
+        iconId: 'bot',
+        primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ section: section.id, field }) },
+      });
+    }
+  }
+  return items;
 }
 
 // ── 设置 ─────────────────────────────────────────────────────────────────────

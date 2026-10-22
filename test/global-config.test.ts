@@ -26,9 +26,26 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' }, asr: { enabled: true } }, { volcengine: null, asr: { enabled: true } }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { apiKey: '' } }, { volcengine: { apiKey: '' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides on disk, row %#', (voice, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ voice }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().voice).toEqual(expected);
   });
 
   afterEach(() => {

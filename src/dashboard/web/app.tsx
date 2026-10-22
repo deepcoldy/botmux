@@ -75,6 +75,7 @@ type BotmuxUpdateStatus = {
   current: string;
   latest: string | null;
   versionLookupOk: boolean;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   localDevInstall: boolean;
   updateSupported: boolean;
@@ -829,6 +830,7 @@ function TopbarVersionControl(props: {
 
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
+  const mirrorFallback = status.latestSource === 'configured-fallback';
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
   // Older backends omit rollbackSupported; retain their update capability fallback.
   const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
@@ -970,6 +972,16 @@ function TopbarVersionControl(props: {
     try {
       const result = await updateAndRestartBotmux(fetch, setPhase);
       stopStatusPolling();
+      if (!result.changed && !result.restarted && !result.restartError) {
+        // The server skipped an implicit update. Refresh the stale badge and
+        // return to idle instead of reporting a failed restart or reconnecting.
+        actionInFlightRef.current = false;
+        setPhase('idle');
+        setProgress(0);
+        setBinaryStatus(null);
+        setRefreshFailed(!await props.onRefresh());
+        return;
+      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -1095,10 +1107,14 @@ function TopbarVersionControl(props: {
           ? t('update.topbarRefreshFailed')
           : behind
           ? automatic
-            ? t('update.versionUpgradePrompt', { version: latestVersion })
+            ? mirrorFallback
+              ? t('update.mirrorVersionUpgradePrompt', { version: latestVersion })
+              : t('update.versionUpgradePrompt', { version: latestVersion })
             : unavailableReason
           : status.latest
-            ? t('update.upToDate')
+            ? mirrorFallback
+              ? t('update.mirrorUpToDate')
+              : t('update.upToDate')
             : t('update.checkUnavailable');
   const action = !automatic
     ? t('update.topbarReview')

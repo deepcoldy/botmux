@@ -62,6 +62,11 @@ export interface PaletteItem {
   iconId?: string;
   /** 同分时的排序先验（0..1）：活跃、最近、待处理更高。 */
   boost?: number;
+  /**
+   * 标题开头从父级继承来的那一段（如「Bot 配置 › 」）的长度。命中只落在这段里时按副标题的分量算，
+   * 也不算「整串都在标题里」：搜父级名字时，层级更深的条目不能和父级的直接子项一样强。
+   */
+  titleContext?: number;
   primary: PaletteAction;
   secondary?: PaletteAction;
 }
@@ -135,8 +140,8 @@ function isWordStart(hay: string, index: number): boolean {
   return CJK_RE.test(prev) !== CJK_RE.test(hay[index]!);
 }
 
-function substringMatch(hay: string, token: string): { index: number; wordStart: boolean } | null {
-  let index = hay.indexOf(token);
+function substringMatch(hay: string, token: string, from = 0): { index: number; wordStart: boolean } | null {
+  let index = hay.indexOf(token, from);
   if (index < 0) return null;
   const first = index;
   // 同一 token 可能出现多次：优先取落在词首的那一处，高亮也跟着它。
@@ -186,10 +191,13 @@ function fuzzyMatch(hay: string, token: string): TokenMatch | null {
 export type MatchTier = 'exact' | 'prefix' | 'word' | 'substring' | 'fuzzy';
 export interface TokenMatch { score: number; ranges: TextRange[]; tier: MatchTier }
 
-/** 单个 token 在单个（已小写）字段里的匹配。分档：全等 > 前缀 > 词首 > 子串 > 模糊。 */
-export function matchToken(hay: string, token: string): TokenMatch | null {
+/**
+ * 单个 token 在单个（已小写）字段里的匹配。分档：全等 > 前缀 > 词首 > 子串 > 模糊。
+ * `from` 只找这个下标之后的出现（分档仍按它在整个字段里的位置算），找不到时不做模糊。
+ */
+export function matchToken(hay: string, token: string, from = 0): TokenMatch | null {
   if (!token || !hay) return null;
-  const hit = substringMatch(hay, token);
+  const hit = substringMatch(hay, token, from);
   if (hit) {
     const coverage = (token.length / hay.length) * 10;
     const tier: MatchTier = hit.index === 0
@@ -201,7 +209,7 @@ export function matchToken(hay: string, token: string): TokenMatch | null {
           : 60 - Math.min(15, hit.index / 4);
     return { score: base + coverage, ranges: [{ start: hit.index, end: hit.index + token.length }], tier };
   }
-  return fuzzyMatch(hay, token);
+  return from > 0 ? null : fuzzyMatch(hay, token);
 }
 
 /**
@@ -274,12 +282,19 @@ export function matchItem(item: PaletteItem, tokens: readonly string[]): ItemMat
   const subtitleRanges: TextRange[] = [];
   let total = 0;
   let allInTitle = true;
+  const context = item.titleContext ?? 0;
   for (const token of tokens) {
     // 粗筛：任何字段都不含这个 token 时，只剩标题模糊匹配一条路（短 token / CJK 连它也没有）。
     if (!fields.haystack.includes(token) && (token.length < 3 || !ASCII_PRINTABLE_RE.test(token))) return null;
-    const inTitle = matchToken(fields.title, token);
+    let inTitle = matchToken(fields.title, token);
+    // 命中落在继承来的前缀里：条目自己的名字里也有就用那一处，否则只算上下文。
+    let inContext = !!inTitle && inTitle.ranges.every(range => range.end <= context);
+    if (inContext) {
+      const own = matchToken(fields.title, token, context);
+      if (own) { inTitle = own; inContext = false; }
+    }
     const inSubtitle = hiddenFieldMatch(fields.subtitle, token);
-    let best = inTitle ? inTitle.score * TITLE_WEIGHT : 0;
+    let best = inTitle ? inTitle.score * (inContext ? SUBTITLE_WEIGHT : TITLE_WEIGHT) : 0;
     for (const keyword of fields.keywords) {
       const hit = hiddenFieldMatch(keyword, token);
       if (hit) best = Math.max(best, hit.score * KEYWORD_WEIGHT);
@@ -288,12 +303,19 @@ export function matchItem(item: PaletteItem, tokens: readonly string[]): ItemMat
     if (best <= 0) return null;
     total += best;
     if (inTitle) titleRanges.push(...inTitle.ranges);
-    else allInTitle = false;
+    if (!inTitle || inContext) allInTitle = false;
     if (inSubtitle && !inTitle) subtitleRanges.push(...inSubtitle.ranges);
   }
   let score = total / tokens.length;
+  const phrase = tokens.join(' ');
   if (tokens.length > 1 && allInTitle) {
-    score += fields.title.includes(tokens.join(' ')) ? 10 : 4;
+    score += fields.title.includes(phrase) ? 10 : 4;
+  }
+  // 快捷操作的多词别名整句打全（「new session」之于「创建会话」）：和单词别名打全一样算全等。
+  // 只对快捷操作：别的条目的多词关键词多是父级名字（「Global Settings」挂在十几个设置区块上），
+  // 抬成全等会和只靠关键词命中的页面打平，把页面本身挤下去。
+  if (tokens.length > 1 && item.kind === 'action' && fields.keywords.includes(phrase)) {
+    score = Math.max(score, matchToken(phrase, phrase)!.score * KEYWORD_WEIGHT);
   }
   return {
     score,

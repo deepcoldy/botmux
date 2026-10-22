@@ -32,7 +32,10 @@ import {
   type BotSubstituteTarget,
   type CliOptionsState,
   type SubstituteTargetResolution,
+  type BotDefaultsSection,
   type BotDefaultsTab,
+  botDefaultsSectionDomId,
+  findBotDefaultsSection,
   parseBotDefaultsTab,
 } from './bot-defaults.js';
 import {
@@ -636,6 +639,62 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
   };
 }
 
+export type BotDefaultsDeepLink = { tab: BotDefaultsTab; section: BotDefaultsSection | null; field: string | null };
+
+export function readBotDefaultsDeepLink(): BotDefaultsDeepLink | null {
+  const section = findBotDefaultsSection(hashQueryParam('section'));
+  // 区块决定分类：手写链接里 tab 与 section 对不上时，以区块所在的分类为准。
+  const tab = section?.tab ?? parseBotDefaultsTab(hashQueryParam('tab'));
+  // 不在该区块登记表里的配置项（手写 / 过期链接）当没给：落到区块本身，不误报「当前 Bot 不显示」。
+  const field = hashQueryParam('field');
+  return tab ? { tab, section, field: field && section?.fieldKeys?.includes(field) ? field : null } : null;
+}
+
+/** 区块里文字恰好是 label 的标题（区块标题 / 配置项标题 / 选项组标题）。 */
+function findLabeledElement(root: HTMLElement, label: string): HTMLElement | null {
+  const candidates = root.querySelectorAll<HTMLElement>('.bd-field-title-text, .bd-mode-group-title, h3, h4');
+  return [...candidates].find(el => el.textContent?.trim() === label) ?? null;
+}
+
+/**
+ * 深链落点：区块所在的格子 → 合放格子里的那个区块 → 区块里的那一行。当前 Bot 不显示该区块 /
+ * 配置项（只对部分 Agent 或配置显示）时，停在能找到的最近一层，`missing` 给出没找到的那一项。
+ */
+export function resolveBotDefaultsTarget(
+  link: BotDefaultsDeepLink,
+  doc: Pick<Document, 'getElementById'>,
+  tr: (key: string) => string,
+): { target: HTMLElement | null; block: ScrollLogicalPosition; missing: string | null } {
+  const tabButton = doc.getElementById(`bd-tab-${link.tab}`);
+  const section = link.section;
+  if (!section) return { target: tabButton, block: 'center', missing: null };
+  const tile = doc.getElementById(botDefaultsSectionDomId(section.tile ?? section.id));
+  if (!tile) return { target: tabButton, block: 'center', missing: tr(section.titleKey) };
+  // 整个区块从顶部露出（高的区块居中会把标题滚出屏幕）；分类栏和某一行居中。
+  const sectionEl = section.tile ? findLabeledElement(tile, tr(section.titleKey))?.closest<HTMLElement>('.bd-section') ?? tile : tile;
+  if (!link.field) return { target: sectionEl, block: 'start', missing: null };
+  const label = findLabeledElement(sectionEl, tr(link.field));
+  if (!label) return { target: sectionEl, block: 'start', missing: tr(link.field) };
+  const row = label.closest<HTMLElement>('.toggle-row, .bd-row, .bd-field, .bd-mode-group, .bd-subsection') ?? label;
+  return { target: row, block: 'center', missing: null };
+}
+
+function focusBotDefaultsTarget(link: BotDefaultsDeepLink, tr: ReturnType<typeof useT>): void {
+  const { target, block, missing } = resolveBotDefaultsTarget(link, document, tr);
+  if (target) {
+    // 资料头（含分类栏）在宽屏下是吸顶的：区块从顶部露出时要让开它，否则标题和闪烁框被挡住。
+    const chrome = document.querySelector<HTMLElement>('.bot-defaults-page .bd-profile-chrome');
+    const sticky = block === 'start' && chrome && getComputedStyle(chrome).position === 'sticky';
+    target.style.scrollMarginTop = sticky ? `${chrome.offsetHeight + 12}px` : '';
+    target.scrollIntoView({ behavior: 'smooth', block });
+    target.classList.remove('palette-target-flash');
+    void target.offsetWidth;
+    target.classList.add('palette-target-flash');
+    window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
+  }
+  if (missing) toast(tr('botDefaults.deepLinkNotShown', { name: missing }));
+}
+
 export function BotDefaultsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
@@ -660,10 +719,11 @@ export function BotDefaultsPage() {
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
-  // `#/bot-defaults?tab=<分类>`（⌘K 全局搜索）：落在该分类并定位过去；显式指定的分类优先于
-  // 「启动被拦的 Bot 自动切到高级」那条首次自动选择逻辑。消费一次后清掉参数。
-  const deepLinkTabRef = useRef<BotDefaultsTab | null>(parseBotDefaultsTab(hashQueryParam('tab')));
-  const [activeTab, setActiveTab] = useState<BotDefaultsTab>(() => deepLinkTabRef.current ?? 'common');
+  // `#/bot-defaults?tab=<分类>&section=<区块>&field=<配置项>`（⌘K 全局搜索）：落在该分类 / 区块 /
+  // 配置项并定位过去；显式指定的分类优先于「启动被拦的 Bot 自动切到高级」那条首次自动选择逻辑。
+  // 消费一次后清掉参数。
+  const deepLinkRef = useRef<BotDefaultsDeepLink | null>(readBotDefaultsDeepLink());
+  const [activeTab, setActiveTab] = useState<BotDefaultsTab>(() => deepLinkRef.current?.tab ?? 'common');
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
@@ -734,27 +794,19 @@ export function BotDefaultsPage() {
     if (!selectedAppId || !filtered.some(bot => bot.larkAppId === selectedAppId)) {
       const firstBot = filtered[0];
       setSelectedAppId(firstBot.larkAppId);
-      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle' && !deepLinkTabRef.current) setActiveTab('advanced');
+      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle' && !deepLinkRef.current) setActiveTab('advanced');
     }
   }, [filtered, loadError, loading, selectedAppId]);
 
   const selectedBot = selectedAppId ? filtered.find(bot => bot.larkAppId === selectedAppId) ?? null : null;
 
-  // 分类深链：选中的 Bot 渲染出来后滚到分类栏并闪一下落点，然后清掉 `tab` 参数（一次性）。
+  // 分类 / 区块深链：选中的 Bot 渲染出来后定位并闪一下落点，然后清掉参数（一次性）。
   useEffect(() => {
-    const tab = deepLinkTabRef.current;
-    if (!tab || !selectedBot) return;
-    deepLinkTabRef.current = null;
-    clearHashQueryParam('tab');
-    window.requestAnimationFrame(() => {
-      const target = document.getElementById(`bd-tab-${tab}`);
-      if (!target) return;
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      target.classList.remove('palette-target-flash');
-      void target.offsetWidth;
-      target.classList.add('palette-target-flash');
-      window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
-    });
+    const link = deepLinkRef.current;
+    if (!link || !selectedBot) return;
+    deepLinkRef.current = null;
+    for (const name of ['tab', 'section', 'field']) clearHashQueryParam(name);
+    window.requestAnimationFrame(() => focusBotDefaultsTarget(link, tr));
   }, [selectedBot]);
 
   const patchBot = useCallback<PatchBot>((appId, patch) => {
@@ -1028,13 +1080,13 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'common'}
         >
           <BdTabGrid>
-            <section className="bd-tile">
+            <section className="bd-tile" id={botDefaultsSectionDomId('agent')}>
               <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} lock={props.linkedAgent} />
             </section>
-            <section className="bd-tile">
+            <section className="bd-tile" id={botDefaultsSectionDomId('working-dir')}>
               <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} lock={props.linkedAgent} />
             </section>
-            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('role')}><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1045,15 +1097,15 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'sessions'}
         >
           <BdTabGrid>
-            <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><CommandTriggerSection bot={bot} /></section>
-            <section className="bd-tile">
+            <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
-            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('session-cap')}><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1066,19 +1118,19 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
-              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('sandbox')}><SandboxSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {bot.cliId === 'codex' ? (
-              <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('codex-auth')}><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {bot.cliId !== 'riff' && (bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'oncall' ? (
-              <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('sandbox-paths')}><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
-            <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('trigger-user-auth')}><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('lark-tool-binding')}><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1089,11 +1141,11 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'cards'}
         >
           <BdTabGrid>
-            <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
-            <section className="bd-tile bd-tile-wide"><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('card-behavior')}><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('feedback')}><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('reply-style')}><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('ask-option-layout')}><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('brand')}><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1109,33 +1161,33 @@ function BotDefaultsCard(props: {
                 无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
                 静默覆盖的假选择。隐藏该区块。 */}
             {!isRemoteCliId(bot.cliId) ? (
-              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('backend')}><BackendTypeSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             ) : null}
             {/* 有效后端解析为 herdr 时才展示放置配置；herdr 不是远端 CLI，无上面那条隐藏限制。 */}
             {herdrConfigVisible(bot) ? (
-              <section className="bd-tile"><HerdrConfigSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('herdr')}><HerdrConfigSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
                 选了别的 agent 就隐藏，避免无效开关。 */}
             {bot.cliId === 'codex-app' ? (
-              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('codex-app-display')}><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
             {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
             {bot.cliId === 'claude-code' ? (
-              <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
-            <section className="bd-tile">
+            <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
               <ReplyDeliverySection bot={bot} patchBot={patchBot} />
             </section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
-            <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile"><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
-            <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
       </div>
@@ -1218,6 +1270,7 @@ function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; c
 }
 
 function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
+  const tr = useT();
   const enabled = props.bot.feedback?.enabled === true;
   const [on, setOn] = useState(enabled);
   const [json, setJson] = useState(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
@@ -1294,10 +1347,10 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   return (
     <section className="bd-section" aria-busy={busy}>
       <h3 className="bd-section-title">
-        <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
+        <FieldTitle help={tr('botDefaults.sectionFeedbackHelp')}>{tr('botDefaults.sectionFeedback')}</FieldTitle>
       </h3>
       <div className="bd-feedback-controls">
-        <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+        <ToggleRow checked={on} disabled={busy} title={tr('botDefaults.sectionFeedback')} help={null} description={tr('botDefaults.sectionFeedbackDesc')} onChange={checked => { setOn(checked); void save(checked); }} />
         <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
       </div>
       <StatusSpan status={status} />

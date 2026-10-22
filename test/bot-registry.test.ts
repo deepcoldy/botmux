@@ -67,6 +67,20 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
 }
 
 describe('voice configuration', () => {
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' } }, { volcengine: null }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { mode: 'standard' } }, { volcengine: { mode: 'standard' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides, row %#', async (voice, expected) => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ voice })]));
+    expect(configs[0]?.voice).toEqual(expected);
+  });
+
   it('preserves a MiniMax per-bot override', async () => {
     const mod = await freshImport();
     const [config] = mod.parseBotConfigsFromText(JSON.stringify([
