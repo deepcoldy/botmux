@@ -74,6 +74,9 @@ export interface BridgePendingTurn {
    * final message reads `end_turn` while the text block, an API error that cut
    * the stream and the Stop hooks may all still follow. See drainEmittable. */
   awaitingDurationMarker?: boolean;
+  /** Its `system/turn_duration` was read: the turn's last record. Anything the
+   *  assistant writes after it belongs to the next turn. */
+  closedByDurationMarker?: boolean;
   /** Structured execution result. This is independent from whether transcript
    * fallback text is visible or suppressed by a prior `botmux send`. */
   terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
@@ -461,6 +464,13 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // An assistant record after the collecting turn's duration marker opens
+        // the next turn, one that began without a meaningful user line (a
+        // `<task-notification>` wake-up). A live drain has emitted the closed
+        // turn by then; a batch spanning several turns — a rotation switch
+        // replaying what the bridge did not read — must not fold the next
+        // turn's reply into it.
+        if (this.collecting?.closedByDurationMarker) this.collecting = null;
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -588,6 +598,7 @@ export class BridgeTurnQueue {
         if (this.collecting) {
           this.collecting.terminalObserved = true;
           this.collecting.awaitingDurationMarker = false;
+          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }

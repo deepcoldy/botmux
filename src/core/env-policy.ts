@@ -79,8 +79,10 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
   if (policy?.mode === 'strict') {
     // Host-owned worker HTTP/watchdog settings are control-plane only. The
     // CLI boundary does not retain them without an explicit user grant.
+    // BOTMUX_TMUX_SOCKET: which tmux server the worker creates managed panes on
+    // (tmux-socket.ts) — dropping it would undo an operator's opt-out per bot.
     for (const key of ['WEB_HOST', 'WEB_EXTERNAL_HOST', 'WEB_EXTERNAL_PORT',
-      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS']) {
+      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET']) {
       if (base[key] !== undefined) env[key] = base[key];
     }
   }

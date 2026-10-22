@@ -496,7 +496,7 @@ export function getChildPids(pid: number): number[] {
  * Recursively search the process tree (up to `maxDepth` levels) for a known CLI binary.
  * Returns { pid, cliId } of the first match, or undefined.
  */
-function findCliProcess(
+export function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,

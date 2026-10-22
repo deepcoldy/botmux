@@ -465,7 +465,8 @@ import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
-import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant } from './services/grant-store.js';
+import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant, sweepExpiredGrants } from './services/grant-store.js';
+import { initGrantStateForDaemon } from './services/grant-state-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
 import {
   getSessionWorkingDir,
@@ -29551,6 +29552,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // per-user talk 授权（chatGrants / globalGrants / 额度 / 有效期）住在 <dataDir>/grants.sqlite：
+  // 把本 bot 在 bots.json 上残留的授权字段并入并删除，再灌入内存缓存。必须先于任何事件处理；
+  // 授权库不可用即拒绝启动（空授权会把只配了 globalGrants 的 bot 误判为开放模式）。
+  // core-only 的 bot 是内存合成的 apiOnly 身份，不在 fleet bots.json 里，也没有飞书授权。
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await initGrantStateForDaemon({ larkAppId: cfg.larkAppId, dataDir: config.session.dataDir });
+  }
   // Host-executed schedule conditions are authority material. Create and
   // validate their 0700 root before any restored worker can receive a sandbox
   // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
@@ -31731,6 +31739,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 120_000);
   sandboxReconcileTimer.unref?.();
 
+  // 已到期的授权只会在对方下一条消息时被顺手清掉；对方再也不说话的就一直留在授权库里。
+  // 启动时清一遍，之后每小时清一遍。授权不做其它任何自动回收。
+  const runGrantExpirySweep = () => {
+    void sweepExpiredGrants(cfg.larkAppId)
+      .then(revoked => { if (revoked > 0) logger.info(`[grant:${cfg.larkAppId}] swept ${revoked} expired grant(s)`); })
+      .catch(err => logger.warn(`[grant:${cfg.larkAppId}] expiry sweep failed: ${err?.message ?? err}`));
+  };
+  const grantExpirySweepTimer = setInterval(runGrantExpirySweep, 60 * 60_000);
+  grantExpirySweepTimer.unref?.();
+  runGrantExpirySweep();
+
   // v3 humanGate cold-attach: re-post pending gate cards + resume healed gates
   // for runs OWNED BY THIS BOT (codex blocker #1 — owner filter, mirrors
   // the immutable v3 run binding). Best-effort; never blocks startup.
@@ -32192,6 +32211,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(grantExpirySweepTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -32459,6 +32479,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(grantExpirySweepTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);

@@ -98,6 +98,43 @@ export function evaluatePidResolverPullback(
   return { suppress: false, clearStale: true };
 }
 
+// ─── Pid-state switch history cutoff ───────────────────────────────────────
+
+/** Skew allowed between a Lark mark and Claude's write of that user line —
+ *  the same bound the fingerprint switch scans and splits with. */
+export const PENDING_MARK_SKEW_MS = 5_000;
+
+export interface PidRotationCutoffInput {
+  /** Last moment the bridge's current path was confirmed: bridge attach, the
+   *  previous switch, or a pid-resolver tick that reported `'same'`. */
+  confirmedAtMs: number;
+  /** Mark times of Lark turns whose user line has not been read yet. */
+  unstartedMarkTimesMs: readonly number[];
+}
+
+/**
+ * Where a pid-state switch splits the transcript it moves onto: events at or
+ * before the returned time are absorbed as history, later ones are ingested.
+ *
+ * The pid-state record names the transcript Claude writes NOW, not since when.
+ * The last confirmation of the previous path bounds that from below: whatever
+ * was written after it may belong to a turn the bridge has not read; whatever
+ * was written before was read from the previous path or predates this worker.
+ * The target is often not a new file — an in-pane `/resume` returns to an old
+ * conversation, and a daemon restart that missed a `/clear` finds hours of
+ * turns in the post-clear file — so reading it from offset 0 would replay them.
+ *
+ * A Lark mark still waiting for its user line pulls the cutoff earlier so that
+ * line stays live (strictly older than the fingerprint scan's floor).
+ */
+export function pidRotationHistoryCutoffMs(input: PidRotationCutoffInput): number {
+  let cutoff = input.confirmedAtMs;
+  for (const markMs of input.unstartedMarkTimesMs) {
+    cutoff = Math.min(cutoff, markMs - PENDING_MARK_SKEW_MS - 1);
+  }
+  return cutoff;
+}
+
 // ─── Two-phase fingerprint-fallback decision ───────────────────────────────
 
 /** UUID-shaped Claude jsonl filename (sessionId.jsonl). Duplicated from

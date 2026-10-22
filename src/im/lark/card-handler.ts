@@ -81,7 +81,12 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { staticModelChoices, detectModels, mergeModelChoices } from '../../services/model-catalog.js';
+import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.js';
+import { selectionKeyForBot } from '../../setup/cli-selection.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
+import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
+import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -93,7 +98,7 @@ import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js'
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard, larkTransportEnabled } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
-import { buildTerminalUrl } from '../../core/terminal-url.js';
+import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
@@ -1319,6 +1324,211 @@ async function cardReplyOptions(
     logger.debug(`card reply-placement probe failed; preserving legacy route: ${err}`);
     return undefined;
   }
+}
+
+// ── Reply-card overflow action menu (reply_card_menu) helpers ──────────────
+
+const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+
+/**
+ * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
+ * The catalogue functions take a "selection key" (cliId + wrapperCli +
+ * launchMode), not a bare cliId — probing a `ttadk codex` session with the
+ * bare 'codex' key returns the native codex list instead of the gateway's.
+ * Probe inputs (custom executable, injected env, runtime cache identity) are
+ * derived through the same helper as the dashboard endpoint so the menu sees
+ * exactly the runtime the session is running.
+ */
+function resolveReplyMenuModelCatalogue(ds: DaemonSession): {
+  key: string;
+  staticChoices: readonly string[];
+  detect: () => Promise<readonly string[] | null>;
+} {
+  const cliId = sessionCliId(ds);
+  const key = selectionKeyForBot(cliId, ds.session.wrapperCli, ds.session.cliLaunchMode);
+  const probe = modelCatalogProbeContext(key, getBot(ds.larkAppId).config, process.env);
+  return {
+    key,
+    staticChoices: staticModelChoices(key),
+    detect: () => detectModels(key, {
+      runtimeContext: probe.runtimeContext,
+      probeEnv: probe.probeEnv,
+      runtimeExecutable: probe.runtimeExecutable,
+      adapterFactory: requestedCliId => createCliAdapterSync(
+        requestedCliId,
+        requestedCliId === probe.cliId ? probe.runtimeExecutable : undefined,
+      ),
+    }),
+  };
+}
+
+/** One accept rule shared by the picker render and the submission whitelist:
+ * live non-empty wins, otherwise the curated static list. Building both from
+ * this keeps the offered options and the inject whitelist on identical terms. */
+async function replyMenuModelChoices(ds: DaemonSession): Promise<readonly string[]> {
+  const catalogue = resolveReplyMenuModelCatalogue(ds);
+  const live = await catalogue.detect().catch(() => null);
+  return mergeModelChoices(catalogue.staticChoices, live).models;
+}
+
+type SessionReplyFn = (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+
+function replyMenuBinding(ds: DaemonSession, rootId: string): Record<string, string> {
+  return {
+    session_id: ds.session.sessionId,
+    root_id: rootId,
+    lark_app_id: ds.larkAppId,
+    chat_id: ds.chatId,
+  };
+}
+
+function menuNoticeCard(markdown: string): string {
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'markdown', content: markdown }],
+  });
+}
+
+/** Privately deliver a writable-terminal link card for the session.
+ *  Returns true when the link card was handed off (caller may show a toast). */
+/** 'write-sent': private write-link card delivered (toast).
+ *  'read-sent': read-only card delivered through normal/ephemeral channel.
+ *  undefined: a notice card (unsupported / not ready) was delivered, no toast. */
+async function deliverMenuTerminalLink(
+  ds: DaemonSession,
+  operatorOpenId: string,
+  rootId: string,
+  sessionReply: SessionReplyFn,
+): Promise<'write-sent' | 'read-sent' | undefined> {
+  const effectiveCliId = sessionCliId(ds);
+  const loc = localeForBot(ds.larkAppId);
+  if (!sessionSupportsWebTerminal(ds)) {
+    const card = menuNoticeCard(t('card.action.terminal_unsupported', undefined, loc));
+    await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
+    return undefined;
+  }
+  // Bound-to-platform deployments: hand out the read-only front-door card the
+  // same way the streaming card's "open web terminal" button does. The view
+  // capability never grants input; an owner signed in via the platform is
+  // upgraded to write server-side (resolveTerminalWrite), teammates/guests
+  // stay read-only. The card still offers "get write link" as an explicit
+  // fallback, which clicks through get_write_link and its own canOperate gate.
+  // Riff sessions are excluded: their AIO Sandbox URL is only produced on the
+  // write path (their read URL falls back to the local log-view terminal).
+  if (platformTerminalReadEntryActive() && !ds.riffAccessUrl) {
+    const readUrl = readableTerminalUrlFor(ds);
+    if (readUrl) {
+      const cardJson = buildSessionCard(
+        ds.session.sessionId,
+        sessionAnchorId(ds),
+        readUrl,
+        ds.session.title || getCliDisplayName(effectiveCliId),
+        effectiveCliId,
+        false, // read-only shape: primary "open terminal" + "get write link" fallback
+        isSharedAdoptSession(ds),
+        loc,
+        isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+        sessionRuntimeDisplayName(ds),
+      );
+      // viewToken is read-only and already present on the in-chat streaming
+      // card, so this card needs no private delivery; ephemeral just keeps it
+      // quiet, with a threaded reply as fallback.
+      await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive', () => sessionReply(rootId, cardJson, 'interactive'));
+      return 'read-sent';
+    }
+  }
+  if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
+    const writeUrl = buildTerminalUrl(ds, { write: true });
+    const cardJson = buildSessionCard(
+      ds.session.sessionId,
+      sessionAnchorId(ds),
+      writeUrl,
+      ds.session.title || getCliDisplayName(effectiveCliId),
+      effectiveCliId,
+      true,
+      isSharedAdoptSession(ds),
+      loc,
+      isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+      sessionRuntimeDisplayName(ds),
+    );
+    void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
+    return 'write-sent';
+  }
+  const card = menuNoticeCard(t('card.action.terminal_not_ready', undefined, loc));
+  await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => sessionReply(rootId, card, 'interactive'));
+  return undefined;
+}
+
+function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Locale): string {
+  const adopt = isSharedAdoptSession(ds);
+  const title = adopt
+    ? t('card.reply_actions.disconnect_confirm_title', undefined, loc)
+    : t('card.reply_actions.close_confirm_title', undefined, loc);
+  const confirmLabel = adopt
+    ? t('card.reply_actions.disconnect_confirm', undefined, loc)
+    : t('card.reply_actions.close_confirm', undefined, loc);
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    elements: [
+      {
+        tag: 'markdown',
+        content: `**${title}**\n\n${t('card.reply_actions.close_confirm_text', undefined, loc)}`,
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: confirmLabel },
+            type: 'danger',
+            value: { action: 'close', menu_reply_card: '1', ...replyMenuBinding(ds, rootId) },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.reply_actions.cancel', undefined, loc) },
+            type: 'default',
+            value: { action: 'reply_menu_cancel', ...replyMenuBinding(ds, rootId) },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+function buildMenuModelPickerCard(
+  ds: DaemonSession,
+  rootId: string,
+  models: readonly string[],
+  currentModel: string | undefined,
+  loc: Locale,
+): string {
+  // Only render slugs the inject path would accept: a live-detected catalogue
+  // entry with exotic characters must not render into a dead option.
+  const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    elements: [
+      { tag: 'markdown', content: `**${t('card.reply_actions.model_title', undefined, loc)}**` },
+      {
+        tag: 'action',
+        actions: [{
+          tag: 'select_static',
+          placeholder: { tag: 'plain_text', content: currentModel || t('card.reply_actions.model', undefined, loc) },
+          ...(currentModel && safeModels.includes(currentModel) ? { initial_option: currentModel } : {}),
+          options: safeModels.slice(0, 50).map(model => ({
+            text: {
+              tag: 'plain_text',
+              content: model === currentModel
+                ? `${model} ${t('card.reply_actions.model_current', undefined, loc)}`
+                : model,
+            },
+            value: model,
+          })),
+          value: { action: 'reply_model_pick', ...replyMenuBinding(ds, rootId) },
+        }],
+      },
+    ],
+  });
 }
 
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -3109,6 +3319,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     }
 
     if (actionType === 'close') {
+      // The reply-card menu's confirm button re-checks the live toggle: a card
+      // left in history after the menu was turned off must not close.
+      if (value?.menu_reply_card === '1') {
+        const menuBotAppId = ds?.larkAppId ?? larkAppId;
+        if (!menuBotAppId || getBot(menuBotAppId).config.replyCardActions !== true) {
+          return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, localeForBot(larkAppId)) } };
+        }
+      }
       if (!ds) {
         // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
         // 会话」却静默无反应会让人以为按钮坏了，给一条失败 toast（成功路径不弹，已关卡即反馈）。
@@ -4415,6 +4633,118 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
       return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
     }
+
+    // Reply-card overflow menu: option picks the action (action.option), while
+    // session binding lives on the shared overflow value.
+    if (actionType === REPLY_CARD_MENU_ACTION) {
+      const effectiveAppId = ds?.larkAppId ?? larkAppId;
+      const loc = localeForBot(effectiveAppId);
+      if (!effectiveAppId || getBot(effectiveAppId).config.replyCardActions !== true) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
+      }
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
+      }
+      const option = typeof action?.option === 'string' ? action.option : '';
+      if (option === 'terminal' && operatorOpenId) {
+        const sent = await deliverMenuTerminalLink(ds, operatorOpenId, rootId, sessionReply);
+        // Only the private write-link path shows a "link sent" toast; the
+        // platform read-only card is itself the visible feedback.
+        return sent === 'write-sent'
+          ? { toast: { type: 'success', content: t('card.action.write_link_sent', undefined, loc) } }
+          : {};
+      }
+      if (option === 'close' && operatorOpenId) {
+        // In durable-primary deployments only the canonical streaming card is
+        // admitted by the lifecycle fence (streamCardId === clicked message).
+        // A separate confirm card could never pass — surface the same guidance
+        // instead of sending a doomed two-step card.
+        if (coordinationModeIsPrimary()) {
+          return { toast: { type: 'warning', content: t('card.action.primary_lifecycle_unavailable', undefined, loc) } };
+        }
+        const cardJson = buildMenuCloseConfirmCard(ds, rootId, loc);
+        await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive', () => sessionReply(rootId, cardJson, 'interactive'));
+        return {};
+      }
+      if (option === 'model' && operatorOpenId) {
+        // Same pre-check the submission does: CLIs without a raw passthrough
+        // surface cannot switch via /model — say so instead of showing a picker
+        // whose only outcome is a refusal.
+        if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+          const cardJson = menuNoticeCard(t('card.reply_actions.model_unsupported', undefined, loc));
+          await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive',
+            () => sessionReply(rootId, cardJson, 'interactive'));
+          return {};
+        }
+        const pickerDs = ds;
+        return {
+          toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
+          afterAck: async () => {
+            const models = await replyMenuModelChoices(pickerDs);
+            const cardJson = models.length > 0
+              ? buildMenuModelPickerCard(
+                pickerDs,
+                rootId,
+                models,
+                pickerDs.activeModel?.trim() || pickerDs.session.model?.trim() || undefined,
+                loc,
+              )
+              : menuNoticeCard(t('card.reply_actions.model_empty', undefined, loc));
+            await deliverEphemeralOrReply(pickerDs, operatorOpenId, cardJson, 'interactive',
+              () => sessionReply(rootId, cardJson, 'interactive'));
+          },
+        };
+      }
+      return {};
+    }
+
+    // Model pick from the reply-card menu. Passthrough `/model <slug>` into the
+    // live session, gated like compact_session plus an idle boundary and a
+    // strict slug whitelist (PTY injection must never carry free text).
+    if (actionType === 'reply_model_pick') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.session_gone', undefined, loc) } };
+      }
+      if (getBot(ds.larkAppId).config.replyCardActions !== true) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.disabled', undefined, loc) } };
+      }
+      if (isSessionTransferring(ds)) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, loc) } };
+      }
+      if (!ds.worker || ds.worker.killed) {
+        return { toast: { type: 'warning', content: t('daemon.cmd_needs_active_cli', { cmd: '/model' }, loc) } };
+      }
+      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })
+        || !deps.deliverPassthroughCommand) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
+      if (!sessionAcceptsDirectCommand(ds)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_busy', undefined, loc) } };
+      }
+      const slug = typeof action?.option === 'string' ? action.option : '';
+      if (!MODEL_SLUG_PATTERN.test(slug)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
+      // Same catalogue terms the picker offered (same selection key + live
+      // wins/static fallback); a slug not in the current list is refused even
+      // if the 10-minute probe cache flipped since the picker rendered.
+      const allowed = new Set<string>(await replyMenuModelChoices(ds));
+      if (!allowed.has(slug)) {
+        return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
+      }
+      deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
+        anchor: sessionAnchorId(ds),
+        senderOpenId: operatorOpenId,
+        senderIsBot: false,
+        messageId: cardMessageId ?? `reply-model-${Date.now()}`,
+        replyRootId: rootId,
+      });
+      logger.info(`[${tag(ds)}] reply-card menu: /model ${slug} passthrough sent`);
+      return { toast: { type: 'success', content: t('card.reply_actions.model_sent', { model: slug }, loc) } };
+    }
+
+    if (actionType === 'reply_menu_cancel') return {};
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {

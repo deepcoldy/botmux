@@ -1,4 +1,4 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
@@ -13,6 +13,11 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
+import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
+
+// The worker inherits process.env, so its panes live on this server.
+const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -68,7 +73,7 @@ afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
   for (const name of tmuxSessions) {
-    try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch { /* gone */ }
+    try { execFileSync('tmux', [...managedTmuxArgs, 'kill-session', '-t', name], { stdio: 'ignore' }); } catch { /* gone */ }
   }
   tmuxSessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
@@ -637,7 +642,7 @@ describe('Codex App worker replacement durable handoff', () => {
     // Kill the actual runner pane while leaving the Node worker alive. This
     // exercises backend.onExit's direct prepared-generation fail-close path,
     // unlike SIGKILLing the worker process as the replacement tests below do.
-    execFileSync('tmux', ['send-keys', '-t', tmuxSession, 'C-c'], { stdio: 'ignore' });
+    execFileSync('tmux', [...managedTmuxArgs, 'send-keys', '-t', tmuxSession, 'C-c'], { stdio: 'ignore' });
     const exited = await workerExit;
 
     expect(prematureAdmissionSignals).toEqual([]);
@@ -742,6 +747,110 @@ describe('Codex App worker replacement durable handoff', () => {
     expect(logs2.join('')).toContain('warm reattach');
     expect(readRequests(requestLog).filter(request => request.method === 'turn/start')).toHaveLength(1);
   }, 35_000);
+
+  it('replaces a surviving runner it cannot authenticate on the server that pane lives on', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-unauth-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+
+    const sessionId = replacementSessionId('unauth');
+    const tmuxSession = `bmx-${sessionId.slice(0, 8)}`;
+    tmuxSessions.add(tmuxSession);
+    const panePid = (): string => {
+      try {
+        // `=name:` — exact session match in a pane target (a bare `=name` is
+        // read as a window name and resolves to nothing).
+        return execFileSync('tmux', [...managedTmuxArgs, 'display-message', '-p', '-t', `=${tmuxSession}:`, '#{pane_pid}'], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+      } catch { return ''; }
+    };
+    const ackDurability = (message: WorkerToDaemon, child: ChildProcess) => {
+      if (message.type === 'codex_app_dispatch_transition') {
+        child.send({ type: 'codex_app_dispatch_persisted', requestId: message.requestId, ok: true } satisfies DaemonToWorker);
+      }
+      if (message.type === 'final_output' && message.codexAppSettlement) {
+        child.send({ type: 'codex_app_dispatch_persisted', requestId: message.codexAppSettlement.requestId, ok: true } satisfies DaemonToWorker);
+      }
+    };
+
+    const logs1: string[] = [];
+    const messages1: WorkerToDaemon[] = [];
+    const worker1 = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs1, messages1, ackDurability);
+    worker1.send(replacementInit(sessionId, fakeCodex, 'first turn', {
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'success' },
+      turnId: 'turn-unauth-1',
+    }));
+    await waitFor(worker1, logs1, () => messages1.some(message => message.type === 'final_output'));
+    await hardKillWorkerOnly(worker1);
+    const survivingRunner = panePid();
+    expect(survivingRunner).not.toBe('');
+
+    // Without its persisted control identity the surviving runner can never be
+    // authenticated: the next worker must remove THAT pane (on the managed
+    // server) and cold-spawn, not leave it running behind a fresh generation.
+    rmSync(codexAppControlStatePath(root, sessionId), { force: true });
+
+    const logs2: string[] = [];
+    const messages2: WorkerToDaemon[] = [];
+    const worker2 = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs2, messages2, ackDurability);
+    worker2.send(replacementInit(sessionId, fakeCodex, '', {
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'success' },
+      resume: true,
+      cliSessionId: 'thread-fake',
+    }));
+    await waitFor(worker2, logs2, () => logs2.join('').includes('has no valid public control identity'));
+    await waitFor(worker2, logs2, () => {
+      const current = panePid();
+      return current !== '' && current !== survivingRunner;
+    });
+    let survivorAlive = true;
+    try { process.kill(Number(survivingRunner), 0); } catch { survivorAlive = false; }
+    expect(survivorAlive).toBe(false);
+  }, 45_000);
+
+  it('kills a rejected fresh generation on the server its pane lives on', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-reject-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+
+    const sessionId = replacementSessionId('reject');
+    const tmuxSession = `bmx-${sessionId.slice(0, 8)}`;
+    tmuxSessions.add(tmuxSession);
+    const paneAlive = () => spawnSync('tmux', [...managedTmuxArgs, 'has-session', '-t', `=${tmuxSession}`]).status === 0;
+    let paneSeen = false;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs, messages);
+    const watchPane = setInterval(() => { paneSeen ||= paneAlive(); }, 20);
+    // A fresh runner cannot prove whether an earlier generation buffered this
+    // prepared frame: once it authenticates the worker rejects the generation,
+    // and the runner (which outlives a worker by design) must go with it.
+    worker.send(replacementInit(sessionId, fakeCodex, '', {
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'success' },
+      codexAppRecoveredDispatches: [{
+        dispatchId: 'dispatch-reject-1',
+        turnId: 'turn-reject-1',
+        state: 'prepared',
+        content: '<user_message>rejected</user_message>',
+        codexAppInput: { text: 'rejected', clientUserMessageId: 'turn-reject-1' },
+      }],
+    }));
+    try {
+      await waitForChildExit(worker, logs);
+    } finally {
+      clearInterval(watchPane);
+    }
+    expect(logs.join('')).toContain('cannot adopt a recovered prepared dispatch');
+    expect(paneSeen).toBe(true);
+    expect(paneAlive()).toBe(false);
+  }, 45_000);
 
   it('holds N+1 behind replayed empty N until daemon durability ACKs final-end', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-empty-replace-'));

@@ -36361,14 +36361,14 @@ dialog.command-palette-dialog::backdrop {
   white-space: nowrap;
 }
 
-/* 设置页深链落点：区块 / 字段行闪一下（outline 外扩，不挤动布局）。 */
-.settings-search-flash {
+/* ⌘K 深链落点（设置区块 / 字段行、Bot 配置分类）闪一下（outline 外扩，不挤动布局）。 */
+.palette-target-flash {
   border-radius: var(--radius-lg);
   outline: 2px solid transparent;
   outline-offset: 6px;
-  animation: settings-search-flash 2.2s ease-out;
+  animation: palette-target-flash 2.2s ease-out;
 }
-@keyframes settings-search-flash {
+@keyframes palette-target-flash {
   0%, 35% { outline-color: var(--accent); background-color: color-mix(in srgb, var(--accent) 7%, transparent); }
   100% { outline-color: transparent; background-color: transparent; }
 }
@@ -36417,7 +36417,7 @@ dialog.command-palette-dialog::backdrop {
   dialog.command-palette-dialog[open],
   dialog.command-palette-dialog::backdrop,
   .cmdk-progress,
-  .settings-search-flash {
+  .palette-target-flash {
     animation: none;
   }
 }

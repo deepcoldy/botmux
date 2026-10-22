@@ -21,7 +21,8 @@ const ALL_SCOPE_GROUP_LIMIT: Record<PaletteKind, number> = {
   session: 5,
   skill: 4,
   agent: 4,
-  setting: 4,
+  // 5：搜「Bot 配置」时它的五个分类能一屏全部露出。
+  setting: 5,
   bot: 3,
   page: 4,
   action: 3,

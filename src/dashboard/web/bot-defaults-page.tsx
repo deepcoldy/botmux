@@ -6,6 +6,8 @@ import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
 import {
+  BOT_DEFAULTS_TABS,
+  BOT_DEFAULTS_TAB_LABEL_KEYS,
   agentSelectionKey,
   cliIdOf,
   createRefreshGate,
@@ -30,6 +32,8 @@ import {
   type BotSubstituteTarget,
   type CliOptionsState,
   type SubstituteTargetResolution,
+  type BotDefaultsTab,
+  parseBotDefaultsTab,
 } from './bot-defaults.js';
 import {
   descriptionPreview,
@@ -91,7 +95,7 @@ import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { fetchAgents } from './agents-api.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
-import { hashQueryParam } from './dashboard-routes.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
@@ -241,15 +245,7 @@ type BotProfileRoleState = {
   items: BotProfileRoleItem[];
 };
 
-export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
-
-export const BOT_DEFAULTS_TABS: readonly BotDefaultsTab[] = [
-  'common',
-  'sessions',
-  'security',
-  'cards',
-  'advanced',
-];
+export { BOT_DEFAULTS_TABS, type BotDefaultsTab };
 
 export function BotDefaultsTabs(props: {
   active: BotDefaultsTab;
@@ -257,13 +253,9 @@ export function BotDefaultsTabs(props: {
 }) {
   const tr = useT();
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const labels: Record<BotDefaultsTab, string> = {
-    common: tr('botDefaults.tabCommon'),
-    sessions: tr('botDefaults.tabSessions'),
-    security: tr('botDefaults.tabSecurity'),
-    cards: tr('botDefaults.tabCards'),
-    advanced: tr('botDefaults.tabAdvanced'),
-  };
+  const labels = Object.fromEntries(
+    BOT_DEFAULTS_TABS.map(tab => [tab, tr(BOT_DEFAULTS_TAB_LABEL_KEYS[tab])]),
+  ) as Record<BotDefaultsTab, string>;
 
   function selectAt(index: number): void {
     const nextIndex = (index + BOT_DEFAULTS_TABS.length) % BOT_DEFAULTS_TABS.length;
@@ -623,6 +615,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     codexBrowser: body.codexBrowser,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    replyCardActions: body.replyCardActions,
     cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
     senderTagHideEmail: body.senderTagHideEmail,
@@ -667,7 +660,10 @@ export function BotDefaultsPage() {
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
-  const [activeTab, setActiveTab] = useState<BotDefaultsTab>('common');
+  // `#/bot-defaults?tab=<分类>`（⌘K 全局搜索）：落在该分类并定位过去；显式指定的分类优先于
+  // 「启动被拦的 Bot 自动切到高级」那条首次自动选择逻辑。消费一次后清掉参数。
+  const deepLinkTabRef = useRef<BotDefaultsTab | null>(parseBotDefaultsTab(hashQueryParam('tab')));
+  const [activeTab, setActiveTab] = useState<BotDefaultsTab>(() => deepLinkTabRef.current ?? 'common');
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
@@ -738,11 +734,28 @@ export function BotDefaultsPage() {
     if (!selectedAppId || !filtered.some(bot => bot.larkAppId === selectedAppId)) {
       const firstBot = filtered[0];
       setSelectedAppId(firstBot.larkAppId);
-      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
+      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle' && !deepLinkTabRef.current) setActiveTab('advanced');
     }
   }, [filtered, loadError, loading, selectedAppId]);
 
   const selectedBot = selectedAppId ? filtered.find(bot => bot.larkAppId === selectedAppId) ?? null : null;
+
+  // 分类深链：选中的 Bot 渲染出来后滚到分类栏并闪一下落点，然后清掉 `tab` 参数（一次性）。
+  useEffect(() => {
+    const tab = deepLinkTabRef.current;
+    if (!tab || !selectedBot) return;
+    deepLinkTabRef.current = null;
+    clearHashQueryParam('tab');
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(`bd-tab-${tab}`);
+      if (!target) return;
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.remove('palette-target-flash');
+      void target.offsetWidth;
+      target.classList.add('palette-target-flash');
+      window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
+    });
+  }, [selectedBot]);
 
   const patchBot = useCallback<PatchBot>((appId, patch) => {
     setBots(rows => rows.map(bot => {
@@ -4773,6 +4786,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
+  const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -4786,8 +4800,9 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
+    setReplyActions(bot.replyCardActions === true);
     setCotEnabled(bot.cotEnabled !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -5008,6 +5023,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = writableLink;
                 setWritableLink(checked);
                 void savePatch({ writableTerminalLinkInCard: checked }, 'writable', () => setWritableLink(previous));
+              }}
+            />
+            <ToggleRow
+              checked={replyActions}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-actions"
+              title={tr('botDefaults.replyCardActions')}
+              description={tr('botDefaults.replyCardActionsDescription')}
+              help={tr('botDefaults.replyCardActionsHelp')}
+              onChange={checked => {
+                const previous = replyActions;
+                setReplyActions(checked);
+                void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
               }}
             />
           </div>

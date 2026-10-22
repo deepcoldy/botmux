@@ -433,6 +433,25 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1', 'a2', 'a3']);
   });
 
+  it('a turn read in the same batch after another turn\'s duration marker stays its own turn', () => {
+    // A rotation switch replays every turn the bridge did not read at once:
+    // two background-task wake-ups, then one after a Lark turn.
+    const notification = (uuid: string) => user(uuid, `<task-notification>\n<task-id>${uuid}</task-id>\n</task-notification>`);
+    const done = (uuid: string): TranscriptEvent => ({ type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint('lark question'));
+    q.ingest([
+      notification('n1'), assistant('a1', 'first wake-up reply'), done('d1'),
+      notification('n2'), assistant('a2', 'second wake-up reply'), done('d2'),
+      user('u1', 'lark question'), assistant('a3', 'lark answer'), done('d3'),
+      notification('n3'), assistant('a4', 'third wake-up reply'), done('d4'),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.map(turn => [turn.isLocal === true, turn.assistantUuids])).toEqual([
+      [true, ['a1']], [true, ['a2']], [false, ['a3']], [true, ['a4']],
+    ]);
+  });
+
   it('headless local turn does not block a Lark turn that arrives next', () => {
     const q = new BridgeTurnQueue();
     // In-flight assistant text after a daemon restart — synthesises a headless turn.

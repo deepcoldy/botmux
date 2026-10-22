@@ -7,6 +7,7 @@ import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
@@ -138,7 +139,9 @@ setInterval(() => {}, 1000);
     if (backendType === 'tmux') {
       let viewport = '';
       await waitFor(() => {
-        viewport = execFileSync('tmux', ['capture-pane', '-e', '-p'], {
+        // The worker puts its pane on the managed server (tmux-socket.ts), not
+        // the default one of this private root.
+        viewport = execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(privateTmuxEnv(root))), 'capture-pane', '-e', '-p'], {
           env: privateTmuxEnv(root), encoding: 'utf8',
         });
         return viewport.includes('custom-model');
@@ -169,7 +172,9 @@ setInterval(() => {}, 1000);
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      for (const socket of new Set([undefined, preferredManagedTmuxSocket(privateTmuxEnv(root))])) {
+        try { execFileSync('tmux', [...tmuxSocketArgs(socket), 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }

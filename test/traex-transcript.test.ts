@@ -2410,6 +2410,28 @@ describe('drainTraexRollout', () => {
     expect(finals[1]).toEqual(expect.objectContaining({ text: '' }));
   });
 
+  it('keeps the fallback for a real empty task_complete with no send/report marker', () => {
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(taskComplete()),
+    ].join(''));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('delivery-empty-traex', 'do the work', Date.parse('2000-01-01T00:00:00.000Z'), 1);
+    queue.ingest(drainTraexRollout(path, 0).events);
+    const turn = queue.drainEmittable()[0];
+    expect(turn.finalText).toBe('');
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      sessionId: 'session-traex',
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      finalText: turn.finalText,
+      terminalStatus: turn.terminalStatus,
+    }, undefined, [], false)).toBe(true);
+  });
+
   it('synthesised sentinel final is genuine silence: the empty-completed alert stays suppressed', () => {
     writeFileSync(path, [
       line(user('do the work')),

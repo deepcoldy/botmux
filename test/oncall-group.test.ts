@@ -159,3 +159,27 @@ describe('Oncall and feedback card composition', () => {
     expect(card.includes('botmux_feedback')).toBe(feedback);
   });
 });
+
+describe('Oncall button with a voice-only chrome row', () => {
+  it('joins the existing footer+voice column_set instead of making a standalone row', () => {
+    // Voice-enabled bots render footer+voice as botmux_reply_actions even when
+    // the reply-card action menu is off; the on-call button must stay in that
+    // row rather than silently moving to a standalone row at card bottom.
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: 'answer' },
+        { tag: 'hr' },
+        { tag: 'column_set', element_id: 'botmux_reply_actions', flex_mode: 'none', columns: [
+          { tag: 'column', width: 'weighted', elements: [{ tag: 'markdown', element_id: 'botmux_reply_footer', content: 'f' }] },
+          { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { tag: 'plain_text', content: '🔊 语音总结' }, behaviors: [{ type: 'callback', value: { action: 'voice_summary' } }] }] },
+        ] },
+      ] },
+    };
+    const attached = JSON.parse(attachOncallGroupButton(JSON.stringify(card), { enabled: true, chatIds: ['oc_source'] }, 'oc_source'));
+    const row = attached.body.elements.find((e: any) => e.element_id === 'botmux_reply_actions');
+    expect(row.columns).toHaveLength(3);
+    expect(row.columns[2].elements[0].text.content).toBe('拉起 Oncall 群');
+    expect(attached.body.elements.some((e: any) => e.element_id === 'botmux_oncall_group')).toBe(false);
+  });
+});

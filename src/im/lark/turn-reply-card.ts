@@ -173,7 +173,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // Keep the canonical footer and action controls. Full original content
     // is in the native attachment; a visible notice always accompanies it.
     card.body.elements = card.body.elements.filter(element =>
-      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_feedback'
+      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_reply_actions'
+      || element.element_id === 'botmux_feedback'
       || element.element_id === 'botmux_oncall_group');
     card.body.elements.unshift({ tag: 'markdown', content: en
       ? 'The full answer is included in this turn’s **Markdown attachment**.'
@@ -239,7 +240,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   if (process.length) {
     for (const entry of process) entry.content = closeProcessCodeFence(entry.content);
     const footerIndex = card.body.elements.findIndex(element =>
-      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
+      element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer'
+      || element.element_id === 'botmux_reply_actions');
     const panel = {
       tag: 'collapsible_panel', element_id: 'botmux_turn_process', expanded: false,
       background_color: 'grey-50', padding: '4px 12px 12px 12px', margin: '4px 0px 0px 0px',

@@ -14,6 +14,10 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGroupContextSeqs, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
+import {
+  shouldEmitEmptyCompletedBridgeFallback,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 import MarkdownIt from 'markdown-it';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
@@ -21,6 +25,88 @@ const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
+  it.each([
+    {
+      name: 'Pi current-session --mention',
+      cliId: 'pi',
+      sendArgs: ['--mention', 'ou_reviewer:ReviewBot'],
+      deliveryKind: 'current_session_send',
+    },
+    {
+      name: 'Grok top-level detour',
+      cliId: 'grok',
+      sendArgs: ['--no-mention', '--top-level'],
+      deliveryKind: 'detoured_send',
+    },
+  ] as const)('records $name as exact empty-final reply evidence', ({ cliId, sendArgs, deliveryKind }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-visible-reply-marker-'));
+    const dataDir = join(root, 'data');
+    const turnId = `om_${cliId}_visible_reply`;
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId,
+        replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId,
+        status: 'active',
+        cliId,
+        larkAppId: key.larkAppId,
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+      } });
+      const result = spawnSyncTsScript(
+        fixture,
+        ['send', ...sendArgs, 'Visible result already delivered.'],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: {
+            PATH: process.env.PATH,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId,
+            BOTMUX_LARK_APP_ID: key.larkAppId,
+          },
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      );
+      expect(result.status, String(result.stderr)).toBe(0);
+      const markerPath = join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`);
+      const markers = readFileSync(markerPath, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as BridgeSendMarker);
+      expect(markers).toHaveLength(1);
+      expect(markers[0]).toMatchObject({
+        sessionId: key.sessionId,
+        turnId,
+        deliveryKind,
+        targetChatId: 'oc_test',
+        messageId: 'om_separate_message',
+      });
+      expect(shouldEmitEmptyCompletedBridgeFallback({
+        sessionId: key.sessionId,
+        turnId,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: '',
+        terminalStatus: 'completed',
+      }, undefined, markers, false)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   it.each([
     ['table', '| A | B |\n| --- | --- |\n| 1 | 2 |', 'table'],
     ['image', '![Preview](img_v3_footer_test)', 'column_set'],

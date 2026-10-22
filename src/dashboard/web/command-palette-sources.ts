@@ -16,6 +16,8 @@ import {
 import { createDashboardTranslator, type DashboardLocale } from './i18n.js';
 import { THEME_OPTIONS } from './theme-menu.js';
 import { sourceLabel } from './skills/shared.js';
+import { BOT_DEFAULTS_TABS, BOT_DEFAULTS_TAB_LABEL_KEYS, botDefaultsHref } from './bot-defaults.js';
+import { BOT_DEFAULTS_ALIASES } from './nav-items.js';
 import type { SkillRow } from './skills/types.js';
 import type { PaletteItem, PaletteTone } from './command-palette-model.js';
 
@@ -25,6 +27,13 @@ export interface PalettePageEntry {
   label: string;
   /** 有 i18n key 的页面额外用另一种语言的名字参与匹配（中文界面搜 settings 也能命中）。 */
   labelKey?: string;
+  /** 界面上不显示、但参与匹配的叫法（如「机器人配置」之于「Bot 配置」）。 */
+  aliases?: readonly string[];
+  /**
+   * 子页面 / 页内 tab 所属的页面：标题与两种语言的关键词都写成「父页面 › 子页面」。
+   * 「会话」「分布」这类短名单独做标题会全等命中，把「会话控制」等主页面挤下首条。
+   */
+  parent?: { label: string; labelKey?: string };
   groupLabel?: string;
   icon?: ReactNode;
 }
@@ -56,6 +65,15 @@ const translators = {
 /** 同一个 key 在两种语言下的文案（去重）。 */
 function bilingual(key: string): string[] {
   return [...new Set([translators.zh(key), translators.en(key)])];
+}
+
+/**
+ * 子页面 / 页内分类在两种语言下的全名「父 › 子」（去重），拿来做关键词。不收光秃秃的短名：
+ * 英文界面搜「会话」时，短名「会话」全等命中会压过只在关键词里前缀命中的「会话控制」。
+ */
+function bilingualPath(parent: { label: string; labelKey?: string }, childKey: string): string[] {
+  const path = (tr: (key: string) => string) => `${parent.labelKey ? tr(parent.labelKey) : parent.label} › ${tr(childKey)}`;
+  return [...new Set([path(translators.zh), path(translators.en)])];
 }
 
 function compact(text: unknown, limit = 140): string {
@@ -159,8 +177,7 @@ function buildSessionItem(s: Record<string, any>, now: number): PaletteItem {
       s.workingDir,
       s.workspace?.rootPath,
       s.workspace?.branch,
-      s.larkAppId,
-      s.botName,
+      // 不放 larkAppId：按 app id 搜要直达那个 bot，不该被一串会话抢在前面；会话仍可按 bot 名（副标题）搜到。
     ].filter(Boolean).map(String),
     meta: lastActive ? relTime(lastActive) : undefined,
     badge: sessionBadge(s),
@@ -224,16 +241,39 @@ export function buildAgentItems(agents: readonly PaletteAgentRow[], links: Recor
 
 export function buildBotItems(bots: ReadonlyArray<{ larkAppId: string; name: string }> = knownBots()): PaletteItem[] {
   if (!ui.authed) return [];
+  const botConfig = t('nav.botDefaults');
   return [...bots]
     .sort((a, b) => a.name.localeCompare(b.name))
-    .map(bot => ({
-      key: `bot:${bot.larkAppId}`,
-      kind: 'bot' as const,
-      title: bot.name,
-      subtitle: bot.larkAppId,
-      avatar: { name: bot.name, larkAppId: bot.larkAppId },
-      primary: { label: t('palette.actionOpenBot'), href: `#/bot-defaults?bot=${encodeURIComponent(bot.larkAppId)}` },
-    }));
+    .map(bot => {
+      const named = bot.name !== bot.larkAppId;
+      return {
+        key: `bot:${bot.larkAppId}`,
+        kind: 'bot' as const,
+        title: bot.name,
+        subtitle: named ? `${botConfig} · ${bot.larkAppId}` : botConfig,
+        // app id 进关键词：按 cli_xxx 搜时直达，排在带同一 app id 的会话之前。
+        keywords: [bot.larkAppId, ...bilingual('nav.botDefaults')],
+        avatar: { name: bot.name, larkAppId: bot.larkAppId },
+        primary: { label: t('palette.actionOpenBot'), href: botDefaultsHref({ bot: bot.larkAppId }) },
+      };
+    });
+}
+
+/** Bot 配置页内的分类（常用 / 会话 / 权限与安全 / 消息卡片 / 高级），直接按 BOT_DEFAULTS_TABS 生成。 */
+export function buildBotDefaultsTabItems(): PaletteItem[] {
+  if (!ui.authed) return [];
+  const botConfig = t('nav.botDefaults');
+  return BOT_DEFAULTS_TABS.map(tab => ({
+    key: `setting:bot-defaults:${tab}`,
+    kind: 'setting' as const,
+    // 带上父页面名：「常用」「会话」「高级」单独做标题会全等命中，抢掉「会话控制」等主页面的首条。
+    title: `${botConfig} › ${t(BOT_DEFAULTS_TAB_LABEL_KEYS[tab])}`,
+    keywords: [...bilingualPath({ label: botConfig, labelKey: 'nav.botDefaults' }, BOT_DEFAULTS_TAB_LABEL_KEYS[tab]), ...BOT_DEFAULTS_ALIASES],
+    // 同分时让「Bot 配置」整页排在分类前面（只搜「机器人配置」时首条应是页面本身）。
+    boost: -0.05,
+    iconId: 'bot',
+    primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ tab }) },
+  }));
 }
 
 // ── 设置 ─────────────────────────────────────────────────────────────────────
@@ -245,6 +285,8 @@ export interface SettingsSearchEntry {
   section: string;
   /** 区块内字段标题的 i18n key；深链带 `field=<key>` 时页面会闪烁定位到该行。 */
   fields: readonly string[];
+  /** 区块的其它叫法（i18n key），例如页面标题和设置侧栏用词不同时两种都能搜到。 */
+  aliasKeys?: readonly string[];
 }
 
 /** 全局设置的可搜索索引。settings 页新增区块 / 字段时同步这里（单测校验 key 都有译文）。 */
@@ -277,7 +319,7 @@ export const SETTINGS_SEARCH_INDEX: readonly SettingsSearchEntry[] = [
   { id: 'settings-vc', module: 'settings.moduleMeeting', section: 'settings.sectionVcMeetingAgent', fields: ['settings.vcMeetingAgent'] },
   { id: 'settings-autostart', module: 'settings.moduleSystem', section: 'settings.sectionAutostart', fields: ['settings.autostartToggle'] },
   { id: 'settings-maintenance', module: 'settings.moduleSystem', section: 'settings.sectionMaintenance', fields: ['settings.autoUpdate', 'settings.autoRestart', 'settings.httpProxy'] },
-  { id: 'settings-update', module: 'settings.moduleSystem', section: 'settings.sectionUpdate', fields: [] },
+  { id: 'settings-update', module: 'settings.moduleSystem', section: 'settings.sectionUpdate', fields: [], aliasKeys: ['update.section'] },
 ];
 
 export function settingsHref(section: string, field?: string): string {
@@ -296,7 +338,12 @@ export function buildSettingItems(index: readonly SettingsSearchEntry[] = SETTIN
       kind: 'setting',
       title: sectionTitle,
       subtitle: `${settingsTitle} › ${t(entry.module)}`,
-      keywords: [...bilingual(entry.section), ...bilingual(entry.module), ...bilingual('nav.settings')],
+      keywords: [
+        ...bilingual(entry.section),
+        ...(entry.aliasKeys ?? []).flatMap(bilingual),
+        ...bilingual(entry.module),
+        ...bilingual('nav.settings'),
+      ],
       primary: { label: t('palette.actionGoto'), href: settingsHref(entry.id) },
     });
     for (const field of entry.fields) {
@@ -351,9 +398,13 @@ export function buildPageItems(pages: readonly PalettePageEntry[]): PaletteItem[
   return pages.map(page => ({
     key: `page:${page.id}`,
     kind: 'page' as const,
-    title: page.label,
+    title: page.parent ? `${page.parent.label} › ${page.label}` : page.label,
     subtitle: page.groupLabel,
-    keywords: [...(page.labelKey ? bilingual(page.labelKey) : []), page.id],
+    keywords: [
+      ...(page.labelKey ? (page.parent ? bilingualPath(page.parent, page.labelKey) : bilingual(page.labelKey)) : []),
+      ...(page.aliases ?? []),
+      page.id,
+    ],
     iconId: page.id,
     primary: { label: t('palette.actionGoto'), href: page.href },
   }));

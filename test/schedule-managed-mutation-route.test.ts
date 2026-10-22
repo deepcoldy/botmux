@@ -79,6 +79,29 @@ function configureProviderActor(
 }
 
 describe('managed schedule mutation route', () => {
+  it('runs the fixed protected task for a current same-app human administrator without a union lookup', async () => {
+    const h = harness('run');
+    h.record.kind = 'direct';
+    h.record.controlUnionId = undefined;
+    h.record.task.enabled = true;
+    h.record.task.preconditionRef = 'host-protected';
+    const resolveUnionId = vi.fn(async () => { throw new Error('union lookup must not be needed'); });
+    h.scope.resolveUnionIdFromOpenId = resolveUnionId;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.scheduler.runTaskNow).toHaveBeenCalledWith('a1b2c3d4');
+    expect(resolveUnionId).not.toHaveBeenCalled();
+    expect(h.record.task.preconditionRef).toBe('host-protected');
+  });
+
+  it('does not treat the same open-id string from another app as a current local administrator', async () => {
+    const h = harness('run');
+    h.record.kind = 'direct';
+    h.record.task.enabled = true;
+    h.ds.activeInteractiveTurn.caller.requestLarkAppId = 'cli_other';
+    expect(await h.run()).toMatchObject({ status: 403 });
+    expect(h.scheduler.runTaskNow).not.toHaveBeenCalled();
+  });
+
   it('does not let a bot-authored create grant become pause authority', async () => {
     const h = harness(); h.ds.activeInteractiveTurn.caller.senderType = 'bot';
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });

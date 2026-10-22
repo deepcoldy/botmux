@@ -23,15 +23,10 @@ import {
   type SandboxTreeFlavour,
 } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { unmountTestMount } from './helpers/unmount-test-mount.js';
 
 const linux = process.platform === 'linux';
 const isRoot = process.getuid?.() === 0;
-
-function unmount(target: string): void {
-  if (!isMountpoint(target)) return;
-  if (spawnSync('umount', [target], { stdio: 'ignore' }).status === 0) return;
-  spawnSync('fusermount', ['-u', target], { stdio: 'ignore' });
-}
 
 function mountSmallFs(target: string, scratch: string): boolean {
   mkdirSync(target, { recursive: true });
@@ -48,8 +43,7 @@ const mountsAvailable = linux && (() => {
   try {
     const target = join(dir, 'm');
     const ok = mountSmallFs(target, join(dir, 'fs'));
-    if (ok) unmount(target);
-    return ok && !isMountpoint(target);
+    return ok && unmountTestMount(target);
   } catch {
     return false;
   } finally {
@@ -110,7 +104,7 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
         if (merged) expect(isMountpoint(merged)).toBe(false);
       }
     } finally {
-      if (merged) unmount(merged);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });
@@ -133,7 +127,7 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
       })).toBe('kept');
       expect(recordedSandboxTreeFlavour(sessionId, dataDir)).toBe(recorded);
     } finally {
-      if (merged) unmount(merged);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });
@@ -151,8 +145,8 @@ describe.skipIf(!linux)('reconcileSandboxTreeFlavour', () => {
       })).toThrow(/could not tear down its previous scratch sandbox tree/);
       expect(mountsAtOrUnder(join(dataDir, 'sandboxes', sessionId))).toEqual([stray]);
     } finally {
-      unmount(stray);
-      if (merged) unmount(merged);
+      unmountTestMount(stray);
+      if (merged) unmountTestMount(merged);
       rmSandboxScratch(dataDir);
     }
   });

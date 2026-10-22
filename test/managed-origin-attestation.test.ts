@@ -58,6 +58,7 @@ describe('managed-origin host proof sidecar', () => {
             callerOpenId: 'ou_current',
             larkAppId: 'cli_app',
             scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
+            scheduleOperator: { ok: false, error: 'caller_not_allowed' },
             dispatchAttempt: 4,
             requiresCodexAppLedger: true,
             issuedAtMs: Date.now(),
@@ -67,6 +68,7 @@ describe('managed-origin host proof sidecar', () => {
           // Deliberately forged transport body: it must never win.
           turnId: 'turn-forged',
           scheduleCreator: { ok: true, ownerUnionId: 'on_forged' },
+          scheduleOperator: { ok: true },
         }), { status: 200 });
       },
     });
@@ -76,6 +78,7 @@ describe('managed-origin host proof sidecar', () => {
       callerOpenId: 'ou_current',
       larkAppId: 'cli_app',
       scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
+      scheduleOperator: { ok: false, error: 'caller_not_allowed' },
       dispatchAttempt: 4,
       requiresCodexAppLedger: true,
     });
