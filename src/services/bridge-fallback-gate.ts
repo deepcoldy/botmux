@@ -252,6 +252,12 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
+  /** Owning chat, when the caller knows it. A detour into another chat does
+   *  not replace the non-empty answer this conversation is waiting for. */
+  chatId?: string;
+  /** Owning topic root. Same-chat delivery into another root is still a
+   *  different conversation; same-chat top-level markers omit this field. */
+  rootMessageId?: string;
   /** Owning BotMux session. The marker file is already per-session; retaining
    *  this field also fails closed if a misplaced new-schema marker is read. */
   sessionId?: string;
@@ -291,14 +297,21 @@ export interface BridgeGateInput {
  * falling back to timestamp-only attribution when their marker carries a
  * turnId. Identity fields are applied last so caller payloads cannot override
  * the source turn. */
-export function bridgeGateInputForTurn(
+export function bridgeGateInputForTurn<
+  T extends Omit<BridgeGateInput,
+    'sessionId' | 'turnId' | 'dispatchAttempt' | 'chatId' | 'rootMessageId'>,
+>(
   sessionId: string | undefined,
   turn: { turnId: string; dispatchAttempt?: number },
-  input: Omit<BridgeGateInput, 'sessionId' | 'turnId' | 'dispatchAttempt'>,
-): BridgeGateInput {
+  input: T,
+  chatId?: string,
+  rootMessageId?: string,
+): BridgeGateInput & T {
   return {
     ...input,
     ...(sessionId ? { sessionId } : {}),
+    ...(chatId ? { chatId } : {}),
+    ...(rootMessageId ? { rootMessageId } : {}),
     turnId: turn.turnId,
     ...(turn.dispatchAttempt !== undefined
       ? { dispatchAttempt: turn.dispatchAttempt }
@@ -433,6 +446,36 @@ function markerMatchesExactTurn(turn: BridgeGateInput, marker: BridgeSendMarker)
     && markerMatchesSession(turn, marker);
 }
 
+/** Whether this delivery can replace the non-empty answer expected here.
+ *
+ * A cross-chat / cross-thread delivery still explains an EMPTY terminal, but
+ * it must not consume this conversation's non-empty final or failure notice.
+ * Legacy markers predate routing metadata and retain their historical credit. */
+function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  if (marker.deliveryKind === undefined) return true;
+  if (turn.chatId && marker.targetChatId && marker.targetChatId !== turn.chatId) {
+    return false;
+  }
+  if (marker.deliveryKind !== 'current_session_send'
+    && turn.rootMessageId && marker.targetRootMessageId
+    && marker.targetRootMessageId !== turn.rootMessageId) {
+    return false;
+  }
+  if (marker.deliveryKind === 'current_session_send') return true;
+  // A relay into this exact source session is this conversation's answer even
+  // when it has no independently-addressable Lark target.
+  if (!marker.targetChatId && marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId) {
+    return true;
+  }
+  // Detours/reports elsewhere need positive same-chat proof. A supplied root
+  // was already checked above; an omitted root is the same chat's top level.
+  if (turn.chatId) return marker.targetChatId === turn.chatId;
+  return !marker.targetChatId
+    && !!marker.targetSessionId
+    && marker.targetSessionId === turn.sessionId;
+}
+
 /**
  * Successful reply markers attributable to one structured turn.
  *
@@ -451,7 +494,11 @@ export function attributableBridgeReplyMarkers(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.filter(marker => {
     if (marker.terminalIndependent === true || !markerMatchesSession(turn, marker)) return false;
-    if (marker.turnId !== undefined) return markerMatchesExactTurn(turn, marker);
+    // Use exact identity only when BOTH sides carry a turn. A rolling-upgrade
+    // marker or an unmigrated caller keeps the bounded legacy time window.
+    if (marker.turnId !== undefined && turn.turnId !== undefined) {
+      return markerMatchesExactTurn(turn, marker);
+    }
     return lower !== undefined && marker.sentAtMs >= lower && marker.sentAtMs < upper;
   });
 }
@@ -480,13 +527,21 @@ export function shouldSuppressBridgeEmit(
   // Keep the dispatch attempt in the identity so a stale durable retry cannot
   // suppress a later attempt of the same logical turn.
   if (turn.turnId && markers.some(marker => markerMatchesExactTurn(turn, marker)
+      && markerCoversOwnThread(turn, marker)
       && marker.terminalIndependent !== true
       && isFinalBridgeSendMarker(marker)
       && (marker.replyCardResponseKind === undefined
         || marker.replyCardResponseKind === 'final'))) {
     return true;
   }
-  const inWindow = attributableBridgeReplyMarkers(turn, nextBoundaryMs, markers);
+  const attributable = attributableBridgeReplyMarkers(turn, nextBoundaryMs, markers);
+  // A successful detour still explains an EMPTY terminal. Only non-empty
+  // duplicate delivery is restricted to markers that reached this chat/root.
+  const hasVisibleFinal = turn.finalText !== undefined
+    && normaliseForFingerprint(turn.finalText).length > 0;
+  const inWindow = hasVisibleFinal
+    ? attributable.filter(marker => markerCoversOwnThread(turn, marker))
+    : attributable;
   if (turn.markTimeMs === undefined) {
     if (inWindow.length === 0) return false;
     // Without a clock window, an exact unclassified/progress delivery proves
@@ -646,9 +701,9 @@ export function shouldSuppressStructuredFallback(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.some(marker => isFinalBridgeSendMarker(marker)
+    && markerMatchesExactTurn(turn, marker)
+    && markerCoversOwnThread(turn, marker)
     && typeof marker.messageId === 'string' && marker.messageId.trim().length > 0
-    && marker.turnId === turn.turnId
-    && marker.dispatchAttempt === turn.dispatchAttempt
     && marker.sentAtMs >= lower && marker.sentAtMs < upper
     && marker.terminalIndependent !== true
     && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));

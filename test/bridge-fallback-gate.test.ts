@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
@@ -362,12 +363,16 @@ describe('production turn identity projection', () => {
       'session-source',
       { turnId: 'turn-source', dispatchAttempt: 4 },
       { markTimeMs, isLocal: false, finalText },
+      'oc_source',
+      'om_source_root',
     );
 
     expect(gate).toMatchObject({
       sessionId: 'session-source',
       turnId: 'turn-source',
       dispatchAttempt: 4,
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
       markTimeMs,
       finalText,
     });
@@ -387,6 +392,134 @@ describe('production turn identity projection', () => {
     );
     const marker = { ...exactMarkers[1], ...override };
     expect(shouldSuppressBridgeEmit(gate, 200, [marker], false)).toBe(false);
+  });
+});
+
+describe('cross-conversation delivery boundaries', () => {
+  const finalText = 'Answer for the topic the user is reading.';
+  const marker = (overrides: Partial<BridgeSendMarker>): BridgeSendMarker => ({
+    sentAtMs: 150,
+    sessionId: 'session-source',
+    turnId: 'turn-source',
+    dispatchAttempt: 4,
+    responseKind: 'final',
+    contentLength: normalise(finalText).length,
+    previewText: finalText,
+    ...overrides,
+  });
+  const gate = (text = finalText) => bridgeGateInputForTurn(
+    'session-source',
+    { turnId: 'turn-source', dispatchAttempt: 4 },
+    { markTimeMs: 100, isLocal: false, finalText: text },
+    'oc_source',
+    'om_source_root',
+  );
+
+  it.each([
+    ['cross-chat --chat-id', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
+    ['same-chat --into another root', {
+      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
+    }],
+    ['report to an orchestrator session', {
+      deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator',
+    }],
+  ] as const)('keeps the source-topic final after %s', (_label, routing) => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(false);
+  });
+
+  it.each([
+    ['same-chat top-level detour', { deliveryKind: 'detoured_send', targetChatId: 'oc_source' }],
+    ['detour back into this root', {
+      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_source_root',
+    }],
+    ['current-session send', { deliveryKind: 'current_session_send', targetChatId: 'oc_source' }],
+    ['report relay back into this session', {
+      deliveryKind: 'dispatch_report', targetSessionId: 'session-source',
+    }],
+    ['legacy marker', {}],
+  ] as const)('keeps existing dedup for %s', (_label, routing) => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(true);
+  });
+
+  it.each([
+    ['cross-chat delivery', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
+    ['same-chat other-root delivery', {
+      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
+    }],
+  ] as const)('still explains an empty terminal after %s', (_label, routing) => {
+    const emptyGate = gate('');
+    const delivered = marker(routing);
+    expect(shouldSuppressBridgeEmit(emptyGate, 200, [delivered], false)).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...emptyGate, terminalStatus: 'completed' }, 200, [delivered], false,
+    )).toBe(false);
+  });
+});
+
+describe('mixed turn-identity rolling-upgrade fallback', () => {
+  const finalText = 'Answer already sent during this bounded turn.';
+  const marker: BridgeSendMarker = {
+    sentAtMs: 150,
+    sessionId: 'session-source',
+    turnId: 'turn-source',
+    dispatchAttempt: 4,
+    deliveryKind: 'current_session_send',
+    responseKind: 'final',
+    contentLength: finalText.length,
+    previewText: finalText,
+  };
+
+  it('uses the bounded window when the gate has no turnId but the marker does', () => {
+    expect(shouldSuppressBridgeEmit(
+      { chatId: 'oc_source', rootMessageId: 'om_source_root', markTimeMs: 100,
+        isLocal: false, finalText },
+      200,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
+  it.each([
+    ['wrong session', { sessionId: 'session-other' }],
+    ['wrong turn', { turnId: 'turn-other' }],
+    ['old attempt', { dispatchAttempt: 3 }],
+  ] as const)('does not widen exact matching for %s', (_label, override) => {
+    const exactGate = bridgeGateInputForTurn(
+      'session-source',
+      { turnId: 'turn-source', dispatchAttempt: 4 },
+      { markTimeMs: 100, isLocal: false, finalText },
+      'oc_source',
+      'om_source_root',
+    );
+    expect(shouldSuppressBridgeEmit(exactGate, 200, [{ ...marker, ...override }], false)).toBe(false);
+  });
+});
+
+describe('worker production gate wiring', () => {
+  // 源码结构护栏(K3)：三个 gate caller 都在 worker.ts 闭包内，没有可导出的行为
+  // seam。门控行为单测无法证明真实 caller 传了 init chat/root；实测删掉任一参数时
+  // 纯门控测试仍会全绿。因此这里仅钉接线不变量：三处必须经统一投影，且 chatId 与
+  // rootMessageId 缺一不可。删除 root 判据由上面的 same-chat other-root 用例精确杀死。
+  it('projects identity plus owning chat/root at all three worker call sites', () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const functionBody = (label: string): string => {
+      const start = source.indexOf(label);
+      expect(start, label).toBeGreaterThan(-1);
+      const rest = source.slice(start + 1);
+      const next = rest.search(/\n(?:async )?function /);
+      return source.slice(start, next < 0 ? source.length : start + 1 + next);
+    };
+
+    for (const label of [
+      'function emitReadyTurns(',
+      'function emitReadyCodexTurns(',
+      'async function handleTrustedCodexAppMarker(',
+    ] as const) {
+      const body = functionBody(label);
+      expect(body, label).toContain('bridgeGateInputForTurn(');
+      expect(body, label).toContain('lastInitConfig?.chatId');
+      expect(body, label).toContain('lastInitConfig?.rootMessageId');
+    }
   });
 });
 
@@ -1387,6 +1520,52 @@ describe('shouldSuppressStructuredFallback', () => {
       expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, mode, OPT_IN)).toBe(true);
       // Notification suppression must not turn an execution failure into success.
       expect(exactTurn.terminalStatus).toBe('failed');
+    });
+
+    it.each([
+      ['cross-chat final detour', { targetChatId: 'oc_other' }],
+      ['same-chat other-root final detour', {
+        targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
+      }],
+    ] as const)('keeps the failed notice visible for a %s even when enabled', (_label, routing) => {
+      const routedTurn = {
+        ...exactTurn,
+        sessionId: 'session-source',
+        chatId: 'oc_source',
+        rootMessageId: 'om_source_root',
+      };
+      const routedMarker: BridgeSendMarker = {
+        ...delivered,
+        sessionId: 'session-source',
+        deliveryKind: 'detoured_send',
+        ...routing,
+      };
+      expect(shouldSuppressStructuredFallback(
+        'failed', routedTurn, 200, [routedMarker], false, 'send', OPT_IN,
+      )).toBe(false);
+      // Default-off behavior remains unchanged regardless of destination.
+      expect(shouldSuppressStructuredFallback(
+        'failed', routedTurn, 200, [routedMarker], false, 'send', false,
+      )).toBe(false);
+    });
+
+    it('still suppresses the failed notice after a final delivered to this exact thread', () => {
+      const routedTurn = {
+        ...exactTurn,
+        sessionId: 'session-source',
+        chatId: 'oc_source',
+        rootMessageId: 'om_source_root',
+      };
+      const sameThread: BridgeSendMarker = {
+        ...delivered,
+        sessionId: 'session-source',
+        deliveryKind: 'detoured_send',
+        targetChatId: 'oc_source',
+        targetRootMessageId: 'om_source_root',
+      };
+      expect(shouldSuppressStructuredFallback(
+        'failed', routedTurn, 200, [sameThread], false, 'send', OPT_IN,
+      )).toBe(true);
     });
 
     it('supports ordinary turns and managed final cards, without requiring body text', () => {

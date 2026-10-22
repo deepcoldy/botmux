@@ -6906,13 +6906,11 @@ function deliverRemoteTurnFinal(
   // the real flag keeps this call identical in shape to the other gate callers.
   const adoptMode = lastInitConfig?.adoptMode === true;
   const markers = adoptMode ? [] : readSendMarkers();
-  const gateInput = {
-    turnId,
-    dispatchAttempt,
+  const gateInput = bridgeGateInputForTurn(sessionId, { turnId, dispatchAttempt }, {
     markTimeMs: mark?.markTimeMs,
     isLocal: false,
     finalText: text,
-  };
+  }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
   notifyExplicitRepliesObserved(
     turnId,
     attributableExplicitReplyMarkersForTurnWindow(turnId, gateInput, undefined, markers, adoptMode),
@@ -8446,7 +8444,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       isScheduled: turn.isScheduled,
       finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync(),
-    });
+    }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
@@ -10644,17 +10642,14 @@ function emitReadyCodexTurns(): void {
       || (sharedAppServerBridge && turn.isLocal === true && !zeroPromptTerminalSync());
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    const gateInput = {
-      sessionId,
-      turnId: turn.turnId,
-      dispatchAttempt: turn.dispatchAttempt,
+    const gateInput = bridgeGateInputForTurn(sessionId, turn, {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       forwardLocalFinal: zeroPromptTerminalSync(),
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
       terminalErrorCode: turn.terminalErrorCode,
-    };
+    }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
     // The rate-limit skip is narrowed to CLIs with a dedicated structured
     // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
     // generic failed fallback would post nothing at all.
@@ -13814,7 +13809,7 @@ async function handleTrustedCodexAppMarker(
         markTimeMs: startedAtMs,
         isLocal: false,
         finalText: finalContent,
-      });
+      }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
       notifyExplicitRepliesObserved(
         turnId,
         attributableExplicitReplyMarkersForTurnWindow(
