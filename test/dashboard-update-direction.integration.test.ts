@@ -24,6 +24,7 @@ describe('dashboard implicit binary updates', () => {
         import { createHash } from 'node:crypto';
         import { loopbackFetch } from './src/core/loopback-fetch.js';
         import { loadOrCreatePersistedToken } from './src/dashboard/auth.js';
+        import { updateAndRestartBotmux } from './src/dashboard/web/update-action.js';
         const botmuxDir = join(homedir(), '.botmux');
         const target = join(botmuxDir, 'candidate');
         writeFileSync(target, 'CURRENT');
@@ -72,6 +73,16 @@ describe('dashboard implicit binary updates', () => {
         };
         const fallback = await request('/api/update/status?refresh=1');
         const older = await request('/api/update/run', 'POST');
+        const updatePaths = [];
+        const updatePhases = [];
+        const clientSkipped = await updateAndRestartBotmux(async (path, init) => {
+          updatePaths.push(path);
+          if (path === '/api/update/restart') throw new Error('skipped update must not request restart');
+          return loopbackFetch('http://127.0.0.1:' + port + path, {
+            ...init, headers: { ...init?.headers, cookie: 'botmux_dashboard_token=' + token },
+            signal: AbortSignal.timeout(5_000),
+          });
+        }, phase => updatePhases.push(phase));
         version = '3.48.0';
         await request('/api/update/status?refresh=1');
         const equal = await request('/api/update/run', 'POST');
@@ -89,6 +100,7 @@ describe('dashboard implicit binary updates', () => {
         const newer = await request('/api/update/run', 'POST');
         console.log('UPDATE_RESULTS=' + JSON.stringify({
           fallback, older, equal, unchanged, skippedDownloads, retriedAfterMinute,
+          clientSkipped, updatePaths, updatePhases,
           publicStatus, newer, downloads, installed: readFileSync(target).equals(payload),
         }));
         process.exit(0);
@@ -107,6 +119,8 @@ describe('dashboard implicit binary updates', () => {
         older: { status: 200, body: { ok: true, skipped: 'already_latest', newVersion: '3.48.0', changed: false, restartRequired: false } },
         equal: { status: 200, body: { ok: true, skipped: 'already_latest', changed: false, restartRequired: false } },
         unchanged: true, skippedDownloads: 0, retriedAfterMinute: true,
+        clientSkipped: { oldVersion: '3.48.0', newVersion: '3.48.0', changed: false, restarted: false },
+        updatePaths: ['/api/update/run'], updatePhases: ['updating'],
         publicStatus: { status: 200, body: { latest: '3.49.0', latestSource: 'public', behind: true } },
         newer: { status: 200, body: { ok: true, newVersion: '3.49.0', changed: true, restartRequired: true, source: 'github-release' } },
         downloads: 1, installed: true,
