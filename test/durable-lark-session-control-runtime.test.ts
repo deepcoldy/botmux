@@ -77,6 +77,37 @@ function control(action: 'close' | 'resume' = 'close') {
   return { data, claim, control: parseDurableLarkSessionControlClaim(claim) };
 }
 
+function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
+  const data = {
+    event_id: `evt_display_${target}`,
+    action: {
+      value: {
+        action: 'toggle_display',
+        target_display_mode: target,
+        session_id: 'session-1',
+        root_id: 'om_root',
+      },
+    },
+    operator: { open_id: 'ou_viewer' },
+    context: { open_message_id: 'om_card' },
+  };
+  const event = durableLarkSessionControlEvent({
+    larkAppId: 'cli_test',
+    eventId: durableLarkSessionControlEventId('cli_test', `evt_display_${target}`),
+    partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+    data,
+    now: 2,
+  });
+  const claim: InboxClaim = {
+    event,
+    workerId: 'control-worker',
+    claimEpoch: 1,
+    claimUntil: 60_000,
+    attempts: 1,
+  };
+  return { data, claim, control: parseDurableLarkSessionControlClaim(claim) };
+}
+
 function directControl(source: 'lark-command' | 'trusted-host', action: 'close' | 'resume' = 'close') {
   const event = durableDirectSessionControlEvent({
     source,
@@ -339,6 +370,72 @@ describe('durable Lark session control runtime', () => {
 
     expect(await runtime.authorizeBeforeAck(control().data)).toBe(true);
     expect(runtime.ownedPartitionKeys()).toEqual([]);
+    await facade.stop();
+    await store.close();
+  });
+
+  it('routes an idempotent display target to the live owner and durably patches the card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-display-owner-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const persisted = session();
+    const active = {
+      session: persisted,
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      streamCardId: 'om_card',
+      displayMode: 'hidden',
+    } as DaemonSession;
+    await admitDurableLarkSession({ facade, message: message(), session: persisted });
+    const handlePresentationControl = vi.fn(async () => {
+      active.displayMode = 'screenshot';
+      return { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: 'screen' }] };
+    });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [active],
+      findActiveSession: () => active,
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: async () => ({ ok: false, error: 'not called' }),
+      resumeSession: async () => ({ ok: false, error: 'not called' }),
+      handlePresentationControl,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: ds => JSON.stringify({ mode: ds.displayMode }),
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+    const input = displayControl();
+    expect(await runtime.authorizeBeforeAck(input.data)).toBe(true);
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(handlePresentationControl).toHaveBeenCalledOnce();
+    expect(active.displayMode).toBe('screenshot');
+    const canonical = parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!);
+    expect(canonical.controls.at(-1)).toMatchObject({
+      action: 'toggle_display',
+      result: { status: 'active', displayMode: 'screenshot' },
+    });
+    const digest = createHash('sha256').update(input.control.operationId).digest('hex');
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        target: { kind: 'update', messageId: 'om_card' },
+        msgType: 'interactive',
+      });
     await facade.stop();
     await store.close();
   });

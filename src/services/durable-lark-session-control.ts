@@ -7,7 +7,11 @@ import {
 
 export const DURABLE_LARK_SESSION_CONTROL_VERSION = 1 as const;
 
-export type DurableLarkSessionControlAction = 'close' | 'resume';
+export type DurableLarkSessionControlAction = 'close' | 'resume' | 'toggle_display';
+export type DurableLifecycleSessionControlAction = Extract<
+  DurableLarkSessionControlAction,
+  'close' | 'resume'
+>;
 export type DurableSessionControlSource = 'lark-card' | 'lark-command' | 'trusted-host';
 
 export interface DurableLarkSessionControlEnvelope {
@@ -38,7 +42,7 @@ interface DurableDirectSessionControlEnvelope {
   source: Exclude<DurableSessionControlSource, 'lark-card'>;
   larkAppId: string;
   operationId: string;
-  action: DurableLarkSessionControlAction;
+  action: DurableLifecycleSessionControlAction;
   sessionId: string;
   rootId: string;
   operatorOpenId: string;
@@ -87,8 +91,13 @@ function rawCardFields(rawValue: unknown): {
     512,
   );
   const actionType = value?.action ?? action?.name ?? action?.option ?? action?.tag;
-  if (actionType !== 'close' && actionType !== 'resume') {
-    throw new Error('durable Lark session control action must be close or resume');
+  if (actionType !== 'close' && actionType !== 'resume' && actionType !== 'toggle_display') {
+    throw new Error('durable Lark session control action is unsupported');
+  }
+  if (actionType === 'toggle_display'
+      && value?.target_display_mode !== 'hidden'
+      && value?.target_display_mode !== 'screenshot') {
+    throw new Error('durable display control requires an idempotent target mode');
   }
   const sessionId = bounded(value?.session_id, 'Lark card sessionId', 256);
   const rootId = bounded(value?.root_id, 'Lark card rootId', 512);
@@ -177,7 +186,7 @@ export function durableDirectSessionControlEvent(input: {
   source: Exclude<DurableSessionControlSource, 'lark-card'>;
   larkAppId: string;
   operationId: string;
-  action: DurableLarkSessionControlAction;
+  action: DurableLifecycleSessionControlAction;
   sessionId: string;
   rootId: string;
   operatorOpenId?: string;

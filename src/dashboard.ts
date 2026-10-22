@@ -191,6 +191,10 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
 import {
+  createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
+} from './services/durable-terminal-route.js';
+import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
 } from './services/durable-config-mutation.js';
@@ -862,10 +866,33 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+// Primary replicas need one shared route registry for Pod-local worker
+// terminals. Initialize it before the `/s/*` front proxy so a request landing
+// on a non-owner backend can resolve the current owner Dashboard NodePort.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config/route provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const terminalRouteInstanceId = (process.env.MY_POD_NAME || process.env.HOSTNAME || `dashboard-${process.pid}`).trim();
+const terminalRouteRegistry = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableTerminalRouteRegistry({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `terminal-route-dashboard:${terminalRouteInstanceId}:${process.pid}`,
+    })
+  : undefined;
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => (
     aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
   ),
+  resolveRemoteTarget: async sessionId => {
+    if (!terminalRouteRegistry) return undefined;
+    const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
+    return route ? { host: route.host, port: route.port } : undefined;
+  },
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -880,6 +907,44 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
 });
+
+const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
+const terminalRoutePort = durableTerminalRoutePort(process.env);
+let terminalRoutePublishInFlight: Promise<void> | undefined;
+async function publishLiveTerminalRoutes(): Promise<void> {
+  if (!terminalRouteRegistry || !terminalRouteHost || terminalRoutePort === undefined) return;
+  await Promise.all(aggregator.getSessions().map(async row => {
+    if (row.status === 'closed'
+        || row.status === 'dormant'
+        || typeof row.larkAppId !== 'string'
+        || typeof row.sessionId !== 'string'
+        || typeof row.webPort !== 'number'
+        || typeof row.proxyPort !== 'number') return;
+    const result = await terminalRouteRegistry.publish({
+      larkAppId: row.larkAppId,
+      sessionId: row.sessionId,
+      ownerInstanceId: terminalRouteInstanceId,
+      host: terminalRouteHost,
+      port: terminalRoutePort,
+    });
+    if (result.kind !== 'published' && result.kind !== 'occupied') {
+      logger.warn(`[terminal-route] publish ${row.sessionId} failed: ${result.kind}`);
+    }
+  }));
+}
+function scheduleTerminalRoutePublish(): void {
+  if (terminalRoutePublishInFlight) return;
+  terminalRoutePublishInFlight = publishLiveTerminalRoutes()
+    .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => { terminalRoutePublishInFlight = undefined; });
+}
+aggregator.on(ev => {
+  if (ev.type === 'session.spawned' || ev.type === 'session.update') {
+    scheduleTerminalRoutePublish();
+  }
+});
+const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
+terminalRouteHeartbeat.unref?.();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
     const daemon = registry.getByAppId(appId);
@@ -1811,14 +1876,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
-const dashboardCoordinationRuntime = coordinationModeIsPrimary()
-  ? await initializeDurableCoordinationRuntime({
-      ...process.env,
-      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
-      // narrow config-CAS provider must not race those reporters on one path.
-      BOTMUX_COORDINATION_HEALTH_FILE: '',
-    }, { allowPrimary: true })
-  : undefined;
 const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
   ? createDurableConfigCoordinator({
       store: dashboardCoordinationRuntime.store,

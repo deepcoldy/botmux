@@ -2424,7 +2424,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     },
   );
 
-  it.each(['close', 'resume'].flatMap(action =>
+  it.each(['close', 'resume', 'toggle_display'].flatMap(action =>
     ['object', 'string', 'behaviors', 'envelope', 'envelope-behaviors'].map(shape => [action, shape]),
   ))(
     'persists a stable %s interaction in %s payloads before ACK when a control consumer is wired',
@@ -2447,6 +2447,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
         action,
         session_id: 'session-primary',
         root_id: 'om_primary_root',
+        ...(action === 'toggle_display' ? { target_display_mode: 'screenshot' } : {}),
       };
       const wrapped = shape === 'envelope' || shape === 'envelope-behaviors';
       const innerShape = shape === 'envelope' ? 'string' : shape;

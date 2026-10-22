@@ -150,7 +150,7 @@ function parseControl(
     throw new Error(`durable primary Session ${recordSessionKey} has an invalid control commit`);
   }
   const action = raw.action;
-  if (action !== 'close' && action !== 'resume') {
+  if (action !== 'close' && action !== 'resume' && action !== 'toggle_display') {
     throw new Error(`durable primary Session ${recordSessionKey} has an invalid control action`);
   }
   const result = raw.result;

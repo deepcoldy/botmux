@@ -1039,7 +1039,14 @@ export function buildStreamingCard(
     headerActions.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
-      { action: 'toggle_display', ...actionBase },
+      {
+        action: 'toggle_display',
+        // Make the user's intent idempotent before the callback enters the
+        // primary multi-replica control lane. A retry after owner failover must
+        // keep applying the same visible mode instead of toggling back.
+        target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+        ...actionBase,
+      },
     ));
     if (displayMode !== 'hidden') {
       headerActions.push(callbackButton(
