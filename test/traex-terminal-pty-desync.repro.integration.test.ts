@@ -105,7 +105,12 @@ function readSubmissions(path: string): Array<{ pid: number; text: string }> {
 }
 
 describe('TraeX transcript-terminal / PTY-readiness desync reproduction', () => {
-  it.each(['intentional restart', 'CLI crash'] as const)('accepts healthy type-ahead and never replays quarantined input after %s', async restartKind => {
+  it.each([
+    { restartKind: 'intentional restart', autoReselect: undefined },
+    { restartKind: 'CLI crash', autoReselect: undefined },
+    { restartKind: 'intentional restart', autoReselect: false },
+    { restartKind: 'intentional restart', autoReselect: true },
+  ] as const)('accepts healthy type-ahead and never replays quarantined input after $restartKind (auto=$autoReselect)', async ({ restartKind, autoReselect }) => {
     const botmuxSessionId = randomUUID();
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-desync-repro-'));
     tempDirs.add(root);
@@ -242,6 +247,8 @@ setInterval(() => {
       rootMessageId: 'om_root',
       workingDir: dataDir,
       cliId: 'traex',
+      ...(autoReselect !== undefined ? { traexAutoModel: { enabled: true,
+        models: ['GPT-6-Astra', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: autoReselect } } : {}),
       cliPathOverride: fakeTraex,
       cliSessionId: nativeSessionId,
       resume: true,

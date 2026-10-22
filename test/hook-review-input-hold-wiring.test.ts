@@ -35,7 +35,7 @@ describe('Hook review input hold', () => {
         lastInitConfig: { cliId: 'codex', disableCliBypass },
         backendScreenEvidenceIsAuthoritativeForMutation: () => true,
         codexAppRuntimeTypeAheadReady: () => false,
-        traexAutoModelRuntimeEligible: () => false,
+        traexAutoModelInputHold: () => false,
         isTypeAheadBlockedByBypass: (...args: unknown[]) => { bypassArgs.push(args); return `blocked:${String(args[1])}`; },
         resolvePtyInputPolicy: (...args: unknown[]) => { policyArgs.push(args); return 'policy'; },
       });
@@ -45,18 +45,18 @@ describe('Hook review input hold', () => {
     }
   });
 
-  it.each([true, false])('serializes PTY writes only when Auto model switching is eligible (%s)', eligible => {
+  it.each([true, false])('serializes PTY writes only while Auto holds a capacity transition (%s)', hold => {
     const runtimePtyInputPolicy = loadWorkerFunction<() => unknown>('runtimePtyInputPolicy', {
       cliAdapter: { id: 'traex' },
       lastInitConfig: { cliId: 'traex' },
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
       codexAppRuntimeTypeAheadReady: () => false,
-      traexAutoModelRuntimeEligible: () => eligible,
+      traexAutoModelInputHold: () => hold,
       isTypeAheadBlockedByBypass: () => false,
       resolvePtyInputPolicy: () => ({ supportsTypeAhead: true, allowBackToBackWrites: true, preferPromptReady: true }),
     });
     expect(runtimePtyInputPolicy()).toEqual({
-      supportsTypeAhead: !eligible, allowBackToBackWrites: !eligible, preferPromptReady: true,
+      supportsTypeAhead: !hold, allowBackToBackWrites: !hold, preferPromptReady: true,
     });
   });
 });

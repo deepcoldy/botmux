@@ -4500,8 +4500,8 @@ function observeTraexAutoModelCapacity(screen: string): void {
   }
 }
 
-/** Serialize turns while auto is active. The previous ask finishes under its
- * own model/identity; an opt-in new-turn reset starts on the preferred model. */
+/** A busy follow-up steers the current model. Only an idle, independent turn
+ * may opt into a preferred-model reset. Capacity rotation retains its queue. */
 function resetTraexAutoModelBeforePendingTurn(): boolean {
   const controller = traexAutoModelController;
   const head = pendingMessages[0];
@@ -4509,7 +4509,7 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
     || head.dispatchAttempt !== undefined || head.traexAutoModelRecovery
     || controller.currentTurnId() === head.turnId) return false;
   if (traexAutoModelSwitching) return true;
-  if (!isPromptReady) return true;
+  if (!isPromptReady) return traexAutoModelInputHold();
   if (!controller.config.reselectPerTurn || controller.currentModelIndex() === 0) return false;
   // The first-ever turn cannot have fallen back without an exact native id.
   if (!lastInitConfig?.cliSessionId) return true;
@@ -16502,6 +16502,16 @@ function codexAppRuntimeTypeAheadReady(): boolean {
     && codexAppInputReady;
 }
 
+/** During capacity rotation, keep unsent follow-ups outside the native queue.
+ * A healthy running model retains TraeX's normal type-ahead contract. */
+function traexAutoModelInputHold(): boolean {
+  return traexAutoModelRuntimeEligible() && (
+    traexAutoModelSwitching
+    || (!isPromptReady && !!backend
+      && traexCapacityQueueVisible(captureBackendScreen(backend).trimEnd()))
+  );
+}
+
 function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
   const policy = resolvePtyInputPolicy(
     cliAdapter ?? {},
@@ -16509,7 +16519,7 @@ function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
     codexAppRuntimeTypeAheadReady(),
     isTypeAheadBlockedByBypass(cliAdapter ?? { id: lastInitConfig?.cliId }, lastInitConfig?.disableCliBypass),
   );
-  return traexAutoModelRuntimeEligible()
+  return traexAutoModelInputHold()
     ? { ...policy, supportsTypeAhead: false, allowBackToBackWrites: false }
     : policy;
 }
@@ -16859,25 +16869,6 @@ async function flushPending(): Promise<void> {
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
-        if (item.turnId && item.dispatchAttempt === undefined) {
-          if (!item.traexAutoModelRecovery) {
-            traexAutoModelTurnReplayForbidden = item.noReplay === true;
-          }
-          const action = traexAutoModelController?.beginTurn(item.turnId);
-          // A fallback-to-core transition must be handled before dequeueing.
-          // Reaching it here means a future input path bypassed the shared
-          // pre-flush gate; fail closed instead of running the new turn on the
-          // stale fallback model.
-          if (action?.kind === 'switch') {
-            throw new Error(
-              `TraeX auto-model reset reached the write edge unexpectedly `
-              + `(${action.fromModel} -> ${action.toModel})`,
-            );
-          }
-          if (traexAutoModelRuntimeEligible()) {
-            publishActiveRuntime({ model: lastInitConfig?.model, reasoningEffort: lastInitConfig?.reasoningEffort });
-          }
-        }
         syncQueuedTurnsFromMarkerDisk();
 
         let currentTurnFinalDelivered = Boolean(
@@ -16897,6 +16888,34 @@ async function flushPending(): Promise<void> {
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
+
+        if (item.turnId && item.dispatchAttempt === undefined) {
+          // A live correction belongs to the running model, even when idle
+          // turns opt into reselection. Once multiple native inputs coexist,
+          // exact resume no longer proves which correction has been consumed;
+          // suppress capacity restarts until a fresh independent input.
+          if (isTypeAhead && !item.traexAutoModelRecovery) {
+            traexAutoModelTurnReplayForbidden = true;
+          } else {
+            if (!item.traexAutoModelRecovery) {
+              traexAutoModelTurnReplayForbidden = item.noReplay === true;
+            }
+            const action = traexAutoModelController?.beginTurn(item.turnId);
+            // A fallback-to-core transition must be handled before dequeueing.
+            // Reaching it here means a future input path bypassed the shared
+            // pre-flush gate; fail closed instead of running the new turn on the
+            // stale fallback model.
+            if (action?.kind === 'switch') {
+              throw new Error(
+                `TraeX auto-model reset reached the write edge unexpectedly `
+                + `(${action.fromModel} -> ${action.toModel})`,
+              );
+            }
+          }
+          if (traexAutoModelRuntimeEligible()) {
+            publishActiveRuntime({ model: lastInitConfig?.model, reasoningEffort: lastInitConfig?.reasoningEffort });
+          }
+        }
 
         if (isTypeAhead && item.turnId) {
           log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);

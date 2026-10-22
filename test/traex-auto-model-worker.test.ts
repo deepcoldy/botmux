@@ -114,3 +114,38 @@ describe('auto-model Worker admission and original-input retirement', () => {
     expect(h.scope.lastInitConfig.modelBackendVariant).toBeUndefined();
   });
 });
+
+
+describe('Auto live follow-up input policy', () => {
+  it.each([
+    { eligible: true, switching: false, ready: false, screen: 'Working…', hold: false },
+    { eligible: true, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' + '\n'.repeat(50), hold: true },
+    { eligible: true, switching: true, ready: true, screen: '', hold: true },
+    { eligible: true, switching: false, ready: true, screen: '◆ Queued for capacity (20s • esc to interrupt)' , hold: false },
+    { eligible: false, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' , hold: false },
+  ])('holds only an active Auto capacity transition (%j)', async ({ eligible, switching, ready, screen, hold }) => {
+    const { traexCapacityQueueVisible } = await import('../src/adapters/cli/traex.js');
+    const scope = { traexAutoModelRuntimeEligible: () => eligible,
+      traexAutoModelSwitching: switching, isPromptReady: ready, backend: {},
+      captureBackendScreen: () => screen, traexCapacityQueueVisible };
+    expect(loadWorkerFunction<() => boolean>('traexAutoModelInputHold', scope)()).toBe(hold);
+  });
+
+  it.each([false, true])('lets a running follow-up keep its current model (reselect=%s)', reselectPerTurn => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'],
+      queueTimeoutMs: 5_000, reselectPerTurn });
+    controller.beginTurn('turn');
+    controller.commitSwitch(action);
+    const scope = { traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
+      pendingMessages: [{ turnId: 'followup' }], traexAutoModelSwitching: false,
+      isPromptReady: false, traexAutoModelInputHold: () => false,
+      lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
+    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    expect(reset()).toBe(false);
+    expect(controller.currentModel()).toBe('backup');
+    expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    scope.isPromptReady = true;
+    expect(reset()).toBe(reselectPerTurn);
+    expect(scope.executeTraexAutoModelSwitch).toHaveBeenCalledTimes(reselectPerTurn ? 1 : 0);
+  });
+});
