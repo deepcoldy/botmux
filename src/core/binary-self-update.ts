@@ -323,7 +323,7 @@ export async function replaceStandaloneBinary(
   const fetchStream = deps.fetchStream
     ?? (async (url: string) => await getReleaseStream(url, proxy, SELF_UPDATE_UA));
   const fetchRegistryStream = deps.fetchRegistryStream
-    ?? (async (url: string) => await getReleaseStream(url, proxy, SELF_UPDATE_UA));
+    ?? (async (url: string) => await getReleaseStream(url, proxy, SELF_UPDATE_UA, 5, { respectNoProxy: true }));
   // Existing tests inject the GitHub stream. Treat that as a complete transport
   // override unless they explicitly opt into the registry-package path too.
   const resolveRegistryArtifact = deps.resolveRegistryArtifact

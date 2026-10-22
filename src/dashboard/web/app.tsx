@@ -972,6 +972,16 @@ function TopbarVersionControl(props: {
     try {
       const result = await updateAndRestartBotmux(fetch, setPhase);
       stopStatusPolling();
+      if (!result.changed && !result.restarted && !result.restartError) {
+        // The server skipped an implicit update. Refresh the stale badge and
+        // return to idle instead of reporting a failed restart or reconnecting.
+        actionInFlightRef.current = false;
+        setPhase('idle');
+        setProgress(0);
+        setBinaryStatus(null);
+        setRefreshFailed(!await props.onRefresh());
+        return;
+      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.

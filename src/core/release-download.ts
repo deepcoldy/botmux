@@ -31,6 +31,29 @@ export function resolveHttpProxy(): string | undefined {
     || undefined;
 }
 
+/** Apply proxy-from-env's NO_PROXY matching rules to an already selected proxy.
+ * Unlike getProxyForUrl, this also honours exclusions for the explicit
+ * httpProxy config / caller-supplied proxy, without mutating process.env. */
+export function proxyForUrl(rawUrl: string, proxy: string | undefined): string | undefined {
+  if (!proxy) return undefined;
+  const exclusions = (process.env.npm_config_no_proxy || process.env.NPM_CONFIG_NO_PROXY
+    || process.env.no_proxy || process.env.NO_PROXY || '').toLowerCase();
+  if (!exclusions) return proxy;
+  if (exclusions === '*') return undefined;
+  const target = new URL(rawUrl);
+  const hostname = target.hostname.toLowerCase();
+  const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  const bypass = exclusions.split(/[,\s]/).some(entry => {
+    if (!entry) return false;
+    const withPort = entry.match(/^(.+):(\d+)$/);
+    const host = withPort ? withPort[1] : entry;
+    if (withPort && Number(withPort[2]) !== port) return false;
+    if (!/^[.*]/.test(host)) return hostname === host;
+    return hostname.endsWith(host.startsWith('*') ? host.slice(1) : host);
+  });
+  return bypass ? undefined : proxy;
+}
+
 /**
  * GET a URL and resolve with the 200 response stream, following redirects and
  * optionally tunnelling through an HTTP proxy.
@@ -43,7 +66,7 @@ export function getReleaseStream(
   proxy: string | undefined,
   userAgent: string,
   redirectsLeft = 5,
-  options: { signal?: AbortSignal; headers?: Record<string, string> } = {},
+  options: { signal?: AbortSignal; headers?: Record<string, string>; respectNoProxy?: boolean } = {},
 ): Promise<IncomingMessage> {
   return new Promise((resolve, reject) => {
     let target: URL;
@@ -64,9 +87,12 @@ export function getReleaseStream(
       resolve(res);
     };
 
+    // Re-evaluate exclusions on every redirect target. Keep the original proxy
+    // available so a direct mirror can redirect back to an external CDN.
+    const hopProxy = options.respectNoProxy ? proxyForUrl(rawUrl, proxy) : proxy;
     let p: URL | undefined;
-    if (proxy) {
-      try { p = new URL(proxy); } catch { reject(new Error(`代理地址非法: ${proxy}`)); return; }
+    if (hopProxy) {
+      try { p = new URL(hopProxy); } catch { reject(new Error(`代理地址非法: ${hopProxy}`)); return; }
     }
     const proxyAuth = (): Record<string, string> => p?.username
       ? { 'proxy-authorization': `Basic ${Buffer.from(`${decodeURIComponent(p.username)}:${decodeURIComponent(p.password)}`).toString('base64')}` }

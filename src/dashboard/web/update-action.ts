@@ -247,6 +247,10 @@ export async function updateAndRestartBotmux(
     restarted: false,
   };
 
+  // An implicit latest update may lose a race with another updater, or resolve
+  // to a stale mirror. The server made no change and queued no restart.
+  if (!targetVersion && update.skipped === true) return result;
+
   onPhase('restarting');
   // The rollback endpoint holds the install lock through restart handoff, so
   // there is deliberately no client-side /restart gap for maintenance to race.
