@@ -306,6 +306,7 @@ function appDeveloperInstructions(args: Args): string {
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
       '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
       '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '用户在本轮结束前看不到中间说明。若本轮要长时间执行或盯盘（例如分阶段发布、等待观察窗口），每完成一个关键阶段或状态有实质变化时用 `botmux send` 推送一条简短进度，不要等到最终回复才汇报；常规短任务仍只用最终回复。',
       '需要用户选择时，原生 `request_user_input` 会桥接为飞书问答卡片并等待答复；也可使用 `botmux ask`。不要通过聊天卡片索取密码等秘密。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       args.browserFamily
@@ -320,6 +321,7 @@ function appDeveloperInstructions(args: Args): string {
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
     'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
     'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'The user cannot see your intermediate commentary until the turn ends. For long-running or monitoring turns (staged rollouts, observation windows), push a brief `botmux send` progress update at each key milestone or material state change instead of waiting for the final answer; short tasks still reply only via the final answer.',
     'Native request_user_input questions are bridged to Lark ask cards and wait for a human answer; botmux ask is also available. Do not request secrets through chat cards.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     args.browserFamily

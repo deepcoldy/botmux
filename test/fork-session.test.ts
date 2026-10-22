@@ -237,6 +237,16 @@ describe('turnStartingCardStatus', () => {
     });
     expect(turnStartingCardStatus(limited, 'grok')).toBe('limited');
   });
+
+  // Repro: a Lark message steered into a RUNNING Codex App turn posts a fresh
+  // status card. Same-turn screen_updates only PATCH on a status edge
+  // (prevStatus !== lastScreenStatus), and the worker is already `working`, so
+  // working→working never edges and a card posted as `starting` stays at
+  // 「启动中…」 for the rest of the turn.
+  it('starts a steered Codex App turn as working when the worker is already working', () => {
+    const steered = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'working' });
+    expect(turnStartingCardStatus(steered, 'codex-app')).toBe('working');
+  });
 });
 
 describe('forkSession — frozen launch posture inheritance', () => {

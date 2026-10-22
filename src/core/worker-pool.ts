@@ -4969,6 +4969,9 @@ export async function __testOnly_waitForPinStreamingCardIdle(): Promise<void> {
 export function turnStartingCardStatus(ds: DaemonSession, effectiveCliId: CliId): 'limited' | 'working' | 'starting' {
   if (ds.usageLimit) return 'limited';
   if (effectiveCliId === 'grok' && workerHasInitialized(ds)) return 'working';
+  // A Codex App message steered into the running turn gets no working→working
+  // screen_update edge, so a `starting` card would never be PATCHed.
+  if (isCodexAppCliId(effectiveCliId) && workerHasInitialized(ds) && ds.lastScreenStatus === 'working') return 'working';
   return 'starting';
 }
 
