@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,9 +31,9 @@ async function listen(server: Server): Promise<string> {
 }
 
 describe('registry metadata proxy transport', () => {
-  it.each(['NO_PROXY', 'no_proxy', 'config'])('bypasses a rejecting proxy for an internal registry using %s', async (mode) => {
+  it.each(['NO_PROXY', 'no_proxy', 'config', 'env'])('routes metadata and tarball correctly with %s proxy settings', async (mode) => {
     const requests: string[] = [];
-    let proxyHits = 0;
+    const proxyRequests: string[] = [];
     const archive = Buffer.from('test platform archive');
     const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
     const registry = await listen(createServer((req, res) => {
@@ -44,22 +44,36 @@ describe('registry metadata proxy transport', () => {
         dist: { tarball: `${registry}/pkg.tgz`, integrity },
       }));
     }));
-    const proxy = await listen(createServer((_req, res) => {
-      proxyHits += 1;
+    const proxy = await listen(createServer((req, res) => {
+      proxyRequests.push(req.url!);
+      if (mode === 'env') {
+        const forwarded = httpRequest(req.url!, reply => {
+          res.writeHead(reply.statusCode ?? 500, reply.headers);
+          reply.pipe(res);
+        });
+        forwarded.on('error', () => { res.writeHead(502); res.end(); });
+        forwarded.end();
+        return;
+      }
       res.writeHead(403); res.end('internal hosts are forbidden');
     }));
     const dir = mkdtempSync(join(tmpdir(), 'botmux-no-proxy-'));
     const configPath = join(dir, 'global.json');
     writeFileSync(configPath, JSON.stringify(mode === 'config' ? { httpProxy: proxy } : {}));
     try {
-      const env = { ...process.env, BOTMUX_GLOBAL_CONFIG_FILE: configPath,
+      const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_GLOBAL_CONFIG_FILE: configPath };
+      for (const key of Object.keys(env)) {
+        if (/proxy$/i.test(key)) delete env[key];
+      }
+      if (mode !== 'config') Object.assign(env, {
         HTTPS_PROXY: proxy, HTTP_PROXY: proxy,
-        NO_PROXY: mode === 'no_proxy' ? 'unmatched.invalid' : '127.0.0.1',
+        NO_PROXY: mode === 'env' ? '' : mode === 'no_proxy' ? 'unmatched.invalid' : '127.0.0.1',
         no_proxy: mode === 'no_proxy' ? '127.0.0.1' : '',
-      };
+      });
       const child = spawnTsEvalWithRepoImports(`
         import { fetchLatestVersion, fetchConfiguredPackageArtifact } from './src/core/update-check.js';
         import { replaceStandaloneBinary } from './src/core/binary-self-update.js';
+        import { getReleaseStream, resolveHttpProxy } from './src/core/release-download.js';
         import { join } from 'node:path';
         import { writeFileSync, readFileSync } from 'node:fs';
         const opts = { registry: ${JSON.stringify(registry)}, timeoutMs: 2000 };
@@ -76,7 +90,15 @@ describe('registry metadata proxy transport', () => {
           },
           probeBinary: () => ({ status: 0, stdout: '3.48.0', stderr: '' }),
         });
-        console.log(JSON.stringify({ version, artifact, source: update.source, bytes: readFileSync(target).length }));
+        let githubError = '';
+        if (${mode === 'config'}) {
+          try {
+            await getReleaseStream('http://github.invalid/release', resolveHttpProxy(), 'botmux', 5, {
+              signal: AbortSignal.timeout(2000),
+            });
+          } catch (error) { githubError = error.message; }
+        }
+        console.log(JSON.stringify({ version, artifact, source: update.source, bytes: readFileSync(target).length, githubError }));
       `, { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = ''; let stderr = '';
       child.stdout!.on('data', data => { stdout += data; });
@@ -87,7 +109,9 @@ describe('registry metadata proxy transport', () => {
       expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
       expect(JSON.parse(stdout)).toMatchObject({ version: '3.48.0', artifact: { version: '3.48.0', integrity },
         source: 'registry-package', bytes: 1_100_000 });
-      expect(proxyHits).toBe(0);
+      expect(JSON.parse(stdout).githubError).toBe(mode === 'config' ? 'HTTP 403' : '');
+      expect(proxyRequests).toEqual(mode === 'config' ? ['http://github.invalid/release'] : mode === 'env'
+        ? [`${registry}/botmux/latest`, `${registry}/botmux-darwin-arm64/3.48.0`, `${registry}/pkg.tgz`] : []);
       expect(requests).toEqual(['/botmux/latest', '/botmux-darwin-arm64/3.48.0', '/pkg.tgz']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

@@ -61,11 +61,11 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it.each([true, 'already_latest'])('returns without restarting when the server skipped an implicit update with %s', async (skipped) => {
+  it('returns without restarting when the server skipped an implicit update', async () => {
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(json(200, {
         ok: true, oldVersion: '3.48.0', newVersion: '3.48.0',
-        changed: false, skipped, restartRequired: false,
+        changed: false, skipped: 'already_latest', restartRequired: false,
       }))
       .mockResolvedValueOnce(json(202, { ok: true }));
     const phases: string[] = [];

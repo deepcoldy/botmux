@@ -22,10 +22,10 @@ import { connect as tlsConnect } from 'node:tls';
 import { Buffer } from 'node:buffer';
 import { readGlobalConfig } from '../global-config.js';
 
-/** Resolve an outbound proxy: explicit config wins, then the standard env vars
- *  (which Node's global fetch ignores — the whole reason we hand-roll this). */
-export function resolveHttpProxy(): string | undefined {
-  return readGlobalConfig().httpProxy
+/** Resolve an outbound proxy: GitHub downloads prefer explicit config, then
+ * standard env vars. Registry requests opt out of the GitHub-only config. */
+export function resolveHttpProxy(options: { includeConfig?: boolean } = {}): string | undefined {
+  return (options.includeConfig !== false ? readGlobalConfig().httpProxy : undefined)
     || process.env.HTTPS_PROXY || process.env.https_proxy
     || process.env.HTTP_PROXY || process.env.http_proxy
     || undefined;

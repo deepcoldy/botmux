@@ -278,7 +278,7 @@ async function fetchRegistryJson(url: string, opts?: FetchOpts): Promise<unknown
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   }
-  const res = await getReleaseStream(url, resolveHttpProxy(), 'botmux', 5, {
+  const res = await getReleaseStream(url, resolveHttpProxy({ includeConfig: false }), 'botmux', 5, {
     signal, headers, respectNoProxy: true,
   });
   const chunks: Buffer[] = [];

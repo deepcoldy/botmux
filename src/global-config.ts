@@ -240,10 +240,11 @@ export interface GlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
-  /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
-   *  binary self-update release asset). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
-   *  so hosts behind a proxy must set this (or the env vars, which we read as a
-   *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
+  /** Optional proxy for GitHub release assets and checksums, preferred over
+   *  HTTP_PROXY/HTTPS_PROXY. Registry metadata and platform-package downloads
+   *  use only environment proxies + NO_PROXY; package-manager installs use
+   *  the manager's own proxy settings. Form: `http://host:port` or
+   *  `http://user:pass@host:port`. */
   httpProxy?: string;
   /** OAuth redirect base for user authorization (/login). When set (e.g.
    *  `http://10.1.2.3:7891`, typically this host's dashboard origin), auth
