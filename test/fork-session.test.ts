@@ -247,6 +247,23 @@ describe('turnStartingCardStatus', () => {
     const steered = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'working' });
     expect(turnStartingCardStatus(steered, 'codex-app')).toBe('working');
   });
+
+  // Unlike Grok (which projects working after init regardless of status),
+  // Codex App must additionally observe `working`: a fresh turn on an
+  // initialized-but-idle worker is a real cold turn and stays `starting` until
+  // its first status edge.
+  it('keeps an initialized but idle Codex App turn on starting', () => {
+    const initializedIdle = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'idle' });
+    expect(turnStartingCardStatus(initializedIdle, 'codex-app')).toBe('starting');
+  });
+
+  // A cached `working` status left by a previous generation must not project
+  // onto a card before the worker has initialized.
+  it('keeps Codex App on starting before worker init even with a cached working status', () => {
+    const coldCachedWorking = makeSourceDs({ cliId: 'codex-app' }, { workerReady: false, lastScreenStatus: 'working' });
+    expect(coldCachedWorking.workerReady).toBe(false);
+    expect(turnStartingCardStatus(coldCachedWorking, 'codex-app')).toBe('starting');
+  });
 });
 
 describe('forkSession — frozen launch posture inheritance', () => {
