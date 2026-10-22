@@ -496,11 +496,13 @@ describe('mixed turn-identity rolling-upgrade fallback', () => {
 });
 
 describe('worker production gate wiring', () => {
-  // 源码结构护栏(K3)：三个 gate caller 都在 worker.ts 闭包内，没有可导出的行为
+  // 源码结构护栏(K3)：四个 gate caller 都在 worker.ts 闭包内，没有可导出的行为
   // seam。门控行为单测无法证明真实 caller 传了 init chat/root；实测删掉任一参数时
-  // 纯门控测试仍会全绿。因此这里仅钉接线不变量：三处必须经统一投影，且 chatId 与
-  // rootMessageId 缺一不可。删除 root 判据由上面的 same-chat other-root 用例精确杀死。
-  it('projects identity plus owning chat/root at all three worker call sites', () => {
+  // 纯门控测试仍会全绿。因此这里仅钉接线不变量：四处必须经统一投影，且 chatId 与
+  // rootMessageId 按顺序缺一不可（两者都是 string|undefined，互换能过 tsc、过
+  // 「两个都在」的存在性断言，却把每次普通发送降级成「不是本话题」=重复发帖）。
+  // 删除 root 判据由上面的 same-chat other-root 用例精确杀死。
+  it('projects identity plus owning chat/root at all four worker call sites', () => {
     const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
     const functionBody = (label: string): string => {
       const start = source.indexOf(label);
@@ -511,14 +513,18 @@ describe('worker production gate wiring', () => {
     };
 
     for (const label of [
+      'function deliverRemoteTurnFinal(',
       'function emitReadyTurns(',
       'function emitReadyCodexTurns(',
       'async function handleTrustedCodexAppMarker(',
     ] as const) {
       const body = functionBody(label);
       expect(body, label).toContain('bridgeGateInputForTurn(');
-      expect(body, label).toContain('lastInitConfig?.chatId');
-      expect(body, label).toContain('lastInitConfig?.rootMessageId');
+      // Ordered: the two routing args are both `string | undefined`, so a swap
+      // still type-checks and still satisfies a presence-only assertion while
+      // silently degrading every plain send to "not this thread" (= duplicate
+      // post). Pin the pair in order.
+      expect(body, label).toContain('lastInitConfig?.chatId, lastInitConfig?.rootMessageId');
     }
   });
 });
