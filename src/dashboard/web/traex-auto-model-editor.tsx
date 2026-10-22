@@ -93,7 +93,7 @@ export function TraexAutoModelEditor(props: {
                 onClick={() => props.onModels(props.models.filter((_, at) => at !== index))}>×</button>
               </div>
               <div className="bd-auto-model-settings">
-                <label>
+                <div className="bd-auto-model-setting">
                   <span>{tr('botDefaults.agentReasoningEffort')}</span>
                   <DropdownField dataInput={`autoModelEffort${index}`} ariaLabel={`${model} ${tr('botDefaults.agentReasoningEffort')}`}
                     value={settings.reasoningEffort ?? ''} disabled={props.busy || !model}
@@ -102,8 +102,8 @@ export function TraexAutoModelEditor(props: {
                     onChange={effort => props.onSettings(model, {
                       ...settings, reasoningEffort: isCodexReasoningEffort(effort) ? effort : undefined,
                     })} />
-                </label>
-                <label>
+                </div>
+                <div className="bd-auto-model-setting">
                   <span>{tr('botDefaults.autoModelContext')}</span>
                   <DropdownField dataInput={`autoModelContext${index}`} ariaLabel={`${model} ${tr('botDefaults.autoModelContext')}`}
                     value={settings.modelBackendVariant ?? ''} disabled={props.busy || !model}
@@ -116,7 +116,7 @@ export function TraexAutoModelEditor(props: {
                         reasoningEffort: settings.reasoningEffort && allowed.includes(settings.reasoningEffort)
                           ? settings.reasoningEffort : undefined });
                     }} />
-                </label>
+                </div>
               </div>
             </li>
           })}

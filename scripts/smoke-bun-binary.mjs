@@ -460,9 +460,16 @@ for (;;) {
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
 const dashboardOutPath = join(home, '.botmux', 'logs', 'dashboard-out.log');
-const dashboardOut = existsSync(dashboardOutPath) ? readFileSync(dashboardOutPath, 'utf8') : '';
-if (!dashboardOut.includes('[INFO] [dashboard] listening on')) {
-  fail('logging', 'compiled dashboard served HTTP but its normal startup log was suppressed');
+// Serving HTTP and flushing stdout to the supervisor's log file are separate
+// readiness signals. Allow the write to land without accepting a missing log.
+const dashboardLogDeadline = Date.now() + 5_000;
+while (true) {
+  const dashboardOut = existsSync(dashboardOutPath) ? readFileSync(dashboardOutPath, 'utf8') : '';
+  if (dashboardOut.includes('[INFO] [dashboard] listening on')) break;
+  if (supervisor.exitCode !== null || !alive(row.pid) || Date.now() >= dashboardLogDeadline) {
+    fail('logging', 'compiled dashboard served HTTP but its normal startup log was suppressed');
+  }
+  await delay(50);
 }
 console.log('smoke: ✅ logging — compiled fleet entry preserves normal startup logs');
 

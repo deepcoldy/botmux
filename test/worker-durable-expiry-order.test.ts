@@ -49,6 +49,8 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     startStuckDetector: vi.fn(),
     adoptPendingLaunchConvergence: vi.fn(),
     codexRpcEligible: () => false,
+    traexAutoModelRuntimeEligible: () => false,
+    traexAutoModelSwitching: false,
     sandboxEnabled: () => false,
     prepareCodexNativeTitleGeneration: vi.fn(async () => {}),
     settleRestartAttemptOnReady: vi.fn(),

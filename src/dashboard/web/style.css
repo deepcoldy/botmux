@@ -36462,7 +36462,7 @@ dialog.command-palette-dialog::backdrop {
 .bd-auto-model-list > li { display: block; margin: 12px 0; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .bd-auto-model-main { display: flex; align-items: center; gap: 6px; }
 .bd-auto-model-settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 8px 0 0 54px; }
-.bd-auto-model-settings label { min-width: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.bd-auto-model-setting { min-width: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
 .bd-auto-model-description { display: flex; align-items: center; gap: 6px; margin: 6px 0 12px; font-size: 12px; }
 .bd-auto-model-count { margin-left: 10px; font-size: 12px; }
 .bd-auto-model-save { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 12px; }
