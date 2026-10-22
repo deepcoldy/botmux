@@ -584,7 +584,19 @@ import {
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
 import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
-import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
+import {
+  traexCapacityQueueVisible,
+  traexCapacityQueuePosition,
+  traexModelProgressVisible,
+  traexNativeSubagentHookConfig,
+} from './adapters/cli/traex.js';
+import {
+  TraexAutoModelController,
+  resolveTraexAutoModelSettings,
+  validTraexAutoModelRuntime,
+  type TraexAutoModelAction,
+} from './services/traex-auto-model.js';
+import { readTraexModelLoads } from './services/traex-model-load.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -2034,6 +2046,22 @@ let resumeFallbackNotified = false;
 let cliTranscriptEverExisted = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
+let deliveredPluginSkillCatalogFingerprint: string | undefined;
+let deferredPluginSkillCatalogFingerprint: string | undefined;
+
+function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
+  if (!deferredPluginSkillCatalog || lastInitConfig?.adoptMode) return;
+  item.logicalContent ??= item.content;
+  item.content = `${item.content}\n\n${deferredPluginSkillCatalog}`;
+  if (item.codexAppInput) {
+    item.codexAppInput = withCodexAppContext(item.codexAppInput,
+      'botmux_plugin_skills', deferredPluginSkillCatalog, 'application');
+  }
+  deliveredPluginSkillCatalogFingerprint = deferredPluginSkillCatalogFingerprint;
+  deferredPluginSkillCatalog = null;
+  deferredPluginSkillCatalogFingerprint = undefined;
+  log('Attached refreshed plugin Skill catalog at the CLI write edge');
+}
 
 function stopSessionMcpGatewayHost(): void {
   const host = sessionMcpGatewayHost;
@@ -2063,6 +2091,7 @@ function resolvePluginGenerationBot(
 function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
+  preserveUnchangedCatalog = false,
 ): void {
   if (cfg.promptInjection === 'none' && (!supportsZeroPromptInjection(cfg.cliId, cfg)
     || process.env[GOAL_ENV.V3_MARKER] === '1')) {
@@ -2081,6 +2110,7 @@ function refreshCliPluginGeneration(
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
     promptInjection: cfg.promptInjection,
+    previousSkillCatalogFingerprint: preserveUnchangedCatalog ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -2102,6 +2132,8 @@ function refreshCliPluginGeneration(
   cfg.skillPluginDir = generation.skillPluginDir;
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
+  deferredPluginSkillCatalogFingerprint = generation.deferredSkillCatalog ? generation.skillCatalogFingerprint : undefined;
+  if (!generation.deferredSkillCatalog) deliveredPluginSkillCatalogFingerprint = generation.skillCatalogFingerprint;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
 }
 
@@ -2135,6 +2167,7 @@ function pluginCardActionCapabilitiesEnv(
 async function prepareCliPluginGenerationAndGateway(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
+  preserveUnchangedCatalog = false,
 ): Promise<SessionMcpRuntimeManifest | null> {
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
     // RPC calls this before spawnCli. Fence the surviving pane before changing
@@ -2152,7 +2185,7 @@ async function prepareCliPluginGenerationAndGateway(
       if (report.warning) throw new Error('Codex instance MCP configuration could not be initialized safely');
     }
   }
-  refreshCliPluginGeneration(cfg, adapter);
+  refreshCliPluginGeneration(cfg, adapter, preserveUnchangedCatalog);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
   if (adapter.mcpGateway && manifest?.entries.length) {
@@ -2782,6 +2815,9 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let traexAutoModelController: TraexAutoModelController | null = null;
+let traexAutoModelSwitching = false;
+let traexAutoModelTurnReplayForbidden = false;
 
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
@@ -4239,6 +4275,249 @@ const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => 
   // Ordered IPC reaches the daemon before any output attributed to the steer.
   send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
 });
+
+function configureTraexAutoModel(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): void {
+  const managedAuto = cfg.cliId === 'traex'
+    && cfg.traexAutoModel?.enabled === true
+    && !cfg.adoptMode
+    && !cfg.existingAppServerEndpoint
+    && !cfg.wrapperCli
+    && !cfg.cliLaunchMode;
+  // Older daemons may send the stored RPC preference rather than the launch
+  // mode. Auto owns this managed terminal; normalize before any RPC startup.
+  if (managedAuto) {
+    cfg.codexRpcInput = false;
+    if (lastInitConfig) lastInitConfig.codexRpcInput = false;
+  }
+  traexAutoModelController = managedAuto && cfg.traexAutoModel
+    ? new TraexAutoModelController(cfg.traexAutoModel,
+      cfg.resume && validTraexAutoModelRuntime(cfg.traexAutoModel, cfg.traexAutoModelRuntime, cfg.cliSessionId)
+        ? cfg.traexAutoModelRuntime : undefined)
+    : null;
+  traexAutoModelSwitching = false;
+  traexAutoModelTurnReplayForbidden = cfg.atMostOnce === true;
+  if (traexAutoModelController) {
+    if (cfg.resume && validTraexAutoModelRuntime(traexAutoModelController.config, cfg.traexAutoModelRuntime, cfg.cliSessionId)) {
+      deliveredPluginSkillCatalogFingerprint = cfg.traexAutoModelRuntime.skillCatalogFingerprint;
+    }
+    const model = traexAutoModelController.currentModel();
+    const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, model, cfg);
+    cfg.model = model;
+    cfg.reasoningEffort = settings.reasoningEffort;
+    cfg.modelBackendVariant = settings.modelBackendVariant;
+    if (lastInitConfig && lastInitConfig !== cfg) {
+      lastInitConfig.model = model;
+      lastInitConfig.reasoningEffort = settings.reasoningEffort;
+      lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
+    }
+  }
+  if (traexAutoModelController
+    && cfg.prompt
+    && cfg.turnId
+    && cfg.dispatchAttempt === undefined) {
+    traexAutoModelController.beginTurn(cfg.turnId);
+  }
+}
+
+function traexAutoModelRuntimeEligible(): boolean {
+  return !!traexAutoModelController
+    && lastInitConfig?.cliId === 'traex'
+    && !lastInitConfig.adoptMode
+    && !lastInitConfig.existingAppServerEndpoint
+    && !codexRpcEngine
+    && !isRemoteBackendType(effectiveBackendType);
+}
+
+function enqueueTraexAutoModelRecovery(turnId: string): boolean {
+  const active = activeTurnAuthority.snapshot();
+  if (!active?.started || active.turnId !== turnId || active.dispatchAttempt !== undefined) {
+    return false;
+  }
+  if (pendingMessages.some(item =>
+    item.traexAutoModelRecovery === true && item.turnId === turnId)) {
+    return true;
+  }
+  pendingMessages.unshift({
+    content: t('worker.traex_auto_model.continue_prompt'),
+    turnId,
+    trustedCaller: active.caller,
+    trustedController: active.controller,
+    turnCallerOpenId: currentBotmuxCallerOpenId,
+    traexAutoModelRecovery: true,
+    // A continuation must not become an ordinary crash-replay input.
+    noReplay: true,
+  });
+  return true;
+}
+
+function executeTraexAutoModelSwitch(
+  action: Extract<TraexAutoModelAction, { kind: 'switch' }>,
+  opts: { resumeCurrentTurn: boolean },
+): boolean {
+  if (!traexAutoModelRuntimeEligible()
+    || traexAutoModelSwitching
+    || cliRestartInProgress
+    || isFlushing
+    || !lastInitConfig) return false;
+  const nativeSessionId = lastInitConfig.cliSessionId;
+  if (!nativeSessionId) return false;
+  if (opts.resumeCurrentTurn && traexAutoModelTurnReplayForbidden) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (opts.resumeCurrentTurn && (!active?.started || active.turnId !== action.turnId
+    || active.dispatchAttempt !== undefined)) return false;
+  if (!traexAutoModelController?.commitSwitch(action)) return false;
+  if (opts.resumeCurrentTurn && !enqueueTraexAutoModelRecovery(action.turnId)) {
+    log(`TraeX auto-model switch refused: turn ${action.turnId.slice(0, 12)} lacks safe ordinary-turn authority`);
+    return false;
+  }
+
+  lastInitConfig.model = action.toModel;
+  const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, action.toModel,
+    lastInitConfig);
+  lastInitConfig.reasoningEffort = settings.reasoningEffort;
+  lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
+  const effort = lastInitConfig.reasoningEffort;
+  if (effort && !traexAutoModelController.config.modelSettings?.[action.toModel]
+    && !cliModelSupportsReasoningEffort('traex', action.toModel, effort)) {
+    lastInitConfig.reasoningEffort = undefined;
+  }
+  // Native resume owns the original ask. Retire its transport replay before
+  // teardown can synchronously call onCliExit and stash it ahead of recovery.
+  inflightInputs.retireTurn(action.turnId);
+  traexAutoModelSwitching = true;
+  send({
+    type: 'user_notify',
+    turnId: action.turnId,
+    message: t(
+      action.reason === 'capacity_timeout'
+        ? 'worker.traex_auto_model.capacity_switch'
+        : action.reason === 'queued_backup'
+          ? 'worker.traex_auto_model.queued_backup'
+        : action.reason === 'available_model'
+          ? 'worker.traex_auto_model.available_model'
+        : action.reason === 'shortest_queue'
+          ? 'worker.traex_auto_model.shortest_queue'
+          : action.reason === 'lowest_load'
+            ? 'worker.traex_auto_model.lowest_load'
+            : 'worker.traex_auto_model.new_turn_switch',
+      {
+        fromModel: action.fromModel,
+        toModel: action.toModel,
+        position: action.queuePosition ?? '?',
+        load: action.loadPercent ?? '?',
+        seconds: Math.round(
+          (traexAutoModelController?.config.queueTimeoutMs ?? 0) / 1_000,
+        ),
+      },
+    ),
+  });
+  log(
+    `TraeX auto-model ${action.reason}: ${action.fromModel} -> ${action.toModel} `
+    + `(turn=${action.turnId.slice(0, 12)})`,
+  );
+  void restartCliProcess(
+    `TraeX auto-model ${action.reason}: ${action.fromModel} -> ${action.toModel}`,
+    {
+      immediate: true,
+      preservePending: true,
+      // Capacity rotation is one logical recovery sequence. Counting each
+      // candidate as a crash restart would force tier-2 FRESH and lose the
+      // native conversation before the allowlist is exhausted.
+      skipRestartBudget: true,
+      exactResumeSessionId: nativeSessionId,
+    },
+  );
+  return true;
+}
+
+function observeTraexAutoModelCapacity(screen: string): void {
+  const controller = traexAutoModelController;
+  if (!controller || !traexAutoModelRuntimeEligible()) return;
+  if (traexAutoModelSwitching || cliRestartInProgress || isFlushing
+    || isPromptReady || traexAutoModelTurnReplayForbidden
+    || !lastInitConfig?.cliSessionId) return;
+
+  const active = activeTurnAuthority.snapshot();
+  if (!active?.started
+    || active.dispatchAttempt !== undefined
+    || active.turnId !== currentBotmuxTurnId) {
+    return;
+  }
+  const action = controller.observeCapacityQueue({
+    turnId: active.turnId,
+    queued: traexCapacityQueueVisible(screen),
+    nowMs: Date.now(),
+    queuePosition: traexCapacityQueuePosition(screen),
+    progressing: traexModelProgressVisible(screen),
+  });
+  if (action.kind === 'load_check') {
+    const target = backend;
+    const generation = cliSpawnGeneration;
+    const config = lastInitConfig;
+    void readTraexModelLoads({
+      cliBin: cliAdapter!.resolvedBin,
+      cwd: config.workingDir,
+      env: { ...buildSessionChildEnv(process.env, config.envPolicy), ...botInjectedEnv(config.env, config.envPolicy) },
+    }).then(loads => {
+      const active = activeTurnAuthority.snapshot();
+      if (backend !== target || generation !== cliSpawnGeneration
+        || controller !== traexAutoModelController || cliRestartInProgress
+        || !active?.started || active.turnId !== action.turnId
+        || active.dispatchAttempt !== undefined || isPromptReady) return;
+      const choice = controller.resolveModelLoads(action.turnId, loads);
+      if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
+      else if (choice.kind === 'exhausted') {
+        publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
+        send({ type: 'user_notify', turnId: choice.turnId,
+          message: t('worker.traex_auto_model.lowest_load_hold', {
+            model: choice.model, load: choice.loadPercent ?? '?',
+          }) });
+      } else {
+        log('TraeX model load incomplete or queue ended; using bounded ordered fallback');
+      }
+    }).catch(error => {
+      if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
+      log(`TraeX model load read failed: ${String(error)}`);
+    });
+  } else if (action.kind === 'switch') {
+    executeTraexAutoModelSwitch(action, { resumeCurrentTurn: true });
+  } else if (action.kind === 'exhausted') {
+    publishActiveRuntime({ model: controller.currentModel(), reasoningEffort: lastInitConfig?.reasoningEffort });
+    send({
+      type: 'user_notify',
+      turnId: action.turnId,
+      message: t('worker.traex_auto_model.exhausted', {
+        count: action.modelCount,
+        model: action.model,
+      }),
+    });
+    log(
+      `TraeX auto-model pool exhausted at ${action.model} `
+      + `(turn=${action.turnId.slice(0, 12)}, count=${action.modelCount})`,
+    );
+  }
+}
+
+/** Serialize turns while auto is active. The previous ask finishes under its
+ * own model/identity; an opt-in new-turn reset starts on the preferred model. */
+function resetTraexAutoModelBeforePendingTurn(): boolean {
+  const controller = traexAutoModelController;
+  const head = pendingMessages[0];
+  if (!controller || !traexAutoModelRuntimeEligible() || !head?.turnId
+    || head.dispatchAttempt !== undefined || head.traexAutoModelRecovery
+    || controller.currentTurnId() === head.turnId) return false;
+  if (traexAutoModelSwitching) return true;
+  if (!isPromptReady) return true;
+  if (!controller.config.reselectPerTurn || controller.currentModelIndex() === 0) return false;
+  // The first-ever turn cannot have fallen back without an exact native id.
+  if (!lastInitConfig?.cliSessionId) return true;
+  const action = controller.beginTurn(head.turnId);
+  return action.kind === 'switch'
+    ? executeTraexAutoModelSwitch(action, { resumeCurrentTurn: false })
+    : false;
+}
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
@@ -6493,6 +6772,8 @@ let codexAdoptRecoveryAttempted = false;
 let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
+let publishedAutoModelVariant: 'standard' | 'max' | null | undefined;
+let publishedAutoModelStateKey: string | undefined;
 const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
 // Structured rollout CoT: Codex/Pi messages and TraeX history mutations emit
 // rollout reasoning/tool events attributed to the collecting turn, feeding
@@ -6543,6 +6824,27 @@ const codexServiceTierTracker = new CodexServiceTierTracker(
 );
 
 function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
+  if (traexAutoModelRuntimeEligible() && runtime.model
+    && !traexAutoModelSwitching && !traexAutoModelController?.currentTurnId()) {
+    traexAutoModelController?.observeRunningModel(runtime.model);
+    if (lastInitConfig && traexAutoModelController?.currentModel().toLowerCase() === runtime.model.toLowerCase()) {
+      const observedModel = traexAutoModelController.currentModel();
+      if (lastInitConfig.model !== observedModel) {
+        const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, observedModel, lastInitConfig);
+        lastInitConfig.reasoningEffort = settings.reasoningEffort;
+        lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
+      }
+      lastInitConfig.model = observedModel;
+    }
+  }
+  const autoState = traexAutoModelRuntimeEligible() && lastInitConfig?.cliSessionId
+    ? { ...traexAutoModelController!.runtimeState(lastInitConfig.cliSessionId),
+      ...(deliveredPluginSkillCatalogFingerprint ? { skillCatalogFingerprint: deliveredPluginSkillCatalogFingerprint } : {}) }
+    : undefined;
+  const autoStateKey = JSON.stringify(autoState);
+  if (autoState && lastInitConfig) lastInitConfig.traexAutoModelRuntime = autoState;
+  const autoVariant = traexAutoModelRuntimeEligible()
+    ? lastInitConfig?.modelBackendVariant ?? null : undefined;
   const normalized: TraexRuntimeSnapshot = {
     ...(runtime.model?.trim() ? { model: runtime.model.trim() } : {}),
     ...(runtime.reasoningEffort?.trim()
@@ -6553,15 +6855,21 @@ function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
     activeRuntimePublished
     && normalized.model === publishedActiveRuntime.model
     && normalized.reasoningEffort === publishedActiveRuntime.reasoningEffort
+    && autoVariant === publishedAutoModelVariant
+    && autoStateKey === publishedAutoModelStateKey
   ) {
     return;
   }
   activeRuntimePublished = true;
   publishedActiveRuntime = normalized;
+  publishedAutoModelVariant = autoVariant;
+  publishedAutoModelStateKey = autoStateKey;
   send({
     type: 'active_runtime',
     model: normalized.model ?? null,
     reasoningEffort: normalized.reasoningEffort ?? null,
+    ...(autoVariant !== undefined ? { modelBackendVariant: autoVariant } : {}),
+    ...(autoState ? { traexAutoModelRuntime: autoState } : {}),
   });
 }
 let hermesBridgeOffset = 0;
@@ -11018,6 +11326,7 @@ function stopCodexBridge(): void {
   }
   codexServiceTierTracker.detach();
   activeRuntimePublished = false;
+  publishedAutoModelVariant = undefined;
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
@@ -11414,6 +11723,16 @@ function observeRestoredStartupHistoryOnScreen(): boolean {
   try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
   log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
+  // TraeX's quiet-composer timer may already have expired while loading held
+  // it. Re-run that check using the initialized authoritative viewport rather
+  // than waiting for another redraw that a restored idle TUI need not emit.
+  // Keep the existing spinner/static-busy checks and the worker's ready fences.
+  if (lastInitConfig?.cliId === 'traex'
+    && backendScreenEvidenceIsAuthoritativeForMutation()
+    && Date.now() - lastPtyOutputAtMs >= 2_000
+    && screenShowsReadyPattern()) {
+    idleDetector.seedReadyEvidence(true);
+  }
   if (cliAdapter?.supportsTypeAhead) void flushPending();
   return true;
 }
@@ -12513,6 +12832,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     // only this exact turn BEFORE acknowledging interruption to the daemon;
     // otherwise the caller sees interrupted while auto-restart executes it again.
     inflightInputs.retireTurn(turnId);
+    traexAutoModelController?.endTurn(turnId);
     for (let i = pendingMessages.length - 1; i >= 0; i--) {
       if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
     }
@@ -16183,12 +16503,15 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 }
 
 function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
-  return resolvePtyInputPolicy(
+  const policy = resolvePtyInputPolicy(
     cliAdapter ?? {},
     backendScreenEvidenceIsAuthoritativeForMutation(),
     codexAppRuntimeTypeAheadReady(),
     isTypeAheadBlockedByBypass(cliAdapter ?? { id: lastInitConfig?.cliId }, lastInitConfig?.disableCliBypass),
   );
+  return traexAutoModelRuntimeEligible()
+    ? { ...policy, supportsTypeAhead: false, allowBackToBackWrites: false }
+    : policy;
 }
 
 /** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
@@ -16249,6 +16572,7 @@ async function flushPending(): Promise<void> {
     if (isFlushing || backend !== target || cliRestartInProgress) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
+  if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
@@ -16489,6 +16813,10 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      // The first item passed the prompt/model gate before beginCliWriteCycle
+      // deliberately cleared readiness. Rechecking that synthetic false here
+      // would strand the very input admitted by this flush.
+      if (itemsWrittenInThisFlush > 0 && resetTraexAutoModelBeforePendingTurn()) break;
       // The entry check protects a new drain. These checks protect subsequent
       // items when a terminal or late receipt arrives during awaited writes.
       if (currentInputDeliveryQuarantine()) break;
@@ -16502,6 +16830,7 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
       // queued credential turns (A/B/C ran as A/C/C).
@@ -16530,6 +16859,25 @@ async function flushPending(): Promise<void> {
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
+        if (item.turnId && item.dispatchAttempt === undefined) {
+          if (!item.traexAutoModelRecovery) {
+            traexAutoModelTurnReplayForbidden = item.noReplay === true;
+          }
+          const action = traexAutoModelController?.beginTurn(item.turnId);
+          // A fallback-to-core transition must be handled before dequeueing.
+          // Reaching it here means a future input path bypassed the shared
+          // pre-flush gate; fail closed instead of running the new turn on the
+          // stale fallback model.
+          if (action?.kind === 'switch') {
+            throw new Error(
+              `TraeX auto-model reset reached the write edge unexpectedly `
+              + `(${action.fromModel} -> ${action.toModel})`,
+            );
+          }
+          if (traexAutoModelRuntimeEligible()) {
+            publishActiveRuntime({ model: lastInitConfig?.model, reasoningEffort: lastInitConfig?.reasoningEffort });
+          }
+        }
         syncQueuedTurnsFromMarkerDisk();
 
         let currentTurnFinalDelivered = Boolean(
@@ -17366,7 +17714,8 @@ function sendToPty(
     next,
     directRpcTurnBlocksTypeAhead(),
   ) && !activeTurnBlocks(next);
-  const shouldMergeQueued = opts.dispatchAttempt === undefined && !durableTurnInFlight
+  const shouldMergeQueued = !traexAutoModelRuntimeEligible()
+    && opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
     isPromptReady,
     isFlushing,
@@ -17454,8 +17803,11 @@ function startScreenUpdates(): void {
   let lastSnapshotPtyActivity = -1;
   let lastSnapshotGridRevision = observedPaneGridRevision;
   screenUpdateTimer = setInterval(() => {
+    const capacityBackend = backend;
+    const capacityGeneration = cliSpawnGeneration;
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
+      if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
       // First-turn 「工作中」 publisher. The async sampler below is fully gated
       // until the first turn ends (markPromptReady flips awaitingFirstPrompt) or
       // the 15s soft timeout, so an argv-baked first prompt (Pi/Grok/…, delivered
@@ -17550,6 +17902,9 @@ function startScreenUpdates(): void {
       }, projectedRuntimeScreenStatus);
       if (!snapshot) return;
 
+      if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
+        observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+      }
       const usageAware = usageLimitTracker.classify(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a
       // background fork agent AFTER the main turn already ended — park the
@@ -18121,7 +18476,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: { pluginGenerationPrepared?: boolean } = {},
+  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
@@ -19885,7 +20240,7 @@ async function spawnCli(
   if (!willReattachPersistent) {
     mcpRuntimeManifest = opts.pluginGenerationPrepared
       ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
-      : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
+      : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter, !!opts.exactResumeSessionId);
   }
   if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
 
@@ -19993,7 +20348,7 @@ async function spawnCli(
     )
     : undefined;
   const tier2ForceFresh = effectiveResume && consecutiveInWorkerRestarts >= 2
-    && codexAutoUpgrade?.stage !== 'restoring';
+    && codexAutoUpgrade?.stage !== 'restoring' && !opts.exactResumeSessionId;
   // Tier 0: see block comment above. The adapter itself drops --resume when
   // the id is missing (its buildArgs starts fresh); demoting HERE keeps
   // effectiveResume honest so the fresh-demotion notice below fires.
@@ -20014,6 +20369,10 @@ async function spawnCli(
   }
   const fallBackToFresh =
     effectiveResume && !willReattachPersistent && (tier1ProbeFalse || tier2ForceFresh || missingExactResumeId);
+  if (opts.exactResumeSessionId && (cfg.cliId !== 'traex' || fallBackToFresh
+    || !effectiveResume || effectiveCliSessionId !== opts.exactResumeSessionId)) {
+    throw new Error('TraeX auto-model requires the exact native resume target; refusing fresh fallback');
+  }
   if (codexAutoUpgrade?.stage === 'restoring'
       && (fallBackToFresh || !effectiveResume || effectiveCliSessionId !== codexAutoUpgrade.threadId)) {
     throw new Error('Automatic Codex upgrade requires the original resume target; fresh fallback is disabled');
@@ -20277,6 +20636,12 @@ async function spawnCli(
     ? ''
     : (process.env.CLI_EXTRA_ARGS ?? '').trim();
   const cliExtraArgs = cliExtra ? cliExtra.split(/\s+/).filter(Boolean) : [];
+  if (traexAutoModelRuntimeEligible() && cliExtraArgs.some((arg, index) =>
+    arg === '-m' || arg === '--model' || arg.startsWith('--model=')
+    || /^model=/.test(arg)
+    || (arg === '-c' && /^model\s*=/.test(cliExtraArgs[index + 1] ?? '')))) {
+    throw new Error('TraeX auto-model pool cannot be overridden by CLI_EXTRA_ARGS model flags');
+  }
 
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
@@ -22517,6 +22882,9 @@ async function spawnCli(
     });
   }
 
+  if (traexAutoModelRuntimeEligible()) {
+    publishActiveRuntime({ model: cfg.model, reasoningEffort: cfg.reasoningEffort });
+  }
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
@@ -23441,12 +23809,14 @@ async function spawnCli(
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
-    const droppedPending = pendingMessages.filter(m => m.noReplay).length;
+    const dropPendingOnExit = (item: PendingCliInput): boolean =>
+      item.noReplay === true && !(intentionalRestart && item.traexAutoModelRecovery);
+    const droppedPending = pendingMessages.filter(dropPendingOnExit).length;
     if (droppedPending > 0) {
       // Remove ONLY the no-replay items still queued (never written); keep any
       // ordinary follow-up input for the restart's normal flush.
       for (let i = pendingMessages.length - 1; i >= 0; i--) {
-        if (pendingMessages[i].noReplay) pendingMessages.splice(i, 1);
+        if (dropPendingOnExit(pendingMessages[i])) pendingMessages.splice(i, 1);
       }
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
     }
@@ -23864,7 +24234,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
@@ -23970,7 +24340,7 @@ async function restartCliProcess(
           startScreenUpdates();
           startStuckDetector();
           try {
-            const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
+            const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: opts.exactResumeSessionId ?? rpcThreadId ?? lastInitConfig.cliSessionId };
             spawnedWorkingDir = restartCfg.workingDir;
             // Launch snapshot of this window. A folded request still pending
             // from before it is satisfied by this replacement (built from the
@@ -23989,7 +24359,8 @@ async function restartCliProcess(
               await engageCodexRpc(restartCfg);
             }
             replacementSpawnInProgress = true;
-            await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+            await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, exactResumeSessionId: opts.exactResumeSessionId });
+            if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: restartCfg.model, reasoningEffort: restartCfg.reasoningEffort });
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
             replacementSpawnInProgress = false;
             if (codexRpcEngine) armRpcStartupDialogDismiss();
@@ -24003,6 +24374,9 @@ async function restartCliProcess(
         }
         cliRestartInProgress = false;
         replacementSpawnInProgress = false;
+        // Release at the replacement boundary, independently of screen output.
+        // A quiet prompt must still be able to flush the queued continuation.
+        traexAutoModelSwitching = false;
         // Follow-up decision (pure, unit-tested in restart-followup-policy.ts):
         //  - cwd-move: a role-switch restart landed after restartCfg was
         //    snapshotted → CLI came up in the old cwd while daemon repinned to
@@ -26336,6 +26710,7 @@ function emitTurnTerminal(
     turnExecutionClock.forget(turnId, dispatchAttempt);
     return;
   }
+  traexAutoModelController?.endTurn(turnId);
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
   if (status !== 'completed') {
     const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
@@ -26722,6 +27097,7 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
         // the registry layer, so retimeout's positive-finite guard is purely
@@ -26916,6 +27292,7 @@ process.on('message', async (raw: unknown) => {
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
         if (deferredFreshRpcTurn) {
@@ -27311,19 +27688,6 @@ process.on('message', async (raw: unknown) => {
       let content = msg.content;
       const postSubmitNativeSessionTitle = msg.nativeSessionTitle;
       let codexAppInput = msg.codexAppInput;
-      if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
-        content = `${content}\n\n${deferredPluginSkillCatalog}`;
-        if (codexAppInput) {
-          codexAppInput = withCodexAppContext(
-            codexAppInput,
-            'botmux_plugin_skills',
-            deferredPluginSkillCatalog,
-            'application',
-          );
-        }
-        deferredPluginSkillCatalog = null;
-        log('Attached refreshed plugin Skill catalog to the first turn of this CLI generation');
-      }
       if (!backend && crashDiagnosticStopped && lastInitConfig && !lastInitConfig.adoptMode) {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
@@ -27520,6 +27884,16 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      if (/^\/(?:model|new|clear)\b/i.test(msg.content.trim())) {
+        // An explicit native setting/session command takes precedence until
+        // the next worker init; the pool must not undo a manual model choice.
+        traexAutoModelController = null;
+      } else if (/^\/(?:stop|cancel)\b/i.test(msg.content.trim()) && currentBotmuxTurnId) {
+        traexAutoModelController?.endTurn(currentBotmuxTurnId);
+        for (let i = pendingMessages.length - 1; i >= 0; i--) {
+          if (pendingMessages[i].traexAutoModelRecovery) pendingMessages.splice(i, 1);
+        }
+      }
       // Preserve legacy busy delivery (/btw and other steering commands). A
       // native /rename and an owned CLI restart are the exceptions: never splice
       // into the rename UI, write through an old backend during async teardown,
@@ -27647,6 +28021,15 @@ process.on('message', async (raw: unknown) => {
       // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
       if (msg.model !== undefined && lastInitConfig) {
         lastInitConfig.model = msg.model === null ? undefined : msg.model;
+      }
+      if (lastInitConfig && msg.codexRpcInput !== undefined) {
+        lastInitConfig.codexRpcInput = msg.codexRpcInput;
+      }
+      if (lastInitConfig && msg.traexAutoModel !== undefined) {
+        lastInitConfig.traexAutoModel = msg.traexAutoModel ?? undefined;
+        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
+      } else if (lastInitConfig && msg.codexRpcInput !== undefined) {
+        configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
       }
       if (msg.larkToolBinding !== undefined && lastInitConfig) {
         lastInitConfig.larkToolBinding = msg.larkToolBinding === null ? false : msg.larkToolBinding;

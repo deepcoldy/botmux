@@ -400,8 +400,8 @@ export const config = {
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
-  // sessions without a daemon restart. The daemon ORs this with each bot's own
-  // `codexRpcInput` flag when building the worker init message.
+  // sessions without a daemon restart. A bot's explicit true/false overrides
+  // this default; only an absent bot setting inherits it.
   // Default OFF (absent ⇒ disabled): the hybrid RPC pane lifecycle (resume
   // respawn + ready-gate) must be live-verified before the fleet default flips
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle

@@ -650,6 +650,8 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
+  /** Undefined means no observation; null means native/default context. */
+  activeModelBackendVariant?: 'standard' | 'max' | null;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it

@@ -315,6 +315,11 @@ export async function buildModelChoicesResponse(
   const browserCapabilities = live?.modelCapabilities?.map(entry => ({
     slug: entry.slug,
     serviceTiers: entry.serviceTiers,
+    ...(selectedCliId === 'traex' ? {
+      ...(entry.reasoningEfforts ? { reasoningEfforts: entry.reasoningEfforts } : {}),
+      ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
+      ...(entry.contextVariants ? { contextVariants: entry.contextVariants } : {}),
+    } : {}),
   }));
   return {
     models,

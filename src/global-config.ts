@@ -367,7 +367,8 @@ export interface DashboardGlobalConfig {
    *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
    *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
-   *  force-enables regardless of this global default. */
+   *  force-enables regardless of this global default; false explicitly keeps
+   *  that bot on terminal input. */
   codexRpcInput?: boolean;
   /** Automatically replace outdated Codex session processes when safely idle
    *  and resume the same thread without sending a new prompt. Experimental,

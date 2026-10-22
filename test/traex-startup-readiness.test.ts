@@ -122,4 +122,67 @@ describe('TraeX startup readiness', () => {
     quiet();
     expect(idle).toHaveBeenCalledTimes(1);
   });
+
+  it('releases a loading hold on the actual 0.210 resumed composer without a loaded banner', () => {
+    detector.feed(LOADING);
+    const restored = `■ Conversation interrupted - use /feedback if something went wrong
+⚠ This session was recorded with model GPT-6-Astra but is resuming with GPT-6.1-Sol.
+──────── Configure botmux environment ─
+❯ Explain this codebase
+───────────────────────────────────────
+  GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
+  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents`;
+    detector.feed(restored);
+    quiet();
+    expect(detector.isStartupPending()).toBe(true);
+    expect(detector.observeStartupHistory(restored)).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+    // Initialization alone must not emit a synthetic turn completion.
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed('❯ Explain this codebase');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    '◆ Queued for capacity (30s • esc to interrupt)',
+    '◆ Working… (3s • esc to interrupt)',
+    'Queued for next turn',
+    '│ model: loading /model to change │\n│ directory: /tmp │',
+  ])('holds a restored composer with conflicting live evidence: %s', conflict => {
+    detector.feed(LOADING);
+    expect(detector.observeStartupHistory(`${conflict}
+──────────────────────────
+❯ Explain this codebase
+──────────────────────────
+  GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
+  ☢ Full Access · ? for shortcuts`)).toBe(false);
+    expect(detector.isStartupPending()).toBe(true);
+  });
+
+  it.each([
+    '❯ 1. Trust and continue',
+    '❯ my unsent draft',
+    '  ❯ Explain this codebase',
+    '▍ ❯ Explain this codebase',
+  ])('does not release on a picker, draft, or quoted composer: %s', prompt => {
+    detector.feed(LOADING);
+    expect(detector.observeStartupHistory(`${prompt}
+──────────────────────────
+  GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
+  ☢ Full Access · ? for shortcuts`)).toBe(false);
+    expect(detector.isStartupPending()).toBe(true);
+  });
+
+  it('accepts an initialized warm footer without misreading old busy transcript as current activity', () => {
+    expect(detector.observeStartupHistory(`◆ Working… (3s • esc to interrupt)
+old completed response
+■ Conversation interrupted
+⚠ Resuming with another model.
+──────────────────────────
+❯ Use /skills to list available skills
+──────────────────────────
+  GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
+  ☢ Full Access · ? for shortcuts`)).toBe(true);
+  });
 });

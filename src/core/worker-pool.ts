@@ -51,7 +51,11 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { MissingWorkingDirError } from './working-dir-recovery.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
-import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
+import {
+  resolveSessionLaunchModel,
+  resolveSessionLaunchModelChoice,
+  resolveSessionGroupSettings,
+} from './session-model.js';
 import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
@@ -66,6 +70,7 @@ import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier }
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
+import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -148,6 +153,7 @@ import {
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
+import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
@@ -2674,8 +2680,8 @@ function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier |
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
@@ -2713,12 +2719,13 @@ function sessionAgentConfig(
     // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
-    const model = resolveSessionLaunchModel(ds, botCfg);
+    const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+    const model = modelChoice.model;
     recordLaunchModel(ds, model);
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2817,7 +2824,8 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
-  const model = resolveSessionLaunchModel(ds, botCfg);
+  const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+  const model = modelChoice.model;
   recordLaunchModel(ds, model);
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
@@ -2834,6 +2842,7 @@ function sessionAgentConfig(
     wrapperCli: ds.session.wrapperCli,
     cliLaunchMode: ds.session.cliLaunchMode,
     model,
+    traexAutoModel: modelChoice.traexAutoModel,
     modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
     serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
@@ -6694,6 +6703,25 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+function latestTraexAutoModelForRespawn(ds: DaemonSession): TraexAutoModelConfig | null | undefined {
+  try {
+    const policy = resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config).traexAutoModel;
+    return policy ?? null;
+  } catch { return undefined; }
+}
+
+function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return resolveCodexRpcInput(
+      sessionCliId(ds, botCfg), botCfg.codexRpcInput, config.codexRpcInputDefault,
+      ds.session.existingAppServerEndpoint,
+      !ds.session.adoptedFrom && !ds.session.wrapperCli && !ds.session.cliLaunchMode
+        ? resolveSessionLaunchModelChoice(ds, botCfg).traexAutoModel : undefined,
+    );
+  } catch { return undefined; }
+}
+
 /**
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
  * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
@@ -6779,7 +6807,11 @@ export function requestSessionRestart(
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
-        ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove, ...restartSessionEnvFields(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
+        ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
+          ...restartSessionEnvFields(ds), model: latestModelForRespawn(ds),
+          traexAutoModel: latestTraexAutoModelForRespawn(ds),
+          codexRpcInput: latestCodexRpcInputForRespawn(ds),
+          larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -11734,7 +11766,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // ORing the frozen init flag closes that window (over-refuse, never leak).
   const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
   if ((cliId === 'codex' || cliId === 'traex')
-    && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+    && (rpcAtSpawn || latestCodexRpcInputForRespawn(ds))) {
     return false;
   }
   return true;
@@ -14583,6 +14615,8 @@ export function forkWorker(
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
     model: agentCfg.model,
+    traexAutoModel: agentCfg.traexAutoModel,
+    traexAutoModelRuntime: ds.session.traexAutoModelRuntime,
     modelBackendVariant: agentCfg.modelBackendVariant,
     reasoningEffort: agentCfg.reasoningEffort,
     serviceTier: agentCfg.serviceTier,
@@ -14603,9 +14637,11 @@ export function forkWorker(
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
     // through its terminal and must never trigger BotMux's self-owned RPC engine.
-    codexRpcInput: existingAppServerEndpoint
-      ? false
-      : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
+    codexRpcInput: resolveCodexRpcInput(
+      agentCfg.cliId, botCfg.codexRpcInput, config.codexRpcInputDefault, existingAppServerEndpoint,
+      !ds.session.adoptedFrom && !agentCfg.wrapperCli && !agentCfg.cliLaunchMode
+        ? agentCfg.traexAutoModel : undefined,
+    ),
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     codexAuthSync: ds.session.cliInstanceBinding
       ? (ds.session.cliInstanceBinding.authMode === 'isolated' ? 'isolated' : 'shared')
@@ -15155,6 +15191,7 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  ds.activeModelBackendVariant = undefined;
   // The model-fallback notice is the ONE runtime fact a worker generation does
   // NOT own: it must survive every respawn and stay visible each round until
   // Claude is observed answering on a different model. Clearing it here and
@@ -16454,15 +16491,26 @@ function setupWorkerHandlers(
         }
         const model = msg.model?.trim() || undefined;
         const reasoningEffort = msg.reasoningEffort?.trim() || undefined;
+        const variant = msg.modelBackendVariant;
+        if (msg.traexAutoModelRuntime
+          && effectiveCliId === 'traex'
+          && msg.traexAutoModelRuntime.model.toLowerCase() === model?.toLowerCase()
+          && msg.traexAutoModelRuntime.nativeSessionId === ds.session.cliSessionId
+          && JSON.stringify(ds.session.traexAutoModelRuntime) !== JSON.stringify(msg.traexAutoModelRuntime)) {
+          ds.session.traexAutoModelRuntime = msg.traexAutoModelRuntime;
+          sessionStore.updateSession(ds.session);
+        }
         if (
           ds.activeModel === model
           && ds.activeReasoningEffort === reasoningEffort
+          && (variant === undefined || ds.activeModelBackendVariant === variant)
         ) {
           break;
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
         if (ds.codexCliEffortConfirmed?.effort === reasoningEffort) ds.codexCliEffortConfirmed = undefined;
+        if (variant !== undefined) ds.activeModelBackendVariant = variant;
         if (ds.session.dispatchLaunchSpec && model) {
           ds.session.dispatchLaunchSpec.effectiveRuntime = {
             model, ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -21484,7 +21532,7 @@ export function forkAdoptWorker(
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
     noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
-    codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    codexRpcInput: resolveCodexRpcInput(adoptedCliId, botCfg.codexRpcInput, config.codexRpcInputDefault),
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
     // — crash, or the "adopted session ended" kill path) must carry that turn's

@@ -459,6 +459,12 @@ for (;;) {
   await delay(250);
 }
 console.log(`smoke: ✅ http — dashboard is serving (status ${served})`);
+const dashboardOutPath = join(home, '.botmux', 'logs', 'dashboard-out.log');
+const dashboardOut = existsSync(dashboardOutPath) ? readFileSync(dashboardOutPath, 'utf8') : '';
+if (!dashboardOut.includes('[INFO] [dashboard] listening on')) {
+  fail('logging', 'compiled dashboard served HTTP but its normal startup log was suppressed');
+}
+console.log('smoke: ✅ logging — compiled fleet entry preserves normal startup logs');
 
 // ── 4b. the embedded frontend must actually be there ─────────────────────────
 // REGRESSION GUARD for a shipped bug this smoke test walked straight past.

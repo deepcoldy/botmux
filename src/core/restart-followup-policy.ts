@@ -104,6 +104,7 @@ export interface RestartLaunchSettings {
   env?: Record<string, string>;
   model?: string;
   larkToolBinding?: boolean;
+  codexRpcInput?: boolean;
 }
 
 export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefined): RestartLaunchSettings {
@@ -112,6 +113,7 @@ export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefi
     env: cfg?.env,
     model: cfg?.model,
     larkToolBinding: cfg?.larkToolBinding,
+    codexRpcInput: cfg?.codexRpcInput,
   };
 }
 
@@ -124,12 +126,13 @@ export function sameRestartEnv(a: Record<string, string> | undefined, b: Record<
     && keys.every((key, index) => key === other[index] && a[key] === b[key]);
 }
 
-/** Value equality of the four restart launch settings. */
+/** Value equality of restart launch settings. */
 export function sameRestartLaunchSettings(a: RestartLaunchSettings, b: RestartLaunchSettings): boolean {
   return (a.workingDir ?? undefined) === (b.workingDir ?? undefined)
     && sameRestartEnv(a.env, b.env)
     && (a.model ?? undefined) === (b.model ?? undefined)
-    && (a.larkToolBinding ?? undefined) === (b.larkToolBinding ?? undefined);
+    && (a.larkToolBinding ?? undefined) === (b.larkToolBinding ?? undefined)
+    && (a.codexRpcInput === true) === (b.codexRpcInput === true);
 }
 
 export type MergedRestartDisposition = 'adopt' | 'converge';

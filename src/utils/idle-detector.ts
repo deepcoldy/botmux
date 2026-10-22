@@ -159,9 +159,10 @@ export class IdleDetector {
    * The caller must first confirm the PTY is quiet AND the current rendered
    * screen matches readyPattern. This only restores readySeen — a full
    * quiescence check (spinner guard included) still runs on top of it, so no
-   * existing check is bypassed.
+   * existing check is bypassed. A newly initialized restored composer can opt
+   * into rechecking evidence whose timer already expired behind startup loading.
    */
-  seedReadyEvidence(): boolean {
+  seedReadyEvidence(recheckExisting = false): boolean {
     if (this.programStatusAuthority) {
       // The post-SessionStart fallback only calls this once the viewport
       // already shows a prompt. Re-publish the OSC terminal state; do not
@@ -175,7 +176,7 @@ export class IdleDetector {
       this.markIdle('program-status');
       return true;
     }
-    if (this.isIdle || this.readySeen) return false;
+    if (this.isIdle || (this.readySeen && !recheckExisting)) return false;
     this.readySeen = true;
     this.clearTimer();
     this.quiescenceCheck();

@@ -451,7 +451,10 @@ import {
 // callers to parse. Transitive logger.info calls from shared modules would
 // corrupt that stream, so the CLI process runs silent by default. DEBUG=1
 // re-enables logging end-to-end for CLI troubleshooting.
-logger.setSilent(true);
+// Set fleet sinks before Bun can evaluate the bundled entry imports; restoring
+// them only at dispatch is too late for the dashboard's startup log.
+logger.setSilent(!['__core-only', '__daemon', '__worker', '__supervisor', '__dashboard', '__plugin-supervisor']
+  .includes(process.argv[2] ?? ''));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -17781,6 +17784,11 @@ if (command === '__orca-relay-local') {
 // these tokens are never used (spawners pass the real dist/*.js path).
 const __entrySubcommand = command && ENTRY_SUBCOMMANDS.has(command) ? entryForSubcommand(command) : null;
 if (__entrySubcommand) {
+  // Compiled fleet entries share this logger module with CLI dispatch.
+  // Protocol helpers/runners retain quiet stdout; fleet logs use normal sinks.
+  if (['core-only', 'daemon', 'worker', 'supervisor', 'dashboard', 'plugin-supervisor'].includes(__entrySubcommand)) {
+    logger.setSilent(false);
+  }
   // Bun's --compile can't bundle a fully-dynamic import specifier, so switch on
   // a static import per entry — the same modules the Node path spawns as files.
   if (__entrySubcommand === 'core-only') await import('./index-core-only.js');
