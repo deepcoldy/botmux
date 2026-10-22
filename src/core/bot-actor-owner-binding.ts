@@ -47,12 +47,17 @@ function canonicalEmail(value: unknown): string | undefined {
  * and duplicate source identities reject the whole Bot config instead of being
  * ignored. A caller cannot populate this value: only the target deployment's
  * canonical bots.json can.
+ *
+ * `null` means the same as "absent" (policy disabled): it is the conventional
+ * hand-edited/frontend spelling for "clear this field", and the IPC clear path
+ * deletes the key outright. Treating it as an array would throw out of config
+ * parsing at startup and prevent every daemon from booting.
  */
 export function normalizeBotActorOwnerBindings(
   value: unknown,
   label = 'botActorOwnerBindings',
 ): BotActorOwnerBinding[] | undefined {
-  if (value === undefined) return undefined;
+  if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
   if (value.length > MAX_BINDINGS) throw new Error(`${label} exceeds ${MAX_BINDINGS} entries`);
 

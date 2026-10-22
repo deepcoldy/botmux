@@ -65,6 +65,25 @@ describe('botActorOwnerBindings', () => {
     expect(normalizeBotActorOwnerBindings([])).toBeUndefined();
   });
 
+  it('treats a hand-written JSON null as disabled instead of rejecting startup', () => {
+    expect(normalizeBotActorOwnerBindings(null)).toBeUndefined();
+    // The fleet-startup path parses the whole bots.json top level: a null
+    // spelling on any one Bot must not throw and take every daemon down.
+    const multi = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_other', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'cli_target', larkAppSecret: 's', cliId: 'codex', botActorOwnerBindings: null },
+    ]));
+    expect(multi).toHaveLength(2);
+    expect(multi[1]?.botActorOwnerBindings).toBeUndefined();
+    const [single] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'cli_target',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      botActorOwnerBindings: null,
+    }]));
+    expect(single?.botActorOwnerBindings).toBeUndefined();
+  });
+
   it('re-reads the canonical target policy on every call instead of caching one Pod snapshot', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'botmux-owner-bindings-'));
     const configPath = join(dir, 'bots.json');
