@@ -2478,12 +2478,12 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
-    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // Runner turn budget: validate the (touched) minutes input before saving
     // so an illegal value surfaces an inline error instead of silently clearing
     // the config. Untouched → omitted below so the daemon preserves the stored
     // ms exactly (including legal non-whole-minute values).
     let turnTimeoutField: number | '' | undefined;
-    if (cliKey === 'dsh' && turnTimeoutTouched) {
+    if (supportsTurnTimeout && turnTimeoutTouched) {
       const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
       if (parsed === 'invalid') {
         const text = tr('botDefaults.agentTurnTimeoutInvalid');
@@ -2528,10 +2528,9 @@ export function BotAgentSection(props: {
         ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
           ? { serviceTier }
           : {}),
-        // dsh-only: only send when the user actually edited the field. Omitting
-        // it makes the daemon preserve the current value; non-dsh selections
-        // never send it (the daemon drops any stored value for non-dsh CLIs).
-        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
+        // Only send a supported budget when edited. Omitting it preserves the
+        // exact stored value; switching to an unsupported CLI clears it.
+        ...(supportsTurnTimeout && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         // dsh-only runtime variant: only send when touched, same semantics as
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
@@ -2746,8 +2745,8 @@ export function BotAgentSection(props: {
   const isTraex = isBackendVariantCliId(selectedCliId);
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
-  // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = selectedCliId === 'dsh';
+  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax';
   const reasoningEffortOptions = useMemo(
     () => {
       const live = isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
@@ -3115,7 +3114,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isDsh && (
+      {supportsTurnTimeout && (
         <div className="bd-row">
           <label>
             <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>

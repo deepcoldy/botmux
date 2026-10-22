@@ -144,6 +144,14 @@ describe('MiniMax Code adapter', () => {
     expect(minimaxDataDir({ MINIMAX_DATA_DIR: '/tmp/primary', MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/primary');
     expect(minimaxDataDir({ MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/legacy');
   });
+  it.each([false, true])('forwards a configured long-review budget on spawn (resume: %s)', resume => {
+    const f = fixture(); vi.stubEnv('MINIMAX_DATA_DIR', join(f.root, 'data'));
+    const adapter = createMinimaxAdapter(f.executable);
+    const options = { sessionId: 'budget', resume, ...(resume ? { resumeSessionId: 'native' } : {}) };
+    expect(adapter.buildArgs(options)).not.toContain('--turn-timeout-ms');
+    const args = adapter.buildArgs({ ...options, turnTimeoutMs: 3_600_000 });
+    expect(args[args.indexOf('--turn-timeout-ms') + 1]).toBe('3600000');
+  });
 });
 
 it.each([
@@ -292,7 +300,15 @@ it.each([
 it('kills a hung invocation and permits a later turn in the same native session', async () => {
   const { h, send } = runner(['--turn-timeout-ms', '1000']); send('hang', 'one');
   await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
-  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('中断或超时');
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('单轮总预算已耗尽（1000ms）');
   send('next', 'two'); await waitFor(() => markers(h.stdout).filter(m => m.kind === 'final').length === 2);
   expect(markers(h.stdout).filter(m => m.kind === 'final')[1].payload.content).toBe('answer:next');
+});
+
+it('rejects a timer overflow before starting native work', async () => {
+  const { h } = runner(['--turn-timeout-ms', '2147483648']);
+  await waitFor(() => h.child.exitCode !== null);
+  expect(await h.closed).toEqual({ code: 2, signal: null });
+  expect(h.stderr).toContain('valid permission policy and timeout');
+  expect(existsSync(h.log)).toBe(false);
 });

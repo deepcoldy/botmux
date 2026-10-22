@@ -8606,11 +8606,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       });
     }
   }
-  // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
-  // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
+  // Per-bot dsh / MiniMax runner turn budget (`--turn-timeout-ms`). The
   // field is optional in the body, so distinguish absent (preserve) from
   // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
-  const supportsTurnTimeout = selected.cliId === 'dsh';
+  const supportsTurnTimeout = selected.cliId === 'dsh' || selected.cliId === 'minimax';
   const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
   let nextTurnTimeoutMs: number | undefined;
   if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {

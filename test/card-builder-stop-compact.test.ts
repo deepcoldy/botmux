@@ -198,7 +198,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 
   it('is hidden for the runner CLIs specifically (mira/mir/dsh/ebsd — /compact would be dropped or sent as a user message)', () => {
-    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd']) {
+    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd', 'minimax']) {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }

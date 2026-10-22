@@ -144,7 +144,7 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
 
 /**
- * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * Upper bound for a per-bot runner turn timeout. Node's `setTimeout` delay
  * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
  * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
  * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
@@ -1549,7 +1549,8 @@ export interface BotConfig {
    * it as `--turn-timeout-ms` to arm the runner's idle watchdog (with a hard
    * cap of 4x this value). Positive integer only; unset/≤0/non-integer means
    * no watchdog is armed (the default — a turn runs until dsh reports idle).
-   * Only affects the `dsh` CLI adapter; other adapters ignore the field.
+   * MiniMax also accepts this field as a total execution budget (human waits pause it).
+   * Other adapters ignore the field.
    */
   turnTimeoutMs?: number;
   /**

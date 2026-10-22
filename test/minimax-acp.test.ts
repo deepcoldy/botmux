@@ -7,6 +7,7 @@ import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { isLinuxZombie } from '../src/utils/process-identity.js';
+import { createServer, type ServerResponse } from 'node:http';
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
@@ -369,10 +370,79 @@ it.each([false, true])('default ACP runner preserves queue attribution, native i
     send('hang', 'three'); await waitFor(() => existsSync(f.log) && f.calls().some(c => c.message?.params?.prompt?.[0]?.text === 'hang'));
     child.stdin.write('\x03');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 3);
+    expect(markers().filter(m => m.kind === 'final').at(-1)?.payload.content).toBe('MiniMax Code 本轮执行已中断。');
     send('healthy', 'four');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 4);
     expect(markers().filter(m => m.kind === 'final').at(-1)?.payload).toMatchObject({ turnId: 'four', content: 'answer:healthy' });
     expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 4 : 3);
     expect(markers().filter(m => m.kind === 'thread')).toEqual([{ kind: 'thread', payload: { threadId: 'session_fixture' } }]);
   } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it.each([false, true])('exhausts the cumulative budget despite progress and runs the queued turn (resume: %s)', async resume => {
+  const f = fixture();
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--data-dir', join(f.root, 'data'), '--turn-timeout-ms', '2000',
+    ...(resume ? ['--native-session-id', 'session_fixture'] : [])], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  const send = (content: string, replyTurnId: string) => child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId })).toString('base64')}\n`);
+  try {
+    await waitFor(() => stdout.includes('ready'));
+    send('progress-hang', 'budget');
+    // Queue only after native execution is observed; no stdout chunk assumptions.
+    await waitFor(() => stdout.includes('progress-2'));
+    send('healthy', 'queued');
+    await waitFor(() => finals().length === 2);
+    expect(finals()[0]).toMatchObject({ turnId: 'budget', content: expect.stringContaining('单轮总预算已耗尽（2000ms）') });
+    expect(finals()[0].content).toContain('模型输出和工具进度不会重置');
+    expect(finals()[1]).toMatchObject({ turnId: 'queued', content: 'answer:healthy' });
+    expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 2 : 1);
+    await stopped(f.calls()[0].pid);
+    await waitFor(() => stdout.endsWith('›\n'));
+  } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it.each(['permission', 'permission-hang'])('pauses the runner budget for a human and resumes accounting after %s', async content => {
+  const f = fixture();
+  mkdirSync(join(f.root, '.botmux'), { mode: 0o700 });
+  writeFileSync(join(f.root, '.botmux/.dashboard-secret'), 'isolated-test-secret', { mode: 0o600 });
+  let pendingAsk: { res: ServerResponse; body: any } | undefined;
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    pendingAsk = { res, body: JSON.parse(body) };
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--turn-timeout-ms', '2000'], { env: { ...f.options.env, HOME: f.root,
+      BOTMUX_SESSION_ID: 'budget-session', BOTMUX_LARK_APP_ID: 'budget-app', BOTMUX_CHAT_ID: 'budget-chat',
+      BOTMUX_DAEMON_IPC_PORT: String(port) } }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  try {
+    child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId: 'human' })).toString('base64')}\n`);
+    await waitFor(() => !!pendingAsk || finals().length > 0);
+    expect(finals()).toEqual([]);
+    expect(pendingAsk!.body).toMatchObject({ originTurnId: 'human', sessionId: 'budget-session' });
+    // Deliberately cross the configured budget AFTER observing the blocked Ask.
+    // This is the timer boundary under test, not a sleep to guess readiness.
+    await new Promise(r => setTimeout(r, 2500));
+    expect(finals()).toEqual([]);
+    expect(pendingAsk!.res.destroyed).toBe(false);
+    const key = pendingAsk!.body.questions[0].options[1].key;
+    pendingAsk!.res.setHeader('content-type', 'application/json');
+    pendingAsk!.res.end(JSON.stringify({ kind: 'answered', answers: [[key]] }));
+    await waitFor(() => finals().length === 1);
+    expect(finals()[0]).toMatchObject({ turnId: 'human', content: expect.stringContaining(
+      content === 'permission' ? 'deny' : '单轮总预算已耗尽（2000ms）') });
+    if (content === 'permission-hang') expect(stdout).toContain('progress-2');
+  } finally {
+    child.kill('SIGTERM'); await closed;
+    await new Promise<void>(r => server.close(() => r()));
+  }
 });
