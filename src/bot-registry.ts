@@ -1545,11 +1545,12 @@ export interface BotConfig {
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
-   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * Per-bot dsh / MiniMax runner timeout in milliseconds. The dsh adapter forwards
    * it as `--turn-timeout-ms` to arm the runner's idle watchdog (with a hard
    * cap of 4x this value). Positive integer only; unset/≤0/non-integer means
    * no watchdog is armed (the default — a turn runs until dsh reports idle).
-   * MiniMax also accepts this field as a total execution budget (human waits pause it).
+   * MiniMax uses an opt-in total execution budget (human waits pause it).
+   * Both runners leave turn duration unlimited when this field is absent.
    * Other adapters ignore the field.
    */
   turnTimeoutMs?: number;

@@ -3117,7 +3117,7 @@ export function BotAgentSection(props: {
       {supportsTurnTimeout && (
         <div className="bd-row">
           <label>
-            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            <FieldTitle help={tr(isDsh ? 'botDefaults.agentTurnTimeoutHelp' : 'botDefaults.minimaxTurnBudgetHelp')}>{tr(isDsh ? 'botDefaults.agentTurnTimeout' : 'botDefaults.minimaxTurnBudget')}</FieldTitle>
             <input
               type="number"
               min={0}

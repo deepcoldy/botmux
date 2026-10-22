@@ -370,7 +370,7 @@ it.each([false, true])('default ACP runner preserves queue attribution, native i
     send('hang', 'three'); await waitFor(() => existsSync(f.log) && f.calls().some(c => c.message?.params?.prompt?.[0]?.text === 'hang'));
     child.stdin.write('\x03');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 3);
-    expect(markers().filter(m => m.kind === 'final').at(-1)?.payload.content).toBe('MiniMax Code 本轮执行已中断。');
+    expect(markers().filter(m => m.kind === 'final').at(-1)?.payload.errorCode).toBe('cancelled');
     send('healthy', 'four');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 4);
     expect(markers().filter(m => m.kind === 'final').at(-1)?.payload).toMatchObject({ turnId: 'four', content: 'answer:healthy' });
@@ -396,8 +396,7 @@ it.each([false, true])('exhausts the cumulative budget despite progress and runs
     await waitFor(() => stdout.includes('progress-2'));
     send('healthy', 'queued');
     await waitFor(() => finals().length === 2);
-    expect(finals()[0]).toMatchObject({ turnId: 'budget', content: expect.stringContaining('单轮总预算已耗尽（2000ms）') });
-    expect(finals()[0].content).toContain('模型输出和工具进度不会重置');
+    expect(finals()[0]).toMatchObject({ turnId: 'budget', errorCode: 'turn_budget_exhausted' });
     expect(finals()[1]).toMatchObject({ turnId: 'queued', content: 'answer:healthy' });
     expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 2 : 1);
     await stopped(f.calls()[0].pid);
@@ -438,9 +437,14 @@ it.each(['permission', 'permission-hang'])('pauses the runner budget for a human
     pendingAsk!.res.setHeader('content-type', 'application/json');
     pendingAsk!.res.end(JSON.stringify({ kind: 'answered', answers: [[key]] }));
     await waitFor(() => finals().length === 1);
-    expect(finals()[0]).toMatchObject({ turnId: 'human', content: expect.stringContaining(
-      content === 'permission' ? 'deny' : '单轮总预算已耗尽（2000ms）') });
-    if (content === 'permission-hang') expect(stdout).toContain('progress-2');
+    expect(finals()[0].turnId).toBe('human');
+    if (content === 'permission-hang') {
+      expect(finals()[0].errorCode).toBe('turn_budget_exhausted');
+      expect(stdout).toContain('progress-2');
+    } else {
+      expect(finals()[0].errorCode).toBeUndefined();
+      expect(finals()[0].content).toContain('deny');
+    }
   } finally {
     child.kill('SIGTERM'); await closed;
     await new Promise<void>(r => server.close(() => r()));

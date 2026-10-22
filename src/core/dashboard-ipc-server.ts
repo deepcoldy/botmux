@@ -8606,7 +8606,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       });
     }
   }
-  // Per-bot dsh / MiniMax runner turn budget (`--turn-timeout-ms`). The
+  // Per-bot dsh / MiniMax runner timeout (`--turn-timeout-ms`). The
   // field is optional in the body, so distinguish absent (preserve) from
   // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
   const supportsTurnTimeout = selected.cliId === 'dsh' || selected.cliId === 'minimax';

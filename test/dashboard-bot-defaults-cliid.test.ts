@@ -1187,7 +1187,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      // Empty → '' so the daemon deletes the field (revert to 10-min default).
+      // Empty → '' so the daemon deletes the field (remove the opt-in limit).
       expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;

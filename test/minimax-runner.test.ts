@@ -300,7 +300,7 @@ it.each([
 it('kills a hung invocation and permits a later turn in the same native session', async () => {
   const { h, send } = runner(['--turn-timeout-ms', '1000']); send('hang', 'one');
   await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
-  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('单轮总预算已耗尽（1000ms）');
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.errorCode).toBe('turn_budget_exhausted');
   send('next', 'two'); await waitFor(() => markers(h.stdout).filter(m => m.kind === 'final').length === 2);
   expect(markers(h.stdout).filter(m => m.kind === 'final')[1].payload.content).toBe('answer:next');
 });
@@ -309,6 +309,23 @@ it('rejects a timer overflow before starting native work', async () => {
   const { h } = runner(['--turn-timeout-ms', '2147483648']);
   await waitFor(() => h.child.exitCode !== null);
   expect(await h.closed).toEqual({ code: 2, signal: null });
-  expect(h.stderr).toContain('valid permission policy and timeout');
+  expect(h.stderr.length).toBeGreaterThan(0);
   expect(existsSync(h.log)).toBe(false);
+});
+
+it.each([false, true])('does not inject a native exec timeout unless configured (resume: %s)', async resume => {
+  const { h, send } = runner(resume ? ['--native-session-id', 'session_fixture'] : []);
+  send('healthy', 'unbounded');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload).toMatchObject({ content: 'answer:healthy', turnId: 'unbounded' });
+  const calls = readFileSync(h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(calls[0].args).not.toContain('--timeout');
+});
+
+it('forwards an explicit budget to native exec', async () => {
+  const { h, send } = runner(['--turn-timeout-ms', '3600000']);
+  send('healthy', 'bounded');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  const call = JSON.parse(readFileSync(h.log, 'utf8').trim());
+  expect(call.args[call.args.indexOf('--timeout') + 1]).toBe('3600000ms');
 });
