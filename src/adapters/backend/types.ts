@@ -163,7 +163,10 @@ export interface BackendTurnFailure {
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
+  // a tmux target without it lives on the default server (every older row).
+  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
   | {

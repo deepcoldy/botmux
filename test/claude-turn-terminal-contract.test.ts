@@ -4,6 +4,7 @@ import {
   isClaudeTurnTerminalEvent,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
+import { localTurnFailureNotice, type LocalTurnFailureNotice } from '../src/services/local-turn-failure.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 
 type TerminalStatus = 'completed' | 'failed' | 'ambiguous';
@@ -39,9 +40,15 @@ function turnDuration(uuid: string): TranscriptEvent {
 
 /** Same two primitives used by worker.ts: transcript attribution + terminal IPC dedup. */
 class ContractHarness {
-  readonly queue = new BridgeTurnQueue();
+  readonly localTurnsStarted: string[] = [];
+  readonly queue = new BridgeTurnQueue(turn => { this.localTurnsStarted.push(turn.turnId); });
   readonly deduper = new TurnTerminalDeduper();
   readonly emitted: Terminal[] = [];
+  readonly notices: LocalTurnFailureNotice[] = [];
+
+  /** `liveSinceMs` stands in for the worker's process start: failures recorded
+   *  before it are replayed history. */
+  constructor(private readonly liveSinceMs = Number.POSITIVE_INFINITY) {}
 
   mark(turnId: string, content: string, dispatchAttempt: number): void {
     this.queue.mark(turnId, makeFingerprint(content), 100, content, dispatchAttempt);
@@ -49,13 +56,34 @@ class ContractHarness {
 
   ingest(events: TranscriptEvent[]): void {
     this.queue.ingest(events, '/tmp/claude-session.jsonl');
-    for (const turn of this.queue.drainEmittable({ explicitTerminalOnly: true })) {
+    this.settle(this.queue.drainEmittable({ explicitTerminalOnly: true }));
+  }
+
+  /** The worker's prompt-ready drain (bridgeDrainAndMaybeEmit). */
+  idle(): void {
+    this.settle(this.queue.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true }));
+  }
+
+  /** drainReliableTerminalBeforeInterrupt: the CLI is about to go away. */
+  preExitDrain(): void {
+    this.settle(this.queue.drainEmittable({
+      terminalBoundary: true, requireExplicitTerminalForDurable: true, releaseHeldTerminals: true,
+    }));
+  }
+
+  private settle(ready: ReturnType<BridgeTurnQueue['drainEmittable']>): void {
+    for (const turn of ready) {
       if (turn.rateLimited) continue;
       const outcome = turn.terminalOutcome;
       // Mirrors worker.ts emitReadyTurns: a SYNTHESISED local turn has no Lark
       // turn behind it, so its failure must not reach the daemon (which would
-      // render a user-facing 「本轮执行失败」card for a turn nobody sent).
-      if (turn.isLocal && outcome && outcome.status !== 'completed') continue;
+      // render a user-facing 「本轮执行失败」card for a turn nobody sent). One
+      // the worker watched happen is announced with a notice instead.
+      if (turn.isLocal && outcome && outcome.status !== 'completed') {
+        const notice = localTurnFailureNotice(turn, { liveSinceMs: this.liveSinceMs, zeroPromptTerminalSync: false });
+        if (notice) this.notices.push(notice);
+        continue;
+      }
       this.emit(
         turn.turnId,
         turn.dispatchAttempt!,
@@ -270,6 +298,150 @@ describe('Claude durable turn terminal contract', () => {
   });
 
   /**
+   * Claude Code writes ONE record per content block and stamps every one with
+   * the message's stop reason. A final message of thinking + text is two
+   * records that both say `end_turn`; when the stream dies after them, an
+   * API-error record and `turn_duration` follow. The reader can stop anywhere
+   * in between (Claude Code flushes in chunks; the idle edge can beat the
+   * flush). Production: a 47-minute review turn was settled as COMPLETED on its
+   * thinking block, the text block became a `local-headless-*` turn, and the
+   * `provider_server_error` that cut the stream failed that local turn — the
+   * group saw a finished turn and no failure.
+   */
+  describe('a final message split across transcript reads', () => {
+    function block(uuid: string, messageId: string, content: unknown[], stopReason: string): TranscriptEvent {
+      return {
+        type: 'assistant',
+        uuid,
+        message: { id: messageId, role: 'assistant', content, stop_reason: stopReason },
+      } as TranscriptEvent;
+    }
+    const thinking = (uuid: string, msg: string) => block(uuid, msg, [{ type: 'thinking', thinking: 'wrap up' }], 'end_turn');
+    const text = (uuid: string, msg: string, body: string) => block(uuid, msg, [{ type: 'text', text: body }], 'end_turn');
+    const connectionLost = (uuid: string): TranscriptEvent => ({
+      type: 'assistant',
+      uuid,
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: Connection lost mid-response. The response above may be incomplete.' }],
+      },
+    } as TranscriptEvent);
+
+    /** A previous, normally finished turn: proves the CLI writes the marker. */
+    function finishedTurn(h: ContractHarness): void {
+      h.mark('earlier', 'earlier prompt', 1);
+      h.ingest([user('u0', 'earlier prompt'), text('a0', 'msg-0', 'earlier answer'), turnDuration('d0')]);
+      h.emitted.length = 0;
+    }
+
+    it('fails the Lark turn when the stream dies after the read stopped on its thinking block', () => {
+      const h = new ContractHarness(0);
+      finishedTurn(h);
+      h.mark('review', 'please re-review', 1);
+      h.ingest([user('u1', 'please re-review'), thinking('a-think', 'msg-1')]);
+      expect(h.emitted).toEqual([]);
+      h.ingest([text('a-text', 'msg-1', 'posting the review now'), connectionLost('err'), turnDuration('d1')]);
+
+      expect(h.emitted).toEqual([{
+        turnId: 'review',
+        dispatchAttempt: 1,
+        status: 'failed',
+        errorCode: 'provider_server_error',
+        retryable: true,
+      }]);
+      expect(h.localTurnsStarted).toEqual([]);
+      expect(h.notices).toEqual([]);
+    });
+
+    it('does not let the idle edge settle it between the two reads either', () => {
+      const h = new ContractHarness(0);
+      finishedTurn(h);
+      h.mark('review', 'please re-review', 1);
+      h.ingest([user('u1', 'please re-review'), thinking('a-think', 'msg-1')]);
+      h.idle();
+      expect(h.emitted).toEqual([]);
+      h.ingest([text('a-text', 'msg-1', 'posting the review now'), connectionLost('err'), turnDuration('d1')]);
+      expect(h.emitted.map(e => [e.turnId, e.status])).toEqual([['review', 'failed']]);
+      expect(h.localTurnsStarted).toEqual([]);
+    });
+
+    it('keeps the answer text of a split final message on an ordinary (non-durable) Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      q.absorb([turnDuration('history-d')]);
+      q.mark('ordinary', makeFingerprint('plain question'), 100, 'plain question');
+      q.ingest([user('u1', 'plain question'), thinking('a-think', 'msg-1')]);
+      expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+      q.ingest([text('a-text', 'msg-1', 'the answer')]);
+      expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+      q.ingest([turnDuration('d1')]);
+
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => [t.turnId, t.terminalOutcome?.status])).toEqual([['ordinary', 'completed']]);
+      expect(ready[0].assistantUuids).toEqual(['a-text']);
+      expect(q.peek()).toEqual([]);
+    });
+
+    it('waits for the marker on the first turn after a restart once the baseline probe saw one', () => {
+      const h = new ContractHarness(0);
+      h.queue.noteDurationMarkerObserved();
+      h.mark('review', 'please re-review', 1);
+      h.ingest([user('u1', 'please re-review'), thinking('a-think', 'msg-1')]);
+      expect(h.emitted).toEqual([]);
+      h.ingest([text('a-text', 'msg-1', 'posting the review now'), connectionLost('err'), turnDuration('d1')]);
+      expect(h.emitted.map(e => [e.turnId, e.status])).toEqual([['review', 'failed']]);
+    });
+
+    it('still settles on the stop_reason for a transcript that has never written the marker', () => {
+      // Older Claude JSONL without turn_duration: holding would leave every
+      // turn open until the next message.
+      const h = new ContractHarness(0);
+      h.mark('old-shape', 'old prompt', 1);
+      h.ingest([user('u1', 'old prompt'), text('a1', 'msg-1', 'answer')]);
+      expect(h.emitted).toEqual([{ turnId: 'old-shape', dispatchAttempt: 1, status: 'completed' }]);
+    });
+
+    it('releases a held turn to the pre-exit drain, so cli_exit cannot mark it ambiguous', () => {
+      // The marker is ~1s behind the final block (p50 0.93s, p99 4.2s): a CLI
+      // killed in that window never writes it. A completed durable turn left
+      // held would lose the deduper to `cli_exit` and be replayed.
+      const done = new ContractHarness(0);
+      finishedTurn(done);
+      done.mark('durable', 'durable prompt', 3);
+      done.ingest([user('u1', 'durable prompt'), text('a1', 'msg-1', 'answer')]);
+      done.idle();
+      expect(done.emitted).toEqual([]);
+      done.preExitDrain();
+      done.exit('durable', 3);
+      expect(done.emitted).toEqual([{ turnId: 'durable', dispatchAttempt: 3, status: 'completed' }]);
+
+      // Same window, but the stream had already died: the failure is the answer.
+      const cut = new ContractHarness(0);
+      finishedTurn(cut);
+      cut.mark('durable', 'durable prompt', 3);
+      cut.ingest([user('u1', 'durable prompt'), thinking('a-think', 'msg-1'), connectionLost('err')]);
+      cut.preExitDrain();
+      cut.exit('durable', 3);
+      expect(cut.emitted.map(e => [e.status, e.errorCode])).toEqual([['failed', 'provider_server_error']]);
+    });
+
+    it('releases a held turn when the next turn starts without its marker', () => {
+      const h = new ContractHarness(0);
+      finishedTurn(h);
+      h.mark('first', 'first prompt', 1);
+      h.mark('second', 'second prompt', 1);
+      h.ingest([user('u1', 'first prompt'), text('a1', 'msg-1', 'first answer')]);
+      expect(h.emitted).toEqual([]);
+      h.ingest([user('u2', 'second prompt')]);
+      expect(h.emitted).toEqual([{ turnId: 'first', dispatchAttempt: 1, status: 'completed' }]);
+      expect(h.queue.peek().map(t => t.turnId)).toEqual(['second']);
+    });
+  });
+
+  /**
    * A synthesised local turn must never raise a user-visible failure.
    *
    * `local-*` / `local-headless-*` ids are minted by the attribution queue for
@@ -351,6 +523,34 @@ describe('Claude durable turn terminal contract', () => {
         errorCode: 'provider_server_error',
         retryable: true,
       }]);
+    });
+
+    it('announces a local turn that fails while the worker watches — still no terminal', () => {
+      // The silence above exists for history replayed after a restart. A
+      // failure recorded after this worker started is live: the CLI stopped
+      // mid-work and the group must hear about it.
+      const h = new ContractHarness(Date.parse('2026-10-21T15:00:00Z'));
+      h.mark('delivery-1', 'a real lark prompt', 1);
+      h.ingest([user('u1', 'a real lark prompt'), assistant('a1', 'done', 'end_turn'), turnDuration('dur-1')]);
+      h.ingest([
+        user('local-u', 'typed straight into the pane'),
+        assistant('local-a', 'partial work', 'tool_use'),
+        { ...connectionLost('local-err'), timestamp: '2026-10-21T15:40:01.328Z' } as TranscriptEvent,
+        turnDuration('local-dur'),
+      ]);
+      expect(h.emitted.map(e => e.turnId)).toEqual(['delivery-1']);
+      expect(h.notices).toEqual([{ errorCode: 'provider_server_error', replyTurnId: 'delivery-1' }]);
+    });
+
+    it('keeps a failure replayed from before the worker started silent', () => {
+      const h = new ContractHarness(Date.parse('2026-10-21T15:00:00Z'));
+      h.ingest([
+        user('local-u', 'typed straight into the pane'),
+        { ...connectionLost('local-err'), timestamp: '2026-10-21T05:17:00.000Z' } as TranscriptEvent,
+        turnDuration('local-dur'),
+      ]);
+      expect(h.emitted).toEqual([]);
+      expect(h.notices).toEqual([]);
     });
 
     it('still emits a local turn\'s COMPLETED terminal (bookkeeping, invisible to the user)', () => {

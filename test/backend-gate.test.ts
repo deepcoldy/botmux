@@ -185,6 +185,8 @@ describe('read-isolation persistent-pane teardown', () => {
   // 状态机/执行器的真值表与顺序在 read-isolation.test.ts 有行为测试，这里守 worker 闭包里的接线：三态存活
   // 探测喂给状态机（unknown → 拒启）、kill 与 post-kill 探测针对重选前捕获的同一 target、只有权威 'missing'
   // 才算拆除成功，之后才重选后端。否则会围着一个可能仍存活、仍在旧围栏下的 pane 发布新一代（#899）。
+  // post-kill 探测走 after-kill 版本：只对 kill 刚让 tmux server 退出时的瞬时 unknown 有界重探，重探完仍
+  // unknown 照样拒启（行为由 sandbox-relay-lifecycle 的形态切换注入用例守）。
   it('fails closed unless the exact captured stale target is proven gone before re-selection', () => {
     const start = workerSource.indexOf('evaluatePersistentPaneMigration({');
     const end = workerSource.indexOf('executePersistentPaneMigration(migration', start);
@@ -198,7 +200,7 @@ describe('read-isolation persistent-pane teardown', () => {
     expect(capture).not.toBeNull();
     const target = capture![1];
     const kill = block.indexOf(`killPersistentBackendTarget(${target}`, capture!.index);
-    const probe = block.indexOf(`probePersistentBackendTarget(${target})`, kill);
+    const probe = block.indexOf(`probePersistentBackendTargetAfterKill(${target})`, kill);
     const strict = block.indexOf("postKillProbe !== 'missing'", probe);
     const reselect = block.indexOf('selectedBackend = selectBackend();', strict);
     expect(kill).toBeGreaterThan(capture!.index!);

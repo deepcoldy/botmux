@@ -126,7 +126,11 @@ console.log('Ready >'); setInterval(() => {}, 1 << 30);
       };
       if (opts.credentialOnly) return read(capabilityLeaf);
       const markers = join(dataDir, '.botmux-cli-pids');
-      const names = existsSync(markers) ? readdirSync(markers) : [];
+      // Only pid-named entries are markers (production looks them up by pid).
+      // A rewrite's `<pid>.lock` / atomic-write tmp siblings would otherwise
+      // make the count 2 ('absent'), and before the first marker lands the lock
+      // alone would read as a turnless marker.
+      const names = existsSync(markers) ? readdirSync(markers).filter(name => /^\d+$/.test(name)) : [];
       return names.length === 1 ? read(join(markers, names[0]!)) : 'absent';
     },
     start(bootId: string, turn?: string): { worker: ChildProcess; logs: () => string } {
@@ -225,15 +229,24 @@ describe('credential-only relay across a real worker lifecycle (tmux)', () => {
         try {
           const first = lab.start('boot-1', 'om_turn_live');
           await vi.waitFor(() => expect(lab.reports().length, first.logs()).toBe(1), { timeout: 30_000 });
-          await vi.waitFor(() => expect(lab.sendTurnIdentity(), first.logs()).toBe('om_turn_live'), { timeout: 15_000 });
-          const during = lab.sendTurnIdentity();
+          // Return the sample the poll accepted instead of reading again: a
+          // second read after the poll gets no retry if it lands in a transient.
+          const during = await vi.waitFor(() => {
+            const identity = lab.sendTurnIdentity();
+            expect(identity, first.logs()).toBe('om_turn_live');
+            return identity;
+          }, { timeout: 15_000 });
           await lab.stop(first.worker, 'SIGTERM');
           expect(lab.paneAlive()).toBe(true);
           const second = lab.start('boot-2');
           await vi.waitFor(() => expect(second.logs()).toMatch(/Re-attaching to existing tmux session/), { timeout: 30_000 });
-          await vi.waitFor(() => expect(lab.sendTurnIdentity(), second.logs()).not.toBe('absent'), { timeout: 15_000 });
+          const afterRestore = await vi.waitFor(() => {
+            const identity = lab.sendTurnIdentity();
+            expect(identity, second.logs()).not.toBe('absent');
+            return identity;
+          }, { timeout: 15_000 });
           expect(lab.reports(), second.logs()).toHaveLength(1); // reattached, not cold-spawned
-          return { during, afterRestore: lab.sendTurnIdentity() };
+          return { during, afterRestore };
         } finally {
           await lab.dispose();
         }

@@ -1,4 +1,5 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import {
   chmodSync,
   existsSync,
@@ -250,7 +251,7 @@ afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
   for (const session of tmuxSessions) {
-    try { execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'ignore' }); } catch { /* gone */ }
+    killWorkerTmuxSession(session);
   }
   tmuxSessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });

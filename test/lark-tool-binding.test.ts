@@ -131,6 +131,14 @@ describe('managed lark-cli binding', () => {
     expect(userEnv.LARKSUITE_CLI_APP_SECRET).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_TENANT_ACCESS_TOKEN).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('own-user');
+    expect(userEnv.LARKSUITE_CLI_APP_ID).toBe(defaults.appId);
+    // A platform-issued user grant runs under the platform's application; a bot
+    // call can never be moved off the bound application.
+    const platformUserEnv = larkToolChildEnv(botEnv, first, { mode: 'user', credential: 'platform-user', appId: 'cli_platform' });
+    expect(platformUserEnv.LARKSUITE_CLI_APP_ID).toBe('cli_platform');
+    expect(platformUserEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('platform-user');
+    expect(platformUserEnv.LARKSUITE_CLI_CONFIG_DIR).toBe(first.configDir);
+    expect(larkToolChildEnv(botEnv, first, { mode: 'bot', credential: 'bot-token', appId: 'cli_platform' }).LARKSUITE_CLI_APP_ID).toBe(defaults.appId);
     expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
     expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
     expect(larkToolPromptFromEnv('en', {})).toBe('');

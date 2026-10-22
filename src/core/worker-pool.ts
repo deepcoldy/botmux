@@ -124,7 +124,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
-import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -133,6 +133,7 @@ import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../ser
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
@@ -153,7 +154,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, probePersistentBackendTargets, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentBackendTargets, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -398,7 +399,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     : 'filesystem';
 }
 
-function prepareAdoptedReplyImages(
+function prepareLocalReplyImages(
   ds: DaemonSession,
   markdown: string,
   state: ReplyImageState,
@@ -406,12 +407,20 @@ function prepareAdoptedReplyImages(
 ): Promise<string> {
   const botCfg = getBot(ds.larkAppId).config;
   const workingDir = ds.workingDir ?? ds.session.workingDir ?? ds.adoptedFrom?.cwd;
-  if (!(ds.adoptedFrom || ds.session.adoptedFrom) || !workingDir || ds.session.vcMeetingReceiver
+  const codexApp = isCodexAppCliId(sessionCliId(ds, botCfg));
+  // Temporary-image roots (os.tmpdir() + POSIX /tmp) are computed from the
+  // DAEMON's environment. A worker pins its own TMPDIR/TMP/TEMP to its
+  // per-session scratch dir (~/.cache/botmux/session-tmp/…); images a CLI only
+  // ever writes under that worker TMPDIR stay outside this allowlist and are
+  // left as text. That is intentional (the scratch dir is not a stable host
+  // location) and degrades to the permanent-rejection notice below.
+  if (!(ds.adoptedFrom || ds.session.adoptedFrom || codexApp) || !workingDir || ds.session.vcMeetingReceiver
     || botCfg.apiOnly || daemonCardLocalHomeLinkMode(ds) !== 'filesystem'
     || sandboxBoolValue(ds.session.sandbox ?? ds.initConfig?.sandbox ?? botCfg.sandbox)
     || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
   return resolveReplyImages(markdown, {
     workingDir, state,
+    allowTemporaryImages: codexApp,
     owns: () => owns() && ds.session.status !== 'closed',
     upload: bytes => uploadImage(ds.larkAppId, bytes),
   });
@@ -687,7 +696,7 @@ import {
   type ReadonlyTaskContinuationState,
 } from '../services/readonly-task-continuation.js';
 import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
-import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
+import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
@@ -695,6 +704,7 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../services/bots-info-cache.js';
+import { applyInlineMentions } from '../im/lark/inline-mentions.js';
 import {
   claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
@@ -783,7 +793,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
-import { recordDispatchInputCommit } from './dispatch.js';
+import { recordDispatchInputCommit, resolveProseBotMentions } from './dispatch.js';
 import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
@@ -1496,13 +1506,35 @@ const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
 const TURN_TERMINAL_CARRIER_MAX = 64;
 
+type TurnTerminalCarrier = {
+  messageId: string;
+  kind: 'standard_reply_card' | 'non_patchable';
+  responseKind?: 'progress' | 'final' | 'auxiliary';
+};
+
+function isFinalTurnTerminalCarrier(
+  carrier: TurnTerminalCarrier | undefined,
+): carrier is TurnTerminalCarrier {
+  return !!carrier
+    && carrier.responseKind !== 'progress'
+    && carrier.responseKind !== 'auxiliary';
+}
+
 function recordTurnTerminalCarrier(
   ds: DaemonSession,
   turnId: string,
-  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable' },
+  carrier: TurnTerminalCarrier,
 ): void {
   if (!turnId || !carrier.messageId) return;
   const carriers = ds.turnTerminalCarriers ?? (ds.turnTerminalCarriers = new Map());
+  const previous = carriers.get(turnId);
+  // A final is the authoritative completion carrier. Later auxiliary/progress
+  // sends are supplemental and must neither steal its footer patch nor turn
+  // themselves into a completed-turn strip. Undefined preserves rolling
+  // compatibility with workers that predate responseKind propagation.
+  const previousIsFinal = isFinalTurnTerminalCarrier(previous);
+  const nextIsFinal = isFinalTurnTerminalCarrier(carrier);
+  if (previousIsFinal && !nextIsFinal) return;
   carriers.delete(turnId);
   carriers.set(turnId, carrier);
   while (carriers.size > TURN_TERMINAL_CARRIER_MAX) {
@@ -3031,7 +3063,7 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   // Runs on every turn's final output; the cached read only re-parses when
   // a sibling daemon actually rewrote bots-info.json.
   const parsed = readBotsInfoJson(dataDir);
-  const botEntries: BotMentionEntry[] = Array.isArray(parsed) ? parsed as BotMentionEntry[] : [];
+  const botEntries: BotMentionEntry[] = Array.isArray(parsed) ? parsed.filter(isBotMentionEntry) : [];
 
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
@@ -3119,6 +3151,53 @@ function zeroPromptFinalInitiator(
   if (isBot !== undefined) return { openId, isBot };
   try { return { openId, isBot: loadKnownBotOpenIdsForApp(ds.larkAppId).has(openId) }; }
   catch { return { openId, isBot: false }; }
+}
+
+/** Zero-injection workers cannot pass `--mention` either, so a peer bot the
+ * reply names in prose (`@Dev(Claude) 请合并`) is resolved exactly as
+ * `botmux send` resolves it and rewritten in place into a real <at>; without
+ * that the named bot never wakes up. Once the body names a bot, the reply is
+ * addressed to it, not to a human initiator: the footer @ of the human is
+ * dropped, and when the name cannot be resolved nobody is @-ed rather than the
+ * wrong person. A bot initiator keeps its @, since that @ is how it receives
+ * the result (see the automatic report below). Only full display names count:
+ * cliId aliases are gated on the cross-bot session table, which only `botmux
+ * send` reads. `dispatcherOpenId` is never @-ed: a dispatched topic reports to
+ * its dispatcher instead (#1887). */
+function addressZeroPromptReply(
+  ds: DaemonSession,
+  text: string,
+  initiator: ZeroPromptFinalInitiator | null,
+  recipientOpenId: string | undefined,
+  dispatcherOpenId: string | undefined,
+  t: string,
+  turnId: string,
+): { text: string; recipientOpenId: string | undefined } {
+  if (ds.chatType === 'p2p' || !text.includes('@')) return { text, recipientOpenId };
+  let prose: ReturnType<typeof resolveProseBotMentions>;
+  try {
+    const dataDir = config.session.dataDir;
+    const parsed = readBotsInfoJson(dataDir);
+    prose = resolveProseBotMentions({
+      text,
+      botEntries: Array.isArray(parsed) ? parsed.filter(isBotMentionEntry) : [],
+      crossRef: readPeerCrossRef(dataDir, ds.larkAppId),
+      selfAppId: ds.larkAppId,
+      convoBotAppIds: new Set(),
+    });
+  } catch {
+    return { text, recipientOpenId };
+  }
+  if (prose.mentions.length === 0 && prose.unresolved.length === 0) return { text, recipientOpenId };
+  if (prose.unresolved.length > 0) {
+    logger.warn(
+      `[${t}] Zero-prompt final names bot(s) with no cross-ref open_id, not @-ing them `
+      + `(${prose.unresolved.join(', ')}; turn ${turnId.substring(0, 8)})`,
+    );
+  }
+  const inline = applyInlineMentions(text, prose.mentions.filter(m => m.open_id !== dispatcherOpenId));
+  const keepInitiator = initiator?.isBot === true && !!recipientOpenId && !inline.usedIds.has(recipientOpenId);
+  return { text: inline.text, recipientOpenId: keepInitiator ? recipientOpenId : undefined };
 }
 
 /** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
@@ -4895,10 +4974,20 @@ export async function __testOnly_waitForPinStreamingCardIdle(): Promise<void> {
  * accepts another turn is already past startup, so surface the turn as working
  * immediately. The worker's structured lifecycle gate will later publish the
  * authoritative terminal state from updates.jsonl.
+ *
+ * Codex App projects the card from the OBSERVED worker state: a fresh card can
+ * be posted for a message steered into the running turn, a serially queued
+ * follow-up (/queue, multi-human serial groups), or a fresh-ready repost, all
+ * while the worker is already `working`. Same-turn screen_updates only PATCH on
+ * a status edge, so working→working produces no patch and a card posted as
+ * `starting` stays 「启动中…」 for the rest of the turn. Unlike Grok, gate on
+ * `lastScreenStatus === 'working'` so a genuinely cold turn still renders
+ * `starting`; a queued turn gets a real edge when the preceding turn settles.
  */
 export function turnStartingCardStatus(ds: DaemonSession, effectiveCliId: CliId): 'limited' | 'working' | 'starting' {
   if (ds.usageLimit) return 'limited';
   if (effectiveCliId === 'grok' && workerHasInitialized(ds)) return 'working';
+  if (isCodexAppCliId(effectiveCliId) && workerHasInitialized(ds) && ds.lastScreenStatus === 'working') return 'working';
   return 'starting';
 }
 
@@ -6862,7 +6951,8 @@ function retireOrphanedSandboxTree(ds: DaemonSession, target: PersistentBackendT
   const sessionId = ds.session.sessionId;
   try { lstatSync(join(config.session.dataDir, 'sandboxes', sessionId)); } catch { return; } // never sandboxed
   let probe: string;
-  try { probe = probePersistentBackendTarget(target); } catch (err) { probe = `unknown (${err})`; }
+  // Right after the kill: the server may still be exiting (see the helper).
+  try { probe = probePersistentBackendTargetAfterKill(target); } catch (err) { probe = `unknown (${err})`; }
   if (probe !== 'missing') {
     logger.warn(`[${tag(ds)}] killWorker: keeping the sandbox tree — backing session not proven gone (probe: ${probe})`);
     return;
@@ -8415,7 +8505,13 @@ function liveLocalResidual(
  */
 function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   if (getSessionPersistentBackendType(ds) !== 'tmux') return;
-  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  // The worker parks it next to the managed session, whose server may have
+  // changed since (legacy default → dedicated socket), so sweep every candidate.
+  const target = ds.session.persistentBackendTarget;
+  const recordedSocket = target?.backendType === 'tmux' ? target.socketName : undefined;
+  for (const socketName of managedTmuxCandidateSockets(recordedSocket, preferredManagedTmuxSocket())) {
+    try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId), socketName); } catch { /* benign */ }
+  }
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
@@ -8466,6 +8562,18 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
 /** Whether accepted ordinary IM input still awaits worker admission. */
 export function hasPendingOrdinaryImInput(ds: DaemonSession): boolean {
   return [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds);
+}
+
+/** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
+ * right now: same idle-boundary guarantees as reasoning-effort CAS minus the
+ * codex transcript turn-boundary probe. Cold/suspended sessions and non-live
+ * backends are accepted (the command queues until the worker consumes it). */
+export function sessionAcceptsDirectCommand(ds: DaemonSession): boolean {
+  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+    || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
+    || hasPendingOrdinaryImInput(ds)) return false;
+  if (ds.worker && !ds.worker.killed && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return false;
+  return true;
 }
 
 /** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
@@ -8527,8 +8635,8 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
 export interface SuspendBackingVerificationOps {
   kill(target: PersistentBackendTarget, sessionId: string): void;
   probe(target: PersistentBackendTarget): ReturnType<typeof probePersistentBackendTarget>;
-  killDiagnostic?(sessionName: string): void;
-  probeDiagnostic?(sessionName: string): ReturnType<typeof TmuxBackend.probeSession>;
+  killDiagnostic?(sessionName: string, socketName?: string): void;
+  probeDiagnostic?(sessionName: string, socketName?: string): ReturnType<typeof TmuxBackend.probeSession>;
 }
 
 /**
@@ -8544,24 +8652,43 @@ export function destroySuspendBackingVerified(
   ops: SuspendBackingVerificationOps = {
     kill: killPersistentBackendTarget,
     probe: probePersistentBackendTarget,
-    killDiagnostic: sessionName => TmuxBackend.killSession(sessionName),
-    probeDiagnostic: sessionName => TmuxBackend.probeSession(sessionName),
   },
 ): boolean {
   if (ds.crashDiagnosticParked) {
     const diagnosticName = TmuxBackend.diagnosticSessionName(ds.session.sessionId);
-    let diagnosticProbe: ReturnType<typeof TmuxBackend.probeSession> = 'unknown';
+    // The worker parks it next to the managed session, whose server may have
+    // changed since (legacy default → dedicated socket): every candidate server
+    // must positively read 'missing', same set reclaimParkedCrashDiagnostic sweeps
+    // (recorded socket first). Each attempt kills on EVERY candidate before
+    // probing, so one unanswerable server never spares a live shell elsewhere.
+    const recorded = ds.session.persistentBackendTarget;
+    const sockets = managedTmuxCandidateSockets(
+      recorded?.backendType === 'tmux' ? recorded.socketName : undefined,
+      preferredManagedTmuxSocket(),
+    );
+    let unverified: { socketName: string | undefined; probe: ReturnType<typeof TmuxBackend.probeSession> } | null = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName); }
-      catch { /* the post-probe below is authoritative */ }
-      try {
-        diagnosticProbe = (ops.probeDiagnostic ?? TmuxBackend.probeSession)(diagnosticName);
-      } catch { diagnosticProbe = 'unknown'; }
-      if (diagnosticProbe === 'missing') break;
+      for (const socketName of sockets) {
+        try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName, socketName); }
+        catch { /* the post-probe below is authoritative */ }
+      }
+      unverified = null;
+      for (const socketName of sockets) {
+        let probe: ReturnType<typeof TmuxBackend.probeSession>;
+        try {
+          // Teardown-grade: a server that has never run (the default one on a
+          // host whose managed sessions all moved to `-L botmux`) cannot hold
+          // the shell, while a running server that cannot answer — including
+          // one whose socket file was unlinked under it — still fails closed.
+          probe = (ops.probeDiagnostic ?? TmuxBackend.probeSessionForTeardown)(diagnosticName, socketName);
+        } catch { probe = 'unknown'; }
+        if (probe !== 'missing') { unverified = { socketName, probe }; break; }
+      }
+      if (!unverified) break;
     }
-    if (diagnosticProbe !== 'missing') {
+    if (unverified) {
       logger.error(
-        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified probe=${diagnosticProbe}`,
+        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified on ${tmuxServerLabel(unverified.socketName)} probe=${unverified.probe}`,
       );
       return false;
     }
@@ -17773,6 +17900,7 @@ function setupWorkerHandlers(
           recordTurnTerminalCarrier(ds, msg.turnId, {
             messageId: msg.messageId,
             kind: msg.terminalCarrier,
+            ...(msg.responseKind ? { responseKind: msg.responseKind } : {}),
           });
         }
         if (ds.session.principalLane && msg.messageId) {
@@ -18299,15 +18427,31 @@ function setupWorkerHandlers(
         // must retain their pre-existing explicit-@ text receipt instead;
         // managed turns remain suppressed by the existing gate below.
         const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
-        const terminalCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
-        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
+        const visibleCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
+        const terminalCarrier = isFinalTurnTerminalCarrier(visibleCarrier)
+          ? visibleCarrier
+          : undefined;
+        // Positive evidence that the card observed so far is interim output.
+        // The worker queues final_output BEFORE turn_terminal, while the
+        // daemon records a transcript fallback final's carrier only AFTER the
+        // Lark send round-trip — so at this synchronous point an in-flight
+        // fallback still looks like an interim-only turn.
+        const interimCarrierOnly = msg.status === 'completed'
+          && !!visibleCarrier
+          && !terminalCarrier;
+        let terminalReceiptKind: TurnTerminalReceiptKind | undefined;
+        // An explicit progress/auxiliary send is positive proof that the
+        // visible card is non-final. The CLI already persists responseKind;
+        // never overwrite that contract with a mechanical completion footer.
+        if (msg.status === 'completed' && !interimCarrierOnly) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
-          ? (msg.outputDisposition === 'nothing_to_send' && !terminalCarrier ? 'silent' : 'completed')
-          : undefined;
-        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
-          && !!terminalReplyContext
+          terminalReceiptKind = msg.outputDisposition === 'nothing_to_send' && !terminalCarrier
+            ? 'silent'
+            : 'completed';
+        }
+        const terminalReceiptRouteEligible = !!terminalReplyContext
           && !recoveryHandled
           && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
           && !ds.session.vcMeetingReceiver
@@ -18315,6 +18459,15 @@ function setupWorkerHandlers(
           && !botCfg.privateCard
           && replyCardModeFor(ds, msg.turnId) === 'legacy'
           && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
+        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
+          && terminalReceiptRouteEligible;
+        // Interim-only turns get no synchronous footer decision. Wait for the
+        // turn's final-output drain and re-read the carrier: a fallback final
+        // landing in that window is the authoritative completion card and must
+        // still receive its footer; without one the interim card stays
+        // footerless by design (and no claim is left behind).
+        const awaitInterimFinalCarrier = interimCarrierOnly
+          && terminalReceiptRouteEligible;
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
         //   ① mark the session so every idle-card rebuild renders
@@ -18328,7 +18481,7 @@ function setupWorkerHandlers(
         //     it must never re-trigger the bot (or a peer bot) that went quiet.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
-          && !terminalCarrier
+          && !visibleCarrier
           && !ds.session.vcMeetingReceiver) {
           // Consume the origin record ONLY when this attempt could actually post:
           // a suppressed attempt that ate the record would leave a later,
@@ -18382,133 +18535,172 @@ function setupWorkerHandlers(
         // The exact inbound reply context proves this was a Lark turn; unified,
         // card-off/private/doc/meeting/silent-schedule paths keep their existing
         // behavior and failed/ambiguous/cancelled never enter this branch.
-        if (shouldPostTerminalReceipt && terminalReplyContext && terminalReceiptKind) {
+        if (terminalReplyContext && (shouldPostTerminalReceipt || awaitInterimFinalCarrier)) {
           const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
-          if (!settled.has(msg.turnId)) {
-            // Claim before waiting: duplicate terminal IPC and dispatchAttempt
-            // replay cannot race two strips into the same thread.
-            settled.add(msg.turnId);
-            trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
-            const replyTarget = { ...terminalReplyContext.target };
-            const receiptUuid = turnTerminalReceiptUuid(ds.session.sessionId, msg.turnId);
-            // Keep graceful shutdown fenced across the answer drain and the
-            // receipt's own bounded retry pipeline. This registration is
-            // intentionally session-only; adding it to the same per-turn set
-            // would make the receipt wait on itself forever.
-            const finishReceiptDrain = beginFinalOutputDelivery(ds);
-            void (async () => {
-              try {
-                // A transcript fallback final can still be in-flight when the
-                // ordered terminal IPC arrives. Never settle the UI before its
-                // delivery has either succeeded or exhausted retries.
-                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+          const replyTarget = { ...terminalReplyContext.target };
+          const receiptUuid = turnTerminalReceiptUuid(ds.session.sessionId, msg.turnId);
+          // Carrier routing after the answer drain, shared by the immediate
+          // receipt and the deferred interim decision. The caller owns the
+          // claim, the drain fence and error handling.
+          const routeAfterDrain = async (kind: TurnTerminalReceiptKind): Promise<void> => {
+            const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+            if (carrier?.kind === 'standard_reply_card') {
+              for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+                const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+                if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
                 if (!ownsLifecycleMutation()) return;
-
-                const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
-                if (carrier?.kind === 'standard_reply_card') {
-                  for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
-                    const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
-                    if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                    if (!ownsLifecycleMutation()) return;
-                    try {
-                      if (await patchTurnTerminalCarrier(
-                        ds,
-                        carrier.messageId,
-                        terminalReceiptKind,
-                      )) return;
-                      // A marker can outlive a manually replaced/non-card
-                      // message. Fall through to the independent strip rather
-                      // than retrying a structurally unpatchable payload.
-                      break;
-                    } catch (err) {
-                      if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) {
-                        logger.warn(
-                          `[${t}] Terminal carrier PATCH exhausted for `
-                          + `${msg.turnId.substring(0, 8)}: `
-                          + `${err instanceof Error ? err.message : String(err)}`,
-                        );
-                        break;
-                      }
-                      logger.warn(
-                        `[${t}] Terminal carrier PATCH retry ${attempt + 1} for `
-                        + `${msg.turnId.substring(0, 8)}: `
-                        + `${err instanceof Error ? err.message : String(err)}`,
-                      );
-                    }
-                  }
-                }
-
-                // With no explicit/fallback body, the live streaming card is
-                // already the last visible carrier. Keep the thread quiet and
-                // render the terminal wording there. CARD_POSTING_SENTINEL is
-                // also accepted: scheduleActiveRuntimePatch records a pending
-                // refresh that the POST completion immediately reconciles.
-                if (!carrier
-                  && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
-                  && !!ds.streamCardId) {
-                  if (terminalReceiptKind === 'silent') {
-                    ds.silentIdleTurnId = msg.turnId;
-                    ds.completedIdleTurnId = undefined;
-                  } else {
-                    ds.completedIdleTurnId = msg.turnId;
-                    ds.silentIdleTurnId = undefined;
-                  }
-                  if (scheduleActiveRuntimePatch(ds)) return;
-                }
-
-                // An independent strip is meaningful only while this remains
-                // the newest turn. A standard card can still be patched safely
-                // after type-ahead because it is bound to the old turn itself;
-                // a new bottom-of-thread strip would incorrectly claim that the
-                // newer turn is awaiting input.
-                if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
-                  logger.debug(
-                    `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
-                  );
-                  return;
-                }
-
-                for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
-                  const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
-                  if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                  if (!ownsLifecycleMutation()
-                    || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
-                    logger.debug(
-                      `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
-                    );
-                    return;
-                  }
-                  try {
-                    await scopedReply(
-                      buildTurnTerminalReceiptCard(
-                        terminalReceiptKind,
-                        localeForBot(ds.larkAppId),
-                      ),
-                      'interactive',
-                      msg.turnId,
-                      { uuid: receiptUuid, replyTarget },
-                    );
-                    return;
-                  } catch (err) {
-                    if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
+                try {
+                  if (await patchTurnTerminalCarrier(
+                    ds,
+                    carrier.messageId,
+                    kind,
+                  )) return;
+                  // A marker can outlive a manually replaced/non-card
+                  // message. Fall through to the independent strip rather
+                  // than retrying a structurally unpatchable payload.
+                  break;
+                } catch (err) {
+                  if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) {
                     logger.warn(
-                      `[${t}] Terminal receipt retry ${attempt + 1} for `
+                      `[${t}] Terminal carrier PATCH exhausted for `
                       + `${msg.turnId.substring(0, 8)}: `
                       + `${err instanceof Error ? err.message : String(err)}`,
                     );
+                    break;
                   }
+                  logger.warn(
+                    `[${t}] Terminal carrier PATCH retry ${attempt + 1} for `
+                    + `${msg.turnId.substring(0, 8)}: `
+                    + `${err instanceof Error ? err.message : String(err)}`,
+                  );
                 }
+              }
+            }
+
+            // With no explicit/fallback body, the live streaming card is
+            // already the last visible carrier. Keep the thread quiet and
+            // render the terminal wording there. CARD_POSTING_SENTINEL is
+            // also accepted: scheduleActiveRuntimePatch records a pending
+            // refresh that the POST completion immediately reconciles.
+            if (!carrier
+              && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
+              && !!ds.streamCardId) {
+              if (kind === 'silent') {
+                ds.silentIdleTurnId = msg.turnId;
+                ds.completedIdleTurnId = undefined;
+              } else {
+                ds.completedIdleTurnId = msg.turnId;
+                ds.silentIdleTurnId = undefined;
+              }
+              if (scheduleActiveRuntimePatch(ds)) return;
+            }
+
+            // An independent strip is meaningful only while this remains
+            // the newest turn. A standard card can still be patched safely
+            // after type-ahead because it is bound to the old turn itself;
+            // a new bottom-of-thread strip would incorrectly claim that the
+            // newer turn is awaiting input.
+            if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
+              logger.debug(
+                `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+              );
+              return;
+            }
+
+            for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+              const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+              if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+              if (!ownsLifecycleMutation()
+                || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
+                logger.debug(
+                  `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+                );
+                return;
+              }
+              try {
+                await scopedReply(
+                  buildTurnTerminalReceiptCard(
+                    kind,
+                    localeForBot(ds.larkAppId),
+                  ),
+                  'interactive',
+                  msg.turnId,
+                  { uuid: receiptUuid, replyTarget },
+                );
+                return;
               } catch (err) {
-                // No attempt was confirmed. Release the in-memory claim so a
-                // durable replay may compensate; the stable provider UUID
-                // collapses commit-unknown retries at Lark.
+                if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
+                logger.warn(
+                  `[${t}] Terminal receipt retry ${attempt + 1} for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          };
+          if (shouldPostTerminalReceipt && terminalReceiptKind) {
+            if (!settled.has(msg.turnId)) {
+              // Claim before waiting: duplicate terminal IPC and dispatchAttempt
+              // replay cannot race two strips into the same thread.
+              settled.add(msg.turnId);
+              trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
+              // Keep graceful shutdown fenced across the answer drain and the
+              // receipt's own bounded retry pipeline. This registration is
+              // intentionally session-only; adding it to the same per-turn set
+              // would make the receipt wait on itself forever.
+              const finishReceiptDrain = beginFinalOutputDelivery(ds);
+              void (async () => {
+                try {
+                  // A transcript fallback final can still be in-flight when the
+                  // ordered terminal IPC arrives. Never settle the UI before its
+                  // delivery has either succeeded or exhausted retries.
+                  await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                  if (!ownsLifecycleMutation()) return;
+                  await routeAfterDrain(terminalReceiptKind);
+                } catch (err) {
+                  // No attempt was confirmed. Release the in-memory claim so a
+                  // durable replay may compensate; the stable provider UUID
+                  // collapses commit-unknown retries at Lark.
+                  settled.delete(msg.turnId);
+                  logger.warn(
+                    `[${t}] Failed to post terminal receipt for ${msg.turnId.substring(0, 8)}: `
+                    + `${err instanceof Error ? err.message : String(err)}`,
+                  );
+                } finally {
+                  finishReceiptDrain();
+                }
+              })();
+            }
+          }
+          if (awaitInterimFinalCarrier) {
+            // No synchronous claim: a turn whose fallback final never lands
+            // must leave no receipt marker behind. The fence is still needed so
+            // graceful shutdown waits for the deferred decision.
+            const finishInterimDrain = beginFinalOutputDelivery(ds);
+            void (async () => {
+              try {
+                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                if (!ownsLifecycleMutation()) return;
+                // Re-decide against the carrier as it stands after the drain.
+                // Only an authoritative final that actually landed may receive
+                // the completion footer; a still-interim turn stays quiet.
+                const settledCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
+                if (!isFinalTurnTerminalCarrier(settledCarrier)) return;
+                // A replayed terminal IPC on the immediate path may already own
+                // the claim; its footer patch is idempotent via the stable UUID.
+                if (settled.has(msg.turnId)) return;
+                settled.add(msg.turnId);
+                trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
+                await routeAfterDrain('completed');
+              } catch (err) {
+                // Release a claim taken after the drain so a replay can retry.
                 settled.delete(msg.turnId);
                 logger.warn(
-                  `[${t}] Failed to post terminal receipt for ${msg.turnId.substring(0, 8)}: `
+                  `[${t}] Failed to post deferred terminal receipt for ${msg.turnId.substring(0, 8)}: `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
               } finally {
-                finishReceiptDrain();
+                finishInterimDrain();
               }
             })();
           }
@@ -19167,7 +19359,7 @@ function setupWorkerHandlers(
         }
         if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
+        const assistantText = await prepareLocalReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
         if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         // This is a historical exchange, so carry the current display policy
@@ -20315,7 +20507,7 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
-      const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      const renderedAssistantText = await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
       if (!isStillOwned()) { onComplete?.(false); return; }
       const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
         : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
@@ -20324,12 +20516,17 @@ function deliverFinalOutput(
       // report below returns the result to its own session, so no @ here.
       const reportInsteadOfAt = zeroPromptReply && initiator?.isBot === true
         && topicReportsToDispatcher(ds, zeroPromptDispatchRoot);
-      const recipientOpenId = managedReceiver
+      const requesterOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
           ?? (zeroPromptReply
             ? (reportInsteadOfAt ? undefined : initiator?.openId)
             : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+      const zeroPromptAddressed = zeroPromptReply && !imOrigin && msg.turnFailed !== true
+        ? addressZeroPromptReply(ds, renderedAssistantText, initiator, requesterOpenId,
+          reportInsteadOfAt ? initiator?.openId : undefined, t, msg.turnId)
+        : undefined;
+      const recipientOpenId = zeroPromptAddressed ? zeroPromptAddressed.recipientOpenId : requesterOpenId;
       // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
       // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
       // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
@@ -20338,7 +20535,7 @@ function deliverFinalOutput(
         : undefined;
       const deliveredAssistantText = failureMentionOpenId
         ? `<at id=${failureMentionOpenId}></at> ${renderedAssistantText}`
-        : renderedAssistantText;
+        : zeroPromptAddressed?.text ?? renderedAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -20364,7 +20561,8 @@ function deliverFinalOutput(
           feedbackPolicy = undefined;
         }
       }
-      const feedbackRequesterSubjectId = recipientOpenId;
+      // The turn's requester, even when the body addressed the reply elsewhere.
+      const feedbackRequesterSubjectId = requesterOpenId;
       // `reviewers`/`everyone` audiences gate clicks without a human requester,
       // so the control is valid even for an ownerless bot-triggered session with
       // no human recipient; `requester` audience still needs the recipient to be
@@ -20383,6 +20581,24 @@ function deliverFinalOutput(
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
+      const replyCardActionBinding = (() => {
+        // Managed VC receiver cards carry no callback controls (same boundary
+        // that drops feedback and the on-call button). Sandboxed/read-isolated
+        // sessions have no control-card surface at all (see replyCardModeFor);
+        // headless sessions have no IM-driven terminal to act on.
+        if (managedReceiver || replyCardSandboxBlocked(ds) || ds.session.headless
+          || getBot(ds.larkAppId).config.replyCardActions !== true) return undefined;
+        const rootId = sessionAnchorId(ds);
+        const sessionId = ds.session?.sessionId;
+        if (!rootId || !sessionId) return undefined;
+        return {
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          rootId,
+          sessionId,
+          adopt: isSharedAdoptSession(ds),
+        };
+      })();
       let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
@@ -20397,6 +20613,7 @@ function deliverFinalOutput(
             usage: renderSnapshot.usage,
             presentation: renderSnapshot,
             ...(feedback ? { feedback } : {}),
+            ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           })
         : buildCanonicalFinalReplyCard({
             markdown: repairReplyMarkdown(deliveredAssistantText),
@@ -20408,6 +20625,7 @@ function deliverFinalOutput(
             localHomeLinkMode,
             usage: renderSnapshot.usage,
             presentation: renderSnapshot,
+            ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
@@ -20622,6 +20840,7 @@ function deliverFinalOutput(
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
           kind: 'standard_reply_card',
+          responseKind: 'final',
         });
       }
       recordPrimaryOutput(messageId);
@@ -20694,29 +20913,32 @@ function deliverFinalOutput(
         onComplete?.(true);
         return;
       }
-      if (isLarkContentAuditError(err)) {
+      const cardRejected = !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
+        && larkErrorCode(err) === 230099;
+      if (isLarkContentAuditError(err) || cardRejected) {
         const deliveredParts = partialResultMessages();
-        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'content_audit_blocked' },
-          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'content_audit_blocked'));
-        // The platform PERMANENTLY rejected this payload (tenant DLP / content
-        // audit: e.g. an email address or phone number in the answer). Retrying
-        // unchanged cannot succeed and only burns 22s of backoff while leaving
-        // the thread with zero signal — the CoT bubble already says "done".
-        // Post a fixed, audit-safe notice (never the rejected body), settle the
-        // turn, and light the dashboard attention row.
+        const permanentReason = cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: permanentReason },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, permanentReason));
+        // Image downgrade already ran above. A remaining card-content or audit
+        // rejection is permanent for this payload. Retrying it leaves the
+        // Codex runner unacknowledged and restarts the entire retry loop.
+        // Send a fixed notice, settle this output, and preserve the session.
         const auditCode = larkErrorCode(err);
+        const rejection = cardRejected ? 'card content' : 'content audit';
         logger.error(
-          `[${t}] Bridge final_output rejected by Lark content audit code=${auditCode ?? 'unknown'} `
+          `[${t}] Bridge final_output rejected by Lark ${rejection} code=${auditCode ?? 'unknown'} `
           + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
         );
         const locale = localeForBot(ds.larkAppId);
-        const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        const notice = tr(cardRejected ? 'worker.final_output_card_rejected' : 'worker.final_output_content_audit_blocked',
+          { code: String(auditCode ?? 'unknown') }, locale);
         // Feishu IM uuid hard cap is 50 chars; raw sessionId(36)+turnId(~35)
         // concatenation is 80+ and would itself be rejected (silently defeating
         // this very notice) or truncated so multiple blocks share one dedupe key.
         // Hash the composite to a stable 50-char token.
         const noticeUuid = `ab_${createHash('sha256')
-          .update(`audit-blocked:${ds.session.sessionId}:${msg.turnId}`)
+          .update(`${cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
           .digest('hex')
           .slice(0, 47)}`;
         try {
@@ -20724,16 +20946,16 @@ function deliverFinalOutput(
             notice,
             'text',
             msg.replyTurnId ?? msg.turnId,
-            { uuid: noticeUuid },
+            { uuid: noticeUuid, ...(frozenReplyTarget ? { replyTarget: frozenReplyTarget } : {}) },
           );
         } catch (noticeError) {
-          logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
+          logger.warn(`[${t}] ${rejection} notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
         }
-        ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
+        ds.agentAttention = { kind: 'blocked', reason: `${rejection} ${auditCode ?? 'unknown'}`, at: Date.now() };
         publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: 'content_audit_blocked',
-          message: `Lark content audit ${auditCode ?? 'unknown'} rejected the final reply`,
+          reason: cardRejected ? 'card_content_rejected' : 'content_audit_blocked',
+          message: `Lark ${rejection} ${auditCode ?? 'unknown'} rejected the final reply`,
           turnId: msg.turnId,
         });
         // Same content can never be delivered as-is; settle like an explicit
@@ -21650,6 +21872,20 @@ function cleanupPersistentBackendSessions(
   }
   const ownedTargetKeys = new Set(ownedIdsByTarget.keys());
   const listBackingTargets = (): PersistentBackendTarget[] => {
+    if (backendType === 'tmux') {
+      // Managed sessions span the default server (pre-isolation rows / opt-out)
+      // and the dedicated socket(s). Ownership below stays name-keyed, so a row
+      // whose recorded server is stale still protects / releases its pane.
+      const sockets = new Set<string | undefined>([undefined, preferredManagedTmuxSocket()]);
+      for (const session of ownedSessions.concat(runtimeSessionRows.filter(belongsToBackend))) {
+        const target = session.persistentBackendTarget;
+        if (target?.backendType === 'tmux' && target.socketName !== undefined) sockets.add(target.socketName);
+      }
+      return [...sockets].flatMap(socketName => TmuxBackend.listBotmuxSessions(socketName)
+        .map((sessionName): PersistentBackendTarget => (socketName === undefined
+          ? { backendType: 'tmux', sessionName }
+          : { backendType: 'tmux', sessionName, socketName })));
+    }
     if (backendType !== 'zmx') {
       return backend.listBotmuxSessions().map(sessionName => ({ backendType, sessionName }));
     }
@@ -21751,6 +21987,10 @@ function cleanupPersistentBackendSessions(
   };
   const killOwnedBackendSession = (target: PersistentBackendTarget, exactSessionId?: string): void => {
     const name = target.sessionName;
+    if (target.backendType === 'tmux') {
+      TmuxBackend.killSession(name, target.socketName);
+      return;
+    }
     if (backendType !== 'zmx') {
       backend.killSession(name);
       return;

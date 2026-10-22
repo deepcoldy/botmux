@@ -484,6 +484,47 @@ describe('TmuxPipeBackend identity marker vs tmux version (#1959)', () => {
   });
 });
 
+describe('TmuxPipeBackend server selection (dedicated socket)', () => {
+  function everyTmuxCall(): string[] {
+    const fileCalls = mockedExecFileSync.mock.calls
+      .filter(([bin]) => bin === 'tmux')
+      .map(([, args]) => (args as string[]).join(' '));
+    const shellCalls = mockedExecSync.mock.calls
+      .map(([cmd]) => String(cmd))
+      .filter(cmd => cmd.startsWith('tmux'));
+    return [...fileCalls.map(args => `tmux ${args}`), ...shellCalls];
+  }
+
+  it('addresses every command of a managed session to its own server', () => {
+    const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true, socketName: 'botmux' });
+    be.spawn('/bin/true', [], spawnOpts());
+    be.sendText('hello');
+    be.sendSpecialKeys('Enter');
+    be.sendLines(['a', 'b'], 'S-Enter');
+    be.pasteText('multi\nline');
+    be.resize(120, 40);
+    be.getChildPid();
+    be.captureCurrentScreen();
+    be.destroySession();
+    const calls = everyTmuxCall();
+    expect(calls.some(call => call.includes('new-session'))).toBe(true);
+    expect(calls.some(call => call.includes('pipe-pane'))).toBe(true);
+    expect(calls.some(call => call.includes('kill-session'))).toBe(true);
+    // `tmux -V` is the version probe: it reaches no server.
+    expect(calls.filter(call => call !== 'tmux -V' && !call.startsWith('tmux -L botmux '))).toEqual([]);
+  });
+
+  it('keeps adopted user panes on the default server', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    be.sendText('hello');
+    be.kill();
+    const calls = everyTmuxCall();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.filter(call => call.includes('-L '))).toEqual([]);
+  });
+});
+
 describe('TmuxPipeBackend input addressing', () => {
   it('sendText routes to the real pane target', () => {
     const be = new TmuxPipeBackend('0:3.1');

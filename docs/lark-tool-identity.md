@@ -37,6 +37,13 @@ Botmux 提供的短期 bot token。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
+- **绑定会话（`larkToolBinding` 默认开启）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
+  - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。
+  - `platform`：只用平台凭据，不看对 bot 应用的授权。
+  - `local`，或 `triggerUserAuth` 未覆盖 lark-cli：与以前一致，只用对 bot 应用的授权。
+  - `--as bot` 始终是本 bot 应用，不受影响；只有 daemon 明确标注为平台签发的用户票，lark-cli 包装器才接受与绑定应用不同的 app id。
+  - 这种情况下 `botmux auth request` 不再发 bot 应用的设备码链接，而是返回 `platform_authorization_required` 与平台凭据页地址；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
+  - 平台应用拿不到某些敏感权限（例如以用户身份读群聊/私聊消息，全员可见的应用通常批不下来）时，数据若在本 bot 能访问的群或文档里，提示会先引导模型对这次**读取**改用 `--as bot`，再考虑补权限；写操作不改用 bot 身份。执行者由模型在命令里显式选择，包装器不会自动换身份重试。
 
 ## 使用
 
@@ -44,11 +51,11 @@ Botmux 提供的短期 bot token。
 # 默认使用当前机器人的应用身份
 lark-cli docs +fetch --doc <文档链接>
 
-# 需要个人资源或 bot 无权时，使用当前用户对同一应用的授权
+# 需要个人资源或 bot 无权时，以当前用户身份调用
 lark-cli docs +fetch --doc <文档链接> --as user
 ```
 
-应用固定，`--as user` 只改变执行者，不改变 App ID。尚未授权时，可以在当前会话发 `/login`，或由 agent 按操作申请权限：
+`--as bot` 固定使用本 bot 应用。`--as user` 改变执行者：通常仍是本 bot 应用，若该用户只有中心化平台授权（见上节），则以平台应用执行。尚未授权时，可以在当前会话发 `/login`，或由 agent 按操作申请权限：
 
 ```sh
 botmux auth request --scope "docx:document:readonly" --json

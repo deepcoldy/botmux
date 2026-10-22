@@ -250,6 +250,9 @@ function isExclusiveAgentlessHerdrTarget(
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    return TmuxBackend.probeSession(target.sessionName, target.socketName);
+  }
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
   }
@@ -291,6 +294,10 @@ export function killPersistentBackendTarget(
       throw new Error('Herdr whole-session teardown requires an exact exclusive owner target');
     }
     HerdrBackend.killSession(target.sessionName);
+    return;
+  }
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    TmuxBackend.killSession(target.sessionName, target.socketName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
@@ -360,6 +367,9 @@ export function persistentBackendTargetKey(target: PersistentBackendTarget): str
     target.backendType === 'herdr' ? target.agentName ?? '' : '',
     target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
     target.backendType === 'zmx' ? target.socketDir ?? '' : '',
+    // Appended only when set so default-server keys stay byte-identical to the
+    // keys older code computed (caches/batches compare them across call sites).
+    ...(target.backendType === 'tmux' && target.socketName !== undefined ? [target.socketName] : []),
   ]);
 }
 
@@ -375,6 +385,10 @@ export function probePersistentBackendTargets(
     // ownership-aware single-target classifier. Never downgrade either kind to
     // the name-only batch probe used by whole-session backends.
     if (target.backendType === 'herdr') {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    if (target.backendType === 'tmux' && target.socketName !== undefined) {
       if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
       continue;
     }
@@ -415,4 +429,49 @@ export function killPersistentSession(
     ZmxBackend.killManagedSession(name, sessionId);
   }
   else HerdrBackend.killSession(name);
+}
+
+/**
+ * {@link probePersistentBackendTarget} for verifying a kill that just went
+ * through. Killing the last session on a tmux server makes that server exit,
+ * and a probe that connects while it is still going down reads "server exited
+ * unexpectedly" — a server-level error, so 'unknown' — although tmux gives its
+ * own answer a moment later. Only 'unknown' is re-probed, with the same short
+ * backoff as {@link TmuxBackend.probeSessionWithRetry} (at most ~0.75s of
+ * sleep over the default three attempts, on top of each probe's own deadline
+ * — 3s for tmux); 'exists' / 'missing' return at once, and a backing that
+ * stays indeterminate is still 'unknown' for the caller to fail closed on.
+ * A target that is unknown by construction is not re-probed at all.
+ */
+export function probePersistentBackendTargetAfterKill(
+  target: PersistentBackendTarget,
+  opts: {
+    attempts?: number;
+    baseDelayMs?: number;
+    /** Test seams. */
+    probe?: (target: PersistentBackendTarget) => SessionProbe;
+    sleep?: (ms: number) => void;
+  } = {},
+): SessionProbe {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+  // A shared/custom agentless herdr target is never asked (see
+  // probePersistentBackendTarget): waiting cannot change its answer.
+  if (target.backendType === 'herdr' && !target.agentName?.trim() && !isExclusiveAgentlessHerdrTarget(target)) {
+    return 'unknown';
+  }
+  const probe = opts.probe ?? probePersistentBackendTarget;
+  const sleep = opts.sleep ?? ((ms: number) => {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+  });
+  let result = probe(target);
+  for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+    const backoff = baseDelayMs * (2 ** (completed - 1));
+    const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+    sleep(backoff + jitter);
+    result = probe(target);
+  }
+  return result;
 }

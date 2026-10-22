@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import * as workerPool from '../src/core/worker-pool.js';
-import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 
 let ipc: IpcServerHandle | null = null;
@@ -22,21 +22,52 @@ async function request(body: unknown) {
   });
 }
 
-async function cli(withAncestor: boolean) {
+/**
+ * Spawn-level smoke for ancestor routing (see #2069):
+ *
+ * `resolveBotmuxAncestorContext` reads kernel-held environment of ANCESTORS
+ * only, starting at `process.ppid`; the spawned CLI's own environment is not
+ * attestation. A direct spawn (no wrapper) therefore routes via whatever
+ * complete BotMux context the test runner's own ancestors carry:
+ *  - clean runner: no ancestor context, the CLI fails closed LOCALLY and the
+ *    daemon attestation is never exercised (a vacuous green),
+ *  - runner inside a live BotMux session: the request is hijacked by the real
+ *    production daemon.
+ * The negative half is structurally unconstructable with a real spawn, so it
+ * lives in deterministic fake-procfs tests instead:
+ *  - local fail-closed without an ancestor: current-actor.test.ts
+ *    (`resolveBotmuxAncestorContext` throws on empty/conflicting ancestry),
+ *  - daemon-side lineage rejection: current-actor-attestation.test.ts
+ *    (unrelated lineage, another session's root, unreadable mid-chain stat…).
+ *
+ * The wrapper eval below is the nearest complete ancestor of the spawned CLI
+ * and always carries THIS mock's routing, so the runner's own ancestors cannot
+ * hijack these legs (nearest-complete-context selection). No skip guard is
+ * needed: the asserted document uniquely identifies the mock responder, so an
+ * answer from any other daemon fails the test instead of passing silently.
+ */
+async function cliViaAncestor(opts: { poisonOwnEnv?: boolean } = {}): Promise<
+  { code: number | null; stdout: string; stderr: string }> {
   const env = { ...process.env, BOTMUX: '1', BOTMUX_SESSION_ID: 's-execution',
     BOTMUX_LARK_APP_ID: 'cli_execution', BOTMUX_DAEMON_IPC_PORT: String(ipc!.port),
-    BOTMUX_TURN_ID: 'stale-spawn-turn', BOTMUX_DISPATCH_ATTEMPT: '999', BOTMUX_NO_CLAIM: '1' };
+    BOTMUX_NO_CLAIM: '1' };
   const options = { env, stdio: ['ignore', 'pipe', 'pipe'] as ['ignore', 'pipe', 'pipe'] };
-  // A real ancestor must carry kernel-held routing; the current CLI's own env
-  // alone is intentionally not an attestation. Both spawns use the repo helper.
-  const child = withAncestor ? spawnTsEvalWithRepoImports(`
+  // When poisonOwnEnv is set, the CLI process keeps wrong routing in its OWN
+  // environment while its wrapper ancestor holds the mock routing. Success
+  // proves the resolver ignores the self layer. A dead port makes a self-env
+  // regression fail fast with ECONNREFUSED instead of a timeout.
+  const innerEnv = opts.poisonOwnEnv
+    ? `env: { ...process.env, BOTMUX_DAEMON_IPC_PORT: '1', BOTMUX_SESSION_ID: 's-poisoned' },`
+    : '';
+  const child = spawnTsEvalWithRepoImports(`
     import { spawnTsScript } from './test/helpers/ts-runner.js';
-    const child = spawnTsScript('src/cli.ts', ['execution', 'current', '--json'], { stdio: 'inherit' });
+    const child = spawnTsScript('src/cli.ts', ['execution', 'current', '--json'],
+      { stdio: 'inherit', ${innerEnv} });
     process.once('SIGTERM', () => child.kill('SIGTERM'));
     child.once('error', () => { process.exitCode = 1; });
     child.once('close', code => { process.exitCode = code ?? 1; });
-  `, options) : spawnTsScript('src/cli.ts', ['execution', 'current', '--json'], options);
-  return await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+  `, options);
+  return await new Promise((resolve, reject) => {
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('execution CLI timed out')); }, 20000);
     child.stdout!.on('data', data => { stdout += data; }); child.stderr!.on('data', data => { stderr += data; });
@@ -44,6 +75,18 @@ async function cli(withAncestor: boolean) {
     child.once('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
 }
+
+/** The mock's exact verified document; any other daemon answers differently. */
+const mockDocument = {
+  schema: 'botmux.current-execution.v1',
+  status: 'verified',
+  larkAppId: 'cli_execution',
+  sessionId: 's-execution',
+  chatId: 'oc_execution',
+  turnId: 'trigger-current',
+  workerGeneration: 7,
+  dispatchAttempt: 3,
+};
 
 describe('POST /api/current-execution', () => {
   it('does not let a valid host HMAC bypass current process attestation', async () => {
@@ -59,25 +102,38 @@ describe('POST /api/current-execution', () => {
     expect(await response.json()).toMatchObject({ status: 'blocked', error: 'current_execution_unverified' });
   });
 
-  it.skipIf(process.platform !== 'linux')('runs the real CLI through ancestor routing and rejects self-reported env alone', async () => {
-    const ds = session();
-    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
-    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
-    const accepted = await cli(true);
-    expect(accepted.code, accepted.stderr).toBe(0);
-    expect(JSON.parse(accepted.stdout)).toMatchObject({ status: 'verified', turnId: 'trigger-current', dispatchAttempt: 3 });
-    const rejected = await cli(false);
-    expect(rejected.code).toBe(2);
-    expect(JSON.parse(rejected.stdout)).toEqual({ schema: 'botmux.current-execution.v1',
-      status: 'blocked', error: 'current_execution_unverified' });
-  }, 30000);
+  it.skipIf(process.platform !== 'linux')(
+    'routes a real spawned CLI through its wrapper ancestor to the mock daemon',
+    async () => {
+      const ds = session();
+      vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+      ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const result = await cliViaAncestor();
+      expect(result.code, result.stderr).toBe(0);
+      // toEqual over the full key set: a foreign daemon hijacking the route
+      // cannot answer with the mock-only turn/generation/session tuple.
+      expect(JSON.parse(result.stdout)).toEqual(mockDocument);
+    }, 30000,
+  );
+
+  it.skipIf(process.platform !== 'linux')(
+    'ignores the spawned CLI own environment when a complete ancestor context exists',
+    async () => {
+      const ds = session();
+      vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+      ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const result = await cliViaAncestor({ poisonOwnEnv: true });
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual(mockDocument);
+    }, 30000,
+  );
 
   it.skipIf(process.platform !== 'linux')('derives a machine execution from the real socket peer, ignoring forged tuple fields', async () => {
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     const before = JSON.stringify(ds);
-    const response = await request({ sessionId: 's-execution', turnId: 'forged', dispatchAttempt: 99, capability: 'forged' });
+    const response = await request({ sessionId: 's-execution', turnId: 'forged', dispatchAttempt: 999, capability: 'forged' });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ schema: 'botmux.current-execution.v1', status: 'verified',
       larkAppId: 'cli_execution', sessionId: 's-execution', chatId: 'oc_execution',

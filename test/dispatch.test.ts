@@ -28,6 +28,7 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  resolveProseBotMentions,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
@@ -616,6 +617,67 @@ describe('eligibleAutoMentionAliases', () => {
   it('excludes self aliases entirely', () => {
     const r = eligibleAutoMentionAliases({ botName: 'Claude', cliId: 'claude-code', larkAppId: 'cli_reviewer_in_topic', selfAliases, convoBotAppIds: convo });
     expect(r).toEqual([]);
+  });
+});
+
+describe('resolveProseBotMentions', () => {
+  // Shared by `botmux send` and the zero-injection final card: the same text
+  // must @ the same bot through either channel.
+  const botEntries = [
+    { larkAppId: 'cli_self', botName: 'Reviewer(pi)', cliId: 'pi', botOpenId: 'ou_self_selfview' },
+    { larkAppId: 'cli_dev', botName: 'Dev(Claude)', cliId: 'claude-code', botOpenId: 'ou_dev_selfview' },
+    { larkAppId: 'cli_claude', botName: 'Claude', cliId: 'claude-code', botOpenId: 'ou_claude_selfview' },
+    { larkAppId: 'cli_twin', botName: 'Claude分身', cliId: 'claude-code', botOpenId: 'ou_twin_selfview' },
+    { larkAppId: 'cli_codex', botName: 'Dev(codex)', cliId: 'codex', botOpenId: 'ou_codex_selfview' },
+    { larkAppId: 'cli_unseen', botName: 'Other(pi)', cliId: 'pi', botOpenId: 'ou_unseen_selfview' },
+  ];
+  // Open_ids as the sender app sees each peer (Lark open_ids are per-app).
+  const crossRef = {
+    'Dev(Claude)': 'ou_dev_here',
+    Claude: 'ou_claude_here',
+    'Claude分身': 'ou_twin_here',
+    'Dev(codex)': 'ou_codex_here',
+    'Reviewer(pi)': 'ou_self_here',
+  };
+  const resolve = (text: string, extra: Partial<Parameters<typeof resolveProseBotMentions>[0]> = {}) =>
+    resolveProseBotMentions({ text, botEntries, crossRef, selfAppId: 'cli_self', convoBotAppIds: new Set(), ...extra });
+
+  it('resolves a named bot to the sender-scoped cross-ref id, never its self-view id', () => {
+    expect(resolve('结论可合。@Dev(Claude) 请执行合并。')).toEqual({
+      mentions: [{ open_id: 'ou_dev_here', name: 'Dev(Claude)' }],
+      unresolved: [],
+    });
+  });
+
+  it('matches whole names only, case-insensitively, with CJK-aware boundaries', () => {
+    expect(resolve('@Claude分身 看下').mentions.map(m => m.name)).toEqual(['Claude分身']);
+    expect(resolve('@claude 看下').mentions.map(m => m.name)).toEqual(['Claude']);
+    expect(resolve('看看@dev(codex)').mentions.map(m => m.open_id)).toEqual(['ou_codex_here']);
+    expect(resolve('mail user@Claude please').mentions).toEqual([]);
+    expect(resolve('@Claude2 不是它').mentions).toEqual([]);
+  });
+
+  it('ignores names quoted in inline code or fenced blocks', () => {
+    expect(resolve('示例 `@Dev(Claude)`\n```\n@Claude\n```')).toEqual({ mentions: [], unresolved: [] });
+  });
+
+  it('never resolves the sender itself', () => {
+    expect(resolve('@Reviewer(pi) 收到')).toEqual({ mentions: [], unresolved: [] });
+  });
+
+  it('reports a named bot without a cross-ref entry instead of guessing an id', () => {
+    expect(resolve('@Other(pi) 你看下')).toEqual({ mentions: [], unresolved: ['Other(pi)'] });
+  });
+
+  it('accepts a cliId alias only for a bot active in this conversation', () => {
+    expect(resolve('@codex 看下').mentions).toEqual([]);
+    expect(resolve('@codex 看下', { convoBotAppIds: new Set(['cli_codex']) }).mentions)
+      .toEqual([{ open_id: 'ou_codex_here', name: 'Dev(codex)' }]);
+  });
+
+  it('skips bots already addressed explicitly', () => {
+    expect(resolve('@Dev(Claude) 和 @Dev(codex)', { alreadyMentioned: ['ou_dev_here'] }).mentions)
+      .toEqual([{ open_id: 'ou_codex_here', name: 'Dev(codex)' }]);
   });
 });
 

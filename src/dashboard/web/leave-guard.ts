@@ -49,6 +49,28 @@ export function holdHashNavigation(from: string, to: string): boolean {
   return true;
 }
 
+/**
+ * In-app navigation (e.g. the ⌘K palette). A different target just changes the
+ * hash and the shell's handler guards it. The same target is a deliberate
+ * remount so the page re-reads its deep-link params; the handler lets same-hash
+ * events through unguarded, so ask the guard here before replaying.
+ */
+export function navigateToHash(href: string): void {
+  if ((location.hash || '#/') !== href) {
+    location.hash = href;
+    return;
+  }
+  const replay = () => window.dispatchEvent(new HashChangeEvent('hashchange'));
+  const prompt = pendingLeavePrompt();
+  if (!prompt) {
+    replay();
+    return;
+  }
+  void confirm({ ...prompt, danger: true }).then(ok => {
+    if (ok && (location.hash || '#/') === href) replay();
+  });
+}
+
 function pagePath(hash: string): string {
   const query = hash.indexOf('?');
   return query < 0 ? hash : hash.slice(0, query);

@@ -80,16 +80,67 @@ const UNION_ID_TTL_MS = 24 * 60 * 60 * 1000;
 /** Feishu union ids are `on_` + hex today; the bound keeps a path-safe shape
  *  without pinning the exact format. */
 const UNION_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
+const OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{4,128}$/;
+/** Seeded by every inbound message; bounded so a busy fleet cannot grow it forever. */
+const UNION_ID_CACHE_MAX = 5000;
 const unionIdCache = new Map<string, { unionId: string; at: number }>();
+
+function rememberUnionId(key: string, unionId: string): void {
+  unionIdCache.delete(key); // re-insert keeps recently seen people at the end
+  unionIdCache.set(key, { unionId, at: deps.now() });
+  if (unionIdCache.size <= UNION_ID_CACHE_MAX) return;
+  // Over the cap: drop expired entries first, then the least recently used.
+  const now = deps.now();
+  for (const [k, v] of unionIdCache) {
+    if (now - v.at >= UNION_ID_TTL_MS) unionIdCache.delete(k);
+  }
+  while (unionIdCache.size > UNION_ID_CACHE_MAX) {
+    const oldest = unionIdCache.keys().next().value;
+    if (oldest === undefined) break;
+    unionIdCache.delete(oldest);
+  }
+}
+
+/**
+ * Record the union_id Feishu put on a verified inbound event for this app's
+ * open_id. The contact API can only answer for people inside the bot app's
+ * contact range (41050 "no user authority" otherwise), so a group member the
+ * bot owner never added would be unresolvable — yet every message event
+ * already carries `sender.sender_id.union_id`. Seeding from the event lets the
+ * platform path work for anyone who talks to the bot. Only human senders are
+ * recorded; malformed ids are ignored.
+ *
+ * The caller passes the raw event `data`; the identity comes from Feishu's
+ * signed event, never from message text or anything the CLI controls.
+ */
+export function noteInboundSenderUnionId(larkAppId: string, data: unknown): void {
+  const sender = (data as { sender?: { sender_type?: unknown; sender_id?: { open_id?: unknown; union_id?: unknown } } } | null)?.sender;
+  if (!sender || sender.sender_type !== 'user') return;
+  noteSenderUnionId(larkAppId, sender.sender_id?.open_id, sender.sender_id?.union_id);
+}
+
+/** Same as {@link noteInboundSenderUnionId} for a pair the daemon already holds
+ *  from a trusted record (e.g. a schedule's host authority). */
+export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: unknown): void {
+  if (!larkAppId || typeof openId !== 'string' || !OPEN_ID_RE.test(openId)) return;
+  // An open_id passes the generic shape check; never let one stand in for a union_id.
+  if (typeof unionId !== 'string' || !UNION_ID_RE.test(unionId) || unionId.startsWith('ou_')) return;
+  rememberUnionId(`${larkAppId}|${openId}`, unionId);
+}
 
 async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
-  if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) return hit.unionId;
+  if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
+    // Keep the entry recently used without extending its lifetime.
+    unionIdCache.delete(key);
+    unionIdCache.set(key, hit);
+    return hit.unionId;
+  }
   let unionId: string | null = null;
   try { unionId = await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
   if (unionId && UNION_ID_RE.test(unionId)) {
-    unionIdCache.set(key, { unionId, at: deps.now() });
+    rememberUnionId(key, unionId);
     return unionId;
   }
   return null;

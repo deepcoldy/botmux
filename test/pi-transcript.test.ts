@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { drainPiTranscript, resetPiPendingTurnState, PI_TURN_BOUNDARY_TIMEOUT_MS, type PiBridgeEvent } from '../src/services/pi-transcript.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { shouldEmitEmptyCompletedBridgeFallback } from '../src/services/bridge-fallback-gate.js';
 
 const ROOT = join(tmpdir(), `botmux-pi-transcript-test-${process.pid}`);
 const SESSION_ID = 'eef935b5-4201-4e59-8bc7-06f03aa3388c';
@@ -99,6 +100,24 @@ describe('drainPiTranscript: turn terminal contract', () => {
     // fallback + historical behavior preserved).
     expect(final.terminalStatus).toBeUndefined();
     expect(final.terminalErrorCode).toBeUndefined();
+  });
+
+  it('keeps the empty-final fallback for a completed Pi turn with no successful send/report marker', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('finish without sending'),
+      assistantFinal('stop', ''),
+    ]);
+    const final = drainAll(path).find(event => event.kind === 'assistant_final');
+    expect(final?.text).toBe('');
+    expect(final?.terminalStatus).toBeUndefined();
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      turnId: 'turn-pi-no-send',
+      markTimeMs: Date.parse('2026-08-03T05:13:39.839Z'),
+      isLocal: false,
+      finalText: final?.text,
+      terminalStatus: final?.terminalStatus,
+    }, undefined, [], false)).toBe(true);
   });
 
   it('does NOT emit for a mid-turn toolUse assistant record (only the terminal record closes)', () => {

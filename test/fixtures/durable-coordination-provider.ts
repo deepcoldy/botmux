@@ -1,3 +1,4 @@
+import { closeSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import {
   DURABLE_COORDINATION_PROVIDER_PROTOCOL,
@@ -6,6 +7,8 @@ import {
 import { DURABLE_COORDINATION_CONTRACT_VERSION } from '../../src/services/durable-coordination.js';
 
 const badContract = process.argv.includes('--bad-contract');
+const closeStdinAfterHello = process.argv.includes('--close-stdin-after-hello');
+if (process.env.DURABLE_FIXTURE_PID_PATH) writeFileSync(process.env.DURABLE_FIXTURE_PID_PATH, `${process.pid}\n`);
 const provider = process.argv.includes('--slow') ? 'fixture-slow' : 'fixture';
 
 function controlRecord(
@@ -40,6 +43,15 @@ lines.on('line', line => {
     requestId: request.requestId,
   };
   if (request.type === 'hello') {
+    if (closeStdinAfterHello) {
+      // 先关读端再回 hello：store 收到 hello 时管道已无人读，之后的任何写入都是
+      // EPIPE。libuv 不会替 stdin.destroy() 关掉 0 号 fd，所以显式 closeSync(0)。
+      // 进程本身保持存活，由 store 负责回收。
+      lines.close();
+      process.stdin.destroy();
+      closeSync(0);
+      setTimeout(() => {}, 60_000);
+    }
     send({
       ...base,
       type: 'hello',

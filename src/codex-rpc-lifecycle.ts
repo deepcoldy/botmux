@@ -9,6 +9,8 @@ import {
   readComm,
 } from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
+import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { tmuxEnv } from './setup/ensure-tmux.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
 
@@ -178,6 +180,8 @@ export function decideStartupDialogAction(screen: string, readyPattern?: RegExp)
 }
 
 export interface PaneProbes {
+  /** tmux server of the managed pane for the default panePidOf (undefined = default server). */
+  socketName?: string;
   panePidOf?: (sessionName: string) => number | undefined;
   argvOf?: (pid: number) => string[];
   commOf?: (pid: number) => string | undefined;
@@ -362,10 +366,10 @@ export async function killAndVerifyPersistentPane(
   return fx.probeLive(sessionName) === 'gone';
 }
 
-function tmuxPanePid(sessionName: string): number | undefined {
+function tmuxPanePid(sessionName: string, socketName?: string): number | undefined {
   try {
-    const out = execFileSync('tmux', ['display', '-t', sessionName, '-p', '#{pane_pid}'],
-      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    const out = execFileSync('tmux', [...tmuxSocketArgs(socketName), 'display', '-t', sessionName, '-p', '#{pane_pid}'],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, env: tmuxEnv() }).trim();
     const n = Number(out);
     return Number.isInteger(n) && n > 0 ? n : undefined;
   } catch { return undefined; }
@@ -385,7 +389,7 @@ export function paneRunsRemoteTui(
   probes: PaneProbes = {},
   expectedExecutable?: string,
 ): boolean {
-  const panePidOf = probes.panePidOf ?? tmuxPanePid;
+  const panePidOf = probes.panePidOf ?? ((name: string) => tmuxPanePid(name, probes.socketName));
   const argvOf = probes.argvOf ?? readCmdline;
   const commOf = probes.commOf ?? readComm;
   const childrenOf = probes.childrenOf ?? getChildPids;

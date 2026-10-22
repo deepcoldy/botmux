@@ -197,6 +197,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       );
     });
     child.stdout.on('data', chunk => this.consumeStdout(String(chunk)));
+    // A provider that stops reading (crashed, closed stdin) makes the next
+    // write fail asynchronously with EPIPE. Each write callback already rejects
+    // its own command and its caller decides the outcome, but the stream also
+    // emits 'error'; unhandled, that is thrown at process level. Only record it
+    // here so the failure is not escalated past the command that hit it.
+    child.stdin.on('error', error => {
+      logger.warn(`[remote-runner] provider stdin error: ${error.message}`);
+    });
     child.on('error', error => this.failProtocol(`provider process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       this.child = null;

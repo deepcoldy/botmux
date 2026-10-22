@@ -58,6 +58,7 @@ import { normalizeCommandTriggers } from './services/command-trigger-normalize.j
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import { parseGrantStateFields } from './services/grant-state.js';
 import {
   normalizeExistingAppServerConfig,
   type ExistingAppServerConfig,
@@ -1941,13 +1942,18 @@ export interface BotConfig {
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
   /** Per-chat override of `soloGroupMentionBypass`; explicit true/false wins over the bot default. */
   chatSoloGroupMentionBypass?: { [chatId: string]: boolean };
-  /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
+  /**
+   * Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。
+   * 本字段及 globalGrants / quotaState / grantExpiryState / dispatchLaunchQuotaReceipts 是授权状态：
+   * daemon 默认存在 `<dataDir>/grants.sqlite`，内存里这几个字段是它的读缓存；bots.json 上出现
+   * 的同名字段在 daemon 启动时并入授权库并删除（primary 多副本模式除外，见 grant-state-store.ts）。
+   */
   chatGrants?: { [chatId: string]: string[] };
   /**
    * 全局对话授权名单：被授权在**任意群**与本 bot 对话的 open_id 列表（人或 bot 通用）。
    * 与 chatGrants 同属 talk-only —— 仅放行 canTalk / bot 路由闸，**canOperate 绝不读它**
    * （敏感操作仍仅限 allowedUsers）。这是 chatGrants 的全局版：作用域升到全局，talk-only
-   * 性质不变。可由 /grant 卡片「全局」按钮写入，也可在 bots.json 手配 open_id。
+   * 性质不变。可由 /grant 卡片「全局」按钮写入；在 bots.json 手配的 open_id 会在 daemon 启动时并入授权库。
    */
   globalGrants?: string[];
   /** Additional plugin ids enabled only for this bot. */
@@ -1994,7 +2000,7 @@ export interface BotConfig {
    */
   grantDefaultDurationMs?: number;
   /**
-   * scope-aware 消息额度计数（运行时状态，随授权一起持久化进 bots.json）。
+   * scope-aware 消息额度计数（运行时状态，随授权一起持久化进授权库）。
    * key = `chat:${chatId}:${openId}` | `global:${openId}`，value = { limit, used }。
    * 仅在 /grant 带额度（显式数字，或开启 default 时取 default）时建记录；
    * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
@@ -2220,6 +2226,12 @@ export interface BotConfig {
    * `/card` group-visible & live.
    */
   privateCard?: boolean;
+  /**
+   * Per-bot opt-in for the compact overflow action menu (open terminal /
+   * switch model / close session) on ordinary reply cards. Default
+   * (undefined) keeps reply cards unchanged.
+   */
+  replyCardActions?: boolean;
   /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
@@ -2928,6 +2940,13 @@ export function findOncallChat(larkAppId: string, chatId: string): OncallChat | 
   refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
+}
+
+/** All oncall bindings currently recorded for a bot, with the same disk
+ *  freshness as {@link findOncallChat}. */
+export function listOncallChats(larkAppId: string): OncallChat[] {
+  refreshRegisteredOncallChatsFromDisk();
+  return [...(bots.get(larkAppId)?.config.oncallChats ?? [])];
 }
 
 /**
@@ -3720,26 +3739,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatSoloGroupMentionBypass = out;
     }
 
-    // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
-    // 丢弃空列表。未配置或全部非法 → undefined。
-    let chatGrants: { [chatId: string]: string[] } | undefined;
-    if (entry.chatGrants && typeof entry.chatGrants === 'object' && !Array.isArray(entry.chatGrants)) {
-      const out: { [chatId: string]: string[] } = {};
-      for (const [cid, arr] of Object.entries(entry.chatGrants)) {
-        if (!Array.isArray(arr)) continue;
-        const ids = (arr as any[]).filter((x): x is string => typeof x === 'string');
-        if (ids.length > 0) out[cid] = ids;
-      }
-      if (Object.keys(out).length > 0) chatGrants = out;
-    }
-
-    // globalGrants：只保留非空 string[]（open_id 列表），逐项校验 typeof === 'string'。
-    // 未配置或全部非法 → undefined。
-    let globalGrants: string[] | undefined;
-    if (Array.isArray(entry.globalGrants)) {
-      const ids = (entry.globalGrants as any[]).filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
-      if (ids.length > 0) globalGrants = ids;
-    }
+    // 授权状态五字段（chatGrants / globalGrants / quotaState / grantExpiryState /
+    // dispatchLaunchQuotaReceipts）：daemon 用 SQLite 后端时启动即把它们并入授权库并从 bots.json
+    // 删掉（见 grant-state-store.ts）；这里的解析服务于 primary 多副本模式与迁移前的首次加载。
+    const { chatGrants, globalGrants, quotaState, dispatchLaunchQuotaReceipts, grantExpiryState } = parseGrantStateFields(entry);
 
     // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（卡片用产品默认 3 条）。
     let messageQuota: { defaultLimit?: number } | undefined;
@@ -3753,49 +3756,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const grantDefaultDurationMs = isGrantDurationOption(entry.grantDefaultDurationMs)
       ? entry.grantDefaultDurationMs
       : undefined;
-
-    // quotaState：scope-aware 计数。逐项校验 key 形如 `chat:*:*` / `global:*`，
-    // value 为 { limit, used } 正整数（used 允许 0）。非法项丢弃；全空 → undefined。
-    let quotaState: { [k: string]: { limit: number; used: number } } | undefined;
-    if (entry.quotaState && typeof entry.quotaState === 'object' && !Array.isArray(entry.quotaState)) {
-      const out: { [k: string]: { limit: number; used: number } } = {};
-      for (const [k, v] of Object.entries(entry.quotaState)) {
-        if (!/^(chat:.+:.+|global:.+)$/.test(k)) continue;
-        if (!v || typeof v !== 'object') continue;
-        const limit = (v as any).limit, used = (v as any).used;
-        if (typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) continue;
-        if (typeof used !== 'number' || !Number.isInteger(used) || used < 0) continue;
-        out[k] = { limit, used };
-      }
-      if (Object.keys(out).length > 0) quotaState = out;
-    }
-
-    let dispatchLaunchQuotaReceipts: { [k: string]: { allow: boolean; chargedAt: string } } | undefined;
-    if (entry.dispatchLaunchQuotaReceipts && typeof entry.dispatchLaunchQuotaReceipts === 'object'
-        && !Array.isArray(entry.dispatchLaunchQuotaReceipts)) {
-      const out: { [k: string]: { allow: boolean; chargedAt: string } } = {};
-      for (const [key, value] of Object.entries(entry.dispatchLaunchQuotaReceipts)) {
-        if (!/^quota_[0-9a-f]{32}$/.test(key) || !value || typeof value !== 'object') continue;
-        const allow = (value as any).allow;
-        const chargedAt = (value as any).chargedAt;
-        if (typeof allow !== 'boolean' || typeof chargedAt !== 'string' || !Number.isFinite(Date.parse(chargedAt))) continue;
-        out[key] = { allow, chargedAt };
-      }
-      if (Object.keys(out).length > 0) dispatchLaunchQuotaReceipts = out;
-    }
-
-    let grantExpiryState: { [k: string]: { expiresAt: number } } | undefined;
-    if (entry.grantExpiryState && typeof entry.grantExpiryState === 'object' && !Array.isArray(entry.grantExpiryState)) {
-      const out: { [k: string]: { expiresAt: number } } = {};
-      for (const [k, v] of Object.entries(entry.grantExpiryState)) {
-        if (!/^(chat:.+:.+|global:.+)$/.test(k)) continue;
-        if (!v || typeof v !== 'object') continue;
-        const expiresAt = (v as any).expiresAt;
-        if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
-        out[k] = { expiresAt };
-      }
-      if (Object.keys(out).length > 0) grantExpiryState = out;
-    }
 
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
     // 名字内空白按 `-` 连接（/Ultra Goal → /ultra-goal）、自动补前导 `/`、
@@ -4222,6 +4182,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      replyCardActions: entry.replyCardActions === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { waitForPidFile } from './helpers/pid-file.js';
 import {
   generateCodexAppThreadTitle,
   setCodexAppThreadName,
@@ -187,7 +188,9 @@ describe('generateCodexAppThreadTitle', () => {
       let ready = false;
       while (performance.now() < readyDeadline) {
         if (existsSync(logPath)) {
-          ready = readFileSync(logPath, 'utf8').trim().split('\n')
+          // The fixture is still appending: the file can exist empty, or end in a
+          // half-written record. Only newline-terminated records are complete.
+          ready = readFileSync(logPath, 'utf8').split('\n').slice(0, -1)
             .some(line => JSON.parse(line).id === 9001);
           if (ready) break;
         }
@@ -213,8 +216,7 @@ describe('generateCodexAppThreadTitle', () => {
       'thread/unsubscribe',
     ]));
 
-    expect(existsSync(pidPath)).toBe(true);
-    const pid = Number(readFileSync(pidPath, 'utf8'));
+    const pid = await waitForPidFile(pidPath);
     const reapDeadline = Date.now() + 2000;
     while (Date.now() < reapDeadline) {
       try {
@@ -433,12 +435,7 @@ describe('setCodexAppThreadName', () => {
       signal: controller.signal,
     });
 
-    const deadline = Date.now() + 2000;
-    while (!existsSync(pidPath) && Date.now() < deadline) {
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 20));
-    }
-    expect(existsSync(pidPath)).toBe(true);
-    const pid = Number(readFileSync(pidPath, 'utf8'));
+    const pid = await waitForPidFile(pidPath);
 
     controller.abort();
     await expect(request).rejects.toThrow(/closed/);
@@ -452,6 +449,40 @@ describe('setCodexAppThreadName', () => {
       }
     }
     throw new Error(`fake Codex app-server ${pid} was not reaped`);
+  });
+
+  it('rejects instead of crashing when the app-server stops reading its stdin', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-stdin-closed-'));
+    tempDirs.push(dir);
+    const pidPath = join(dir, 'pid');
+    // Every write after initialize hits a pipe nobody reads: EPIPE. Without a
+    // stdin error listener that is thrown at process level, which takes the
+    // daemon down. Bun only reports EPIPE for writes the pipe buffer cannot
+    // absorb, so the request is made larger than that.
+    await expect(setCodexAppThreadName({
+      threadId: 'thread-stdin-closed',
+      name: 'x'.repeat(256 * 1024),
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_BEHAVIOR: 'close-stdin-after-initialize',
+        FAKE_CODEX_PID_PATH: pidPath,
+      },
+      timeoutMs: 20_000,
+    })).rejects.toThrow(/stdin/);
+
+    const pid = await waitForPidFile(pidPath);
+    const reapDeadline = Date.now() + 2000;
+    while (Date.now() < reapDeadline) {
+      try {
+        process.kill(pid, 0);
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 20));
+      } catch {
+        return;
+      }
+    }
+    throw new Error(`fake Codex app-server ${pid} with closed stdin was not reaped`);
   });
 
   it('supports synchronous force-close for worker exit cleanup', async () => {
@@ -476,12 +507,8 @@ describe('setCodexAppThreadName', () => {
       },
     });
 
-    const deadline = Date.now() + 2000;
-    while (!existsSync(pidPath) && Date.now() < deadline) {
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 20));
-    }
+    const pid = await waitForPidFile(pidPath);
     expect(forceClose).toBeTypeOf('function');
-    const pid = Number(readFileSync(pidPath, 'utf8'));
 
     forceClose?.();
     await expect(request).rejects.toThrow(/force-closed/);
@@ -499,6 +526,10 @@ describe('setCodexAppThreadName', () => {
 });
 
 describe('Codex archive lifecycle RPC', () => {
+  // These cases assert what the RPC does, not how fast it is. The deadline also
+  // covers cold-starting the fixture, which a saturated runner stretches past
+  // 500ms, so only the hang case (which needs it to fire) gets a short one.
+  const RPC_TIMEOUT_MS = 10_000;
   async function probe(archived: boolean, storedArchived: boolean, behavior = 'success', outside = false) {
     const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-archive-'));
@@ -510,7 +541,7 @@ describe('Codex archive lifecycle RPC', () => {
     mkdirSync(join(env.FAKE_CODEX_THREAD_PATH!, '..'), { recursive: true });
     writeFileSync(env.FAKE_CODEX_THREAD_PATH!, '{}');
     const promise = setCodexAppThreadArchived({ threadId: 'native-thread', archived,
-      codexHome: env.CODEX_HOME!, codexBin: FAKE_CODEX, env, timeoutMs: 500 });
+      codexHome: env.CODEX_HOME!, codexBin: FAKE_CODEX, env, timeoutMs: behavior === 'hang-archive' ? 500 : RPC_TIMEOUT_MS });
     return { promise, requests: () => readFileSync(logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
   }
   it.each([[true, false, 'thread/archive'], [false, true, 'thread/unarchive']] as const)(
@@ -536,7 +567,7 @@ describe('Codex archive lifecycle RPC', () => {
     const rollout = join(realHome, archived ? 'sessions' : 'archived_sessions', 'rollout.jsonl');
     mkdirSync(join(rollout, '..'), { recursive: true }); writeFileSync(rollout, '{}');
     await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived, codexHome: alias,
-      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: 1000 })).resolves.toBeUndefined();
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: RPC_TIMEOUT_MS })).resolves.toBeUndefined();
   });
   it('restores with the frozen executable after its temporary symlink disappears', async () => {
     const { setCodexAppThreadArchived } = await import('../src/services/codex-app-threads.js');
@@ -549,7 +580,7 @@ describe('Codex archive lifecycle RPC', () => {
       mkdirSync(join(env.CODEX_HOME!, folder), { recursive: true });
       writeFileSync(join(env.CODEX_HOME!, folder, 'rollout.jsonl'), '{}');
     }
-    const opts = { threadId: 'native-thread', codexHome: env.CODEX_HOME!, codexBin: frozenBin, env, timeoutMs: 1000 };
+    const opts = { threadId: 'native-thread', codexHome: env.CODEX_HOME!, codexBin: frozenBin, env, timeoutMs: RPC_TIMEOUT_MS };
     const { archiveCodexForCleanup, restoreCodexCleanupArchive } = await import('../src/services/codex-cleanup-archive.js');
     const row = { sessionId: 'mock-bin-recovery', status: 'closed', cliId: 'codex-app', backendType: 'tmux',
       cliSessionId: opts.threadId, codexCleanupTarget: { threadId: opts.threadId, codexHome: opts.codexHome, codexBin: frozenBin } } as import('../src/types.js').Session;
@@ -568,7 +599,7 @@ describe('Codex archive lifecycle RPC', () => {
     mkdirSync(join(env.CODEX_HOME!, 'sessions')); const outside = join(dir, 'outside.jsonl'); writeFileSync(outside, '{}');
     const rollout = join(env.CODEX_HOME!, 'sessions', 'rollout.jsonl'); symlinkSync(outside, rollout);
     await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived: true, codexHome: env.CODEX_HOME!,
-      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: 1000 })).rejects.toThrow('outside the frozen session home');
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: rollout }, timeoutMs: RPC_TIMEOUT_MS })).rejects.toThrow('outside the frozen session home');
     expect(readFileSync(logPath, 'utf8')).not.toContain('thread/archive');
   });
   it('rejects a sessions-directory symlink escaping the canonical home', async () => {
@@ -577,7 +608,7 @@ describe('Codex archive lifecycle RPC', () => {
     const env = fakeCodexEnv(dir); const outside = join(dir, 'foreign'); mkdirSync(outside); writeFileSync(join(outside, 'rollout.jsonl'), '{}');
     symlinkSync(outside, join(env.CODEX_HOME!, 'sessions'), 'dir');
     await expect(setCodexAppThreadArchived({ threadId: 'native-thread', archived: true, codexHome: env.CODEX_HOME!,
-      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: join(env.CODEX_HOME!, 'sessions', 'rollout.jsonl') }, timeoutMs: 1000 })).rejects.toThrow('outside the frozen session home');
+      codexBin: FAKE_CODEX, env: { ...env, FAKE_CODEX_THREAD_PATH: join(env.CODEX_HOME!, 'sessions', 'rollout.jsonl') }, timeoutMs: RPC_TIMEOUT_MS })).rejects.toThrow('outside the frozen session home');
   });
   it.each(['archive-error', 'hang-archive'])('propagates bounded RPC failure (%s)', async behavior => {
     const p = await probe(true, false, behavior);

@@ -109,10 +109,7 @@ export function createTaskWithOptionalPrecondition(
       // effort because either residue (pending sidecar or marker-only task)
       // fails closed; the original error remains the actionable one.
       try {
-        const current = scheduleStore.getTask(id, appId);
-        if (current?.preconditionRef === staged.preconditionRef) {
-          scheduler.rollbackUnpublishedRuntimeTask(id, appId);
-        }
+        scheduler.rollbackUnpublishedRuntimeTask(id, appId, staged.preconditionRef);
       } catch (cleanupError) {
         logRollbackFailure(id, 'task-row cleanup after create failure', cleanupError);
       }

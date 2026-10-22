@@ -25,6 +25,9 @@ async function probe(runtime: 'node' | 'bun', mode: string) {
   return JSON.parse(output.trim());
 }
 
+/** What the exit-* probes write right before exiting (see the fixture). */
+const EXIT_OUTPUT = Array.from({ length: 256 }, (_, i) => String(i).padStart(62, '0') + '\r\n').join('') + 'TAIL';
+
 describe.skipIf(process.platform === 'win32')('PTY nonblocking reader compatibility', () => {
   for (const runtime of ['node', 'bun'] as const) {
     describe.skipIf(runtime === 'bun' && !resolveBunExecutable())(runtime, () => {
@@ -58,6 +61,25 @@ describe.skipIf(process.platform === 'win32')('PTY nonblocking reader compatibil
       it('preserves buffered output across pause/resume and large bursts', async () => {
         const result = await probe(runtime, 'pause');
         expect(result.output).toBe('first' + 'A'.repeat(262144) + 'last');
+        expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
+      });
+      it('keeps output the child wrote before exiting when the reader had not caught up', async () => {
+        // Node's libuv reader took POLLHUP plus one short read as the end and
+        // dropped the rest; a busy host hits the same with a short tail.
+        const result = await probe(runtime, 'exit-burst');
+        expect(result.output.length).toBe(EXIT_OUTPUT.length);
+        expect(result.output).toBe(EXIT_OUTPUT);
+        expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
+      });
+      it('keeps queued output when node-pty tears the reader down after exit', async () => {
+        const result = await probe(runtime, 'exit-stall');
+        // The injected stall hit node-pty's teardown timer.
+        expect(result.teardownStalls).toBe(1);
+        const output = String(result.output).replace(/^\d+:/, '');
+        expect(output.length).toBe(EXIT_OUTPUT.length);
+        expect(output).toBe(EXIT_OUTPUT);
+        // The exit arrived while a background process still held the terminal.
+        expect(result.heldOpen).toBe(true);
         expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
       });
     });

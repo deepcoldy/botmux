@@ -213,8 +213,8 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |
 | `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
 | `defaultOncall` | The bot's default: the first new topic in a new group chat is automatically bound to oncall. `{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`; older groups that already existed before `since` are unaffected |
-| `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk` |
-| `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
+| `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk`. See "Grant store" below |
+| `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card or by multi-bot group creation, but can also be configured by hand. See "Grant store" below |
 | `messageQuota` | Message-quota override `{ "defaultLimit": N }`: **applies only to grantees admitted by grant cards or self-service requests** — once a positive integer is configured, new grant cards use an N-message quota; when unset they default to 3 messages per person. **Oncall groups are always unmetered and never read this value.** An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
@@ -435,13 +435,20 @@ Set `agentAppId` to the bot that executes the role. Add the profile id to `defau
 
 ## Runtime state (auto-maintained, do not edit)
 
-The following fields are written by botmux itself and persisted into `bots.json` alongside authorizations / switches. They are listed only for reference — **do not edit them by hand**:
+The following fields are written by botmux itself and persisted into `bots.json` alongside switches. They are listed only for reference — **do not edit them by hand**:
 
 | Field | Description |
 |------|------|
 | `defaultOncallAutoboundChats` | The chat_ids that `defaultOncall` has already auto-bound (append-only). Once recorded, it won't auto-bind again even if later unbound |
-| `quotaState` | Scope-level message-quota counters `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`; when exhausted, automatically revokes the corresponding scope's authorization |
 | `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
+
+### Grant store (`grants.sqlite`)
+
+Per-user talk authorizations are not kept in `bots.json`; they live in `<data dir>/grants.sqlite` (default `~/.botmux/data/grants.sqlite`): `chatGrants`, `globalGrants`, and their message-quota counters (`quotaState`, `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`; when exhausted, the corresponding scope's authorization is revoked), expiry times (`grantExpiryState`) and dispatch charge receipts. Creating a multi-bot group adds one authorization per bot for every other bot, so keeping them in the config file made `bots.json` grow with every group.
+
+- When a daemon starts and its bot still has any of these fields in `bots.json` (pre-upgrade data, hand-written entries), they are **merged into the grant store and then removed from `bots.json`**; for a record that already exists in the store, the store wins. Before the first removal the whole `bots.json` is backed up to `bots.json.bak-grants-v1`.
+- Authorizations are only reclaimed automatically once they **expire**: expired ones are cleaned when the daemon starts and every hour. Use `/revoke` or the grant card to revoke.
+- Under `BOTMUX_COORDINATION_MODE=primary` (multiple replicas) replicas do not share a data dir, so authorizations stay in `bots.json` and behave as before. A deployment that already ran in the default mode and then switches to primary will not read the authorizations in the grant store (it only grants less), so do not switch back and forth between the two modes.
 
 > **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.
 

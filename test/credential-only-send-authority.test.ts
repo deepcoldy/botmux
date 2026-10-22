@@ -356,7 +356,9 @@ describe('credential-only pane on the default tmux backend', () => {
     () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), 'credonly-tmux-')));
       const socket = `bmx-credonly-${process.pid}-${Date.now()}`;
-      const clientBase: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: root };
+      // Keep the fence's private socket root: a hand-built env without
+      // TMUX_TMPDIR puts this server in the HOST socket directory.
+      const clientBase: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: root, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
       const runTmux = (args: string[], env: NodeJS.ProcessEnv) => {
         const r = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
         expect(r.status, r.stderr || String(r.error ?? '')).toBe(0);

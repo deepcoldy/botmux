@@ -51,6 +51,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -423,7 +424,7 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, localeForBot: () => 'en', logger: { warn: vi.fn() },
+      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn() },
       parseScheduledTurnId: (turnId: string) => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;

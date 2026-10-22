@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -27,7 +27,10 @@ const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
-if (pidPath) writeFileSync(pidPath, String(process.pid));
+// 结尾换行表示 PID 已写完整（test/helpers/pid-file.ts 据此判断）：writeFileSync
+// 先建空文件再写入，轮询方在这个窗口读到 ''，Number('') 是 0，而 process.kill(0, 0)
+// 探测的是测试自己的进程组，永远成功，「已回收」就永远等不到。
+if (pidPath) writeFileSync(pidPath, `${process.pid}\n`);
 if (process.env.FAKE_CODEX_INHERITED_STDIO) {
   // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
   spawn(process.execPath, ['-e', `
@@ -462,6 +465,14 @@ function handle(request) {
 
   if (request.method === 'initialize') {
     if (behavior === 'hang-initialize') return;
+    if (behavior === 'close-stdin-after-initialize') {
+      // 先关读端再回响应：client 收到响应时管道已无人读，它接下来的任何写入都是
+      // EPIPE。libuv 不会替 stdin.destroy() 关掉 0 号 fd，所以显式 closeSync(0)。
+      // 进程本身保持存活，由 client 负责回收。
+      process.stdin.destroy();
+      closeSync(0);
+      setTimeout(() => {}, 60_000);
+    }
     respond(request.id, { userAgent: 'fake-codex-app-server' });
     return;
   }

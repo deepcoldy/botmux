@@ -69,6 +69,7 @@ import {
 import { MANAGED_ORIGIN_PROOF_DOMAIN } from '../src/core/managed-origin-attestation.js';
 import {
   NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS,
   nativeSubagentRuntimeCapabilityHeaders,
   nativeSubagentRuntimeHostChallengeHeaders,
   readNativeSubagentRuntimeResponseProof,
@@ -1090,24 +1091,44 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
         }),
       );
       const path = `/api/sessions/${sessionId}/native-subagent-runtime`;
-      for (let i = 0; i < 64; i += 1) {
-        const headers = nativeSubagentRuntimeCapabilityHeaders({
-          capability: POLICY_CAPABILITY,
-          method: 'POST',
-          path,
-          port: handle.port,
-          sessionId,
-          larkAppId: SESSION_APP,
-          bootInstanceId: workerPool.getDaemonBootId(),
-          nonce: `ff${i.toString(16).padStart(62, '0')}`,
-        });
-        const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', ...headers },
-          body: '{}',
-        });
-        expect(response.status, `proof fill ${i}`).toBe(200);
-        await response.arrayBuffer();
+      // Each fill holds a proof slot only until a server timer frees it once the
+      // proof TTL has passed. Cold-starting the hook from source can outlast that
+      // on a loaded runner (and so can the fills themselves); the hook's request
+      // would then get a free slot and a signed 429 (deny) instead of the exhausted
+      // quota this case is about. Cancel every timer longer than the proof TTL the
+      // moment the fills start it, so the quota stays exhausted however long either
+      // phase takes (afterEach resets the quota bookkeeping). Under Bun this also
+      // cancels node:http's socket timeout for each finished fill connection.
+      const realSetTimeout = globalThis.setTimeout;
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+        callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]
+      ) => {
+        const timer = realSetTimeout(callback, ms, ...args);
+        if ((ms ?? 0) > NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS) clearTimeout(timer);
+        return timer;
+      }) as typeof setTimeout);
+      try {
+        for (let i = 0; i < 64; i += 1) {
+          const headers = nativeSubagentRuntimeCapabilityHeaders({
+            capability: POLICY_CAPABILITY,
+            method: 'POST',
+            path,
+            port: handle.port,
+            sessionId,
+            larkAppId: SESSION_APP,
+            bootInstanceId: workerPool.getDaemonBootId(),
+            nonce: `ff${i.toString(16).padStart(62, '0')}`,
+          });
+          const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: '{}',
+          });
+          expect(response.status, `proof fill ${i}`).toBe(200);
+          await response.arrayBuffer();
+        }
+      } finally {
+        setTimeoutSpy.mockRestore();
       }
       const child = spawnTsScript(resolve('src/cli.ts'), ['native-subagent-runtime-hook'], {
         cwd: resolve('.'),
@@ -1625,6 +1646,34 @@ describe('POST /api/session-origin/attest', () => {
     } finally { fixture.cleanup(); }
   });
 
+  it('separates same-app open-id operation from union-id creator ownership', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      registerBot({ larkAppId: 'app-managed-origin', larkAppSecret: 'test-secret',
+        allowedUsers: ['ou_managed_origin_owner'] });
+      const bot = getBot('app-managed-origin');
+      bot.resolvedAllowedUsers = ['ou_managed_origin_owner'];
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      for (const revoked of [false, true]) {
+        if (revoked) bot.resolvedAllowedUsers = [];
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+          callerOpenId: 'ou_forged', larkAppId: 'cli_other', scheduleOperator: { ok: true },
+        });
+        expect(response.status).toBe(200);
+        const proof = JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+        expect(proof.scheduleOperator).toEqual(revoked
+          ? { ok: false, error: 'caller_not_allowed' } : { ok: true });
+        expect(proof.scheduleCreator).toEqual({ ok: false,
+          error: revoked ? 'caller_not_allowed' : 'caller_union_id_unresolved' });
+        expect(proof.callerOpenId).toBe('ou_managed_origin_owner');
+        expect(proof.larkAppId).toBe('app-managed-origin');
+      }
+    } finally { fixture.cleanup(); }
+  });
+
   it('rejects missing, disconnected, or dead exact workers without writing a proof', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -1885,6 +1934,39 @@ describe('POST /api/session-origin/attest', () => {
       fixture.cleanup();
     }
   }, 5_000);
+});
+
+describe('GET /api/bot-default-oncall — oncall chat counts', () => {
+  it('reports live bindings (oncallChats) apart from the autobound tombstone list', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-oncall-counts-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-oncall-counts-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        // oc_live is still bound; the other two were unbound / released and only
+        // remain in the "auto-bind already used" list.
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+        defaultOncallAutoboundChats: ['oc_live', 'oc_unbound', 'oc_released'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ autoboundChatCount: 3, oncallChatCount: 1 });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/bot-default-oncall — schedule host paths', () => {
@@ -4165,7 +4247,7 @@ describe('GET /api/sessions', () => {
   it('does not scan transcripts while composing the bulk sessions list', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-token-list-'));
     const prevConfigDataDir = config.session.dataDir;
-    const usageSpy = vi.spyOn(costCalculator, 'getSessionTokenUsage').mockImplementation(() => {
+    const usageSpy = vi.spyOn(costCalculator, 'getSessionUsageWithContext').mockImplementation(() => {
       throw new Error('bulk sessions list must not scan token usage');
     });
     try {
@@ -5183,7 +5265,7 @@ describe('PUT /api/bot-read-isolation', () => {
         codexAppDispatchLedger: pendingLedger,
       } as any]);
       const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
-      const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+      const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
       const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
       try {
         handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -5401,7 +5483,7 @@ describe('PUT /api/bot-read-isolation', () => {
       larkAppId: appId,
       backendType: 'tmux',
     } as any]);
-    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession')
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget')
       .mockReturnValueOnce('exists')
       .mockReturnValue('missing');
     const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
@@ -5431,7 +5513,55 @@ describe('PUT /api/bot-read-isolation', () => {
         suspendedSessions: 0,
       });
       expect(updateSpy).toHaveBeenCalledOnce();
-      expect(probeSpy).toHaveBeenCalledWith('tmux', 'bmx-s-just-c');
+      expect(probeSpy).toHaveBeenCalledWith({ backendType: 'tmux', sessionName: 'bmx-s-just-c' });
+    } finally {
+      updateSpy.mockRestore();
+      probeSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('probes a closed tmux row on the server its pane was frozen onto, not the default one', async () => {
+    const appId = 'test-read-isolation-dedicated-socket';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-dedicated',
+      chatId: 'oc_dedicated',
+      rootMessageId: 'om_dedicated',
+      title: 'closed on the dedicated socket',
+      status: 'closed',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      backendType: 'tmux',
+      persistentBackendTarget: { backendType: 'tmux', sessionName: 'bmx-s-dedica', socketName: 'botmux' },
+    } as any]);
+    // The pane is still alive on `-L botmux`; the default server knows nothing of it.
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget')
+      .mockImplementation(target => (target.backendType === 'tmux' && target.socketName === 'botmux' ? 'exists' : 'missing'));
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_teardown_unverified' });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(probeSpy).toHaveBeenCalledWith({ backendType: 'tmux', sessionName: 'bmx-s-dedica', socketName: 'botmux' });
     } finally {
       updateSpy.mockRestore();
       probeSpy.mockRestore();
@@ -5463,7 +5593,7 @@ describe('PUT /api/bot-read-isolation', () => {
       larkAppId: appId,
       // Deliberately no backendType stamp.
     } as any]);
-    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
     const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
       .mockResolvedValue({ ok: true, readIsolation: false });
     try {
@@ -9022,6 +9152,7 @@ describe('PUT /api/bot-agent', () => {
         blockingSessions: [{
           sessionId: session.sessionId,
           cliId: 'codex-app',
+          title: 'Pending',
           reasons: ['codex_app_dispatch'],
         }],
       });
@@ -9087,6 +9218,7 @@ describe('PUT /api/bot-agent', () => {
         blockingSessions: [{
           sessionId: session.sessionId,
           cliId: 'traex',
+          title: 'Generic pending',
           reasons: ['queued_todo', 'repository_setup'],
         }],
       });

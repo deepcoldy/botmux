@@ -18,12 +18,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { rmSandboxScratch } from './rm-sandbox-scratch.js';
-
-function unmount(mountPoint: string): void {
-  if (spawnSync('umount', [mountPoint], { stdio: 'ignore' }).status !== 0) {
-    spawnSync('fusermount', ['-u', mountPoint], { stdio: 'ignore' });
-  }
-}
+import { unmountTestMount } from './unmount-test-mount.js';
 
 export function scratchMountRuntimeAvailable(storage: 'tmpfs' | 'disk'): boolean {
   if (process.platform !== 'linux') return false;
@@ -61,7 +56,7 @@ export function scratchMountRuntimeAvailable(storage: 'tmpfs' | 'disk'): boolean
   } catch {
     return false;
   } finally {
-    for (const mp of mounted) unmount(mp);
+    for (const mp of mounted) unmountTestMount(mp);
     // Refuses (and reports) while anything is still mounted below: never
     // delete through a lowerdir=/ overlay.
     rmSandboxScratch(root);

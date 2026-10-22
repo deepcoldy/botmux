@@ -7,6 +7,38 @@ import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
+/** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
+export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
+
+export const BOT_DEFAULTS_TABS: readonly BotDefaultsTab[] = [
+  'common',
+  'sessions',
+  'security',
+  'cards',
+  'advanced',
+];
+
+export const BOT_DEFAULTS_TAB_LABEL_KEYS: Readonly<Record<BotDefaultsTab, string>> = {
+  common: 'botDefaults.tabCommon',
+  sessions: 'botDefaults.tabSessions',
+  security: 'botDefaults.tabSecurity',
+  cards: 'botDefaults.tabCards',
+  advanced: 'botDefaults.tabAdvanced',
+};
+
+export function parseBotDefaultsTab(value: string | null | undefined): BotDefaultsTab | null {
+  return value && (BOT_DEFAULTS_TABS as readonly string[]).includes(value) ? value as BotDefaultsTab : null;
+}
+
+/** `#/bot-defaults?bot=<appId>&tab=<分类>` 深链；都不给就是 Bot 配置页本身。 */
+export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab } = {}): string {
+  const params = new URLSearchParams();
+  if (target.bot) params.set('bot', target.bot);
+  if (target.tab) params.set('tab', target.tab);
+  const query = params.toString();
+  return `#/bot-defaults${query ? `?${query}` : ''}`;
+}
+
 export type CliOption = {
   id: string;
   label: string;
@@ -96,7 +128,10 @@ export type BotDefaultsRow = {
   /** 「仓库选择卡片」形态的工作目录，与 defaultWorkingDir 互斥。 */
   workingDir?: string | null;
   defaultWorkingDirAutoWorktree?: boolean;
+  /** 自动绑定机会已用过的群数（含已解绑 / 切模式释放的），不是当前绑定数。 */
   autoboundChatCount?: number;
+  /** 当前 oncall 绑定数；null = daemon 太旧没报。 */
+  oncallChatCount?: number | null;
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
@@ -162,6 +197,7 @@ export type BotDefaultsRow = {
   codexBrowser?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  replyCardActions?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;

@@ -216,8 +216,8 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |
 | `defaultOncall` | 该 bot 的默认：新群聊首条新话题自动绑定 oncall。`{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`；`since` 之前已存在的老群不受影响 |
-| `globalGrants` | 全局可对话名单（`ou_xxx`，人或 bot）。任意群可对话，仅 `canTalk` |
-| `chatGrants` | 按群的 per-user 授权 `{ "oc_xxx": ["ou_yyy"] }`，仅放行 `canTalk`。一般由 `/grant` 卡片写入，也可手配 |
+| `globalGrants` | 全局可对话名单（`ou_xxx`，人或 bot）。任意群可对话，仅 `canTalk`。见下方「授权库」 |
+| `chatGrants` | 按群的 per-user 授权 `{ "oc_xxx": ["ou_yyy"] }`，仅放行 `canTalk`。一般由 `/grant` 卡片或多 bot 建群写入，也可手配。见下方「授权库」 |
 | `messageQuota` | 消息额度覆盖 `{ "defaultLimit": N }`：**只约束授权卡/自助申请授权放进来的访客**——配了正整数后新授权卡使用 N 条额度；未配置时新授权卡默认每人 3 条。**Oncall 群恒不设额度、不读此值**。显式 `/grant @用户 N` 始终使用 N。仅约束 talk 授权，不影响 `canOperate` |
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
@@ -446,13 +446,20 @@ Dashboard 的“会议角色预设”提供本地内置模板库，当前包含�
 
 ## 运行时状态（自动维护，勿手改）
 
-下列字段由 botmux 自身写入并随授权 / 开关一起持久化进 `bots.json`，列出仅为说明，**不要手动编辑**：
+下列字段由 botmux 自身写入并随开关一起持久化进 `bots.json`，列出仅为说明，**不要手动编辑**：
 
 | 字段 | 说明 |
 |------|------|
 | `defaultOncallAutoboundChats` | `defaultOncall` 已自动绑过的 chat_id（append-only）。一旦记录，即使后续解绑也不会再次自动绑 |
-| `quotaState` | scope 级消息额度计数 `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`；用满自动收回对应 scope 授权 |
 | `noCardChats` | `/card off\|on` 写入的「该群不发流式卡片」名单 |
+
+### 授权库（`grants.sqlite`）
+
+per-user 对话授权不放在 `bots.json`，而是存在 `<数据目录>/grants.sqlite`（默认 `~/.botmux/data/grants.sqlite`）：`chatGrants`、`globalGrants`，以及它们的消息额度计数（`quotaState`，`{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`，用满自动收回对应 scope 授权）、有效期（`grantExpiryState`）和派发扣费回执。多 bot 建群会在每个 bot 上为其它 bot 各建一条授权，放在配置文件里会让 `bots.json` 随建群线性膨胀。
+
+- daemon 启动时，若本 bot 在 `bots.json` 里还有这些字段（升级前的存量、手工配置），会**并入授权库后从 `bots.json` 删除**；库里已有的同一条记录以库为准。首次删除前整份 `bots.json` 会备份为 `bots.json.bak-grants-v1`。
+- 授权只在**过期**时自动回收：daemon 启动时及每小时清理一次已到期的授权；撤销请用 `/revoke` 或授权卡。
+- `BOTMUX_COORDINATION_MODE=primary`（多副本）下各副本的数据目录不共享，授权仍保存在 `bots.json` 中，行为不变。已经用默认模式运行过的部署再切到 primary，授权库里的授权不会被读取（只会少放权），不要在两种模式之间来回切换。
 
 > **配置优先级**：`BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`。改完跑 `botmux restart` 生效。
 

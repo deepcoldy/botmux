@@ -1431,6 +1431,9 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
               if (ph) buttons.push(`[输入框: ${ph}]`);
             }
             else if (node.tag === 'select_static' || node.tag === 'multi_select_static' || node.tag === 'overflow') {
+              // botmux's own callback controls (reply-card menu/model picker,
+              // effort/config selects) are pure UI chrome — drop them.
+              if (isBotmuxCallbackButton(node)) continue;
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
               const opts = Array.isArray(node.options)
                 ? node.options.map((o: any) => (typeof o.text === 'string' ? o.text : o.text?.content)).filter(Boolean)
@@ -1726,10 +1729,13 @@ function firstNonEmptyString(...candidates: unknown[]): string | undefined {
  *  in extractElementText.
  *
  *  Primary detection is the egress-stamped ownership marker
- *  (callback-button-marker.ts). This wordlist is the LEGACY fallback for
- *  cards sent by pre-marker builds (chat history is long-lived), covering
- *  every action dispatched by card-handler as of the fix — it is frozen;
- *  new botmux buttons rely on the marker, not on growing this list.
+ *  (callback-button-marker.ts). This wordlist is a defense-in-depth fallback
+ *  for two cases: cards still in chat history that were sent by pre-marker
+ *  builds (history is long-lived), and any delivery path that fails to stamp
+ *  the egress marker. It covers every action dispatched by card-handler; when
+ *  adding a new internal control that can traverse an unstamped path, register
+ *  it here (with a parser test asserting it does not leak), do not rely on the
+ *  marker alone.
  *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
  *  marker and their `value` never uses botmux's action vocabulary. */
 const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
@@ -1738,6 +1744,7 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
   'retry_last_task', 'takeover', 'term_action', 'toggle_display',
   'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  'reply_card_menu', 'reply_model_pick', 'reply_menu_cancel',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
   'worktree_toggle_mode', 'repo_rebuild_worktree',
@@ -2034,7 +2041,10 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // select / multi-select / overflow — surface placeholder + selectable
-  // options so the choices the card offers aren't lost.
+  // options so the choices the card offers aren't lost. botmux's own callback
+  // controls (reply card menu/model picker, effort/config selects) are dropped.
+  if ((tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow')
+    && isBotmuxCallbackButton(el)) return;
   if (tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow') {
     const ph = el.placeholder?.content;
     const opts = Array.isArray(el.options)

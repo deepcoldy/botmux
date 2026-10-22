@@ -75,11 +75,14 @@ describe('worker wiring', () => {
   // 源码结构护栏(K3+K2)：spawn 前的读隔离闸门在 worker.ts 的 spawnCli 巨型闭包里，没有可单测的 seam；
   // 上面的纯函数用例删掉 worker 调用点照样全绿。守两件事：① 闸门吃的是经冷机判定升级后的 probe——
   // 2026-10-02 重启清空 /tmp 后所有读隔离 bot 一直起不来（11d09778c9）；② 这个「unknown→missing」
-  // 的放宽只有这一个生产调用点，不能扩散到 post-kill 确认 / MCP 闸门等其它 fail-closed 判定。
+  // 的放宽只有这一个生产调用点，不能扩散到 post-kill 确认 / MCP 闸门等其它 fail-closed 判定；
+  // ③ 托管会话有了独立 tmux socket 后，冷机探测必须问「本次选中 target 所在的 server」——
+  // 问默认 server 会把独立 server 上还活着的受限 pane 当成冷机器清掉。
   it('feeds only the read-isolation gate through the tmux cold-machine probe upgrade', () => {
     const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
-    const call = src.match(/(\w+) = resolveReadIsolationPaneProbe\([\s\S]{0,200}?serverAbsentOnColdMachine\(\)/);
+    const call = src.match(/(\w+) = resolveReadIsolationPaneProbe\([\s\S]{0,300}?serverAbsentOnColdMachine\(([^)]*)\)/);
     expect(call).not.toBeNull();
+    expect(call![2]).toMatch(/^persistentTarget\?\.backendType === 'tmux' \? persistentTarget\.socketName : undefined$/);
     expect(src.match(/resolveReadIsolationPaneProbe\(/g)).toHaveLength(1);
     expect(src.match(/serverAbsentOnColdMachine\(/g)).toHaveLength(1);
     // The gate's state machine consumes the resolved probe, never the raw one.

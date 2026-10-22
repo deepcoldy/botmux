@@ -64,8 +64,19 @@ const HELP_TEXT = `botmux observe — 读取 daemon 实时 SessionRow 投影（v
   identity/cli/backend, liveness (alive|not_running|closed|unknown),
   turn (working|idle|starting|analyzing|limited|stalled|interrupted|unknown),
   phase (仅 'unknown'), queued/parkedOrSuspended/closed (boolean|'unknown'),
-  pendingRepo, lastActivityAt, workingDirectory, rawStatus.
+  pendingRepo, lastActivityAt, workingDirectory, rawStatus, context.
   probe.status: ok|unauthorized|unreachable|not_found|daemon_offline。
+
+context（上下文占用，仅 --session 单会话查询；Claude Code / Codex）：
+  { usedTokens, windowTokens|null, compactions|null, measuredAt, source }
+  usedTokens    最近一次请求的提示大小（不是累计 token）。
+  windowTokens  CLI 自己报的上下文窗口；Claude 取 statusline 快照（超过 10 分钟即
+                null），Codex 取 rollout 的 model_context_window；从不按模型名猜。
+  compactions   上下文被压缩的次数；无法可靠统计时为 null（不是 0）。
+  measuredAt    usedTokens 所在 transcript 条目的时间（epoch ms）。
+  source        claude-transcript | codex-rollout。
+  拿不到（别的 CLI、无 transcript、尚无用量、transcript 过大）时整块缺省——
+  不会填 0 或猜测值。列表模式为避免批量扫 transcript 不带 context，要读请用 --session。
 
 Probe 失败不回退旧缓存；phase 目前只报 unknown。
 `;

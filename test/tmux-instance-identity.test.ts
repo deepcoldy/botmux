@@ -138,3 +138,35 @@ describe.skipIf(process.platform !== 'linux')('Linux cold tmux evidence', () => 
     expect(() => TmuxBackend.assertInstanceIdentity(NAME, 'binding-a')).toThrow(/preserved/);
   });
 });
+
+describe.skipIf(process.platform !== 'linux')('teardown probe on the default server', () => {
+  it('reads a socket no server ever bound as missing, where the strict probe stays unknown', () => {
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('missing');
+    expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
+  });
+
+  it('trusts a running server that answers the session is gone', () => {
+    exec.mockImplementation(() => { throw error({ status: 1, signal: null, stderr: `can't find session: ${NAME}` }); });
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('missing');
+  });
+
+  it('keeps an unlinked live socket that still owns its kernel pathname unknown', () => {
+    read.mockReturnValue(HEADER + row(SOCKET));
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('unknown');
+  });
+
+  it('keeps an unreadable kernel socket census unknown', () => {
+    read.mockImplementation(() => { throw error({ code: 'EACCES' }); });
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('unknown');
+  });
+
+  it.each(['', 'unrecognized header\n', HEADER + 'incomplete socket row\n'])('keeps missing or malformed kernel evidence unknown: %j', contents => {
+    read.mockReturnValue(contents);
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('unknown');
+  });
+
+  it('keeps a timed-out answer unknown', () => {
+    exec.mockImplementation(() => { throw error({ code: 'ETIMEDOUT', status: 1, signal: null, stderr: `error connecting to ${SOCKET} (No such file or directory)` }); });
+    expect(TmuxBackend.probeSessionForTeardown(NAME)).toBe('unknown');
+  });
+});

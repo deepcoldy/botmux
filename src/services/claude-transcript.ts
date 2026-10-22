@@ -644,10 +644,17 @@ export function classifyClaudeTerminalEvent(
  * Both may be present for the same turn, so consumers must deduplicate by the
  * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
  * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ *
+ * The two are not equally final. Claude Code writes one record per content
+ * block and stamps every record with the MESSAGE's stop reason, so the thinking
+ * block of a final message already carries `end_turn` while its text block, a
+ * trailing API-error record and the Stop hooks are still to come. Only
+ * `turn_duration` (see {@link isClaudeTurnDurationEvent}) is written after all
+ * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
   if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
-  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  if (isClaudeTurnDurationEvent(ev)) return true;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return false;
   const reason = ev.message?.stop_reason;
@@ -655,6 +662,44 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason.length > 0
     && reason !== 'tool_use'
     && reason !== 'pause_turn';
+}
+
+/** Claude Code's main-thread `system/turn_duration` record: the last record of
+ *  a turn, written after its final content block, any API-error record and the
+ *  Stop hooks. */
+export function isClaudeTurnDurationEvent(ev: TranscriptEvent): boolean {
+  return !!ev && typeof ev === 'object' && (ev as any).isSidechain !== true
+    && ev.type === 'system' && ev.subtype === 'turn_duration';
+}
+
+/** Same bound and rationale as CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES: the probe
+ *  below runs synchronously at bridge baseline and must stay bounded. Only
+ *  lines mentioning the marker are parsed. */
+const TURN_DURATION_MARKER_PROBE_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Whether a transcript's recent history holds a `turn_duration` record, i.e.
+ *  the CLI writing it closes every turn with that marker. Baseline cursors
+ *  straight to EOF without parsing history, so without this probe the bridge
+ *  queue would only learn it at the end of the first turn after a restart. */
+export function transcriptShowsTurnDurationMarker(path: string): boolean {
+  if (!path || !existsSync(path)) return false;
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return false; }
+  if (completeEnd <= 0) return false;
+  try {
+    return scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - TURN_DURATION_MARKER_PROBE_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => {
+        const text = line.toString('utf8');
+        if (!text.includes('turn_duration')) return false;
+        try { return isClaudeTurnDurationEvent(JSON.parse(text) as TranscriptEvent); } catch { return false; }
+      },
+    });
+  } catch {
+    return false;
+  }
 }
 
 /** The launch-ack a background Agent/Task tool_result carries the moment it is
@@ -774,7 +819,7 @@ export interface BackgroundTaskLaunch {
   expiresAtMs?: number;
 }
 
-function eventTimeMs(ev: TranscriptEvent): number | undefined {
+export function eventTimeMs(ev: TranscriptEvent): number | undefined {
   const ms = typeof ev.timestamp === 'string' ? Date.parse(ev.timestamp) : NaN;
   return Number.isFinite(ms) ? ms : undefined;
 }

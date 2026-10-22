@@ -15,6 +15,8 @@
  */
 
 import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+import { stripCodeSpans } from '../utils/markdown-code.js';
+import type { BotMentionEntry, OutgoingMention } from '../utils/bot-routing.js';
 
 export { resolveSendTarget };
 
@@ -776,4 +778,73 @@ export function eligibleAutoMentionAliases(input: {
     out.push(cliId);
   }
   return out;
+}
+
+/**
+ * Which known peer bots a reply names in prose (`@BotName`), resolved to the
+ * sender app's own open_ids. One matcher for every reply channel that has no
+ * explicit `--mention`: `botmux send`'s auto-injection and the daemon's
+ * zero-injection final card, so the same text @s the same bot either way.
+ *
+ *   - Code (inline spans, fenced blocks) is not scanned: a quoted `@Bot` is an
+ *     example, not a handoff.
+ *   - Boundary: the lookbehind blocks only ASCII word chars (`user@Claude` is
+ *     rejected, a CJK-prefixed `看看@CoCo` is accepted); the lookahead blocks
+ *     any Unicode letter/digit (`@Claude2` / `@Claude分身` are not `Claude`).
+ *     A non-letter separator (`@Claude-Code`) can still match a shorter name
+ *     too; the inline rewrite (applyInlineMentions) binds it to the longer one.
+ *   - Lark open_ids are per-app scoped, so only the sender's cross-ref counts.
+ *     The target's self-reported `botOpenId` is the wrong scope; a named bot
+ *     without a cross-ref entry is returned in `unresolved`, never guessed.
+ */
+export function resolveProseBotMentions(input: {
+  text: string;
+  botEntries: readonly BotMentionEntry[];
+  crossRef: Readonly<Record<string, string>>;
+  selfAppId: string;
+  /** Bots with an active session in this conversation; only they may be
+   *  named by their type-generic cliId alias (see eligibleAutoMentionAliases). */
+  convoBotAppIds: Set<string>;
+  /** open_ids already addressed explicitly; not returned again. */
+  alreadyMentioned?: Iterable<string>;
+}): { mentions: Array<Required<OutgoingMention>>; unresolved: string[] } {
+  const textForBotScan = stripCodeSpans(input.text);
+  const sortedEntries = [...input.botEntries].sort(
+    (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
+  );
+  const selfAliases = new Set(
+    input.botEntries
+      .filter(entry => entry.larkAppId === input.selfAppId)
+      .flatMap(entry => [entry.botName, entry.cliId])
+      .filter((name): name is string => !!name)
+      .map(name => name.toLowerCase()),
+  );
+  const mentioned = new Set(input.alreadyMentioned);
+  const mentions: Array<Required<OutgoingMention>> = [];
+  const unresolved: string[] = [];
+  for (const entry of sortedEntries) {
+    if (!entry.botName || entry.larkAppId === input.selfAppId) continue;
+    const names = eligibleAutoMentionAliases({
+      botName: entry.botName,
+      cliId: entry.cliId ?? undefined,
+      larkAppId: entry.larkAppId ?? undefined,
+      selfAliases,
+      convoBotAppIds: input.convoBotAppIds,
+    });
+    for (const name of names) {
+      const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
+      if (!re.test(textForBotScan)) continue;
+      const senderScopedId = input.crossRef[entry.botName];
+      if (!senderScopedId) {
+        unresolved.push(entry.botName);
+        break;
+      }
+      if (mentioned.has(senderScopedId)) break;
+      mentions.push({ open_id: senderScopedId, name: entry.botName });
+      mentioned.add(senderScopedId);
+      break;
+    }
+  }
+  return { mentions, unresolved };
 }
