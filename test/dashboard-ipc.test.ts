@@ -4165,7 +4165,7 @@ describe('GET /api/sessions', () => {
   it('does not scan transcripts while composing the bulk sessions list', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-token-list-'));
     const prevConfigDataDir = config.session.dataDir;
-    const usageSpy = vi.spyOn(costCalculator, 'getSessionTokenUsage').mockImplementation(() => {
+    const usageSpy = vi.spyOn(costCalculator, 'getSessionUsageWithContext').mockImplementation(() => {
       throw new Error('bulk sessions list must not scan token usage');
     });
     try {

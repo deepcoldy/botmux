@@ -104,6 +104,7 @@ vi.mock('../src/config.js', async () => {
 
 vi.mock('../src/core/cost-calculator.js', () => ({
   getSessionTokenUsage: vi.fn(() => null),
+  getSessionUsageWithContext: vi.fn(() => ({ snapshot: { context: null, tokens: null, turnTokens: null } })),
   getSessionUsageSnapshot: vi.fn(() => ({
     context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
     tokens: { in: 67_890, out: 123 },
