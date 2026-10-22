@@ -1228,7 +1228,7 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     const ownRoots = [
       `${sd}/runtime-skills/s/claude-plugin`,   // claude-plugin delivery
       `${sd}/runtime-skills/s/skills`,          // skill-root delivery (pi)
-      `${sd}/pi-initial-prompts/s`,             // pi long initial prompt
+      `${sd}/pi-initial-prompts/s`,             // pi initial prompt @file delivery
     ];
 
     it('stays readOnly under no-transport for every delivery shape; siblings stay denied', () => {

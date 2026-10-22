@@ -790,6 +790,11 @@ describe('cleanupTraexAskHooks', () => {
   });
 });
 
+const OPENCODE_PLUGIN_CASES = [
+  { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
+  { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
+];
+
 /**
  * The generated plugins must not reach a loopback service through the global
  * `fetch`, and — the part a `toContain` check cannot see — the helper they call
@@ -809,12 +814,7 @@ describe('cleanupTraexAskHooks', () => {
  * corporate proxy, not just a failed reply.
  */
 describe('generated OpenCode plugins — loopback requests bypass the proxy', () => {
-  const CASES = [
-    { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
-    { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
-  ];
-
-  for (const { label, cliId, format } of CASES) {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
     it(`${label}: defines loopbackSafeFetch wherever it is called`, () => {
       const dir = makeTmpDir();
       const configPath = join(dir, 'plugin', 'botmux-ask.js');
@@ -887,6 +887,37 @@ describe('generated OpenCode plugins — loopback requests bypass the proxy', ()
       } finally {
         await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
       }
+    });
+  }
+});
+
+/**
+ * A hook that dies before reading its stdin (crashes at startup, gets killed)
+ * turns the plugin's pending stdin write into EPIPE. The plugin runs inside
+ * OpenCode's own process, so an unhandled stream error there takes OpenCode down;
+ * the ask must fall back to passthrough instead. Executed rather than grepped for
+ * the reason given above: the guard has to exist in BOTH emitted templates.
+ */
+describe('generated OpenCode plugins — a hook that exits before reading stdin', () => {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
+    it(`${label}: askBotmux resolves passthrough instead of throwing EPIPE`, async () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+      const from = src.indexOf('function askBotmux');
+      expect(from).toBeGreaterThan(-1);
+      const askSrc = src.slice(from, src.indexOf('\n}', from) + 2);
+
+      const hook = join(dir, 'hook.mjs');
+      writeFileSync(hook, 'process.exit(7);\n');
+      const { spawn } = await import('node:child_process');
+      // eslint-disable-next-line no-new-func
+      const askBotmux = new Function('spawn', 'CMD', 'ARGS', `${askSrc}\nreturn askBotmux;`)(
+        spawn, process.execPath, [hook],
+      ) as (payload: string) => Promise<string>;
+      // Larger than the pipe buffer, so the write is still pending when the hook exits.
+      await expect(askBotmux(JSON.stringify({ text: 'x'.repeat(256 * 1024) }))).resolves.toBe('');
     });
   }
 });

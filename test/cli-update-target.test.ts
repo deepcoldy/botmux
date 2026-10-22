@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
@@ -33,77 +33,30 @@ function runCli(args: string[]): { status: number | null; stdout: string; stderr
   };
 }
 
+// Every argument combination is decided in-process by `decideUpgradeArgs`
+// (test/update-target.test.ts). These cases only prove the real CLI wires each
+// exit path to its exit code and never reaches the update itself, so each one
+// cold-starts src/cli.ts exactly once: a cold start costs seconds on a loaded
+// runner, and six of them in a row used to blow the per-test budget.
 describe('botmux update/upgrade target arguments validation', () => {
   it('rejects conflicting multiple targets with rc=2', () => {
-    const conflictingCases = [
-      ['update', '--canary', '--beta'],
-      ['update', '--canary', 'latest'],
-      ['update', 'latest', '--canary'],
-      ['upgrade', '--canary', '--beta'],
-      ['upgrade', '--canary', 'latest'],
-      ['upgrade', 'latest', '--canary'],
-    ];
-
-    for (const args of conflictingCases) {
-      const res = runCli(args);
-      expect(res.status).toBe(2);
-      expect(res.stderr).toContain('不能同时指定多个升级目标');
-      expect(res.stdout).not.toContain('本地 checkout 更新');
-    }
-  }, 30_000);
+    const res = runCli(['update', '--canary', 'latest']);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toContain('不能同时指定多个升级目标');
+    expect(res.stdout).not.toContain('本地 checkout 更新');
+  });
 
   it('rejects URL, protocol, and alias specs with rc=2', () => {
-    const protocolCases = [
-      ['update', 'npm:other-package@1.0.0'],
-      ['update', 'https://example.invalid/botmux.tgz'],
-      ['update', 'file:./local-botmux'],
-      ['update', 'git+https://github.com/foo/bar.git'],
-      ['upgrade', 'npm:other-package@1.0.0'],
-      ['upgrade', 'https://example.invalid/botmux.tgz'],
-    ];
-
-    for (const args of protocolCases) {
-      const res = runCli(args);
-      expect(res.status).toBe(2);
-      expect(res.stderr).toContain('非法的目标频道或版本格式');
-      expect(res.stdout).not.toContain('本地 checkout 更新');
-    }
-  }, 30_000);
-
-  it('rejects semver range, wildcard, and unknown tag specs with rc=2', () => {
-    const rangeCases = [
-      ['update', 'x'],
-      ['update', 'X'],
-      ['update', 'vx'],
-      ['update', 'v3'],
-      ['update', '3.x'],
-      ['upgrade', 'x'],
-      ['upgrade', 'v3'],
-    ];
-
-    for (const args of rangeCases) {
-      const res = runCli(args);
-      expect(res.status).toBe(2);
-      expect(res.stderr).toContain('非法的目标频道或版本格式');
-      expect(res.stdout).not.toContain('本地 checkout 更新');
-    }
-  }, 30_000);
+    const res = runCli(['upgrade', 'npm:other-package@1.0.0']);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toContain('非法的目标频道或版本格式');
+    expect(res.stdout).not.toContain('本地 checkout 更新');
+  });
 
   it('rejects non-latest channel/version updates on local git checkout', () => {
-    const nonLatestCases = [
-      ['update', 'canary'],
-      ['update', '@canary'],
-      ['update', '--canary'],
-      ['update', '3.28.0'],
-      ['upgrade', 'canary'],
-      ['upgrade', '3.28.0'],
-    ];
-
-    for (const args of nonLatestCases) {
-      const res = runCli(args);
-      expect(res.status).toBe(1);
-      expect(res.stderr).toContain('当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本');
-      expect(res.stdout).not.toContain('本地 checkout 更新');
-    }
-  }, 30_000);
+    const res = runCli(['update', 'canary']);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain('当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本');
+    expect(res.stdout).not.toContain('本地 checkout 更新');
+  });
 });

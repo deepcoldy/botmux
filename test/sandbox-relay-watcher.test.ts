@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  watch,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -361,6 +362,44 @@ describe('sandbox relay watcher host handoff', () => {
       expect(authorize).toHaveBeenCalledWith({ capability: 'deadbeef'.repeat(4) });
     } finally {
       stop();
+    }
+  });
+});
+
+// inotify reports a directory's entries in the order they changed; macOS
+// FSEvents may coalesce them, so the ordering proof runs where workers run.
+describe.skipIf(process.platform !== 'linux')('sandbox relay watcher completion order', () => {
+  it.each([
+    ['served', JSON.stringify({ contentFile: 'order-1.content', flags: [] }), 0],
+    ['rejected', '{', 1],
+  ] as const)('consumes a %s request before its response becomes visible', async (_label, request, code) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-order-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-ok.mjs');
+    writeFileSync(fixture, `process.stdout.write('ok');`);
+    const id = 'order-1';
+    writeFileSync(join(outbox, `${id}.content`), 'pong');
+    writeFileSync(join(outbox, `${id}.req.json`), request);
+    // Armed after the request exists, so its only rename is its removal.
+    const renamed: string[] = [];
+    const observer = watch(outbox, (event, name) => {
+      if (event === 'rename' && name) renamed.push(String(name));
+    });
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      await vi.waitFor(() => expect(renamed).toEqual(
+        expect.arrayContaining([`${id}.req.json`, `${id}.res.json`]),
+      ), { timeout: 10_000 });
+      // Whoever sees the response must find its request already consumed: a
+      // watcher taking over this outbox would otherwise run it a second time.
+      expect(renamed.indexOf(`${id}.req.json`)).toBeLessThan(renamed.indexOf(`${id}.res.json`));
+      const response = JSON.parse(readFileSync(join(outbox, `${id}.res.json`), 'utf8')) as { code: number };
+      expect(response.code).toBe(code);
+    } finally {
+      stop();
+      observer.close();
     }
   });
 });

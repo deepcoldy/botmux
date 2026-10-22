@@ -96,7 +96,10 @@ export type BotDefaultsRow = {
   /** 「仓库选择卡片」形态的工作目录，与 defaultWorkingDir 互斥。 */
   workingDir?: string | null;
   defaultWorkingDirAutoWorktree?: boolean;
+  /** 自动绑定机会已用过的群数（含已解绑 / 切模式释放的），不是当前绑定数。 */
   autoboundChatCount?: number;
+  /** 当前 oncall 绑定数；null = daemon 太旧没报。 */
+  oncallChatCount?: number | null;
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;

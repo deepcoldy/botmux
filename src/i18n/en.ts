@@ -1353,6 +1353,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux restarted while an automatic {cliName} continuation was being handed off, so its execution state is unknown. To avoid repeating external side effects, Botmux did not replay it. Check the Web Terminal, then send a message to continue.',
   'worker.ordinary_recovery_non_retryable': '⚠️ This {cliName} turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
   'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
+  'worker.local_turn_failed': '⚠️ {cliName} failed ({errorCode}). The failed turn has no matching Lark message (for example input typed in the terminal, or output continuing the previous turn), so it is not retried automatically. Check the Web Terminal and resend if needed.',
 
   // ─── Turn-failure card (generic failure card: @mention + retry button) ────
   'card.turn_failed.title': '⚠️ {cliName} turn failed',

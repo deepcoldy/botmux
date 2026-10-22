@@ -137,7 +137,12 @@ export async function platformAuthRequestRedirect(input: {
   const who = input.delegated ? 'The original user' : 'This user';
   return {
     error: `${who}'s lark-cli authorization comes from the botmux platform, not from application ${input.bot.larkAppId}. `
-      + `Send them the platform page at ${url} to authorize (or re-authorize). If a scope is still missing afterwards, `
+      // The platform application cannot hold every scope (some need tenant-wide
+      // approval), but the bot's own identity often covers the same data.
+      + 'For a READ of data in a chat or document this bot can access (for example messages of a group the bot is in), '
+      + 'retry that read with --as bot first; it needs no user authorization. Never switch a write to --as bot. '
+      + `If the read also fails as bot, or the action must be done as this user, send them the platform page at ${url} `
+      + 'to authorize (or re-authorize). If a scope is still missing afterwards, '
       + 'the platform application itself must enable it first; tell the user which scope is needed instead of retrying.',
     authorizeUrl: url,
   };

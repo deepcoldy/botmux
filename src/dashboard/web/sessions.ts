@@ -10,10 +10,20 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
+import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 
 export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
   if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');
   return `${translate('sessions.resumeFailed')}: ${reason}`;
+}
+
+/** 「重启失败」提示：被未处理完的会话挡住时说清卡在什么、怎么办，其余沿用 daemon 的 message / error。 */
+export function restartErrorMessage(body: any, status: number, translate: typeof t = t): string {
+  const blocked = sessionMutationBlockedText(body, translate);
+  const reason = blocked
+    ? translate('sessions.restartBlocked', { detail: blocked })
+    : body?.message ?? body?.error ?? status;
+  return `${translate('sessions.restartFailed')}: ${reason}`;
 }
 
 export function tokenCount(value: unknown): number | null {

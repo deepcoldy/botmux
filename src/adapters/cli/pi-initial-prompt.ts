@@ -22,6 +22,17 @@ export function piInitialPromptNeedsFile(prompt: string | undefined): boolean {
     // integration can also bypass the PATH launcher, so even short routed
     // Botmux prompts must use Pi's safe @file positional form.
     || /[\x00-\x1f\x7f]/.test(prompt)
+    // Pi parses `pi [options] [--] [@files...] [messages...]`. A positional
+    // that starts with `@` is an at-file reference and one that starts with
+    // `-` is parsed as an option, so either prefix exits in ~1s with no turn
+    // ever running: `pi "@{Bot} do X"` -> `Error: File not found: …`,
+    // `pi "- do X"` -> `Error: Unknown option: - do X`; the retry spawn then
+    // dropped the prompt entirely. A `--` separator would only dodge option
+    // parsing, it does not neutralize the at-file case, so both prefixes take
+    // the real @file path. trimStart also covers leading whitespace, which was
+    // the only manual workaround for the @ case.
+    || prompt.trimStart().startsWith('@')
+    || prompt.trimStart().startsWith('-')
   );
 }
 
@@ -59,7 +70,7 @@ export function preparePiInitialPromptArg(opts: {
 
   const sessionDataDir = opts.sessionDataDir?.trim();
   if (!sessionDataDir) {
-    throw new Error('Pi long initial prompt requires SESSION_DATA_DIR for @file delivery; refusing TUI paste fallback');
+    throw new Error('Pi initial prompt @file delivery requires SESSION_DATA_DIR; refusing TUI paste fallback');
   }
 
   const dir = piInitialPromptDir(sessionDataDir, opts.sessionId);

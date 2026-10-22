@@ -349,6 +349,8 @@ async function expectPaneRelayServed(lab: Lab, logs: () => string): Promise<void
   const response = lab.response(id)!;
   expect(response.stderr ?? '', JSON.stringify(response)).not.toMatch(/relay rejected|relay: bad json/);
   expect(typeof response.code).toBe('number');
+  // The watcher consumes a request before publishing its response, so this
+  // holds the moment the response is visible (sandbox-relay-watcher.test.ts).
   expect(existsSync(join(lab.outbox, `${id}.req.json`))).toBe(false);
 }
 

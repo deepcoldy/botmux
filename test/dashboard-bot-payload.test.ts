@@ -61,6 +61,14 @@ describe('dashboard bot payload helpers', () => {
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
 
+  it('passes the live oncall binding count through next to the autobound count; an older daemon yields null', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052, oncallChatCount: 0 }))
+      .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: 0 });
+    // 旧 daemon 不回 oncallChatCount：不能补成 0（会被读成「已全部解绑」），也不能拿累计数顶上。
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052 }))
+      .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: null });
+  });
+
   it('passes the herdr placement block through to the browser, degrading non-objects to null', () => {
     const herdr = { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] };
     expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr })).toMatchObject({ herdr });

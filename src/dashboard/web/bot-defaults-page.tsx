@@ -62,6 +62,7 @@ import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
 import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
+import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -904,6 +905,29 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
   );
 }
 
+/**
+ * 名字行右侧的 oncall 群计数。autoboundChatCount 是自动绑定名单（tombstone）的长度：
+ * 已解绑、切出 oncall 模式被释放的群都还在里面，单独显示会被读成「还绑着这么多群」，
+ * 所以和当前绑定数并排给出，并在悬浮说明里讲清名单里的群不会再自动绑定。
+ */
+export function OncallChatCounts(props: { bot: Pick<BotDefaultsRow, 'autoboundChatCount' | 'oncallChatCount'> }) {
+  const tr = useT();
+  const autobound = props.bot.autoboundChatCount ?? 0;
+  // 旧 daemon 不报当前绑定数（null）：只显示自动绑定过的数量，不猜。
+  const bound = typeof props.bot.oncallChatCount === 'number' ? props.bot.oncallChatCount : null;
+  if (autobound <= 0 && !bound) return null;
+  const parts = [
+    ...(bound !== null ? [tr('botDefaults.oncallBound', { count: bound })] : []),
+    ...(autobound > 0 ? [tr('botDefaults.autobound', { count: autobound })] : []),
+  ];
+  return (
+    <small data-oncall-chat-counts>
+      {parts.join(' · ')}
+      {autobound > 0 ? <InfoTip>{tr('botDefaults.autoboundHelp')}</InfoTip> : null}
+    </small>
+  );
+}
+
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
   bots: BotDefaultsRow[];
@@ -961,7 +985,7 @@ function BotDefaultsCard(props: {
                     : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
                     : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
-                  {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
+                  <OncallChatCounts bot={bot} />
                 </>
               )}
             />
@@ -2611,6 +2635,9 @@ export function BotAgentSection(props: {
         // and their remote ids are only ever reported here.
         const aborted = carriesAgentSwitchCloseSummary(res.body);
         const abortSummary = parseAgentSwitchSummary(res.body);
+        // Refused up front because a session still owns unfinished input: name
+        // the sessions and what to do, not the bare `session_mutation_pending`.
+        const blocked = sessionMutationBlockedText(res.body, tr);
         const detail = aborted
           ? [
             tr('botDefaults.agentSwitchAborted', {
@@ -2619,9 +2646,11 @@ export function BotAgentSection(props: {
             }),
             residualIdText(abortSummary, tr),
           ].filter(Boolean).join(' · ')
-          : typeof res.body?.message === 'string' && res.body.message
-            ? res.body.message
-            : responseErrorText(res);
+          : blocked
+            ? tr('botDefaults.agentBlockedBySessions', { detail: blocked })
+            : typeof res.body?.message === 'string' && res.body.message
+              ? res.body.message
+              : responseErrorText(res);
         const text = `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
@@ -2682,6 +2711,7 @@ export function BotAgentSection(props: {
       // Aborted switch (close refused, or commit failed after closes ran): the
       // config did NOT change and some remote sessions may need manual cleanup.
       const aborted = carriesAgentSwitchCloseSummary(res.body);
+      const blocked = sessionMutationBlockedText(res.body, tr);
       const note = aborted
         ? [
           // Riff-specific wording: by this point the /riff write already
@@ -2690,7 +2720,9 @@ export function BotAgentSection(props: {
           tr('botDefaults.riffAgentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
           residualIdText(summary, tr),
         ].filter(Boolean).join(' · ')
-        : responseErrorText(res);
+        : blocked
+          ? tr('botDefaults.riffAgentBlockedBySessions', { detail: blocked })
+          : responseErrorText(res);
       return { ok: false, hadProblem: true, note };
     } catch (e: any) {
       return { ok: false, hadProblem: true, note: caughtErrorText(e) };

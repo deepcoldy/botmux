@@ -260,9 +260,10 @@ import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallR
 import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import {
+  decideUpgradeArgs,
   fetchDistTagVersion,
   isNewerVersion,
-  parseUpdateTarget,
+  multipleUpgradeTargetsMessage,
   shouldApplySelfUpdate,
 } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -3494,30 +3495,22 @@ function printUpgradeHelp(): void {
 }
 
 async function cmdUpgrade(args: string[] = []): Promise<void> {
-  const nonHelpArgs = args.filter(a => a !== '--help' && a !== '-h');
-  if (nonHelpArgs.length > 1) {
-    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelpArgs.join(' ')}）。请只指定一个频道或版本。`);
-    process.exit(2);
+  const localDevInstall = isLocalDevInstall();
+  const decision = decideUpgradeArgs(args, localDevInstall);
+  if (decision.kind === 'reject') {
+    console.error(decision.message);
+    process.exit(decision.exitCode);
   }
-  const rawTarget = nonHelpArgs[0]?.trim();
-  if (rawTarget === 'help') {
+  if (decision.kind === 'help') {
     printUpgradeHelp();
     return;
   }
-  const target = parseUpdateTarget(rawTarget);
-  if (!target) {
-    console.error(`❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（latest、canary、beta、rc、next）或语义化版本号（如 3.28.0）。`);
-    process.exit(2);
-  }
+  const { target } = decision;
 
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
-  if (isLocalDevInstall()) {
-    if (target.isExplicit && target.tag !== 'latest') {
-      console.error(`❌ 当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本（${target.raw || target.tag}）。\n若需使用发布版本，请通过安装脚本或包管理器全局安装 botmux。`);
-      process.exit(1);
-    }
+  if (localDevInstall) {
     cmdUpgradeLocalDev();
     return;
   }
@@ -10026,8 +10019,19 @@ async function sendDryRun(rest: string[]): Promise<void> {
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
-  // `--help` wins over every other flag and over all content resolution.
-  // It must stay the FIRST statement in cmdSend: content resolution below
+  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
+  // Provider values are opaque argv tokens, but flag-shaped mention values can
+  // otherwise trigger the help/dry-run early exits below before the outbound
+  // policy guard runs. Reject them at the final CLI boundary as well as in the
+  // Remote Runner protocol parser so direct/replayed invocations fail closed.
+  if (remoteRunnerOutbound
+    && argValues(rest, '--mention').some(value => /^--?\w/.test(value))) {
+    console.error('botmux send refused: --remote-runner-outbound mention values must not look like CLI flags');
+    process.exit(2);
+  }
+  // `--help` wins over every ordinary flag and over all content resolution.
+  // It must stay the first generic early exit after the narrow provider-value
+  // shape check above: content resolution below
   // falls through to readStdin() when there is no positional/--content-file,
   // and positionals() filters `--help` out as a flag, so anything placed
   // after it turns `botmux send --help` into a stdin wait instead of help —
@@ -10045,7 +10049,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
-  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Workflow subagents cannot own chat-facing effects: those belong to a
   // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
   // of both the sandbox relay and VC-origin store reads; neither path may turn
@@ -17723,7 +17726,7 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   }
   if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {
     const nonHelp = fleetArgs.filter(a => a !== '--help' && a !== '-h');
-    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelp.join(' ')}）。请只指定一个频道或版本。`);
+    console.error(multipleUpgradeTargetsMessage(nonHelp));
     process.exit(2);
   }
 }
