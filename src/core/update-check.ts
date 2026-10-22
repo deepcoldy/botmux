@@ -325,6 +325,42 @@ export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget | null 
   return null;
 }
 
+/** What `botmux update|upgrade [target]` does with its arguments. */
+export type UpgradeArgsDecision =
+  | { kind: 'help' }
+  | { kind: 'proceed'; target: ParsedUpdateTarget }
+  | { kind: 'reject'; exitCode: 1 | 2; message: string };
+
+/** The one wording for `update|upgrade` given several targets; the CLI entry's
+ *  pre-dispatch check reports the same conflict before this module is reached. */
+export function multipleUpgradeTargetsMessage(nonHelpArgs: readonly string[]): string {
+  return `❌ 不能同时指定多个升级目标（收到：${nonHelpArgs.join(' ')}）。请只指定一个频道或版本。`;
+}
+
+/**
+ * Validate `botmux update|upgrade` arguments before anything touches the install:
+ * exit 2 when they cannot name one target (several targets, unknown channel or
+ * version format), exit 1 when a local git checkout is asked to switch to an npm
+ * channel/version it cannot reach.
+ */
+export function decideUpgradeArgs(args: readonly string[], localDevInstall: boolean): UpgradeArgsDecision {
+  const nonHelpArgs = args.filter(a => a !== '--help' && a !== '-h');
+  if (nonHelpArgs.length > 1) {
+    return { kind: 'reject', exitCode: 2, message: multipleUpgradeTargetsMessage(nonHelpArgs) };
+  }
+  const rawTarget = nonHelpArgs[0]?.trim();
+  if (rawTarget === 'help') return { kind: 'help' };
+  const target = parseUpdateTarget(rawTarget);
+  if (!target) {
+    return { kind: 'reject', exitCode: 2, message: `❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（latest、canary、beta、rc、next）或语义化版本号（如 3.28.0）。` };
+  }
+  // 本地 checkout 只会 git pull 到最新，切不到 npm 频道/版本（见 install-info.ts 的 isLocalDevInstall）。
+  if (localDevInstall && target.isExplicit && target.tag !== 'latest') {
+    return { kind: 'reject', exitCode: 1, message: `❌ 当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本（${target.raw || target.tag}）。\n若需使用发布版本，请通过安装脚本或包管理器全局安装 botmux。` };
+  }
+  return { kind: 'proceed', target };
+}
+
 /**
  * The dist-tag version (e.g. `latest`, `canary`, `beta`, `rc`, `next`) or specific
  * manifest version on the registry npm is configured to use.

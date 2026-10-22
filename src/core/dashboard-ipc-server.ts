@@ -682,6 +682,8 @@ function rejectProtectedSessionMutation(
   const bySessionId = new Map<string, {
     sessionId: string;
     cliId?: string;
+    /** Lets the dashboard name the blocking session instead of a bare id. */
+    title?: string;
     reasons: ReturnType<typeof protectedSessionMutationReasons>;
   }>();
   for (const value of values) {
@@ -696,6 +698,7 @@ function rejectProtectedSessionMutation(
     bySessionId.set(session.sessionId, {
       sessionId: session.sessionId,
       ...(session.cliId ? { cliId: session.cliId } : {}),
+      ...(session.title ? { title: session.title } : {}),
       reasons,
     });
   }

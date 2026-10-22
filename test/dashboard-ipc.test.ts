@@ -69,6 +69,7 @@ import {
 import { MANAGED_ORIGIN_PROOF_DOMAIN } from '../src/core/managed-origin-attestation.js';
 import {
   NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS,
   nativeSubagentRuntimeCapabilityHeaders,
   nativeSubagentRuntimeHostChallengeHeaders,
   readNativeSubagentRuntimeResponseProof,
@@ -1090,24 +1091,44 @@ describe('POST /api/sessions/:sessionId/native-subagent-runtime', () => {
         }),
       );
       const path = `/api/sessions/${sessionId}/native-subagent-runtime`;
-      for (let i = 0; i < 64; i += 1) {
-        const headers = nativeSubagentRuntimeCapabilityHeaders({
-          capability: POLICY_CAPABILITY,
-          method: 'POST',
-          path,
-          port: handle.port,
-          sessionId,
-          larkAppId: SESSION_APP,
-          bootInstanceId: workerPool.getDaemonBootId(),
-          nonce: `ff${i.toString(16).padStart(62, '0')}`,
-        });
-        const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', ...headers },
-          body: '{}',
-        });
-        expect(response.status, `proof fill ${i}`).toBe(200);
-        await response.arrayBuffer();
+      // Each fill holds a proof slot only until a server timer frees it once the
+      // proof TTL has passed. Cold-starting the hook from source can outlast that
+      // on a loaded runner (and so can the fills themselves); the hook's request
+      // would then get a free slot and a signed 429 (deny) instead of the exhausted
+      // quota this case is about. Cancel every timer longer than the proof TTL the
+      // moment the fills start it, so the quota stays exhausted however long either
+      // phase takes (afterEach resets the quota bookkeeping). Under Bun this also
+      // cancels node:http's socket timeout for each finished fill connection.
+      const realSetTimeout = globalThis.setTimeout;
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+        callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]
+      ) => {
+        const timer = realSetTimeout(callback, ms, ...args);
+        if ((ms ?? 0) > NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS) clearTimeout(timer);
+        return timer;
+      }) as typeof setTimeout);
+      try {
+        for (let i = 0; i < 64; i += 1) {
+          const headers = nativeSubagentRuntimeCapabilityHeaders({
+            capability: POLICY_CAPABILITY,
+            method: 'POST',
+            path,
+            port: handle.port,
+            sessionId,
+            larkAppId: SESSION_APP,
+            bootInstanceId: workerPool.getDaemonBootId(),
+            nonce: `ff${i.toString(16).padStart(62, '0')}`,
+          });
+          const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: '{}',
+          });
+          expect(response.status, `proof fill ${i}`).toBe(200);
+          await response.arrayBuffer();
+        }
+      } finally {
+        setTimeoutSpy.mockRestore();
       }
       const child = spawnTsScript(resolve('src/cli.ts'), ['native-subagent-runtime-hook'], {
         cwd: resolve('.'),
@@ -9055,6 +9076,7 @@ describe('PUT /api/bot-agent', () => {
         blockingSessions: [{
           sessionId: session.sessionId,
           cliId: 'codex-app',
+          title: 'Pending',
           reasons: ['codex_app_dispatch'],
         }],
       });
@@ -9120,6 +9142,7 @@ describe('PUT /api/bot-agent', () => {
         blockingSessions: [{
           sessionId: session.sessionId,
           cliId: 'traex',
+          title: 'Generic pending',
           reasons: ['queued_todo', 'repository_setup'],
         }],
       });

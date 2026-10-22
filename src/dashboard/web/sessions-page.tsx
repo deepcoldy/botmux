@@ -73,6 +73,7 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  restartErrorMessage,
   resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
@@ -3304,7 +3305,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) toast(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`, { kind: 'error' });
+        if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);

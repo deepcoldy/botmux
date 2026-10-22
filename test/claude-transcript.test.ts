@@ -34,6 +34,7 @@ import {
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  transcriptShowsTurnDurationMarker,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -111,6 +112,26 @@ describe('drainTranscript', () => {
     appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'short' }] } });
     const r2 = drainTranscript(path, r1.newOffset);
     expect(r2.events.find(e => e.uuid === 'u2')).toBeDefined();
+  });
+});
+
+describe('transcriptShowsTurnDurationMarker', () => {
+  it('finds a main-thread turn_duration in the history behind the baseline', () => {
+    appendLine({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hi' } });
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'd1', durationMs: 1200 });
+    appendLine({ type: 'last-prompt', leafUuid: 'a1' });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(true);
+  });
+
+  it('is false for a transcript that never wrote one, a sidechain one, or only a half-written one', () => {
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'turn_duration is just a word here' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'side-d', isSidechain: true });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    // A record still being written sits past the baseline cursor.
+    appendFileSync(path, '{"type":"system","subtype":"turn_duration","uuid":"d-partial"', 'utf8');
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    expect(transcriptShowsTurnDurationMarker(join(dir, 'missing.jsonl'))).toBe(false);
   });
 });
 

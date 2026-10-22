@@ -62,6 +62,7 @@ import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
 import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
+import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -2634,6 +2635,9 @@ export function BotAgentSection(props: {
         // and their remote ids are only ever reported here.
         const aborted = carriesAgentSwitchCloseSummary(res.body);
         const abortSummary = parseAgentSwitchSummary(res.body);
+        // Refused up front because a session still owns unfinished input: name
+        // the sessions and what to do, not the bare `session_mutation_pending`.
+        const blocked = sessionMutationBlockedText(res.body, tr);
         const detail = aborted
           ? [
             tr('botDefaults.agentSwitchAborted', {
@@ -2642,9 +2646,11 @@ export function BotAgentSection(props: {
             }),
             residualIdText(abortSummary, tr),
           ].filter(Boolean).join(' · ')
-          : typeof res.body?.message === 'string' && res.body.message
-            ? res.body.message
-            : responseErrorText(res);
+          : blocked
+            ? tr('botDefaults.agentBlockedBySessions', { detail: blocked })
+            : typeof res.body?.message === 'string' && res.body.message
+              ? res.body.message
+              : responseErrorText(res);
         const text = `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
@@ -2705,6 +2711,7 @@ export function BotAgentSection(props: {
       // Aborted switch (close refused, or commit failed after closes ran): the
       // config did NOT change and some remote sessions may need manual cleanup.
       const aborted = carriesAgentSwitchCloseSummary(res.body);
+      const blocked = sessionMutationBlockedText(res.body, tr);
       const note = aborted
         ? [
           // Riff-specific wording: by this point the /riff write already
@@ -2713,7 +2720,9 @@ export function BotAgentSection(props: {
           tr('botDefaults.riffAgentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
           residualIdText(summary, tr),
         ].filter(Boolean).join(' · ')
-        : responseErrorText(res);
+        : blocked
+          ? tr('botDefaults.riffAgentBlockedBySessions', { detail: blocked })
+          : responseErrorText(res);
       return { ok: false, hadProblem: true, note };
     } catch (e: any) {
       return { ok: false, hadProblem: true, note: caughtErrorText(e) };

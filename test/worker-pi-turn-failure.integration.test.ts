@@ -47,9 +47,22 @@ describe('Pi worker: a turn Pi aborts on an unresolvable model credential', () =
     const transcript = join(piSessionsDir, `20261020120000_${cliSessionId}.jsonl`);
     writeFileSync(transcript, '');
     const fakePi = join(root, 'fake-pi');
+    // Like Pi itself: the busy line stays on screen while the turn runs and is
+    // repainted away once the turn settles. Pi's idle detection is the viewport
+    // (no busy line + quiet), so a fake that never clears it only passed when the
+    // worker happened to check the screen before the busy line was drawn.
     writeFileSync(fakePi, `#!/usr/bin/env node
 process.stdout.write('Working...\\n');
 process.stdin.resume();
+import('node:fs').then(({ readFileSync }) => {
+  const settle = setInterval(() => {
+    let rows = '';
+    try { rows = readFileSync(${JSON.stringify(transcript)}, 'utf8'); } catch {}
+    if (!/"lastStopReason":"/.test(rows)) return;
+    clearInterval(settle);
+    process.stdout.write('\\u001b[2J\\u001b[H> ');
+  }, 50);
+});
 setInterval(() => {}, 1000);
 `);
     chmodSync(fakePi, 0o755);
