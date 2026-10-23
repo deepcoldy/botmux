@@ -30,6 +30,11 @@ describe('meeting inviter authority', () => {
   ])('rejects unverified/old invitation %j', patch => {
     expect(createVcMeetingInviterGrant(policy, { ...invitation, ...patch }, now)).toBeUndefined();
   });
+  it('rejects a stale invitation even when it is newer than the enable epoch', () => {
+    const olderPolicy = { ...policy, inviterManagementEnabledAt: now - 2 * 60 * 60_000 };
+    expect(createVcMeetingInviterGrant(olderPolicy, { ...invitation, invitedAt: now - 31 * 60_000 }, now)).toBeUndefined();
+    expect(createVcMeetingInviterGrant(olderPolicy, { ...invitation, invitedAt: now - 29 * 60_000 }, now)).toBeDefined();
+  });
   it('preserves enable epoch for old clients and ordinary policy edits', () => {
     const next: VcMeetingInviterPolicy = { ...policy };
     applyVcMeetingInviterPolicyPatch(next, undefined, now);

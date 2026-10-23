@@ -778,7 +778,7 @@ export function VcConsumerProfilesSection(props: {
                     </label>
                     <label className="vc-bot-policy-cell vc-bot-policy-rtv" title={tr('settings.vcProfiles.botPolicies.inviterManagementHelp')}>
                       <input type="checkbox" checked={row.inviterManagementEnabled}
-                        disabled={rowFrozen || !row.vcEligible}
+                        disabled={rowFrozen || !row.vcEligible || !row.vcEnabled}
                         onChange={event => updateBotPolicy(row.appId, { inviterManagementEnabled: event.target.checked })} />
                       <span>{tr('settings.vcProfiles.botPolicies.inviterManagement')}</span>
                     </label>

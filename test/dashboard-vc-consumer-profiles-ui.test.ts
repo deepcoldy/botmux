@@ -778,6 +778,19 @@ describe('meeting inviter owner switch', () => {
     await flush();
     expect(putCalls(fetchMock)[0]).toMatchObject({ botOutputPolicies: [{ appId: 'app_alpha', inviterManagementEnabled: true }] });
   });
+  it('disables the inviter switch while meeting events are off without erasing the saved preference', async () => {
+    stubFetch({ onGet: () => jsonRes(200, catalogBody({ agentOptions: [agentOption('app_alpha', {
+      vcEnabled: false, inviterManagementEnabled: true,
+    })] })) });
+    const r = await mount();
+    const label = r.root.findAllByType('label').find(n => textOf(n).includes('邀请人管理本场会议'))!;
+    expect(label.findByType('input').props.disabled).toBe(true);
+    expect(label.findByType('input').props.checked).toBe(true);
+    const receive = r.root.findAllByType('label').find(n => textOf(n).includes('接收会议事件'))!.findByType('input');
+    await act(async () => { receive.props.onChange({ target: { checked: true } }); });
+    expect(label.findByType('input').props.disabled).toBe(false);
+    expect(label.findByType('input').props.checked).toBe(true);
+  });
   it('is not editable by a read-only viewer', async () => {
     stubFetch(); const r = await mount({ canWrite: false });
     const label = r.root.findAllByType('label').find(n => textOf(n).includes('邀请人管理本场会议'));

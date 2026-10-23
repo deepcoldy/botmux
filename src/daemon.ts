@@ -18592,6 +18592,7 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     const session = getOrCreateVcMeetingDaemonSession(ctx.larkAppId, meeting, cfg, { joined: joinedByInvite });
     if (!session) return;
     let inviterGrantUnavailable = cfg.inviterManagementEnabled === true;
+    let inviterBlocked = false;
     if (ctx.inviter) {
       const grant = createVcMeetingInviterGrant(cfg, { ...ctx.inviter, eventId: ctx.eventId });
       if (grant && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) {
@@ -18605,7 +18606,10 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
           persistVcMeetingRuntimeSession(session, cfg);
         }
       } else if (cfg.inviterManagementEnabled === true) {
-        logger.warn('[vc-agent] inviter management skipped: invitation identity/time is not verifiable');
+        inviterBlocked = !!grant && getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId);
+        logger.warn(inviterBlocked
+          ? '[vc-agent] inviter management skipped: inviter is blocked'
+          : '[vc-agent] inviter management skipped: invitation identity/time is not verifiable');
       }
     }
     const result = await startVcMeetingMonitoring({
@@ -18624,7 +18628,9 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
       if (inviterGrantUnavailable) {
         const eventHash = createHash('sha1').update(ctx.eventId ?? 'unknown').digest('hex').slice(0, 16);
         await sendMessage(ctx.larkAppId, result.listenerChatId,
-          '本次邀请未取得可核验且有效的邀请人身份，未自动授予本场管理权；原授权人权限保持不变。',
+          inviterBlocked
+            ? '本次邀请人命中机器人黑名单，未自动授予本场管理权；原授权人权限保持不变。'
+            : '本次邀请未取得可核验且有效的邀请人身份，未自动授予本场管理权；原授权人权限保持不变。',
           'text', `vc_inviter_unverified_${eventHash}`).catch(() => undefined);
       }
       deleteVcMeetingPendingInvite(key);

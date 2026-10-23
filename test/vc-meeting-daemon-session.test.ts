@@ -1032,6 +1032,53 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(handled).toBe(true);
       expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_guest']);
     });
+    it('revokes already-granted inviter card authority immediately on block, preserving owner control', async () => {
+      const bot = configure(true);
+      __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+        meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+      });
+      await invite();
+      const selection = lastInteractiveCardSelectOption('Claude Loopy');
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).not.toBe('error');
+      await __vcMeetingAgentTest.submitOutput({ larkAppId: APP_ID, meetingId: actualMeetingId,
+        channel: 'text', content: 'pending before block' });
+      const approval = { value: lastInteractiveCardButton('发送会中弹幕') };
+      bot.resolvedBlockedUsers = [inviter];
+      const deniedApproval = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: approval }, APP_ID);
+      expect(deniedApproval.toast.type).toBe('error');
+      const deniedSelection = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: selection }, APP_ID);
+      expect(deniedSelection.toast.type).toBe('error');
+      expect(meetingTextOutputs).toEqual([]);
+      await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: TARGET_OPEN_ID }, action: approval }, APP_ID);
+      expect(meetingTextOutputs.map(output => output.text)).toEqual(['pending before block']);
+    });
+    it('revokes already-granted inviter union identity on block at the temporary-auth entry', async () => {
+      const bot = configure(true);
+      await invite();
+      await selectConsumerAgentViaCard('Claude Loopy', inviter);
+      await __vcMeetingAgentTest.handlePush({
+        larkAppId: APP_ID, kind: 'meeting_activity', eventType: 'vc.bot.meeting_activity_v1',
+        eventId: 'evt_inviter_identity', meeting: { id: actualMeetingId, meetingNo },
+        raw: { event: { meeting_activity_items: [{ activity_event_type: 'participant_joined',
+          meeting: { id: actualMeetingId, meeting_no: meetingNo },
+          participant_joined_items: [{ participant: { id: { open_id: inviter, union_id: 'on_inviterA' }, user_name: 'Inviter' } }],
+        }] } },
+      });
+      const grant = (guest: string) => __vcMeetingAgentTest.handleTemporaryAuthCommand({
+        larkAppId: APP_ID, chatId: 'oc_listener_1', commandContent: '/vc-auth @Guest',
+        mentions: [{ key: '@_user_1', name: 'Guest', openId: guest }],
+        senderOpenId: 'ou_otherAppScoped', senderUnionId: 'on_inviterA',
+      });
+      await grant('ou_beforeblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock']);
+      bot.resolvedBlockedUsers = [inviter];
+      await grant('ou_afterblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock']);
+      // Unblocking uses the same trusted identity and existing meeting grant.
+      bot.resolvedBlockedUsers = [];
+      await grant('ou_afterunblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock', 'ou_afterunblock']);
+    });
     it('deduplicates repeated invitations and adds a second inviter without a second group', async () => {
       configure(true);
       await invite(); await invite(); await invite('ou_inviterB');

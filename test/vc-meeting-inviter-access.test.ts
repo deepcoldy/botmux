@@ -30,6 +30,7 @@ describe('meeting-scoped IM permission', () => {
     fixtures.records[0].consumerClosePhase = 'data_closing'; expect(run()).toBe(false); delete fixtures.records[0].consumerClosePhase;
     fixtures.records[0].inviterManagers[0].memberReady = false; expect(run()).toBe(false);
     fixtures.records[0].inviterManagers[0].memberReady = true;
+    fixtures.route.candidate.lifecycle = 'sealed'; expect(run()).toBe(false);
     fixtures.route = { kind: 'ordinary' }; expect(run()).toBe(false);
     fixtures.route = { kind: 'ambiguous' }; expect(run()).toBe(false);
   });
