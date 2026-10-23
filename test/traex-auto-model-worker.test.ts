@@ -10,7 +10,7 @@ import { createReadStream, mkdtempSync, rmSync, writeFileSync, chmodSync } from 
 import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
-import { traexCapacityQueueVisible, traexModelProgressVisible } from '../src/adapters/cli/traex.js';
+import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 function harness(extra: Record<string, unknown> = {}) {
@@ -50,7 +50,7 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
     currentInputDeliveryQuarantine: () => null, activeTurnBlocks: () => false,
     currentPostTerminalInputFence: () => null, pendingInjections: [], shouldDeferUserFlush: () => false,
     retryTraexAutoModelAdmission: vi.fn(), traexCapacityQueueVisible,
-    traexModelProgressVisible,
+    traexModelProgressVisible, traexQueuedTypeAheadVisible,
     captureBackendScreen: (be: any) => be.captureViewport?.() ?? '',
     ...extra,
   };
@@ -678,5 +678,19 @@ describe('live-only model effort on capacity switch', () => {
     h.scope.lastInitConfig.reasoningEffort = 'xhigh';
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
     expect(h.scope.lastInitConfig.reasoningEffort).toBe('xhigh');
+  });
+});
+
+describe('Auto legacy parked-input admission', () => {
+  it.each([
+    ['active legacy work with a parked successor', '⠋ Any second now…\nQueued for next turn\nContext 65% left', true],
+    ['parking without active work', 'Queued for next turn\nContext 65% left', false],
+    ['capacity with a parked successor', '◆ Queued for capacity (10s • esc to interrupt)\nQueued for next turn\nContext 65% left', false],
+    ['quoted work above parking', 'A reply quotes ⠋ Any second now…\nQueued for next turn\nContext 65% left', false],
+    ['unknown content separating work from parking', '⠋ Any second now…\nunknown surface\nQueued for next turn\nContext 65% left', false],
+    ['a draft below a parked successor', '⠋ Any second now…\nQueued for next turn\nmy unsent draft', false],
+  ])('%s has the expected input admission', async (_name, screen, expected) => {
+    const h = admissionHarness({ backend: { captureViewportAsync: vi.fn(async () => screen) } });
+    expect(await h.admit()).toBe(expected);
   });
 });

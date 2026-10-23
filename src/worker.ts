@@ -588,6 +588,7 @@ import {
   traexCapacityQueueVisible,
   traexCapacityQueuePosition,
   traexModelProgressVisible,
+  traexQueuedTypeAheadVisible,
   traexNativeSubagentHookConfig,
 } from './adapters/cli/traex.js';
 import {
@@ -16621,6 +16622,7 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     // readyPattern's Context percentage is also present on queue screens.
     if (cliAdapter?.startupPendingPattern?.test(screen)) return hold();
     return traexModelProgressVisible(screen)
+      || traexQueuedTypeAheadVisible(screen)
       || /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/.test(screen)
       || hold();
   } catch {
