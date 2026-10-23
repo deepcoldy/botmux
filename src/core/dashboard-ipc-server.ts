@@ -262,6 +262,7 @@ import {
   type AppSlashCommandSyncResult,
   type AppSlashCommandUnavailable,
 } from '../im/lark/app-slash-commands.js';
+import { pluginCommandGateway } from './plugins/commands/runtime.js';
 import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -7824,7 +7825,11 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', requireBoundBot(async (r
 // 批量同步只增不删；删除只走逐条显式 route，且服务端按命令名重新解析远端 ID。
 function currentAppSlashCommandCatalog(): AppSlashCommandSpec[] {
   const config = getBot(cachedLarkAppId).config;
-  return buildAppSlashCommandCatalog({ cliId: config.cliId, locale: localeForBot(cachedLarkAppId) });
+  return buildAppSlashCommandCatalog({
+    cliId: config.cliId,
+    locale: localeForBot(cachedLarkAppId),
+    pluginCommands: pluginCommandGateway.list(cachedLarkAppId),
+  });
 }
 
 function appSlashCommandPermissionUrls(): { read: string; write: string } {
