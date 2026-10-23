@@ -24,10 +24,10 @@ const executable = values.get('--mcode-bin');
 const permission = values.get('--permission') ?? 'full';
 let timeoutMs: number | undefined;
 try { timeoutMs = parseMinimaxTurnTimeout(values.get('--turn-timeout-ms')); }
-catch { output.error('minimax runner requires a valid permission policy and timeout\n'); process.exit(2); }
+catch { output.error('minimax runner: invalid --turn-timeout-ms (expected an integer from 1 to 2147483647)\n'); process.exit(2); }
 const transport = values.get('--transport') ?? 'acp';
 if (!executable || !['acp', 'exec'].includes(transport) || !['full', 'smart'].includes(permission)) {
-  output.error('minimax runner requires --mcode-bin, a valid permission policy and timeout\n'); process.exit(2);
+  output.error('minimax runner: missing --mcode-bin or invalid --permission/--transport\n'); process.exit(2);
 }
 const cwd = resolve(values.get('--cwd') ?? process.cwd());
 // npm's executable uses /usr/bin/env node. Its host PATH entry may be a symlink

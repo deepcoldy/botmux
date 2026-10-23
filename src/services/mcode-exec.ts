@@ -10,6 +10,7 @@ export interface McodeExecOptions {
   model?: string;
   effort?: string;
   permission: 'full' | 'smart';
+  /** Native exec wall-clock limit. This one-way transport does not bridge human input. */
   timeoutMs?: number;
   onEvent?: (event: Record<string, any>) => void;
 }
