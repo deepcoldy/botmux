@@ -28,6 +28,7 @@ import {
 import { normalizeVcMeetingProfileInstructions } from './vc-meeting-profile-instructions.js';
 import {
   VC_MEETING_LISTENER_OUTPUT_CONTRACT,
+  VC_MEETING_FINAL_SUMMARY_CONTRACT,
   vcMeetingListenerOutputProtocolForInstructionVersion,
 } from './vc-meeting-listener-output-protocol.js';
 
@@ -185,6 +186,7 @@ export async function registerVcMeetingMember(
     receiverSessionId,
     outputChatId: request.outputRoute.chatId,
     outputPlacement: request.outputRoute.placement,
+    listenerPolicy: request.outputRoute.listenerPolicy,
   });
 
   // Fencing a stream off must never depend on being able to start/restore its
@@ -260,6 +262,7 @@ export function buildVcMeetingDeliveryTriggerRequest(
   deliveryKey = deriveVcMeetingDeliveryIdentity(request).deliveryKey,
   responseMode: 'silent' | 'listener_thread' = 'listener_thread',
   configuredInstructions?: string,
+  finalSummary = false,
 ): TriggerRequest {
   const silent = responseMode === 'silent';
   const rawText = request.entries
@@ -291,7 +294,7 @@ export function buildVcMeetingDeliveryTriggerRequest(
   );
   const listenerOutputContract = silent || listenerOutputProtocol === 'plain'
     ? ''
-    : `\n\n${VC_MEETING_LISTENER_OUTPUT_CONTRACT}`;
+    : `\n\n${VC_MEETING_LISTENER_OUTPUT_CONTRACT}${finalSummary && request.stream.final ? `\n${VC_MEETING_FINAL_SUMMARY_CONTRACT}` : ''}`;
   return {
     source: {
       type: 'vc_meeting',
@@ -334,6 +337,7 @@ function validateDeliveryBinding(
   responseMode: 'silent' | 'listener_thread';
   outputPlacement: 'auto' | 'chat' | 'topic';
   instructions?: string;
+  finalSummary: boolean;
 } {
   if (request.member.agentAppId !== deps.selfAppId) {
     return errorResult(409, 'wrong_agent', 'delivery target does not match this daemon');
@@ -375,6 +379,7 @@ function validateDeliveryBinding(
   return {
     binding,
     responseMode: projection.responseMode,
+    finalSummary: projection.listenerPolicy?.finalSummary === true,
     outputPlacement: projection.outputPlacement ?? 'auto',
     ...(projection.instructions !== undefined ? { instructions: projection.instructions } : {}),
   };
@@ -396,6 +401,7 @@ async function dispatchAcceptedDelivery(
         deliveryKey,
         responseMode,
         configuredInstructions,
+        findVcMeetingDeliveryByKey(deps.dataDir, deliveryKey)?.receipt.listenerOutputProtocol === 'final_summary_v1',
       ),
       {
         stableTurnId: deliveryKey,
@@ -475,6 +481,7 @@ export async function receiveVcMeetingDelivery(
     outputPlacement: binding.outputPlacement,
     listenerOutputProtocol: vcMeetingListenerOutputProtocolForInstructionVersion(
       request.instructionVersion,
+      request.stream.final && binding.finalSummary && binding.responseMode !== 'silent',
     ),
     receiverBootId: deps.receiverBootId,
   });

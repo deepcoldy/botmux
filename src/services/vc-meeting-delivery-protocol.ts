@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
 import { createHash } from 'node:crypto';
 import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.js';
 import type {
@@ -69,6 +70,7 @@ export interface VcMeetingMemberProjectionRequest {
     chatId: string;
     /** Omitted by pre-feature senders and normalized to `auto`. */
     placement?: VcMeetingListenerOutputPlacement;
+    listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   };
 }
 
@@ -84,6 +86,7 @@ export type NormalizedVcMeetingMemberProjectionRequest = Omit<
   outputRoute: {
     chatId: string;
     placement: VcMeetingListenerOutputPlacement;
+    listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   };
 };
 
@@ -235,6 +238,9 @@ export function validateVcMeetingMemberProjectionRequest(
     || !(VC_MEETING_RESPONSE_MODES as readonly string[]).includes(raw.member.responseMode)) {
     return badProjectionRequest('member.responseMode is not supported', 'member.responseMode');
   }
+  let listenerPolicy: Partial<VcMeetingListenerPolicy> | undefined;
+  try { listenerPolicy = normalizeVcMeetingListenerPolicy(raw.outputRoute.listenerPolicy); }
+  catch { return badProjectionRequest('invalid listenerPolicy', 'outputRoute.listenerPolicy'); }
   const placement = raw.outputRoute.placement ?? 'auto';
   if (typeof placement !== 'string'
     || !(VC_MEETING_LISTENER_OUTPUT_PLACEMENTS as readonly string[]).includes(placement)) {
@@ -288,6 +294,7 @@ export function validateVcMeetingMemberProjectionRequest(
         ...policy,
       },
       outputRoute: {
+        ...(listenerPolicy ? { listenerPolicy } : {}),
         chatId: raw.outputRoute.chatId as string,
         placement: placement as VcMeetingListenerOutputPlacement,
       },

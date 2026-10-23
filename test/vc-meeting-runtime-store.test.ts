@@ -54,6 +54,17 @@ describe('vc meeting runtime store', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('freezes policy for future meetings without changing legacy or restored records', () => {
+    const base = { larkAppId: 'cli_a', meeting: { id: 'policy' }, listenerChatId: 'oc_listener', selectedAgents: [] };
+    const policy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    recordVcMeetingRuntimeSession(dir, { ...base, listenerPolicy: policy }, 1000);
+    recordVcMeetingRuntimeSession(dir, { ...base, listenerPolicy: { ...policy, rawMessages: true } }, 2000);
+    expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 2500)[0].listenerPolicy).toEqual(policy);
+    recordVcMeetingRuntimeSession(dir, { ...base, meeting: { id: 'legacy' } }, 1000);
+    recordVcMeetingRuntimeSession(dir, { ...base, meeting: { id: 'legacy' }, listenerPolicy: policy }, 2000);
+    expect(listVcMeetingRuntimeSessions(dir, 'cli_a', 2500).find(row => row.meeting.id === 'legacy')!.listenerPolicy).toBeUndefined();
+  });
+
   it('records, updates, lists, and removes runtime listener routes', () => {
     recordVcMeetingRuntimeSession(dir, {
       larkAppId: 'cli_a',

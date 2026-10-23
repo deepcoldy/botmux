@@ -20563,8 +20563,8 @@ function deliverFinalOutput(
       } else if (!imOrigin
         && listenerOutputOwner
         && msg.dispatchAttempt !== undefined
-        && listenerOutputProtocol === 'decision_v1') {
-        const controlledOutput = parseVcMeetingListenerOutput(msg.content);
+        && (listenerOutputProtocol === 'decision_v1' || listenerOutputProtocol === 'final_summary_v1')) {
+        const controlledOutput = parseVcMeetingListenerOutput(msg.content, listenerOutputProtocol === 'final_summary_v1');
         if (!controlledOutput.ok) {
           ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
           logger.error(

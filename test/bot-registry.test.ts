@@ -669,6 +669,12 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('preserves explicit false listener-policy overrides for future meetings', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a', larkAppSecret: 's',
+      vcMeetingAgent: { listenerPolicy: { rawMessages: false, finalSummary: true, allowSummarySharing: false } } }]));
+    expect(cfg.vcMeetingAgent?.listenerPolicy).toEqual({ rawMessages: false, finalSummary: true, allowSummarySharing: false });
+  });
+
   it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
