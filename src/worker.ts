@@ -11987,6 +11987,7 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       // A loaded banner may already have retired startup without setting
       // readySeen. Recheck even in that case. The detector's spinner/static
       // busy guards and normal worker ready/input fences still own admission.
+      // startupReadyFromHistory being true implies readyPattern on this viewport.
       detector?.seedReadyEvidence(true);
     } catch (err: any) {
       log(`${cliName()} first-prompt viewport check failed: ${err.message}`);

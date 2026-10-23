@@ -23,9 +23,11 @@ function redraw(rows: string[]): string {
   return '\x1b[2J\x1b[H' + rows.map((row, index) => `\x1b[${index + 1};1H${row}`).join('');
 }
 
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog';
+
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog'] as const) {
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
       () => runScenario(backendType, mode),
@@ -34,7 +36,7 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
   }
 }
 
-async function runScenario(backendType: 'pty' | 'tmux', mode: 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens'): Promise<void> {
+async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise<void> {
   const root = mkdtempSync('/tmp/bmx-traex-startup-');
   const sessionId = randomUUID();
   const nativeId = randomUUID();
@@ -58,7 +60,11 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: 'fresh' | 'resume'
     renameSync(`${frameFile}.tmp`, frameFile);
     return id;
   }
-  const initial = mode === 'blocked-screens'
+  const initial = mode === 'hostile-first'
+    ? COMPOSER.map(row => row.replace('GPT-6-Astra xhigh', 'loading'))
+    : mode === 'hostile-dialog'
+      ? ['Sign in to TraeCode CLI', '❯ 1. Sign in with browser', ...COMPOSER.slice(2)]
+      : mode === 'blocked-screens'
     ? ['│ model: loading /model to change │', '│ directory: /tmp │', ...COMPOSER]
     : mode === 'loaded-banner'
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
@@ -137,6 +143,14 @@ setInterval(() => {
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(seenFile), 'first frame');
+    if (mode === 'hostile-first' || mode === 'hostile-dialog') {
+      // No loading banner precedes these frames: only the viewport predicate
+      // can reject them after PTY silence and the spinner guard both expire.
+      await new Promise(resolveWait => setTimeout(resolveWait, 6_200));
+      expect(existsSync(inputFile), initial.join('\n') + '\n' + logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+      paint(['TraeCode CLI (v0.211.1)', '', ...COMPOSER]);
+    }
     if (mode === 'blocked-screens') {
       // Cross the quiet/spinner thresholds on each input owner. Even a visible
       // composer/footer cannot authorize a paste while another surface owns it.
