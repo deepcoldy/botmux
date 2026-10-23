@@ -745,6 +745,7 @@ import {
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
+  type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
@@ -1505,12 +1506,6 @@ const SILENT_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
 const TURN_TERMINAL_CARRIER_MAX = 64;
-
-type TurnTerminalCarrier = {
-  messageId: string;
-  kind: 'standard_reply_card' | 'non_patchable';
-  responseKind?: 'progress' | 'final' | 'auxiliary';
-};
 
 function isFinalTurnTerminalCarrier(
   carrier: TurnTerminalCarrier | undefined,
@@ -20795,6 +20790,13 @@ function deliverFinalOutput(
         return;
       }
       if (messageId && !managedReceiver) {
+        // Explicitly record as 'final' because deliverFinalOutput produces the
+        // authoritative completion carrier for this turn. While 'final' and
+        // undefined are currently equivalent in isFinalTurnTerminalCarrier (for
+        // rolling compatibility with older workers that omit responseKind),
+        // explicitly specifying 'final' here is an intentional forward-compatible
+        // contract to preserve deliberate intent when legacy worker semantics
+        // are eventually decoupled.
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
           kind: 'standard_reply_card',

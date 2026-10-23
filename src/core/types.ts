@@ -61,6 +61,20 @@ export interface GroupJoinContext {
   gateMatched: boolean;
 }
 
+/** Last user-visible output carrier observed for each in-flight turn. The
+ *  worker reconstructs explicit-send entries from the durable turn-sends
+ *  journal before publishing turn_terminal; daemon-owned fallback output is
+ *  recorded directly after Lark accepts it. Retained in a bounded map so a
+ *  duplicate terminal can safely retry after an unconfirmed provider error. */
+export type TurnTerminalCarrier = {
+  messageId: string;
+  kind: 'standard_reply_card' | 'non_patchable';
+  /** Explicit send classification. `progress` / `auxiliary` are visible
+   *  interim output and must never be promoted to a completed-turn carrier.
+   *  Undefined is retained for rolling compatibility with older workers. */
+  responseKind?: 'progress' | 'final' | 'auxiliary';
+};
+
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
  *  in the ImAdapter implementation (e.g. Map<string, ImRenderState>
@@ -543,14 +557,7 @@ export interface DaemonSession {
    *  journal before publishing turn_terminal; daemon-owned fallback output is
    *  recorded directly after Lark accepts it. Retained in a bounded map so a
    *  duplicate terminal can safely retry after an unconfirmed provider error. */
-  turnTerminalCarriers?: Map<string, {
-    messageId: string;
-    kind: 'standard_reply_card' | 'non_patchable';
-    /** Explicit send classification. `progress` / `auxiliary` are visible
-     *  interim output and must never be promoted to a completed-turn carrier.
-     *  Undefined is retained for rolling compatibility with older workers. */
-    responseKind?: 'progress' | 'final' | 'auxiliary';
-  }>;
+  turnTerminalCarriers?: Map<string, TurnTerminalCarrier>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
