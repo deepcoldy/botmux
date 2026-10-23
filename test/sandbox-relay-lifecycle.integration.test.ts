@@ -165,6 +165,13 @@ setInterval(() => {}, 1 << 30);
   // moment the worker attaches pipe-pane, i.e. after its pane exists: the
   // post-spawn provenance commit then fails (a real post-spawn failure exit).
   const corruptProofFlag = join(dir, 'corrupt-proof-on-pipe-pane');
+  // `exitingServerOnPostKillProbes(ordinals)`: after a kill of THIS pane (plain,
+  // or the conditional one a retire sends), each listed has-session of it (1 =
+  // the first probe after the kill) meets the server while it is still exiting
+  // (killing its last session makes a tmux server exit), i.e. reads `server
+  // exited unexpectedly`. Scoped to the pane so unrelated kills/probes
+  // (diagnostic sessions, backend selection) neither arm nor count.
+  const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
 if [ -e '${failNewSessionFlag}' ]; then
@@ -177,10 +184,33 @@ if [ -e '${failNewSessionFlag}' ]; then
 fi
 if [ -e '${failKillSessionFlag}' ]; then
   # Any kill: a plain kill-session, or the conditional one a retire sends.
-  if [ "$1" = if-shell ]; then echo 'if-shell refused by test' >&2; exit 1; fi
+  # Scan every argument: managed calls lead with the server (\`-L botmux\`).
   for arg in "$@"; do
+    if [ "$arg" = if-shell ]; then echo 'if-shell refused by test' >&2; exit 1; fi
     if [ "$arg" = kill-session ]; then echo 'kill-session refused by test' >&2; exit 1; fi
   done
+fi
+if [ -e '${exitingServerFlag}' ]; then
+  ours=0; killing=0; probing=0
+  for arg in "$@"; do
+    case "$arg" in
+      '${paneTarget}'|'=${paneTarget}') ours=1 ;;
+      *kill-session*'${paneTarget}'*) ours=1; killing=1 ;;
+    esac
+    [ "$arg" = kill-session ] && killing=1
+    [ "$arg" = has-session ] && probing=1
+  done
+  [ $ours = 1 ] && [ $killing = 1 ] && : > '${exitingServerFlag}.killed'
+  if [ $ours = 1 ] && [ $probing = 1 ] && [ -e '${exitingServerFlag}.killed' ]; then
+    echo >> '${exitingServerFlag}.probes'
+    seen=$(($(wc -l < '${exitingServerFlag}.probes')))
+    for want in $(cat '${exitingServerFlag}'); do
+      if [ "$seen" -eq "$want" ]; then
+        echo fired >> '${exitingServerFlag}.fired'
+        echo 'server exited unexpectedly' >&2; exit 1
+      fi
+    done
+  fi
 fi
 if [ -e '${corruptProofFlag}' ]; then
   for arg in "$@"; do
@@ -235,6 +265,13 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
+    exitingServerOnPostKillProbes: (ordinals: number[]): void => {
+      if (ordinals.length) writeFileSync(exitingServerFlag, ordinals.join(' '));
+    },
+    /** How many injected `server exited unexpectedly` answers were actually given. */
+    exitingServerProbesFired: (): number => existsSync(`${exitingServerFlag}.fired`)
+      ? readFileSync(`${exitingServerFlag}.fired`, 'utf8').split('\n').filter(Boolean).length
+      : 0,
     failKillSession: (on: boolean): void => {
       if (on) writeFileSync(failKillSessionFlag, '');
       else rmSync(failKillSessionFlag, { force: true });
@@ -289,7 +326,7 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     start(
       bootId: string,
-      startOpts: { env?: NodeJS.ProcessEnv; crashHook?: boolean; flavour?: SandboxFlavour } = {},
+      startOpts: { env?: NodeJS.ProcessEnv; crashHook?: boolean; flavour?: SandboxFlavour; envPolicy?: { mode: 'strict' } } = {},
     ): { worker: ChildProcess; logs: () => string; errors: () => string[] } {
       if (startOpts.flavour) applyFlavour(startOpts.flavour);
       const workerEnv = { ...env, ...startOpts.env };
@@ -308,7 +345,7 @@ exec '${realTmux}' -S '${socket}' "$@"
       worker.on('message', (message: { type?: string; message?: string }) => {
         if (message?.type === 'error') errors.push(String(message.message));
       });
-      worker.send(init(bootId));
+      worker.send({ ...init(bootId), ...(startOpts.envPolicy ? { envPolicy: startOpts.envPolicy } : {}) });
       return { worker, logs: () => logs, errors: () => errors };
     },
     async stop(worker: ChildProcess, how: 'SIGTERM' | 'transfer' | 'close'): Promise<void> {
@@ -495,13 +532,22 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
   // pane down before refusing. Preservation is armed as soon as the pane
   // exists and dropped only once the teardown PROVED the pane gone — never
   // leave a live pane without the relay tree it is bound to.
-  it.skipIf(!realTmux || !runtime)('tmux × provenance commit fails after the pane exists, pane retired: rolls the tree back', async () => {
+  // The retire kills the private server's last session, so its post-kill probe
+  // can meet that server mid-exit ('unknown' once, or twice in a row): that
+  // transient must not keep the tree as if the pane might still run.
+  it.skipIf(!realTmux || !runtime).each([
+    { variant: '', exitingProbes: [] as number[] },
+    { variant: ' (post-kill probe 1 meets the exiting tmux server)', exitingProbes: [1] },
+    { variant: ' (post-kill probes 1 & 2 meet the exiting tmux server)', exitingProbes: [1, 2] },
+  ])('tmux × provenance commit fails after the pane exists, pane retired$variant: rolls the tree back', async ({ exitingProbes }) => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       lab.corruptProofOnPipePane();
+      lab.exitingServerOnPostKillProbes(exitingProbes);
       const first = lab.start('boot-1');
       await workerExit(first);
       expect(first.errors().join('\n'), first.logs()).toMatch(/could not commit .* generation proof/);
+      expect(lab.exitingServerProbesFired(), first.logs()).toBe(exitingProbes.length);
       expect(lab.paneAlive()).toBe(false);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
       if (flavour === 'scratch') expect(mountsAtOrUnder(dirname(lab.dataDir))).toEqual([]);
@@ -530,8 +576,13 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
   // A crash keeps the tree for a successor (the pane survives). If the session
   // is closed before any successor attached, the daemon's worker-less close is
   // the only cleanup left: it must retire the pane, then tear the tree down
-  // with the flavour's own teardown (scratch: unmount first).
-  it.skipIf(!realTmux || !runtime)('tmux × worker crash, closed before a successor attached: the worker-less close tears the tree down', async () => {
+  // with the flavour's own teardown (scratch: unmount first). The kill takes
+  // the private server's last session, so the post-kill probe can meet that
+  // server mid-exit; that transient must not leave the tree behind.
+  it.skipIf(!realTmux || !runtime).each([
+    { variant: 'the worker-less close tears the tree down', exitingProbes: [] as number[] },
+    { variant: 'a post-kill probe that meets the exiting tmux server still tears the tree down', exitingProbes: [1] },
+  ])('tmux × worker crash, closed before a successor attached: $variant', async ({ exitingProbes }) => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       const first = lab.start('boot-1', { crashHook: true });
@@ -548,7 +599,9 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
       expect(existsSync(lab.outbox), first.logs()).toBe(true);
       if (merged) expect(isMountpoint(merged)).toBe(true);
 
+      lab.exitingServerOnPostKillProbes(exitingProbes);
       const closeLog = lab.closeWithoutWorker();
+      expect(lab.exitingServerProbesFired(), closeLog).toBe(exitingProbes.length);
       expect(lab.paneAlive(), closeLog).toBe(false);
       expect(existsSync(lab.sessionRoot), closeLog).toBe(false);
       if (merged) {
@@ -712,8 +765,18 @@ describe('sandbox flavour switch across a daemon restart', () => {
   const switchRuns = (from: SandboxFlavour, to: SandboxFlavour): boolean =>
     !!realTmux && runtimeAvailable(from) && runtimeAvailable(to);
   // Combinations this host cannot run are reported as skipped, never as passed.
-  for (const [from, to] of flavourSwitches) {
-    it.skipIf(!switchRuns(from, to))(`tmux ${from} -> ${to}: retires the old pane, tears its tree down first, then builds the new one`, async () => {
+  // The retire kills the private server's last session, so a probe after it
+  // can meet that server mid-exit ('unknown'); one pair also runs with that
+  // transient injected: the new pane must still cold-spawn, not be refused.
+  // Probe 1 is the migration's own confirmation, probe 2 the tree
+  // reconciliation's check of the same (by then gone) pane.
+  for (const [from, to, exitingProbes] of [
+    ...flavourSwitches.map(([from, to]) => [from, to, [] as number[]] as const),
+    ['oncall', 'credential-only', [1]] as const,
+    ['oncall', 'credential-only', [2]] as const,
+  ]) {
+    const variant = exitingProbes.length ? ` (post-kill probe ${exitingProbes.join(' & ')} meets the exiting tmux server)` : '';
+    it.skipIf(!switchRuns(from, to))(`tmux ${from} -> ${to}${variant}: retires the old pane, tears its tree down first, then builds the new one`, async () => {
       const lab = createLab({ flavour: from, backend: 'tmux' });
       try {
         const first = lab.start('boot-1');
@@ -726,8 +789,10 @@ describe('sandbox flavour switch across a daemon restart', () => {
         expect(existsSync(lab.outbox), first.logs()).toBe(true);
         expect(recordedSandboxTreeFlavour(lab.sessionId, lab.dataDir)).toBe(from);
 
+        lab.exitingServerOnPostKillProbes([...exitingProbes]);
         const second = lab.start('boot-2', { flavour: to });
         await vi.waitFor(() => expect(second.logs()).toContain(`sandbox flavour changed (${from} → ${to === 'off' ? 'none' : to})`), { timeout: 60_000 });
+        expect(lab.exitingServerProbesFired(), second.logs()).toBe(exitingProbes.length);
         // The old tree (and the old CLI's report in it) is gone and the new
         // flavour's tree is in place before the NEW pane reports its start.
         await vi.waitFor(() => expect(recordedSandboxTreeFlavour(lab.sessionId, lab.dataDir), second.logs())
@@ -754,4 +819,37 @@ describe('sandbox flavour switch across a daemon restart', () => {
       }
     }, 240_000);
   }
+});
+
+// A persistent pane from a generation without the configured strict
+// environment policy is killed and cold-spawned (strict never reuses an
+// unstamped generation). The kill takes the private server's last session, so
+// its post-kill probe can meet that server mid-exit ('unknown' once, or twice
+// in a row): that transient must not refuse the start.
+describe('persistent pane retired for a changed environment policy', () => {
+  it.skipIf(!realTmux).each([
+    { variant: '', exitingProbes: [] as number[] },
+    { variant: ' (post-kill probe 1 meets the exiting tmux server)', exitingProbes: [1] },
+    { variant: ' (post-kill probes 1 & 2 meet the exiting tmux server)', exitingProbes: [1, 2] },
+  ])('tmux, strict policy over an unstamped generation$variant: kills the old pane and cold-spawns', async ({ exitingProbes }) => {
+    const lab = createLab({ flavour: 'off', backend: 'tmux' });
+    try {
+      const first = lab.start('boot-1');
+      await vi.waitFor(() => expect(lab.starts().length, first.logs()).toBe(1), { timeout: 60_000 });
+      const oldPane = lab.panePid();
+      await lab.stop(first.worker, 'SIGTERM');
+      expect(lab.paneAlive()).toBe(true);
+
+      lab.exitingServerOnPostKillProbes(exitingProbes);
+      const second = lab.start('boot-2', { envPolicy: { mode: 'strict' } });
+      await vi.waitFor(() => expect(second.logs()).toContain('environment policy — killing + cold-spawning'), { timeout: 60_000 });
+      await vi.waitFor(() => expect(lab.starts().length, `${second.logs()}\n${second.errors().join('\n')}`).toBe(2), { timeout: 60_000 });
+      expect(second.errors()).toEqual([]);
+      expect(lab.exitingServerProbesFired(), second.logs()).toBe(exitingProbes.length);
+      expect(lab.hostProcessAlive(oldPane)).toBe(false);
+      expect(lab.panePid()).not.toBe(oldPane);
+    } finally {
+      await lab.dispose();
+    }
+  }, 120_000);
 });

@@ -23,12 +23,20 @@ vi.mock('../src/services/project-scanner.js', () => ({
   scanMultipleProjects: vi.fn(() => []),
 }));
 
+vi.mock('../src/services/session-store.js', () => ({
+  updateSession: vi.fn(),
+}));
+
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return { ...actual, existsSync: vi.fn((p: string) => p === '/repos' || actual.existsSync(p)) };
 });
 
-import { publishWorkingDirRecovery, workingDirRecoveryPending } from '../src/core/working-dir-recovery.js';
+import {
+  onlyUnstartedOpeningHolds,
+  publishWorkingDirRecovery,
+  workingDirRecoveryPending,
+} from '../src/core/working-dir-recovery.js';
 import { resolveDeletedWorktreeOrigin } from '../src/services/git-worktree.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -174,5 +182,98 @@ describe('publishWorkingDirRecovery', () => {
     await publishWorkingDirRecovery(ds, GONE, deps);
     ds.workingDir = '/repos';
     expect(workingDirRecoveryPending(ds)).toBe(false);
+  });
+});
+
+describe('a session whose first message has not started', () => {
+  // The opening is staged for repo selection: choosing a directory starts it,
+  // so the card asks for a directory instead of a resend.
+  const OPENING = 'first message';
+  function makeOpeningDs(overrides: Partial<DaemonSession> = {}, sessionOverrides: Record<string, unknown> = {}): DaemonSession {
+    const ds = makeDs({ pendingRepo: true, ...overrides });
+    Object.assign(ds.session, {
+      queued: true,
+      queuedPrompt: OPENING,
+      pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: OPENING, turnId: 'om_opening' },
+      ...sessionOverrides,
+    });
+    return ds;
+  }
+
+  it('publishes the picker for that message and makes it the setup\'s picker', async () => {
+    const ds = makeOpeningDs();
+    const { deps, sessionReply } = makeDeps();
+
+    const messageId = await publishWorkingDirRecovery(ds, GONE, deps);
+
+    expect(messageId).toBe('om_recovery_card');
+    const card = sessionReply.mock.calls[0]![1];
+    expect(card).toContain('还没有开始处理');
+    expect(card).toContain('不用重发');
+    expect(card).not.toContain('重发消息即可继续');
+    expect(card).not.toContain('skip_repo');
+    expect(card).toContain('repo_rebuild_worktree');
+    expect(ds.session.pendingRepoSetup?.repoCardMessageId).toBe('om_recovery_card');
+  });
+
+  it('a refused start that left the picker gets the same form', async () => {
+    const ds = makeOpeningDs({ pendingRepo: false, initialStartPending: true });
+    const { deps, sessionReply } = makeDeps();
+
+    await publishWorkingDirRecovery(ds, GONE, deps);
+
+    expect(sessionReply.mock.calls[0]![1]).toContain('不用重发');
+    expect(ds.session.pendingRepoSetup?.repoCardMessageId).toBe('om_recovery_card');
+  });
+
+  it('without a card, says the message is kept and /repo picks the directory', async () => {
+    const ds = makeOpeningDs();
+    const { deps, sessionReply } = makeDeps();
+    sessionReply.mockImplementationOnce(async () => { throw new Error('230025 card too long'); });
+
+    expect(await publishWorkingDirRecovery(ds, GONE, deps)).toBeUndefined();
+
+    const text = sessionReply.mock.calls[1]![1];
+    expect(text).toContain('还没有开始处理');
+    expect(text).toContain('/repo');
+    expect(text).not.toContain('/cd');
+  });
+
+  it('an ordinary session (it has a conversation) keeps the resend form', async () => {
+    const ds = makeDs();
+    const { deps, sessionReply } = makeDeps();
+
+    await publishWorkingDirRecovery(ds, GONE, deps);
+
+    expect(sessionReply.mock.calls[0]![1]).toContain('重发消息即可继续');
+    expect(sessionReply.mock.calls[0]![1]).not.toContain('不用重发');
+  });
+});
+
+describe('onlyUnstartedOpeningHolds', () => {
+  function refusedOpening(sessionOverrides: Record<string, unknown> = {}, overrides: Partial<DaemonSession> = {}): DaemonSession {
+    const ds = makeDs({ pendingRepo: false, initialStartPending: true, ...overrides });
+    Object.assign(ds.session, {
+      queued: true,
+      pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first', turnId: 'om_opening' },
+      ...sessionOverrides,
+    });
+    return ds;
+  }
+
+  it('holds for a refused staged opening, with or without messages queued behind it', () => {
+    expect(onlyUnstartedOpeningHolds(refusedOpening())).toBe(true);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({ queuedActivationTail: [{ userPrompt: 'next', turnId: 'om_next' }] }))).toBe(true);
+  });
+
+  it('does not hold once other work is unsettled or the session is not in that state', () => {
+    expect(onlyUnstartedOpeningHolds(refusedOpening({ queuedActivationPending: true }))).toBe(false);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({ principalLaneQueuedTurns: [{ turnId: 'om_lane' }] }))).toBe(false);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({
+      codexAppDispatchLedger: [{ dispatchId: 'd1', turnId: 'om_x', state: 'accepted' }],
+    }))).toBe(false);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({ pendingRepoSetup: undefined }))).toBe(false);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({}, { pendingRepo: true }))).toBe(false);
+    expect(onlyUnstartedOpeningHolds(refusedOpening({}, { worker: { killed: false } as any }))).toBe(false);
   });
 });

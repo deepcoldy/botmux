@@ -26,11 +26,14 @@ function modeFromEnv(env: NodeJS.ProcessEnv): DurableCoordinationMode {
 }
 
 /** Lightweight probe for code paths that must not mutate lifecycle state outside
- *  the durable primary commit path (e.g. typed `/resume`). Never throws. */
+ *  the durable primary commit path (e.g. typed `/resume`, and card controls that
+ *  can only reach the durable-control queue from the canonical streaming card —
+ *  see authorizeBeforeAck). Off-card controls (reply-card menu confirm,
+ *  write-link cards) cannot be fenced, so callers must hide/redirect them in
+ *  primary mode. Never throws. */
 export function coordinationModeIsPrimary(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.BOTMUX_COORDINATION_MODE?.trim() === 'primary';
 }
-
 function optionalTimeout(value: string | undefined, name: string): number | undefined {
   if (value === undefined || !value.trim()) return undefined;
   const parsed = Number(value);

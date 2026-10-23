@@ -779,6 +779,39 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
+  // 默认工作目录不存在（被删、写错、配置自别的机器）：既不能在那里开工，也不能当成
+  // 「无可选项目 → 直接开工」——那条路同样落到这个目录，被 forkWorker 拒绝后首轮就挂在
+  // 会话上。改为发缺目录形态的选仓卡（没有「直接开启会话」），首轮挂在卡后，选好目录即开工。
+  it('默认工作目录不存在时发缺目录选仓卡等选目录，而不是在不存在的目录里开工', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_missing_default';
+    const chatId = 'oc_join_missing_default';
+    const missing = join(tempRoot, 'gone', 'botmux');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: missing,
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.repoCardMessageId).toBe('om_reply');
+    const cardCall = mocks.replyMessage.mock.calls.find(call => (call as unknown[])[3] === 'interactive') as unknown[] | undefined;
+    // The card belongs under the shared join seed, like the ordinary picker.
+    expect(cardCall?.[1]).toBe('om_join_seed');
+    expect(String(cardCall?.[2])).toContain(missing);
+    expect(String(cardCall?.[2])).toContain('repo_manual_submit');
+    expect(String(cardCall?.[2])).not.toContain('skip_repo');
+  });
+
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_shared_race';

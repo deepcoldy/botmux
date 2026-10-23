@@ -7,6 +7,7 @@ import type { DurableCoordinationStore, DurableJson } from './durable-coordinati
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
 import { durableLarkSessionControlPartition } from './durable-lark-session-control.js';
 import type { DurableSessionControlDispatchOptions } from './durable-session-control-dispatch.js';
+import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
   commitDurableLarkSessionControl,
@@ -56,21 +57,29 @@ export interface DurableLarkSessionControlRuntimeOptions {
   takeOverActiveSession?(
     sessionKey: string,
     canonical: Session,
-  ): Promise<Session | undefined>;
+  ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
+  /** Process-level proof that the admitted provider worker is still usable. */
+  isResumeReady?(session: DaemonSession): boolean;
   buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
+  buildPendingCard?(action: 'close' | 'resume', session: Session): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
   closeRefusedText(error: string, taskId?: string): string;
   resumeRefusedText(error: string, activeSessionId?: string, sessionId?: string): string;
+  resumeReadinessPollMs?: number;
+  resumeReadinessStabilityMs?: number;
+  resumeReadinessTimeoutMs?: number;
   now?: () => number;
+  wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 export interface DurableLarkSessionControlRuntime {
   ownedPartitionKeys(): string[];
   authorizeBeforeAck(data: unknown): Promise<boolean>;
+  pendingCardBeforeAck(data: unknown): Promise<Record<string, unknown> | undefined>;
   resolve: DurableSessionControlDispatchOptions['resolve'];
 }
 
@@ -80,11 +89,53 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function abortableWait(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** Daemon-facing lifecycle adapter; keeps the daemon itself as thin wiring. */
 export function createDurableLarkSessionControlRuntime(
   options: DurableLarkSessionControlRuntimeOptions,
 ): DurableLarkSessionControlRuntime {
   const now = options.now ?? Date.now;
+  const wait = options.wait ?? abortableWait;
+  const resumeReadinessPollMs = boundedInteger(
+    options.resumeReadinessPollMs ?? 100,
+    'resumeReadinessPollMs',
+    10,
+    5_000,
+  );
+  const resumeReadinessStabilityMs = boundedInteger(
+    options.resumeReadinessStabilityMs ?? 750,
+    'resumeReadinessStabilityMs',
+    0,
+    10_000,
+  );
+  const resumeReadinessTimeoutMs = boundedInteger(
+    options.resumeReadinessTimeoutMs ?? 45_000,
+    'resumeReadinessTimeoutMs',
+    100,
+    300_000,
+  );
 
   const ownedPartitionKeys = (): string[] => {
     const sessionIds = new Set<string>();
@@ -129,6 +180,40 @@ export function createDurableLarkSessionControlRuntime(
         || (actionType === 'close' && session.status !== 'active')
         || (actionType === 'resume' && session.status !== 'closed')) return false;
     return options.canOperate(session.chatId, operatorOpenId);
+  };
+
+  const pendingCardBeforeAck = async (
+    raw: unknown,
+  ): Promise<Record<string, unknown> | undefined> => {
+    if (!options.buildPendingCard) return undefined;
+    const data = record(raw);
+    const action = record(data?.action);
+    const value = record(action?.value);
+    const operator = record(data?.operator);
+    const context = record(data?.context);
+    const actionType = value?.action;
+    const sessionId = value?.session_id;
+    const rootId = value?.root_id;
+    const operatorOpenId = operator?.open_id;
+    const cardMessageId = context?.open_message_id ?? data?.open_message_id;
+    if ((actionType !== 'close' && actionType !== 'resume')
+        || typeof sessionId !== 'string'
+        || typeof rootId !== 'string'
+        || typeof operatorOpenId !== 'string'
+        || typeof cardMessageId !== 'string') return undefined;
+    const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
+    if (!canonical) return undefined;
+    const session = parseDurablePrimarySessionRecord(canonical).session;
+    if (!session
+        || session.larkAppId !== options.larkAppId
+        || session.sessionId !== sessionId
+        || session.streamCardId !== cardMessageId
+        || (actionType === 'close' && session.status !== 'active')
+        || (actionType === 'resume' && session.status !== 'closed')
+        || !options.canOperate(session.chatId, operatorOpenId)) return undefined;
+    const card = record(JSON.parse(options.buildPendingCard(actionType, session)));
+    if (!card) throw new Error('durable lifecycle pending card is invalid');
+    return card;
   };
 
   const resolve: DurableSessionControlDispatchOptions['resolve'] = async (control, context) => {
@@ -193,7 +278,10 @@ export function createDurableLarkSessionControlRuntime(
         // While the old owner is still live this remains retryable; once its
         // lease expires, any replica can materialize and apply the control.
         if (persisted?.status !== 'closed') {
-          await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          const takeover = await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+            throw new DurableSessionControlOwnerHandoffError(takeover.reason);
+          }
           live = options.findActiveSession(control.sessionId);
           persisted = options.getPersistedSession(control.sessionId);
           if (!live || live.session.sessionId !== canonicalSession.sessionId) {
@@ -299,6 +387,7 @@ export function createDurableLarkSessionControlRuntime(
               || recoveredState.generation <= resumeBaselineState.generation
               || !recoveredState.remoteSessionId) return undefined;
         }
+        if (!active || (options.isResumeReady && !options.isResumeReady(active))) return undefined;
         return {
           result: result('active', active ? options.buildActiveCard(active) : undefined),
           evidence: {
@@ -314,6 +403,40 @@ export function createDurableLarkSessionControlRuntime(
         };
       }
       return undefined;
+    };
+
+    const waitForResumeReadiness = async (
+      signal: AbortSignal,
+    ): Promise<
+      | { kind: 'completed'; result: DurableJson }
+      | { kind: 'ambiguous'; error: string }
+    > => {
+      const deadline = now() + resumeReadinessTimeoutMs;
+      let stableSince: number | undefined;
+      for (;;) {
+        if (signal.aborted) throw signal.reason;
+        const recovered = observed(true);
+        const status = record(recovered?.result)?.status;
+        if (recovered && status === 'closed') {
+          return { kind: 'completed', result: recovered.result };
+        }
+        if (recovered && status === 'active') {
+          stableSince ??= now();
+          if (now() - stableSince >= resumeReadinessStabilityMs) {
+            return { kind: 'completed', result: recovered.result };
+          }
+        } else {
+          stableSince = undefined;
+        }
+        const remaining = deadline - now();
+        if (remaining <= 0) {
+          return {
+            kind: 'ambiguous',
+            error: 'remote resume recovery readiness timed out',
+          };
+        }
+        await wait(Math.min(resumeReadinessPollMs, remaining), signal);
+      }
     };
 
     return {
@@ -366,12 +489,7 @@ export function createDurableLarkSessionControlRuntime(
           const resumed = await options.resumeSession(control.sessionId);
           if (resumed.ok) {
             if (resumed.recoveryPending === true) {
-              const recovered = observed(true);
-              if (recovered) return { kind: 'completed', result: recovered.result };
-              return {
-                kind: 'ambiguous',
-                error: 'remote resume recovery is pending durable readiness',
-              };
+              return waitForResumeReadiness(signal);
             }
             return {
               kind: 'completed',
@@ -414,11 +532,30 @@ export function createDurableLarkSessionControlRuntime(
             error: `resume result requires reconciliation: ${resumed.error}`,
           };
         },
-        reconcile: async () => {
-          const reconciled = observed(true);
-          return reconciled
-            ? { kind: 'completed', ...reconciled }
-            : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
+        reconcile: async signal => {
+          if (control.action === 'close') {
+            const reconciled = observed(true);
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
+          }
+          const reconciled = await waitForResumeReadiness(signal);
+          if (reconciled.kind !== 'completed') {
+            return { kind: 'unknown', error: reconciled.error };
+          }
+          const status = record(reconciled.result)?.status;
+          if (status !== 'active' && status !== 'closed') {
+            return { kind: 'unknown', error: 'reconciled resume result has an invalid status' };
+          }
+          return {
+            kind: 'completed',
+            result: reconciled.result,
+            evidence: {
+              source: 'session-store',
+              status,
+              recovery: status === 'active' ? 'ready' : 'rolled-back',
+            },
+          };
         },
         commit: async (rawResult, signal) => {
           if (signal.aborted) throw signal.reason;
@@ -507,5 +644,5 @@ export function createDurableLarkSessionControlRuntime(
     };
   };
 
-  return { ownedPartitionKeys, authorizeBeforeAck, resolve };
+  return { ownedPartitionKeys, authorizeBeforeAck, pendingCardBeforeAck, resolve };
 }

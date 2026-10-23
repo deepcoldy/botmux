@@ -18,7 +18,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -185,6 +185,26 @@ async function resumeRestoredPendingRepoSetup(
   // identity, not that the Lark message still exists. Persist the replacement
   // before best-effort withdrawal so exactly one card remains authoritative.
   const oldCardMessageId = setup.repoCardMessageId;
+  // The directory this opening would start in without a pick is missing: the
+  // picker in its missing-directory form, as on the first attempt (daemon's
+  // publishMissingStartDirPicker); the no-project start below would be refused.
+  const { missingStartDir, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+  const missingDir = missingStartDir(ds);
+  if (missingDir) {
+    const { sendMessage, replyMessage, deleteMessage } = await import('../im/lark/client.js');
+    const messageId = await publishWorkingDirRecovery(ds, missingDir, {
+      sessionReply: (_rootId, content, msgType = 'text') => ds.scope === 'thread'
+        ? replyMessage(ds.larkAppId, anchor, content, msgType, true)
+        : sendMessage(ds.larkAppId, ds.chatId, content, msgType),
+      lastRepoScan: new Map(),
+    });
+    if (oldCardMessageId && messageId && oldCardMessageId !== messageId) {
+      void deleteMessage(ds.larkAppId, oldCardMessageId).catch(() => {});
+    }
+    announcePendingRepoSession(ds);
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] Re-posted durable pending repo picker (start dir ${missingDir} is missing)`);
+    return;
+  }
   const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
   const projects = scanDirs.length > 0
     ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
@@ -4114,10 +4134,6 @@ export async function resumeSession(
       const current = sessionStore.getOwnedSession(sessionId);
       if (!current || current.status !== 'active') return current?.status === 'closed';
       if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
-        logger.error(
-          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
-          + 'leaving the row active for explicit reconciliation',
-        );
         return false;
       }
       try {
@@ -4141,13 +4157,26 @@ export async function resumeSession(
       });
       return true;
     };
+    const reconcileStartedRemoteResumeExit = async (): Promise<boolean> => {
+      if (rollbackUnstartedRemoteResume()) return true;
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} provider exited after advancing lineage; `
+        + 'running an authoritative close before canonical activation',
+      );
+      const closed = await closeSessionForBackgroundCleanup(
+        sessionId,
+        'remote resume provider-exit rollback',
+      );
+      const current = sessionStore.getOwnedSession(sessionId);
+      return closed.ok && current?.status === 'closed';
+    };
     let started = false;
     try {
       started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
         onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
-        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+        onRemoteBackendStartupExit: reconcileStartedRemoteResumeExit,
       });
     } catch (error) {
       logger.warn(
@@ -4921,11 +4950,45 @@ function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): str
   return undefined;
 }
 
+/** forkOrShowRepoCard 的缺目录分支：首轮按选仓流程落盘，发缺目录形态的选仓卡（没有「直接开启
+ *  会话」，0 个项目也能手填），选好目录由 card-handler 的 pendingRepo 分支起 CLI。卡片发不出去
+ *  时 publishWorkingDirRecovery 改回文字，会话仍待选仓，`/repo <路径>` 可以提交。 */
+async function showMissingStartDirPicker(
+  ds: DaemonSession,
+  missingDir: string,
+  userContent: string,
+): Promise<'pending_repo'> {
+  ds.pendingRepo = true;
+  ds.pendingPrompt = userContent;
+  try {
+    stagePendingRepoSetup(ds, {
+      mode: 'picker',
+      turnId: ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId,
+    });
+  } catch (err) {
+    // Nothing was published, and a direct start would be refused as well.
+    ds.pendingRepo = false;
+    throw err;
+  }
+  ds.initialStartPending = false;
+  const { publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+  const { sendMessage } = await import('../im/lark/client.js');
+  await publishWorkingDirRecovery(ds, missingDir, {
+    sessionReply: (_rootId, content, msgType = 'text') => sendMessage(ds.larkAppId, ds.chatId, content, msgType),
+    lastRepoScan: new Map(),
+  });
+  announcePendingRepoSession(ds);
+  dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+  logger.info(`[createSession] start dir ${missingDir} is missing — repo picker posted for session ${ds.session.sessionId.substring(0, 8)}`);
+  return 'pending_repo';
+}
+
 /** 起会话或弹 /repo 选择卡片——复用普通新话题那套仓库选择逻辑：
  *  - ds.workingDir 已钉（oncall / bot 默认）→ 直接 forkWorker。
  *  - 没钉但扫到可选项目 → 设 pendingRepo + 把 userContent 暂存进 pendingPrompt + 在群里发
  *    buildRepoSelectCard（含 worktree）。用户点卡片由 card-handler 的 pendingRepo 分支起 CLI。
  *  - 没钉也没项目 → 回退用 bot 默认 cwd 直接起。
+ *  - 没钉且那个默认 cwd 不存在 → 不直接起（会被拒），发缺目录选仓卡（showMissingStartDirPicker）。
  *  userContent 是已按角色包装好的首轮内容（lead 前言等），不论哪条路都原样带过去。 */
 async function forkOrShowRepoCard(
   ds: DaemonSession,
@@ -4992,6 +5055,11 @@ async function forkOrShowRepoCard(
   );
 
   if (!ds.workingDir) {
+    // 不选仓库时会落到的目录（bot 默认工作目录）不存在：直接起会被拒，与普通新话题一样改发
+    // 缺目录选仓卡（daemon 的 publishMissingStartDirPicker），首轮挂在卡后。
+    const { missingStartDir } = await import('./working-dir-recovery.js');
+    const missingDir = missingStartDir(ds);
+    if (missingDir) return showMissingStartDirPicker(ds, missingDir, userContent);
     // 没钉目录 → 复用 /repo 选择卡片让用户在群里选仓库。
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];

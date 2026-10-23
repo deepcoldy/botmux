@@ -91,6 +91,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
+  // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
+  putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
   {
     method: 'PUT',

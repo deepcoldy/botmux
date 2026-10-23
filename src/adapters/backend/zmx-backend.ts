@@ -2362,7 +2362,7 @@ export function buildZmxLaunchFiles(
 ): { bootstrap: string; payload: string } {
   const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
   const shellKind = shellKindForPath(shellSpec.shell);
-  const envAssignments = (opts.strictEnv ? strictPaneEnvArgs(opts) : buildBotmuxEnvAssignments(opts.env, opts.injectEnv))
+  const envAssignments = (opts.strictEnv ? strictPaneEnvArgs(opts) : buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv))
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
   const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);

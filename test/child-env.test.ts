@@ -313,39 +313,24 @@ describe('redactChildEnv()', () => {
   it.skipIf(isBun)('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
     // Same guard across the PTY transport, which marshals env into raw K=V pairs
     // in native code rather than reusing libuv's spawn path — a distinct code
-    // path worth covering. Node-only for the reason documented above.
-    const pty = await import('node-pty');
+    // path worth covering. Node-only for the reason documented above. Spawned
+    // through the production wrapper, which delivers everything the child wrote
+    // before onExit; raw node-pty under Node can drop the tail (src/utils/pty.ts).
+    const pty = await import('../src/utils/pty.js');
     const out = await withLeakyParentEnv((env) => new Promise<string>((resolve, reject) => {
       const p = pty.spawn('/bin/sh', ['-c', leakProbeScript(PM2_GRACEFUL_EXIT_CODE_ENV)], {
         name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env: env as { [k: string]: string },
       });
       let buf = '';
-      let settled = false;
-      // node-pty delivers onData and onExit on independent paths: the child can be
-      // reaped before the pty's pending output has been drained, so resolving
-      // straight from onExit can hand back an empty string. Settle on having BOTH
-      // answers, and let exit only START a short grace period rather than decide.
-      // If the grace period expires with the output still incomplete, REJECT with
-      // the raw buffer: a lost read must never be reported as a leak-shaped
-      // assertion failure ("Expected to contain R=UNSET / Received: ''").
-      const hasBothAnswers = () => /\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf);
-      const finish = (settle: () => void) => { if (settled) return; settled = true; settle(); };
-      const fail = () => finish(() => reject(new Error(
-        'pty output incomplete — a lost read, not an env leak. '
-        + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
-      )));
-      const guard = setTimeout(fail, 10_000);
-      guard.unref?.();
-      p.onData((d) => {
-        buf += d;
-        if (hasBothAnswers()) { clearTimeout(guard); finish(() => resolve(buf)); }
-      });
+      p.onData((d) => { buf += d; });
       p.onExit(() => {
-        setTimeout(() => {
-          clearTimeout(guard);
-          if (hasBothAnswers()) finish(() => resolve(buf));
-          else fail();
-        }, 250);
+        // A lost read must never be reported as a leak-shaped assertion failure
+        // ("Expected to contain R=UNSET / Received: ''").
+        if (/\bR=(UNSET|SET)/.test(buf) && /\bS=(UNSET|SET)/.test(buf)) resolve(buf);
+        else reject(new Error(
+          'pty output incomplete — a lost read, not an env leak. '
+          + `Expected both R= and S= answers, got ${JSON.stringify(buf)}`,
+        ));
       });
     }));
     expectNoLeak(out);

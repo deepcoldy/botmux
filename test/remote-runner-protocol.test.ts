@@ -139,7 +139,7 @@ describe('remote runner protocol', () => {
             openId: 'ou_owner',
             unionId: 'on_owner',
             email: 'owner@bytedance.com',
-            source: 'platform_team',
+            source: 'bot_config',
           },
         },
       },
@@ -181,7 +181,7 @@ describe('remote runner protocol', () => {
             openId: 'ou_owner',
             unionId: 'on_owner',
             email: 'owner@bytedance.com',
-            source: 'platform_team',
+            source: 'bot_config',
           },
         },
       },
@@ -210,6 +210,36 @@ describe('remote runner protocol', () => {
         },
       },
     }))).toBeUndefined();
+  });
+
+  it('rejects the whole recovered turn when a provider echoes the legacy platform_team owner source', () => {
+    // The host mints botOwner only with source 'bot_config' (#2100 replaced the
+    // platform_team resolver). A provider echoing the legacy tag must not be
+    // normalized into the recovered caller at all: the whole event is rejected,
+    // not merely stripped.
+    const parsed = parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-legacy-platform-team',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_bot',
+          requestLarkAppId: 'cli_app',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
+      },
+    }));
+    expect(parsed).toBeUndefined();
   });
 
   it('validates generation-fenced terminal screen snapshots', () => {
@@ -292,6 +322,7 @@ describe('remote runner protocol', () => {
       { mention: 'explicit', mentions: ['ou_target:Target', ''] },
       { mention: 'explicit', mentions: ['ou_target\0Target'] },
       { mention: 'explicit', mentions: ['--help'] },
+      { mention: 'explicit', mentions: [' --help'] },
       { mention: 'explicit', mentions: ['-h'] },
       { mention: 'explicit', mentions: ['--dry-run'] },
       { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },

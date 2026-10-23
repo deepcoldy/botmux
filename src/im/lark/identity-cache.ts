@@ -454,7 +454,7 @@ function tripOwnerScopeBreaker(larkAppId: string, negativeKey: string, attemptTo
 }
 
 /**
- * Resolve a platform-attested union_id through the receiving bot app.
+ * Resolve a deployment-configured Owner union_id through the receiving bot app.
  *
  * Admission-path protections (mirroring ensureContactProfile's shape):
  * - a strict wall-clock budget over the WHOLE SDK call, INCLUDING the SDK's

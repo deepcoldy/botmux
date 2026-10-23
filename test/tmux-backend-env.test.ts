@@ -72,7 +72,9 @@ describe('host session scope reaches the pane', () => {
   it.skipIf(!hasTmux)('replaces stale server scope for thread and chat panes and clears it for an unscoped pane', () => {
     const dir = mkdtempSync(join(tmpdir(), 'session-scope-tmux-'));
     const socket = `bmx-scope-${process.pid}-${Date.now()}`;
-    const clientEnv = { PATH: process.env.PATH, HOME: dir };
+    // Keep the fence's private socket root: a hand-built env without
+    // TMUX_TMPDIR puts this server in the HOST socket directory.
+    const clientEnv = { PATH: process.env.PATH, HOME: dir, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
     const runTmux = (args: string[], env: NodeJS.ProcessEnv = clientEnv) => {
       const result = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
       expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);

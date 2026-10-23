@@ -1,4 +1,5 @@
-import { isScheduleCreatorAuthorization, type ScheduleCreatorAuthorization } from './schedule-creator-authorization.js';
+import { isScheduleCreatorAuthorization, isScheduleOperatorAuthorization,
+  type ScheduleCreatorAuthorization, type ScheduleOperatorAuthorization } from './schedule-creator-authorization.js';
 import { randomBytes } from 'node:crypto';
 import { loopbackFetchImpl } from './loopback-fetch.js';
 import {
@@ -39,6 +40,8 @@ export interface ManagedOriginAttestation {
   larkAppId?: string;
   /** Optional for old daemons; only the protected proof can authorize a creator. */
   scheduleCreator?: ScheduleCreatorAuthorization;
+  /** App-scoped admission for existing-task operations; no union-id lookup. */
+  scheduleOperator?: ScheduleOperatorAuthorization;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   requiresCodexAppLedger: boolean;
@@ -168,6 +171,7 @@ function validateProof(input: {
       && (typeof proof.larkAppId !== 'string'
         || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(proof.larkAppId)))
     || (proof.scheduleCreator !== undefined && !isScheduleCreatorAuthorization(proof.scheduleCreator))
+    || (proof.scheduleOperator !== undefined && !isScheduleOperatorAuthorization(proof.scheduleOperator))
     || (proof.linkRefMode !== undefined
       && proof.linkRefMode !== 'observe'
       && proof.linkRefMode !== 'enabled')
@@ -191,6 +195,7 @@ function validateProof(input: {
     ...(typeof proof.callerOpenId === 'string' ? { callerOpenId: proof.callerOpenId } : {}),
     ...(typeof proof.larkAppId === 'string' ? { larkAppId: proof.larkAppId } : {}),
     ...(isScheduleCreatorAuthorization(proof.scheduleCreator) ? { scheduleCreator: proof.scheduleCreator } : {}),
+    ...(isScheduleOperatorAuthorization(proof.scheduleOperator) ? { scheduleOperator: proof.scheduleOperator } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(proof.linkRefMode === 'observe' || proof.linkRefMode === 'enabled'
       ? { linkRefMode: proof.linkRefMode }

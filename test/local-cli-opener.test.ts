@@ -229,6 +229,23 @@ describe('local-cli-opener', () => {
     expect(result.ok && result.command).not.toContain('/opt/legacy/custom-traex');
   });
 
+  it('attach mode addresses the dedicated tmux server a session was created on', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'tmux',
+        cliSessionId: undefined,
+        persistentBackendTarget: { backendType: 'tmux', sessionName: 'bmx-abcdef12', socketName: 'botmux' },
+      },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "tmux -L 'botmux' attach-session -t '=bmx-abcdef12'",
+    });
+  });
+
   it('attach mode opens a managed tmux session with exact target syntax', () => {
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
     const result = buildLocalCliOpenCommand(ds({

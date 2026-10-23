@@ -14,7 +14,7 @@
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward, scanJsonlFromOffset } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
@@ -700,6 +700,31 @@ export function transcriptShowsTurnDurationMarker(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** How much of a transcript's head transcriptHoldsConversation reads. Claude
+ *  opens a file with a handful of small metadata records (mode,
+ *  permission-mode, title, a file-history snapshot); the first conversation
+ *  record follows within a few KB. */
+const CONVERSATION_PROBE_MAX_BYTES = 256 * 1024;
+
+/** Does the transcript hold a conversation `claude --resume` can open? Claude
+ *  answers "No conversation found" for a file of metadata records alone — what
+ *  a `--fork-session` child's file holds for its first moments (2.1.308) — and
+ *  resumes one with a single user or assistant record. */
+export function transcriptHoldsConversation(path: string): boolean {
+  let found = false;
+  scanJsonlFromOffset(path, 0, {
+    endOffset: CONVERSATION_PROBE_MAX_BYTES,
+    onLine: (line) => {
+      if (found || !/"type":"(user|assistant)"/.test(line)) return;
+      try {
+        const type = (JSON.parse(line) as TranscriptEvent).type;
+        found = type === 'user' || type === 'assistant';
+      } catch { /* a foreign line */ }
+    },
+  });
+  return found;
 }
 
 /** The launch-ack a background Agent/Task tool_result carries the moment it is

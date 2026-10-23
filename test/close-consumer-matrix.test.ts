@@ -155,6 +155,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
+  'core/session-manager.ts::reconcileStartedRemoteResumeExit::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A provisional Remote Runner resume lost its provider before canonical activation. '
+      + 'The background wrapper logs refusals and residuals; durable control commits closed '
+      + 'only after the authoritative close is proven.',
+  },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
     category: 'impossible_by_invariant',
     why: 'Same scratch-placeholder eviction as resumeSession: no remote lineage.',

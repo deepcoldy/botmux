@@ -4554,6 +4554,10 @@ export interface LarkEventDispatcherRuntimeOptions {
   }) => Promise<Array<{ messageId: string; deletedAt: number }>>;
   /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
   authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
+  /** Rendered only after a new durable control event is inserted. */
+  pendingPrimaryControlCard?: (
+    data: unknown,
+  ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>;
   /**
    * Primary consumer 在执行本地会话副作用前回读权威 Session。若权威 active
    * Session 属于另一副本，本副本必须先经过 takeOverPrimarySession 的分布式
@@ -4719,6 +4723,9 @@ export function createLarkEventDispatcherRuntime(
     };
     if (typeof primary.context.queuePostAdmissionOutput === 'function') {
       ctx.queuePostAdmissionOutput = primary.context.queuePostAdmissionOutput;
+    }
+    if (typeof primary.context.queuePostAdmissionControl === 'function') {
+      ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
   };
 
@@ -6245,35 +6252,49 @@ export function createLarkEventDispatcherRuntime(
             }
             const eventId = durableLarkSessionControlEventId(larkAppId, stableEventId);
             const partitionKey = durableLarkSessionControlPartition(larkAppId, sessionId);
-            return runtimeOptions.enqueuePrimaryControl({ eventId, partitionKey, data }).then(
-              () => ({
+            const inserted = await runtimeOptions.enqueuePrimaryControl({ eventId, partitionKey, data });
+            if ((inserted as { kind?: unknown } | undefined)?.kind === 'duplicate') {
+              return {
                 toast: {
                   type: 'info',
-                  content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)),
+                  content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)),
                 },
-              }),
-              error => {
-                logger.error(
-                  `[card-action] durable primary control enqueue failed: app=${larkAppId} `
-                  + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
-                );
-                return {
-                  toast: {
-                    type: 'warning',
-                    content: t(
-                      'card.action.primary_lifecycle_unavailable',
-                      undefined,
-                      localeForBot(larkAppId),
-                    ),
-                  },
-                };
+              };
+            }
+            let pendingCard: Record<string, unknown> | undefined;
+            try {
+              pendingCard = await runtimeOptions.pendingPrimaryControlCard?.(data);
+            } catch (error) {
+              // The durable event is already authoritative. A presentation
+              // failure must not turn a safely accepted lifecycle request into
+              // a false rejection; the final outbox update still converges it.
+              logger.warn(
+                `[card-action] durable primary pending card render failed: app=${larkAppId} `
+                + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+            return {
+              toast: {
+                type: 'info',
+                content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)),
               },
-            );
+              ...(pendingCard ? { card: { type: 'raw' as const, data: pendingCard } } : {}),
+            };
           } catch (error) {
-            logger.warn(
-              `[card-action] durable primary rejected invalid session control: app=${larkAppId} `
+            logger.error(
+              `[card-action] durable primary control enqueue failed: app=${larkAppId} `
               + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
             );
+            return {
+              toast: {
+                type: 'warning',
+                content: t(
+                  'card.action.primary_lifecycle_unavailable',
+                  undefined,
+                  localeForBot(larkAppId),
+                ),
+              },
+            };
           }
         }
         logger.warn(

@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   appendFileSync,
@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -33,7 +34,7 @@ afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
   for (const name of tmuxSessions) {
-    try { execFileSync('tmux', ['kill-session', '-t', `=${name}`], { stdio: 'ignore' }); } catch { /* already gone */ }
+    killWorkerTmuxSession(`=${name}`);
   }
   tmuxSessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });

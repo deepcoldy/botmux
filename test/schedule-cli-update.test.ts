@@ -74,7 +74,8 @@ async function managed(
     if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
     observedRequests?.push(request);
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
-      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
+      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' },
+      scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
@@ -106,7 +107,7 @@ async function managed(
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'schedule creator bot does not match the session' }));
       }
-      if (proof.scheduleCreator?.ok !== true) {
+      if (proof.scheduleOperator?.ok !== true) {
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'current turn caller is not an allowed bot operator' }));
       }
@@ -119,7 +120,7 @@ async function managed(
         res.statusCode = 404;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_not_found' }));
       }
-      if (current.preconditionRef) {
+      if (request.action === 'update' && current.preconditionRef) {
         res.statusCode = 409;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_precondition_dashboard_update_required' }));
       }
@@ -207,6 +208,19 @@ describe('schedule CLI prompt updates', () => {
     expect(f.read()[f.task.id]).toEqual({ ...f.task, prompt: 'new prompt' });
     expect(calls()).toBe(4);
     expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
+  });
+  it('runs an existing protected task with same-app open-id admission and no creator union id', async () => {
+    const f = fixture();
+    await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_union_id_unresolved' }; });
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true, preconditionRef: 'host-owned' } }));
+    const result = await f.run(['run', f.task.id]);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ manualRunRequested: true, preconditionRef: 'host-owned' });
+    expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
+    const create = await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344']);
+    expect(create.code, create.output).not.toBe(0);
+    expect(create.output).toContain('cannot resolve the current turn caller union_id');
+    expect(f.read()['11223344']).toBeUndefined();
   });
   it('lets the worker-owned Remote Runner relay reach daemon authorization without a CLI pid marker', async () => {
     const f = fixture(); const calls = await managed(f);
@@ -420,8 +434,11 @@ describe('schedule CLI prompt updates', () => {
     'preserves the old task when authorization is %s', async mode => {
       const f = fixture();
       await managed(f, (proof, index) => {
-        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
-        if (mode === 'old-daemon') delete proof.scheduleCreator;
+        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) {
+          proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
+          proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' };
+        }
+        if (mode === 'old-daemon') delete proof.scheduleOperator;
         if (mode === 'turn-rotated' && index > 1) proof.turnId = 'om_next';
         if (mode === 'cross-bot') proof.larkAppId = 'cli_other';
       });

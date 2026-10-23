@@ -1,4 +1,5 @@
 import { botInjectedEnv } from '../../core/env-policy.js';
+import { applySessionEnvUnset } from '../../core/session-env.js';
 import * as pty from '../../utils/pty.js';
 import { chmodSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -41,7 +42,7 @@ export class PtyBackend implements SessionBackend {
       // No shared backing server here, so per-bot env (opts.injectEnv) is safe
       // to merge straight into the child env — appended last so it wins over a
       // same-named key already in opts.env.
-      env: opts.injectEnv ? { ...opts.env, ...(opts.strictEnv ? botInjectedEnv(opts.injectEnv, { mode: 'strict' }) : opts.injectEnv) } : opts.env,
+      env: ptyChildEnv(opts),
     });
     logger.debug(`[pty] spawned pid=${this.process.pid}`);
   }
@@ -78,4 +79,13 @@ export class PtyBackend implements SessionBackend {
       this.process = null;
     }
   }
+}
+
+/** Child env for the pty backend: session-env removals, then per-bot env. */
+export function ptyChildEnv(opts: Pick<SpawnOpts, 'env' | 'injectEnv' | 'unsetEnv' | 'strictEnv'>): Record<string, string> {
+  if (!opts.injectEnv && !opts.unsetEnv?.length) return opts.env;
+  const env: NodeJS.ProcessEnv = { ...opts.env };
+  applySessionEnvUnset(env, opts.unsetEnv);
+  if (opts.injectEnv) Object.assign(env, opts.strictEnv ? botInjectedEnv(opts.injectEnv, { mode: 'strict' }) : opts.injectEnv);
+  return env as Record<string, string>;
 }

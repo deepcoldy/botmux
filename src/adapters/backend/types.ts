@@ -163,7 +163,10 @@ export interface BackendTurnFailure {
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
+  // a tmux target without it lives on the default server (every older row).
+  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
   | {
@@ -207,6 +210,14 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Inherited variables the session env overlay removes (core/session-env.ts).
+   * The worker already deleted them from `env`; the shell-wrapped backends
+   * (tmux/zellij/zmx) additionally pass `-u KEY` to the pane's final
+   * `/usr/bin/env`, which runs after the rcfile and the terminal server's
+   * global env have been applied, so those sources cannot re-add them.
+   */
+  unsetEnv?: string[];
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */

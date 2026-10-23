@@ -166,7 +166,12 @@ export class IdleDetector {
       // The post-SessionStart fallback only calls this once the viewport
       // already shows a prompt. Re-publish the OSC terminal state; do not
       // let the screen timer declare idle while a child is still working.
-      if (this.isIdle || !this.isTerminalProgramStatus()) return false;
+      // Already being idle is no reason to skip it: when OSC reports idle
+      // before the SessionStart signal, resetReadyEvidence() republishes that
+      // edge while the worker's ready gate still holds, the worker drops it,
+      // and every caller of this method is one still waiting for an edge.
+      // Skipping it left the first prompt to the 15s timeout (#2178).
+      if (!this.isTerminalProgramStatus()) return false;
       this.markIdle('program-status');
       return true;
     }

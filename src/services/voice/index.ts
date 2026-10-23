@@ -19,8 +19,11 @@ import type { ResolvedAsrConfig } from './asr.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import type { VoiceConfig, VoiceAsrConfig } from './types.js';
+import { mergeVolcengineConfig, resolveVolcengineConfig } from './volcengine-config.js';
+import { volcengineSynthesizePcm, DEFAULT_VOLCENGINE_SPEAKER } from './volcengine.js';
 
 export type { VoiceConfig, VoiceEngine, VoiceAsrConfig } from './types.js';
+export { DEFAULT_VOLCENGINE_SPEAKER } from './volcengine.js';
 export type { ResolvedAsrConfig } from './asr.js';
 export {
   DEFAULT_MINIMAX_SPEAKER,
@@ -42,6 +45,7 @@ function mergeVoice(base: VoiceConfig | undefined, over: VoiceConfig | undefined
     sami: { ...base?.sami, ...over?.sami },
     openai: { ...base?.openai, ...over?.openai },
     minimax: { ...base?.minimax, ...over?.minimax },
+    volcengine: mergeVolcengineConfig(base?.volcengine, over?.volcengine),
   };
 }
 
@@ -58,6 +62,8 @@ function hasUsableCreds(v: VoiceConfig | undefined): VoiceConfig | null {
   } else if (engine === 'openai') {
     const { baseUrl, model } = v.openai ?? {};
     if (!baseUrl || !model) return null;
+  } else if (engine === 'volcengine') {
+    if (!resolveVolcengineConfig(v.volcengine)) return null;
   } else if (!v.minimax?.apiKey) {
     return null;
   }
@@ -141,6 +147,7 @@ function effectiveSpeaker(v: VoiceConfig): string {
   if (v.speaker) return v.speaker;
   if (v.engine === 'openai') return DEFAULT_OPENAI_SPEAKER;
   if (v.engine === 'minimax') return DEFAULT_MINIMAX_SPEAKER;
+  if (v.engine === 'volcengine') return DEFAULT_VOLCENGINE_SPEAKER;
   return DEFAULT_SAMI_SPEAKER;
 }
 
@@ -154,11 +161,16 @@ export async function synthesizeVoicePcmForMessage(
   effects: VoiceProviderEffectOptions = {},
 ): Promise<Pcm> {
   const cfg = resolveVoiceConfig(larkAppId);
-  if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容 / MiniMax 引擎。');
+  if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容 / MiniMax / 火山引擎。');
   const spoken = toSpoken(text);
   if (!spoken) throw new Error('精简后没有可朗读的内容');
   const speaker = effectiveSpeaker(cfg);
 
+  if (cfg.engine === 'volcengine') {
+    const credentials = resolveVolcengineConfig(cfg.volcengine);
+    if (!credentials) throw new Error('火山引擎 TTS 配置不完整（需要明确的 mode 和 API key）。');
+    return await volcengineSynthesizePcm(credentials, spoken, { speaker, rate: cfg.rate }, effects);
+  }
   if (cfg.engine === 'openai') {
     return await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate }, effects);
   }

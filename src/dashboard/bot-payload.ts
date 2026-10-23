@@ -183,6 +183,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,

@@ -653,9 +653,26 @@ export function createTask(params: {
   followActive?: boolean;
   model?: string;
   reasoningEffort?: ScheduleReasoningEffort;
-}): ScheduledTask {
+}, authoritativeCreate?: (task: ScheduledTask) => ScheduledTask): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
   if (params.id) assertValidTaskId(params.id);
+  if (authoritativeCreate) {
+    // Authority owns idempotency and runtime state. Do not read or write the
+    // projection before it accepts this candidate.
+    const task: ScheduledTask = {
+      ...params,
+      chatId: targets.chatId,
+      chatIds: targets.chatIds,
+      id: params.id ?? randomUUID().substring(0, 8),
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
+      silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+    };
+    return authoritativeCreate(task);
+  }
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
   // its daemon (the only one that executes it) can see it. Sandboxed callers

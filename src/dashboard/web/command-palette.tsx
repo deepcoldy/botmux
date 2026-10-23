@@ -7,7 +7,7 @@ import { ModalDialog } from './modal-dialog.js';
 import { navigateToHash } from './leave-guard.js';
 import { Html } from './dashboard-components.js';
 import { useDashboardLocale, useDashboardStore } from './react-hooks.js';
-import { botAvatarHtml, nameMapsVersion, t, ui } from './ui.js';
+import { botAvatarHtml, loadNameMaps, nameMapsVersion, t, ui } from './ui.js';
 import type { SkillRow } from './skills/types.js';
 import {
   PALETTE_SCOPES,
@@ -30,6 +30,8 @@ import {
 import {
   buildActionItems,
   buildAgentItems,
+  buildBotDefaultsSectionItems,
+  buildBotDefaultsTabItems,
   buildBotItems,
   buildPageItems,
   buildPreferenceItems,
@@ -227,7 +229,16 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   const baseId = useId();
   const listId = `${baseId}-list`;
   const optionId = (index: number) => `${baseId}-opt-${index}`;
-  const { remote, loading } = useRemoteSources(open, authed && context.manageDataReady);
+  const manageReady = authed && context.manageDataReady;
+  const { remote, loading } = useRemoteSources(open, manageReady);
+  // 机器人条目来自名称映射：首屏那次加载失败或还没回来时，唤起面板补一次（有缓存，已加载则立即返回）。
+  const [, bumpNames] = useState(0);
+  useEffect(() => {
+    if (!open || !manageReady) return undefined;
+    let alive = true;
+    void loadNameMaps().then(() => { if (alive) bumpNames(value => value + 1); });
+    return () => { alive = false; };
+  }, [manageReady, open]);
   // bot / 群名映射晚到（冷启动时 /api/groups 还没回来）时，按行缓存的会话条目要跟着失效。
   const namesVersion = nameMapsVersion();
 
@@ -256,6 +267,8 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   const localItems = useMemo(() => (open ? [
     ...buildActionItems(context),
     ...buildSettingItems(),
+    ...buildBotDefaultsTabItems(),
+    ...buildBotDefaultsSectionItems(),
     ...buildPreferenceItems(context),
     ...buildBotItems(),
     ...buildPageItems(context.pages),

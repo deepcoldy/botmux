@@ -632,7 +632,9 @@ export function makeSubmitFingerprint(content: string, len = 30): string | undef
  *  `sessionId` even though it rotates the on-disk jsonl. Callers that
  *  rely on this for rotation tracking must therefore treat a "matching
  *  sessionId" answer as "no spawn-time rotation observed", not "no
- *  rotation at all" — the latter requires fingerprint corroboration. */
+ *  rotation at all" — the latter requires fingerprint corroboration.
+ *  Claude Code 2.1.305/2.1.306 rewrite `sessionId` on `/clear` as well
+ *  (observed 2026-10-22: the record named the post-clear transcript). */
 export function claudePidStatePath(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   return join(dataDir, 'sessions', `${pid}.json`);
 }

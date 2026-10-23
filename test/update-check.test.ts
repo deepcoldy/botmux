@@ -10,6 +10,10 @@ import {
   isNewerVersion,
   selectReleasesSince,
   fetchLatestVersion,
+  fetchReleaseVersion,
+  fetchConfiguredPackageArtifact,
+  mirrorFallbackRetryMs,
+  registryPackageVersionUrl,
   selectRollbackVersions,
   fetchRollbackVersions,
   fetchReleasesSince,
@@ -193,6 +197,101 @@ describe('fetchLatestVersion', () => {
     await fetchLatestVersion({ registry: 'garbage', fetchImpl });
     expect(seen).toBe('https://registry.npmjs.org/botmux/latest');
   });
+});
+
+describe('release-backed version lookup', () => {
+  it('uses the public registry as authoritative even when a configured mirror exists', async () => {
+    const urls: string[] = [];
+    const fetchImpl = async (url: unknown) => {
+      urls.push(String(url));
+      return jsonResponse(200, { version: '3.48.0' });
+    };
+    await expect(fetchReleaseVersion('latest', {
+      registry: 'https://mirror.example.com',
+      fetchImpl,
+    })).resolves.toEqual({ version: '3.48.0', source: 'public' });
+    expect(urls).toEqual(['https://registry.npmjs.org/botmux/latest']);
+  });
+
+  it('falls back transparently to the configured mirror and reports weaker provenance', async () => {
+    const urls: string[] = [];
+    const fetchImpl = async (url: unknown) => {
+      urls.push(String(url));
+      return String(url).startsWith('https://registry.npmjs.org/')
+        ? jsonResponse(503, {})
+        : jsonResponse(200, { version: '3.47.0' });
+    };
+    await expect(fetchReleaseVersion('latest', {
+      registry: 'https://mirror.example.com',
+      fetchImpl,
+    })).resolves.toEqual({ version: '3.47.0', source: 'configured-fallback' });
+    expect(urls).toEqual([
+      'https://registry.npmjs.org/botmux/latest',
+      'https://mirror.example.com/botmux/latest',
+    ]);
+  });
+
+  it('returns no version when both public and configured sources fail', async () => {
+    const fetchImpl = async () => jsonResponse(503, {});
+    await expect(fetchReleaseVersion('latest', {
+      registry: 'https://mirror.example.com',
+      fetchImpl,
+    })).resolves.toEqual({ version: null, source: null });
+  });
+
+  it('backs repeated mirror fallbacks off from one minute to thirty minutes', () => {
+    expect([1, 2, 3, 4, 5, 99].map(mirrorFallbackRetryMs)).toEqual([
+      60_000,
+      5 * 60_000,
+      15 * 60_000,
+      30 * 60_000,
+      30 * 60_000,
+      30 * 60_000,
+    ]);
+  });
+});
+
+describe('configured registry platform package', () => {
+  it('resolves an exact version manifest with a SHA-512 integrity', async () => {
+    let seen = '';
+    const fetchImpl = async (url: unknown) => {
+      seen = String(url);
+      return jsonResponse(200, {
+        name: 'botmux-darwin-arm64',
+        version: '3.48.0',
+        dist: {
+          tarball: 'https://mirror.example.com/pkg.tgz',
+          integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`,
+        },
+      });
+    };
+    await expect(fetchConfiguredPackageArtifact('botmux-darwin-arm64', '3.48.0', {
+      registry: 'https://mirror.example.com',
+      fetchImpl,
+    })).resolves.toMatchObject({
+      packageName: 'botmux-darwin-arm64',
+      version: '3.48.0',
+      tarball: 'https://mirror.example.com/pkg.tgz',
+    });
+    expect(seen).toBe(registryPackageVersionUrl(
+      'https://mirror.example.com',
+      'botmux-darwin-arm64',
+      '3.48.0',
+    ));
+  });
+
+  it.each([
+    { name: 'botmux-linux-x64', version: '3.48.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.47.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.48.0', integrity: 'sha512-bad', tarball: 'https://mirror.example.com/pkg.tgz' },
+    { name: 'botmux-darwin-arm64', version: '3.48.0', integrity: `sha512-${Buffer.alloc(64, 7).toString('base64')}`, tarball: 'file:///x' },
+  ])('rejects invalid manifest $name / $version / $integrity / $tarball', async ({ name, version, integrity, tarball }) => {
+    await expect(fetchConfiguredPackageArtifact('botmux-darwin-arm64', '3.48.0', {
+      registry: 'https://mirror.example.com',
+      fetchImpl: async () => jsonResponse(200, { name, version, dist: { tarball, integrity } }),
+    })).resolves.toBeNull();
+  });
+
 });
 
 describe('resolveNpmRegistryBase cache policy', () => {

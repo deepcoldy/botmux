@@ -12,8 +12,9 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
@@ -457,8 +458,9 @@ export class FleetSupervisor {
     if (this.opts.logDir) {
       try {
         mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
+        // 打开前按大小轮转（默认 20MiB，保留 1 份 .1），防止单一日志无限增长吃满磁盘。
+        outFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-out.log`));
+        errFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-err.log`));
         stdio = ['ignore', outFd, errFd];
       } catch (err) {
         this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);

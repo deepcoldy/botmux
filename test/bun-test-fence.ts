@@ -3,6 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import * as realOs from 'node:os';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
+import {
+  applyTmuxFenceEnv,
+  createTmuxFence,
+  readTmuxFenceDenials,
+  teardownTmuxFence,
+  tmuxFenceDenialError,
+} from './helpers/tmux-fence.js';
 
 /**
  * `bun test` counterpart of `test/unit-setup.ts`.
@@ -111,6 +118,12 @@ const mojoWorkspaceRoot = join(fileRoot, 'mojo-workspaces');
 mkdirSync(mojoWorkspaceRoot);
 process.env.BOTMUX_MOJO_WORKSPACE_ROOT = mojoWorkspaceRoot;
 
+// Same tmux fence as vitest (test/helpers/tmux-fence.ts): no test may reach the
+// host's tmux servers. `bun test` runs every file in this one process, so one
+// private socket root serves the whole invocation.
+const tmuxFence = createTmuxFence(process.env);
+applyTmuxFenceEnv(tmuxFence);
+
 // A preload runs before the test module, so a file-wide override made at module
 // scope or in beforeAll must be captured once and then repaired per test.
 let fileDataDir = '';
@@ -128,4 +141,7 @@ afterAll(() => {
   // Botmux data to a straggling write.
   process.env.SESSION_DATA_DIR = dataDir;
   rmSync(fileRoot, { recursive: true, force: true });
+  const tmuxDenials = readTmuxFenceDenials(tmuxFence);
+  teardownTmuxFence(tmuxFence);
+  if (tmuxDenials.length > 0) throw tmuxFenceDenialError(tmuxDenials);
 });

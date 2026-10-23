@@ -14,6 +14,7 @@ import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeBlindTurnWatch } from '../src/services/claude-bridge-blind-turn.js';
 import { localTurnFailureNotice } from '../src/services/local-turn-failure.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { t } from '../src/i18n/index.js';
@@ -133,6 +134,7 @@ function exitPath(queue: BridgeTurnQueue) {
     bridgeKnownSessionIds: new Set(),
     bridgeSecondaryPaths: new Map(),
     bridgeRestoreGate: { markGenerationRetired: () => {} },
+    bridgeBlindTurnWatch: new BridgeBlindTurnWatch(),
     resetThinkingChannel: () => {},
   };
   scope.emitReadyTurns = loadWorkerFunction('emitReadyTurns', scope);

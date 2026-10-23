@@ -32,7 +32,9 @@ import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
-import { isReservedPerBotEnvKey, nextPerBotEnv, parsePerBotEnvText, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { isReservedPerBotEnvKey, nextPerBotEnv, parsePerBotEnvText, sanitizePerBotEnv, sessionEnvLock } from '../core/per-bot-env.js';
+import { applyEnvOps, botEnvLayer, envLayerWithinBudget, isSessionEnvName, parseEnvOps, type EnvLayer, type EnvOp, type EnvOpsError } from '../core/session-env.js';
+import { sessionEnvLockContextForBot } from '../core/session-env-resolve.js';
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
@@ -49,7 +51,7 @@ import {
 } from './codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
-import { botInjectedEnv, buildSessionChildEnv } from '../core/env-policy.js';
+import { botOneShotEnv } from '../core/session-env-resolve.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import {
   MAX_CARD_ACTION_ACK_TIMEOUT_MS,
@@ -59,6 +61,7 @@ import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-
 import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 import { defaultReplyDeliveryFor, supportsTranscriptReplyDelivery } from '../core/reply-delivery.js';
 import { supportsZeroPromptInjection } from '../core/prompt-injection.js';
+import { normalizeBotActorOwnerBindings } from '../core/bot-actor-owner-binding.js';
 
 /**
  * 生效时机：
@@ -128,6 +131,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'showReplyTiming', configKey: 'showReplyTiming', kind: 'boolean', effect: 'immediate', clearable: false, hint: '最终回复页脚分别显示等待和执行耗时 on|off（默认 off）；普通发送显示执行至回复，结束后显示最终耗时；等待含排队/准备，缺失计时则不显示' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
+  { key: 'botActorOwnerBindings', configKey: 'botActorOwnerBindings', kind: 'json', effect: 'immediate', clearable: true, hint: 'Bot 调用者双 ID 到 Owner union/email 的严格 JSON 绑定；只用于 developer_default 凭据选择' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
@@ -141,6 +145,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
+  { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
@@ -172,6 +177,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'envPolicy', configKey: 'envPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: '进程环境继承策略 JSON：{"mode":"strict","inherit":["HTTPS_PROXY"]}；默认 inherit 兼容旧行为。仅变量名，不填值；下次 worker 冷启动生效，旧 pane 策略不匹配时拒绝复用；unset 恢复默认' },
   { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名或宿主 MCP/Unix IPC；下个新会话生效，unset 恢复 sandboxNetwork' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量，接受 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}）、{"env":{…}} settings 片段、.env / export KEY=… 行或 exec env 启动脚本（让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY；保留键如 CLAUDE_CONFIG_DIR 会被拒绝）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
+  { key: 'envUnset', configKey: 'envUnset', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseEnvUnsetInput, hint: '在本 bot 的会话里去掉的继承环境变量名（逗号/空格/换行分隔，如 BYTECLOUD_AUTH_AS HTTPS_PROXY）；只对新会话生效，运行中的会话重启后生效；botmux 保留变量与 PATH/HOME 不能去掉；与 Dashboard「Bot 配置 → 运行环境 → 会话环境变量」同一份配置；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
@@ -312,19 +318,80 @@ export async function applyPerBotEnvChange(
 ): Promise<{ ok: true; envKeys: string[] } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-  const r = await rmwBotEntry<Record<string, string> | null>(larkAppId, (entry) => {
+  const r = await rmwBotEntry<Record<string, string> | null | 'layer_too_large'>(larkAppId, (entry) => {
+    const prevLayer = botEnvLayer(entry);
     const prev = sanitizePerBotEnv(entry.env);
     const next = nextPerBotEnv({ prev, ...change });
+    // Same pane-argv budget as the session-env editor: the whole bot layer
+    // (`env` set + `envUnset` removals) must fit a tmux pane start command.
+    // Shrinking stays allowed, so an already-oversized layer stays fixable.
+    if (!envLayerWithinBudget(prevLayer, botEnvLayer({ env: next ?? undefined, envUnset: entry.envUnset }))) {
+      return { write: false, result: 'layer_too_large' };
+    }
     if (next) entry.env = next;
     else delete entry.env;
     return { write: true, result: next };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
+  if (r.result === 'layer_too_large') return { ok: false, reason: 'layer_too_large' };
   const spec = findConfigField('env')!;
   const oldText = formatFieldValue(spec, bot.config.env, bot.config);
   bot.config.env = r.result ?? undefined;
   logger.info(`[config:${larkAppId}] set env (${change.mode}): ${oldText} -> ${formatFieldValue(spec, bot.config.env, bot.config)}`);
   return { ok: true, envKeys: r.result ? Object.keys(r.result).sort() : [] };
+}
+
+/** `/botconfig envUnset` input: names only, invalid or non-removable ones dropped. */
+function parseEnvUnsetInput(raw: string): string[] {
+  return [...new Set(raw.split(/[\s,]+/).filter(k => isSessionEnvName(k) && sessionEnvLock(k) === null))].sort();
+}
+
+/**
+ * The Dashboard write path for the bot layer: validates raw ops against THIS
+ * bot's lock context (identity-wrapper names are locked only while that
+ * wrapper is on) before applying them.
+ */
+export async function applyBotSessionEnvRequest(
+  larkAppId: string,
+  rawOps: unknown,
+): Promise<{ ok: true; layer: EnvLayer } | { ok: false; reason: EnvOpsError | string; key?: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const parsed = parseEnvOps(rawOps, sessionEnvLockContextForBot(bot.config));
+  if (!parsed.ok) return { ok: false, reason: parsed.error, ...(parsed.key ? { key: parsed.key } : {}) };
+  return applyBotSessionEnvOps(larkAppId, parsed.ops);
+}
+
+/**
+ * Dashboard session-env save for the bot layer (`env` = set, `envUnset` =
+ * unset). Like {@link applyPerBotEnvChange} the ops are applied INSIDE the
+ * bots.json file lock against the on-disk entry, so concurrent edits of
+ * different keys never lose each other. `ops` must already be validated
+ * (parseEnvOps with this bot's lock context).
+ */
+export async function applyBotSessionEnvOps(
+  larkAppId: string,
+  ops: readonly EnvOp[],
+): Promise<{ ok: true; layer: EnvLayer } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<EnvLayer | 'layer_too_large'>(larkAppId, (entry) => {
+    const prev = botEnvLayer(entry);
+    const next = applyEnvOps(prev, ops);
+    if (!envLayerWithinBudget(prev, next)) return { write: false, result: 'layer_too_large' };
+    if (Object.keys(next.set).length) entry.env = next.set;
+    else delete entry.env;
+    if (next.unset.length) entry.envUnset = next.unset;
+    else delete entry.envUnset;
+    return { write: true, result: next };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  if (r.result === 'layer_too_large') return { ok: false, reason: 'layer_too_large' };
+  bot.config.env = Object.keys(r.result.set).length ? r.result.set : undefined;
+  bot.config.envUnset = r.result.unset.length ? r.result.unset : undefined;
+  // Names only — values may be credentials.
+  logger.info(`[config:${larkAppId}] session env: ${ops.map(op => `${op.op} ${op.key}`).join(', ')}`);
+  return { ok: true, layer: r.result };
 }
 
 /**
@@ -390,10 +457,7 @@ async function applyConfigFieldInternal(
     const availability = checkCliAvailability({ cliId: nextCliId, cliPathOverride: cliPath });
     const tierCheck = await validateCodexServiceTier({
       cliBin: availability.resolvedPath ?? availability.command ?? '',
-      env: {
-        ...buildSessionChildEnv(process.env, bot.config.envPolicy),
-        ...botInjectedEnv(bot.config.env, bot.config.envPolicy),
-      },
+      env: botOneShotEnv(process.env, bot.config),
       model: nextModel,
       serviceTier: nextServiceTier,
     });
@@ -406,6 +470,11 @@ async function applyConfigFieldInternal(
   }
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
+    // Snapshot for the pane-argv budget check on env / envUnset below (the
+    // callback mutates `entry` in place before the generic write branch).
+    const prevEnvLayer = spec.configKey === 'env' || spec.configKey === 'envUnset'
+      ? botEnvLayer(entry)
+      : undefined;
     if (entry.replyCardMode === 'final-only') {
       entry.replyCardMode = 'unified';
       entry.disableStreamingCard = true;
@@ -528,6 +597,13 @@ async function applyConfigFieldInternal(
     }
     if (spec.configKey === 'cliId' && !isCodexServiceTierCliId(nextCliId)) {
       delete entry.serviceTier;
+    }
+    // The pane-argv budget applies to the legacy /botconfig env / envUnset
+    // writes too — an oversized layer makes every new tmux session of this bot
+    // fail deterministically ("command too long"). Shrinking (including clear)
+    // stays allowed so an already-oversized layer can always be cleaned up.
+    if (prevEnvLayer && !envLayerWithinBudget(prevEnvLayer, botEnvLayer(entry))) {
+      return { write: false, result: 'layer_too_large' };
     }
     return { write: true, result: null };
   });
@@ -1020,6 +1096,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'botActorOwnerBindings') {
+          try {
+            const bindings = normalizeBotActorOwnerBindings(parsed);
+            return bindings ? { ok: true, value: bindings } : { ok: false, reason: 'invalid_json' };
+          } catch { return { ok: false, reason: 'invalid_json' }; }
+        }
         if (spec.configKey === 'noProgressNotify') {
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
           catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }

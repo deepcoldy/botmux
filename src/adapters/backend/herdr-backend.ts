@@ -6,6 +6,7 @@ import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { sessionChildEnvWithInject } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
 
@@ -665,7 +666,7 @@ export class HerdrBackend implements SessionBackend {
     // Appended last so injected values win over same-named keys in opts.env.
     this.childEnv = this.opts.externalTarget
       ? undefined
-      : { ...opts.env, ...(opts.injectEnv ?? {}) };
+      : sessionChildEnvWithInject(opts);
     this.ensureServer();
 
     const external = this.opts.externalTarget;

@@ -57,8 +57,9 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `fish` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`, or `~/.config/fish/config.fish` for fish). fish is a first-class launch shell: `launchShell: "fish"` and absolute fish paths (e.g. `/usr/bin/fish`) are supported, and the desktop PATH probe reads fish when `$SHELL` is fish, so fish users don't need to mirror PATH / env into `.bashrc` / `.zshrc`. Empty = use `$SHELL`. Takes effect next session for shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); `pty` execs the CLI directly and is unaffected. Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, whitespace inside a name joins with `-` (`/Ultra Goal` → `/ultra-goal`), only `[a-z0-9:_-]` kept, deduplicated; in dashboard free text, separate entries with commas/newlines or a space before the next `/`); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
-| `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). |
-| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+| `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). In the Dashboard it is "Inherit host environment" above the session environment table. |
+| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. It is the bot layer's "set" in the session environment; also editable in the Dashboard ("Bot settings → Runtime environment → Session environment") |
+| `envUnset` | Inherited variable names removed from this bot's sessions, e.g. `["BYTECLOUD_AUTH_AS"]` (the bot layer's "remove", see below). botmux-reserved names and `PATH` / `HOME` cannot be removed; a name also listed in `env` is treated as set. Effective from the next session |
 | `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexCapacityRecovery` | **Off by default**. Set `true` to continue explicit model-capacity failures in managed Codex Lark sessions, or use `/botconfig set codexCapacityRecovery on` / `off`. At most two recovery inputs are appended per task and may remain in native model context; disabling this does not delete history. Not provider-specific; ordinary rate limits and quota exhaustion are excluded. |
 | `suppressDeliveredFinalFailureNotice` | **Experimental, off by default**. When `true`, a structured-transcript session (such as Codex) that already delivered an explicit final with a Lark receipt for the same turn and dispatch attempt (`botmux send --response-kind final` or a managed final card) no longer posts the "model connection failed" notice if a later model-service error (such as 527) ends that turn; the failed terminal and logs are kept. It trusts the delivered final and does not compare it with text the model may write afterwards. Progress/auxiliary sends, unacknowledged sends and sends from other turns are unaffected. Missing/`false` keeps the previous behavior. Toggle with `/botconfig set suppressDeliveredFinalFailureNotice on` / `off`; takes effect on the next worker start |
@@ -144,7 +145,7 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 - For GLM in China, use `https://open.bigmodel.cn/api/anthropic` for `ANTHROPIC_BASE_URL`.
 - For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`.
 - **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
-- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat configuration queries mask values and Dashboard returns names only.
+- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat configuration queries mask values, and the Dashboard masks them by default with reveal available only to the local owner.
 - Takes effect from the next **session**.
 
 ### Clean Codex App input (experimental)
@@ -213,8 +214,8 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |
 | `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
 | `defaultOncall` | The bot's default: the first new topic in a new group chat is automatically bound to oncall. `{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`; older groups that already existed before `since` are unaffected |
-| `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk` |
-| `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
+| `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk`. See "Grant store" below |
+| `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card or by multi-bot group creation, but can also be configured by hand. See "Grant store" below |
 | `messageQuota` | Message-quota override `{ "defaultLimit": N }`: **applies only to grantees admitted by grant cards or self-service requests** — once a positive integer is configured, new grant cards use an N-message quota; when unset they default to 3 messages per person. **Oncall groups are always unmetered and never read this value.** An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
@@ -435,20 +436,54 @@ Set `agentAppId` to the bot that executes the role. Add the profile id to `defau
 
 ## Runtime state (auto-maintained, do not edit)
 
-The following fields are written by botmux itself and persisted into `bots.json` alongside authorizations / switches. They are listed only for reference — **do not edit them by hand**:
+The following fields are written by botmux itself and persisted into `bots.json` alongside switches. They are listed only for reference — **do not edit them by hand**:
 
 | Field | Description |
 |------|------|
 | `defaultOncallAutoboundChats` | The chat_ids that `defaultOncall` has already auto-bound (append-only). Once recorded, it won't auto-bind again even if later unbound |
-| `quotaState` | Scope-level message-quota counters `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`; when exhausted, automatically revokes the corresponding scope's authorization |
 | `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
+
+### Grant store (`grants.sqlite`)
+
+Per-user talk authorizations are not kept in `bots.json`; they live in `<data dir>/grants.sqlite` (default `~/.botmux/data/grants.sqlite`): `chatGrants`, `globalGrants`, and their message-quota counters (`quotaState`, `{ "chat:<cid>:<oid>" \| "global:<oid>": { limit, used } }`; when exhausted, the corresponding scope's authorization is revoked), expiry times (`grantExpiryState`) and dispatch charge receipts. Creating a multi-bot group adds one authorization per bot for every other bot, so keeping them in the config file made `bots.json` grow with every group.
+
+- When a daemon starts and its bot still has any of these fields in `bots.json` (pre-upgrade data, hand-written entries), they are **merged into the grant store and then removed from `bots.json`**; for a record that already exists in the store, the store wins. Before the first removal the whole `bots.json` is backed up to `bots.json.bak-grants-v1`.
+- Authorizations are only reclaimed automatically once they **expire**: expired ones are cleaned when the daemon starts and every hour. Use `/revoke` or the grant card to revoke.
+- Under `BOTMUX_COORDINATION_MODE=primary` (multiple replicas) replicas do not share a data dir, so authorizations stay in `bots.json` and behave as before. A deployment that already ran in the default mode and then switches to primary will not read the authorizations in the grant store (it only grants less), so do not switch back and forth between the two modes.
 
 > **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.
 
 
-### Strict process environment inheritance (opt in)
+### Session environment (global and per-bot layers)
 
-![Dashboard strict inheritance and write-only environment example](/img/strict-env-policy-dashboard.png)
+![Dashboard session environment](/img/session-env-dashboard.png)
+
+A session's environment is assembled in this order:
+
+| Order | Layer | Stored in | Notes |
+| --- | --- | --- | --- |
+| 1 | Inherited baseline | — | The daemon's environment after botmux's own marker cleanup, the `envPolicy` inheritance boundary and child redaction (Feishu app credentials, `GITHUB_TOKEN`, a parent tmux connection, …) |
+| 2 | Global layer | `~/.botmux/config.json` → `sessionEnv: { "set": {…}, "unset": […] }` | Applies to every bot's sessions |
+| 3 | Bot layer | this bot's `env` (set) + `envUnset` (remove) | Overrides the global layer |
+| 4 | botmux reserved | fixed list in code | `BOTMUX*`, `LARK_APP_*`, `SESSION_DATA_DIR`, `TMPDIR` / `TMP` / `TEMP`, …; injected last, no layer can set or remove them |
+
+- Within a layer a variable is either set or removed. A higher layer's entry replaces a lower one for the same name; "restore inherited" deletes this layer's entry so the value falls back to the layer below.
+- `PATH` and `HOME` can be overridden but not removed (sessions need them to start).
+- With the lark tool binding on, `ZDOTDIR` / `BASH_ENV` belong to the identity wrapper; with trigger-user CLI identity on, so do `GIT_ASKPASS` / `GIT_CONFIG_*`. On such a bot they cannot be set or removed, and existing values in its config are not injected into sessions that run the wrapper. HTTP virtual chats, sessions attached to an external Codex App Server, v3 workflow workers and one-shot processes run without the lark tool binding and keep receiving them.
+- Set and remove entries of one layer may total at most 4 KB: tmux / zellij / zmx put them into the session launch command, which tmux caps in length. A save past that is refused; an oversized legacy layer can always be shrunk.
+- For tmux / zellij / zmx sessions, removal happens at the last step of the pane launch (`/usr/bin/env -u`), so a same-named variable coming from the tmux server's global environment or the login shell's startup files is removed too.
+- No migration: `env` already is the bot layer's set and `envPolicy` the inheritance mode. Without `envUnset` / `sessionEnv` the session environment is exactly what it was before.
+- Sessions on the riff / mojo backends do not run on this host: only the bot's own `env` is sent along; the global layer and removals do not apply.
+
+**Managing it in the Dashboard**: the global layer is under "Settings → Session environment", the bot layer under "Bot settings → Runtime environment → Session environment". The table lists each variable's name, effective value and source (inherited / global / bot); you can set, override, remove, restore inherited, or paste in bulk (same formats as `env`). Credential-like values are masked; only the local owner (local management cookie) can reveal them, and other managers see every value masked.
+
+**When it applies**: changes apply to new sessions without restarting the daemon. Running sessions keep the environment they started with; the page lists the ones still on the old environment, which pick the change up after a restart. "More → View session environment" in the session drawer shows the real environment of a running session's CLI process (read-only, masked, sources inferred by value; Linux only).
+
+**tmux server global environment**: a tmux server freezes a global environment when it starts, and every pane created on it inherits it. Below the global table, "Settings → Session environment" lists both the default server and the managed-session `tmux -L botmux` server and marks where new managed sessions are created. The local owner can remove a variable from a server's global environment (with confirmation): only panes created afterwards are affected, running sessions keep theirs, and a restarted server freezes its starter's environment again — use "remove" above for a lasting effect.
+
+> env blocks in a CLI's own config (e.g. Claude's `~/.claude/settings.json`) are applied by the CLI after it starts and are not affected by removals.
+
+### Strict process environment inheritance (opt in)
 
 Omit `envPolicy` or use `{ "mode": "inherit" }` to retain historical host inheritance and mandatory credential/session-marker filtering. Strict mode uses exact approved names:
 
@@ -461,7 +496,7 @@ Omit `envPolicy` or use `{ "mode": "inherit" }` to retain historical host inheri
 
 The fixed baseline contains PATH, HOME, user identity, temporary directories, standard locale, terminal and XDG paths; see `src/core/env-policy.ts` for the complete list. `inherit` adds exact names without wildcards. Proxy, CA, toolchain and model-auth variables require explicit approval here or this bot's `env`. Configured `env` wins over inherited values and stays per child/pane. Botmux injects its own identity/control variables; reserved names including `BOTMUX*`, `__OWNER_OPEN_ID` and `CODEX_HOME` cannot be overridden or inherited as user grants. Non-reserved adapter variables such as `TRAE_HOME` and `CLI_EXTRA_ARGS` also require an explicit `inherit` grant or a value in this bot's `env`. Process-level `GROK_HOME`, `DSH_HOME` and `LARKSUITE_CLI_DATA_DIR` may be explicitly inherited. Mandatory sensitive-variable filtering remains enforced in strict mode.
 
-Set the policy in Dashboard under “Process environment inheritance”, with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
+Set the policy in the Dashboard with "Inherit host environment" above the session environment table (Bot settings → Runtime environment), with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
 
 **Combining network policies:** When using a version that provides `sandboxNetworkPolicy`, the `HTTPS_PROXY` example above must also satisfy this table. An exact environment grant controls whether a value reaches the CLI; it does not authorize network access or silently remove/rewrite a proxy.
 

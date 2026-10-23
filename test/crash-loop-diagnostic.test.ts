@@ -231,7 +231,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持），
     // 并标记 reason: 'cli_crash' 区分 operator 主动 restart；经 restart coordinator 发出，
     // 必带 attemptId（#1863：只有关联回执能放开 workerReady 栅栏）。
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'cli_crash', env: null, model: null, larkToolBinding: true });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'cli_crash', env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.

@@ -3,7 +3,8 @@ import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
-import { withPlatformBotOwner } from './core/bot-owner-attribution.js';
+import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
+import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -91,6 +92,8 @@ import {
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
   botAcceptsSlashFromBots,
+  getLoadedConfigPath,
+  getLoadedConfigProvenance,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -136,6 +139,7 @@ import {
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { requestDurableSessionControl } from './services/durable-session-control-request.js';
+import { buildSessionControlPendingCard } from './im/lark/session-control-pending-card.js';
 import {
   createDurableGroupContextRecallFacade,
   readDurableGroupContextRecalls,
@@ -289,10 +293,25 @@ async function trustedCallerForInboundTurn(
     senderUnionId,
     senderIsBot,
   );
-  const enriched = await withPlatformBotOwner(caller, config.session.dataDir);
+  const canonicalBindings = caller?.senderType === 'bot'
+    ? await readCanonicalBotActorOwnerBindings(
+      getLoadedConfigProvenance() === 'loaded' ? getLoadedConfigPath() : undefined,
+      larkAppId,
+    )
+    : { ok: true as const, bindings: undefined };
+  if (!canonicalBindings.ok) {
+    logger.debug(
+      `[bot-owner] canonical binding unavailable reason=${canonicalBindings.reason} `
+      + `target=${larkAppId}; user credentials remain unavailable`,
+    );
+  }
+  const enriched = await withConfiguredBotOwner(
+    caller,
+    canonicalBindings.ok ? canonicalBindings.bindings : undefined,
+  );
   if (caller?.senderType === 'bot' && !enriched?.botOwner) {
     logger.debug(
-      `[bot-owner] no verified platform owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
+      `[bot-owner] no verified configured owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
       + `target=${larkAppId}; user credentials remain unavailable`,
     );
   }
@@ -464,7 +483,8 @@ import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
-import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant } from './services/grant-store.js';
+import { consumeDispatchLaunchQuotaOnce, consumeQuota, removeChatGrant, removeGlobalGrant, sweepExpiredGrants } from './services/grant-store.js';
+import { initGrantStateForDaemon } from './services/grant-state-store.js';
 import { abortCharge, commitCharge, beginCharge } from './services/quota-dedup.js';
 import {
   getSessionWorkingDir,
@@ -572,7 +592,7 @@ import {
   type XpiSharedCwdDispatchUnknownStartupNotice,
   type XpiSharedCwdStartupNotice,
 } from './core/xpi-shared-cwd-admission.js';
-import { MissingWorkingDirError, publishWorkingDirRecovery } from './core/working-dir-recovery.js';
+import { MissingWorkingDirError, missingStartDir, publishWorkingDirRecovery } from './core/working-dir-recovery.js';
 import {
   XpiSessionStoreBusyRetryScheduler,
   type XpiSessionStoreBusyRetryEvent,
@@ -757,6 +777,7 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { pruneOldAttachments, collectProtectedAttachmentDirs } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -22501,6 +22522,25 @@ async function replyInvalidWorkingDirs(
   return true;
 }
 
+/**
+ * The repo picker for an opening that pinned no directory while the one it
+ * would start in without one ({@link missingStartDir}: the bot's default
+ * working dir) does not exist. resolveBotDefaultWorkingDir already declined to
+ * pin it and forkWorker refuses to start there, so the "no projects / no card →
+ * start directly" fallback has nowhere to go. The picker is published in its
+ * missing-directory form instead — manual entry even when the scan is empty, no
+ * 「直接开启会话」— and the opening stays staged behind it until a directory is
+ * chosen, which starts it there. Without a card the reply says to use
+ * `/repo <路径>`, which commits the same pending selection. Resolves to the
+ * card's message id, if one was published.
+ */
+async function publishMissingStartDirPicker(ds: DaemonSession, missingDir: string): Promise<string | undefined> {
+  ds.initialStartPending = false; // pendingRepo/card now owns buffering
+  const cardMessageId = await publishWorkingDirRecovery(ds, missingDir, { sessionReply, lastRepoScan });
+  logger.info(`[${tag(ds)}] start dir ${missingDir} is missing — waiting for repo selection${cardMessageId ? '' : ' (no card; /repo <path> selects)'}`);
+  return cardMessageId;
+}
+
 function coldStartPassthroughCommands(larkAppId: string): ReadonlySet<string> {
   return new Set(resolveAdapterDefaultPassthroughCommands(larkAppId));
 }
@@ -22975,6 +23015,14 @@ async function startInitialPassthroughSession(args: {
   }
 
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+  const missingDir = missingStartDir(ds);
+  if (missingDir) {
+    // 已 durable staging（picker，含 rawInput）且通过放弃闸：缺目录选仓卡接管投递。
+    onDurablyAdmitted?.();
+    await publishMissingStartDirPicker(ds, missingDir);
+    announcePendingRepoSession(ds);
+    return;
+  }
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
   let repoCardDegraded = false;
@@ -24340,6 +24388,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Show repo selection card
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+  const missingDir = missingStartDir(ds);
+  if (missingDir) {
+    // 已 durable staging（picker）且通过放弃闸：缺目录选仓卡接管投递。
+    markIngressAdmitted(ctx);
+    await publishMissingStartDirPicker(ds, missingDir);
+    announcePendingRepoSession(ds);
+    return;
+  }
   let projects = prefetchedRepoProjects ?? [];
   if (!prefetchedRepoProjects) {
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
@@ -25342,6 +25398,23 @@ async function handleBotAdded(
     // No default dir → degrade to repo-selection card (D6 / FR-4).
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
       withdrawSharedReplySeed();
+      return;
+    }
+    const missingDir = missingStartDir(ds);
+    if (missingDir) {
+      // Same shared-seed handling as the ordinary picker below.
+      armSharedReplyTarget();
+      const cardMessageId = await publishMissingStartDirPicker(ds, missingDir);
+      if (joinBootstrapWasTakenOver()) {
+        if (cardMessageId) {
+          void deleteMessage(larkAppId, cardMessageId);
+          if (ds.repoCardMessageId === cardMessageId) ds.repoCardMessageId = undefined;
+          if (ds.workingDirRecovery?.cardMessageId === cardMessageId) ds.workingDirRecovery = undefined;
+        }
+        if (!ds.worker || ds.worker.killed) withdrawSharedReplySeed();
+        return;
+      }
+      announcePendingRepoSession(ds);
       return;
     }
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
@@ -27061,6 +27134,14 @@ async function handleThreadReplyAdmitted(
 
     // Show repo selection card (same as handleNewTopic)
     if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+    const missingDir = missingStartDir(newDs);
+    if (missingDir) {
+      // 已 durable staging（picker）且通过放弃闸：缺目录选仓卡接管投递。
+      markIngressAdmitted(ctx);
+      await publishMissingStartDirPicker(newDs, missingDir);
+      announcePendingRepoSession(newDs);
+      return;
+    }
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
     let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
     if (scanDirs2.length > 0) {
@@ -29356,6 +29437,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 信息可行动，避免拖到首次落盘才炸。
   sessionStore.assertSqliteSupported();
 
+  // 启动时回收过期入站附件（默认 14 天）。附件仅供产生它的那个 CLI turn
+  // 引用，turn 结束后无读者；旧实现只写不删，随消息量线性膨胀（实测单桶近
+  // 1GB，私聊文件长期留存也有隐私面）。fail-open，不阻断启动。
+  // 选仓卡 / Dashboard backlog 待办等长期挂起的会话会把附件路径持久化在
+  // 会话库里，且会话本身被无限期保护、可能 14 天后才被用户继续——这些目录
+  // 即使超龄也跳过，否则用户日后继续会话时，注入 prompt 的会是已删除的
+  // 失效路径。
+  try {
+    const attachmentsRoot = join(config.session.dataDir, 'attachments');
+    let protectedDirs: Set<string> = new Set();
+    try {
+      const snapshot = sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir });
+      protectedDirs = collectProtectedAttachmentDirs(snapshot.values(), attachmentsRoot);
+    } catch (err) {
+      // 快照读不出来时按「无保护」继续（回收仍逐目录 fail-open）；宁可留下
+      // 过期文件，也不能阻断启动。
+      logger.warn(`[attachments] protected-dir scan failed, pruning without exclusions: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const { removedDirs, appBuckets } = pruneOldAttachments(attachmentsRoot, undefined, undefined, protectedDirs);
+    if (removedDirs > 0) logger.info(`[attachments] startup prune removed ${removedDirs} old message dirs across ${appBuckets} app buckets`);
+  } catch (err) {
+    logger.warn(`[attachments] startup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // Inert until an enabled turn is admitted: construction performs no URL
   // scan and does not open, create, query, or prune the LinkRef ledger.
   initializeLinkRefRuntime(config.session.dataDir);
@@ -29550,6 +29655,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // per-user talk 授权（chatGrants / globalGrants / 额度 / 有效期）住在 <dataDir>/grants.sqlite：
+  // 把本 bot 在 bots.json 上残留的授权字段并入并删除，再灌入内存缓存。必须先于任何事件处理；
+  // 授权库不可用即拒绝启动（空授权会把只配了 globalGrants 的 bot 误判为开放模式）。
+  // core-only 的 bot 是内存合成的 apiOnly 身份，不在 fleet bots.json 里，也没有飞书授权。
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await initGrantStateForDaemon({ larkAppId: cfg.larkAppId, dataDir: config.session.dataDir });
+  }
   // Host-executed schedule conditions are authority material. Create and
   // validate their 0700 root before any restored worker can receive a sandbox
   // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
@@ -31121,6 +31233,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }),
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
+            pendingPrimaryControlCard: data =>
+              primaryControlRuntime?.pendingCardBeforeAck(data),
             readPrimarySession: async stableKey => {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
@@ -31160,8 +31274,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               return materialized;
             },
             takeOverActiveSession: async (stableKey, canonical) => {
-              const takeover = await takeOverPrimarySession(stableKey, canonical);
-              return takeover && 'kind' in takeover ? undefined : takeover;
+              return takeOverPrimarySession(stableKey, canonical);
             },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
@@ -31170,10 +31283,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               cardVisibility: 'public',
             }),
             resumeSession: sessionId => resumeSession(sessionId, activeSessions),
+            isResumeReady: ds => !!ds.worker && !ds.worker.killed && ds.workerReady === true,
             buildClosedCard: ds => buildClosedSessionCard(ds, localeForBot(cfg.larkAppId)),
             buildActiveCard: ds => buildStreamingCardJson(
               ds,
               ds.session.suspendedColdResume ? 'idle' : undefined,
+            ),
+            buildPendingCard: action => buildSessionControlPendingCard(
+              action,
+              localeForBot(cfg.larkAppId),
             ),
             closeResidualText: residual => {
               const loc = localeForBot(cfg.larkAppId);
@@ -31724,6 +31842,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }, 120_000);
   sandboxReconcileTimer.unref?.();
 
+  // 已到期的授权只会在对方下一条消息时被顺手清掉；对方再也不说话的就一直留在授权库里。
+  // 启动时清一遍，之后每小时清一遍。授权不做其它任何自动回收。
+  const runGrantExpirySweep = () => {
+    void sweepExpiredGrants(cfg.larkAppId)
+      .then(revoked => { if (revoked > 0) logger.info(`[grant:${cfg.larkAppId}] swept ${revoked} expired grant(s)`); })
+      .catch(err => logger.warn(`[grant:${cfg.larkAppId}] expiry sweep failed: ${err?.message ?? err}`));
+  };
+  const grantExpirySweepTimer = setInterval(runGrantExpirySweep, 60 * 60_000);
+  grantExpirySweepTimer.unref?.();
+  runGrantExpirySweep();
+
   // v3 humanGate cold-attach: re-post pending gate cards + resume healed gates
   // for runs OWNED BY THIS BOT (codex blocker #1 — owner filter, mirrors
   // the immutable v3 run binding). Best-effort; never blocks startup.
@@ -32185,6 +32314,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(grantExpirySweepTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -32452,6 +32582,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    clearInterval(grantExpirySweepTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);

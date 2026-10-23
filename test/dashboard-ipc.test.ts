@@ -1646,6 +1646,34 @@ describe('POST /api/session-origin/attest', () => {
     } finally { fixture.cleanup(); }
   });
 
+  it('separates same-app open-id operation from union-id creator ownership', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      registerBot({ larkAppId: 'app-managed-origin', larkAppSecret: 'test-secret',
+        allowedUsers: ['ou_managed_origin_owner'] });
+      const bot = getBot('app-managed-origin');
+      bot.resolvedAllowedUsers = ['ou_managed_origin_owner'];
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      for (const revoked of [false, true]) {
+        if (revoked) bot.resolvedAllowedUsers = [];
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+          callerOpenId: 'ou_forged', larkAppId: 'cli_other', scheduleOperator: { ok: true },
+        });
+        expect(response.status).toBe(200);
+        const proof = JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+        expect(proof.scheduleOperator).toEqual(revoked
+          ? { ok: false, error: 'caller_not_allowed' } : { ok: true });
+        expect(proof.scheduleCreator).toEqual({ ok: false,
+          error: revoked ? 'caller_not_allowed' : 'caller_union_id_unresolved' });
+        expect(proof.callerOpenId).toBe('ou_managed_origin_owner');
+        expect(proof.larkAppId).toBe('app-managed-origin');
+      }
+    } finally { fixture.cleanup(); }
+  });
+
   it('rejects missing, disconnected, or dead exact workers without writing a proof', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -4219,7 +4247,7 @@ describe('GET /api/sessions', () => {
   it('does not scan transcripts while composing the bulk sessions list', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-token-list-'));
     const prevConfigDataDir = config.session.dataDir;
-    const usageSpy = vi.spyOn(costCalculator, 'getSessionTokenUsage').mockImplementation(() => {
+    const usageSpy = vi.spyOn(costCalculator, 'getSessionUsageWithContext').mockImplementation(() => {
       throw new Error('bulk sessions list must not scan token usage');
     });
     try {
@@ -5237,7 +5265,7 @@ describe('PUT /api/bot-read-isolation', () => {
         codexAppDispatchLedger: pendingLedger,
       } as any]);
       const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
-      const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+      const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
       const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
       try {
         handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -5455,7 +5483,7 @@ describe('PUT /api/bot-read-isolation', () => {
       larkAppId: appId,
       backendType: 'tmux',
     } as any]);
-    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession')
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget')
       .mockReturnValueOnce('exists')
       .mockReturnValue('missing');
     const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
@@ -5485,7 +5513,55 @@ describe('PUT /api/bot-read-isolation', () => {
         suspendedSessions: 0,
       });
       expect(updateSpy).toHaveBeenCalledOnce();
-      expect(probeSpy).toHaveBeenCalledWith('tmux', 'bmx-s-just-c');
+      expect(probeSpy).toHaveBeenCalledWith({ backendType: 'tmux', sessionName: 'bmx-s-just-c' });
+    } finally {
+      updateSpy.mockRestore();
+      probeSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('probes a closed tmux row on the server its pane was frozen onto, not the default one', async () => {
+    const appId = 'test-read-isolation-dedicated-socket';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-dedicated',
+      chatId: 'oc_dedicated',
+      rootMessageId: 'om_dedicated',
+      title: 'closed on the dedicated socket',
+      status: 'closed',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      backendType: 'tmux',
+      persistentBackendTarget: { backendType: 'tmux', sessionName: 'bmx-s-dedica', socketName: 'botmux' },
+    } as any]);
+    // The pane is still alive on `-L botmux`; the default server knows nothing of it.
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget')
+      .mockImplementation(target => (target.backendType === 'tmux' && target.socketName === 'botmux' ? 'exists' : 'missing'));
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_teardown_unverified' });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(probeSpy).toHaveBeenCalledWith({ backendType: 'tmux', sessionName: 'bmx-s-dedica', socketName: 'botmux' });
     } finally {
       updateSpy.mockRestore();
       probeSpy.mockRestore();
@@ -5517,7 +5593,7 @@ describe('PUT /api/bot-read-isolation', () => {
       larkAppId: appId,
       // Deliberately no backendType stamp.
     } as any]);
-    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentBackendTarget');
     const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
       .mockResolvedValue({ ok: true, readIsolation: false });
     try {

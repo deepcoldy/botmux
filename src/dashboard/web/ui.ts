@@ -282,6 +282,8 @@ export function chatAvatarHtml(opts: ChatAvatarOpts): string {
 // /api/groups 的注册表 + 群列表把 id 解析成人话。加载失败静默降级显示原值——
 // 纯展示增强，不挡核心功能。
 const botNameByAppId = new Map<string, string>();
+/** 注册表里出现过的全部 bot（含还没拿到友好名的），⌘K 按 app id 也要能直达。 */
+const registryBotAppIds = new Set<string>();
 const chatNameById = new Map<string, string>();
 const chatAvatarById = new Map<string, string>();
 let nameMapsPromise: Promise<void> | null = null;
@@ -359,6 +361,7 @@ export function loadNameMaps(): Promise<void> {
       // 就地写内存+localStorage 生效，都不依赖本函数重跑。
       const data = await fetchGroupsNamesSnapshot();
       for (const b of data.bots ?? []) {
+        if (b.larkAppId) registryBotAppIds.add(String(b.larkAppId));
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
         }
@@ -387,9 +390,13 @@ export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
 }
 
-/** 注册表里已知友好名的全部 bot（⌘K 面板的「机器人」条目）；loadNameMaps / 本地缓存回灌后才有。 */
+/**
+ * 已知的全部 bot（⌘K 面板的「机器人」条目）：有友好名的用友好名，注册表里还没友好名的以 app id 充当
+ * 名字。来自 loadNameMaps / 本地缓存回灌，所以首屏名称映射到达前可能只有缓存里的那部分。
+ */
 export function knownBots(): Array<{ larkAppId: string; name: string }> {
-  return [...botNameByAppId.entries()].map(([larkAppId, name]) => ({ larkAppId, name }));
+  const appIds = new Set([...botNameByAppId.keys(), ...registryBotAppIds]);
+  return [...appIds].map(larkAppId => ({ larkAppId, name: botNameByAppId.get(larkAppId) ?? larkAppId }));
 }
 
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */

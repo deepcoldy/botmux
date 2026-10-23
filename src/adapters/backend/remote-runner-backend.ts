@@ -32,6 +32,7 @@ import {
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import { sessionChildEnvWithInject } from '../../core/session-env.js';
 
 type PendingRequest = {
   command: RemoteRunnerCommand;
@@ -185,7 +186,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (this.killed) throw new Error('remote runner backend is closed');
     const child = spawnProcess(bin, args, {
       cwd: opts.cwd,
-      env: { ...opts.env, ...(opts.injectEnv ?? {}) },
+      env: sessionChildEnvWithInject(opts),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;

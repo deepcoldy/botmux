@@ -8,7 +8,7 @@ import { resolveWorkspace } from './workspace-metadata.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
-import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -45,7 +45,18 @@ import {
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
-import { botInjectedEnv, buildSessionChildEnv } from './env-policy.js';
+import { botOneShotEnv } from './session-env-resolve.js';
+import {
+  botSessionEnvView,
+  globalSessionEnvView,
+  liveSessionEnvView,
+  removeTmuxServerGlobalEnv,
+  revealLiveSessionEnvValue,
+  revealSessionEnvValue,
+  revealTmuxServerEnvValue,
+  sessionEnvSessions,
+  tmuxServersEnvView,
+} from './session-env-host.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
@@ -141,7 +152,7 @@ import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, applyPerBotEnvChange, applyBotSessionEnvRequest, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
@@ -1334,12 +1345,14 @@ async function handleManagedOriginAttestation(
   // authorization for this exact caller/turn, never a client-selected identity.
   let scheduleBot;
   try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
-  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+  const scheduleCaller = {
     callerOpenId: origin.callerOpenId,
     allowedUsers: scheduleBot?.config.allowedUsers,
     resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
     resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
-  });
+  };
+  const scheduleCreator = authorizeOwnerlessScheduleCreator(scheduleCaller);
+  const scheduleOperator = authorizeScheduleOperator(scheduleCaller);
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -1352,6 +1365,7 @@ async function handleManagedOriginAttestation(
         sessionId,
         turnId: liveTurnId,
         scheduleCreator,
+        scheduleOperator,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
@@ -7891,6 +7905,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
@@ -8038,7 +8053,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -8055,7 +8070,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -8103,6 +8118,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
@@ -8816,10 +8832,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
         const tierCheck = await validateCodexServiceTier({
           cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
-          env: {
-            ...buildSessionChildEnv(process.env, entry.envPolicy),
-            ...botInjectedEnv(entry.env, entry.envPolicy),
-          },
+          env: botOneShotEnv(process.env, entry),
           model,
           serviceTier: effectiveServiceTier,
         });
@@ -9293,6 +9306,23 @@ botConfigPutRoute<{ oncallGroup?: unknown }>('/api/bot-oncall-group', 'oncallGro
   respond: value => ({ ok: true, oncallGroup: value }),
 });
 
+// Security-sensitive Bot caller → human Owner bindings. There is deliberately
+// no free-form merge mode: each PUT replaces the complete target-Bot policy
+// after the shared strict parser validates exact keys, both source ids, Owner
+// union/email and duplicate identities. null clears the policy.
+botConfigPutRoute<{ botActorOwnerBindings?: unknown }>(
+  '/api/bot-actor-owner-bindings',
+  'botActorOwnerBindings',
+  {
+    normalize: (body, spec) => {
+      if (body.botActorOwnerBindings === null) return fieldOk(null);
+      const parsed = coerceConfigValue(spec, JSON.stringify(body.botActorOwnerBindings ?? []));
+      return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+    },
+    respond: value => ({ ok: true, botActorOwnerBindings: value ?? null }),
+  },
+);
+
 // Per-bot Codex App 无进展提醒 noProgressNotify（#1162）。Body
 // `{ noProgressNotify?: { enabled?: boolean; timeoutMs?: number } | null }`:
 //   • null/缺省 → 清回默认（开启 + 90s）
@@ -9380,6 +9410,88 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 });
 
 // Codex credential policy: shared global login or an independent per-bot CODEX_HOME.
+// ─── 会话环境变量（Dashboard「会话环境变量」，core/session-env*.ts）──────────
+// 视图里的值一律打码；`maskAll=1` 由 Dashboard 给没有查看原文权限的访客加上，
+// 连非凭据值也遮住。`/reveal` 只回单个变量的原文，Dashboard 只对本机 owner 转发。
+function sessionEnvQuery(req: IncomingMessage): URLSearchParams {
+  return new URL(req.url ?? '/', 'http://localhost').searchParams;
+}
+const sessionEnvViewOpts = (req: IncomingMessage) => ({ maskAll: sessionEnvQuery(req).get('maskAll') === '1' });
+/** `?socket=` → tmux server: absent/`default` = default server. */
+function sessionEnvSocketParam(raw: unknown): string | null {
+  return typeof raw === 'string' && raw && raw !== 'default' ? raw : null;
+}
+
+ipcRoute('GET', '/api/bot-session-env', requireBoundBot(async (req, res) => {
+  jsonRes(res, 200, { ok: true, ...botSessionEnvView(getBot(cachedLarkAppId).config, sessionEnvViewOpts(req)) });
+}, NOT_BOUND_BODY.okFalse));
+
+// Body `{ ops: [{op:'set',key,value} | {op:'unset',key} | {op:'reset',key}] }`：
+// 在 bots.json 文件锁内改本 bot 的 env（= set）/ envUnset（= unset），内存热更，
+// 下一个新会话生效。保留变量、身份包装接管的变量与 PATH/HOME 的去掉一律 400。
+ipcRoute('PUT', '/api/bot-session-env', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ ops?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  const r = await applyBotSessionEnvRequest(cachedLarkAppId, body?.ops);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, ...(r.key ? { key: r.key } : {}) });
+  jsonRes(res, 200, { ok: true, ...botSessionEnvView(getBot(cachedLarkAppId).config, sessionEnvViewOpts(req)) });
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/bot-session-env/reveal', requireBoundBot(async (req, res) => {
+  const value = revealSessionEnvValue(sessionEnvQuery(req).get('key') ?? '', getBot(cachedLarkAppId).config);
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+}, NOT_BOUND_BODY.okFalse));
+
+// 运行中会话实际拿到的环境（/proc/<CLI pid>/environ），只读、打码。
+ipcRoute('GET', '/api/bot-session-env/live', requireBoundBot(async (req, res) => {
+  const ds = findActiveBySessionId(sessionEnvQuery(req).get('sessionId') ?? '');
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const view = liveSessionEnvView(ds, sessionEnvViewOpts(req));
+  jsonRes(res, view.ok ? 200 : 409, view);
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/bot-session-env/live/reveal', requireBoundBot(async (req, res) => {
+  const q = sessionEnvQuery(req);
+  const ds = findActiveBySessionId(q.get('sessionId') ?? '');
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const value = revealLiveSessionEnvValue(ds, q.get('key') ?? '');
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+}, NOT_BOUND_BODY.okFalse));
+
+// 全局层视图：基线取本 daemon（fleet 共用 supervisor 环境），全局层读 config.json；
+// 写全局层在 Dashboard 进程里做（它负责 config.json 的写入）。
+ipcRoute('GET', '/api/session-env-global', async (req, res) => {
+  const opts = sessionEnvViewOpts(req);
+  jsonRes(res, 200, { ok: true, ...globalSessionEnvView(opts), tmuxServers: tmuxServersEnvView(opts) });
+});
+
+ipcRoute('GET', '/api/session-env-global/reveal', async (req, res) => {
+  const q = sessionEnvQuery(req);
+  const key = q.get('key') ?? '';
+  const value = q.get('source') === 'tmux'
+    ? revealTmuxServerEnvValue(sessionEnvSocketParam(q.get('socket')), key)
+    : revealSessionEnvValue(key);
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+});
+
+/** 本 daemon 正在运行的会话及其环境是否过期（Dashboard 汇总全 fleet）。 */
+ipcRoute('GET', '/api/session-env-sessions', async (_req, res) => {
+  jsonRes(res, 200, { ok: true, sessions: sessionEnvSessions() });
+});
+
+// Body `{ socket: string|null, key }`：从该 tmux server 的全局环境移除一个变量
+// （set-environment -g -u）。只影响之后新建的 pane；只允许默认 server 和托管
+// 会话所用的 socket。
+ipcRoute('POST', '/api/session-env-tmux/remove', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ socket?: unknown; key?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  const r = removeTmuxServerGlobalEnv(sessionEnvSocketParam(body?.socket), typeof body?.key === 'string' ? body.key : '');
+  jsonRes(res, r.ok ? 200 : r.error === 'server_not_running' ? 409 : 400, r);
+});
+
 ipcRoute('PUT', '/api/bot-env-policy', requireBoundBot(async (req, res) => {
   let body: { envPolicy?: unknown };
   try { body = await readJsonBody<{ envPolicy?: unknown }>(req); }
@@ -9802,7 +9914,10 @@ ipcRoute('PUT', '/api/bot-read-isolation', requireBoundBot(async (req, res) => {
           backendType,
           session.sessionId,
         );
-        const probe = backendType === 'zmx'
+        // tmux rows may be frozen onto the dedicated socket (`socketName`); a
+        // name-only probe would ask the default server and read a live pane as
+        // gone. Rows without it resolve to the historical default-server target.
+        const probe = backendType === 'zmx' || backendType === 'tmux'
           ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
             backendType, session.sessionId, session.persistentBackendTarget,
           ))

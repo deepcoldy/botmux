@@ -43,7 +43,6 @@ import {
 } from '../utils/install-info.js';
 import {
   resolveGlobalInstallPlan,
-  formatGlobalInstallCommand,
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
@@ -53,9 +52,7 @@ import { isStandaloneBinary } from './self-spawn.js';
 import {
   currentUpdateStrategy,
   currentBinaryInstallShape,
-  replaceStandaloneBinary,
   type BinaryInstallShape,
-  type UpdateStrategy,
 } from './binary-self-update.js';
 import { compareVersions } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
@@ -259,37 +256,6 @@ export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalI
   if (result.status !== 0) {
     throw new Error(`${plan.manager} install exited with ${result.status ?? result.signal ?? 'unknown status'}`);
   }
-}
-
-/**
- * Apply an update for whatever install shape this process is, resolving the
- * strategy first so a compiled binary is handled instead of being rejected as an
- * "unsupported install".
- *
- * Shared by the CLI (`botmux update`), the dashboard's `/api/update/run` and the
- * scheduled auto-update so the three cannot drift — they previously all funnelled
- * into `resolveGlobalInstallPlan`, which is exactly the call that fails in
- * compiled mode.
- *
- * @param spec  the version spec for the package-manager path, and the version to
- *              download for the self-replace path ('latest' resolves upstream).
- */
-export async function applyBotmuxUpdate(
-  installRoot: string,
-  version: string,
-): Promise<{ strategy: UpdateStrategy['kind']; detail: string }> {
-  const strategy = currentUpdateStrategy(installRoot);
-  if (strategy.kind === 'unsupported') {
-    throw new UnsupportedGlobalInstallError('unknown', process.execPath);
-  }
-  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
-    const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target}` };
-  }
-  const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
-  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
-  installLatestBotmuxSync(plan);
-  return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
 }
 
 /**
@@ -655,6 +621,10 @@ export function runSelfReplaceBlocking(version = 'latest'): string {
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || '').trim().split('\n').slice(-3).join('; ');
     throw new Error(`self-update exited with ${result.status ?? result.signal ?? 'unknown status'}${detail ? `: ${detail}` : ''}`);
+  }
+  // The child is captured, so forward its outcome/source for scheduled updates.
+  for (const line of `${result.stdout || ''}\n${result.stderr || ''}`.split('\n')) {
+    if (line.startsWith('__self-update:')) logger.info(`[maintenance] ${line}`);
   }
   const m = /BOTMUX_SELF_UPDATE_VERSION=(\S+)/.exec(result.stdout || '');
   return m?.[1] ?? '';

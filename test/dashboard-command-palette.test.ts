@@ -113,6 +113,31 @@ describe('command palette model: matching', () => {
     expect(match.titleRanges).toEqual([]);
   });
 
+  it('counts a hit inside the inherited title prefix as context, preferring the item\'s own name', () => {
+    const titleContext = 'Bot Config › '.length;
+    const child = item({ key: 'setting:child', kind: 'setting', title: 'Bot Config › Model', titleContext });
+    const sibling = item({ key: 'setting:sibling', kind: 'setting', title: 'Bot Config › Common' });
+    // 只命中继承来的前缀：比把前缀当成自己名字的同级条目弱，前缀里的命中照样高亮。
+    expect(matchItem(child, ['bot', 'config'])!.score).toBeLessThan(matchItem(sibling, ['bot', 'config'])!.score);
+    expect(matchItem(child, ['bot'])!.titleRanges).toEqual([{ start: 0, end: 3 }]);
+    // 自己的名字里也有这个词时用那一处，按它在整个标题里的位置计分，不降权。
+    const own = item({ key: 'setting:own', kind: 'setting', title: 'Bot Config › Config directory', titleContext });
+    const ownMatch = matchItem(own, ['config'])!;
+    expect(ownMatch.titleRanges).toEqual([{ start: titleContext, end: titleContext + 'config'.length }]);
+    expect(ownMatch.score).toBe(matchToken('bot config › config directory', 'config', titleContext)!.score);
+  });
+
+  it('treats a quick action\'s multi-word alias typed in full like a one-word alias typed in full', () => {
+    const phrase = item({ key: 'action:phrase', kind: 'action', title: '创建会话', keywords: ['new session'] });
+    const word = item({ key: 'action:word', kind: 'action', title: '创建会话', keywords: ['newsession'] });
+    expect(matchItem(phrase, ['new', 'session'])!.score).toBe(matchItem(word, ['newsession'])!.score);
+    // 只打了一部分，不算整句。
+    expect(matchItem(phrase, ['new', 'sess'])!.score).toBeLessThan(matchItem(word, ['newsession'])!.score);
+    // 别的条目的多词关键词多是父级名字（「Global Settings」挂在一串设置区块上），不抬成全等。
+    const block = item({ key: 'setting:block', kind: 'setting', title: '访问权限', keywords: ['global settings'] });
+    expect(matchItem(block, ['global', 'settings'])!.score).toBeLessThan(matchItem(phrase, ['new', 'session'])!.score);
+  });
+
   it('splits text into highlighted and plain parts', () => {
     expect(splitHighlights('hello world', [{ start: 0, end: 2 }, { start: 6, end: 11 }])).toEqual([
       { text: 'he', hit: true },
@@ -559,7 +584,8 @@ describe('CommandPalette interaction', () => {
     const more = palette.options().find(node => palette.textOf(node).includes(expandLabel))!;
     expect(more).toBeDefined();
     act(() => { more.props.onClick(); });
-    expect(palette.options().filter(node => palette.textOf(node).includes('管理'))).toHaveLength(6);
+    // 只数这 6 个页面：别的分组（例如 Bot 配置里的配置项）也可能含「管理」。
+    expect(palette.options().filter(node => pages.some(page => palette.textOf(node).includes(page.label)))).toHaveLength(6);
     // 选中项落在展开出来的第一条（原先被截掉的第 5 个），而不是跳回顶部。
     expect(palette.activeTitle()).toBe('插件管理');
     expect(palette.selectedTab()).toBe(copy('palette.scopeAll'));

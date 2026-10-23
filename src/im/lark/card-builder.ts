@@ -133,7 +133,7 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
   { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
 ];
@@ -1378,6 +1378,9 @@ export interface RepoSelectRecovery {
   missingPath: string;
   /** Branch the deleted worktree had; absent → no rebuild button. */
   rebuildBranch?: string;
+  /** The session's first message has not started: choosing a directory starts
+   *  it there, so the card asks for a directory rather than a resend. */
+  opening?: boolean;
 }
 
 function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
@@ -1403,7 +1406,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
 
   const card = wideCard({
     header: recovery
-      ? cardHeaderTemplateFirst('orange', t('card.repo.recovery_title', undefined, locale))
+      ? cardHeaderTemplateFirst('orange', t(recovery.opening ? 'card.repo.recovery_title_opening' : 'card.repo.recovery_title', undefined, locale))
       : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
       // Recovery: the missing directory + 「重建 worktree」take the top row. There
@@ -1418,7 +1421,13 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              larkMdDiv(t(recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild', { path: escapeMd(recovery.missingPath) }, locale)),
+              larkMdDiv(t(
+                recovery.opening
+                  ? 'card.repo.recovery_missing_opening'
+                  : recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild',
+                { path: escapeMd(recovery.missingPath) },
+                locale,
+              )),
             ],
           },
           ...(recovery.rebuildBranch ? [{
@@ -1612,7 +1621,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t(recovery ? 'card.repo.recovery_note' : 'card.repo.note', undefined, locale),
+            content: t(
+              recovery ? (recovery.opening ? 'card.repo.recovery_note_opening' : 'card.repo.recovery_note') : 'card.repo.note',
+              undefined,
+              locale,
+            ),
           },
         ],
       },

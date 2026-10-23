@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -581,6 +581,40 @@ describe('plugin MCP Gateway', () => {
     } finally {
       await client.close();
       rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
+    }
+  });
+
+  it('prunes diagnostics older than the TTL when persisting, keeping the newest 50', async () => {
+    // 写侧接线：persistDiagnostics 落盘后顺手 prune 7 天前的旧快照、至少留 50。
+    const dir = join(home, '.botmux', 'data', 'mcp-gateway');
+    mkdirSync(dir, { recursive: true });
+    // 55 个超龄快照，seed-54 最新、seed-00 最旧；再加一个非 .json 文件，不能被碰。
+    for (let i = 0; i < 55; i += 1) {
+      const p = join(dir, `seed-${String(i).padStart(2, '0')}.json`);
+      writeFileSync(p, '{}\n');
+      const ageSeconds = 8 * 86400 - i; // seed-00 最旧
+      utimesSync(p, (Date.now() - ageSeconds * 1000) / 1000, (Date.now() - ageSeconds * 1000) / 1000);
+    }
+    writeFileSync(join(dir, 'notes.txt'), 'keep');
+
+    const sessionId = 'mcp-serve-prune-ttl';
+    const sessionFile = join(dir, `${sessionId}.json`);
+    const client = await connectMcpServe(sessionId);
+    try {
+      await vi.waitFor(() => expect(existsSync(sessionFile)).toBe(true));
+      // 56 个 .json（55 旧 + 当前会话）→ 删掉最旧 6 个，保留 50 个。
+      await vi.waitFor(() => {
+        const jsonCount = readdirSync(dir).filter(name => name.endsWith('.json')).length;
+        expect(jsonCount).toBe(50);
+      });
+      expect(existsSync(join(dir, 'seed-00.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-05.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-06.json'))).toBe(true);
+      expect(existsSync(join(dir, 'seed-54.json'))).toBe(true);
+      expect(existsSync(sessionFile)).toBe(true);
+      expect(existsSync(join(dir, 'notes.txt'))).toBe(true);
+    } finally {
+      await client.close();
     }
   });
 
