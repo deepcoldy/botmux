@@ -191,6 +191,46 @@ export function sessionEnvTmuxSockets(): Array<{ socket: string | null; managed:
     : [{ socket: null, managed: false }, { socket: preferred, managed: true }];
 }
 
+/** Parse `tmux show-environment [-g]` output, preserving multiline values.
+ *  Each record begins with `NAME=` (set) or `-NAME` (unset); any subsequent
+ *  physical lines that do not start with a new record belong to the value of
+ *  the previous record (joined with `\n`).
+ */
+export function parseTmuxShowEnvironmentOutput(output: string): Record<string, string> {
+  const vars: Record<string, string> = {};
+  let currentKey: string | null = null;
+
+  for (const line of String(output).split('\n')) {
+    if (!line) continue;
+
+    // `-NAME` marks an explicitly removed entry; it holds no value.
+    if (line.startsWith('-')) {
+      const removedKey = line.slice(1);
+      if (ENV_NAME_RE.test(removedKey)) {
+        currentKey = null;
+        continue;
+      }
+    }
+
+    const eq = line.indexOf('=');
+    if (eq > 0) {
+      const key = line.slice(0, eq);
+      if (ENV_NAME_RE.test(key)) {
+        currentKey = key;
+        vars[key] = line.slice(eq + 1);
+        continue;
+      }
+    }
+
+    // Continuation line of a multiline value.
+    if (currentKey !== null) {
+      vars[currentKey] = `${vars[currentKey]}\n${line}`;
+    }
+  }
+
+  return vars;
+}
+
 /** `tmux show-environment -g`: the env a server froze when it started (plus later set-environment -g). */
 export function readTmuxServerGlobalEnv(socket: string | null): { found: boolean; vars: Record<string, string> } {
   let output: string;
@@ -204,16 +244,7 @@ export function readTmuxServerGlobalEnv(socket: string | null): { found: boolean
   } catch {
     return { found: false, vars: {} };
   }
-  const vars: Record<string, string> = {};
-  for (const line of String(output).split('\n')) {
-    // `-NAME` marks an explicitly removed entry; it holds no value.
-    if (!line || line.startsWith('-')) continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq);
-    if (ENV_NAME_RE.test(key)) vars[key] = line.slice(eq + 1);
-  }
-  return { found: true, vars };
+  return { found: true, vars: parseTmuxShowEnvironmentOutput(output) };
 }
 
 export function tmuxServersEnvView(opts: SessionEnvViewOptions = {}): TmuxServerEnvView[] {
