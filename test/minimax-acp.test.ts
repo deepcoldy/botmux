@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { isLinuxZombie } from '../src/utils/process-identity.js';
@@ -433,8 +434,9 @@ it.each(['permission', 'permission-hang'])('pauses the runner budget for a human
   writeFileSync(join(f.root, '.botmux/.dashboard-secret'), 'isolated-test-secret', { mode: 0o600 });
   let pendingAsk: { res: ServerResponse; body: any } | undefined;
   const server = createServer(async (req, res) => {
-    let body = ''; for await (const chunk of req) body += chunk;
-    pendingAsk = { res, body: JSON.parse(body) };
+    const body = await readRequestBodyJson<Record<string, any>>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    pendingAsk = { res, body };
   });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
   const port = (server.address() as { port: number }).port;
@@ -451,6 +453,16 @@ it.each(['permission', 'permission-hang'])('pauses the runner budget for a human
     await waitFor(() => !!pendingAsk || finals().length > 0);
     expect(finals()).toEqual([]);
     expect(pendingAsk!.body).toMatchObject({ originTurnId: 'human', sessionId: 'budget-session' });
+    // Loopback probes must neither crash the fixture nor replace the real Ask.
+    const ask = pendingAsk;
+    for (const body of [undefined, 'not json']) {
+      const probe = await fetch(`http://127.0.0.1:${port}/`, {
+        method: body === undefined ? 'GET' : 'POST', body, signal: AbortSignal.timeout(5000),
+      });
+      expect(probe.status).toBe(400);
+      await probe.text();
+      expect(pendingAsk).toBe(ask);
+    }
     // Deliberately cross the configured budget AFTER observing the blocked Ask.
     // This is the timer boundary under test, not a sleep to guess readiness.
     await new Promise(r => setTimeout(r, 2500));
