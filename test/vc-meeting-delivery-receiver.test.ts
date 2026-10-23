@@ -237,6 +237,19 @@ describe('vc meeting delivery receiver', () => {
     expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the incremental protocol before the final batch even with final summaries enabled', async () => {
+    const harness = receiverHarness(dir);
+    await registerActiveMember(harness, projection({ member: { responseMode: 'listener_thread' }, outputRoute: { listenerPolicy: { finalSummary: true } } }));
+    const request = delivery();
+    request.instructionVersion = 'meeting-consumer-v2';
+    request.stream.final = false;
+    request.stream.inputHash = computeVcMeetingDeliveryInputHash(request);
+    expect((await receiveVcMeetingDelivery(request, harness.deps)).status).toBe(202);
+    const key = deriveVcMeetingDeliveryIdentity(request).deliveryKey;
+    expect(findVcMeetingDeliveryByKey(dir, key)!.receipt.listenerOutputProtocol).toBe('decision_v1');
+    expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses listener policy changes within an existing member epoch', async () => {
     const harness = receiverHarness(dir);
     await registerActiveMember(harness, projection({ outputRoute: { listenerPolicy: { finalSummary: true } } }));

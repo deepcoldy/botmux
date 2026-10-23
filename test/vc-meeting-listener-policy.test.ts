@@ -8,7 +8,8 @@ describe('future meeting listener defaults', () => {
     expect(resolveVcMeetingListenerPolicy(global, { finalSummary: false })).toEqual({ ...global, finalSummary: false });
     expect(global.finalSummary).toBe(true);
   });
-  it.each([null, [], 'false', { rawMessages: 'false' }, { allowSummarySharing: 1 }, { constructor: false }, { unknown: true }])('rejects invalid policy %#', raw => {
+  // Wrap the empty-array input as one argument under both Vitest and Bun.
+  it.each([null, [[]], 'false', { rawMessages: 'false' }, { allowSummarySharing: 1 }, { constructor: false }, { unknown: true }])('rejects invalid policy %#', raw => {
     expect(() => normalizeVcMeetingListenerPolicy(raw)).toThrow();
   });
   it('accepts only a standalone admitted human text command', () => {
