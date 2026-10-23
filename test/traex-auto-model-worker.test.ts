@@ -694,3 +694,11 @@ describe('Auto legacy parked-input admission', () => {
     expect(await h.admit()).toBe(expected);
   });
 });
+
+it('holds static capacity text while an otherwise ready composer stays rendered', async () => {
+  const screen = "Too many requests right now. You're in the queue at position 3.\n\n❯ Ask anything";
+  const h = admissionHarness({ backend: { captureViewportAsync: async () => screen } });
+  expect(await h.admit()).toBe(false);
+  expect(h.scope.pendingMessages).toEqual([h.item]);
+  expect(h.scope.retryTraexAutoModelAdmission).toHaveBeenCalledOnce();
+});
