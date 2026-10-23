@@ -423,16 +423,13 @@ describe('controller switch source consistency', () => {
 
 
 describe('hand-written Auto settings and recovery defaults', () => {
-  it('rejects a known model with an unsupported effort without guessing unknown live models', () => {
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'],
-      modelSettings: { 'seed-code': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
-      .toMatch(/not supported/);
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['future-live-model'],
-      modelSettings: { 'future-live-model': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
+  it.each(['seed-code', 'gpt-6-astra', 'future-live-model'])('leaves capability decisions to the live catalog for %s', model => {
+    const pool = { enabled: true, models: [model, 'gpt-5.6-sol'],
+      modelSettings: { [model]: { reasoningEffort: 'ultra', modelBackendVariant: 'max' },
+        'gpt-5.6-sol': { reasoningEffort: 'xhigh' } } };
+    expect(normalizeTraexAutoModelConfig(pool).config).toMatchObject(pool);
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: [model], modelSettings: { [model]: {} } }).error)
       .toBeUndefined();
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': { modelBackendVariant: 'max' } } }, { validateKnownSettings: true }).error).toMatch(/not supported/);
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': {} } },
-      { validateKnownSettings: true }).error).toBeUndefined();
   });
   it('persists an independent copy of shared settings through native recovery', () => {
     const config = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 5_000 };

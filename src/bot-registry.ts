@@ -3894,7 +3894,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const requestedModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
-    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel, { validateKnownSettings: true });
+    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel);
     const traexAutoRequested = entryCliId === 'traex'
       && requestedModel?.toLowerCase() === TRAEX_AUTO_MODEL_ID;
     if (traexAutoRequested && (!normalizedTraexAutoModel.config || normalizedTraexAutoModel.error)) {

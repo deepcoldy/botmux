@@ -1,5 +1,3 @@
-import { knownTraexContextVariantsForModel, knownTraexReasoningEffortsForModel } from './codex-reasoning-effort.js';
-
 export const TRAEX_AUTO_MODEL_ID = 'auto';
 export const TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 export const TRAEX_AUTO_MODEL_MIN_QUEUE_TIMEOUT_MS = 5_000;
@@ -34,8 +32,10 @@ export type TraexAutoModelConfigResult = {
  * The list is an allowlist, not a suggestion list: runtime fallback may only
  * use these entries and preserves their order. Invalid enabled configs are
  * rejected as a whole so a typo cannot silently widen or reorder the pool.
+ * Capability tables can lag behind the CLI: validate setting syntax here,
+ * leaving model-specific support to the live catalog in Dashboard saves.
  */
-export function normalizeTraexAutoModelConfig(raw: unknown, options: { validateKnownSettings?: boolean } = {}): TraexAutoModelConfigResult {
+export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfigResult {
   if (raw === undefined || raw === null || raw === false) return {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { error: 'traexAutoModel must be an object' };
@@ -90,16 +90,8 @@ export function normalizeTraexAutoModelConfig(raw: unknown, options: { validateK
       if (effort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort as string)) {
         return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is invalid` };
       }
-      const knownEfforts = options.validateKnownSettings ? knownTraexReasoningEffortsForModel(model) : undefined;
-      if (effort !== undefined && knownEfforts && !knownEfforts.includes(effort as TraexAutoModelSettings['reasoningEffort'] & string)) {
-        return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is not supported by this model` };
-      }
       if (variant !== undefined && variant !== 'standard' && variant !== 'max') {
         return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is invalid` };
-      }
-      const knownVariants = options.validateKnownSettings ? knownTraexContextVariantsForModel(model) : undefined;
-      if (variant !== undefined && knownVariants && !knownVariants.includes(variant as string)) {
-        return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is not supported by this model` };
       }
       // defineProperty safely preserves literal ids such as __proto__.
       Object.defineProperty(modelSettings, model, { enumerable: true, configurable: true, writable: true,
