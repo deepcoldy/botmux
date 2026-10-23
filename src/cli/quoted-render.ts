@@ -26,6 +26,8 @@ export async function getQuotedMessageDetail(
     // Only the known provider error gets a representation fallback. Permission,
     // withdrawn-message, rate-limit and transport failures remain failures.
     if (structuredLarkCode(err) !== LARK_CODE_MESSAGE_INTERNAL_ERROR) throw err;
+    // 2200 describes a representation failure, not one message type. Standalone
+    // cards can also degrade to a placeholder; the fallback is attempted once.
     return getMessageDetail(larkAppId, messageId, { userCardContent: false });
   }
 }
@@ -38,6 +40,7 @@ export type ExpandMergeForwardFn = (
   messageId: string,
   parsed: LarkMessage,
   numberer: ReturnType<typeof createImgNumberer>,
+  initialDetail?: { items?: any[] },
 ) => Promise<{ extraResources: MessageResource[] }>;
 
 /** Subset of resolveMergedCardContent used here (dependency-injected so tests
@@ -73,6 +76,7 @@ export async function renderQuotedMessage(
   rawMessage: any,
   expandMergeForward: ExpandMergeForwardFn,
   resolveMergedCard?: ResolveMergedCardFn,
+  initialDetail?: { items?: any[] },
 ): Promise<RenderedQuotedMessage> {
   const numberer = createImgNumberer();
   // Order: extractResources first so top-level keys get their numbers, then
@@ -83,7 +87,7 @@ export async function renderQuotedMessage(
   const resources = extractResources(rawMessage.msg_type ?? '', rawMessage.body?.content ?? '', numberer);
   const parsed = parseApiMessage(rawMessage, numberer);
   if (parsed.msgType === 'merge_forward') {
-    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);
+    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer, initialDetail);
     resources.push(...extraResources);
   }
   // Interactive cards: union both im.message.get representations so the quoted
