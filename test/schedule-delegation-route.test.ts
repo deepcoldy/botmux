@@ -253,6 +253,22 @@ function directHumanHarness() {
 }
 
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
+    const h = directHumanHarness();
+    h.ds.scope = h.ds.session.scope = 'chat';
+    h.ds.session.rootMessageId = 'om_unrelated_first_message';
+    h.ds.session.replyTargets.om_kickoff.rootMessageId = 'om_current_topic';
+    h.ds.session.currentReplyTarget = { turnId: 'om_queued', rootMessageId: 'om_queued_topic' };
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    }));
+  });
+
   it.each(['thread', 'chat'] as const)('uses the exact human sender in %s scope with delegation disabled', async scope => {
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
