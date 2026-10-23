@@ -210,6 +210,14 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /**
+   * Inherited variables the session env overlay removes (core/session-env.ts).
+   * The worker already deleted them from `env`; the shell-wrapped backends
+   * (tmux/zellij/zmx) additionally pass `-u KEY` to the pane's final
+   * `/usr/bin/env`, which runs after the rcfile and the terminal server's
+   * global env have been applied, so those sources cannot re-add them.
+   */
+  unsetEnv?: string[];
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */

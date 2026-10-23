@@ -175,7 +175,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'runtime-env',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionRuntimeEnv',
-    fieldKeys: ['botDefaults.sectionEnv', 'botDefaults.sectionLaunchShell', 'botDefaults.envPolicyLabel'],
+    fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel'],
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText'] },
 ];

@@ -195,16 +195,16 @@ describe('v3 ephemeral pool', () => {
       const restored = parseFrozenBotSnapshots(JSON.parse(serialized)).get('')!;
       bot.envPolicy = { mode: 'inherit' };
       const worker = new ScriptedWorker(); const factory = factoryFor(worker);
-      const resolveBotEnv = vi.fn(appId => appId === bot.larkAppId ? bot.env : undefined);
+      const resolveBot = vi.fn(appId => appId === bot.larkAppId ? bot : undefined);
       const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1,
-        resolveLarkAppSecret: () => 'secret', resolveBotEnv });
+        resolveLarkAppSecret: () => 'secret', resolveBot });
       const running = pool.runNode({ ...request(), botSnapshot: restored });
       await worker.waitForInit();
       expect(worker.init.envPolicy).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY'] });
       expect(worker.init.env.MODEL_AUTH === 'bot-sentinel').toBe(true);
       expect(factory.lastOpts!.env.UNLISTED_CLOUD_CREDENTIAL).toBeUndefined();
       expect(factory.lastOpts!.env.HTTPS_PROXY === 'proxy-sentinel').toBe(true);
-      expect(resolveBotEnv).toHaveBeenCalledWith('cli_app');
+      expect(resolveBot).toHaveBeenCalledWith('cli_app');
       worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
       worker.emitMessage({ type: 'prompt_ready' });
       worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });

@@ -57,8 +57,9 @@
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `fish` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`，fish 用户写 `~/.config/fish/config.fish`）。fish 是一等启动 shell：`launchShell: "fish"` 和 fish 绝对路径（如 `/usr/bin/fish`）都支持，`$SHELL` 为 fish 时桌面 PATH 探测也会读 fish，所以 fish 用户无需把 PATH / 环境变量回填到 `.bashrc` / `.zshrc`。下个会话对需要 shell 包装的持久后端（`tmux` / `zellij` / `zmx`）生效；`pty` 直接 exec CLI，本就不受影响。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、名字内空白归一为连字符（`/Ultra Goal` → `/ultra-goal`）、仅留 `[a-z0-9:_-]`、去重；面板自由文本以逗号/换行或「空格+下一条 `/`」分隔条目）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
-| `envPolicy` | 显式进程继承策略：默认 inherit；strict 只保留运行基线、获准名称和本 bot env（见下文）。 |
-| `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
+| `envPolicy` | 显式进程继承策略：默认 inherit；strict 只保留运行基线、获准名称和本 bot env（见下文）。Dashboard 里是「会话环境变量」上方的「继承宿主环境」。 |
+| `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。它就是「会话环境变量」Bot 层的「设置」，也可在 Dashboard「Bot 配置 → 运行环境 → 会话环境变量」配置 |
+| `envUnset` | 在这个 bot 的会话里去掉的继承变量名列表，如 `["BYTECLOUD_AUTH_AS"]`（「会话环境变量」Bot 层的「去掉」，见下文）。botmux 保留变量与 `PATH` / `HOME` 不能去掉；同一个名字也写在 `env` 里时按 `env` 处理。下个新会话生效 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
 | `suppressDeliveredFinalFailureNotice` | **实验性、默认关闭**。设为 `true` 后，结构化转写会话（如 Codex）中同一轮、同一次执行尝试已带飞书回执送达显式 final（`botmux send --response-kind final` 或托管 final 卡）时，收尾阶段再遇到模型服务错误（如 527）只记日志与失败终态，不再补发「模型连接失败」通知。该开关信任已送达的 final，不比对模型事后续写的文本；进度 / 补充消息、未带回执或跨轮次的发送不受影响。缺省 / `false` 与此前行为一致。可用 `/botconfig set suppressDeliveredFinalFailureNotice on` / `off` 切换，下个 worker 启动生效 |
@@ -148,7 +149,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 - GLM 国内站把 `ANTHROPIC_BASE_URL` 换成 `https://open.bigmodel.cn/api/anthropic`。
 - 给 Codex 这类 OpenAI 协议 CLI 接入时，填 `OPENAI_BASE_URL` / `OPENAI_API_KEY`（服务商的 OpenAI 兼容端点）而非 `ANTHROPIC_*`。
 - **隔离**：env 按会话注入到 CLI 进程，全后端一致（tmux / zellij 经每个 pane 注入，绝不写共享 server 全局），所以一个 bot 的服务商配置不会串到别的 bot。
-- **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；聊天配置查询会脱敏显示，Dashboard 只回读变量名。
+- **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；聊天配置查询会脱敏显示，Dashboard 默认打码，只有本机 owner 能点开看原文。
 - 改完下个**新会话**生效。
 
 ### Codex App 纯净输入（实验性）
@@ -464,9 +465,36 @@ per-user 对话授权不放在 `bots.json`，而是存在 `<数据目录>/grants
 > **配置优先级**：`BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`。改完跑 `botmux restart` 生效。
 
 
-### 严格进程环境继承（显式启用）
+### 会话环境变量（全局 / Bot 两层）
 
-![Dashboard 严格继承与只写环境配置示意](/img/strict-env-policy-dashboard.png)
+![Dashboard 会话环境变量示意](/img/session-env-dashboard.png)
+
+会话拿到的环境按这个顺序组装：
+
+| 顺序 | 层 | 存在哪 | 说明 |
+| --- | --- | --- | --- |
+| 1 | 继承基线 | — | daemon 进程环境，经过 botmux 自己的标记清理、`envPolicy` 继承边界和子进程脱敏（飞书应用凭证、`GITHUB_TOKEN`、上层 tmux 连接等）之后的结果 |
+| 2 | 全局层 | `~/.botmux/config.json` 的 `sessionEnv: { "set": {…}, "unset": […] }` | 对所有 bot 的会话生效 |
+| 3 | Bot 层 | 本 bot 的 `env`（设置）+ `envUnset`（去掉） | 覆盖全局层 |
+| 4 | botmux 保留 | 代码内固定名单 | `BOTMUX*`、`LARK_APP_*`、`SESSION_DATA_DIR`、`TMPDIR` / `TMP` / `TEMP` 等，最后注入，任何一层都不能设置或去掉 |
+
+- 每一层里，一个变量要么「设置」要么「去掉」。上层的条目覆盖下层同名条目；「恢复继承」就是删掉本层的这个条目，值回落到下一层。
+- `PATH`、`HOME` 可以覆盖，不能去掉（会话启动需要它们）。
+- Bot 开着 lark 工具绑定时，`ZDOTDIR` / `BASH_ENV` 由身份包装接管；开着按触发人身份调用 CLI 时，`GIT_ASKPASS` / `GIT_CONFIG_*` 也由它接管。这些变量在该 bot 上不能设置或去掉，在装了身份包装的会话里，配置里已有的值也不注入；HTTP 虚拟会话、接入外部 Codex App Server 的会话、v3 工作流和一次性子进程不装 lark 工具绑定，照旧注入。
+- 每一层的「设置」和「去掉」合计不超过 4 KB：tmux / zellij / zmx 会把它们放进会话启动命令，而 tmux 单条命令有长度上限。超出时保存会被拒绝；已经超出的老配置，做缩小的修改总是允许。
+- 「去掉」对 tmux / zellij / zmx 会话放在 pane 启动的最后一步（`/usr/bin/env -u`），所以 tmux server 全局环境和登录 Shell 启动文件带进来的同名变量也会被去掉。
+- 老配置不用迁移：`env` 原样就是 Bot 层的「设置」，`envPolicy` 原样就是继承方式；没写 `envUnset` / `sessionEnv` 时，会话环境和以前完全相同。
+- riff / mojo 后端的会话不在本机运行：只有本 bot 的 `env` 随会话下发，全局层和「去掉」对它们不生效。
+
+**在 Dashboard 里管理**：全局层在「设置 → 会话环境变量」，Bot 层在「Bot 配置 → 运行环境 → 会话环境变量」。表格列出变量名、生效值和来源（宿主继承 / 全局 / 本 Bot），可以设置、覆盖、去掉、恢复继承，也能批量粘贴（格式同 `env`）。凭据类的值默认打码，只有本机 owner（本地管理 cookie）能点开看原文；其他管理身份看到的值全部打码。
+
+**生效时机**：改完对新会话生效，不用重启 daemon。正在运行的会话保留启动时的环境，页面会列出「仍在使用旧环境」的会话，重启会话后生效。会话抽屉「更多 → 查看会话环境」可以看某个运行中会话 CLI 进程实际拿到的环境（只读、打码，来源按值推断；仅 Linux）。
+
+**tmux 服务端全局环境**：tmux server 启动时会冻结一份全局环境，之后在它上面新建的 pane 都会继承。「设置 → 会话环境变量」下方同时列出默认 server 和托管会话专用的 `tmux -L botmux` server，并标出托管会话新建在哪个 server 上。本机 owner 可以把某个变量从 server 全局环境里移除（二次确认）：只影响之后新建的 pane，正在运行的会话不变，server 重启后会按启动它的进程重新冻结；要长期去掉，仍用上面的「去掉」。
+
+> CLI 自己配置文件里的 env（例如 Claude 的 `~/.claude/settings.json`）由 CLI 启动后自行注入，不受「去掉」影响。
+
+### 严格进程环境继承（显式启用）
 
 默认不填写 `envPolicy`，或设置 `{ "mode": "inherit" }`：继续继承宿主环境，并保留已有的飞书应用凭证、Dashboard H5、GitHub daemon token、Claude 会话标记等强制过滤。严格模式使用精确变量名白名单：
 
@@ -489,7 +517,7 @@ per-user 对话授权不放在 `bots.json`，而是存在 `<数据目录>/grants
 
 `TRAE_HOME`、`CLI_EXTRA_ARGS` 等非保留适配器环境项也不会自动继承宿主值；如需沿用，须在 `inherit` 中逐项获准，或在本 bot 的 `env` 中配置。
 
-可在 Dashboard「机器人默认设置 → 进程环境继承」配置，或执行 `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'`（用 --bot 选择目标 bot）；会话内也可使用 `/botconfig set envPolicy {"mode":"strict"}`。`unset` 恢复默认继承。格式错误、未知字段和保留变量名会拒绝保存/加载，不静默降级。
+可在 Dashboard「Bot 配置 → 运行环境 → 会话环境变量」上方的「继承宿主环境」配置，或执行 `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'`（用 --bot 选择目标 bot）；会话内也可使用 `/botconfig set envPolicy {"mode":"strict"}`。`unset` 恢复默认继承。格式错误、未知字段和保留变量名会拒绝保存/加载，不静默降级。
 
 **与网络策略组合：** 使用支持 `sandboxNetworkPolicy` 的版本时，上述 `HTTPS_PROXY` 示例还需满足下表。严格继承的精确授权只决定环境值能否到达 CLI，不会替代网络许可，也不会悄悄删除或改写代理。
 

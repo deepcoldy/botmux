@@ -6974,35 +6974,8 @@ dialog.onboarding-dialog::backdrop {
   resize: vertical;
 }
 
-/* Per-bot env editor: stored names as removable chips, live parse preview of
-   the draft (names + new/overwrite/reserved tags — values never rendered). */
-.bd-env-stored {
-  margin: 4px 0 10px;
-  padding: 8px 10px;
-  background: var(--surface-muted);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-}
-.bd-env-stored-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
-}
-.bd-env-clear {
-  padding: 2px 8px;
-  font-size: 12px;
-  color: var(--danger);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-.bd-env-clear:hover:not(:disabled) {
-  background: var(--danger-soft);
-  border-color: var(--danger);
-}
+/* 会话环境变量（session-env-editor.tsx）：全局层在「设置」，Bot 层在「运行环境」。
+   值都是服务端打码后的；被「去掉」的变量划线显示。 */
 .bd-env-chips {
   display: flex;
   flex-wrap: wrap;
@@ -7016,7 +6989,7 @@ dialog.onboarding-dialog::backdrop {
   align-items: center;
   gap: 4px;
   max-width: 100%;
-  padding: 2px 4px 2px 8px;
+  padding: 2px 8px;
   font-size: 12px;
   line-height: 18px;
   color: var(--fg);
@@ -7031,57 +7004,117 @@ dialog.onboarding-dialog::backdrop {
   font-family: var(--mono);
   background: none;
 }
-.bd-env-chip-remove {
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  font-size: 14px;
-  line-height: 16px;
-  color: var(--faint);
-  background: transparent;
-  border: 0;
-  border-radius: 50%;
-  cursor: pointer;
-}
-.bd-env-chip-remove:hover:not(:disabled) {
-  color: var(--on-danger);
-  background: var(--danger);
-}
-.bd-env-chip-tag {
-  padding: 0 6px;
-  font-size: 11px;
-  border-radius: 999px;
-}
-.bd-env-chip.is-new { border-color: var(--success); }
-.bd-env-chip.is-new .bd-env-chip-tag { color: var(--success); background: var(--success-soft); }
-.bd-env-chip.is-overwrite { border-color: var(--warning); }
-.bd-env-chip.is-overwrite .bd-env-chip-tag { color: var(--warning); background: var(--warning-soft); }
-.bd-env-chip.is-reserved { border-color: var(--danger); }
-.bd-env-chip.is-reserved .bd-env-chip-tag { color: var(--danger); background: var(--danger-soft); }
-.bd-env-chip.is-skipped { color: var(--faint); border-style: dashed; }
-.bd-env-chip.is-skipped .bd-env-chip-tag { color: var(--faint); }
-.bd-env textarea[aria-invalid="true"] { border-color: var(--danger); }
-.bd-env-preview {
-  margin: 6px 0 0;
-  font-size: 12px;
-}
-.bd-env-preview-head { color: var(--muted); }
-.bd-env-preview p { margin: 6px 0 0; }
-.bd-env .is-error { color: var(--danger); }
-.bd-env .is-warning { color: var(--warning); }
-.bd-env-mode {
+.se-editor { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.se-editor .is-error, .se-dialog .is-error { color: var(--danger); margin: 0; }
+.se-editor .is-warning, .se-dialog .is-warning { color: var(--warning); margin: 0; }
+.se-editor .is-ok { color: var(--success); margin: 0; }
+.se-intro { margin: 0; font-size: 12px; }
+.se-inherit {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 16px;
-  margin-top: 10px;
-  font-size: 12px;
-}
-.bd-env-mode label {
-  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+}
+.se-inherit input { flex: 1 1 220px; min-width: 0; }
+.se-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.se-toolbar input[type="search"] { flex: 0 1 220px; min-width: 120px; }
+.se-toolbar-spacer { flex: 1 1 auto; }
+.se-only-changed { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.se-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.se-table th, .se-table td {
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-wrap: anywhere;
+}
+.se-table th { font-size: 12px; font-weight: 500; color: var(--muted); }
+.se-table th:first-child, .se-table td:first-child { width: 30%; }
+.se-table td code { font-family: var(--mono); font-size: 12px; background: none; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; }
+.se-table th:nth-child(3), .se-table td:nth-child(3) { width: 104px; }
+.se-table .se-actions { width: 208px; text-align: right; }
+.se-actions-inner { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px 4px; }
+.se-tmux .se-table .se-actions { width: 132px; }
+.se-live .se-table th:nth-child(3), .se-live .se-table td:nth-child(3) { width: 156px; }
+.se-value { display: flex; align-items: flex-start; gap: 4px; min-width: 0; max-width: 100%; }
+.se-value code { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
+.se-value.is-struck code { text-decoration: line-through; color: var(--faint); }
+.se-reveal {
+  flex: none;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 18px;
+  background: transparent;
+  border: 0;
   cursor: pointer;
 }
+.se-note { display: block; margin-top: 2px; font-size: 11px; color: var(--muted); }
+.se-note.is-warning { color: var(--warning); }
+.se-badge {
+  display: inline-block;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+}
+.se-badge.is-global { color: var(--accent); background: var(--accent-soft); }
+.se-badge.is-bot { color: var(--success); background: var(--success-soft); }
+.se-badge.is-unset { color: var(--danger); background: var(--danger-soft); }
+.se-badge.is-reserved { color: var(--faint); }
+.se-badge.is-tmux-server, .se-badge.is-other { color: var(--warning); background: var(--warning-soft); }
+.se-badge.is-managed { margin-left: 6px; color: var(--success); background: var(--success-soft); }
+.se-link {
+  padding: 0 4px;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--accent);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.se-link:hover:not(:disabled) { text-decoration: underline; }
+.se-link.is-danger { color: var(--danger); }
+.se-locked, .se-stale, .se-tmux-server {
+  padding: 6px 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.se-locked summary, .se-stale summary, .se-tmux-server summary { cursor: pointer; font-size: 12px; }
+.se-locked p { margin: 6px 0 0; font-size: 12px; }
+.se-stale { border-color: var(--warning); }
+.se-stale summary { color: var(--warning); }
+.se-stale ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+.se-stale-title { font-weight: 500; }
+.se-tmux { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.se-tmux .se-table { margin-top: 6px; }
+.se-dialog { width: min(640px, calc(100vw - 32px)); }
+.se-dialog form { display: flex; flex-direction: column; gap: 10px; }
+.se-dialog h3 { margin: 0; font-size: 15px; }
+.se-dialog textarea, .se-dialog input:not([type="checkbox"]) {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.se-dialog .actions { display: flex; justify-content: flex-end; gap: 8px; }
+.se-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.se-live { width: min(920px, calc(100vw - 32px)); }
+.se-live-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.se-live input[type="search"] { margin: 6px 0; }
 
 @media (max-width: 980px) {
   .app-shell {

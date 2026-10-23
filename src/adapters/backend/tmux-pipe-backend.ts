@@ -1169,7 +1169,7 @@ export class TmuxPipeBackend implements SessionBackend {
     const tmuxVersion = getTmuxVersionCached();
     const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
     const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
-    const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
+    const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv);
     const script = shellWrapperScript(
       resolveBotmuxWrapperBinDir(opts.env ?? process.env),
       shellKindForPath(shellSpec.shell),

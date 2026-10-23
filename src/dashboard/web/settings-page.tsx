@@ -14,6 +14,7 @@ import {
   binaryProgressText,
 } from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -21,6 +22,8 @@ import {
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -1105,6 +1108,12 @@ function SettingsBody(props: {
           />
         </SettingsBlock>
       </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
+        </SettingsBlock>
+      </SettingsGroup>
       </SettingsModule>
       <SettingsModule
         className="settings-module-meeting"
@@ -1258,6 +1267,7 @@ function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element 
       label: tr('settings.moduleGeneral'),
       items: [
         { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-session-env', label: tr('sessionEnv.sectionTitle') },
         { id: 'settings-cards', label: tr('settings.sectionCards') },
         { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
         { id: 'settings-experimental', label: tr('settings.sectionExperimental') },

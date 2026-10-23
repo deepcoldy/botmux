@@ -258,7 +258,7 @@ describe('resolveRemoteExecutionProven — launcher env voids the proof on all b
  *
  * `ds.initConfig` is written only at spawn/refork, but a live-worker `/restart`
  * (operator, working-dir change, cli_crash auto-restart) ships
- * `latestPerBotEnvForRestart(ds)` — i.e. live `getBot().config.env` — and the
+ * `latestSessionEnvForRestart(ds).env` — i.e. live `getBot().config.env` — and the
  * worker overwrites its own copy before respawning. So the child can be running
  * an env the daemon's snapshot has never seen.
  *

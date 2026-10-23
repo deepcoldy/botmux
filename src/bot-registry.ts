@@ -50,6 +50,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { botEnvLayer } from './core/session-env.js';
 import { normalizeDispatchLaunchPolicy } from './core/dispatch-launch-contract.js';
 import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
 import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
@@ -2080,6 +2081,13 @@ export interface BotConfig {
    * the shared tmux/zellij server env. Missing/empty → undefined.
    */
   env?: Record<string, string>;
+  /**
+   * Inherited variables removed from THIS bot's sessions (the bot layer's
+   * `unset`; `env` above is its `set`). See core/session-env.ts. Locked names
+   * and names also present in `env` are dropped at load. Missing/empty →
+   * undefined.
+   */
+  envUnset?: string[];
   /** Explicit process inheritance policy; missing retains historical behavior. */
   envPolicy?: EnvPolicy;
   /**
@@ -3821,6 +3829,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const envPolicy = normalizeEnvPolicy(entry.envPolicy);
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+    const envUnsetList = botEnvLayer({ env: entry.env, envUnset: entry.envUnset }).unset;
+    const envUnset = envUnsetList.length > 0 ? envUnsetList : undefined;
 
     const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
     for (const warning of normalizedReplyStyle.warnings) {
@@ -4117,6 +4127,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       tuiSlashAllow,
       startupCommands,
       env,
+      envUnset,
       envPolicy,
       skills,
       plugins,

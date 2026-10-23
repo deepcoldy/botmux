@@ -1,5 +1,5 @@
 import type { BotConfig } from '../bot-registry.js';
-import { botInjectedEnv, buildSessionChildEnv } from '../core/env-policy.js';
+import { botOneShotEnv } from '../core/session-env-resolve.js';
 import { runtimeExecutableForBotSelection } from '../services/model-catalog.js';
 import {
   lookupCliSelection,
@@ -41,11 +41,6 @@ export function modelCatalogProbeContext(
     runtimeContext: runtimeApplies
       ? `${botConfig.larkAppId}:${cliId}:${runtimeExecutable ?? 'default'}`
       : undefined,
-    probeEnv: runtimeApplies
-      ? {
-          ...buildSessionChildEnv(baseEnv, botConfig.envPolicy),
-          ...botInjectedEnv(botConfig.env, botConfig.envPolicy),
-        }
-      : undefined,
+    probeEnv: runtimeApplies ? botOneShotEnv(baseEnv, botConfig) : undefined,
   };
 }

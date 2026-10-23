@@ -142,6 +142,8 @@ const remoteAccessEnabledMock = vi.fn(() => false);
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
   isRemoteAccessEnabled: () => remoteAccessEnabledMock(),
+  // Model probes compose the session env overlay (no global layer here).
+  readRawGlobalSessionEnv: () => undefined,
 }));
 
 const staticModelChoicesMock = vi.fn(() => ['fable', 'opus', 'sonnet', 'haiku']);

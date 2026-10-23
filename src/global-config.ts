@@ -24,6 +24,7 @@ import { normalizePluginIdList } from './core/plugins/ids.js';
 import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
+import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -274,6 +275,10 @@ export interface GlobalConfig {
   scheduleTimeZone?: string;
   /** Machine-wide cross-bot schedule delegation policy. */
   scheduleDelegation?: ScheduleDelegationGlobalConfig;
+  /** Session environment overlay for every bot's sessions, applied after the
+   *  inherited baseline and before each bot's own layer (core/session-env.ts).
+   *  Managed from Dashboard「设置 → 会话环境变量」. Values may be credentials. */
+  sessionEnv?: EnvLayer;
 }
 
 export interface GlobalSkillConfig {
@@ -886,6 +891,8 @@ export function readGlobalConfig(): GlobalConfig {
   }
   const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
   if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
+  const sessionEnv = globalEnvLayer(raw.sessionEnv);
+  if (!isEmptyEnvLayer(sessionEnv)) out.sessionEnv = sessionEnv;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }
@@ -1084,6 +1091,21 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+}
+
+/** The stored `sessionEnv` exactly as written (for hand-edit diagnostics). */
+export function readRawGlobalSessionEnv(): unknown {
+  return readRawConfig().sessionEnv;
+}
+
+/** Apply validated ops to the global session-env layer; an empty result
+ *  removes the key so an untouched install keeps no trace of the feature. */
+export function applyGlobalSessionEnvOps(ops: readonly EnvOp[]): { ok: true; layer: EnvLayer } | { ok: false; error: 'layer_too_large' } {
+  const prev = globalEnvLayer(readRawConfig().sessionEnv);
+  const next = applyEnvOps(prev, ops);
+  if (!envLayerWithinBudget(prev, next)) return { ok: false, error: 'layer_too_large' };
+  mergeGlobalConfig({ sessionEnv: isEmptyEnvLayer(next) ? null : next });
+  return { ok: true, layer: next };
 }
 
 /** Merge only the dashboard sub-config, preserving unknown keys inside that
