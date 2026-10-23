@@ -379,6 +379,29 @@ it.each([false, true])('default ACP runner preserves queue attribution, native i
   } finally { child.kill('SIGTERM'); await closed; }
 });
 
+it('reports native ACP failure with its cause and resumes the next turn', async () => {
+  const f = fixture();
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--data-dir', join(f.root, 'data')], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  const send = (content: string, replyTurnId: string) => child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId })).toString('base64')}\n`);
+  try {
+    send('crash', 'failed');
+    await waitFor(() => finals().length === 1);
+    expect(finals()[0]).toMatchObject({ turnId: 'failed', errorCode: 'execution_failed',
+      content: expect.stringContaining('mcode_acp_process_exited') });
+    send('healthy', 'next');
+    await waitFor(() => finals().length === 2);
+    expect(finals()[1]).toMatchObject({ turnId: 'next', content: 'answer:healthy' });
+    expect(finals()[1].errorCode).toBeUndefined();
+    expect(f.calls().filter(c => c.message?.method === 'session/resume').map(c => c.message.params.sessionId))
+      .toEqual(['session_fixture']);
+  } finally { child.kill('SIGTERM'); await closed; }
+});
+
 it.each([false, true])('exhausts the cumulative budget despite progress and runs the queued turn (resume: %s)', async resume => {
   const f = fixture();
   const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,

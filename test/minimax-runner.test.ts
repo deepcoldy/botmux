@@ -297,6 +297,21 @@ it.each([
     content, nativeSessionId: 'session_fixture', timeoutMs: 5000, permission: 'full' }, AbortSignal.timeout(8000))).rejects.toThrow(error);
 });
 
+it('reports native exec failure with its cause and resumes the next turn', async () => {
+  const { h, send } = runner();
+  const finals = () => markers(h.stdout).filter(m => m.kind === 'final').map(m => m.payload);
+  send('failed', 'failed');
+  await waitFor(() => finals().length === 1);
+  expect(finals()[0]).toMatchObject({ turnId: 'failed', errorCode: 'execution_failed',
+    content: expect.stringContaining('INTERACTION_NOT_AVAILABLE') });
+  send('healthy', 'next');
+  await waitFor(() => finals().length === 2);
+  expect(finals()[1]).toMatchObject({ turnId: 'next', content: 'answer:healthy' });
+  expect(finals()[1].errorCode).toBeUndefined();
+  const calls = readFileSync(h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(calls[1].args[calls[1].args.indexOf('--session') + 1]).toBe('session_fixture');
+});
+
 it('kills a hung invocation and permits a later turn in the same native session', async () => {
   const { h, send } = runner(['--turn-timeout-ms', '1000']); send('hang', 'one');
   await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
