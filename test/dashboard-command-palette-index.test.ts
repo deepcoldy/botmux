@@ -177,6 +177,23 @@ describe('⌘K index coverage', () => {
       }
     }
   });
+
+  // 源码结构护栏(K4)：配置项标签写在各区块组件内部，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
+  // 守的是「区块组件里新增了可见配置项或选项组标签，却忘记在 BOT_DEFAULTS_SECTIONS.fieldKeys 登记」——
+  // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
+  it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
+    const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx']
+      .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+
+    const fieldTitleMatches = [...sources.matchAll(/\{tr\('([^']+)'\)\}<\/FieldTitle>/g)].map(m => m[1]!);
+    const groupNameMatches = [...sources.matchAll(/groupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
+    const toggleRowMatches = [...sources.matchAll(/<ToggleRow[^>]*\btitle=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
+
+    const renderedKeys = new Set([...fieldTitleMatches, ...groupNameMatches, ...toggleRowMatches]);
+    const unindexedKeys = [...renderedKeys].filter(key => key.startsWith('botDefaults.') && !indexedKeys.has(key));
+    expect(unindexedKeys, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
+  });
 });
 
 describe('⌘K reaches the Bot config page, its categories and each bot', () => {
