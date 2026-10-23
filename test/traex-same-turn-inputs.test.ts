@@ -154,6 +154,25 @@ describe('TRAE messages merged into one native turn', () => {
     expect(superseded).toEqual([]);
   });
 
+  it('a resumed segment replaying the same message does not synthesize a second local turn', () => {
+    // TraeX writes a resumed session as a new rollout segment that replays the
+    // copied user record under a fresh path (hence a fresh event uuid). The
+    // (turn, message) identity is unchanged, so adopt-mode synthesis must not
+    // open a second local turn that supersedes the still-open first one.
+    const resumed = join(dir, `rollout-2026-01-01T00-00-00-${SID}_${NATIVE}.jsonl`);
+    writeFileSync(resumed, '');
+    append(input('Task', 'first'));
+    appendFileSync(resumed, JSON.stringify(input('Task', 'first')) + '\n');
+    const queue = new CodexBridgeQueue();
+    queue.setLocalTurns(true, START);
+    const superseded: string[] = [];
+    queue.setCotSupersededObserver(turn => superseded.push(turn.turnId));
+    queue.ingest(drainTraexRollout(path, 0, { adoptMode: true }).events);
+    queue.ingest(drainTraexRollout(resumed, 0, { adoptMode: true }).events);
+    expect(queue.peek()).toHaveLength(1);
+    expect(superseded).toEqual([]);
+  });
+
   it('an interrupted merged turn settles the latest input as ambiguous', () => {
     append(input('Task', 'first'), input('Correction', 'second', START + 1_000), terminal(START + 2_000, NATIVE, true));
     const queue = new CodexBridgeQueue();
