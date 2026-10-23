@@ -23,6 +23,7 @@ import { preferredManagedTmuxSocket } from '../../src/adapters/backend/tmux-sock
 import { probeTmuxFunctional } from '../../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { privateTmuxEnv } from './private-tmux-env.js';
+import { killProcessTree } from './process-tree.js';
 import { spawnNodeTsScript } from './ts-runner.js';
 
 export const claudeHarnessRunnable = process.platform === 'linux' && probeTmuxFunctional().ok;
@@ -107,7 +108,14 @@ const render = () => {
     + '\\r\\n❯ ' + composer + '\\r\\n' + rule + '\\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)'
     + (busy ? ' · esc to interrupt' : '') + '\\r\\n');
 };
+// A status clock ticking until the first turn: the screen never goes quiet, so
+// the worker never sees the prompt settle and falls back to its first-prompt
+// timeout, which reads the prompt off the screen instead.
+let startupTicker = cfg.startupTicker
+  ? setInterval(() => process.stdout.write('\x1b7\x1b[1;40H' + new Date().toISOString().slice(11, 19) + '\x1b8'), 500)
+  : undefined;
 const runTurn = (prompt, reply) => {
+  if (startupTicker) { clearInterval(startupTicker); startupTicker = undefined; }
   busy = true;
   record({ type: 'user', message: { role: 'user', content: prompt } });
   render();
@@ -198,12 +206,13 @@ export interface Generation {
   kill: () => Promise<void>;
 }
 
-const cleanups: Array<() => void> = [];
+const cleanups: Array<() => void | Promise<void>> = [];
 /** Register with `afterEach`: kills every worker, fake CLI and tmux server the
- *  test started, and removes its files. */
-export function cleanUpClaudeHarnesses(): void {
+ *  test started, and removes its files. Workers go first, each with the tmux
+ *  calls it still has in flight, so none of them outlives its TMUX_TMPDIR. */
+export async function cleanUpClaudeHarnesses(): Promise<void> {
   while (cleanups.length) {
-    try { cleanups.pop()!(); } catch { /* best effort */ }
+    try { await cleanups.pop()!(); } catch { /* best effort */ }
   }
 }
 
@@ -220,6 +229,9 @@ export function setupFakeClaude(opts: {
   /** The pid-state record keeps the spawn-time sessionId (2.1.123), and the
    *  fake holds its active session's tasks dir open. */
   stalePidState?: boolean;
+  /** Keep the screen busy with a status clock until the first turn, so the
+   *  worker only finds the prompt through its first-prompt timeout. */
+  startupTicker?: boolean;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -251,6 +263,7 @@ export function setupFakeClaude(opts: {
     ...(opts.pidStateGated ? { pidStateGate } : {}),
     ...(opts.stalePidState ? { stalePidState: true, holdTasksDir: true } : {}),
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
+    ...(opts.startupTicker ? { startupTicker: true } : {}),
   }));
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.
@@ -323,13 +336,8 @@ child.on('exit', code => process.exit(code ?? 1));
       });
       child.stdout?.on('data', b => logs.push(b.toString()));
       child.stderr?.on('data', b => logs.push(b.toString()));
-      const kill = async () => {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        const exited = new Promise<void>(done => child.once('exit', () => done()));
-        child.kill('SIGKILL');
-        await Promise.race([exited, new Promise(done => setTimeout(done, 3_000))]);
-      };
-      cleanups.push(() => { child.kill('SIGKILL'); });
+      const kill = () => killProcessTree(child, 3_000);
+      cleanups.push(kill);
       child.send({
         type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir,
         cliId: 'claude-code', cliPathOverride: opts.unknownLayer ? launcher : fakeCli, cliConfigDir: claudeDir, backendType: 'tmux',

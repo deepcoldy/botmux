@@ -1104,29 +1104,30 @@ describe('Codex-compatible runtime editor', () => {
     expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.value).toBe('ultra');
   });
 
-  const dshCliState = {
+  const budgetCliState = {
     options: [
       { id: 'codex', label: 'Codex' },
       { id: 'dsh', label: 'dsh' },
+      { id: 'minimax', label: 'MiniMax Code' },
     ],
     ttadkModelDefault: '',
     ttadkModelSuggestions: [],
   };
 
-  function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+  function renderBudget(bot: Record<string, any>, patchBot = vi.fn()) {
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
         bot: { larkAppId: 'cli_dsh', model: '', ...bot },
-        sessionFallback: 'dsh',
-        cliState: dshCliState as any,
+        sessionFallback: bot.cliId ?? 'dsh',
+        cliState: budgetCliState as any,
         patchBot,
       }));
     });
     return { renderer, root: renderer.root, patchBot };
   }
 
-  it('shows the dsh turn timeout in minutes and PUTs it as milliseconds', async () => {
+  it.each(['dsh', 'minimax'])('shows the turn timeout in minutes and PUTs it as milliseconds (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1139,12 +1140,12 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
       // 1_800_000 ms = 30 min
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '45' } }));
@@ -1154,13 +1155,13 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       // 45 min → 2_700_000 ms
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('clears the dsh turn timeout to the runner default when emptied', async () => {
+  it.each(['dsh', 'minimax'])('clears the turn timeout to the runner default when emptied (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1173,11 +1174,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '' } }));
@@ -1186,19 +1187,19 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      // Empty → '' so the daemon deletes the field (revert to 10-min default).
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
+      // Empty → '' so the daemon deletes the field (remove the opt-in limit).
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('omits the turn timeout field for non-dsh CLIs', () => {
-    const { root } = renderDsh({ cliId: 'codex' });
+  it('omits the turn timeout field for unsupported CLIs', () => {
+    const { root } = renderBudget({ cliId: 'codex' });
     expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
   });
 
-  it('shows a legal non-whole-minute timeout and preserves it on a model-only save', async () => {
+  it.each(['dsh', 'minimax'])('shows a legal non-whole-minute timeout and preserves it on a model-only save (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1212,12 +1213,12 @@ describe('Codex-compatible runtime editor', () => {
         ok: true,
         status: 200,
         // Daemon preserved the stored ms because the field was absent from the body.
-        json: async () => ({ ok: true, cliId: 'dsh', model: body.model, turnTimeoutMs: 90_001, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: body.model, turnTimeoutMs: 90_001, selectionKey: cliId }),
       } as any;
     });
     try {
       // 90_001 ms is a legal positive integer but not a whole minute.
-      const { root } = renderDsh({ cliId: 'dsh', model: 'm0', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, model: 'm0', turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // Shown as exact decimal minutes (≈ 1.5000166667), never blanked.
       expect(input.props.value).not.toBe('');
@@ -1231,14 +1232,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: 'm1', reasoningEffort: '' }]);
+      expect(requests).toEqual([{ cliId, model: 'm1', reasoningEffort: '' }]);
       expect(Object.prototype.hasOwnProperty.call(requests[0], 'turnTimeoutMs')).toBe(false);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('re-saves the displayed non-whole-minute value back to the exact stored ms', async () => {
+  it.each(['dsh', 'minimax'])('re-saves the displayed non-whole-minute value back to the exact stored ms (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1251,11 +1252,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       const shown = input.props.value; // e.g. "1.5000166667"
       // Re-enter the exact displayed minutes (a touch) and save: rounding to the
@@ -1266,14 +1267,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
       expect(root.findAllByProps({ 'data-turn-timeout-error': '' })).toHaveLength(0);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save and shows an inline error on invalid turn timeout input (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1282,10 +1283,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 0 is not a clearable blank and not a positive timeout → must error, not clear.
       act(() => input.props.onChange({ currentTarget: { value: '0' } }));
@@ -1302,7 +1303,7 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
-  it('blocks the save when the minutes value exceeds the arm-able millisecond bound', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save when the minutes value exceeds the arm-able millisecond bound (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1311,10 +1312,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 40000 min = 2.4e9 ms > 2_147_483_647 ms → invalid (would overflow setTimeout).
       act(() => input.props.onChange({ currentTarget: { value: '40000' } }));

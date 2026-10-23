@@ -53,6 +53,19 @@ describe('global dashboard config', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false, listenerPolicy: { rawMessages: false, finalSummary: false, allowSummarySharing: false } });
+  });
+
+  it('round-trips global meeting listener defaults without changing consumer selection', () => {
+    const listenerPolicy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    writeFileSync(globalConfigPath(), JSON.stringify({ vcMeetingAgent: { enabled: true, listenerPolicy } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerPolicy });
+  });
+
   it('reads only boolean dashboard settings', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: {

@@ -44,7 +44,7 @@ export interface DashboardBotDescriptor {
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
-  /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
+  /** dsh / MiniMax runner turn budget (ms). */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
   dshRuntime?: 'official' | 'tui' | null;

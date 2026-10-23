@@ -53,7 +53,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionAgent',
     fieldKeys: [
       'botDefaults.agentModel', 'botDefaults.agentReasoningEffort', 'botDefaults.agentServiceTier',
-      'botDefaults.agentModelBackendVariant', 'botDefaults.agentTurnTimeout', 'botDefaults.cliConfigDir',
+      'botDefaults.agentModelBackendVariant', 'botDefaults.agentTurnTimeout', 'botDefaults.minimaxTurnBudget',
+      'botDefaults.cliConfigDir',
       'botDefaults.skillInjection', 'botDefaults.nativeSubagentTitle', 'botDefaults.runtimeTitle',
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',

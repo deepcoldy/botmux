@@ -352,7 +352,18 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.launches)).toHaveLength(3);
     expect(f.messages.filter(message => message.type === 'user_notify' && message.message.includes('均持续排队'))).toHaveLength(notices);
     writeFileSync(f.release, 'go');
-    await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('next ask')), 'next submit after preferred reset');
+    // The preferred-model relaunch (4th launch row) and the re-submission are
+    // written by different steps; waiting on the submission alone races the
+    // launch record under load (the row can land seconds later). Wait for
+    // both durabilities, with model attribution inside the predicate: an input
+    // consumed by the pre-switch 'last' process can never satisfy this, so a
+    // real misroute fails by timeout instead of flaking on the launch assert.
+    await f.wait(() => {
+      const nextSubmissions = rows(f.submissions).filter(row => row.text.startsWith('next ask'));
+      return rows(f.launches).length === 4
+        && nextSubmissions.length === 1
+        && nextSubmissions[0]!.model === 'core';
+    }, 'next ask relaunched on the preferred model after reset');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
   }, 100_000);

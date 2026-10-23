@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
  *
@@ -111,6 +112,8 @@ export interface VcMeetingSharedConsumerCatalog {
 }
 
 export interface VcMeetingAgentGlobalConfig {
+  /** Defaults for future meetings; each meeting freezes its effective policy. */
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
@@ -777,6 +780,15 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const out: VcMeetingAgentGlobalConfig = {};
+  try {
+    const listenerPolicy = normalizeVcMeetingListenerPolicy(v.listenerPolicy);
+    if (listenerPolicy) out.listenerPolicy = listenerPolicy;
+  } catch {
+    // A typo in this optional feature must not break unrelated global config
+    // reads or silently fall back to publishing raw meeting text.
+    console.warn('[botmux] Invalid vcMeetingAgent.listenerPolicy; disabling its publication/sharing flags.');
+    out.listenerPolicy = { rawMessages: false, finalSummary: false, allowSummarySharing: false };
+  }
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
@@ -946,6 +958,7 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
     ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
+    ...(parsed?.listenerPolicy ? { listenerPolicy: parsed.listenerPolicy } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;

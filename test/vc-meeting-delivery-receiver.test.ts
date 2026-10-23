@@ -1,3 +1,4 @@
+import { VC_MEETING_FINAL_SUMMARY_CONTRACT } from '../src/services/vc-meeting-listener-output-protocol.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +25,7 @@ import {
 } from '../src/services/vc-meeting-delivery-receiver.js';
 import {
   getVcMeetingMemberProjection,
+  findVcMeetingDeliveryByKey,
   getVcMeetingReceiverStream,
 } from '../src/services/vc-meeting-delivery-store.js';
 
@@ -216,6 +218,48 @@ describe('vc meeting delivery receiver', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each(['listener_thread', 'silent'] as const)('freezes final-summary protocol and never redispatches a final receipt (%s)', async responseMode => {
+    const harness = receiverHarness(dir);
+    await registerActiveMember(harness, projection({ member: { responseMode }, outputRoute: { listenerPolicy: { finalSummary: true } } }));
+    const request = delivery();
+    request.instructionVersion = 'meeting-consumer-v2';
+    request.stream.final = true;
+    request.entries[request.entries.length - 1] = { deliverySeq: request.stream.toSeq, kind: 'final', rawText: 'end' };
+    request.stream.inputHash = computeVcMeetingDeliveryInputHash(request);
+    expect((await receiveVcMeetingDelivery(request, harness.deps)).status).toBe(202);
+    const key = deriveVcMeetingDeliveryIdentity(request).deliveryKey;
+    expect(findVcMeetingDeliveryByKey(dir, key)!.receipt.listenerOutputProtocol)
+      .toBe(responseMode === 'silent' ? 'decision_v1' : 'final_summary_v1');
+    expect(harness.capturedTriggers[0].instruction.includes(VC_MEETING_FINAL_SUMMARY_CONTRACT)).toBe(responseMode !== 'silent');
+    expect(harness.capturedTriggers[0].envelope).toMatchObject({ payload: { stream: { final: true }, entries: request.entries.map(({ rawText, ...metadata }) => metadata) } });
+    expect(harness.capturedTriggers[0].envelope.rawText).toContain(request.entries[0].rawText);
+    await receiveVcMeetingDelivery(request, harness.deps);
+    expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the incremental protocol before the final batch even with final summaries enabled', async () => {
+    const harness = receiverHarness(dir);
+    await registerActiveMember(harness, projection({ member: { responseMode: 'listener_thread' }, outputRoute: { listenerPolicy: { finalSummary: true } } }));
+    const request = delivery();
+    request.instructionVersion = 'meeting-consumer-v2';
+    request.stream.final = false;
+    request.stream.inputHash = computeVcMeetingDeliveryInputHash(request);
+    expect((await receiveVcMeetingDelivery(request, harness.deps)).status).toBe(202);
+    const key = deriveVcMeetingDeliveryIdentity(request).deliveryKey;
+    expect(findVcMeetingDeliveryByKey(dir, key)!.receipt.listenerOutputProtocol).toBe('decision_v1');
+    expect(harness.capturedTriggers[0].instruction).not.toContain(VC_MEETING_FINAL_SUMMARY_CONTRACT);
+    expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses listener policy changes within an existing member epoch', async () => {
+    const harness = receiverHarness(dir);
+    await registerActiveMember(harness, projection({ outputRoute: { listenerPolicy: { finalSummary: true } } }));
+    const changed = await registerVcMeetingMember(projection({ member: { membershipGeneration: 2 },
+      outputRoute: { listenerPolicy: { finalSummary: false } } }), harness.deps);
+    expect(changed).toMatchObject({ status: 409, body: { errorCode: 'epoch_required' } });
+    expect(getVcMeetingMemberProjection(dir, { listenerAppId: LISTENER_APP_ID, meetingId: MEETING_ID, memberId: MEMBER_ID, memberEpoch: 1 })!.listenerPolicy).toEqual({ finalSummary: true });
   });
 
   describe('member registration', () => {

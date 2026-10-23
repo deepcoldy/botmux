@@ -231,7 +231,7 @@ export interface CliAdapter {
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
-     *  (dsh). Forwarded as `--turn-timeout-ms` to opt into an idle watchdog;
+     *  (dsh / MiniMax). Forwarded as `--turn-timeout-ms`; semantics belong to the runner;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
@@ -370,6 +370,20 @@ export interface CliAdapter {
 
   readonly rawCommandInputMode?: 'paste-line';
   readonly rawCommandSettleMs?: number;
+
+  /**
+   * True when the CLI runs behind a long-lived stdin bridge that only accepts
+   * its OWN framed line protocol (e.g. MiniMax Code's `minimax-runner`:
+   * `<prefix><base64><CR>`). When set, EVERY input path — ordinary turns AND
+   * raw passthrough (typed slash commands, v3 goal-mode's first dispatch,
+   * startup command lines) — must go through {@link writeInput}, which owns
+   * the runner's pre-flush / chunking / submit-retry / ambiguous-disposition
+   * protocol. Typing a literal line via the generic raw writer would be
+   * rejected by the runner ("ignoring non-frame input"), and a half-written
+   * frame could merge with the next line into one dropped blob that a plain
+   * writer would still report as accepted.
+   */
+  readonly runnerFramedInput?: boolean;
 
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
@@ -1011,7 +1025,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

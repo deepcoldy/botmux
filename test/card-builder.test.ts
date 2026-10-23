@@ -35,6 +35,8 @@ import type { ZellijAdoptableSession } from '../src/core/zellij-adopt-discovery.
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
+import { resolveCliRuntime } from '../src/adapters/cli/runtime.js';
+import { configuredRuntimeDisplayName } from '../src/core/cli-runtime-display.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -71,6 +73,30 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('Kimi-compatible CodeM runtime cards', () => {
+  it('uses the configured distribution name for waiting, streaming and closed cards', () => {
+    const runtime = resolveCliRuntime({
+      cliId: 'kimi',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: 'codem-wrapper', update: { provider: 'none' } },
+    });
+    const name = configuredRuntimeDisplayName(runtime);
+    const session = parse(buildSessionCard('session', 'root', 'https://terminal.example', 'Review', 'kimi', false, false, 'en', false, name));
+    const streaming = parse(buildStreamingCard(
+      'session', 'root', 'https://terminal.example', 'Review', '', 'idle', 'kimi',
+      'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false, undefined, name,
+    ));
+    for (const card of [session, streaming]) {
+      expect(card.header.title.content).toContain('CodeM');
+      expect(card.header.title.content).not.toContain('Kimi');
+    }
+    const closed = buildSessionClosedCard('session', 'root', 'Review', 'kimi', '/work', null, 'en', name);
+    expect(closed).toContain('CodeM');
+    expect(closed).not.toContain('Kimi');
+    const plain = parse(buildSessionCard('plain', 'root', '', 'Review', 'kimi', false, false, 'en'));
+    expect(plain.header.title.content).toContain('Kimi');
+  });
+});
 
 describe('buildTuiPromptFailedCard', () => {
   it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {

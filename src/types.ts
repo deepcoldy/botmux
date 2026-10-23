@@ -39,6 +39,8 @@ export interface VcMeetingListenerDeliveryConfig {
  * persisted session so queued human turns cannot overwrite each other's
  * authority before the worker actually dequeues them. */
 export interface VcMeetingImTurnOrigin {
+  /** Frozen only from an exact, standalone human sharing command. Not inherited across turns. */
+  summaryShareTargetChatId?: string;
   listenerAppId: string;
   meetingId: string;
   memberId: string;

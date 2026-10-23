@@ -24,6 +24,7 @@ import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -558,11 +559,18 @@ async function applyConfigFieldInternal(
       return { write: false, result: 'reply_delivery_unsupported' };
     }
     if (cliSelection) {
+      const adapterChanged = currentCliId !== cliSelection.cliId;
       entry.cliId = cliSelection.cliId;
       if (cliSelection.wrapperCli) entry.wrapperCli = cliSelection.wrapperCli;
       else delete entry.wrapperCli;
       if (cliSelection.cliLaunchMode) entry.cliLaunchMode = cliSelection.cliLaunchMode;
       else delete entry.cliLaunchMode;
+      // A structured runtime asserts one adapter contract. A /config-driven
+      // adapter switch must not strand it: codex↔kimi would otherwise reload
+      // legally and silently run one family's binary under the other's TUI
+      // contract. Clear the descriptor and its equal downgrade shadow using
+      // the same rule as setup/dashboard edits.
+      dropConfiguredCliRuntime(entry, adapterChanged);
       try {
         validateCliLaunchModeConfig({
           cliId: entry.cliId,
@@ -623,9 +631,12 @@ async function applyConfigFieldInternal(
         : undefined
     : undefined;
   if (cliSelection) {
+    const adapterChanged = bot.config.cliId !== cliSelection.cliId;
     bot.config.cliId = cliSelection.cliId;
     bot.config.wrapperCli = cliSelection.wrapperCli;
     bot.config.cliLaunchMode = cliSelection.cliLaunchMode;
+    // Keep the in-memory config identical to what was persisted above.
+    dropConfiguredCliRuntime(bot.config, adapterChanged);
   } else if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {

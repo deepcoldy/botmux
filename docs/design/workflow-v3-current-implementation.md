@@ -247,6 +247,9 @@ Goal 节点交给临时 Agent CLI Worker：
 - `seed`
 - `traex`
 - `relay`
+- `minimax`
+
+下发形态分两类（`buildGoalCommand`）：前五个 CLI 原生理解 `/goal`，注入 `/goal <objective>`；`minimax` 由常驻 runner 走 `mcode acp` 的 `session/prompt`，该通道只拦截固定只读命令（help/new/model/status/doctor/context/skills/mcp/usage/compact），`/goal` 会被当普通文本，因此只注入裸 `<objective>`（它本身就是指向 goal.txt 的完整单行指令）。两种形态都能被 `isBotmuxGoalObjective` 识别，节点成败一律由 manifest watcher 判定。
 
 节点可以通过 `override.model` 和 `override.systemPromptAppend` 覆盖本节点模型与附加指令。权限绕过策略不能由节点覆盖。
 

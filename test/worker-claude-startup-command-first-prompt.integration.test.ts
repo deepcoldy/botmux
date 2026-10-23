@@ -47,6 +47,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 
@@ -306,11 +307,8 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
     run.events = readEvents(eventsFile);
     run.logs = logs.join('');
     run.transcript = existsSync(transcript) ? readFileSync(transcript, 'utf8') : '';
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (child) await killProcessTree(child);
     if (existsSync(pidFile)) {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }

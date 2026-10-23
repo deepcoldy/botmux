@@ -377,9 +377,13 @@ describe('Auto live follow-up input policy', () => {
       queueTimeoutMs: 5_000, reselectPerTurn });
     controller.beginTurn('turn');
     controller.commitSwitch(action);
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    activeTurnAuthority.reserve({ turnId: 'turn' });
+    activeTurnAuthority.markStarted({ turnId: 'turn' });
     const scope = { traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
       pendingMessages: [{ turnId: 'followup' }], traexAutoModelSwitching: false,
-      isPromptReady: false, traexAutoModelInputHold: () => false,
+      isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
+      queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
     const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
     expect(reset()).toBe(false);
@@ -388,6 +392,71 @@ describe('Auto live follow-up input policy', () => {
     scope.isPromptReady = true;
     expect(reset()).toBe(reselectPerTurn);
     expect(scope.executeTraexAutoModelSwitch).toHaveBeenCalledTimes(reselectPerTurn ? 1 : 0);
+  });
+
+  it('holds a queued successor on a fallback until the composer after the predecessor terminal', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'],
+      queueTimeoutMs: 5_000, reselectPerTurn: true });
+    controller.beginTurn('turn');
+    controller.commitSwitch(action);
+    // The structured terminal has released the predecessor, but the PTY
+    // composer has not been re-observed yet (isPromptReady stays false).
+    const activeTurnAuthority = new ActiveTurnAuthority();
+    const scope = { traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
+      pendingMessages: [{ turnId: 'followup' }], traexAutoModelSwitching: false,
+      isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
+      queuedTypeAheadTurns: [],
+      lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
+    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    expect(reset()).toBe(true);
+    expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    // Once the composer is observed, the normal switch branch restarts core.
+    scope.isPromptReady = true;
+    expect(reset()).toBe(true);
+    expect(scope.executeTraexAutoModelSwitch).toHaveBeenCalledOnce();
+  });
+
+  it('holds a post-terminal successor even when per-turn reselection is disabled', () => {
+    // The predecessor turn is gone and the composer is not back: the message
+    // is a new independent turn, not a steer. Waiting for the idle edge is
+    // required for correct turn attribution regardless of model reselection.
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'],
+      queueTimeoutMs: 5_000, reselectPerTurn: false });
+    controller.beginTurn('turn');
+    controller.commitSwitch(action);
+    const scope = { traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
+      pendingMessages: [{ turnId: 'followup' }], traexAutoModelSwitching: false,
+      isPromptReady: false, traexAutoModelInputHold: () => false,
+      activeTurnAuthority: new ActiveTurnAuthority(), queuedTypeAheadTurns: [],
+      lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
+    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    expect(reset()).toBe(true);
+    expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    // With reselection off, the composer edge releases the write without a switch.
+    scope.isPromptReady = true;
+    expect(reset()).toBe(false);
+    expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+  });
+
+  it('still steers a successor already written as type-ahead after the predecessor terminal', () => {
+    // A predecessor terminal releases the authority while a type-ahead
+    // successor keeps running natively; BotMux's authority for it only
+    // advances at the next prompt edge. The non-empty type-ahead queue keeps
+    // the next correction flowing as a steer instead of holding for a
+    // composer that will not arrive until the successor ends.
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'],
+      queueTimeoutMs: 5_000, reselectPerTurn: true });
+    controller.beginTurn('turn');
+    controller.commitSwitch(action);
+    const scope = { traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
+      pendingMessages: [{ turnId: 'followup' }], traexAutoModelSwitching: false,
+      isPromptReady: false, traexAutoModelInputHold: () => false,
+      activeTurnAuthority: new ActiveTurnAuthority(),
+      queuedTypeAheadTurns: [{ turnId: 'successor-turn' }],
+      lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
+    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    expect(reset()).toBe(false);
+    expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
   });
 });
 

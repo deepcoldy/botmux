@@ -63,6 +63,7 @@ describe('botAcceptsLaunchModel', () => {
   it('清单内的 CLI 放行', () => {
     expect(botAcceptsLaunchModel({ cliId: 'claude-code' })).toBe(true);
     expect(botAcceptsLaunchModel({ cliId: 'mojo' })).toBe(true);
+    expect(botAcceptsLaunchModel({ cliId: 'codem' })).toBe(true);
   });
 
   it('清单外的 CLI 拒绝', () => {
@@ -75,6 +76,7 @@ describe('botAcceptsLaunchModel', () => {
   it('riff 后端一票否决，与 cliId 无关', () => {
     expect(botAcceptsLaunchModel({ cliId: 'codex' })).toBe(true);
     expect(botAcceptsLaunchModel({ cliId: 'codex', backendType: 'riff' })).toBe(false);
+    expect(botAcceptsLaunchModel({ cliId: 'codem', backendType: 'riff' })).toBe(false);
   });
 
   it('没有 cliId（未注册 bot）→ 拒绝', () => {

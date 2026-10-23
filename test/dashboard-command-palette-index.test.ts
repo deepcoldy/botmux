@@ -32,7 +32,7 @@ import {
   findBotDefaultsSection,
   parseBotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
-import { BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
@@ -198,6 +198,43 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
   ];
 
   for (const locale of ['zh', 'en'] as const) {
+    it.each([
+      { cliId: 'dsh', field: 'botDefaults.agentTurnTimeout' },
+      { cliId: 'minimax', field: 'botDefaults.minimaxTurnBudget' },
+    ])(`finds the rendered $cliId budget field and preserves its deep link (${locale} UI)`, async ({ cliId, field }) => {
+      vi.stubGlobal('window', { localStorage: { getItem: () => null, setItem: () => {} } });
+      vi.stubGlobal('document', { documentElement: {}, addEventListener: () => {}, removeEventListener: () => {} });
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ models: [], profiles: [] }),
+      })));
+      ui.setLocale(locale);
+      let renderer: TestRenderer.ReactTestRenderer | undefined;
+      try {
+        await act(async () => {
+          renderer = TestRenderer.create(createElement(BotAgentSection, {
+            bot: { larkAppId: 'cli_budget_search', cliId, agentSelectionKey: cliId },
+            sessionFallback: cliId,
+            cliState: { options: [{ id: cliId, label: cliId }], ttadkModelDefault: '', ttadkModelSuggestions: [] },
+            patchBot: () => {},
+          }));
+        });
+        const label = renderer!.root.findByProps({ 'data-input': 'agentTurnTimeout' }).parent!
+          .findByProps({ className: 'bd-field-title-text' }).children.join('');
+        expect(label).toBe(createDashboardTranslator(locale)(field));
+        const items = buildBotDefaultsSectionItems();
+        const href = botDefaultsHref({ section: 'agent', field });
+        for (const query of [label, zh(field), en(field)]) {
+          expect(topItem(items, query)?.primary.href, query).toBe(href);
+        }
+        vi.stubGlobal('location', { hash: href });
+        expect(readBotDefaultsDeepLink()).toEqual({ tab: 'common', section: findBotDefaultsSection('agent'), field });
+      } finally {
+        if (renderer) act(() => renderer!.unmount());
+        ui.setLocale('zh');
+      }
+    });
+
     it(`finds the page, its categories and bots with ${locale} UI`, () => {
       vi.stubGlobal('window', { localStorage: { getItem: () => null, setItem: () => {} } });
       vi.stubGlobal('document', { documentElement: {} });

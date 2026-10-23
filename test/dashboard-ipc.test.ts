@@ -8847,7 +8847,7 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
-  it('persists, validates and clears the dsh turn timeout through bots.json', async () => {
+  it.each(['dsh', 'minimax'])('persists, validates and clears the %s turn timeout through bots.json', async cliId => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tt-ipc-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-agent-tt-app';
@@ -8857,7 +8857,7 @@ describe('PUT /api/bot-agent', () => {
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
-        cliId: 'dsh',
+        cliId,
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
@@ -8868,7 +8868,7 @@ describe('PUT /api/bot-agent', () => {
       const bad = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 0 }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: 0 }),
       });
       expect(bad.status).toBe(400);
       expect(await bad.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
@@ -8877,7 +8877,7 @@ describe('PUT /api/bot-agent', () => {
       const over = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 2_147_483_648 }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: 2_147_483_648 }),
       });
       expect(over.status).toBe(400);
       expect(await over.json()).toMatchObject({ error: 'invalid_turn_timeout_ms' });
@@ -8886,39 +8886,47 @@ describe('PUT /api/bot-agent', () => {
       const oddMs = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 90_001 }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: 90_001 }),
       });
       expect(oddMs.status).toBe(200);
       expect(await oddMs.json()).toMatchObject({ ok: true, turnTimeoutMs: 90_001 });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ turnTimeoutMs: 90_001 });
 
-      // Set a valid timeout → stored on the dsh bot + echoed back.
+      // Set a valid timeout → stored on the bot + echoed back.
       const set = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 1_800_000 }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: 1_800_000 }),
       });
       expect(set.status).toBe(200);
-      expect(await set.json()).toMatchObject({ ok: true, cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      expect(await set.json()).toMatchObject({ ok: true, cliId, turnTimeoutMs: 1_800_000 });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ turnTimeoutMs: 1_800_000 });
       expect(getBot(appId).config.turnTimeoutMs).toBe(1_800_000);
+
+      // Unrelated saves must preserve a configured budget, including exact ms.
+      const preserved = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId, model: '' }),
+      });
+      expect(await preserved.json()).toMatchObject({ turnTimeoutMs: 1_800_000 });
+      expect(loadBotConfigs().find((c: any) => c.larkAppId === appId)?.turnTimeoutMs).toBe(1_800_000);
 
       // Empty string clears it (revert to runner default).
       const cleared = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: '' }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: '' }),
       });
       expect(cleared.status).toBe(200);
       expect(await cleared.json()).toMatchObject({ ok: true, turnTimeoutMs: null });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].turnTimeoutMs).toBeUndefined();
       expect(getBot(appId).config.turnTimeoutMs).toBeUndefined();
 
-      // Set it again, then switch away from dsh → non-dsh CLI drops the field.
+      // Set it again, then switch to an unsupported CLI → drops the field.
       await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'dsh', model: '', turnTimeoutMs: 900_000 }),
+        body: JSON.stringify({ cliId, model: '', turnTimeoutMs: 900_000 }),
       });
       const switched = await fetch(url, {
         method: 'PUT',
