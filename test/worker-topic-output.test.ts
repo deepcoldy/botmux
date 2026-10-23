@@ -91,6 +91,25 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe('worker final-output topic transport', () => {
+  it.each(['turn_budget_exhausted', 'execution_failed'])(
+    'renders MiniMax %s on the actual reply card and retains it in the result', async errorCode => {
+      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'minimax',
+        turnResults: { enabled: true }, replyCardMode: 'legacy' });
+      ds.session.cliId = 'minimax';
+      observeTurnResultTerminal(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_turn_old', status: 'failed', errorCode }, 1);
+      await new Promise<void>(resolve => deliverFinalOutput(ds, {
+        type: 'final_output', turnId: 'om_turn_old', content: 'native diagnostic', lastUuid: 'output-failure',
+        turnFailed: true, turnFailureCode: errorCode,
+      }, 'fixture', 0, () => resolve(), () => true, { mode: 'thread', rootMessageId: 'om_source' }));
+      const sent = JSON.parse(mocks.reply.mock.calls.at(-1)![0].data.content);
+      expect(sent.body.elements.find((element: any) => element.element_id === 'botmux_turn_error')?.content).toContain(errorCode);
+      const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+      expect(lookup).toMatchObject({ status: 'ready', result: {
+        execution: { status: 'failed', errorCode }, output: { status: 'unavailable' },
+      } });
+    },
+  );
   it.each([
     ['stale_worker', 'stale'],
     ['delivery_suppressed_for_turn', 'suppressed'],

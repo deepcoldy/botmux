@@ -65,6 +65,7 @@ export function observeTurnResultTerminal(
     runtime?.begin(binding);
     runtime?.terminal(binding, {
       status: terminal.status,
+      ...(terminal.errorCode !== undefined ? { errorCode: terminal.errorCode } : {}),
       ...(terminal.completedAtMs !== undefined && Number.isFinite(terminal.completedAtMs) && terminal.completedAtMs > 0
         ? { completedAt: new Date(terminal.completedAtMs).toISOString() } : {}),
       ...(Number.isSafeInteger(terminal.durationMs) && terminal.durationMs! >= 0 ? { durationMs: terminal.durationMs } : {}),
