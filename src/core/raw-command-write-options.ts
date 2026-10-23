@@ -10,13 +10,15 @@ export interface WorkerRawCommandWriteOptions extends RawCommandWriteOptions {
 }
 
 export function rawCommandWriteOptionsFor(
-  adapter: Pick<CliAdapter, 'id' | 'rawCommandInputMode' | 'rawCommandSettleMs'> | undefined,
+  adapter: Pick<CliAdapter, 'id' | 'rawCommandInputMode' | 'rawCommandSettleMs' | 'frameRawCommandLine'> | undefined,
   cliId: CliId | string | undefined,
 ): WorkerRawCommandWriteOptions {
   const options: WorkerRawCommandWriteOptions = {
     coco: cliId === 'coco',
     cocoThrottleMs: COCO_SLASH_TYPE_THROTTLE_MS,
     submitBeatMs: RAW_COMMAND_SUBMIT_BEAT_MS,
+    // Framed stdin runners: encode before every delivery variant.
+    ...(adapter?.frameRawCommandLine ? { frameLine: adapter.frameRawCommandLine } : {}),
   };
   if (options.coco) return options;
   if (

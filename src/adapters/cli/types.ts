@@ -371,6 +371,20 @@ export interface CliAdapter {
   readonly rawCommandInputMode?: 'paste-line';
   readonly rawCommandSettleMs?: number;
 
+  /**
+   * Encode a raw passthrough line (`raw_input` IPC — including v3 goal-mode's
+   * first dispatch) into this CLI's long-lived runner line protocol.
+   *
+   * Adapters whose CLI runs behind a stdin bridge (MiniMax Code's
+   * `minimax-runner`, …) only accept framed messages (`<prefix><base64>`); a
+   * literal line is rejected by the runner ("ignoring non-frame input").
+   * Ordinary turns already pass through {@link writeInput}, so this keeps the
+   * raw channel byte-compatible with it. Return the complete one-line frame
+   * WITHOUT a trailing newline (the writer submits it). Adapters that read
+   * literal PTY input leave this undefined.
+   */
+  readonly frameRawCommandLine?: (content: string) => string;
+
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
    *  "session closed" card so users have an obvious way to keep the

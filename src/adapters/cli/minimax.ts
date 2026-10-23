@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { writeRunnerInput } from './runner-input.js';
+import { encodeRunnerInput, writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
 import { locateExecutable } from '../../utils/executable.js';
@@ -117,6 +117,13 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     },
     writeInput(pty, content, context) {
       return writeRunnerInput(pty, '::botmux-minimax:', content, undefined, context?.turnId);
+    },
+    // v3 goal-mode and other raw_input dispatches bypass writeInput and type
+    // the line literally; this runner only speaks the framed protocol, so an
+    // unframed /goal/objective would be dropped with "ignoring non-frame
+    // input". Frame raw lines exactly like ordinary turns (no replyTurnId).
+    frameRawCommandLine(content) {
+      return `::botmux-minimax:${encodeRunnerInput(content)}`;
     },
     supportsTypeAhead: false,
     readyPattern: /^›\r?$/m,
