@@ -128,6 +128,32 @@ describe('TRAE messages merged into one native turn', () => {
     expect(queue.size()).toBe(0);
   });
 
+  it('a turn-bound id-less adopt turn ignores the same message replayed from another rollout path', () => {
+    // Late attach replays an id-less legacy user record first; its UserMessage
+    // mirror arrives in a later drain as a turn_bind that establishes the
+    // native (turn, message) identity. A resumed/rotated rollout segment then
+    // replays the SAME native message under a fresh uuid — the queue's
+    // logical-message dedup (shared across rollout paths, unlike the per-path
+    // drainer receipts) must suppress it instead of synthesizing a duplicate
+    // local turn that supersedes the bound one.
+    const queue = new CodexBridgeQueue();
+    queue.setLocalTurns(true, START);
+    const superseded: string[] = [];
+    queue.setCotSupersededObserver(turn => superseded.push(turn.turnId));
+    queue.ingest([{ kind: 'user', text: 'Task', uuid: 'legacy-user', timestampMs: START,
+      sourceSessionId: SID }]);
+    queue.ingest([{ kind: 'turn_bind', text: '', uuid: 'delayed-bind', timestampMs: START + 100,
+      sourceSessionId: SID, sourceTurnId: NATIVE, sourceMessageId: 'first' }]);
+    queue.ingest([{ kind: 'user', text: 'Task', uuid: 'replayed-from-next-segment',
+      timestampMs: START + 200, sourceSessionId: SID, sourceTurnId: NATIVE,
+      sourceMessageId: 'first' }]);
+    expect(queue.peek().map(turn => turn.turnId)).toEqual(['codex-local-legacy-user']);
+    expect(queue.peek()[0]).toEqual(expect.objectContaining({
+      sourceTurnId: NATIVE, sourceMessageId: 'first',
+    }));
+    expect(superseded).toEqual([]);
+  });
+
   it('an interrupted merged turn settles the latest input as ambiguous', () => {
     append(input('Task', 'first'), input('Correction', 'second', START + 1_000), terminal(START + 2_000, NATIVE, true));
     const queue = new CodexBridgeQueue();
