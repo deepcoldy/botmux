@@ -881,10 +881,13 @@ export class TmuxPipeBackend implements SessionBackend {
    *     per-second re-probes from every worker are themselves connect-storm fuel
    *     (each refused connect frees a backlog slot another worker instantly
    *     takes).
-   * Detection latency for a genuinely dead pane grows to ~13s worst-case, which
-   * is acceptable: writes still fail fast via guardedSend (its own probe fires
-   * teardown immediately when the pane is authoritatively gone), and adopt-mode
-   * pid-death above stays on the ≤ current-interval path.
+   * Detection latency for a genuinely dead pane grows to ~13s once the server
+   * answers 'missing', plus one more 9s period when an 'unknown' answer lands
+   * in between and resets the streak — e.g. a sole-session server probed in
+   * the few ms it spends exiting behind its last pane ("server exited
+   * unexpectedly"). That is acceptable: writes still fail fast via guardedSend
+   * (its own probe fires teardown immediately when the pane is authoritatively
+   * gone), and adopt-mode pid-death above stays on the ≤ current-interval path.
    */
   private nextProbeDelayMs(): number {
     if (this.probeSetbackStreak <= 0) return 1000;
