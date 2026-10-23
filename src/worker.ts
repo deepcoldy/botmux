@@ -4544,7 +4544,11 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
   if (traexAutoModelSwitching) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
   if (!controller.config.reselectPerTurn || controller.currentModelIndex() === 0) return false;
-  // The first-ever turn cannot have fallen back without an exact native id.
+  // commitSwitch can only be reached through executeTraexAutoModelSwitch,
+  // which requires the exact native id before advancing the pool index.
+  // Restoring an index also requires validTraexAutoModelRuntime's native id.
+  // Thus index > 0 without cliSessionId is unreachable in a managed runtime;
+  // keep the fail-closed guard for inconsistent future restore paths.
   if (!lastInitConfig?.cliSessionId) return true;
   const action = controller.beginTurn(head.turnId);
   return action.kind === 'switch'
@@ -16541,9 +16545,89 @@ function traexAutoModelInputHold(): boolean {
   return traexAutoModelRuntimeEligible() && (
     traexAutoModelSwitching
     || traexAutoModelController?.awaitingModelActivity() === true
-    || (!isPromptReady && !!backend
+    // Other native screen backends retain their existing admission path.
+    // tmux uses fresh async reads below; PTY uses the drained renderer.
+    || (!isPromptReady && !!backend && !backend.captureViewportAsync
+      && !!(backend.captureViewport || backend.captureCurrentScreen)
       && traexCapacityQueueVisible(captureBackendScreen(backend).trimEnd()))
   );
+}
+
+let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
+
+/** Unknown/stale reads must retain the input and remain live even when a
+ * static screen emits no further output. One bounded retry drives the normal
+ * flush guards again; it never replays a dequeued or ambiguous submission. */
+function retryTraexAutoModelAdmission(): void {
+  if (traexAutoModelAdmissionRetry) return;
+  traexAutoModelAdmissionRetry = setTimeout(() => {
+    traexAutoModelAdmissionRetry = undefined;
+    if (traexAutoModelRuntimeEligible() && backend && pendingMessages.length > 0) void flushPending();
+  }, 200);
+  traexAutoModelAdmissionRetry.unref();
+}
+
+/** Called under isFlushing, immediately before taking ONE queue head.
+ * Cached revisions cannot prove an external tmux viewport has not changed.
+ * Authorize only a fresh read and its captured input/generation/turn; the
+ * next item must obtain its own read after the preceding write settles. */
+async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<boolean> {
+  if (!traexAutoModelRuntimeEligible()) return true;
+  const target = backend;
+  const controller = traexAutoModelController;
+  const generation = cliSpawnGeneration;
+  const turnId = currentBotmuxTurnId;
+  const poolTurnId = controller?.currentTurnId();
+  const targetRenderer = renderer;
+  const revision = backendScreenRevision;
+  const gridRevision = observedPaneGridRevision;
+  const current = () => backend === target && cliSpawnGeneration === generation
+    && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
+    && currentBotmuxTurnId === turnId && pendingMessages[0] === item
+    && renderer === targetRenderer && !cliRestartInProgress
+    && !traexAutoModelSwitching && traexAutoModelRuntimeEligible();
+  const hold = () => {
+    retryTraexAutoModelAdmission();
+    return false;
+  };
+  if (!target || !current()
+    || (controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
+  // Keep other native screen/history backends on their existing admission
+  // contract. Do not disguise their synchronous capture as an async read.
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()
+    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) return true;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = async (): Promise<string> => {
+      if (target.captureViewportAsync) return target.captureViewportAsync();
+      if (!targetRenderer) return '';
+      await targetRenderer.writeAndFlush('');
+      return targetRenderer.rawSnapshot();
+    };
+    const screen = (await Promise.race([
+      read(),
+      new Promise<string>(resolve => { timeout = setTimeout(() => resolve(''), 1_200); }),
+    ])).trimEnd();
+    if (!current() || backendScreenRevision !== revision || observedPaneGridRevision !== gridRevision
+      || commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight()
+      || currentInputDeliveryQuarantine() || currentPostTerminalInputFence()
+      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)
+      || (controller?.awaitingModelActivity()
+        && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
+    if (!screen || traexCapacityQueueVisible(screen)) return hold();
+    // Absence of Queued is insufficient: empty/skeleton/unknown frames cannot
+    // grant input. Use positive model activity or the actual composer marker;
+    // readyPattern's Context percentage is also present on queue screens.
+    if (cliAdapter?.startupPendingPattern?.test(screen)) return hold();
+    return traexModelProgressVisible(screen)
+      || /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/.test(screen)
+      || hold();
+  } catch {
+    return hold();
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
@@ -16872,6 +16956,8 @@ async function flushPending(): Promise<void> {
           || cliRestartInProgress) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
+      if (traexAutoModelRuntimeEligible()
+        && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       attachDeferredPluginSkillCatalog(item);

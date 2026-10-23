@@ -24,7 +24,7 @@
  * subscription, which is automatically detached when we kill the backend.
  */
 import * as fs from 'node:fs';
-import { execSync, execFileSync, spawnSync } from 'node:child_process';
+import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -1390,6 +1390,23 @@ export class TmuxPipeBackend implements SessionBackend {
   captureViewport(): string {
     // No `-S`/`-E` flags = tmux default = current viewport only.
     return this.captureWithBounds('');
+  }
+
+  /** Input admission needs current cells, not ANSI seeding/cursor modes.
+   * One async native read also avoids captureWithBounds' synchronous mode
+   * query. Never use the pipe renderer as a substitute: tmux can repaint
+   * before Node has consumed the corresponding FIFO data callback. */
+  captureViewportAsync(): Promise<string> {
+    if (this.exited) return Promise.resolve('');
+    return new Promise((resolve, reject) => {
+      execFile('tmux', [...this.tmuxArgs, 'capture-pane', '-p', '-t', this.paneTarget], {
+        encoding: 'utf8', timeout: 1_000, killSignal: 'SIGKILL',
+        maxBuffer: 1024 * 1024, env: tmuxEnv(),
+      }, (error, stdout) => {
+        if (error) reject(error);
+        else resolve(this.exited ? '' : stdout);
+      });
+    });
   }
 
   captureInputState(): {

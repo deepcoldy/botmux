@@ -5,6 +5,13 @@ import { knownTraexReasoningEffortsForModel } from '../src/services/codex-reason
 import { buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { execFileSync } from 'node:child_process';
+import { createReadStream, mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { traexCapacityQueueVisible, traexModelProgressVisible } from '../src/adapters/cli/traex.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 function harness(extra: Record<string, unknown> = {}) {
   const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: true });
@@ -29,6 +36,27 @@ function harness(extra: Record<string, unknown> = {}) {
   return { scope, controller, tracker, switchModel: loadWorkerFunction<(action: any, options: any) => boolean>('executeTraexAutoModelSwitch', scope) };
 }
 const action = { kind: 'switch', reason: 'lowest_load', turnId: 'turn', fromModel: 'core', toModel: 'backup', toIndex: 1, loadPercent: 120 };
+
+function admissionHarness(extra: Record<string, unknown> = {}) {
+  const item = { content: 'follow-up', turnId: 'next', trustedCaller: { requestUserOpenId: 'original-caller' } };
+  const scope: Record<string, any> = {
+    traexAutoModelRuntimeEligible: () => true, traexAutoModelSwitching: false,
+    backend: { captureViewportAsync: vi.fn(async () => '◆ Working… (2s • esc to interrupt)') },
+    traexAutoModelController: new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 }),
+    cliSpawnGeneration: 1, currentBotmuxTurnId: 'turn', pendingMessages: [item],
+    renderer: null, backendScreenRevision: 0, observedPaneGridRevision: 0,
+    cliRestartInProgress: false, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    commandLineWritesPending: 0, injectionFlushing: false, sessionRenameInFlight: () => false,
+    currentInputDeliveryQuarantine: () => null, activeTurnBlocks: () => false,
+    currentPostTerminalInputFence: () => null, pendingInjections: [], shouldDeferUserFlush: () => false,
+    retryTraexAutoModelAdmission: vi.fn(), traexCapacityQueueVisible,
+    traexModelProgressVisible,
+    captureBackendScreen: (be: any) => be.captureViewport?.() ?? '',
+    ...extra,
+  };
+  const admit = loadWorkerFunction<(item: any) => Promise<boolean>>('admitTraexAutoModelPendingInput', scope);
+  return { scope, item, admit: () => admit(scope.pendingMessages[0]) };
+}
 
 describe('auto-model Worker admission and original-input retirement', () => {
   it('recovers the actual live model and its settings after a worker upgrade, and persists a same-model hold change', () => {
@@ -119,6 +147,193 @@ describe('auto-model Worker admission and original-input retirement', () => {
 
 
 describe('Auto live follow-up input policy', () => {
+  it.each([
+    { backend: {} }, { cliSpawnGeneration: 2 }, { currentBotmuxTurnId: 'other' },
+    { renderer: {} }, { backendScreenRevision: 1 }, { observedPaneGridRevision: 1 },
+    { cliRestartInProgress: true }, { traexAutoModelSwitching: true },
+    { commandLineWritesPending: 1 }, { injectionFlushing: true },
+    { sessionRenameInFlight: () => true }, { currentInputDeliveryQuarantine: () => ({}) },
+    { currentPostTerminalInputFence: () => ({}) }, { shouldDeferUserFlush: () => true },
+    { activeTurnBlocks: () => true },
+  ])('rejects a late healthy read after its admission boundary changed (%j)', async changed => {
+    let finish!: (screen: string) => void;
+    const h = admissionHarness({ backend: { captureViewportAsync: () => new Promise<string>(resolve => { finish = resolve; }) } });
+    const pending = h.admit();
+    Object.assign(h.scope, changed);
+    finish('◆ Working… (2s • esc to interrupt)');
+    expect(await pending).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+    expect(h.item.trustedCaller.requestUserOpenId).toBe('original-caller');
+    expect(h.scope.retryTraexAutoModelAdmission).toHaveBeenCalledOnce();
+  });
+
+  it.each(['head', 'pool'])('rejects a read for a replaced %s identity', async replaced => {
+    let finish!: (screen: string) => void;
+    const h = admissionHarness({ backend: { captureViewportAsync: () => new Promise<string>(resolve => { finish = resolve; }) } });
+    const pending = h.admit();
+    if (replaced === 'head') h.scope.pendingMessages[0] = { content: 'new', turnId: 'replacement' };
+    else h.scope.traexAutoModelController.beginTurn('replacement');
+    finish('◆ Working… (2s • esc to interrupt)');
+    expect(await pending).toBe(false);
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it('uses a separate fresh read for each consecutive input', async () => {
+    const h = admissionHarness();
+    const capture = h.scope.backend.captureViewportAsync;
+    capture.mockResolvedValueOnce('◆ Working… (2s • esc to interrupt)')
+      .mockResolvedValueOnce('◆ Queued for capacity (20s • esc to interrupt)');
+    expect(await h.admit()).toBe(true);
+    h.scope.pendingMessages.shift();
+    h.scope.pendingMessages.push({ content: 'third', turnId: 'third' });
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.pendingMessages[0].content).toBe('third');
+  });
+
+  it.each(['', 'unrecognized frame', '│ model: loading │\n❯ Ask anything', 'error', 'timeout'])(
+    'retains unreadable input and retries successfully after %s', async frame => {
+      vi.useFakeTimers();
+      try {
+        const read = vi.fn(() => frame === 'error' ? Promise.reject(new Error('capture failed'))
+          : frame === 'timeout' ? new Promise<string>(() => {})
+          : Promise.resolve(frame));
+        const h = admissionHarness({ backend: { captureViewportAsync: read },
+          cliAdapter: { startupPendingPattern: /│[ \t]+model:[ \t]+loading\b/ } });
+        const pending = h.admit();
+        if (frame === 'timeout') await vi.advanceTimersByTimeAsync(1_201);
+        expect(await pending).toBe(false);
+        expect(h.scope.pendingMessages).toEqual([h.item]);
+        expect(h.scope.retryTraexAutoModelAdmission).toHaveBeenCalledOnce();
+        read.mockImplementation(() => Promise.resolve('❯ Ask anything'));
+        expect(await h.admit()).toBe(true);
+        expect(h.scope.pendingMessages).toEqual([h.item]);
+      } finally { vi.useRealTimers(); }
+    });
+
+  it('drains actual xterm parsing before judging a PTY repaint', async () => {
+    const renderer = new TerminalRenderer(100, 24);
+    try {
+      const h = admissionHarness({ backend: {}, renderer });
+      await renderer.writeAndFlush('◆ Working… (2s • esc to interrupt)');
+      expect(await h.admit()).toBe(true);
+      renderer.write('\x1b[2J\x1b[H◆ Queued for capacity (20s • esc to interrupt)');
+      expect(await h.admit()).toBe(false);
+      expect(h.scope.pendingMessages).toEqual([h.item]);
+      renderer.write('\x1b[2J\x1b[H◆ Working… (3s • esc to interrupt)');
+      expect(await h.admit()).toBe(true);
+    } finally { renderer.dispose(); }
+  });
+
+  it('only admits the attributed recovery while waiting for first model activity', async () => {
+    const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    h.scope.traexAutoModelController.beginTurn('turn');
+    h.scope.traexAutoModelController.commitSwitch(action);
+    expect(await h.admit()).toBe(false);
+    Object.assign(h.item, { traexAutoModelRecovery: true, turnId: 'turn', noReplay: true });
+    expect(await h.admit()).toBe(true);
+    expect(h.item).toMatchObject({ noReplay: true, trustedCaller: { requestUserOpenId: 'original-caller' } });
+  });
+
+  it('does not release a healthy read if recovery starts while it is in flight', async () => {
+    let finish!: (screen: string) => void;
+    const h = admissionHarness({ backend: { captureViewportAsync: () => new Promise<string>(resolve => { finish = resolve; }) } });
+    h.scope.traexAutoModelController.beginTurn('turn');
+    const pending = h.admit();
+    h.scope.traexAutoModelController.commitSwitch(action);
+    finish('◆ Working… (2s • esc to interrupt)');
+    expect(await pending).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+  });
+
+  it('re-drives one held queue without replaying a consumed item', async () => {
+    vi.useFakeTimers();
+    const scope = { traexAutoModelAdmissionRetry: undefined, traexAutoModelRuntimeEligible: () => true,
+      backend: {}, pendingMessages: [{}], flushPending: vi.fn() };
+    try {
+      const retry = loadWorkerFunction<() => void>('retryTraexAutoModelAdmission', scope);
+      retry(); retry();
+      await vi.advanceTimersByTimeAsync(201);
+      expect(scope.flushPending).toHaveBeenCalledOnce();
+      retry();
+      scope.pendingMessages.length = 0;
+      await vi.advanceTimersByTimeAsync(201);
+      expect(scope.flushPending).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('holds a queued native viewport before ordinary FIFO delivery advances the Worker revision', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'auto-admission-'));
+    const socket = `auto-admission-${process.pid}-${Date.now()}`;
+    const fifo = join(root, 'output');
+    const originalPath = process.env.PATH;
+    const tmux = (...args: string[]) => execFileSync('tmux', ['-L', socket, ...args], { encoding: 'utf8', timeout: 2_000 });
+    let reader: ReturnType<typeof createReadStream> | undefined;
+    try {
+      tmux('new-session', '-d', '-s', 'test', '-x', '100', '-y', '24',
+        'stty -echo; while IFS= read -r line; do printf "\\033[2J\\033[H%s\\r\\n" "$line"; done');
+      execFileSync('mkfifo', [fifo]);
+      reader = createReadStream(fifo, { flags: 'r+' });
+      let revision = 0;
+      reader.on('data', () => { revision++; });
+      tmux('pipe-pane', '-O', '-t', 'test:0.0', `cat > '${fifo}'`);
+      const be = new TmuxPipeBackend('test:0.0', { socketName: socket });
+      const repaint = (frame: string) => {
+        tmux('send-keys', '-t', 'test:0.0', '-l', frame);
+        tmux('send-keys', '-t', 'test:0.0', 'Enter');
+        const deadline = Date.now() + 2_000;
+        while (!tmux('capture-pane', '-p', '-t', 'test:0.0').includes(frame)) {
+          if (Date.now() > deadline) throw new Error('native repaint did not arrive');
+        }
+      };
+      const h = admissionHarness({ backend: be });
+      repaint('◆ Working… (2s • esc to interrupt)');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const cachedAdmission = await h.admit();
+      const before = revision;
+      repaint('◆ Queued for capacity (20s • esc to interrupt)');
+      expect(revision).toBe(before);
+      expect(cachedAdmission).toBe(true);
+      expect(await h.admit()).toBe(false);
+      expect(h.scope.pendingMessages).toEqual([h.item]);
+      const started = performance.now();
+      let ticks = 0;
+      const heartbeat = setInterval(() => { ticks++; }, 5);
+      try {
+        for (let i = 0; i < 30; i++) expect(await h.admit()).toBe(false);
+      } finally { clearInterval(heartbeat); }
+      expect(ticks).toBeGreaterThan(0);
+      console.log(JSON.stringify({ measurement: 'async-auto-admission', count: 30, elapsedMs: performance.now() - started, heartbeatTicks: ticks }));
+
+      // Slow the client before forwarding to the same real tmux server.
+      // A timer wrapping sync capture would still freeze this heartbeat.
+      const tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
+      const wrapper = join(root, 'tmux');
+      writeFileSync(wrapper, `#!/bin/sh\nsleep 0.2\nexec '${tmuxBin.replaceAll("'", "'\\''")}' "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+      let slowTicks = 0;
+      const slowHeartbeat = setInterval(() => { slowTicks++; }, 5);
+      const slowStarted = performance.now();
+      try {
+        expect(await h.admit()).toBe(false);
+      } finally { clearInterval(slowHeartbeat); }
+      expect(slowTicks).toBeGreaterThan(5);
+      console.log(JSON.stringify({ measurement: 'slow-native-client', elapsedMs: performance.now() - slowStarted, heartbeatTicks: slowTicks }));
+      writeFileSync(wrapper, '#!/bin/sh\nexit 77\n');
+      expect(await h.admit()).toBe(false);
+      expect(h.scope.pendingMessages).toEqual([h.item]);
+      process.env.PATH = originalPath;
+      repaint('◆ Working… (3s • esc to interrupt)');
+      expect(await h.admit()).toBe(true);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      reader?.destroy();
+      try { tmux('kill-server'); } catch { /* isolated server already gone */ }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('holds follow-ups through the resumed continuation until its first model activity', async () => {
     const { traexCapacityQueueVisible, traexModelProgressVisible } = await import('../src/adapters/cli/traex.js');
     const h = harness();
@@ -140,17 +355,21 @@ describe('Auto live follow-up input policy', () => {
   });
 
   it.each([
-    { eligible: true, switching: false, ready: false, screen: 'Working…', hold: false },
-    { eligible: true, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' + '\n'.repeat(50), hold: true },
-    { eligible: true, switching: true, ready: true, screen: '', hold: true },
-    { eligible: true, switching: false, ready: true, screen: '◆ Queued for capacity (20s • esc to interrupt)' , hold: false },
-    { eligible: false, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' , hold: false },
-  ])('holds only an active Auto capacity transition (%j)', async ({ eligible, switching, ready, screen, hold }) => {
+    { eligible: true, switching: false, ready: false, screen: 'Working…', hold: false, admitted: true },
+    { eligible: true, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' + '\n'.repeat(50), hold: false, admitted: false },
+    { eligible: true, switching: true, ready: true, screen: '', hold: true, admitted: false },
+    { eligible: true, switching: false, ready: true, screen: '◆ Queued for capacity (20s • esc to interrupt)', hold: false, admitted: false },
+    { eligible: false, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)', hold: false, admitted: true },
+  ])('keeps synchronous policy screen-free while async admission fences capacity (%j)', async ({ eligible, switching, ready, screen, hold, admitted }) => {
     const { traexCapacityQueueVisible } = await import('../src/adapters/cli/traex.js');
     const scope = { traexAutoModelRuntimeEligible: () => eligible,
       traexAutoModelSwitching: switching, isPromptReady: ready, backend: {},
-      captureBackendScreen: () => screen, traexCapacityQueueVisible };
+      captureBackendScreen: vi.fn(() => { throw new Error('synchronous hot-path capture'); }), traexCapacityQueueVisible };
     expect(loadWorkerFunction<() => boolean>('traexAutoModelInputHold', scope)()).toBe(hold);
+    expect(scope.captureBackendScreen).not.toHaveBeenCalled();
+    const h = admissionHarness({ traexAutoModelRuntimeEligible: () => eligible, traexAutoModelSwitching: switching,
+      backend: { captureViewportAsync: async () => screen.replace(/^Working/, '◆ Working') } });
+    expect(await h.admit()).toBe(admitted);
   });
 
   it.each([false, true])('lets a running follow-up keep its current model (reselect=%s)', reselectPerTurn => {

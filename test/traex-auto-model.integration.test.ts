@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -33,7 +34,7 @@ function rows(path: string): any[] {
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
-  freshStart = false) {
+  freshStart = false, activityMode?: 'working' | 'queue-after-second') {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -87,7 +88,7 @@ fs.appendFileSync(${JSON.stringify(launches)}, JSON.stringify({ model, args: pro
 process.stdin.setRawMode?.(true);
 process.stdin.setEncoding('utf8');
 process.stdout.write('\\x1b[?2004h');
-let input = '', pasted = '', submitted = false, completed = false;
+let input = '', pasted = '', submitted = false, completed = false, submissionCount = 0;
 let turnId;
 const startedAt = Date.now();
 function line(payload) { fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
@@ -120,7 +121,10 @@ process.stdin.on('data', chunk => {
     fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
-    queued();
+    submissionCount++;
+    if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working')} || submissionCount === 1)) {
+      process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
+    } else queued();
   }
 });
 setInterval(() => {
@@ -145,9 +149,35 @@ setInterval(() => {
       CLI_EXTRA_ARGS: startupExtraArgs ?? '', SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
   };
-  const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
+  let entry = resolve('src/worker.ts');
+  if (activityMode && !binary) {
+    // Observe the real Worker loop and native captures without changing their
+    // behavior. The bootstrap lives inside this fixture's already-cleaned root.
+    entry = join(root, 'observed-worker.mts');
+    writeFileSync(entry, `
+let previous = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  if (process.connected) process.send?.({ type: 'admission_heartbeat', atMs: Date.now(), gapMs: now - previous });
+  previous = now;
+}, 5).unref();
+const { TmuxPipeBackend } = await import(${JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href)});
+const capture = TmuxPipeBackend.prototype.captureViewportAsync;
+TmuxPipeBackend.prototype.captureViewportAsync = async function () {
+  const started = performance.now();
+  try { return await capture.call(this); }
+  finally { if (process.connected) process.send?.({ type: 'admission_capture', elapsedMs: performance.now() - started }); }
+};
+await import(${JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href)});
+`);
+  }
+  const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
   children.push(child);
-  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  const measurements: any[] = [];
+  child.on('message', (raw: any) => {
+    if (raw.type === 'admission_heartbeat' || raw.type === 'admission_capture') measurements.push(raw);
+    else messages.push(raw as WorkerToDaemon);
+  });
   child.stdout?.on('data', chunk => logs.push(chunk.toString()));
   child.stderr?.on('data', chunk => logs.push(chunk.toString()));
   async function wait(predicate: () => boolean, description: string, timeout = 35_000) {
@@ -175,10 +205,53 @@ setInterval(() => {
   child.send(init);
   if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
   else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init };
+  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('submits healthy running follow-ups in order on the current model', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'working');
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    const started = performance.now();
+    const heartbeatStartMs = Date.now();
+    f.measurements.length = 0;
+    f.child.send({ type: 'message', content: 'healthy correction one', turnId: 'om_one' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'healthy correction two', turnId: 'om_two' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 3, 'both running corrections');
+    const elapsedMs = performance.now() - started;
+    expect(elapsedMs).toBeLessThan(1_500);
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'healthy correction one', 'healthy correction two',
+    ]);
+    expect(rows(f.submissions).slice(1).every(row => !row.text.includes('botmux_skills_refresh'))).toBe(true);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    const heartbeats = f.measurements.filter(row => row.type === 'admission_heartbeat' && row.atMs >= heartbeatStartMs);
+    const captures = f.measurements.filter(row => row.type === 'admission_capture').map(row => row.elapsedMs);
+    if (!process.env.BOTMUX_TEST_WORKER_BINARY) expect(heartbeats.length).toBeGreaterThan(0);
+    console.log(JSON.stringify({ measurement: 'real-worker-running-additions',
+      backend: process.env.BOTMUX_TEST_WORKER_BACKEND ?? 'pty', count: 2, elapsedMs,
+      heartbeatTicks: heartbeats.length, maxHeartbeatGapMs: Math.max(0, ...heartbeats.map(row => row.gapMs)),
+      captureCount: captures.length, captureMs: captures }));
+  }, 45_000);
+
+  it('keeps a successive input queued after the preceding write changes Working to capacity', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'queue-after-second');
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    await new Promise(resolveWait => setTimeout(resolveWait, 1_000));
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity',
+    ]);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => rows(f.submissions).length === 3, 'held input after composer');
+    expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
+  }, 45_000);
+
   it('preserves a fresh topic selection, final wait and catalog across an in-worker restart', async () => {
     const f = await fixture(true, 'busy', false, undefined, false, undefined, true);
     expect(f.init.resume).toBe(false);
