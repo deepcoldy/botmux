@@ -51,6 +51,35 @@ describe('native invitation identity extraction', () => {
   it.each([native, { event: native }, { data: { event: native } }])('extracts only a real human inviter, retaining event provenance', data => {
     expect(parse(data).inviter).toEqual({ openId: 'ou_inviter', invitedAt: now });
   });
+  const withoutInviteTime = { event_id: 'evt_no_time', inviter: native.inviter, meeting: native.meeting };
+  it.each([
+    { ...withoutInviteTime, header: { create_time: String(now) } },
+    { header: { create_time: String(now) }, event: withoutInviteTime },
+    { header: { create_time: String(now) }, data: { event: withoutInviteTime } },
+  ])('rejects envelope-only invitation time through parser and grant policy: %#', data => {
+    const parsed = parse(data);
+    expect(parsed.inviter).toEqual({ openId: 'ou_inviter' });
+    expect(parsed.occurredAtMs).toBe(now); // General event timing remains available, not authority.
+    expect(createVcMeetingInviterGrant(policy, { ...parsed.inviter!, eventId: parsed.eventId }, now)).toBeUndefined();
+  });
+  it('does not substitute a fresh envelope for malformed invite_time', () => {
+    const parsed = parse({ header: { create_time: String(now) }, event: { ...native, invite_time: 'not-a-time' } });
+    expect(parsed.inviter?.invitedAt).toBeUndefined();
+    expect(createVcMeetingInviterGrant(policy, { ...parsed.inviter!, eventId: parsed.eventId }, now)).toBeUndefined();
+  });
+  it('grants a valid native invitation using invite_time rather than envelope time', () => {
+    const invitedAt = now - 500;
+    const parsed = parse({ header: { create_time: String(now) }, event: { ...native, invite_time: String(invitedAt) } });
+    expect(parsed.inviter).toEqual({ openId: 'ou_inviter', invitedAt });
+    expect(createVcMeetingInviterGrant(policy, { ...parsed.inviter!, eventId: parsed.eventId }, now))
+      .toEqual({ openId: 'ou_inviter', eventId: native.event_id, invitedAt,
+        policyEnabledAt: policy.inviterManagementEnabledAt, memberReady: false });
+  });
+  it('rejects a native invitation before enable even when its envelope is fresh', () => {
+    const parsed = parse({ header: { create_time: String(now) }, event: { ...native, invite_time: String(now - 2000) } });
+    expect(parsed.inviter?.invitedAt).toBe(now - 2000);
+    expect(createVcMeetingInviterGrant(policy, { ...parsed.inviter!, eventId: parsed.eventId }, now)).toBeUndefined();
+  });
   it('does not promote hosts, names, bots, other ID types or non-invitation events', () => {
     expect(parse({ meeting: { host_user: { open_id: 'ou_host' } } }).inviter).toBeUndefined();
     expect(parse({ ...native, inviter: { id: 'on_other', user_type: 1 } }).inviter).toBeUndefined();
