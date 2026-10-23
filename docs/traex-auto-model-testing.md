@@ -43,5 +43,6 @@ BOTMUX_TEST_WORKER_BINARY=/tmp/botmux-auto-model \
 4. 换模型前后原生会话 ID 相同，已有图片及历史保留，原问题不重发。恢复画面只有原生空输入框与模型/Context 状态栏时也能续接；忙碌、排队、草稿及选择器不能误触发提交。
 5. 启用 Auto 自动适配当前托管 TraeX 的终端输入，不改 Bot 已保存的 RPC 偏好；关闭后恢复该偏好。其他 Bot、具体模型调用、wrapper、adopt 和共享 App Server 不套用 Auto。
 6. 新版独立 tmux socket 下，冷创建与模型切换都在正确的 managed server 上；升级重新观察仍存活的旧默认 server 会话时保持其原有 pane。
+7. 新话题从首选切到备选或最终等待模型后执行 `/restart`，应续接同一原生会话并保持模型、档位和最终等待状态；未变化的 Skill 目录不重复交付。再次输入仍在该模型执行，除非显式开启每轮重新择优。
 
 新启动或重启会话加载配置。部署本地测试构建前备份配置和会话数据库，重启后分别核对磁盘版本、运行进程、原生会话 ID、tmux pane PID 以及 Dashboard HTTP。手动 `botmux upgrade` 会替换本地测试包，正式版本是否包含此功能应以合入状态为准。

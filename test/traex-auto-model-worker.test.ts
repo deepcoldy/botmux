@@ -119,6 +119,26 @@ describe('auto-model Worker admission and original-input retirement', () => {
 
 
 describe('Auto live follow-up input policy', () => {
+  it('holds follow-ups through the resumed continuation until its first model activity', async () => {
+    const { traexCapacityQueueVisible, traexModelProgressVisible } = await import('../src/adapters/cli/traex.js');
+    const h = harness();
+    h.controller.commitSwitch(action);
+    let frame = '❯ Ask anything';
+    Object.assign(h.scope, { isPromptReady: false, backend: {}, commandLineWritesPending: 0,
+      currentBotmuxTurnId: 'turn', captureBackendScreen: () => frame,
+      traexCapacityQueueVisible, traexModelProgressVisible, traexCapacityQueuePosition: () => undefined,
+      flushPending: vi.fn(async () => {}), publishActiveRuntime: vi.fn() });
+    const hold = loadWorkerFunction<() => boolean>('traexAutoModelInputHold', h.scope);
+    const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
+    expect(hold()).toBe(true);
+    observe(frame);
+    expect(hold()).toBe(true);
+    frame = '◆ Working… (2s • esc to interrupt)';
+    observe(frame);
+    expect(hold()).toBe(false);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { eligible: true, switching: false, ready: false, screen: 'Working…', hold: false },
     { eligible: true, switching: false, ready: false, screen: '◆ Queued for capacity (20s • esc to interrupt)' + '\n'.repeat(50), hold: true },
@@ -300,6 +320,78 @@ describe('Auto input and shared-setting continuity', () => {
 
 
 describe('same-worker Auto restart model continuity', () => {
+  it.each([
+    { cliId: 'traex', resume: true, cliSessionId: 'native', eligible: true, preserved: true },
+    { cliId: 'traex', resume: true, cliSessionId: 'other', eligible: true, preserved: false },
+    { cliId: 'traex', resume: true, cliSessionId: undefined, eligible: true, preserved: false },
+    { cliId: 'traex', resume: false, cliSessionId: 'native', eligible: true, preserved: false },
+    { cliId: 'traex', resume: true, cliSessionId: 'native', eligible: false, preserved: false },
+    { cliId: 'claude-code', resume: true, cliSessionId: 'native', eligible: false, preserved: false },
+  ])('passes the delivered catalog only to an eligible same-session Auto resume (%j)', ({ eligible, preserved, ...cfg }) => {
+    const prepare = vi.fn(() => ({ prompt: '', diagnostics: [], pluginManifest: { pluginIds: [] } }));
+    const scope = { lastInitConfig: { cliSessionId: 'native' },
+      traexAutoModelRuntimeEligible: () => eligible,
+      deliveredPluginSkillCatalogFingerprint: 'delivered',
+      resolvePluginGenerationBot: () => ({ larkAppId: 'app' }), readGlobalConfig: () => ({}),
+      prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } }, log: vi.fn() };
+    loadWorkerFunction<(cfg: any, adapter: any) => void>('refreshCliPluginGeneration', scope)(
+      { ...cfg, sessionId: 'session', workingDir: '/workspace', prompt: '' }, { id: cfg.cliId });
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
+      previousSkillCatalogFingerprint: preserved ? 'delivered' : undefined,
+    }));
+  });
+
+  const pool = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 5_000 };
+  function waitingController() {
+    const controller = new TraexAutoModelController(pool, undefined,
+      { reasoningEffort: 'low', modelBackendVariant: 'standard' });
+    controller.beginTurn('turn');
+    expect(controller.commitSwitch(action)).toBe(true);
+    return controller;
+  }
+
+  it.each([undefined, false, true])('restores a validated runtime independently of the original resume flag (%s)', resume => {
+    const runtime = { ...waitingController().runtimeState('native'), skillCatalogFingerprint: 'delivered' };
+    const cfg = { cliId: 'traex', cliSessionId: 'native', resume, model: 'auto', prompt: '',
+      traexAutoModel: pool, traexAutoModelRuntime: runtime };
+    const scope: Record<string, any> = { lastInitConfig: { ...cfg }, traexAutoModelController: null,
+      TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
+    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    expect(cfg).toMatchObject({ model: 'backup', reasoningEffort: 'low', modelBackendVariant: 'standard' });
+    expect(scope.lastInitConfig.model).toBe('backup');
+    expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ waitingOnFinalModel: true });
+    expect(scope.deliveredPluginSkillCatalogFingerprint).toBe('delivered');
+    scope.traexAutoModelController.beginTurn('next');
+    expect(scope.traexAutoModelController.observeCapacityQueue({ turnId: 'next', queued: true, nowMs: 0 })).toEqual({ kind: 'none' });
+    expect(scope.traexAutoModelController.observeCapacityQueue({ turnId: 'next', queued: true, nowMs: 60_000 })).toEqual({ kind: 'none' });
+  });
+
+  it.each([false, true])('preserves the live model, hold and newest catalog across a restart IPC configuration (%s)', resume => {
+    const stale = { ...new TraexAutoModelController(pool).runtimeState('native'), skillCatalogFingerprint: 'old-catalog' };
+    const lastInitConfig = { cliId: 'traex', cliSessionId: 'native', resume, model: 'core', prompt: 'original ask',
+      traexAutoModel: pool, traexAutoModelRuntime: stale };
+    const scope: Record<string, any> = { lastInitConfig, traexAutoModelController: waitingController(),
+      deliveredPluginSkillCatalogFingerprint: 'new-catalog',
+      TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
+    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)({ ...lastInitConfig, prompt: '' });
+    expect(lastInitConfig.model).toBe('backup');
+    expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ model: 'backup', waitingOnFinalModel: true });
+    expect(scope.deliveredPluginSkillCatalogFingerprint).toBe('new-catalog');
+  });
+
+  it.each([
+    { nativeSessionId: 'another-native' }, { policyKey: 'different-policy' }, { model: 'outside' },
+  ])('rejects an unrelated runtime without adopting its catalog (%j)', changed => {
+    const cfg = { cliId: 'traex', cliSessionId: 'native', resume: true, model: 'auto', prompt: '', traexAutoModel: pool,
+      traexAutoModelRuntime: { ...waitingController().runtimeState('native'), skillCatalogFingerprint: 'unrelated', ...changed } };
+    const scope: Record<string, any> = { lastInitConfig: cfg, traexAutoModelController: null,
+      TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
+    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    expect(cfg.model).toBe('core');
+    expect(scope.traexAutoModelController.runtimeState('native').waitingOnFinalModel).toBe(false);
+    expect(scope.deliveredPluginSkillCatalogFingerprint).toBeUndefined();
+  });
+
   it('retains the selected model when fresh init did not set resume=true', () => {
     const pool = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 5_000 };
     const controller = new TraexAutoModelController(pool);

@@ -32,7 +32,8 @@ function rows(path: string): any[] {
 }
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
-  rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string) {
+  rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
+  freshStart = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -77,6 +78,11 @@ const model = process.argv[process.argv.indexOf('--model') + 1];
 const nativeId = ${JSON.stringify(nativeId)};
 const release = ${JSON.stringify(release)};
 const rollout = ${JSON.stringify(rolloutPath)};
+// Fresh-session discovery follows the native CLI's open rollout descriptor.
+const rolloutFd = fs.openSync(rollout, 'a');
+if (!process.argv.includes('resume')) fs.writeSync(rolloutFd, JSON.stringify({
+  type: 'session_meta', payload: { id: nativeId, cwd: process.cwd() },
+}) + '\\n');
 fs.appendFileSync(${JSON.stringify(launches)}, JSON.stringify({ model, args: process.argv.slice(2) }) + '\\n');
 process.stdin.setRawMode?.(true);
 process.stdin.setEncoding('utf8');
@@ -84,7 +90,7 @@ process.stdout.write('\\x1b[?2004h');
 let input = '', pasted = '', submitted = false, completed = false;
 let turnId;
 const startedAt = Date.now();
-function line(payload) { fs.appendFileSync(rollout, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
+function line(payload) { fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
 function idle() {
   if (${JSON.stringify(restoreWithoutBanner)} && model !== 'core') {
     if (Date.now() - startedAt < 400) {
@@ -153,9 +159,9 @@ setInterval(() => {
     }
     throw new Error(`timeout: ${description}\n${logs.join('')}`);
   }
-  child.send({ type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: nativeId,
-    resume: true, model: 'core', backendType, prompt: '',
+  const init = { type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+    workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: freshStart ? undefined : nativeId,
+    resume: !freshStart, model: 'core', backendType, prompt: '',
     ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
     ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
       reselectPerTurn,
@@ -165,13 +171,52 @@ setInterval(() => {
         last: { reasoningEffort: 'xhigh', modelBackendVariant: 'max' },
       } } : {}),
     } } : {}),
-    larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker);
+    larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker;
+  child.send(init);
   if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
   else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests };
+  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('preserves a fresh topic selection, final wait and catalog across an in-worker restart', async () => {
+    const f = await fixture(true, 'busy', false, undefined, false, undefined, true);
+    expect(f.init.resume).toBe(false);
+    f.child.send({ type: 'message', content: 'fresh original ask', turnId: 'om_fresh' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 2, 'fresh-topic capacity switch');
+    const currentRuntime = () => f.messages.filter(message => message.type === 'active_runtime')
+      .map(message => message.traexAutoModelRuntime).filter(Boolean).at(-1);
+    await f.wait(() => currentRuntime()?.waitingOnFinalModel === true, 'final-model hold published');
+    const before = currentRuntime()!;
+    expect(before).toMatchObject({ model: 'last', nativeSessionId: f.nativeId });
+    expect(before.skillCatalogFingerprint).toEqual(expect.any(String));
+    expect(rows(f.launches)[0].args[0]).not.toBe('resume');
+
+    const readyCount = f.messages.filter(message => message.type === 'prompt_ready').length;
+    f.child.send({ type: 'restart', reason: 'operator', model: 'core', codexRpcInput: false,
+      traexAutoModel: f.init.traexAutoModel } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.launches).length === 3
+      && f.messages.filter(message => message.type === 'prompt_ready').length > readyCount, 'same-worker restarted CLI ready');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'last', 'last']);
+    expect(rows(f.launches)[2].args).toEqual(rows(f.launches)[1].args);
+
+    const queryCount = rows(f.rpcRequests).length;
+    await new Promise(resolveWait => setTimeout(resolveWait, 6_000));
+    expect(rows(f.launches)).toHaveLength(3);
+    expect(rows(f.rpcRequests)).toHaveLength(queryCount);
+    expect(currentRuntime()).toMatchObject({ model: 'last', waitingOnFinalModel: true,
+      skillCatalogFingerprint: before.skillCatalogFingerprint });
+    // Restart may submit an attributed interruption note before the next user
+    // input. Let that native turn finish; a final capacity wait must not admit
+    // the next user turn just because the replacement reached its prompt.
+    writeFileSync(f.release, 'finish resumed turn');
+    f.child.send({ type: 'message', content: 'next ask after restart', turnId: 'om_after_restart' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('next ask after restart')), 'input after restart');
+    expect(rows(f.launches)).toHaveLength(3);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('fresh original ask'))).toHaveLength(1);
+    expect(rows(f.submissions).slice(1).filter(row => row.text.includes('botmux_skills_refresh'))).toEqual([]);
+  }, 80_000);
+
   it('refuses environment argv before launching an out-of-pool model', async () => {
     const f = await fixture(true, false, false, undefined, false, '--model outside');
     expect(rows(f.launches)).toEqual([]);
@@ -216,6 +261,9 @@ describe('TraeX auto-model real Worker and PTY', () => {
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 1, 'original submit');
     // Arrives during the queue: stays a distinct turn through both restarts.
+    // A receipt on disk precedes the PTY redraw; require a visible queue frame.
+    await f.wait(() => f.messages.some(message => message.type === 'screen_update'
+      && message.content.includes('position 1590')), 'first model capacity viewport');
     f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
     await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.message.includes('均持续排队')), 'exhaustion', 55_000);
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
@@ -271,6 +319,8 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.launches)[1].args).toContain('model_backend_variant="standard"');
     expect(f.messages).toContainEqual(expect.objectContaining({ type: 'active_runtime',
       model: 'backup', reasoningEffort: 'xhigh', modelBackendVariant: 'standard' }));
+    await f.wait(() => f.messages.some(message => message.type === 'screen_update'
+      && message.content.includes('position 1000')), 'backup capacity viewport');
     f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 3, 'later model after backup queues');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);

@@ -224,6 +224,7 @@ export class TraexAutoModelController {
   private loadCheckPending = false;
   private searchingBackups = false;
   private progressSinceMs: number | undefined;
+  private awaitingActivity = false;
 
   readonly sharedSettings?: TraexAutoModelSettings;
 
@@ -270,10 +271,16 @@ export class TraexAutoModelController {
     return this.queueSinceMs !== undefined || this.exhausted;
   }
 
-  beginTurn(turnId: string): TraexAutoModelAction {
+  /** A resumed continuation must show activity before queued corrections can
+   * follow it; process startup alone does not finish a capacity transition. */
+  awaitingModelActivity(): boolean {
+    return this.awaitingActivity;
+  }
+
+  beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
     const fromModel = this.currentModel();
-    if (!this.config.reselectPerTurn || this.currentIndex === 0) {
+    if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === 0) {
       this.turnId = turnId;
       this.queueSinceMs = undefined;
       if (this.config.reselectPerTurn) this.exhausted = false;
@@ -307,6 +314,7 @@ export class TraexAutoModelController {
     this.queueSinceMs = undefined;
     this.exhausted = action.reason === 'shortest_queue' || action.reason === 'lowest_load';
     this.searchingBackups = action.reason !== 'new_turn' && !this.exhausted;
+    this.awaitingActivity = action.reason !== 'new_turn';
     this.progressSinceMs = undefined;
     this.lastSwitchAtMs = nowMs;
     this.loadCheckDone = false;
@@ -319,6 +327,7 @@ export class TraexAutoModelController {
 
   endTurn(turnId: string): void {
     if (this.turnId !== turnId) return;
+    this.awaitingActivity = false;
     this.turnId = undefined;
     this.queueSinceMs = undefined;
     this.searchingBackups = false;
@@ -383,6 +392,7 @@ export class TraexAutoModelController {
     queuePosition?: number;
   }): TraexAutoModelAction {
     if (!input.turnId || input.turnId !== this.turnId) return { kind: 'none' };
+    if (input.queued || input.progressing) this.awaitingActivity = false;
     if (!input.queued) {
       this.queueSinceMs = undefined;
       // Startup frames alone do not prove that a backup has left its queue.

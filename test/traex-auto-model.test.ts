@@ -379,6 +379,35 @@ describe('traexCapacityQueueVisible', () => {
 
 
 describe('controller switch source consistency', () => {
+  it.each(['queue', 'progress', 'terminal'] as const)('ends capacity-transition admission only on model %s evidence', evidence => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.commitSwitch({ kind: 'switch', reason: 'capacity_timeout', turnId: 'turn',
+      fromModel: 'core', toModel: 'backup', toIndex: 1 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    controller.observeCapacityQueue({ turnId: 'turn', queued: false, nowMs: 1 });
+    controller.observeCapacityQueue({ turnId: 'stale', queued: true, nowMs: 2 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    if (evidence === 'terminal') controller.endTurn('turn');
+    else controller.observeCapacityQueue({ turnId: 'turn', queued: evidence === 'queue', progressing: evidence === 'progress', nowMs: 3 });
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
+
+  it('can admit an already-dequeued turn on the running model without repeating a preferred-model reset', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'],
+      queueTimeoutMs: 5_000, reselectPerTurn: true });
+    controller.observeRunningModel('backup');
+    expect(controller.beginTurn('next').kind).toBe('switch');
+    expect(controller.beginTurn('next', { retainCurrentModel: true })).toEqual({ kind: 'none' });
+    expect(controller.currentModel()).toBe('backup');
+    expect(controller.currentTurnId()).toBe('next');
+    expect(controller.beginTurn('next')).toEqual({ kind: 'none' });
+    // Only the write-edge fallback skips reselection; a later independent turn
+    // must still obey the configured preferred-model policy.
+    expect(controller.beginTurn('later')).toMatchObject({ kind: 'switch', toModel: 'core' });
+  });
+
   it('rejects a proposal after the observed model changes without advancing the controller', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000 });
     controller.beginTurn('turn');

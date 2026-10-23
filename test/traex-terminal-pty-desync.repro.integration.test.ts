@@ -470,8 +470,11 @@ setInterval(() => {
     await waitFor(child, () => readSubmissions(submissionsPath).length >= 7, logs, 'fresh input on replacement generation');
     const afterRestart = readSubmissions(submissionsPath);
     expect(afterRestart).toHaveLength(7);
-    // Every generation refreshes the plugin catalogue on its first message.
-    expect(afterRestart[6]!.text).toBe(firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
+    // Auto exact resume keeps the delivered catalogue; ordinary TraeX retains
+    // its existing first-message refresh behavior after a process restart.
+    expect(afterRestart[6]!.text).toBe(autoReselect !== undefined
+      ? 'fresh input after recovery'
+      : firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
     expect(afterRestart[6]!.pid).not.toBe(recoveredSubmissions[5]!.pid);
   }, 60_000);
 });

@@ -2098,6 +2098,11 @@ function refreshCliPluginGeneration(
     throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
   }
   const bot = resolvePluginGenerationBot(cfg);
+  // Operator/crash restarts of Auto also resume the same native conversation;
+  // they do not carry the capacity-switch-only exactResumeSessionId option.
+  const sameAutoSession = cfg.cliId === 'traex' && cfg.resume === true
+    && !!cfg.cliSessionId && cfg.cliSessionId === lastInitConfig?.cliSessionId
+    && traexAutoModelRuntimeEligible();
 
   const generation = prepareCliPluginGeneration({
     sessionId: cfg.sessionId,
@@ -2110,7 +2115,8 @@ function refreshCliPluginGeneration(
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
     promptInjection: cfg.promptInjection,
-    previousSkillCatalogFingerprint: preserveUnchangedCatalog ? deliveredPluginSkillCatalogFingerprint : undefined,
+    previousSkillCatalogFingerprint: preserveUnchangedCatalog || sameAutoSession
+      ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -4287,8 +4293,11 @@ function configureTraexAutoModel(
   const sharedSettings = traexAutoModelController?.sharedSettings
     ?? { reasoningEffort: cfg.reasoningEffort, modelBackendVariant: cfg.modelBackendVariant };
   const previousRuntime = traexAutoModelController && cfg.cliSessionId
-    ? traexAutoModelController.runtimeState(cfg.cliSessionId) : undefined;
-  const restoreRuntime = cfg.traexAutoModel && (cfg.resume || traexAutoModelController)
+    ? { ...traexAutoModelController.runtimeState(cfg.cliSessionId),
+      skillCatalogFingerprint: deliveredPluginSkillCatalogFingerprint } : undefined;
+  // Native-session identity and policy validate recovery. The original init's
+  // resume flag describes that launch, not a later in-worker restart.
+  const restoreRuntime = cfg.traexAutoModel
     ? validTraexAutoModelRuntime(cfg.traexAutoModel, previousRuntime, cfg.cliSessionId)
       ? previousRuntime
       : validTraexAutoModelRuntime(cfg.traexAutoModel, cfg.traexAutoModelRuntime, cfg.cliSessionId) ? cfg.traexAutoModelRuntime : undefined
@@ -4311,8 +4320,8 @@ function configureTraexAutoModel(
   traexAutoModelSwitching = false;
   traexAutoModelTurnReplayForbidden = cfg.atMostOnce === true;
   if (traexAutoModelController) {
-    if (cfg.resume && validTraexAutoModelRuntime(traexAutoModelController.config, cfg.traexAutoModelRuntime, cfg.cliSessionId)) {
-      deliveredPluginSkillCatalogFingerprint = cfg.traexAutoModelRuntime.skillCatalogFingerprint;
+    if (restoreRuntime) {
+      deliveredPluginSkillCatalogFingerprint = restoreRuntime.skillCatalogFingerprint;
     }
     const model = traexAutoModelController.currentModel();
     const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, model, traexAutoModelController.sharedSettings ?? cfg);
@@ -4458,13 +4467,18 @@ function observeTraexAutoModelCapacity(screen: string): void {
     || active.turnId !== currentBotmuxTurnId) {
     return;
   }
+  const awaitingActivity = controller.awaitingModelActivity();
+  const progressing = traexModelProgressVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
     queued: traexCapacityQueueVisible(screen),
     nowMs: Date.now(),
     queuePosition: traexCapacityQueuePosition(screen),
-    progressing: traexModelProgressVisible(screen),
+    progressing,
   });
+  if (awaitingActivity && !controller.awaitingModelActivity() && progressing) {
+    void flushPending();
+  }
   if (action.kind === 'load_check') {
     const target = backend;
     const generation = cliSpawnGeneration;
@@ -16526,6 +16540,7 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 function traexAutoModelInputHold(): boolean {
   return traexAutoModelRuntimeEligible() && (
     traexAutoModelSwitching
+    || traexAutoModelController?.awaitingModelActivity() === true
     || (!isPromptReady && !!backend
       && traexCapacityQueueVisible(captureBackendScreen(backend).trimEnd()))
   );
@@ -16922,13 +16937,14 @@ async function flushPending(): Promise<void> {
             const action = traexAutoModelController?.beginTurn(item.turnId);
             // A fallback-to-core transition must be handled before dequeueing.
             // Reaching it here means a future input path bypassed the shared
-            // pre-flush gate; fail closed instead of running the new turn on the
-            // stale fallback model.
+            // pre-flush gate. The input is already dequeued: keep this turn on
+            // the running pool model rather than throwing into a retry loop.
             if (action?.kind === 'switch') {
-              throw new Error(
-                `TraeX auto-model reset reached the write edge unexpectedly `
+              log(
+                `TraeX auto-model skipped preferred-model reset at the write edge `
                 + `(${action.fromModel} -> ${action.toModel})`,
               );
+              traexAutoModelController?.beginTurn(item.turnId, { retainCurrentModel: true });
             }
           }
           if (traexAutoModelRuntimeEligible()) {
