@@ -41,6 +41,7 @@ import { resolveBotmuxDataDir } from '../../data-dir.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { pruneFilesByAge } from '../../../utils/prune-by-age.js';
 import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
@@ -264,6 +265,9 @@ function writeDiagnostics(file: McpGatewayDiagnosticsFile, dataDir: string): voi
   const path = diagnosticsPath(file.sessionId, dataDir);
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  // 诊断快照每会话一个、只写不删；dashboard 只读最新 50 个。写入时顺手回收
+  // 7 天前的旧快照（至少保留最新 50 个），避免随会话数无限累积。
+  pruneFilesByAge({ dir: dirname(path), suffix: '.json', maxAgeMs: 7 * 24 * 60 * 60_000, retainMin: 50 });
 }
 
 function resolveStdioCommand(descriptor: GatewayDescriptor): { command: string; args: string[] } {
