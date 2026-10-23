@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /**
  * The two daemon routes through which `botmux dispatch` writes to Lark — the
  * new-topic seed registration and the kickoff delivery — must apply the same
@@ -115,6 +116,7 @@ function run(
     initialDispatchLifecycle: () => ({}),
     projectCoordinator: { run: async () => undefined },
     getBot: () => ({ config: {} }),
+    matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({}),
     getDashboardAdminOpenIds: () => [],
     dispatchUserForTurn: async () => undefined,

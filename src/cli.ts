@@ -8596,16 +8596,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   // Persistent task-management actions are distinct from schedule:create.
-  // In a managed session every mutation needs its own current-human proof; a
-  // bot-authored dispatch turn cannot reuse its create grant to alter, resume,
-  // delete or force-run any task. Host-terminal administration authenticates
+  // Pause/remove admission is decided by the daemon, which can also verify an
+  // explicit bot-policy task in its original topic. Other management actions
+  // still require current-human proof; a create grant alone is insufficient.
+  // Host-terminal administration authenticates
   // to the owning daemon; neither path falls back to editing schedules.json.
   const mutationSession = await detectCurrentSession();
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
     && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
   if (!trustedRemoteRunnerRelay
-      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
+      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate
+      && !['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub)) {
     await detectAuthenticatedCurrentSession('operate');
   }
   const managedMutation = async (

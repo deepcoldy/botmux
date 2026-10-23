@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -64,6 +65,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
     authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
@@ -240,6 +242,31 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     h.scope.getBot = () => ({ config: {} });
     h.scope.getDashboardAdminOpenIds = () => [];
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_source_operator_denied' } });
+    expect(h.send).not.toHaveBeenCalled();
+  });
+  it.each(['bot', 'report'])('issues host bot grants on %s-triggered turns without personal credentials', async kind => {
+    const h = harness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } };
+    if (kind === 'report') h.ds.activeInteractiveTurn = undefined;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } });
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_alice' }));
+    expect((await h.run()).status).toBe(200);
+    const payload = await read();
+    expect(payload?.authority.tools).toEqual([]);
+    expect(payload?.authority.unionId).toBe('on_sponsor');
+    expect(payload && scheduleCreateCapabilities(payload.authority)).toEqual([
+      expect.objectContaining({ botGrantId: 'team', allowedRunScopes: [], allowSelfManage: true }),
+    ]);
+  });
+  it('does not accept a non-admin sponsor for a host bot grant', async () => {
+    const h = harness();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } });
+    h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_other' }));
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_controller_denied' } });
     expect(h.send).not.toHaveBeenCalled();
   });
   it('can default schedule delegation by source orchestrator and honors one-shot opt-out', async () => {

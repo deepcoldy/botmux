@@ -504,6 +504,16 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
+  it('loads explicit bot scheduling scopes without accepting malformed or ambiguous grants', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: { botGrants: [
+      grant, { ...grant, id: 'bad', controllerUnionId: 'ou_app_scoped' },
+      { ...grant, id: 'duplicate' }, { ...grant, id: 'duplicate' },
+    ] } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+  });
   it('keeps schedule delegation issuance and execution revocation independent', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       scheduleDelegation: { createEnabled: true, runEnabled: false,

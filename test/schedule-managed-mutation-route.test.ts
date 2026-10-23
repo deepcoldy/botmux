@@ -1,3 +1,5 @@
+import { assertScheduleBotGrantActive } from '../src/core/schedule-bot-grant.js';
+import { authorizeScheduleSelfManage as realAuthorizeSelfManage } from '../src/core/schedule-delegated-runtime.js';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
@@ -43,7 +45,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,
-    authorizeScheduleSelfManage,
+    authorizeScheduleSelfManage, assertScheduleBotGrantActive,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
     resolveUnionIdFromOpenId: async () => 'on_admin',
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
@@ -79,6 +81,42 @@ function configureProviderActor(
 }
 
 describe('managed schedule mutation route', () => {
+  it.each(['pause', 'remove'])('lets the owning bot %s its policy task in the original topic after a report', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, state: 'paused', controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    expect((await h.run()).status).toBe(200);
+    h.ds.session.rootMessageId = 'om_other';
+    expect((await h.run()).status).toBe(403);
+    h.ds.session.rootMessageId = 'om_topic';
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+    expect((await h.run()).status).toBe(403);
+  });
+  it('rejects topic cleanup when its managed turn changes during authorization', async () => {
+    const h = harness('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    h.scope.authorizeScheduleSelfManage = async () => { h.ds.workerGeneration++; };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_mutation_turn_changed' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+  it.each(['update', 'resume', 'run'])('does not turn a bot policy cleanup grant into %s authority', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    expect((await h.run()).status).toBe(403);
+  });
   it('runs the fixed protected task for a current same-app human administrator without a union lookup', async () => {
     const h = harness('run');
     h.record.kind = 'direct';
