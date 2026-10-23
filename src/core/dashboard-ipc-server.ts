@@ -1104,6 +1104,9 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // verification and then enters the durable action ledger. Keeping this one
   // aperture is what preserves managed meeting actions from inside bwrap.
   if (method === 'POST' && pathname === '/api/vc-meetings/action-request') return true;
+  // Human summary sharing uses the same rotating capability, plus an exact IM
+  // turn and frozen sharing policy. The handler, not host HMAC, proves authority.
+  if (method === 'POST' && pathname === '/api/vc-meetings/share-summary') return true;
   // These two CLI-in-sandbox endpoints verify the same rotating capability in
   // their handlers and bind it to body.sessionId. They cannot be bare loopback
   // exceptions: a receiver that learned another session id could otherwise

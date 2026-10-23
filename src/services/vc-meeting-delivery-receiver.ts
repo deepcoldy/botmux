@@ -30,6 +30,7 @@ import {
   VC_MEETING_LISTENER_OUTPUT_CONTRACT,
   VC_MEETING_FINAL_SUMMARY_CONTRACT,
   vcMeetingListenerOutputProtocolForInstructionVersion,
+  type VcMeetingListenerOutputProtocol,
 } from './vc-meeting-listener-output-protocol.js';
 
 const MAX_AUTOMATIC_DISPATCH_ATTEMPTS = 3;
@@ -262,7 +263,7 @@ export function buildVcMeetingDeliveryTriggerRequest(
   deliveryKey = deriveVcMeetingDeliveryIdentity(request).deliveryKey,
   responseMode: 'silent' | 'listener_thread' = 'listener_thread',
   configuredInstructions?: string,
-  finalSummary = false,
+  listenerOutputProtocol: VcMeetingListenerOutputProtocol = vcMeetingListenerOutputProtocolForInstructionVersion(request.instructionVersion),
 ): TriggerRequest {
   const silent = responseMode === 'silent';
   const rawText = request.entries
@@ -289,12 +290,9 @@ export function buildVcMeetingDeliveryTriggerRequest(
   const trustedRoleSection = normalizedInstructions.instructions === undefined
     ? ''
     : `\n\n<botmux_role_instructions>\n${normalizedInstructions.instructions}\n</botmux_role_instructions>`;
-  const listenerOutputProtocol = vcMeetingListenerOutputProtocolForInstructionVersion(
-    request.instructionVersion,
-  );
   const listenerOutputContract = silent || listenerOutputProtocol === 'plain'
     ? ''
-    : `\n\n${VC_MEETING_LISTENER_OUTPUT_CONTRACT}${finalSummary && request.stream.final ? `\n${VC_MEETING_FINAL_SUMMARY_CONTRACT}` : ''}`;
+    : `\n\n${VC_MEETING_LISTENER_OUTPUT_CONTRACT}${listenerOutputProtocol === 'final_summary_v1' ? `\n${VC_MEETING_FINAL_SUMMARY_CONTRACT}` : ''}`;
   return {
     source: {
       type: 'vc_meeting',
@@ -401,7 +399,7 @@ async function dispatchAcceptedDelivery(
         deliveryKey,
         responseMode,
         configuredInstructions,
-        findVcMeetingDeliveryByKey(deps.dataDir, deliveryKey)?.receipt.listenerOutputProtocol === 'final_summary_v1',
+        findVcMeetingDeliveryByKey(deps.dataDir, deliveryKey)?.receipt.listenerOutputProtocol,
       ),
       {
         stableTurnId: deliveryKey,

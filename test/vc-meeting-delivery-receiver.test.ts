@@ -1,3 +1,4 @@
+import { VC_MEETING_FINAL_SUMMARY_CONTRACT } from '../src/services/vc-meeting-listener-output-protocol.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -231,6 +232,7 @@ describe('vc meeting delivery receiver', () => {
     const key = deriveVcMeetingDeliveryIdentity(request).deliveryKey;
     expect(findVcMeetingDeliveryByKey(dir, key)!.receipt.listenerOutputProtocol)
       .toBe(responseMode === 'silent' ? 'decision_v1' : 'final_summary_v1');
+    expect(harness.capturedTriggers[0].instruction.includes(VC_MEETING_FINAL_SUMMARY_CONTRACT)).toBe(responseMode !== 'silent');
     expect(harness.capturedTriggers[0].envelope).toMatchObject({ payload: { stream: { final: true }, entries: request.entries.map(({ rawText, ...metadata }) => metadata) } });
     expect(harness.capturedTriggers[0].envelope.rawText).toContain(request.entries[0].rawText);
     await receiveVcMeetingDelivery(request, harness.deps);
@@ -247,6 +249,7 @@ describe('vc meeting delivery receiver', () => {
     expect((await receiveVcMeetingDelivery(request, harness.deps)).status).toBe(202);
     const key = deriveVcMeetingDeliveryIdentity(request).deliveryKey;
     expect(findVcMeetingDeliveryByKey(dir, key)!.receipt.listenerOutputProtocol).toBe('decision_v1');
+    expect(harness.capturedTriggers[0].instruction).not.toContain(VC_MEETING_FINAL_SUMMARY_CONTRACT);
     expect(harness.dispatchTurn).toHaveBeenCalledTimes(1);
   });
 
