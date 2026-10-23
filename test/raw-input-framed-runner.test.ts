@@ -14,6 +14,7 @@ class SubmissionWriteError extends Error {
     message: string,
     readonly recoveryFailureReason?: string,
     readonly submissionStarted = true,
+    readonly runnerGenerationUnsafe = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
@@ -65,7 +66,7 @@ describe('sendRawCommandLine — framed stdin runner isolation', () => {
     expect(genericWrite).not.toHaveBeenCalled();
   });
 
-  it('dirty_unknown submit: throws an ambiguous, in-flight SubmissionWriteError (no replay)', async () => {
+  it('dirty_unknown submit: throws an ambiguous, generation-unsafe error that fences the runner', async () => {
     const writeInput = vi.fn(async () => ({
       submitted: false,
       submissionDisposition: 'dirty_unknown',
@@ -76,23 +77,24 @@ describe('sendRawCommandLine — framed stdin runner isolation', () => {
       name: 'SubmissionWriteError',
       recoveryFailureReason: 'runner_frame_submit_ambiguous',
       submissionStarted: true,
+      runnerGenerationUnsafe: true,
     });
   });
 
-  it('clean pre-buffer reject: throws non-ambiguous, known-not-started so retry is safe', async () => {
+  it('clean pre-buffer reject: non-ambiguous, known-not-started, generation still safe', async () => {
     const writeInput = vi.fn(async () => ({
       submitted: false,
       submissionDisposition: 'untouched',
     }));
     const { sendRaw } = loadSender({ runnerFramedInput: true, writeInput });
 
-    await expect(sendRaw({}, 'x')).rejects.toMatchObject({
+    const error = await sendRaw({}, 'x').then(() => null, (e) => e);
+    expect(error).toMatchObject({
       name: 'SubmissionWriteError',
       submissionStarted: false,
+      runnerGenerationUnsafe: false,
     });
-    await expect(sendRaw({}, 'x')).rejects.not.toMatchObject({
-      recoveryFailureReason: expect.any(String),
-    });
+    expect(error.recoveryFailureReason).toBeUndefined();
   });
 
   it('non-framed adapters keep the generic literal writer path', async () => {

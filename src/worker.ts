@@ -68,6 +68,7 @@ import {
   terminalWriteFrame,
 } from './core/terminal-write-frame.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
+import { classifyRawDispatchFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
@@ -3428,13 +3429,15 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
     if (result && result.submitted === false) {
       const ambiguous = result.submissionDisposition === 'dirty_unknown';
       // submissionStarted=false only when no frame byte could have reached the
-      // runner (pre-flush refused); any other disposition stays ambiguous.
+      // runner (pre-flush refused); a dirty disposition may have buffered a
+      // partial/full frame, so mark the whole runner generation unsafe.
       throw new SubmissionWriteError(
         result.failureReason
           ?? (ambiguous
-            ? 'framed runner submit unconfirmed; holding this generation to avoid double submit'
+            ? 'framed runner submit unconfirmed; fencing this runner generation to avoid a merged dropped frame'
             : 'framed runner rejected the line before buffering it'),
         ambiguous ? 'runner_frame_submit_ambiguous' : undefined,
+        ambiguous,
         ambiguous,
       );
     }
@@ -3498,6 +3501,12 @@ class SubmissionWriteError extends Error {
     /** False only when the logical transaction was rejected before its write
      * callback ran, so the current input is known not to have reached the PTY. */
     readonly submissionStarted = true,
+    /** True when a framed stdin runner may already hold part/all of the line in
+     *  its own buffer (dirty_unknown submit). The CLI runner generation is then
+     *  unsafe for ANY successor write: a later line could merge with the
+     *  half-frame and be dropped while the backend still reports success.
+     *  Callers must fence/exit the generation, never continue typing. */
+    readonly runnerGenerationUnsafe = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
@@ -3665,6 +3674,14 @@ async function runStartupCommands(): Promise<boolean> {
         await sendRawCommandLineWithRecoveryFence(be, cmd);
         submitOutputGeneration = ptyOutputGeneration.snapshot();
       } catch (e: any) {
+        // A framed runner may hold a half frame: continuing to the next startup
+        // command would type onto the dirty line and lose BOTH. Fence the whole
+        // runner generation instead of skipping to the next command.
+        if (classifyRawDispatchFailure(e, false) === 'fence-generation') {
+          log(`Startup command fence (${cmd}): ${e?.message ?? e}`);
+          await sendFatalWorkerErrorAndExit(e);
+          return false;
+        }
         log(`Startup command failed (${cmd}): ${e?.message ?? e}`);
         startupCommandCursor++;
         continue;
@@ -4072,20 +4089,30 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         : undefined;
       disarmEffortConfirm();
       disarmBtwCapture();
+      switch (classifyRawDispatchFailure(err, isWorkflowWorker())) {
+        case 'fence-generation':
+          // A framed stdin runner may already hold a half frame: ANY successor
+          // raw line in this generation could merge with it and be silently
+          // dropped. Exit the process — daemon restarts/resumes the persisted
+          // native session; a workflow node fails once. Never type another line
+          // into the dirty pane, never notify-and-continue.
+          log(`Passthrough slash command fence (${msg.content}): ${err.message}`);
+          await sendFatalWorkerErrorAndExit(err, msg.turnId);
+          return false;
+        case 'workflow-node-fail':
+          // No human in this session to retry the single goal dispatch: fail the
+          // node immediately instead of idling until the wall deadline.
+          send({
+            type: 'error',
+            message: `workflow goal input dispatch failed: ${err?.message ?? String(err)}`,
+          });
+          return false;
+        default:
+          break;
+      }
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
-      // A workflow worker's only raw dispatch is the node's goal input. There
-      // is no user in this session to notify or retry it, so fail the node
-      // immediately (the pool requests worker exit; an ambiguous frame is
-      // never auto-resubmitted in the same generation) instead of hanging the
-      // node until its wall deadline.
-      if (isWorkflowWorker()) {
-        send({
-          type: 'error',
-          message: `workflow goal input dispatch failed: ${err?.message ?? String(err)}`,
-        });
-      }
       const failedTurnId = msg.followUpTurnId ?? msg.turnId;
       if (failedTurnId && !recoveryFailureReason) {
         emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
@@ -14966,11 +14993,14 @@ async function runAmbiguousSubmissionTransaction<T>(
     const recoveryFailureReason = err instanceof AmbiguousSubmissionBlockedError
       ? ambiguousSubmissionRecoveryMessage(err.failure)
       : cancelAmbiguousSubmissionAfterFailure(target, submissionFence);
+    const frameUnsafe = err instanceof SubmissionWriteError && err.runnerGenerationUnsafe;
+    // Preserve the framed-runner marker across the WAL transaction rewrap.
     const detail = err instanceof Error ? err.message : String(err);
     throw new SubmissionWriteError(
       recoveryFailureReason ? `${detail}; ${recoveryFailureReason}` : detail,
       recoveryFailureReason,
       submissionStarted,
+      frameUnsafe,
     );
   } finally {
     release();
