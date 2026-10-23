@@ -5351,7 +5351,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next }),
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next === null ? null : { ...props.bot.noProgressNotify, ...next } }),
       setStatus,
       setBusy: on => setBusy(on ? 'no-progress' : null),
       saved: tr('botDefaults.cardPrefSaved'),

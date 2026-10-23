@@ -1614,7 +1614,9 @@ export interface BotConfig {
    * with later transcript text. Missing/false keeps the legacy notice. */
   suppressDeliveredFinalFailureNotice?: boolean;
   /**
-   * Codex App only: tune or mute the once-per-turn "no observable progress"
+   * Codex CLI: cliEnabled opts into daemon-owned 5/15 minute notices for
+   * direct human IM turns (timeoutMs overrides the first threshold). No replay.
+   * Codex App: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
    * keeps polling, so the dashboard stalled projection and the
    * `session.requires_attention` hook stay observable. `timeoutMs` overrides
