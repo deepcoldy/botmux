@@ -57,8 +57,10 @@
  *     nextBoundaryMs) — without that, a model that's still mid-tool-use
  *     for turn N+1 could leak a send credit into turn N's window.
  */
+import type { TurnTerminalCarrierKind } from '../core/types.js';
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
 import { CODEX_RATE_LIMIT_ERROR_CODE } from './codex-transcript.js';
+import type { TurnSendKind } from './turn-send-ledger.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
@@ -224,7 +226,7 @@ export interface BridgeSendMarker {
   targetRootMessageId?: string;
   targetSessionId?: string;
   dispatchRootId?: string;
-  responseKind?: 'progress' | 'final' | 'auxiliary';
+  responseKind?: TurnSendKind;
   turnId?: string;
   dispatchAttempt?: number;
   /** The last user-visible carrier left by this send. The daemon uses this
@@ -232,9 +234,9 @@ export interface BridgeSendMarker {
    *  in place, while files/voice/custom cards deliberately fall back to a
    *  separate compact terminal strip. Older markers omit the field and simply
    *  degrade to the live streaming-card terminal state. */
-  terminalCarrier?: 'standard_reply_card' | 'non_patchable';
+  terminalCarrier?: TurnTerminalCarrierKind;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
-  replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  replyCardResponseKind?: TurnSendKind;
   /** The send is explicitly an interim side effect and must never stand in for
    * the turn's eventual final/failure delivery. Remote Runner outbound_message
    * uses this while ordinary historical `botmux send` keeps its old heuristic. */
