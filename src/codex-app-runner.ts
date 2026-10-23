@@ -14,6 +14,7 @@ import {
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from './services/codex-app-runner-protocol.js';
+import { captureCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   CODEX_APP_CONTROL_BOOTSTRAP_ENV,
   CODEX_APP_CONTROL_FINAL_CHUNK_BYTES,
@@ -331,6 +332,7 @@ function appDeveloperInstructions(args: Args): string {
 }
 
 class AppServerClient {
+  processIdentity?: CodexAppProcessIdentity;
   private child: ChildProcessWithoutNullStreams;
   /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
    *  awaiting continuation ahead of a notification coalesced behind it. */
@@ -397,6 +399,7 @@ class AppServerClient {
       capabilities: { experimentalApi: true },
     }, { timeoutMs });
     this.notify('initialized');
+    this.processIdentity = captureCodexAppProcessIdentity(this.child.pid ?? 0);
   }
 
   request(
@@ -785,6 +788,7 @@ function emitRunnerState(
     // signed state. The worker uses this field as a runtime type-ahead gate;
     // authentication alone never releases a prompt.
     acceptingInput: runnerReady,
+    ...(client?.processIdentity ? { processIdentity: client.processIdentity } : {}),
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
 }

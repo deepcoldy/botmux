@@ -1,5 +1,7 @@
 # 当前执行的只读证明
 
+Codex App 的独立 runner 通过已认证的签名 state 上报原生 app-server 的 PID 与启动时间；worker 再核对本会话 backend 血缘及继承的 RPC stdin/stdout 管道，随后沿私有 IPC 发布引擎根。npm 的 Node 启动器不再造成跨轮工具被误判。接管旧 runner 时，只在签名通道认证后识别同一可执行文件、同一 session 的唯一 runner 及其直接启动的 RPC 子进程；歧义或无法证明时仍拒绝。后续 busy/idle 不重新快照正在执行的工具，旧工具和旧代次不能获得新轮权限。
+
 `botmux execution current --json` 返回调用工具进程所属的当前执行。适用于本机 Linux 的普通消息与机器 Trigger；不要求该轮存在真人 caller 或已验证邮箱。
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。
