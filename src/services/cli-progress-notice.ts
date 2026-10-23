@@ -18,6 +18,9 @@ export interface CliProgressNotice {
   settled?: boolean;
   paused?: boolean;
   dirty?: boolean;
+  /** Bounded, durable PATCH budget for each new display state. */
+  patchAttempts?: number;
+  patchRevision?: number;
 }
 export interface CliProgressNoticeDeps {
   records: CliProgressNotice[];
@@ -60,7 +63,7 @@ export class CliProgressNotifier {
     const key = JSON.stringify([turn, attempt]);
     const previous = this.persistedAt.get(key) ?? 0;
     r.progressAt = this.deps.now(); r.stage = stage;
-    if (r.stalled) { r.stalled = false; r.dirty = true; }
+    if (r.stalled) { r.stalled = false; this.markDirty(r); }
     if (changed || r.progressAt - previous >= 10_000) {
       this.deps.persist(); this.persistedAt.set(key, r.progressAt);
     }
@@ -74,7 +77,7 @@ export class CliProgressNotifier {
   finish(turn: string, attempt?: number): void {
     const r = this.find(turn, attempt);
     if (!r || r.settled) return;
-    r.settled = true; r.stalled = false; r.dirty = true;
+    r.settled = true; r.stalled = false; this.markDirty(r);
     this.persistedAt.delete(JSON.stringify([turn, attempt])); this.deps.persist();
   }
   dispose(): void { this.disposed = true; }
@@ -84,11 +87,30 @@ export class CliProgressNotifier {
     try {
       for (const r of this.deps.records) {
         if (this.disposed || !this.deps.allowed(r)) continue;
-        if (r.dirty && r.messages.length) {
-          r.dirty = false; this.deps.persist();
-          for (const id of r.messages) {
-            try { await this.deps.update(r, id, () => this.guard(r)); }
-            catch (e) { this.deps.error(e); }
+        // Recovery retries must never patch an old card back to an @ warning
+        // after a later silence window has already posted a new alert.
+        if (r.dirty && r.messages.length && (!r.stalled || r.settled)) {
+          const attempt = (r.patchAttempts ?? 0) + 1;
+          if (attempt > 3) { r.dirty = false; this.deps.persist(); }
+          else {
+            const revision = r.patchRevision ?? 0;
+            r.patchAttempts = attempt;
+            // Unlike POST, repeating an update to a known message is safe.
+            // Keep dirty durable until ACK; a crash must not lose the recovery.
+            this.deps.persist();
+            let failed = false;
+            for (const id of r.messages) {
+              try {
+                await this.deps.update(r, id, () => {
+                  this.guard(r);
+                  if ((r.patchRevision ?? 0) !== revision) throw new Error('superseded progress patch');
+                });
+              } catch (e) { failed = true; this.deps.error(e); }
+            }
+            // A terminal/progress event may arrive during the API call. It owns
+            // a fresh retry budget and must not be cleared by this old ACK.
+            if ((r.patchRevision ?? 0) === revision) r.dirty = failed && attempt < 3;
+            this.deps.persist();
           }
         }
         if (r.settled) continue;
@@ -113,15 +135,21 @@ export class CliProgressNotifier {
           });
           r.messages.push(id); r.deliveryPending = false;
           // An actual result may race the API acknowledgement; patch, do not resend.
-          if (r.settled || !r.stalled || r.progressAt !== observedAt) r.dirty = true;
+          if (r.settled || !r.stalled || r.progressAt !== observedAt) this.markDirty(r);
           this.deps.persist();
         } catch (e) {
           // The transport may have accepted the message before losing its ACK.
-          // Suppress escalation too: no new post until delivery is reconciled.
+          // deliveryPending fences a crash/ACK loss from the pre-send claim.
+          // claimed also fences this process if ACK cleared deliveryPending
+          // but persisting the acknowledged result threw. No escalation then.
           r.claimed = 2; this.deps.persist(); this.deps.error(e);
         }
       }
     } finally { this.busy = false; }
+  }
+  private markDirty(r: CliProgressNotice): void {
+    r.dirty = true; r.patchAttempts = 0;
+    r.patchRevision = (r.patchRevision ?? 0) + 1;
   }
   private guard(r: CliProgressNotice) {
     if (this.disposed || !this.deps.allowed(r)) throw new Error('retired progress notification');

@@ -204,7 +204,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('avatar', { kind: 'raw', cap: { maxBytes: 4_000_000, error: 'image_too_large' } }),
   // max-live-workers：`{ maxLiveWorkers: number | null }`（null = 回落内置默认 30）。
   putBotConfig('max-live-workers'),
-  // no-progress-notify：`{ noProgressNotify: { enabled?, timeoutMs? } | null }`（null = 默认开启 + 90s）。
+  // no-progress-notify：`{ noProgressNotify: { enabled?, cliEnabled?, timeoutMs? } | null }`（null = App 开启/90s、CLI 关闭）。
   putBotConfig('no-progress-notify'),
   // idle-suspend-minutes：`{ idleSuspendMinutes: number | null }`（null = 关闭空闲 TTL）。
   putBotConfig('idle-suspend-minutes'),

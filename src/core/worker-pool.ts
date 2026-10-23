@@ -15332,7 +15332,7 @@ function setupWorkerHandlers(
     update: async (r, id, beforeWrite) => {
       await updateMessage(ds.larkAppId, id, cliProgressNoticeCard(r, Date.now(), r.claimed, localeForBot(ds.larkAppId) === 'en'), { beforeWrite });
     },
-    error: () => logger.warn(`[${t}] CLI progress notice delivery/update not confirmed; no automatic resend`),
+    error: () => logger.warn(`[${t}] CLI progress notice delivery/update not confirmed; no automatic repost`),
   });
   const beginCliNotice = (turnId: string, attempt?: number) => {
     if (!ownsLifecycleMutation() || !cliNoticeEnabled() || ds.adoptedFrom || ds.session.adoptedFrom

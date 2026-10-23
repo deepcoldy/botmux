@@ -108,6 +108,73 @@ describe('daemon-owned CLI silence notices', () => {
     expect(card.schema).toBe('2.0');
     expect(card.body.elements.map((e: { tag: string }) => e.tag)).toEqual(['markdown']);
   });
+  it('retries a failed terminal PATCH to the same message without another POST', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll(); h.n.finish('om_turn');
+    vi.mocked(h.deps.update).mockRejectedValueOnce(new Error('temporary outage'));
+    await h.n.poll(); expect(h.records[0].dirty).toBe(true);
+    h.time(315_000); await h.n.poll(); await h.n.poll();
+    expect(h.deps.update).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(h.deps.update).mock.calls.map(call => call[1])).toEqual(['notice-1', 'notice-1']);
+    expect(h.records[0].dirty).toBe(false); expect(h.deps.send).toHaveBeenCalledTimes(1);
+  });
+  it('does not turn a pending recovery retry back into an @ warning after a new stall', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll();
+    h.n.progress('om_turn', undefined, 1, 'tool_returned');
+    vi.mocked(h.deps.update).mockRejectedValue(new Error('temporary outage')); await h.n.poll();
+    h.time(1_200_000); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledTimes(2);
+    expect(h.records[0].stalled).toBe(true);
+    await h.n.poll(); expect(h.deps.update).toHaveBeenCalledTimes(2);
+    h.n.finish('om_turn'); vi.mocked(h.deps.update).mockResolvedValue(undefined);
+    await h.n.poll(); expect(h.deps.update).toHaveBeenCalledTimes(4);
+    expect(h.records[0].dirty).toBe(false);
+  });
+  it('bounds PATCH failures across restore, but a new terminal state gets a fresh budget', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll();
+    h.n.progress('om_turn', undefined, 1, 'tool_returned');
+    vi.mocked(h.deps.update).mockRejectedValue(new Error('persistent outage'));
+    await h.n.poll(); await h.n.poll(); h.n.dispose();
+    const restored = harness(JSON.parse(JSON.stringify(h.records)));
+    vi.mocked(restored.deps.update).mockRejectedValue(new Error('persistent outage'));
+    for (let i = 0; i < 10; i++) await restored.n.poll();
+    expect(h.deps.update).toHaveBeenCalledTimes(2); expect(restored.deps.update).toHaveBeenCalledTimes(1);
+    expect(restored.records[0].dirty).toBe(false); expect(restored.deps.send).not.toHaveBeenCalled();
+    vi.mocked(restored.deps.update).mockResolvedValue(undefined); restored.n.finish('om_turn');
+    await restored.n.poll(); expect(restored.deps.update).toHaveBeenCalledTimes(2);
+    expect(restored.records[0].dirty).toBe(false);
+  });
+  it('keeps a pending PATCH durable and retries it after interruption', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll(); h.n.finish('om_turn');
+    let resolve!: () => void;
+    h.deps.update = vi.fn(async () => new Promise<void>(r => { resolve = r; }));
+    const pending = h.n.poll();
+    const restored = harness(JSON.parse(JSON.stringify(h.records))); h.n.dispose();
+    await restored.n.poll(); expect(restored.deps.update).toHaveBeenCalledTimes(1);
+    expect(restored.records[0].dirty).toBe(false); expect(restored.deps.send).not.toHaveBeenCalled();
+    resolve(); await pending;
+  });
+  it('an in-flight recovery PATCH cannot overwrite a newer terminal state or consume its budget', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll();
+    h.n.progress('om_turn', undefined, 1, 'tool_returned');
+    let resolve!: () => void; let guard!: () => void;
+    h.deps.update = vi.fn(async (_r, _id, beforeWrite) => {
+      guard = beforeWrite; return new Promise<void>(r => { resolve = r; });
+    });
+    const pending = h.n.poll(); h.n.finish('om_turn');
+    expect(() => guard()).toThrow(); resolve(); await pending;
+    expect(h.records[0].dirty).toBe(true); expect(h.records[0].patchAttempts).toBe(0);
+    vi.mocked(h.deps.update).mockResolvedValue(undefined); await h.n.poll();
+    expect(h.deps.update).toHaveBeenCalledTimes(2); expect(h.records[0].dirty).toBe(false);
+  });
+  it('claimed fences escalation when an ACK cleared pending but saving the receipt failed', async () => {
+    const h = harness(); h.begin(); let failed = false;
+    h.deps.persist = vi.fn(() => {
+      if (!failed && h.records[0].messages.length) { failed = true; throw new Error('receipt save failed'); }
+    });
+    h.time(300_000); await h.n.poll(); expect(h.records[0].deliveryPending).toBe(false);
+    const restored = harness(JSON.parse(JSON.stringify(h.records))); restored.time(900_000); restored.begin();
+    await restored.n.poll(); expect(restored.deps.send).not.toHaveBeenCalled();
+    h.time(900_000); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledTimes(1);
+  });
   it('CLI is opt-in and does not change the existing App policy defaults', () => {
     expect(normalizeNoProgressNotifyPolicy({})).toEqual({ enabled: true });
     expect(normalizeNoProgressNotifyPolicy({ cliEnabled: true })).toEqual({ enabled: true, cliEnabled: true });

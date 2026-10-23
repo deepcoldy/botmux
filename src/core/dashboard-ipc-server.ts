@@ -9412,11 +9412,12 @@ botConfigPutRoute<{ botActorOwnerBindings?: unknown }>(
   },
 );
 
-// Per-bot Codex App 无进展提醒 noProgressNotify（#1162）。Body
-// `{ noProgressNotify?: { enabled?: boolean; timeoutMs?: number } | null }`:
-//   • null/缺省 → 清回默认（开启 + 90s）
+// Per-bot Codex App/CLI 无进展提醒 noProgressNotify（#1162）。Body
+// `{ noProgressNotify?: { enabled?: boolean; cliEnabled?: boolean; timeoutMs?: number } | null }`:
+//   • null/缺省 → 清回默认（App 开启 + 90s、CLI 关闭）
 //   • {"enabled":false} → 仅静默 Lark 推送（立即生效，读实时 registry）
-//   • {"timeoutMs":300000} → 调整阈值（10000–3600000ms，下一个 worker 进程生效）
+//   • {"cliEnabled":true} → 开启 CLI 通知（下一个 worker，默认 5/15 分钟）
+//   • {"timeoutMs":300000} → 调整阈值（10000–3600000ms；App 下个 worker、CLI 热读取）
 // 走 coerceConfigValue + applyConfigField（与 /config set 同一写盘 + 热更新路径）。
 botConfigPutRoute<{ noProgressNotify?: unknown }>('/api/bot-no-progress-notify', 'noProgressNotify', {
   notBound: NOT_BOUND_BODY.okFalse,

@@ -187,4 +187,48 @@ describe('CLI progress timer at actual worker IPC seam', () => {
     h.worker.emit('message', { type: 'turn_progress', turnId: 'om_turn', stage: 'model_output' });
     expect(h.ds.session.cliProgressNotices![0].progressAt).toBe(1_000_000);
   });
+  it.each([false, true])('new owner cannot send or patch an old-generation record (dirty=%s)', async dirty => {
+    const h = setup(); h.start();
+    const record = h.ds.session.cliProgressNotices![0];
+    if (dirty) { record.dirty = true; record.messages = ['om_old_notice']; }
+    const original = JSON.parse(JSON.stringify(record));
+    const next = Object.assign(new EventEmitter(), {
+      killed: false, send: vi.fn(), kill: vi.fn(), pid: 4243,
+      stdout: new EventEmitter(), stderr: new EventEmitter(),
+    });
+    h.ds.worker = next as any;
+    __testOnly_setupWorkerHandlers(h.ds, next as any);
+    expect(h.ds.workerGeneration).toBeGreaterThan(record.generation);
+    // No execution_started for the persisted old turn on an attach/restore.
+    await vi.advanceTimersByTimeAsync(915_000);
+    expect(h.reply).not.toHaveBeenCalled(); expect(updateMessage).not.toHaveBeenCalled();
+    expect(record).toEqual(original);
+    // Prove the new owner/timer is live rather than passing by suppressing all UI.
+    h.ds.session.turnReplyContexts!.om_new = h.ds.session.turnReplyContexts!.om_turn;
+    next.emit('message', { type: 'turn_execution_started', turnId: 'om_new', startedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(h.reply).toHaveBeenCalledTimes(1); expect(h.reply.mock.calls[0][4]).toBe('om_new');
+    expect(updateMessage).not.toHaveBeenCalled(); expect(record).toEqual(original);
+  });
+  it.each(['schedule:task:fire', 'cross-principal:request'])('rejects hostile synthetic %s even with human context and mention', async turnId => {
+    const h = setup('group', 'codex', true);
+    h.ds.session.turnReplyContexts![turnId] = h.ds.session.turnReplyContexts!.om_turn;
+    h.ds.turnExplicitMentions!.add(turnId);
+    h.start(turnId);
+    await vi.advanceTimersByTimeAsync(915_000);
+    expect(h.reply).not.toHaveBeenCalled(); expect(updateMessage).not.toHaveBeenCalled();
+    h.start(); await vi.advanceTimersByTimeAsync(300_000);
+    expect(h.reply).toHaveBeenCalledTimes(1); expect(h.reply.mock.calls[0][4]).toBe('om_turn');
+  });
+
+  it('hot mute pauses pending recovery patches without spending their retry budget', async () => {
+    const h = setup(); h.start(); await vi.advanceTimersByTimeAsync(300_000);
+    h.worker.emit('message', { type: 'turn_progress', turnId: 'om_turn', stage: 'tool_returned' });
+    policy.enabled = false; await vi.advanceTimersByTimeAsync(60_000);
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(h.ds.session.cliProgressNotices![0].patchAttempts).toBe(0);
+    policy.enabled = true; await vi.advanceTimersByTimeAsync(15_000);
+    expect(updateMessage).toHaveBeenCalledTimes(1); expect(h.reply).toHaveBeenCalledTimes(1);
+  });
+
 });
