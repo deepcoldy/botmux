@@ -372,18 +372,18 @@ export interface CliAdapter {
   readonly rawCommandSettleMs?: number;
 
   /**
-   * Encode a raw passthrough line (`raw_input` IPC — including v3 goal-mode's
-   * first dispatch) into this CLI's long-lived runner line protocol.
-   *
-   * Adapters whose CLI runs behind a stdin bridge (MiniMax Code's
-   * `minimax-runner`, …) only accept framed messages (`<prefix><base64>`); a
-   * literal line is rejected by the runner ("ignoring non-frame input").
-   * Ordinary turns already pass through {@link writeInput}, so this keeps the
-   * raw channel byte-compatible with it. Return the complete one-line frame
-   * WITHOUT a trailing newline (the writer submits it). Adapters that read
-   * literal PTY input leave this undefined.
+   * True when the CLI runs behind a long-lived stdin bridge that only accepts
+   * its OWN framed line protocol (e.g. MiniMax Code's `minimax-runner`:
+   * `<prefix><base64><CR>`). When set, EVERY input path — ordinary turns AND
+   * raw passthrough (typed slash commands, v3 goal-mode's first dispatch,
+   * startup command lines) — must go through {@link writeInput}, which owns
+   * the runner's pre-flush / chunking / submit-retry / ambiguous-disposition
+   * protocol. Typing a literal line via the generic raw writer would be
+   * rejected by the runner ("ignoring non-frame input"), and a half-written
+   * frame could merge with the next line into one dropped blob that a plain
+   * writer would still report as accepted.
    */
-  readonly frameRawCommandLine?: (content: string) => string;
+  readonly runnerFramedInput?: boolean;
 
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the

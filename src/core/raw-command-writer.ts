@@ -15,10 +15,6 @@ export interface RawCommandWriteOptions {
   pasteLine?: boolean;
   pasteSettleMs?: number;
   submitBeatMs?: number;
-  /** Encode the line into a long-lived runner's framed line protocol before
-   *  writing (the submit newline stays literal). Runners that only accept
-   *  `<prefix><base64>` frames would otherwise drop a raw passthrough line. */
-  frameLine?: (content: string) => string;
   delay?: (ms: number) => Promise<void>;
 }
 
@@ -27,12 +23,9 @@ export interface RawCommandWriteOptions {
  * explicit false is a proven drop and must never produce an activation ACK. */
 export async function writeRawCommandLine(
   backend: RawCommandWriter,
-  contentIn: string,
+  content: string,
   opts: RawCommandWriteOptions = {},
 ): Promise<boolean> {
-  // Frame before any delivery variant: the encoded line must be the exact
-  // bytes the runner parses (base64 guarantees no embedded newline).
-  const content = opts.frameLine ? opts.frameLine(contentIn) : contentIn;
   const delay = opts.delay ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const beatMs = opts.submitBeatMs ?? 200;
   const sendText = backend.sendText?.bind(backend);

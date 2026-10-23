@@ -4,7 +4,6 @@ import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { rawCommandWriteOptionsFor } from '../src/core/raw-command-write-options.js';
-import { writeRawCommandLine, type RawCommandWriter } from '../src/core/raw-command-writer.js';
 
 describe('raw command write options', () => {
   it('maps OpenCode raw command capability to paste-line delivery', () => {
@@ -43,36 +42,36 @@ describe('raw command write options', () => {
     expect(options.pasteLine).toBeUndefined();
     expect(options.pasteSettleMs).toBeUndefined();
   });
+});
 
-  it('minimax raw 通道按 runner 帧协议编码（v3 goal 注入不能被 runner 丢成 non-frame input）', () => {
+describe('framed stdin runners route raw passthrough through writeInput', () => {
+  it('minimax declares runnerFramedInput and frames a raw objective exactly like a turn', async () => {
     const adapter = createMinimaxAdapter('/bin/true');
-    const options = rawCommandWriteOptionsFor(adapter, 'minimax');
+    expect(adapter.runnerFramedInput).toBe(true);
+    expect(adapter.frameRawCommandLine).toBeUndefined();
 
-    expect(typeof options.frameLine).toBe('function');
-    const objective = 'Read $BOTMUX_GOAL_PATH. Complete it.';
-    const framed = options.frameLine!(objective);
-    expect(framed.startsWith('::botmux-minimax:')).toBe(true);
-    expect(framed).not.toContain('\n');
-    expect(framed).not.toContain('\r');
-    const decoded = JSON.parse(Buffer.from(framed.slice('::botmux-minimax:'.length), 'base64').toString('utf8'));
+    const sent: string[] = [];
+    const keys: string[] = [];
+    const pty = {
+      write: (data: string) => sent.push(data),
+      sendText: (text: string) => { sent.push(text); },
+      sendSpecialKeys: (...pressed: string[]) => { keys.push(...pressed); },
+    };
+    const objective = 'Read $BOTMUX_GOAL_PATH. Write files and manifest. Complete it.';
+    await adapter.writeInput(pty as never, objective);
+
+    // One framed line (::botmux-minimax:<base64>); the runner protocol sends a
+    // pre-flush Enter (idempotent on an empty buffer) plus the submit Enter.
+    expect(keys).toEqual(['Enter', 'Enter']);
+    const line = sent.join('');
+    expect(sent.filter((s) => s.startsWith('::botmux-minimax:'))).toHaveLength(1);
+    expect(line.startsWith('::botmux-minimax:')).toBe(true);
+    const decoded = JSON.parse(Buffer.from(line.slice('::botmux-minimax:'.length), 'base64').toString('utf8'));
     expect(decoded).toEqual({ type: 'message', content: objective });
   });
 
-  it('writeRawCommandLine writes the framed line verbatim and submits with Enter', async () => {
-    const sent: string[] = [];
-    const keys: string[] = [];
-    const backend: RawCommandWriter = {
-      sendText: (text) => { sent.push(text); },
-      sendSpecialKeys: (...pressed) => { keys.push(...pressed); },
-    };
-    const frameLine = (content: string) => `frame:${Buffer.from(content).toString('base64')}`;
-    const ok = await writeRawCommandLine(backend, '/goal hi', {
-      frameLine,
-      submitBeatMs: 0,
-      delay: async () => {},
-    });
-    expect(ok).not.toBe(false);
-    expect(sent).toEqual([frameLine('/goal hi')]);
-    expect(keys).toEqual(['Enter']);
+  it('generic adapters do not opt into framed raw routing', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').runnerFramedInput).toBeUndefined();
+    expect(createOpenCodeAdapter('/bin/opencode').runnerFramedInput).toBeUndefined();
   });
 });
