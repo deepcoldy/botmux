@@ -342,9 +342,9 @@ describe('delegated identity (signed cross-bot dispatch)', () => {
     credentialOpenId: 'ou_requester', targetOpenId: 'ou_requester_in_target_app', tools, dispatchRoot: 'om_root',
   });
 
-  it('asks the platform for the original requester, not the dispatching bot', async () => {
-    unionIds.set('ou_requester', 'on_requester');
-    unionIds.set('ou_requester_in_target_app', 'on_wrong_key');
+  it('resolves the requester using the receiver-app open_id for platform grants', async () => {
+    unionIds.set('ou_requester', 'on_wrong_issuer_key');
+    unionIds.set('ou_requester_in_target_app', 'on_requester');
     grantResponse = (req: any) => (req.unionId === 'on_requester' ? granted('lark-cli') : { ok: false, reason: 'not_authorized', error: 'x' });
     const out = await publishTurnCliIdentity({
       botConfig: botConfig({ enabled: true, tools: ['lark-cli'] }), sessionDataDir: dir, sessionId: SESSION,

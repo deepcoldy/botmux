@@ -166,9 +166,11 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
   // verified). In strict `platform` mode a non-grant is final; in `auto` an
   // already-provisioned local HOME is still honoured below.
   const source = credentialSourceOf(args.botConfig.triggerUserAuth);
-  if (source !== 'local') {
+  if (source !== 'local' && user.targetOpenId) {
+    // Platform lookup is receiver-app scoped; the issuer open_id belongs only
+    // to the local credential reference and cannot be resolved in this app.
     const platform = await resolvePlatformIdentity({
-      botConfig: args.botConfig, tool, openId: user.credentialOpenId,
+      botConfig: args.botConfig, tool, openId: user.targetOpenId,
       sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
     });
     if (platform.state === 'granted') identity = platform.identity;
