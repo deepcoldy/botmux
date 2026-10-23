@@ -1,15 +1,34 @@
 /**
- * Pure-function render pipeline for `botmux quoted`. Extracted so unit tests
+ * Fetch/render pipeline for `botmux quoted`. Extracted so unit tests
  * can exercise the wire-up (numberer sharing, extraResources merging) without
  * spinning up the CLI dispatcher or hitting Lark APIs.
  */
 import type { LarkMessage } from '../types.js';
+import { LARK_CODE_MESSAGE_INTERNAL_ERROR, structuredLarkCode } from '../im/lark/lark-errors.js';
 import {
   parseApiMessage,
   extractResources,
   createImgNumberer,
   type MessageResource,
 } from '../im/lark/message-parser.js';
+
+/** Keep full card JSON on successful lookups. Some merge_forward parents return
+ *  Lark 2200 with user_card_content; retry once without that parameter so the
+ *  renderer can reach the existing forwarded-tree/card recovery pipeline. */
+export async function getQuotedMessageDetail(
+  larkAppId: string,
+  messageId: string,
+  getMessageDetail: typeof import('../im/lark/client.js').getMessageDetail,
+): Promise<any> {
+  try {
+    return await getMessageDetail(larkAppId, messageId);
+  } catch (err) {
+    // Only the known provider error gets a representation fallback. Permission,
+    // withdrawn-message, rate-limit and transport failures remain failures.
+    if (structuredLarkCode(err) !== LARK_CODE_MESSAGE_INTERNAL_ERROR) throw err;
+    return getMessageDetail(larkAppId, messageId, { userCardContent: false });
+  }
+}
 
 /** Subset of expandMergeForward used here — accepts the parsed message and a
  *  numberer, mutates parsed.content to the rendered tree, returns extra
