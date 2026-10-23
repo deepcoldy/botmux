@@ -167,6 +167,46 @@ async function managed(
 }
 
 describe('schedule CLI prompt updates', () => {
+  it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: { om_live: { rootMessageId: 'om_current_topic', updatedAt: new Date().toISOString() } },
+      currentReplyTarget: { turnId: 'om_queued', rootMessageId: 'om_queued_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344']).toMatchObject({ executionPosition: 'topic', rootMessageId: 'om_current_topic' });
+  });
+
+  it.each(['missing', 'plain'])('refuses implicit --topic when the exact chat turn is %s', async mode => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: mode === 'plain' ? { om_live: { updatedAt: new Date().toISOString() } } : {},
+      currentReplyTarget: { turnId: 'om_other', rootMessageId: 'om_other_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('话题下执行需要');
+    expect(f.read()['11223344']).toBeUndefined();
+    const explicit = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--root-msg-id', 'om_explicit', '--id', '11223344']);
+    expect(explicit.code, explicit.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_explicit');
+  });
+
+  it('keeps the bound root for an ordinary thread session', async () => {
+    const f = fixture();
+    await managed(f);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_root');
+  });
+
   it('documents both update inputs without requiring a configured bot', async () => {
     const f = fixture();
     const result = await f.run(['update', '--help']);

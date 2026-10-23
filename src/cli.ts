@@ -61,7 +61,7 @@ import {
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
-import { isHttpVirtualSession } from './core/types.js';
+import { isHttpVirtualSession, type TurnTerminalCarrierKind } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -451,7 +451,10 @@ import {
 // callers to parse. Transitive logger.info calls from shared modules would
 // corrupt that stream, so the CLI process runs silent by default. DEBUG=1
 // re-enables logging end-to-end for CLI troubleshooting.
-logger.setSilent(true);
+// Set fleet sinks before Bun can evaluate the bundled entry imports; restoring
+// them only at dispatch is too late for the dashboard's startup log.
+logger.setSilent(!['__core-only', '__daemon', '__worker', '__supervisor', '__dashboard', '__plugin-supervisor']
+  .includes(process.argv[2] ?? ''));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -7606,6 +7609,7 @@ interface CurrentSession {
   turnId?: string;
   chatId: string;
   rootMessageId: string;
+  scheduleRootMessageId?: string;
   workingDir?: string;
   larkAppId?: string;
   chatType?: 'group' | 'p2p';
@@ -7627,6 +7631,11 @@ async function detectCurrentSession(): Promise<CurrentSession | null> {
     turnId: ancestor?.turnId,
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
+    // A shared chat session retains its first message as the session anchor.
+    // Only this turn's reply target can identify the topic creating a task.
+    scheduleRootMessageId: s.scope === 'chat'
+      ? (ancestor?.turnId ? pickTurnReplyTarget(s, ancestor.turnId)?.rootMessageId : undefined)
+      : s.rootMessageId,
     workingDir: s.workingDir,
     larkAppId: s.larkAppId,
     chatType: s.chatType,
@@ -7784,6 +7793,9 @@ async function detectAuthenticatedCurrentSession(purpose: 'create' | 'operate' =
     turnId: provenance.turnId,
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
+    scheduleRootMessageId: s.scope === 'chat'
+      ? pickTurnReplyTarget(s, provenance.turnId)?.rootMessageId
+      : s.rootMessageId,
     workingDir: s.workingDir,
     larkAppId: s.larkAppId,
     chatType: s.chatType,
@@ -8367,10 +8379,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const cur = frozenRelaySession ?? await detectCurrentSession();
+    let cur = frozenRelaySession ?? await detectCurrentSession();
     let creatorAuthError: unknown;
     if (!trustedRemoteRunnerRelay) {
-      try { await detectAuthenticatedCurrentSession(); }
+      try { cur = await detectAuthenticatedCurrentSession() ?? cur; }
       catch (error) { creatorAuthError = error; }
     }
     const explicitTaskId = argValue(rest, '--id');
@@ -8385,7 +8397,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const chatId = trustedRemoteRunnerRelay ? cur?.chatId : argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = trustedRemoteRunnerRelay ? undefined : argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
-      ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
+      ?? (chatId && chatId === cur?.chatId
+        ? (trustedRemoteRunnerRelay ? cur.rootMessageId : cur.scheduleRootMessageId)
+        : undefined);
     // Resolve the daemon that owns the authoritative task store. A bare host
     // terminal uses the primary bot selected above; managed sessions stay
     // pinned to their own app.
@@ -9071,10 +9085,10 @@ async function cmdQuoted(rest: string[]): Promise<void> {
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const { renderQuotedMessage } = await import('./cli/quoted-render.js');
+  const { getQuotedMessageDetail, renderQuotedMessage } = await import('./cli/quoted-render.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
-    const detail = await getMessageDetail(appId, messageId);
+    const detail = await getQuotedMessageDetail(appId, messageId, getMessageDetail);
     const msg = detail?.items?.[0];
     if (!msg) {
       console.error(`未找到消息 ${messageId}`);
@@ -12386,7 +12400,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     sentAtMs: number,
     messageId: string,
     sentContent: string,
-    terminalCarrier?: 'standard_reply_card' | 'non_patchable',
+    terminalCarrier?: TurnTerminalCarrierKind,
   ): void => {
     try {
       const markerSessionId = originSessionId ?? sid;
@@ -17770,6 +17784,11 @@ if (command === '__orca-relay-local') {
 // these tokens are never used (spawners pass the real dist/*.js path).
 const __entrySubcommand = command && ENTRY_SUBCOMMANDS.has(command) ? entryForSubcommand(command) : null;
 if (__entrySubcommand) {
+  // Compiled fleet entries share this logger module with CLI dispatch.
+  // Protocol helpers/runners retain quiet stdout; fleet logs use normal sinks.
+  if (['core-only', 'daemon', 'worker', 'supervisor', 'dashboard', 'plugin-supervisor'].includes(__entrySubcommand)) {
+    logger.setSilent(false);
+  }
   // Bun's --compile can't bundle a fully-dynamic import specifier, so switch on
   // a static import per entry — the same modules the Node path spawns as files.
   if (__entrySubcommand === 'core-only') await import('./index-core-only.js');

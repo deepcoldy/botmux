@@ -66,6 +66,21 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('meeting inviter configuration', () => {
+  it.each([
+    [{}, undefined, undefined],
+    [{ inviterManagementEnabled: false }, false, undefined],
+    [{ inviterManagementEnabled: true, inviterManagementEnabledAt: 123 }, true, 123],
+    [{ inviterManagementEnabled: 'true', inviterManagementEnabledAt: '123' }, undefined, undefined],
+    [{ inviterManagementEnabled: 1, inviterManagementEnabledAt: -1 }, undefined, undefined],
+  ])('normalizes policy strictly without enabling old configurations: %#', async (vcMeetingAgent, enabled, epoch) => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ vcMeetingAgent })]));
+    expect(config.vcMeetingAgent?.inviterManagementEnabled).toBe(enabled);
+    expect(config.vcMeetingAgent?.inviterManagementEnabledAt).toBe(epoch);
+  });
+});
+
 describe('voice configuration', () => {
   it.each([
     [{ volcengine: null }, { volcengine: null }],

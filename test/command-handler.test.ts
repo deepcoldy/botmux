@@ -1721,6 +1721,8 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'minimax').size).toBe(0);
     // ebsd is interactive, but every external message must pass through the
     // service-user envelope and structured terminal-marker ledger.
     expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
@@ -5303,6 +5305,7 @@ describe('handleCommand', () => {
 
     it('starts a first message refused for its missing directory in the /repo-chosen one', async () => {
       const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = { path: '/gone/default-dir' };
       const deps = makeDeps(ds);
       deps.lastRepoScan.set(CHAT_ID, [
         { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
@@ -5317,6 +5320,20 @@ describe('handleCommand', () => {
       expect(sessionStore.createSession).not.toHaveBeenCalled();
       expect(ds.workingDir).toBe('/home/testuser/project-a');
       expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    });
+
+    it('guides bare /repo to pass a path instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
     });
 
     it('still refuses /repo while an activation is actually in flight', async () => {

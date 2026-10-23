@@ -55,6 +55,7 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
@@ -242,6 +243,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_reapOrphanTmuxServers'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
@@ -478,6 +480,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
     }
     patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
+  }
+  if ('reapOrphanTmuxServers' in obj) {
+    if (typeof obj.reapOrphanTmuxServers !== 'boolean') {
+      return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
+    }
+    patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {

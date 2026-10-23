@@ -94,6 +94,7 @@ describe('summary sharing IPC aperture', () => {
     expect(hostHits).toBe(0);
     expect((await call('/api/test-summary-host-only', {}, true)).status).toBe(200);
     expect(hostHits).toBe(1);
+    expect((await call('/api/vc-meetings-sibling/share-summary')).status).toBe(401);
     expect((await call(PATH, undefined, false, 'GET')).status).toBe(401);
     expect(handlerHits).toBe(0);
     expect((await call(PATH, { receiverSessionId: 'receiver', content: 'Minutes' }, true)).status).toBe(403);

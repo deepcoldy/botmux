@@ -616,6 +616,28 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('passes optional cumulative cache counters and rejects malformed ones', () => {
+    const base = {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'final',
+      turnId: 'turn-usage',
+      content: 'done',
+    } as const;
+    const withTokens = (tokens: unknown) => parseRemoteRunnerEventLine(JSON.stringify({
+      ...base,
+      usage: { generation: 3, snapshot: { context: null, tokens } },
+    }));
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 })).toMatchObject({
+      usage: { snapshot: { tokens: { in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 } } },
+    });
+    const withoutCache = withTokens({ in: 7230, out: 44 }) as any;
+    expect(withoutCache.usage.snapshot.tokens).toEqual({ in: 7230, out: 44 });
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 7231 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheCreateTokens: -1 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 1.5 })).toBeUndefined();
+  });
+
   it('ships a runnable reference provider covering hello/start/turn/status/detach', async () => {
     const child = spawn(process.execPath, [resolve('examples/remote-runner/reference-runner.mjs')], {
       stdio: ['pipe', 'pipe', 'inherit'],

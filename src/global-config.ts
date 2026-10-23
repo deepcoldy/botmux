@@ -370,13 +370,22 @@ export interface DashboardGlobalConfig {
    *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
    *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
-   *  force-enables regardless of this global default. */
+   *  force-enables regardless of this global default; false explicitly keeps
+   *  that bot on terminal input. */
   codexRpcInput?: boolean;
   /** Automatically replace outdated Codex session processes when safely idle
    *  and resume the same thread without sending a new prompt. Experimental,
    *  default OFF; read live so an explicit true starts scheduling upgrades and
    *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
+  /** Experimental: at daemon startup, SIGTERM tmux SERVERS orphaned by a
+   *  previous daemon generation (a displaced server whose socket was rebound
+   *  still hosts the old managed CLIs holding per-session file locks). This is
+   *  an automatic process kill, so it is default OFF and must be enabled
+   *  explicitly from the Dashboard experimental settings; read live by the
+   *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
+   *  remains an independent emergency kill-switch. */
+  reapOrphanTmuxServers?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -559,6 +568,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
+  if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.

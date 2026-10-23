@@ -161,6 +161,8 @@ export type VcMeetingPushEventKind =
   | 'participant_meeting_joined';
 
 export interface VcMeetingPushContext {
+  /** Only extracted from the native bot invitation event; app-scoped human identity. */
+  inviter?: { openId: string; invitedAt?: number };
   larkAppId: string;
   kind: VcMeetingPushEventKind;
   eventType: string;

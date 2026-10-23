@@ -36454,3 +36454,25 @@ dialog.command-palette-dialog::backdrop {
     animation: none;
   }
 }
+
+.bd-auto-model { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.bd-auto-model-toggle { display: flex; align-items: center; gap: 8px; }
+.bd-auto-model-toggle input { width: auto; }
+.bd-auto-model-list { list-style: none; padding: 0; margin: 10px 0; }
+.bd-auto-model-list > li { display: block; margin: 12px 0; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.bd-auto-model-main { display: flex; align-items: center; gap: 6px; }
+.bd-auto-model-settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 8px 0 0 54px; }
+.bd-auto-model-setting { min-width: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.bd-auto-model-description { display: flex; align-items: center; gap: 6px; margin: 6px 0 12px; font-size: 12px; }
+.bd-auto-model-count { margin-left: 10px; font-size: 12px; }
+.bd-auto-model-save { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 12px; }
+.bd-auto-model-save button { flex-shrink: 0; }
+.bd-auto-model-rank { width: 48px; flex-shrink: 0; font-size: 12px; }
+.bd-auto-model-picker { min-width: 0; flex: 1; }
+.bd-auto-model-list button { min-width: 28px; }
+.bd-auto-model-timeout { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.bd-auto-model-timeout input { width: 85px; }
+@media (max-width: 480px) {
+  .bd-auto-model-settings { margin-left: 0; gap: 8px; }
+  .bd-auto-model-description { align-items: flex-start; }
+}

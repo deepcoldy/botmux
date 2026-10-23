@@ -227,7 +227,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
     "generation": 3,
     "snapshot": {
       "context": { "usedTokens": 7274, "windowTokens": 258400, "percentUsed": 3 },
-      "tokens": { "in": 7230, "out": 44 },
+      "tokens": { "in": 7230, "out": 44, "cacheReadTokens": 6100, "cacheCreateTokens": 1000 },
       "turnTokens": { "in": 7230, "out": 44 },
       "model": "example-model",
       "reasoningEffort": "high"
@@ -238,6 +238,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - `generation` 必须等于当前远端 compute generation；旧 generation 的快照会被拒绝。
 - `context` 和 `tokens` 必须显式为对象或 `null`。缺失指标保持缺失，不得由 provider 估算。
+- `tokens.cacheReadTokens` / `tokens.cacheCreateTokens` 可选，表示累计缓存读 / 写 token，都包含在 `in` 里（不得大于 `in`）。上报后卡片显示 `缓存命中 N%`（N = cacheReadTokens / in，向下取整）；不报则不显示。
 - BotMux 严格校验非负整数、上下文百分比和运行时标签，然后把快照交给普通卡片的同一套 usage renderer。
 - 这是 v1 的可选 additive 字段：旧 provider 不上报时行为不变，旧 BotMux 会忽略该字段，因此无需增加 capability 或升级协议版本。
 - 最近一次通过校验的快照会随 Session 持久化；远端 generation 前进时自动清除，避免恢复后显示旧计算资源的数据。

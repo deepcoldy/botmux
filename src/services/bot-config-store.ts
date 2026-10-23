@@ -113,6 +113,7 @@ export interface ConfigFieldSpec {
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
+  { key: 'codexRpcInput', configKey: 'codexRpcInput', kind: 'boolean', effect: 'next-session', clearable: true, hint: 'Codex/TraeX RPC 输入 on|off；off 显式使用终端输入，unset 跟随全局；Auto 启用时自动使用终端输入' },
   { key: 'reasoningEffort', configKey: 'reasoningEffort', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], hint: '支持的 CLI 上新会话默认思考强度 low|medium|high|xhigh|max|ultra；unset 回 CLI 默认' },
   { key: 'serviceTier', configKey: 'serviceTier', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'priority', 'ultrafast'], hint: 'Codex 新会话速度档位 default|priority|ultrafast；default 显式覆盖原生加速配置；unset 回 Codex 原生配置' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
@@ -214,6 +215,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 
 /** 展示某字段当前值的人类可读文本。`cfg` 供 enumDefault 为函数的字段求缺省值。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown, cfg: BotConfig): string {
+  if (spec.configKey === 'codexRpcInput' && typeof value !== 'boolean') return 'inherit';
   if (spec.kind === 'boolean') return (spec.defaultOn ? value !== false : value === true) ? 'on' : 'off';
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
@@ -582,7 +584,9 @@ async function applyConfigFieldInternal(
       if (spec.configKey === 'cotEnabled') delete entry.thinkingCard; // [legacy-thinkingCard] 懒迁移，同上
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
       // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
-      if (spec.defaultOn) {
+      if (spec.configKey === 'codexRpcInput') {
+        entry.codexRpcInput = effective === true;
+      } else if (spec.defaultOn) {
         if (effective === false) entry[spec.configKey] = false;
         else delete entry[spec.configKey];
       } else if (effective === true) entry[spec.configKey] = true;
@@ -625,7 +629,8 @@ async function applyConfigFieldInternal(
   } else if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = spec.defaultOn
+    (bot.config as any)[spec.configKey] = spec.configKey === 'codexRpcInput'
+      ? effective === true : spec.defaultOn
       ? (effective === false ? false : undefined)
       : (effective || undefined);
   } else if (spec.kind === 'json') {

@@ -29,6 +29,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
+    reapOrphanTmuxServers: false,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -203,6 +204,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
+  });
+
+  it.each([false, true])('writes reapOrphanTmuxServers=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ reapOrphanTmuxServers: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -569,6 +577,13 @@ describe('applySettingsWrite — validation errors', () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid reapOrphanTmuxServers=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_reapOrphanTmuxServers' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 

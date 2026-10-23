@@ -95,6 +95,9 @@ export interface RemoteRunnerUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   turnTokens?: {
     in: number;
@@ -577,6 +580,22 @@ function normalizeTokenPair(value: unknown): { in: number; out: number } | undef
   return { in: input, out: output };
 }
 
+/** Cumulative tokens: the in/out pair plus optional cache counters. A cache
+ *  counter that is present must be a non-negative integer no larger than `in`;
+ *  otherwise the whole snapshot is rejected, like any other malformed metric. */
+function normalizeCumulativeTokens(value: unknown): RemoteRunnerUsageSnapshot['tokens'] | undefined {
+  const tokens: RemoteRunnerUsageSnapshot['tokens'] | undefined = normalizeTokenPair(value);
+  if (!tokens) return undefined;
+  const raw = record(value)!;
+  for (const key of ['cacheReadTokens', 'cacheCreateTokens'] as const) {
+    if (raw[key] === undefined) continue;
+    const count = nonNegativeInteger(raw[key]);
+    if (count === undefined || count > tokens.in) return undefined;
+    tokens[key] = count;
+  }
+  return tokens;
+}
+
 export function normalizeRemoteRunnerUsageReport(
   value: unknown,
 ): RemoteRunnerUsageReport | undefined {
@@ -615,7 +634,7 @@ export function normalizeRemoteRunnerUsageReport(
   if (snapshotRaw.tokens === null) {
     tokens = null;
   } else {
-    tokens = normalizeTokenPair(snapshotRaw.tokens) ?? null;
+    tokens = normalizeCumulativeTokens(snapshotRaw.tokens) ?? null;
     if (tokens === null) return undefined;
   }
 

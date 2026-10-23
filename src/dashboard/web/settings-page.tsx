@@ -44,6 +44,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -205,6 +206,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -832,7 +834,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -988,6 +990,13 @@ function SettingsBody(props: {
             checked={settings.autoUpgradeCodexSessions}
             disabled={dis || savingKey === 'autoUpgradeCodexSessions'}
             onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
+          />
+          <ToggleRow
+            title={tr('settings.reapOrphanTmuxServers')}
+            help={tr('settings.reapOrphanTmuxServersHelp')}
+            checked={settings.reapOrphanTmuxServers}
+            disabled={dis || savingKey === 'reapOrphanTmuxServers'}
+            onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
           />
           <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}

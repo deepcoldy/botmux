@@ -69,6 +69,33 @@ describe('CLI plugin generation', () => {
     expect(existsSync(user)).toBe(true);
   });
 
+  it('suppresses an unchanged delivered Auto catalog while still refreshing snapshots and publishing removals', () => {
+    const source = join(home, 'skill-src', 'demo');
+    write(join(source, 'SKILL.md'), '---\nname: demo\ndescription: A demo\n---\n# Demo');
+    installLocalSkill(source, { link: false });
+    const opts = { sessionId: 'auto-catalog', bot: { larkAppId: 'app', skills: { include: ['skill:demo'] } },
+      dataDir, cliId: 'traex' as const, adapter: { id: 'traex' } as CliAdapter,
+      workingDir: join(home, 'proj'), prompt: 'first', replacesPriorGeneration: false };
+    const first = prepareCliPluginGeneration(opts);
+    expect(first.prompt).toContain('botmux_skills');
+    const same = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(same.prompt).toBe('');
+    expect(same.skillCatalog).toBeUndefined();
+    expect(same.deferredSkillCatalog).toBeUndefined();
+    expect(same.skillReadonlyRoots?.length).toBeGreaterThan(0);
+    expect(readSessionSkillManifest('auto-catalog')?.prioritySkills.map(skill => skill.name)).toEqual(['demo']);
+    const unchangedRealTurn = prepareCliPluginGeneration({ ...opts, prompt: 'next ask', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(unchangedRealTurn.prompt).toBe('next ask');
+    const removed = prepareCliPluginGeneration({ ...opts, bot: { larkAppId: 'app' }, prompt: '',
+      replacesPriorGeneration: true, previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(removed.deferredSkillCatalog).toContain('Skills not listed here are no longer available');
+    expect(removed.skillCatalogFingerprint).not.toBe(first.skillCatalogFingerprint);
+    const ordinary = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true });
+    expect(ordinary.deferredSkillCatalog).toContain('<botmux_skills_refresh>');
+  });
+
   it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', () => {
     const source = join(home, 'demo-source');
     write(join(source, 'package.json'), JSON.stringify({

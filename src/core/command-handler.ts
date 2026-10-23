@@ -62,7 +62,7 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
+import { onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
@@ -2949,6 +2949,13 @@ export async function handleCommand(
         // back to is missing still holds the session; `/repo <路径>` picks the
         // directory for it, like the recovery card (the no-card reply says so).
         if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
+        if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
+          await sessionReply(
+            rootId,
+            t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+          );
+          break;
+        }
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
           await sessionReply(
@@ -3101,6 +3108,7 @@ export async function handleCommand(
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
+            current.workingDirRecovery = undefined;
             return { current, cardToWithdraw };
           });
           if (!started) return false;

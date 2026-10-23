@@ -30,11 +30,14 @@ export function withCardRuntimeIdentity(
   const effort = remote?.reasoningEffort?.trim()
     || (effectiveCliId === 'minimax' ? nativeEffort : undefined)
     || reasoningEffort || nativeEffort;
-  const variant = remote?.modelBackendVariant?.trim() || ds.session.modelBackendVariant;
+  const variant = remote?.modelBackendVariant?.trim() || (ds.activeModelBackendVariant !== undefined
+    ? ds.activeModelBackendVariant : ds.session.modelBackendVariant);
   return {
     ...snapshot,
     ...(model ? { model } : {}),
     ...(effort ? { reasoningEffort: effort } : {}),
-    ...(variant ? { modelBackendVariant: variant } : {}),
+    ...(ds.activeModelBackendVariant !== undefined
+      ? { modelBackendVariant: variant || undefined }
+      : variant ? { modelBackendVariant: variant } : {}),
   };
 }

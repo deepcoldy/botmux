@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -60,6 +61,22 @@ export interface GroupJoinContext {
   operatorOpenId?: string;
   gateMatched: boolean;
 }
+
+export type TurnTerminalCarrierKind = 'standard_reply_card' | 'non_patchable';
+
+/** Last user-visible output carrier observed for each in-flight turn. The
+ *  worker reconstructs explicit-send entries from the durable turn-sends
+ *  journal before publishing turn_terminal; daemon-owned fallback output is
+ *  recorded directly after Lark accepts it. Retained in a bounded map so a
+ *  duplicate terminal can safely retry after an unconfirmed provider error. */
+export type TurnTerminalCarrier = {
+  messageId: string;
+  kind: TurnTerminalCarrierKind;
+  /** Explicit send classification. `progress` / `auxiliary` are visible
+   *  interim output and must never be promoted to a completed-turn carrier.
+   *  Undefined is retained for rolling compatibility with older workers. */
+  responseKind?: TurnSendKind;
+};
 
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
@@ -543,14 +560,7 @@ export interface DaemonSession {
    *  journal before publishing turn_terminal; daemon-owned fallback output is
    *  recorded directly after Lark accepts it. Retained in a bounded map so a
    *  duplicate terminal can safely retry after an unconfirmed provider error. */
-  turnTerminalCarriers?: Map<string, {
-    messageId: string;
-    kind: 'standard_reply_card' | 'non_patchable';
-    /** Explicit send classification. `progress` / `auxiliary` are visible
-     *  interim output and must never be promoted to a completed-turn carrier.
-     *  Undefined is retained for rolling compatibility with older workers. */
-    responseKind?: 'progress' | 'final' | 'auxiliary';
-  }>;
+  turnTerminalCarriers?: Map<string, TurnTerminalCarrier>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -643,6 +653,8 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
+  /** Undefined means no observation; null means native/default context. */
+  activeModelBackendVariant?: 'standard' | 'max' | null;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it

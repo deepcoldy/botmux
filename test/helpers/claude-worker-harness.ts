@@ -15,7 +15,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { claudeJsonlPathForSession } from '../../src/adapters/cli/claude-code.js';
@@ -71,8 +71,10 @@ const record = o => {
     uuid: randomUUID(), timestamp: new Date().toISOString(), sessionId: sid, cwd: cfg.workingDir, ...o,
   }) + '\\n');
 };
-// Claude's own pid-state record. Withheld until the gate file exists when the
-// scenario wants a transcript nobody can locate.
+// Claude's own pid-state record, rewritten in place the way Claude does (never
+// through a rename): the worker has to read through a torn record. Withheld
+// until the gate file exists when the scenario wants a transcript nobody can
+// locate.
 const pidState = () => {
   if (cfg.pidStateGate && !fs.existsSync(cfg.pidStateGate)) return;
   fs.mkdirSync(path.join(cfg.claudeDir, 'sessions'), { recursive: true });
@@ -264,7 +266,11 @@ const child = spawn(process.execPath, [${JSON.stringify(fakeCli)}, ...process.ar
 child.on('exit', code => process.exit(code ?? 1));
 `);
   chmodSync(launcher, 0o755);
-  const readEvents = () => (existsSync(events) ? readFileSync(events, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []);
+  // The fake appends one line per event while tests poll this file: a trailing
+  // fragment without its newline is an append still in progress, not an event.
+  const readEvents = () => (existsSync(events)
+    ? readFileSync(events, 'utf8').split('\n').slice(0, -1).filter(Boolean).map(line => JSON.parse(line))
+    : []);
   const killCli = () => {
     for (const pid of new Set(readEvents().map(e => e.pid as number))) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
@@ -285,7 +291,14 @@ child.on('exit', code => process.exit(code ?? 1));
   let notified = 0;
   const harness: Harness = {
     root, sessionId, workingDir, claudeDir, transcript, clearSid, forkSid, pidStateGate, killCli,
-    notify: reply => writeFileSync(join(notifyDir, String(++notified).padStart(4, '0')), reply),
+    // Staged outside notifyDir and renamed in: the fake polls notifyDir every
+    // 100ms, and a file it reads between creation and write is an empty reply.
+    notify: reply => {
+      const name = String(++notified).padStart(4, '0');
+      const staged = join(root, `notify-${name}.tmp`);
+      writeFileSync(staged, reply);
+      renameSync(staged, join(notifyDir, name));
+    },
     commands: () => readEvents().filter(e => e.kind === 'command').map(e => e.text as string),
     launches: () => readEvents().filter(e => e.kind === 'start').map(e => ({ sid: e.sid as string, args: e.args as string[] })),
     doneAt: (kind, text) => readEvents().find(e => e.kind === kind && (kind === 'command' ? e.text === text : e.reply === text))?.t,

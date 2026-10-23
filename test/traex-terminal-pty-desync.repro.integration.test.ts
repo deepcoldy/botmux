@@ -105,7 +105,12 @@ function readSubmissions(path: string): Array<{ pid: number; text: string }> {
 }
 
 describe('TraeX transcript-terminal / PTY-readiness desync reproduction', () => {
-  it.each(['intentional restart', 'CLI crash'] as const)('accepts healthy type-ahead and never replays quarantined input after %s', async restartKind => {
+  it.each([
+    { restartKind: 'intentional restart', autoReselect: undefined },
+    { restartKind: 'CLI crash', autoReselect: undefined },
+    { restartKind: 'intentional restart', autoReselect: false },
+    { restartKind: 'intentional restart', autoReselect: true },
+  ] as const)('accepts healthy type-ahead and never replays quarantined input after $restartKind (auto=$autoReselect)', async ({ restartKind, autoReselect }) => {
     const botmuxSessionId = randomUUID();
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-desync-repro-'));
     tempDirs.add(root);
@@ -242,6 +247,8 @@ setInterval(() => {
       rootMessageId: 'om_root',
       workingDir: dataDir,
       cliId: 'traex',
+      ...(autoReselect !== undefined ? { traexAutoModel: { enabled: true,
+        models: ['GPT-6-Astra', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: autoReselect } } : {}),
       cliPathOverride: fakeTraex,
       cliSessionId: nativeSessionId,
       resume: true,
@@ -463,8 +470,11 @@ setInterval(() => {
     await waitFor(child, () => readSubmissions(submissionsPath).length >= 7, logs, 'fresh input on replacement generation');
     const afterRestart = readSubmissions(submissionsPath);
     expect(afterRestart).toHaveLength(7);
-    // Every generation refreshes the plugin catalogue on its first message.
-    expect(afterRestart[6]!.text).toBe(firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
+    // Auto exact resume keeps the delivered catalogue; ordinary TraeX retains
+    // its existing first-message refresh behavior after a process restart.
+    expect(afterRestart[6]!.text).toBe(autoReselect !== undefined
+      ? 'fresh input after recovery'
+      : firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
     expect(afterRestart[6]!.pid).not.toBe(recoveredSubmissions[5]!.pid);
   }, 60_000);
 });
