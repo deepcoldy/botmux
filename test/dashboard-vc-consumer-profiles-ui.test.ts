@@ -520,6 +520,7 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     expect(putCalls(fetchMock)[0].botOutputPolicies).toEqual([{
       appId: 'app_on',
       vcEnabled: true,
+      inviterManagementEnabled: false,
       textOutputPolicy: 'approval',
       voiceOutputPolicy: null,
       realtimeVoiceEnabled: true,
@@ -540,6 +541,7 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     expect(putCalls(fetchMock)[0].botOutputPolicies).toEqual([{
       appId: 'app_on',
       vcEnabled: true,
+      inviterManagementEnabled: false,
       textOutputPolicy: null,
       voiceOutputPolicy: null,
       realtimeVoiceEnabled: false,
@@ -760,5 +762,26 @@ describe('会议角色预设 · 文案', () => {
     expect(zh('settings.vcProfiles.botPolicies.preflightHelp')).toContain('启动时自动体检');
     expect(en('settings.vcProfiles.botPolicies.preflightHelp')).toContain('subscribe meeting events');
     expect(en('settings.vcProfiles.botPolicies.preflightHelp')).toContain('auto-checked at daemon startup');
+  });
+});
+
+
+describe('meeting inviter owner switch', () => {
+  it('is off by default and writes only after the owner toggles and saves', async () => {
+    const fetchMock = stubFetch(); const r = await mount();
+    const label = r.root.findAllByType('label').find(n => textOf(n).includes('邀请人管理本场会议'))!;
+    const input = label.findByType('input');
+    expect(input.props.checked).toBe(false);
+    expect(putCalls(fetchMock)).toHaveLength(0);
+    await act(async () => { input.props.onChange({ target: { checked: true } }); });
+    await act(async () => { saveButton(r)!.props.onClick(); });
+    await flush();
+    expect(putCalls(fetchMock)[0]).toMatchObject({ botOutputPolicies: [{ appId: 'app_alpha', inviterManagementEnabled: true }] });
+  });
+  it('is not editable by a read-only viewer', async () => {
+    stubFetch(); const r = await mount({ canWrite: false });
+    const label = r.root.findAllByType('label').find(n => textOf(n).includes('邀请人管理本场会议'));
+    if (label) expect(label.findByType('input').props.disabled).toBe(true);
+    expect(saveButton(r)?.props.disabled ?? true).toBe(true);
   });
 });

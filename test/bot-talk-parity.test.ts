@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 let tempDir: string;
+const inviterTalk = vi.hoisted(() => ({ allowed: false }));
+vi.mock('../src/services/vc-meeting-inviter-access.js', () => ({ canInviterTalkToMeeting: () => inviterTalk.allowed }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -79,6 +81,11 @@ function restricted(): void {
 }
 
 const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
+  meetingInviter: {
+    arrange: () => { restricted(); inviterTalk.allowed = true; },
+    human: true, bot: true,
+    why: 'The shared predicate consumes a preverified human invitation. A real bot cannot acquire that human identity; this parity fixture reuses one ID on both callers. No operate grant.',
+  },
   allowedUser: {
     arrange: () => {
       restricted();
@@ -183,6 +190,7 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
 
 describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
   beforeEach(() => {
+    inviterTalk.allowed = false;
     tempDir = mkdtempSync(join(tmpdir(), 'botmux-parity-'));
     const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [] });
     bot.resolvedAllowedUsers = [];
@@ -304,4 +312,12 @@ describe('canRunDaemonCommand — bot 发送方走 evaluateBotTalk（daemon 命�
       canRunDaemonCommand(APP, otherChat, SENDER, undefined, '/status', undefined, 'group', true),
     ).toBe(false);
   });
+});
+
+it('meeting invitation talk never grants daemon administration', () => {
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', allowedUsers: ['ou_owner'] });
+  bot.resolvedAllowedUsers = ['ou_owner'];
+  inviterTalk.allowed = true;
+  expect(canRunDaemonCommand(APP, CHAT, SENDER, undefined, '/restart')).toBe(false);
+  inviterTalk.allowed = false;
 });
