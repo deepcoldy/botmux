@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
-import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, parseBotConfigsFromText, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer } from '../src/core/dashboard-ipc-server.js';
+import { __testOnly_sessionAgentConfig } from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { resolveSessionLaunchModelChoice } from '../src/core/session-model.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
 
@@ -18,6 +20,8 @@ vi.mock('../src/adapters/cli/model-catalog-json.js', async importOriginal => ({
   detectModelCapabilitiesViaExec: vi.fn(async () => [
     { slug: 'gpt-5.6-sol', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
       contextVariants: [{ id: 'standard', contextWindow: 272000 }, { id: 'max', contextWindow: 800000 }] },
+    { slug: 'future-live-model', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+      contextVariants: [{ id: 'standard', contextWindow: 272000, reasoningEfforts: ['low', 'medium', 'high', 'xhigh'] }] },
     { slug: 'gpt-6-astra', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
       contextVariants: [{ id: 'standard', contextWindow: 272000 }, { id: 'max', contextWindow: 800000 }] },
   ]),
@@ -79,6 +83,21 @@ describe('TraeX auto-model settings', () => {
         ...configuredPool, modelSettings: { 'gpt-6-astra': { reasoningEffort: 'ultra' } },
       } });
       expect(invalidEffort.status).toBe(400);
+      const fixed = await save({ cliId: 'traex', model: 'future-live-model', reasoningEffort: 'xhigh',
+        modelBackendVariant: 'standard', traexAutoModel: null });
+      expect(fixed.status).toBe(200);
+      expect((await fixed.json()).reasoningEffort).toBe('xhigh');
+      expect(loadBotConfigs()[0]!.reasoningEffort).toBe('xhigh');
+      const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+      const launch = __testOnly_sessionAgentConfig({ larkAppId: 'auto_test', session: { cliId: 'traex', reasoningEffort: 'xhigh' } } as any, getBot('auto_test').config);
+      expect(launch.reasoningEffort).toBe('xhigh');
+      update.mockRestore();
+      const rejected = await save({ cliId: 'traex', model: 'seed-code', reasoningEffort: 'ultra',
+        traexAutoModel: { enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': {} } } });
+      expect(rejected.status).toBe(400);
+      expect(getBot('auto_test').config.model).toBe('future-live-model');
+      expect((await save({ cliId: 'traex', model: 'auto', reasoningEffort: '', traexAutoModel: configuredPool })).status).toBe(200);
+
       const before = readFileSync(path, 'utf8');
       expect((await save({ cliId: 'traex', model: 'auto', traexAutoModel: { ...pool, models: ['auto'] } })).status).toBe(400);
       expect(readFileSync(path, 'utf8')).toBe(before);
@@ -250,5 +269,13 @@ describe('TraeX auto-model settings', () => {
       globalThis.fetch = previous;
       vi.unstubAllGlobals();
     }
+  });
+});
+
+
+describe('Auto shared defaults on daemon launch', () => {
+  it('keeps shared effort for an inheriting backup when the preferred model has native defaults', () => {
+    const parsed = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'shared_defaults', larkAppSecret: 'fixture', cliId: 'traex', model: 'auto', reasoningEffort: 'high', traexAutoModel: { enabled: true, models: ['seed-code', 'gpt-5.5'], modelSettings: { 'seed-code': {} } } }]))[0]!;
+    expect(parsed.reasoningEffort).toBe('high');
   });
 });

@@ -1,3 +1,5 @@
+import { knownTraexContextVariantsForModel, knownTraexReasoningEffortsForModel } from './codex-reasoning-effort.js';
+
 export const TRAEX_AUTO_MODEL_ID = 'auto';
 export const TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 export const TRAEX_AUTO_MODEL_MIN_QUEUE_TIMEOUT_MS = 5_000;
@@ -33,7 +35,7 @@ export type TraexAutoModelConfigResult = {
  * use these entries and preserves their order. Invalid enabled configs are
  * rejected as a whole so a typo cannot silently widen or reorder the pool.
  */
-export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfigResult {
+export function normalizeTraexAutoModelConfig(raw: unknown, options: { validateKnownSettings?: boolean } = {}): TraexAutoModelConfigResult {
   if (raw === undefined || raw === null || raw === false) return {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { error: 'traexAutoModel must be an object' };
@@ -88,8 +90,16 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
       if (effort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort as string)) {
         return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is invalid` };
       }
+      const knownEfforts = options.validateKnownSettings ? knownTraexReasoningEffortsForModel(model) : undefined;
+      if (effort !== undefined && knownEfforts && !knownEfforts.includes(effort as TraexAutoModelSettings['reasoningEffort'] & string)) {
+        return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is not supported by this model` };
+      }
       if (variant !== undefined && variant !== 'standard' && variant !== 'max') {
         return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is invalid` };
+      }
+      const knownVariants = options.validateKnownSettings ? knownTraexContextVariantsForModel(model) : undefined;
+      if (variant !== undefined && knownVariants && !knownVariants.includes(variant as string)) {
+        return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is not supported by this model` };
       }
       // defineProperty safely preserves literal ids such as __proto__.
       Object.defineProperty(modelSettings, model, { enumerable: true, configurable: true, writable: true,
@@ -151,6 +161,7 @@ export interface TraexAutoModelRuntimeState {
   policyKey: string;
   nativeSessionId: string;
   skillCatalogFingerprint?: string;
+  sharedSettings?: TraexAutoModelSettings;
 }
 
 export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
@@ -158,7 +169,8 @@ export function traexAutoModelPolicyKey(config: TraexAutoModelConfig): string {
     config.queueTimeoutMs, config.switchCooldownMs ?? TRAEX_AUTO_MODEL_DEFAULT_SWITCH_COOLDOWN_MS,
     config.models.map(model => {
       const settings = resolveTraexAutoModelSettings(config, model);
-      return [settings.reasoningEffort ?? null, settings.modelBackendVariant ?? null];
+      return [Object.prototype.hasOwnProperty.call(config.modelSettings ?? {}, model),
+        settings.reasoningEffort ?? null, settings.modelBackendVariant ?? null];
     })]);
 }
 
@@ -213,9 +225,14 @@ export class TraexAutoModelController {
   private searchingBackups = false;
   private progressSinceMs: number | undefined;
 
-  constructor(readonly config: TraexAutoModelConfig, restored?: TraexAutoModelRuntimeState) {
+  readonly sharedSettings?: TraexAutoModelSettings;
+
+  constructor(readonly config: TraexAutoModelConfig, restored?: TraexAutoModelRuntimeState,
+    sharedSettings?: TraexAutoModelSettings) {
+    this.sharedSettings = sharedSettings === undefined ? undefined : { ...sharedSettings };
     if (restored && restored.policyKey === traexAutoModelPolicyKey(config)
       && config.models.includes(restored.model)) {
+      if (restored.sharedSettings) this.sharedSettings = { ...restored.sharedSettings };
       this.currentIndex = config.models.indexOf(restored.model);
       this.exhausted = restored.waitingOnFinalModel;
     }
@@ -223,7 +240,8 @@ export class TraexAutoModelController {
 
   runtimeState(nativeSessionId: string): TraexAutoModelRuntimeState {
     return { model: this.currentModel(), waitingOnFinalModel: this.exhausted,
-      policyKey: traexAutoModelPolicyKey(this.config), nativeSessionId };
+      policyKey: traexAutoModelPolicyKey(this.config), nativeSessionId,
+      ...(this.sharedSettings !== undefined ? { sharedSettings: { ...this.sharedSettings } } : {}) };
   }
 
   /** A live persistent pane may predate this controller after a worker update. */

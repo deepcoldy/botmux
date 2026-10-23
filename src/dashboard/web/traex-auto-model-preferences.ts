@@ -35,6 +35,7 @@ export function autoModelDraftFromConfig(
   config?: TraexAutoModelConfig,
   legacy: TraexAutoModelSettings = {},
   preferences?: TraexAutoModelPreferences,
+  enabled = config?.enabled === true,
 ): TraexAutoModelDraft {
   return {
     reselectPerTurn: config?.reselectPerTurn === true,
@@ -47,7 +48,7 @@ export function autoModelDraftFromConfig(
     ...preferences,
     // Reload always reflects the saved switch, even for legacy drafts that
     // carried enabled. Only the pool preferences survive an unfinished edit.
-    enabled: config?.enabled === true,
+    enabled,
   };
 }
 

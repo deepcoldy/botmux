@@ -209,13 +209,22 @@ const TRAEX_CAPACITY_QUEUE_PATTERN = new RegExp(
   'im',
 );
 
+const TRAEX_PROGRESS_PATTERN = new RegExp(
+  `^[ \t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \t]+(?:${TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued')).join('|')})(?:[ \t]*\\([^\\r\\n]*esc to interrupt\\))?[ \t]*$`, 'i');
+
+function traexCurrentFooterState(screen: string): 'capacity' | 'progress' | 'other' | undefined {
+  // In no-alt-screen mode an earlier queue row can remain above the current
+  // thinking row. The latest activity, rather than elapsed time, wins.
+  for (const row of screen.split(/\r?\n/).slice(-12).reverse()) {
+    if (TRAEX_PROGRESS_PATTERN.test(row)) return 'progress';
+    if (TRAEX_CAPACITY_QUEUE_PATTERN.test(row)) return 'capacity';
+    if (/Queued for next turn/.test(row)) return 'other';
+  }
+  return undefined;
+}
+
 export function traexCapacityQueueVisible(screen: string): boolean {
-  // Capacity is a footer state, not transcript content. Inspect only the
-  // bottom of the current viewport; quoted prose and bare keywords are not
-  // actionable evidence.
-  return !!screen && TRAEX_CAPACITY_QUEUE_PATTERN.test(
-    screen.split(/\r?\n/).slice(-12).join('\n'),
-  );
+  return !!screen && traexCurrentFooterState(screen) === 'capacity';
 }
 
 export function traexCapacityQueuePosition(screen: string): number | undefined {
@@ -229,10 +238,7 @@ export function traexCapacityQueuePosition(screen: string): number | undefined {
 
 /** Positive work evidence, scoped to the current footer, not quoted history. */
 export function traexModelProgressVisible(screen: string): boolean {
-  const footer = screen.split(/\r?\n/).slice(-12).join('\n');
-  if (traexCapacityQueueVisible(screen)) return false;
-  const labels = TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued'));
-  return new RegExp(`^[ \\t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \\t]+(?:${labels.join('|')})(?:[ \\t]*\\([^\\r\\n]*esc to interrupt\\))?[ \\t]*$`, 'im').test(footer);
+  return traexCurrentFooterState(screen) === 'progress';
 }
 
 /** Rotating activity glyphs observed on live TraeX activity rows. */

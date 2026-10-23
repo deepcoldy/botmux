@@ -32,7 +32,7 @@ function rows(path: string): any[] {
 }
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
-  rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false) {
+  rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -90,7 +90,7 @@ function idle() {
     if (Date.now() - startedAt < 400) {
       process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n│ directory: ${dataDir} │\\n❯ Explain this codebase\\n');
     } else {
-      process.stdout.write('\\x1b[2J\\x1b[H■ Conversation interrupted - use /feedback if something went wrong\\n⚠ This session is resuming with another model.\\n──────── Configure botmux environment ─\\n❯ Explain this codebase\\n───────────────────────────────────────\\n  ' + model + ' xhigh · ~ · Context 89% left\\n  ☢ Full Access · ? for shortcuts\\n');
+      process.stdout.write('\\x1b[2J\\x1b[H■ Conversation interrupted - use /feedback if something went wrong\\n⚠ This session was recorded with model core but is resuming with backup. Consider switching back as it may affect TRAE CLI performance.\\n──────── Configure botmux environment ─\\n❯ Explain this codebase\\n───────────────────────────────────────\\n  ' + model + ' xhigh · ~ · Context 89% left\\n  ☢ Full Access · ? for shortcuts\\n');
     }
     return;
   }
@@ -136,7 +136,7 @@ setInterval(() => {
   const options = {
     cwd: resolve('.'),
     env: { ...process.env, HOME: root, TRAE_HOME: traeHome, BOTMUX_TIME_SCALE: '0.01',
-      SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
+      CLI_EXTRA_ARGS: startupExtraArgs ?? '', SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
   };
   const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
@@ -166,11 +166,19 @@ setInterval(() => {
       } } : {}),
     } } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker);
-  await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
+  if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
+  else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
   return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('refuses environment argv before launching an out-of-pool model', async () => {
+    const f = await fixture(true, false, false, undefined, false, '--model outside');
+    expect(rows(f.launches)).toEqual([]);
+    expect(rows(f.rpcRequests)).toEqual([]);
+    expect(f.messages.some(message => message.type === 'prompt_ready')).toBe(false);
+  });
+
   it('continues the original turn and queued follow-up when resume restores a composer without a loaded banner', async () => {
     const f = await fixture(true, false, false, undefined, true);
     f.child.send({ type: 'message', content: 'original image ask', turnId: 'om_image' } satisfies DaemonToWorker);
@@ -179,6 +187,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     f.child.send({ type: 'message', content: 'follow-up image', turnId: 'om_followup' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'restored composer continuation', 30_000);
     expect(f.logs.join('')).toContain('restored composer observed on screen');
+    expect(f.logs.join('')).not.toContain('WARN First prompt hard timeout');
     expect(rows(f.submissions).filter(row => row.text.startsWith('original image ask'))).toHaveLength(1);
     expect(rows(f.submissions).filter(row => row.text.startsWith('follow-up image'))).toHaveLength(0);
     expect(rows(f.launches).every(row => row.args.at(-1) === f.nativeId)).toBe(true);

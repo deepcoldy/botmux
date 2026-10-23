@@ -2356,7 +2356,7 @@ export function BotAgentSection(props: {
     ? readAutoModelDraft(bot.larkAppId) : undefined);
   const autoDraftRef = useRef<TraexAutoModelDraft>(autoModelDraftFromConfig(bot.traexAutoModel, {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
-    }, initialAutoDraft.current));
+    }, initialAutoDraft.current, selectedAgentCliId(initialKey) === 'traex' && bot.model?.toLowerCase() === 'auto'));
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(autoDraftRef.current.enabled ? 'auto'
@@ -2370,6 +2370,12 @@ export function BotAgentSection(props: {
   const [autoCooldownSeconds, setAutoCooldownSeconds] = useState(autoDraftRef.current.cooldownSeconds);
   const [autoDraftStorageFailed, setAutoDraftStorageFailed] = useState(false);
   const pendingAutoDefaults = useRef(new Set<string>());
+  const savedAutoPreferences = useRef<string | undefined>(undefined);
+  const editorSaveEpoch = useRef(0);
+  useEffect(() => {
+    editorSaveEpoch.current += 1;
+    return () => { editorSaveEpoch.current += 1; };
+  }, [bot.larkAppId]);
   function applyAutoDraft(draft: TraexAutoModelDraft) {
     autoDraftRef.current = draft;
     setAutoModelEnabled(draft.enabled);
@@ -2430,10 +2436,10 @@ export function BotAgentSection(props: {
       ? readAutoModelDraft(bot.larkAppId) : undefined;
     const draft = autoModelDraftFromConfig(bot.traexAutoModel, {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
-    }, stored);
+    }, stored, selectedAgentCliId(agentSelectionKey(bot, props.sessionFallback)) === 'traex' && bot.model?.toLowerCase() === 'auto');
     applyAutoDraft(draft);
     setModel(draft.enabled ? 'auto' : typeof bot.model === 'string' ? bot.model : '');
-    setAutoModelTouched(!!stored);
+    setAutoModelTouched(!!stored && JSON.stringify(stored) !== savedAutoPreferences.current);
     setAutoDraftStorageFailed(false);
     pendingAutoDefaults.current.clear();
     setModelBackendVariant(bot.modelBackendVariant ?? '');
@@ -2657,6 +2663,9 @@ export function BotAgentSection(props: {
         return;
       }
     }
+    const saveEpoch = editorSaveEpoch.current;
+    const draftAtSave = autoDraftRef.current;
+    const storedAtSave = JSON.stringify(readAutoModelDraft(bot.larkAppId));
     setAgentBusy(true);
     try {
       const nativeSubagentRuntime = nativeModelMode === 'passthrough' && nativeEffortMode === 'passthrough'
@@ -2694,10 +2703,46 @@ export function BotAgentSection(props: {
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      const syncSavedBot = () => patchBot(bot.larkAppId, {
+          cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime === undefined
+            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
+            : res.body.cliRuntime,
+          cliPathOverride: res.body.cliPathOverride === undefined
+            ? runtimeTouched ? null : bot.cliPathOverride ?? null
+            : res.body.cliPathOverride,
+          wrapperCli: res.body.wrapperCli ?? null,
+          cliLaunchMode: res.body.cliLaunchMode ?? null,
+          model: res.body.model ?? '',
+          traexAutoModel: res.body.traexAutoModel ?? undefined,
+          codexRpcInput: res.body.codexRpcInput === undefined ? bot.codexRpcInput : res.body.codexRpcInput,
+          codexRpcInputDefault: res.body.codexRpcInputDefault ?? bot.codexRpcInputDefault,
+          codexRpcInputEffective: res.body.codexRpcInputEffective,
+          traexAutoModelBlockedReason: null,
+          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
+          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
+          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+          dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
+          dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
+          cliConfigDir: typeof res.body.cliConfigDir === 'string' ? res.body.cliConfigDir : null,
+          agentSelectionKey: res.body.selectionKey ?? cliKey,
+          readIsolation: res.body.readIsolation === true,
+          readIsolationSupported: res.body.readIsolationSupported === true,
+        });
+      if (editorSaveEpoch.current !== saveEpoch) {
+        if (res.ok && res.body.ok) syncSavedBot();
+        return;
+      }
       if (res.ok && res.body.ok) {
         const savedAutoConfig = res.body.traexAutoModel ?? undefined;
-        const retainedPreferences = !savedAutoConfig?.enabled && autoDraftRef.current.models.length > 0
-          ? autoDraftRef.current : undefined;
+        const latestStored = readAutoModelDraft(bot.larkAppId);
+        const newerStored = JSON.stringify(latestStored) !== storedAtSave;
+        const newerDraft = autoDraftRef.current !== draftAtSave || newerStored;
+        const retainedPreferences = newerStored ? latestStored
+          : (newerDraft || !savedAutoConfig?.enabled) && autoDraftRef.current.models.length > 0
+            ? autoDraftRef.current : undefined;
         // Disabling the feature saves the switch without discarding its pool.
         // Saving an enabled pool replaces the draft with authoritative config.
         if (retainedPreferences) {
@@ -2706,11 +2751,12 @@ export function BotAgentSection(props: {
           clearAutoModelDraft(bot.larkAppId);
           setAutoDraftStorageFailed(false);
         }
-        setAutoModelTouched(false);
+        savedAutoPreferences.current = newerDraft ? undefined : JSON.stringify(readAutoModelDraft(bot.larkAppId));
+        setAutoModelTouched(newerDraft);
         applyAutoDraft(autoModelDraftFromConfig(savedAutoConfig, {
           reasoningEffort: res.body.reasoningEffort ?? undefined,
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
-        }, retainedPreferences));
+        }, retainedPreferences, res.body.model?.toLowerCase() === 'auto' && savedAutoConfig?.enabled === true));
         const summary = parseAgentSwitchSummary(res.body);
         const closedCount = summary.closed;
         const residualCount = summary.residual;
@@ -2739,34 +2785,7 @@ export function BotAgentSection(props: {
             // session survived: that is what made this invisible.
             ? { text: `⚠️ ${closedText}` }
             : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
-        patchBot(bot.larkAppId, {
-          cliId: res.body.cliId,
-          cliRuntime: res.body.cliRuntime === undefined
-            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
-            : res.body.cliRuntime,
-          cliPathOverride: res.body.cliPathOverride === undefined
-            ? runtimeTouched ? null : bot.cliPathOverride ?? null
-            : res.body.cliPathOverride,
-          wrapperCli: res.body.wrapperCli ?? null,
-          cliLaunchMode: res.body.cliLaunchMode ?? null,
-          model: res.body.model ?? '',
-          traexAutoModel: res.body.traexAutoModel ?? undefined,
-          codexRpcInput: res.body.codexRpcInput === undefined ? bot.codexRpcInput : res.body.codexRpcInput,
-          codexRpcInputDefault: res.body.codexRpcInputDefault ?? bot.codexRpcInputDefault,
-          codexRpcInputEffective: res.body.codexRpcInputEffective,
-          traexAutoModelBlockedReason: null,
-          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
-          reasoningEffort: res.body.reasoningEffort ?? undefined,
-          serviceTier: res.body.serviceTier ?? undefined,
-          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
-          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
-          dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
-          dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
-          cliConfigDir: typeof res.body.cliConfigDir === 'string' ? res.body.cliConfigDir : null,
-          agentSelectionKey: res.body.selectionKey ?? cliKey,
-          readIsolation: res.body.readIsolation === true,
-          readIsolationSupported: res.body.readIsolationSupported === true,
-        });
+        syncSavedBot();
         // Re-sync the minutes input from the authoritative saved ms and clear
         // the dirty flag so a subsequent unrelated save won't touch the field.
         setTurnTimeoutMin(turnTimeoutMinFromMs(
@@ -2923,11 +2942,14 @@ export function BotAgentSection(props: {
   const isDsh = selectedCliId === 'dsh';
   const reasoningEffortOptions = useMemo(
     () => {
-      const live = isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
+      const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
+      const live = isTraex
+        ? capability?.contextVariants?.find(entry => entry.id === modelBackendVariant)?.reasoningEfforts ?? capability?.reasoningEfforts
+        : isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
       return live?.filter(isCodexReasoningEffort)
         ?? reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model);
     },
-    [cliKey, detectedModels, isCodexSelection, model],
+    [cliKey, detectedModels, isCodexSelection, isTraex, model, modelBackendVariant],
   );
   const nativeReasoningEffortOptions = useMemo(
     () => nativeModelMode === 'custom'
@@ -2937,8 +2959,11 @@ export function BotAgentSection(props: {
   );
 
   useEffect(() => {
+    // Await positive per-model metadata before clearing a saved TraeX value.
+    // A pending or missing live catalog is not evidence that a level is invalid.
+    if (isTraex && !detectedModels?.modelCapabilities?.some(entry => entry.slug.toLowerCase() === model.toLowerCase())) return;
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
-  }, [reasoningEffort, reasoningEffortOptions]);
+  }, [reasoningEffort, reasoningEffortOptions, isTraex, detectedModels, model]);
   useEffect(() => {
     if (nativeModelMode !== 'custom') {
       if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));

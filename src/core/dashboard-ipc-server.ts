@@ -8867,7 +8867,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
           .filter(([, settings]) => settings.reasoningEffort || settings.modelBackendVariant);
         const catalog = settingsEntries.length ? await detectModelCapabilitiesViaExec(
           availability.resolvedPath ?? effectivePath ?? 'traex',
-          { ...buildSessionChildEnv(process.env, entry.envPolicy), ...botInjectedEnv(entry.env, entry.envPolicy) },
+          botOneShotEnv(process.env, entry),
         ) : null;
         for (const [modelId, settings] of settingsEntries) {
           const capability = catalog?.find(item => item.slug.toLowerCase() === modelId.toLowerCase());
@@ -8918,11 +8918,21 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       const nextReasoningEffort = supportsReasoningEffort
         ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
         : undefined;
+      let fixedTraexEfforts: string[] | undefined;
+      if (selected.cliId === 'traex' && model.toLowerCase() !== TRAEX_AUTO_MODEL_ID && nextReasoningEffort
+        && (nextModelBackendVariant || !cliModelSupportsReasoningEffort('traex', model, nextReasoningEffort))) {
+        const capabilities = await detectModelCapabilitiesViaExec(
+          availability.resolvedPath ?? effectivePath ?? 'traex', botOneShotEnv(process.env, entry));
+        const capability = capabilities?.find(item => item.slug.toLowerCase() === model.toLowerCase());
+        fixedTraexEfforts = capability?.contextVariants?.find(item => item.id === nextModelBackendVariant)?.reasoningEfforts
+          ?? capability?.reasoningEfforts;
+      }
       const effortModels = selected.cliId === 'traex' && model.toLowerCase() === TRAEX_AUTO_MODEL_ID
         ? nextTraexAutoModel!.models : [model || undefined];
       if (nextReasoningEffort && effortModels.some(candidate =>
-        !(candidate && nextTraexAutoModel?.modelSettings && Object.prototype.hasOwnProperty.call(nextTraexAutoModel.modelSettings, candidate)) &&
-        !cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort))) {
+        !(model.toLowerCase() === TRAEX_AUTO_MODEL_ID && candidate && nextTraexAutoModel?.modelSettings && Object.prototype.hasOwnProperty.call(nextTraexAutoModel.modelSettings, candidate)) &&
+        !(fixedTraexEfforts ? fixedTraexEfforts.includes(nextReasoningEffort)
+          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort)))) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       const nextServiceTier = supportsServiceTier

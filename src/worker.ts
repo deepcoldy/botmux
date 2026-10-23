@@ -171,7 +171,7 @@ import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
-import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
+import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
@@ -3997,6 +3997,9 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         if (currentBotmuxTurnId && currentBotmuxTurnId !== msg.turnId) {
           markTurnRetired(currentBotmuxTurnId);
         }
+        // Busy passthrough input is not proven to be in native resume history.
+        // Keep it on this generation until the next independent ordinary input.
+        if (traexAutoModelController && !isPromptReady) traexAutoModelTurnReplayForbidden = true;
         setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId);
         currentVcMeetingImTurnOrigin = undefined;
         if (!activeTurnAuthority.inheritOrStartControl(
@@ -4279,6 +4282,17 @@ const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => 
 function configureTraexAutoModel(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
 ): void {
+  // In-worker restarts receive the current model's resolved overrides. Keep
+  // the original shared defaults, including when the pool policy changes.
+  const sharedSettings = traexAutoModelController?.sharedSettings
+    ?? { reasoningEffort: cfg.reasoningEffort, modelBackendVariant: cfg.modelBackendVariant };
+  const previousRuntime = traexAutoModelController && cfg.cliSessionId
+    ? traexAutoModelController.runtimeState(cfg.cliSessionId) : undefined;
+  const restoreRuntime = cfg.traexAutoModel && (cfg.resume || traexAutoModelController)
+    ? validTraexAutoModelRuntime(cfg.traexAutoModel, previousRuntime, cfg.cliSessionId)
+      ? previousRuntime
+      : validTraexAutoModelRuntime(cfg.traexAutoModel, cfg.traexAutoModelRuntime, cfg.cliSessionId) ? cfg.traexAutoModelRuntime : undefined
+    : undefined;
   const managedAuto = cfg.cliId === 'traex'
     && cfg.traexAutoModel?.enabled === true
     && !cfg.adoptMode
@@ -4292,9 +4306,7 @@ function configureTraexAutoModel(
     if (lastInitConfig) lastInitConfig.codexRpcInput = false;
   }
   traexAutoModelController = managedAuto && cfg.traexAutoModel
-    ? new TraexAutoModelController(cfg.traexAutoModel,
-      cfg.resume && validTraexAutoModelRuntime(cfg.traexAutoModel, cfg.traexAutoModelRuntime, cfg.cliSessionId)
-        ? cfg.traexAutoModelRuntime : undefined)
+    ? new TraexAutoModelController(cfg.traexAutoModel, restoreRuntime, sharedSettings)
     : null;
   traexAutoModelSwitching = false;
   traexAutoModelTurnReplayForbidden = cfg.atMostOnce === true;
@@ -4303,7 +4315,7 @@ function configureTraexAutoModel(
       deliveredPluginSkillCatalogFingerprint = cfg.traexAutoModelRuntime.skillCatalogFingerprint;
     }
     const model = traexAutoModelController.currentModel();
-    const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, model, cfg);
+    const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, model, traexAutoModelController.sharedSettings ?? cfg);
     cfg.model = model;
     cfg.reasoningEffort = settings.reasoningEffort;
     cfg.modelBackendVariant = settings.modelBackendVariant;
@@ -4375,11 +4387,12 @@ function executeTraexAutoModelSwitch(
 
   lastInitConfig.model = action.toModel;
   const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, action.toModel,
-    lastInitConfig);
+    traexAutoModelController.sharedSettings ?? lastInitConfig);
   lastInitConfig.reasoningEffort = settings.reasoningEffort;
   lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
   const effort = lastInitConfig.reasoningEffort;
   if (effort && !traexAutoModelController.config.modelSettings?.[action.toModel]
+    && knownTraexReasoningEffortsForModel(action.toModel) !== undefined
     && !cliModelSupportsReasoningEffort('traex', action.toModel, effort)) {
     lastInitConfig.reasoningEffort = undefined;
   }
@@ -4459,13 +4472,19 @@ function observeTraexAutoModelCapacity(screen: string): void {
     void readTraexModelLoads({
       cliBin: cliAdapter!.resolvedBin,
       cwd: config.workingDir,
-      env: { ...buildSessionChildEnv(process.env, config.envPolicy), ...botInjectedEnv(config.env, config.envPolicy) },
+      env: { ...buildSessionChildEnv(process.env, config.envPolicy, config.envUnset), ...botInjectedEnv(config.env, config.envPolicy) },
     }).then(loads => {
       const active = activeTurnAuthority.snapshot();
       if (backend !== target || generation !== cliSpawnGeneration
         || controller !== traexAutoModelController || cliRestartInProgress
         || !active?.started || active.turnId !== action.turnId
-        || active.dispatchAttempt !== undefined || isPromptReady) return;
+        || active.dispatchAttempt !== undefined || isPromptReady
+        || currentBotmuxTurnId !== action.turnId || commandLineWritesPending > 0
+        || isFlushing || traexAutoModelTurnReplayForbidden) {
+        // A rejected reply must not strand the controller's pending check.
+        if (controller === traexAutoModelController) controller.resolveModelLoads(action.turnId, null);
+        return;
+      }
       const choice = controller.resolveModelLoads(action.turnId, loads);
       if (choice.kind === 'switch') executeTraexAutoModelSwitch(choice, { resumeCurrentTurn: true });
       else if (choice.kind === 'exhausted') {
@@ -6830,7 +6849,7 @@ function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
     if (lastInitConfig && traexAutoModelController?.currentModel().toLowerCase() === runtime.model.toLowerCase()) {
       const observedModel = traexAutoModelController.currentModel();
       if (lastInitConfig.model !== observedModel) {
-        const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, observedModel, lastInitConfig);
+        const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, observedModel, traexAutoModelController.sharedSettings ?? lastInitConfig);
         lastInitConfig.reasoningEffort = settings.reasoningEffort;
         lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
       }
@@ -11716,7 +11735,7 @@ function observeRestoredStartupHistory(): void {
  * tmux capture-pane shell-out, and — critically — excludes scrollback, so a
  * stale `esc to interrupt` / restoration marker far above the composer cannot
  * be misread as current readiness. No-op for adapters without the predicate
- * (only the Codex family declares startupReadyFromHistory). */
+ * (Codex and TraeX declare startupReadyFromHistory). */
 function observeRestoredStartupHistoryOnScreen(): boolean {
   if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
   let screen = '';
@@ -18493,6 +18512,22 @@ function scheduleBusyPatternIdleProbe(source: string): void {
   busyPatternIdleProbeTimer.unref?.();
 }
 
+/** Resolve the actual worker argv boundary before handing it to the adapter. */
+function resolveCliExtraArgs(): string[] {
+  const cliExtra = cliAdapter!.allowExtraArgs === false
+    ? ''
+    : (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  const cliExtraArgs = cliExtra ? cliExtra.split(/\s+/).filter(Boolean) : [];
+  if (traexAutoModelRuntimeEligible() && cliExtraArgs.some((arg, index) =>
+    (arg === '-m' || /^-m.+/.test(arg)) || arg === '--model' || arg.startsWith('--model=')
+    || /^model=/.test(arg) || /^-c=?model=/.test(arg) || /^--config=model=/.test(arg)
+    || ((arg === '-c' || arg === '--config') && /^model\s*=/.test(cliExtraArgs[index + 1] ?? '')))) {
+    throw new Error('TraeX auto-model pool cannot be overridden by CLI_EXTRA_ARGS model flags');
+  }
+
+  return cliExtraArgs;
+}
+
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string } = {},
@@ -20651,16 +20686,7 @@ async function spawnCli(
   }
   const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
-  const cliExtra = cliAdapter.allowExtraArgs === false
-    ? ''
-    : (process.env.CLI_EXTRA_ARGS ?? '').trim();
-  const cliExtraArgs = cliExtra ? cliExtra.split(/\s+/).filter(Boolean) : [];
-  if (traexAutoModelRuntimeEligible() && cliExtraArgs.some((arg, index) =>
-    arg === '-m' || arg === '--model' || arg.startsWith('--model=')
-    || /^model=/.test(arg)
-    || (arg === '-c' && /^model\s*=/.test(cliExtraArgs[index + 1] ?? '')))) {
-    throw new Error('TraeX auto-model pool cannot be overridden by CLI_EXTRA_ARGS model flags');
-  }
+  const cliExtraArgs = resolveCliExtraArgs();
 
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
@@ -23909,7 +23935,7 @@ async function spawnCli(
     // guarded history predicate recognizes that layout. ZMX runs it per-chunk
     // (cheap snapshot cache); byte-stream backends (tmux/PTY) run it here, on
     // the bounded recheck schedule, against the rendered viewport.
-    if (idleDetector?.isStartupPending()) {
+    if (idleDetector?.isStartupPending() || (cfg.resume && cfg.cliId === 'traex')) {
       observeRestoredStartupHistoryOnScreen();
     }
     if (idleDetector?.isStartupPending()) {

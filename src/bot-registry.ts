@@ -85,7 +85,7 @@ import {
   setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
@@ -3894,7 +3894,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const requestedModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
-    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel);
+    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel, { validateKnownSettings: true });
     const traexAutoRequested = entryCliId === 'traex'
       && requestedModel?.toLowerCase() === TRAEX_AUTO_MODEL_ID;
     if (traexAutoRequested && (!normalizedTraexAutoModel.config || normalizedTraexAutoModel.error)) {
@@ -3911,6 +3911,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const model = traexAutoRequested
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
+
+    // Shared effort applies only where a model has no independent entry.
+    const sharedEffortModels = traexAutoModel
+      ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
+      : [model];
 
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
@@ -4032,11 +4037,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
-        && cliModelSupportsReasoningEffort(
-          entryCliId,
-          traexAutoModel?.models[0] ?? model,
-          entry.reasoningEffort,
-        )
+        && sharedEffortModels.every(candidate => (entryCliId === 'traex' && knownTraexReasoningEffortsForModel(candidate ?? '') === undefined)
+          || cliModelSupportsReasoningEffort(entryCliId, candidate, entry.reasoningEffort))
         ? entry.reasoningEffort : undefined,
       serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
         ? entry.serviceTier

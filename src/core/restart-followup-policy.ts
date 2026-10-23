@@ -1,3 +1,5 @@
+import { traexAutoModelPolicyKey, type TraexAutoModelConfig, type TraexAutoModelSettings } from '../services/traex-auto-model.js';
+
 /**
  * Worker restart follow-up policy — pure decision for whether an in-flight
  * `restartCliProcess()` must chain one more restart when its continuation
@@ -99,9 +101,12 @@ export function decideRestartFollowup(input: RestartFollowupInput): RestartFollo
 
 /** The launch settings a `restart` request can change (see the worker's
  *  `case 'restart'`): what a replacement must run to satisfy that request. */
-export interface RestartLaunchSettings {
+export interface RestartLaunchSettings extends TraexAutoModelSettings {
   workingDir?: string;
   env?: Record<string, string>;
+  envUnset?: string[];
+  envFingerprint?: string;
+  traexAutoModel?: TraexAutoModelConfig;
   model?: string;
   larkToolBinding?: boolean;
   codexRpcInput?: boolean;
@@ -111,6 +116,11 @@ export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefi
   return {
     workingDir: cfg?.workingDir,
     env: cfg?.env,
+    envUnset: cfg?.envUnset,
+    envFingerprint: cfg?.envFingerprint,
+    traexAutoModel: cfg?.traexAutoModel,
+    reasoningEffort: cfg?.reasoningEffort,
+    modelBackendVariant: cfg?.modelBackendVariant,
     model: cfg?.model,
     larkToolBinding: cfg?.larkToolBinding,
     codexRpcInput: cfg?.codexRpcInput,
@@ -130,9 +140,16 @@ export function sameRestartEnv(a: Record<string, string> | undefined, b: Record<
 export function sameRestartLaunchSettings(a: RestartLaunchSettings, b: RestartLaunchSettings): boolean {
   return (a.workingDir ?? undefined) === (b.workingDir ?? undefined)
     && sameRestartEnv(a.env, b.env)
+    && sameRestartEnv(Object.fromEntries((a.envUnset ?? []).map(key => [key, ''])),
+      Object.fromEntries((b.envUnset ?? []).map(key => [key, ''])))
+    && a.envFingerprint === b.envFingerprint
+    && (a.traexAutoModel ? traexAutoModelPolicyKey(a.traexAutoModel) : undefined)
+      === (b.traexAutoModel ? traexAutoModelPolicyKey(b.traexAutoModel) : undefined)
+    && a.reasoningEffort === b.reasoningEffort
+    && a.modelBackendVariant === b.modelBackendVariant
     && (a.model ?? undefined) === (b.model ?? undefined)
     && (a.larkToolBinding ?? undefined) === (b.larkToolBinding ?? undefined)
-    && (a.codexRpcInput === true) === (b.codexRpcInput === true);
+    && a.codexRpcInput === b.codexRpcInput;
 }
 
 export type MergedRestartDisposition = 'adopt' | 'converge';

@@ -6,6 +6,7 @@ import {
   TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS,
   resolveTraexAutoModelSettings,
   validTraexAutoModelRuntime,
+  traexAutoModelPolicyKey,
 } from '../src/services/traex-auto-model.js';
 
 describe('normalizeTraexAutoModelConfig', () => {
@@ -373,5 +374,74 @@ describe('traexCapacityQueueVisible', () => {
     expect(traexCapacityQueueVisible('A user wrote: You\'re in the queue at position 12.')).toBe(false);
     expect(traexCapacityQueueVisible('Queued for capacity')).toBe(false);
     expect(traexCapacityQueueVisible('◆ Queued for capacity (51s • esc to interrupt)\n' + '\n'.repeat(13) + '❯ Ready')).toBe(false);
+  });
+});
+
+
+describe('controller switch source consistency', () => {
+  it('rejects a proposal after the observed model changes without advancing the controller', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    controller.observeRunningModel('backup');
+    expect(controller.commitSwitch({ kind: 'switch', reason: 'capacity_timeout', turnId: 'turn',
+      fromModel: 'core', toModel: 'last', toIndex: 2 }, 10_000)).toBe(false);
+    expect(controller.currentModel()).toBe('backup');
+    expect(controller.commitSwitch({ kind: 'switch', reason: 'capacity_timeout', turnId: 'turn',
+      fromModel: 'backup', toModel: 'last', toIndex: 2 }, 10_000)).toBe(true);
+    expect(controller.currentModel()).toBe('last');
+  });
+});
+
+
+describe('hand-written Auto settings and recovery defaults', () => {
+  it('rejects a known model with an unsupported effort without guessing unknown live models', () => {
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'],
+      modelSettings: { 'seed-code': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
+      .toMatch(/not supported/);
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['future-live-model'],
+      modelSettings: { 'future-live-model': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
+      .toBeUndefined();
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': { modelBackendVariant: 'max' } } }, { validateKnownSettings: true }).error).toMatch(/not supported/);
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': {} } },
+      { validateKnownSettings: true }).error).toBeUndefined();
+  });
+  it('persists an independent copy of shared settings through native recovery', () => {
+    const config = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 5_000 };
+    const shared = { reasoningEffort: 'low' as const, modelBackendVariant: 'standard' as const };
+    const controller = new TraexAutoModelController(config, undefined, shared);
+    controller.observeRunningModel('backup');
+    const state = controller.runtimeState('native');
+    shared.reasoningEffort = 'high' as any;
+    const restored = new TraexAutoModelController(config, state, { reasoningEffort: 'high', modelBackendVariant: 'max' });
+    expect(resolveTraexAutoModelSettings(restored.config, 'backup', restored.sharedSettings)).toEqual({ reasoningEffort: 'low', modelBackendVariant: 'standard' });
+    expect(restored.currentModel()).toBe('backup');
+  });
+});
+
+
+describe('current footer capacity evidence', () => {
+  it('does not switch during a long ordinary reasoning interval', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    for (const nowMs of [0, 5_000, 30_000, 90_000, 600_000]) {
+      const screen = '⠋ Thinking longer… (10m • esc to interrupt)';
+      expect(controller.observeCapacityQueue({ turnId: 'turn', nowMs,
+        queued: traexCapacityQueueVisible(screen), progressing: traexModelProgressVisible(screen) })).toEqual({ kind: 'none' });
+    }
+    expect(controller.currentModel()).toBe('core');
+  });
+  it('uses the newest activity row when an old queue notice remains visible', () => {
+    const queued = "◆ Queued for capacity (51s • esc to interrupt)\n  └ Too many requests right now. You're in the queue at position 1590.";
+    expect(traexCapacityQueueVisible(queued + '\n⠋ Deep in thought… (2m • esc to interrupt)\nContext 89% left')).toBe(false);
+    expect(traexModelProgressVisible(queued + '\n⠋ Deep in thought… (2m • esc to interrupt)')).toBe(true);
+    expect(traexCapacityQueueVisible('⠋ Deep in thought…\n' + queued)).toBe(true);
+  });
+});
+
+
+describe('Auto policy setting presence', () => {
+  it('distinguishes inherited settings from an explicit native-default entry', () => {
+    const base = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 30_000 };
+    expect(traexAutoModelPolicyKey(base)).not.toBe(traexAutoModelPolicyKey({ ...base, modelSettings: { backup: {} } }));
   });
 });
