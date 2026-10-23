@@ -265,6 +265,10 @@ export interface CodexBridgeEvent {
    *  can use it to bind cosmetic/terminal events to the exact started turn
    *  instead of relying solely on whichever turn is currently collecting. */
   sourceTurnId?: string;
+  /** Identity of a genuine native user message. TRAE can accept several
+   * messages into one running turn; different message ids are real steering
+   * inputs, while mirrors of the same message must remain idempotent. */
+  sourceMessageId?: string;
   /** The transcript parser has positive evidence that this user record starts
    * a distinct native turn while an older id-less turn remains open. */
   preserveCollecting?: boolean;

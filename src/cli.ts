@@ -61,7 +61,7 @@ import {
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
-import { isHttpVirtualSession } from './core/types.js';
+import { isHttpVirtualSession, type TurnTerminalCarrierKind } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -9085,10 +9085,10 @@ async function cmdQuoted(rest: string[]): Promise<void> {
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const { renderQuotedMessage } = await import('./cli/quoted-render.js');
+  const { getQuotedMessageDetail, renderQuotedMessage } = await import('./cli/quoted-render.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
-    const detail = await getMessageDetail(appId, messageId);
+    const detail = await getQuotedMessageDetail(appId, messageId, getMessageDetail);
     const msg = detail?.items?.[0];
     if (!msg) {
       console.error(`未找到消息 ${messageId}`);
@@ -12400,7 +12400,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     sentAtMs: number,
     messageId: string,
     sentContent: string,
-    terminalCarrier?: 'standard_reply_card' | 'non_patchable',
+    terminalCarrier?: TurnTerminalCarrierKind,
   ): void => {
     try {
       const markerSessionId = originSessionId ?? sid;

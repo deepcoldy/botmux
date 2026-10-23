@@ -1,6 +1,7 @@
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
+import { applyVcMeetingInviterPolicyPatch } from './services/vc-meeting-inviter-policy.js';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
@@ -1414,6 +1415,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
           : {};
         // 「接收会议事件」开关。VC 对每个连着飞书的 bot 默认可用，`enabled: false`
         // 才是显式退出——所以打开时删掉这个 key 回到默认，而不是写 `enabled: true`。
+        applyVcMeetingInviterPolicyPatch(vc, patch.inviterManagementEnabled);
         if (patch.vcEnabled) delete vc.enabled;
         else vc.enabled = false;
         const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
@@ -6892,6 +6894,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, out.status, out.body);
       }
       if (req.method === 'PUT') {
+        if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);

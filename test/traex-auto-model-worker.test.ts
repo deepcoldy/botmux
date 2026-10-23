@@ -445,7 +445,7 @@ describe('Worker read-only capacity query', () => {
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
     vi.useFakeTimers(); vi.setSystemTime(0); observe('queue');
     vi.setSystemTime(5_000); observe('queue'); vi.useRealTimers();
-    return { scope, read, resolveLoads };
+    return { scope, read, resolveLoads, observe };
   }
   it('uses the composed set and unset layers for the read-only helper', async () => {
     const h = query();
@@ -466,6 +466,51 @@ describe('Worker read-only capacity query', () => {
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
     await Promise.resolve(); await Promise.resolve();
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+  });
+  it.each([
+    { currentBotmuxTurnId: 'passthrough' }, { commandLineWritesPending: 1 },
+    { traexAutoModelTurnReplayForbidden: true }, { isFlushing: true },
+  ])('continues ordered fallback after a rejected load reply (%j)', async changed => {
+    const h = query();
+    const previous = Object.fromEntries(Object.keys(changed).map(key => [key, h.scope[key]]));
+    Object.assign(h.scope, changed);
+    h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    Object.assign(h.scope, previous);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      h.observe('queue');
+      expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'switch', turnId: 'turn', toModel: 'backup' }),
+        { resumeCurrentTurn: true },
+      );
+    } finally { vi.useRealTimers(); }
+  });
+  it('checks loads again after queue activity ends and an input boundary rejects the pending reply', async () => {
+    const h = query();
+    // A real non-queued observation clears queueSinceMs while the helper is
+    // still pending. The rejected reply must release that pending check too.
+    h.scope.traexCapacityQueueVisible = (screen: string) => screen === 'queue';
+    h.observe('working');
+    h.scope.isFlushing = true;
+    h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    h.scope.isFlushing = false;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000); h.observe('queue');
+      expect(h.read).toHaveBeenCalledOnce();
+      vi.setSystemTime(15_000); h.observe('queue');
+      expect(h.read).toHaveBeenCalledTimes(2);
+      await Promise.resolve(); await Promise.resolve();
+      expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+        expect.objectContaining({ turnId: 'turn', toModel: 'backup' }),
+        { resumeCurrentTurn: true },
+      );
+    } finally { vi.useRealTimers(); }
   });
 });
 

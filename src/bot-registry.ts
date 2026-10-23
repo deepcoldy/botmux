@@ -477,6 +477,11 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
   // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
   // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
+  if (entry.inviterManagementEnabled === true) out.inviterManagementEnabled = true;
+  else if (entry.inviterManagementEnabled === false) out.inviterManagementEnabled = false;
+  if (Number.isSafeInteger(entry.inviterManagementEnabledAt) && Number(entry.inviterManagementEnabledAt) >= 0) {
+    out.inviterManagementEnabledAt = Number(entry.inviterManagementEnabledAt);
+  }
   if (entry.enabled === true) out.enabled = true;
   else if (entry.enabled === false) out.enabled = false;
   const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
@@ -1323,6 +1328,9 @@ export interface SubstituteModeConfig {
 }
 
 export interface VcMeetingAgentConfig {
+  /** Owner opt-in: verified inviters may manage only the invited meeting. Default false. */
+  inviterManagementEnabled?: boolean;
+  inviterManagementEnabledAt?: number;
   enabled?: boolean;
   /** Existing chat used for meeting transcript/chat sync. If unset, confirmation creates a listener group. */
   listenerChatId?: string;
@@ -3894,7 +3902,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const requestedModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
-    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel, { validateKnownSettings: true });
+    const normalizedTraexAutoModel = normalizeTraexAutoModelConfig(entry.traexAutoModel);
     const traexAutoRequested = entryCliId === 'traex'
       && requestedModel?.toLowerCase() === TRAEX_AUTO_MODEL_ID;
     if (traexAutoRequested && (!normalizedTraexAutoModel.config || normalizedTraexAutoModel.error)) {

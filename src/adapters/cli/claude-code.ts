@@ -657,6 +657,53 @@ function readProcStarttime(pid: number): string | null {
   }
 }
 
+/** Re-read delays for a pid-state record caught mid-rewrite. Claude rewrites
+ *  the record in place — never through a rename — on every state change,
+ *  including the busy→idle edge the worker judges a finished turn on:
+ *    - the native build opens it without O_TRUNC, writes, then ftruncates
+ *      (strace, 2.1.309): a record that shrinks reads as the new JSON followed
+ *      by the old record's tail until the ftruncate lands;
+ *    - a writer that truncates first (Node's writeFileSync: O_TRUNC → write)
+ *      leaves it empty until the write lands.
+ *  Either window lies between two consecutive syscalls of the writer and stays
+ *  open only while it waits to be scheduled again; 45ms of re-reads outlasts
+ *  that on a loaded host. Read once, such a record made the unread-turn check
+ *  tell the group a reply was lost that the next bridge tick delivered. */
+const PID_STATE_REREAD_DELAYS_MS = [5, 15, 25];
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+let pidStateRereadSleepFn: (ms: number) => void = sleepSyncMs;
+
+/** Test seam: the re-reads sleep SYNCHRONOUSLY, so a test cannot finish the
+ *  rewrite from a timer; it passes a sleep that does. Pass null to restore the
+ *  real sleep. */
+export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) | null): void {
+  pidStateRereadSleepFn = fn ?? sleepSyncMs;
+}
+
+/** The parsed pid-state record; undefined when there is none or it never
+ *  parses. Only a record that exists but does not parse is re-read: a missing
+ *  one is the common answer for a pid that is not Claude, polled every tick. */
+function readClaudePidState(path: string): unknown {
+  for (let attempt = 0; ; attempt++) {
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
+    }
+  }
+}
+
 /** Resolve Claude Code's authoritative current session id via
  *  ~/.claude/sessions/<pid>.json. Validates pid + sessionId UUID + cwd so a
  *  stale or unrelated pid file can't redirect us to the wrong jsonl. On Linux
@@ -665,12 +712,7 @@ function readProcStarttime(pid: number): string | null {
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  let parsed: any;
-  try {
-    parsed = JSON.parse(readFileSync(claudePidStatePath(pid, dataDir), 'utf8'));
-  } catch {
-    return null;
-  }
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;

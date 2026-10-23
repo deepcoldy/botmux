@@ -1,3 +1,4 @@
+import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
  * Lark event dispatcher — handles WSClient setup, bot identity probing,
  * and message routing (group access checks, @mention detection).
@@ -1817,6 +1818,7 @@ export const TALK_REASONS = [
   'open',
   'chatGrant',
   'globalGrant',
+  'meetingInviter',
   'p2pOpen',
   'blocked',
   'none',
@@ -2054,6 +2056,11 @@ export function evaluateTalk(
   if (senderOpenId && bot.resolvedBlockedUsers.includes(senderOpenId)) {
     return { allowed: false, reason: 'blocked' };
   }
+  if (canInviterTalkToMeeting({ dataDir: config.session.dataDir, agentAppId: larkAppId,
+    chatId, openId: senderOpenId, unionId: memberUnionId,
+    isBlockedFor: (appId, openId) => getBot(appId).resolvedBlockedUsers.includes(openId),
+    policyFor: appId => { const cfg = getBot(appId).config; return cfg.apiOnly || cfg.vcMeetingAgent?.enabled === false ? undefined : cfg.vcMeetingAgent; },
+  })) return { allowed: true, reason: 'meetingInviter' };
   // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
   // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
   // 命中会话群时无论表不表态，都不再回落 oncall 腿。

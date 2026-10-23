@@ -274,6 +274,42 @@ describe('TraeX auto-model settings', () => {
 
 
 describe('Auto shared defaults on daemon launch', () => {
+  it.each([
+    { reasoningEffort: 'high', modelBackendVariant: 'standard' },
+    { reasoningEffort: 'ultra', modelBackendVariant: 'max' },
+  ])('keeps a hand-written pool and shared defaults when static capabilities lag (%j)', settings => {
+    const models = ['gpt-6-astra', 'gpt-5.6-sol', 'glm-5.1'];
+    const pool = { enabled: true, models, modelSettings: {
+      'gpt-6-astra': settings,
+      'gpt-5.6-sol': { reasoningEffort: 'xhigh', modelBackendVariant: 'max' },
+    } };
+    const parsed = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'handwritten_auto', larkAppSecret: 'fixture', cliId: 'traex', model: 'auto',
+      reasoningEffort: 'high', modelBackendVariant: 'standard', traexAutoModel: pool,
+    }]))[0]!;
+    expect(parsed.model).toBe('auto');
+    expect(parsed.traexAutoModel).toMatchObject(pool);
+    expect(parsed.traexAutoModel!.models).toEqual(models);
+    expect(parsed.reasoningEffort).toBe('high');
+    expect(parsed.modelBackendVariant).toBe('standard');
+    const launch = resolveSessionLaunchModelChoice({ session: { cliId: 'traex' } }, parsed);
+    expect(launch).toMatchObject({ model: models[0], traexAutoModel: pool });
+    const controller = new TraexAutoModelController(parsed.traexAutoModel!);
+    expect(controller.currentModel()).toBe(models[0]);
+  });
+  it.each([
+    { modelSettings: { 'gpt-6-astra': { reasoningEffort: 'typo' } } },
+    { modelSettings: { 'gpt-6-astra': { modelBackendVariant: 'giant' } } },
+    { models: ['gpt-6-astra', 'GPT-6-ASTRA'] },
+    { models: ['auto'] }, { queueTimeoutMs: 0 }, { switchCooldownMs: 1.5 },
+  ])('still rejects structurally invalid hand-written pools (%j)', changed => {
+    const parsed = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'invalid_auto', larkAppSecret: 'fixture', cliId: 'traex', model: 'auto',
+      traexAutoModel: { enabled: true, models: ['gpt-6-astra'], ...changed },
+    }]))[0]!;
+    expect(parsed.model).toBeUndefined();
+    expect(parsed.traexAutoModel).toBeUndefined();
+  });
   it('keeps shared effort for an inheriting backup when the preferred model has native defaults', () => {
     const parsed = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'shared_defaults', larkAppSecret: 'fixture', cliId: 'traex', model: 'auto', reasoningEffort: 'high', traexAutoModel: { enabled: true, models: ['seed-code', 'gpt-5.5'], modelSettings: { 'seed-code': {} } } }]))[0]!;
     expect(parsed.reasoningEffort).toBe('high');
