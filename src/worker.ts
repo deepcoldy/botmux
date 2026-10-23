@@ -171,7 +171,7 @@ import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
-import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
@@ -4399,12 +4399,8 @@ function executeTraexAutoModelSwitch(
     traexAutoModelController.sharedSettings ?? lastInitConfig);
   lastInitConfig.reasoningEffort = settings.reasoningEffort;
   lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
-  const effort = lastInitConfig.reasoningEffort;
-  if (effort && !traexAutoModelController.config.modelSettings?.[action.toModel]
-    && knownTraexReasoningEffortsForModel(action.toModel) !== undefined
-    && !cliModelSupportsReasoningEffort('traex', action.toModel, effort)) {
-    lastInitConfig.reasoningEffort = undefined;
-  }
+  // Handwritten shared settings, like per-model settings, are syntax-checked
+  // at load time; the live CLI catalog may support efforts absent locally.
   // Native resume owns the original ask. Retire its transport replay before
   // teardown can synchronously call onCliExit and stash it ahead of recovery.
   inflightInputs.retireTurn(action.turnId);

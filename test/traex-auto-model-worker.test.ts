@@ -461,3 +461,16 @@ describe('live-only model effort on capacity switch', () => {
     expect(h.scope.lastInitConfig.reasoningEffort).toBe('xhigh');
   });
 });
+
+
+it('preserves handwritten shared effort when switching to a known model with a stale static table', () => {
+  const h = harness({ cliModelSupportsReasoningEffort: () => false });
+  const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'gpt-6-astra'], queueTimeoutMs: 5_000 },
+    undefined, { reasoningEffort: 'ultra' });
+  controller.beginTurn('turn');
+  h.scope.traexAutoModelController = controller;
+  h.scope.lastInitConfig.reasoningEffort = 'ultra';
+  expect(h.switchModel({ ...action, toModel: 'gpt-6-astra' }, { resumeCurrentTurn: true })).toBe(true);
+  expect(h.scope.lastInitConfig.reasoningEffort).toBe('ultra');
+  expect(h.scope.restartCliProcess).toHaveBeenCalledOnce();
+});
