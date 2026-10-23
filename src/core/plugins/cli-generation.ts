@@ -40,8 +40,8 @@ function renderReplacementCatalog(manifest: SessionSkillManifest | null): string
 /** Prepare the shared Skills/MCP snapshot immediately before a real CLI spawn. */
 export function prepareCliPluginGeneration(opts: {
   sessionId: string;
-  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'>;
-  global?: Pick<GlobalConfig, 'plugins'>;
+  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills' | 'pluginRuntime'>;
+  global?: Pick<GlobalConfig, 'plugins' | 'mcpGatewayMaxToolTimeoutMs'>;
   dataDir?: string;
   cliId: CliId;
   adapter: CliAdapter;
@@ -63,6 +63,8 @@ export function prepareCliPluginGeneration(opts: {
   refreshSessionMcpRuntimeManifest({
     sessionId: opts.sessionId,
     pluginIds: pluginManifest.pluginIds,
+    pluginRuntime: opts.bot.pluginRuntime,
+    maxToolTimeoutMs: opts.global?.mcpGatewayMaxToolTimeoutMs,
     dataDir: opts.dataDir,
     now: opts.now,
   });

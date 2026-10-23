@@ -61,6 +61,10 @@ import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenanc
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import {
+  ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
+  type PluginMcpRuntimeOptions,
+} from './core/plugins/mcp/runtime-options.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
 import { parseGrantStateFields } from './services/grant-state.js';
@@ -2144,6 +2148,12 @@ export interface BotConfig {
    * undefined.
    */
   envUnset?: string[];
+  /**
+   * Host-only runtime options for enabled plugin MCP subprocesses. Keys are
+   * plugin ids. Environment values and timeouts are written only to the 0600
+   * session MCP runtime snapshot and are never injected into the model CLI.
+   */
+  pluginRuntime?: Record<string, PluginMcpRuntimeOptions>;
   /** Explicit process inheritance policy; missing retains historical behavior. */
   envPolicy?: EnvPolicy;
   /**
@@ -3932,6 +3942,26 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
     const envUnsetList = botEnvLayer({ env: entry.env, envUnset: entry.envUnset }).unset;
     const envUnset = envUnsetList.length > 0 ? envUnsetList : undefined;
+    const pluginRuntime = entry.pluginRuntime && typeof entry.pluginRuntime === 'object' && !Array.isArray(entry.pluginRuntime)
+      ? Object.fromEntries(Object.entries(entry.pluginRuntime)
+        .filter(([pluginId, value]) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(pluginId)
+          && value !== null && typeof value === 'object' && !Array.isArray(value))
+        .map(([pluginId, value]) => {
+          const record = value as Record<string, unknown>;
+          const runtimeEnv = sanitizePerBotEnv(record.env);
+          const toolTimeoutMs = typeof record.toolTimeoutMs === 'number'
+            && Number.isInteger(record.toolTimeoutMs)
+            && record.toolTimeoutMs > 0
+            && record.toolTimeoutMs <= ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS
+            ? record.toolTimeoutMs
+            : undefined;
+          return [pluginId, {
+            ...(Object.keys(runtimeEnv).length > 0 ? { env: runtimeEnv } : {}),
+            ...(toolTimeoutMs === undefined ? {} : { toolTimeoutMs }),
+          }] as const;
+        })
+        .filter(([, value]) => Object.keys(value).length > 0))
+      : undefined;
 
     const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
     for (const warning of normalizedReplyStyle.warnings) {
@@ -4266,6 +4296,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       startupCommands,
       env,
       envUnset,
+      pluginRuntime: pluginRuntime && Object.keys(pluginRuntime).length > 0 ? pluginRuntime : undefined,
       envPolicy,
       skills,
       plugins,

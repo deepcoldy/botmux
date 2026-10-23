@@ -7,11 +7,17 @@ import { pluginMcpPrivatePath, pluginRuntimeDir } from '../paths.js';
 import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
+import {
+  ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
+  effectiveMcpGatewayMaxToolTimeoutMs,
+  type PluginMcpRuntimeOptions,
+} from './runtime-options.js';
 
 export interface SessionMcpRuntimeEntry {
   pluginId: string;
   pluginDir: string;
   server: PluginMcpServer;
+  toolTimeoutMs?: number;
 }
 
 export interface SessionMcpRuntimeManifest {
@@ -52,7 +58,11 @@ export function readSessionMcpRuntimeManifest(
         && enabled.has(value.pluginId)
         && typeof value.pluginDir === 'string'
         && isAbsolute(value.pluginDir)
-        && isPluginMcpServer(value.server);
+        && isPluginMcpServer(value.server)
+        && (value.toolTimeoutMs === undefined
+          || (Number.isInteger(value.toolTimeoutMs)
+            && value.toolTimeoutMs > 0
+            && value.toolTimeoutMs <= ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS));
     })) return null;
     return parsed as SessionMcpRuntimeManifest;
   } catch {
@@ -63,17 +73,33 @@ export function readSessionMcpRuntimeManifest(
 export function refreshSessionMcpRuntimeManifest(opts: {
   sessionId: string;
   pluginIds: readonly string[];
+  pluginRuntime?: Record<string, PluginMcpRuntimeOptions>;
+  maxToolTimeoutMs?: number;
   dataDir?: string;
   now?: () => string;
 }): SessionMcpRuntimeManifest {
   const registry = readPluginRegistry();
   const pluginIds = [...opts.pluginIds];
   const entries: SessionMcpRuntimeEntry[] = [];
+  const maxToolTimeoutMs = effectiveMcpGatewayMaxToolTimeoutMs(opts.maxToolTimeoutMs);
   for (const pluginId of pluginIds) {
     const contribution = registry.plugins[pluginId]?.contributions?.mcp;
     if (!contribution) continue;
     const server = readPluginMcpDescriptor(pluginId, contribution);
-    entries.push({ pluginId, pluginDir: pluginRuntimeDir(pluginId), server });
+    const runtime = opts.pluginRuntime?.[pluginId];
+    if (runtime?.toolTimeoutMs !== undefined && runtime.toolTimeoutMs > maxToolTimeoutMs) {
+      throw new Error(`plugin_mcp_tool_timeout_exceeds_max:${pluginId}:${runtime.toolTimeoutMs}:${maxToolTimeoutMs}`);
+    }
+    const env = runtime?.env;
+    const sessionServer = server.transport === 'stdio' && env && Object.keys(env).length > 0
+      ? { ...server, env: { ...(server.env ?? {}), ...env } }
+      : server;
+    entries.push({
+      pluginId,
+      pluginDir: pluginRuntimeDir(pluginId),
+      server: sessionServer,
+      ...(runtime?.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: runtime.toolTimeoutMs }),
+    });
   }
   const manifest: SessionMcpRuntimeManifest = {
     schemaVersion: 1,

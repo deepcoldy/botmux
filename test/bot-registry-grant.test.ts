@@ -94,6 +94,25 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
+  it('normalizes host-only plugin runtime options without exposing invalid entries', () => {
+    const [config] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'plugin-runtime',
+      larkAppSecret: 's',
+      pluginRuntime: {
+        report: {
+          env: { PROFILE: 'prod', RETRIES: 3, 'bad-key': 'drop' },
+          toolTimeoutMs: 120_000,
+        },
+        'bad/id': { toolTimeoutMs: 10_000 },
+        tooLong: { toolTimeoutMs: 2_147_483_648 },
+        empty: { env: { 'bad-key': 'drop' }, toolTimeoutMs: 0 },
+      },
+    }]));
+    expect(config.pluginRuntime).toEqual({
+      report: { env: { PROFILE: 'prod', RETRIES: '3' }, toolTimeoutMs: 120_000 },
+    });
+  });
+
   it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg2', larkAppSecret: 's' }]))[0].globalGrants).toBeUndefined();
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg3', larkAppSecret: 's', globalGrants: [1, 2, ''] }]))[0].globalGrants).toBeUndefined();

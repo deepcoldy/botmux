@@ -119,9 +119,30 @@ describe('CLI plugin generation', () => {
     installLocalPlugin(source);
     const adapter = { id: 'codex' } as CliAdapter;
 
+    expect(() => prepareCliPluginGeneration({
+      sessionId: 'timeout-ceiling',
+      bot: { larkAppId: 'app', plugins: ['demo'], pluginRuntime: { demo: { toolTimeoutMs: 120_000 } } },
+      global: { plugins: [], mcpGatewayMaxToolTimeoutMs: 60_000 },
+      dataDir,
+      cliId: 'codex',
+      adapter,
+      workingDir: '/repo',
+      prompt: 'test',
+      replacesPriorGeneration: false,
+    })).toThrow('plugin_mcp_tool_timeout_exceeds_max:demo:120000:60000');
+
     const first = prepareCliPluginGeneration({
       sessionId: 'same-session',
-      bot: { larkAppId: 'app-1', plugins: ['demo'] },
+      bot: {
+        larkAppId: 'app-1',
+        plugins: ['demo'],
+        pluginRuntime: {
+          demo: {
+            env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+            toolTimeoutMs: 120_000,
+          },
+        },
+      },
       global: { plugins: [] },
       dataDir,
       cliId: 'codex',
@@ -141,7 +162,12 @@ describe('CLI plugin generation', () => {
       pluginIds: ['demo'],
       entries: [{
         pluginId: 'demo',
-        server: { transport: 'stdio', command: ['./mcp/server.mjs'] },
+        toolTimeoutMs: 120_000,
+        server: {
+          transport: 'stdio',
+          command: ['./mcp/server.mjs'],
+          env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+        },
       }],
     });
     if (!firstMcpRuntime) throw new Error('expected session MCP runtime manifest');

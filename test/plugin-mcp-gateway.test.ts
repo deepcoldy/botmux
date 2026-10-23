@@ -14,6 +14,7 @@ import {
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
 import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
+import { pluginMcpToolTimeoutOptions } from '../src/core/plugins/mcp/runtime-options.js';
 import {
   sessionMcpGatewayPathRegex,
   sessionMcpGatewaySocketDir,
@@ -50,6 +51,14 @@ describe('plugin MCP Gateway', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('applies a configured downstream tool timeout without changing the default', () => {
+    expect(pluginMcpToolTimeoutOptions(120_000)).toEqual({
+      timeout: 120_000,
+      maxTotalTimeout: 120_000,
+    });
+    expect(pluginMcpToolTimeoutOptions()).toEqual({});
   });
 
   function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {

@@ -6,10 +6,12 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readMaterializedPlugin } from '../materializer.js';
+import { readGlobalConfig } from '../../../global-config.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
   MCP_GATEWAY_OWNER_ENV,
 } from './environment.js';
+import { effectiveMcpGatewayMaxToolTimeoutMs } from './runtime-options.js';
 
 const GATEWAY_START = '# >>> botmux mcp gateway';
 const GATEWAY_END = '# <<< botmux mcp gateway';
@@ -24,6 +26,7 @@ export interface GatewayEntryReport {
 export interface GatewayEntry {
   command: string;
   args: string[];
+  maxToolTimeoutMs?: number;
 }
 
 export function defaultGatewayEntry(): GatewayEntry {
@@ -39,6 +42,7 @@ export function defaultGatewayEntry(): GatewayEntry {
   return {
     command: process.env.BOTMUX_BIN_PATH ?? join(home, '.botmux', 'bin', 'botmux'),
     args: ['mcp', 'serve'],
+    maxToolTimeoutMs: effectiveMcpGatewayMaxToolTimeoutMs(readGlobalConfig().mcpGatewayMaxToolTimeoutMs),
   };
 }
 
@@ -225,6 +229,10 @@ function renderCodexEntry(entry: GatewayEntry): string {
     '[mcp_servers.botmux]',
     `command = ${JSON.stringify(entry.command)}`,
     `args = [${entry.args.map(value => JSON.stringify(value)).join(', ')}]`,
+    // The Gateway applies the tighter per-plugin value. Codex needs a matching
+    // outer ceiling so a valid long-running downstream call is not aborted by
+    // its default MCP timeout before the Gateway can return the result.
+    `tool_timeout_sec = ${Math.ceil(effectiveMcpGatewayMaxToolTimeoutMs(entry.maxToolTimeoutMs) / 1_000)}`,
     `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     GATEWAY_END,
   ].join('\n');
