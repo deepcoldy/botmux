@@ -2,8 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 /**
- * Caller-level guards for review finding
- * om_x100b6284c51fc0b4b1e57cbf7ef2b60/cli_aaacc9cb7f39dce4/02:
+ * Caller-level guards for framed stdin runner raw passthrough (PR #2202).
  * throwing an error from the raw writer is not isolation by itself. The two
  * REAL dispatch callers must fence the runner generation (exit) on an unsafe
  * framed submit instead of merely notifying / moving on to the next command.
@@ -138,5 +137,81 @@ describe('deliverRawInput — framed dirty submit fences before any further disp
     expect(scope.emitTurnTerminal).not.toHaveBeenCalled();
     expect(scope.finalizeRawCommandDelivery).not.toHaveBeenCalled();
     expect(scope.flushPending).not.toHaveBeenCalled();
+  });
+
+  // P2-2: a goal-input write failure inside a v3 workflow worker must fail the
+  // node immediately (error IPC) instead of hanging until the wall deadline.
+  function buildWorkflowScope(isWorkflow: boolean, errorToThrow: unknown) {
+    const fatalExit = vi.fn(async () => { throw new Error('__worker_exits__'); });
+    const send = vi.fn();
+    const finalize = vi.fn(() => true);
+    const classifier = vi.fn((e: unknown) => {
+      if (e instanceof SubmissionWriteError && e.runnerGenerationUnsafe) return 'fence-generation';
+      if (e instanceof SubmissionWriteError && e.generationAlreadyFenced) return 'generation-fenced';
+      return isWorkflow ? 'workflow-node-fail' : 'notify';
+    });
+    const scope: Record<string, unknown> = {
+      SubmissionWriteError,
+      cliName: () => 'minimax',
+      classifyRawDispatchFailure: classifier,
+      isWorkflowWorker: vi.fn(() => isWorkflow),
+      sendFatalWorkerErrorAndExit: fatalExit,
+      send,
+      log: vi.fn(),
+      disarmEffortConfirm: vi.fn(),
+      disarmBtwCapture: vi.fn(),
+      emitTurnTerminal: vi.fn(),
+      t: vi.fn((key: string) => key),
+      scheduleSubmitFailureNotify: vi.fn(),
+      recoveryFailureReason: undefined,
+      backend: { id: 'pane' },
+      lastInitConfig: { adoptMode: false },
+      pendingRawInputs: [],
+      sendRawCommandLineWithRecoveryFence: vi.fn(async () => { throw errorToThrow; }),
+      finalizeRawCommandDelivery: finalize,
+      flushPending: vi.fn(),
+      activeTurnAuthority: { inheritOrStartControl: vi.fn(() => true) },
+      setCaptureIdentity: vi.fn(),
+      markTurnExecutionStart: vi.fn(),
+      stampMojoTurnMark: vi.fn(),
+      writeCliPidMarker: vi.fn(),
+      publishSandboxRelayCapability: vi.fn(),
+      markNewTurn: vi.fn(),
+      inflightInputs: { forget: vi.fn(), retrieve: vi.fn() },
+      usageLimitTracker: { beginTurn: vi.fn() },
+    };
+    return { scope, fatalExit, send, classifier };
+  }
+
+  it('P2-2: workflow worker goal-input write failure → immediate error IPC, no hang, no user card', async () => {
+    // A CLEAN (non-unsafe) failure: the line never typed (untouched pre-flush),
+    // so no generation fence — but in a workflow node it must still fail fast.
+    const cleanError = new SubmissionWriteError('clean reject', undefined, false);
+    const { scope, fatalExit, send } = buildWorkflowScope(true, cleanError);
+    const deliver = loadWorkerFunction<(msg: unknown) => Promise<void>>('deliverRawInput', scope);
+    await deliver({ content: '/goal hi' });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![0]).toMatchObject({ type: 'error' });
+    expect(String(send.mock.calls[0]![0].message)).toContain('workflow goal input dispatch failed');
+    // No fatal generation exit (clean failure, runner is not unsafe)…
+    expect(fatalExit).not.toHaveBeenCalled();
+    // …no user-facing terminal/card, no finalize, no ordinary queue flush.
+    expect(scope.emitTurnTerminal).not.toHaveBeenCalled();
+    expect(scope.finalizeRawCommandDelivery).not.toHaveBeenCalled();
+    expect(scope.flushPending).not.toHaveBeenCalled();
+  });
+
+  it('P2-2 对照：非 workflow worker 的同样干净失败走通知路径，不发 workflow error IPC', async () => {
+    const cleanError = new SubmissionWriteError('clean reject', undefined, false);
+    const { scope, send } = buildWorkflowScope(false, cleanError);
+    const deliver = loadWorkerFunction<(msg: unknown) => Promise<void>>('deliverRawInput', scope);
+    await deliver({ content: '/goal hi' });
+
+    const errorIpc = send.mock.calls.map(c => c![0]).some(m => m?.type === 'error');
+    expect(errorIpc).toBe(false);
+    // Ordinary interactive path surfaces a user_notify.
+    const userNotify = send.mock.calls.map(c => c![0]).some(m => m?.type === 'user_notify');
+    expect(userNotify).toBe(true);
   });
 });

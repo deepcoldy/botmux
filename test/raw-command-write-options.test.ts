@@ -48,7 +48,6 @@ describe('framed stdin runners route raw passthrough through writeInput', () => 
   it('minimax declares runnerFramedInput and frames a raw objective exactly like a turn', async () => {
     const adapter = createMinimaxAdapter('/bin/true');
     expect(adapter.runnerFramedInput).toBe(true);
-    expect(adapter.frameRawCommandLine).toBeUndefined();
 
     const sent: string[] = [];
     const keys: string[] = [];

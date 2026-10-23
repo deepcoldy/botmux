@@ -22,6 +22,46 @@ export interface RawDispatchFailureLike {
   runnerGenerationUnsafe?: boolean;
 }
 
+/**
+ * Structural shape of the worker's SubmissionWriteError needed to preserve its
+ * safety marker when the ambiguous-submission WAL transaction re-wraps a
+ * thrown error. Kept structural (not an import of the worker class) so this
+ * pure seam is testable without loading worker.ts.
+ */
+export interface RewrapableSubmissionFailure {
+  message: string;
+  runnerGenerationUnsafe?: boolean;
+}
+
+export interface RewrappedSubmissionFailure {
+  message: string;
+  recoveryFailureReason?: string;
+  submissionStarted: boolean;
+  runnerGenerationUnsafe: boolean;
+}
+
+/**
+ * Preserve the framed-runner safety marker when an error escapes the
+ * ambiguous submission transaction. Without this, a `runnerGenerationUnsafe`
+ * error from the writer is re-wrapped into a plain error and the caller's
+ * fence-generation classification silently downgrades to `notify`, re-opening
+ * the "half-frame merges with the next queued line and is dropped" bug.
+ */
+export function rewrapSubmissionFailure(
+  err: unknown,
+  recoveryFailureReason: string | undefined,
+  submissionStarted: boolean,
+): RewrappedSubmissionFailure {
+  const e = err as RewrapableSubmissionFailure | null;
+  const detail = err instanceof Error ? err.message : String(err);
+  return {
+    message: recoveryFailureReason ? `${detail}; ${recoveryFailureReason}` : detail,
+    ...(recoveryFailureReason ? { recoveryFailureReason } : {}),
+    submissionStarted,
+    runnerGenerationUnsafe: !!e?.runnerGenerationUnsafe,
+  };
+}
+
 export function classifyRawDispatchFailure(
   err: unknown,
   isWorkflowWorker: boolean,

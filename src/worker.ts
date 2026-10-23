@@ -68,7 +68,7 @@ import {
   terminalWriteFrame,
 } from './core/terminal-write-frame.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
-import { classifyRawDispatchFailure } from './core/raw-dispatch-failure.js';
+import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
@@ -4226,7 +4226,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       pendingRawInputs.push(msg);
       return;
     }
-    await writeRawInput(
+    const rawAccepted = await writeRawInput(
       targetBackend,
       undefined,
       msg.followUpContent
@@ -4239,6 +4239,10 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
           }
         : undefined,
     );
+    // A workflow-node fail (or a fenced generation that detached) returns
+    // false: the error IPC/fatal path already ran. Do not flush pending work
+    // onto a failing/fenced runner.
+    if (rawAccepted === false) return;
   }
   // A pending /rename may have been held by the command-write mutex. It still
   // waits for a genuine prompt because isPromptReady was cleared above.
@@ -14993,14 +14997,13 @@ async function runAmbiguousSubmissionTransaction<T>(
     const recoveryFailureReason = err instanceof AmbiguousSubmissionBlockedError
       ? ambiguousSubmissionRecoveryMessage(err.failure)
       : cancelAmbiguousSubmissionAfterFailure(target, submissionFence);
-    const frameUnsafe = err instanceof SubmissionWriteError && err.runnerGenerationUnsafe;
     // Preserve the framed-runner marker across the WAL transaction rewrap.
-    const detail = err instanceof Error ? err.message : String(err);
+    const rewrapped = rewrapSubmissionFailure(err, recoveryFailureReason, submissionStarted);
     throw new SubmissionWriteError(
-      recoveryFailureReason ? `${detail}; ${recoveryFailureReason}` : detail,
-      recoveryFailureReason,
-      submissionStarted,
-      frameUnsafe,
+      rewrapped.message,
+      rewrapped.recoveryFailureReason,
+      rewrapped.submissionStarted,
+      rewrapped.runnerGenerationUnsafe,
     );
   } finally {
     release();

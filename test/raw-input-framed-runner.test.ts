@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { rewrapSubmissionFailure } from '../src/core/raw-dispatch-failure.js';
 
 /**
- * Behavior guard for review finding
- * om_x100b6284c51fc0b4b1e57cbf7ef2b60/cli_aaacc9cb7f39dce4/02:
- * a framed stdin runner's raw passthrough line must be delivered through the
+ * Behavior guard for framed stdin runner raw passthrough (PR #2202):
+ * a raw passthrough line must be delivered through the
  * adapter's writeInput submit transaction (pre-flush / retry / disposition),
  * never typed literally — and an unconfirmed frame must quarantine the
  * generation instead of being reported as accepted.
@@ -114,5 +114,54 @@ describe('sendRawCommandLine — framed stdin runner isolation', () => {
     await sendRaw({ id: 'pane' }, '/goal hi');
     expect(genericWrite).toHaveBeenCalledTimes(1);
     expect(writeInput).not.toHaveBeenCalled();
+  });
+});
+
+describe('P2-3: runnerGenerationUnsafe survives the ambiguous-submission WAL rewrap', () => {
+  it('real sendRawCommandLineWithRecoveryFence preserves the marker on a fence-capable (ZMX-like) backend', async () => {
+    // Load the REAL functions together so the shared module globals (the raw
+    // tail lock) behave as in production.
+    const shared: Record<string, unknown> = {};
+    const load = <T extends (...a: any[]) => any>(name: string): T =>
+      loadWorkerFunction<T>(name, shared);
+    const sendRaw = load<(be: unknown, c: string) => Promise<void>>('sendRawCommandLine');
+    const runTxn = load<(be: unknown, w: () => Promise<unknown>) => Promise<{result: unknown}>>(
+      'runAmbiguousSubmissionTransaction',
+    );
+    const withFence = load<(be: unknown, c: string) => Promise<void>>(
+      'sendRawCommandLineWithRecoveryFence',
+    );
+
+    // The writer throws a framed-dirty error.
+    const writeInput = vi.fn(async () => ({
+      submitted: false, submissionDisposition: 'dirty_unknown',
+    }));
+    // Fake fence-capable backend: captureAmbiguousSubmissionFence exists, so the
+    // transaction takes the WAL branch and re-wraps the writer's throw.
+    const backend = { id: 'zmx-like', captureAmbiguousSubmissionFence: vi.fn(() => 1) };
+    Object.assign(shared, {
+      SubmissionWriteError,
+      rewrapSubmissionFailure,
+      commandLineWriteTail: Promise.resolve(),
+      commandLineWritesPending: 0,
+      cliAdapter: { runnerFramedInput: true, writeInput },
+      isUnsafeRawWriteFenced: vi.fn(() => false),
+      sendRawCommandLine: sendRaw,
+      runAmbiguousSubmissionTransaction: runTxn,
+      // Real globals the WAL transaction branch reads.
+      get backend() { return backend; },
+      ambiguousSubmissionWriteTail: Promise.resolve(),
+      captureAmbiguousSubmissionFence: vi.fn(() => 1),
+      AmbiguousSubmissionBlockedError: class AmbiguousSubmissionBlockedError extends Error {},
+      cancelAmbiguousSubmissionAfterFailure: vi.fn(() => undefined),
+      confirmAmbiguousSubmissionAfterSuccess: vi.fn(() => undefined),
+    });
+
+    await expect(withFence(backend as never, 'first')).rejects.toMatchObject({
+      name: 'SubmissionWriteError',
+      // The marker must survive rewrap — this is the P2-3 regression guard.
+      runnerGenerationUnsafe: true,
+    });
+    expect(writeInput).toHaveBeenCalledTimes(1);
   });
 });
