@@ -6492,6 +6492,9 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   };
 
   killOnce();
+  // Deliberately not probePaneAfterKill: this is the /restart path rather than
+  // cold spawn, and an 'unknown' probe deliberately does not block the refork
+  // (stranding the session is worse than a best-effort reattach).
   // Advance a single probe result monotonically through the real retry path so
   // an 'unknown' first probe is never mislabelled as a post-retry survivor:
   //  - 'missing' → gone, fork is genuinely fresh.

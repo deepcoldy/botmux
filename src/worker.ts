@@ -19721,8 +19721,9 @@ async function spawnCli(
       // Confirm the stale pane is really gone before re-selecting. Re-selection
       // below decides reattach-vs-fresh from this probe, so an unconfirmed kill
       // would let the new backend reattach to the pane we just tried to remove.
-      // Deliberately not probePaneAfterKill: this gate only rejects a pane
-      // proven live (shouldRejectPersistentPostKillProbe), so a tmux server's
+      // Deliberately not probePaneAfterKill: this gate delegates to
+      // shouldRejectPersistentPostKillProbe (for tmux only 'exists' is
+      // rejected; zmx additionally fail-closes on 'unknown'), so for tmux a
       // mid-exit 'unknown' already reads as gone here — nothing to re-ask.
       const postKillProbe = effectiveBackendType === 'zmx'
         ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
