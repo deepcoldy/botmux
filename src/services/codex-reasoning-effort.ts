@@ -107,14 +107,6 @@ export function grokReasoningEffortsForModel(model: string | undefined): readonl
   return GROK_COMMON_REASONING_EFFORTS;
 }
 
-/** Known local capability rows only; unknown ids are left to the live catalog. */
-export function knownTraexContextVariantsForModel(model: string): readonly string[] | undefined {
-  const id = model.trim().toLowerCase();
-  if (id === 'seed-code') return ['standard'];
-  if (id === 'gpt-6-astra' || id === 'gpt-6.1-sol') return ['standard', 'max'];
-  return undefined;
-}
-
 export function knownTraexReasoningEffortsForModel(model: string): readonly CodexReasoningEffort[] | undefined {
   return TRAEX_REASONING_EFFORTS_BY_MODEL.get(model.trim().toLowerCase());
 }
