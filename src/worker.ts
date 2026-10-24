@@ -4524,6 +4524,7 @@ function executeTraexAutoModelSwitch(
       // native conversation before the allowlist is exhausted.
       skipRestartBudget: true,
       exactResumeSessionId: nativeSessionId,
+      restartCause: 'traex-auto-model',
     },
   );
   return true;
@@ -18834,7 +18835,7 @@ function resolveCliExtraArgs(): string[] {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string } = {},
+  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string; restartCause?: 'traex-auto-model' } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
@@ -23114,8 +23115,18 @@ async function spawnCli(
   // never stopped: the transcript bridge's baseline reads what the previous
   // process left unfinished. Codex App / remote runners keep their own
   // provider-side turn recovery.
+  // Auto rotation intentionally resumes the native conversation; an active
+  // turn already has its attributed continuation queued before teardown.
+  // This cause belongs only to this exact successful resume, never the stored
+  // init config or a later crash/follow-up spawn. Keep any interruption saved
+  // by an earlier genuine crash: deliverRestartInterruptionNote still owns it.
+  const plannedAutoModelResume = opts.restartCause === 'traex-auto-model'
+    && cfg.cliId === 'traex'
+    && opts.exactResumeSessionId !== undefined
+    && lastSpawnEffectiveCliSessionId === opts.exactResumeSessionId;
   if (lastSpawnEffectiveResume && !actuallyReattachedPersistent && !cfg.adoptMode
-    && !isCodexAppCliId(cfg.cliId) && !isRemoteBackendType(effectiveBackendType)) {
+    && !isCodexAppCliId(cfg.cliId) && !isRemoteBackendType(effectiveBackendType)
+    && !plannedAutoModelResume) {
     restartInterruptionScanBeforeMs = spawnStartedAtMs;
   }
   // A late same-named pane was reused, so the relay never ran to consume its plan.
@@ -24636,7 +24647,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: 'traex-auto-model' } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
@@ -24761,7 +24772,11 @@ async function restartCliProcess(
               await engageCodexRpc(restartCfg);
             }
             replacementSpawnInProgress = true;
-            await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, exactResumeSessionId: opts.exactResumeSessionId });
+            await spawnCli(restartCfg, {
+              pluginGenerationPrepared: rpcPluginGenerationPrepared,
+              exactResumeSessionId: opts.exactResumeSessionId,
+              restartCause: opts.restartCause,
+            });
             if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: restartCfg.model, reasoningEffort: restartCfg.reasoningEffort });
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
             replacementSpawnInProgress = false;
