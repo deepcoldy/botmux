@@ -43,12 +43,14 @@ board_items      事项（主键 app_id + seq；seq 就是 #12）
   recommend, recommend_reason   推荐项和理由
   rev              管家每改一次内容 +1（提交时用来提示「你写完草稿后管家又改过这项」）
   created_at / updated_at / state_at / steward_event_at / owner_seen_at
-board_links      关联对象 (app_id, seq, kind, ref, label, ord)；ord 是事项内插入序号，列表按它排（WITHOUT ROWID 表没有 rowid，
-                   同一毫秒写入的几行只按时间排会退化成按 kind 字典序）
+board_links      关联对象 (app_id, seq, kind, ref, label, ord)。ord 是事项内写入序号，从 0 起、无空洞：只有新关联
+                   占号，已有关联只改标签不挪位置；列表按 ord 排（同一毫秒写入时 created_at 打平，不能靠时间）。schema v2
                    kind = pr | issue | chat | thread | session | commit | doc | url
 board_events     历史，只追加：时间、actor（steward / owner / system，加会话 id 或提交人）、
                    kind（note / state / edit / decision / reply / attach / link / import）、text、data_json
-board_files      附件元数据：sha256、mime、大小、上传方（owner / steward）、所属事项、ord（看板内插入序号，按它列出）
+board_files      附件元数据：sha256、mime、大小、上传方（owner / steward）、所属事项、ord。ord 是看板内（按 app_id，
+                   不按事项）写入序号，从 1 起：owner 上传时还没归属事项，提交才补 seq。详情页按 ord 列出。
+                   schema v3，老库缺列时 ADD COLUMN 后按看板内 (created_at, id) 回填
 board_drafts     草稿 (app_id, seq, author)：选项、文本、附件、base_rev、updated_at。Dashboard 固定写 author='owner'：
                    一张看板一份草稿，电脑上和飞书侧栏里看到的是同一份
 board_batches    提交批次：编号、提交人、nonce（防重复点击）、投递状态 pending / delivered / failed、

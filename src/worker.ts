@@ -174,13 +174,14 @@ import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { writeSessionEnvStamp } from './services/session-env-stamp.js';
-import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
+import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
   appendBridgeTurnJournalEntry,
@@ -609,6 +610,7 @@ import { readTraexModelLoads } from './services/traex-model-load.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
+import { runnerFinalOutcome } from './services/runner-final-outcome.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
@@ -4639,14 +4641,10 @@ function executeTraexAutoModelSwitch(
   lastInitConfig.model = action.toModel;
   const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, action.toModel,
     traexAutoModelController.sharedSettings ?? lastInitConfig);
+  // Handwritten shared settings, like per-model settings, are syntax-checked
+  // at load time; the live CLI catalog may support efforts absent locally.
   lastInitConfig.reasoningEffort = settings.reasoningEffort;
   lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
-  const effort = lastInitConfig.reasoningEffort;
-  if (effort && !traexAutoModelController.config.modelSettings?.[action.toModel]
-    && knownTraexReasoningEffortsForModel(action.toModel) !== undefined
-    && !cliModelSupportsReasoningEffort('traex', action.toModel, effort)) {
-    lastInitConfig.reasoningEffort = undefined;
-  }
   // Native resume owns the original ask. Retire its transport replay before
   // teardown can synchronously call onCliExit and stash it ahead of recovery.
   inflightInputs.retireTurn(action.turnId);
@@ -4710,7 +4708,7 @@ function observeTraexAutoModelCapacity(screen: string): void {
     return;
   }
   const awaitingActivity = controller.awaitingModelActivity();
-  const progressing = traexModelProgressVisible(screen);
+  const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
     queued: traexCapacityQueueVisible(screen),
@@ -9418,6 +9416,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean; releaseHeldTermi
           ...(notice.replyTurnId ? { turnId: notice.replyTurnId } : {}),
           message: t('worker.local_turn_failed', { cliName: cliName(), errorCode: notice.errorCode }),
         });
+        lastTurnFailureSurfacedAtMs = Date.now();
         continue;
       }
       log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
@@ -14668,6 +14667,7 @@ async function handleTrustedCodexAppMarker(
 
   if (kind === 'final' && typeof payload.content === 'string') {
     const finalContent = payload.content;
+    const outcome = runnerFinalOutcome(lastInitConfig?.cliId, payload.errorCode);
     // Blocking 1 N-final expansion: a `steer_superseded` disposition marks one of
     // the first N−1 members of an ordered steered group. It advances the worker
     // FIFO (durable settlement) but is NEVER delivered, carries no usage, and does
@@ -14790,7 +14790,9 @@ async function handleTrustedCodexAppMarker(
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }
-    if (deliverableContent && startedAtMs !== undefined) {
+    // A native failure is a separate diagnostic, not a duplicate model reply.
+    // Earlier explicit output must not hide the budget/execution failure.
+    if (deliverableContent && startedAtMs !== undefined && outcome.status === 'completed') {
       const suppressMarkers = readSendMarkers();
       // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
       // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
@@ -14886,7 +14888,7 @@ async function handleTrustedCodexAppMarker(
           && !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
         return false;
       }
-      if (finalContent && !suppressDelivery) {
+      if (finalContent && !suppressDelivery && outcome.status !== 'cancelled') {
       send({
         type: 'final_output',
         content: deliverableContent,
@@ -14895,6 +14897,11 @@ async function handleTrustedCodexAppMarker(
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(linkRefMode ? { linkRefMode } : {}),
+        ...(outcome.status === 'failed' ? {
+          turnFailed: true,
+          turnFailureCode: outcome.errorCode,
+          turnFailureNotice: deliverableContent,
+        } : {}),
       });
       } else if (isSuperseded) {
         // A superseded member still emits a final_output so the daemon (and any
@@ -14941,7 +14948,7 @@ async function handleTrustedCodexAppMarker(
     // The app-server runner timestamps its own completion; prefer that instant
     // over "whenever this worker got around to handling the marker". The clock
     // clamps it to now, so a skewed runner cannot mint a future completion.
-    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt, undefined, undefined, completedAtMs);
+    emitTurnTerminal(turnId, outcome.status, outcome.errorCode, dispatchAttempt, undefined, undefined, completedAtMs);
     return true;
   }
   rejectCodexAppControlMarker(`unsupported signed ${kind}`);
@@ -16986,7 +16993,9 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 function traexAutoModelInputHold(): boolean {
   return traexAutoModelRuntimeEligible() && (
     traexAutoModelSwitching
-    || traexAutoModelController?.awaitingModelActivity() === true
+    // Native async admission checks activity on the actual pane. A rendered
+    // display snapshot may omit the first row when rebuilding a full viewport.
+    || (traexAutoModelController?.awaitingModelActivity() === true && !backend?.captureViewportAsync)
     // Other native screen backends retain their existing admission path.
     // tmux uses fresh async reads below; PTY uses the drained renderer.
     || (!isPromptReady && !!backend && !backend.captureViewportAsync
@@ -17020,11 +17029,14 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   const generation = cliSpawnGeneration;
   const turnId = currentBotmuxTurnId;
   const poolTurnId = controller?.currentTurnId();
+  const poolModel = controller?.currentModel();
+  const awaitingActivity = controller?.awaitingModelActivity();
   const targetRenderer = renderer;
   const revision = backendScreenRevision;
   const gridRevision = observedPaneGridRevision;
   const current = () => backend === target && cliSpawnGeneration === generation
     && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
+    && controller?.currentModel() === poolModel && controller?.awaitingModelActivity() === awaitingActivity
     && currentBotmuxTurnId === turnId && pendingMessages[0] === item
     && renderer === targetRenderer && !cliRestartInProgress
     && !traexAutoModelSwitching && traexAutoModelRuntimeEligible();
@@ -17032,13 +17044,14 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     retryTraexAutoModelAdmission();
     return false;
   };
-  if (!target || !current()
-    || (controller?.awaitingModelActivity()
-      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
+  if (!target || !current()) return hold();
   // Keep other native screen/history backends on their existing admission
   // contract. Do not disguise their synchronous capture as an async read.
   if (!backendScreenEvidenceIsAuthoritativeForMutation()
-    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) return true;
+    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) {
+    return controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId) ? hold() : true;
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const read = async (): Promise<string> => {
@@ -17054,15 +17067,18 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     if (!current() || backendScreenRevision !== revision || observedPaneGridRevision !== gridRevision
       || commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight()
       || currentInputDeliveryQuarantine() || currentPostTerminalInputFence()
-      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)
-      || (controller?.awaitingModelActivity()
-        && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
-    if (!screen || traexCapacityQueueVisible(screen)) return hold();
+      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)) return hold();
+    if (!screen || traexCapacityQueueVisible(screen) || cliAdapter?.startupPendingPattern?.test(screen)) return hold();
+    const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+    if (controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId)) {
+      if (!progressing) return hold();
+      controller.observeCapacityQueue({ turnId: poolTurnId, queued: false, progressing: true, nowMs: Date.now() });
+    }
     // Absence of Queued is insufficient: empty/skeleton/unknown frames cannot
     // grant input. Use positive model activity or the actual composer marker;
     // readyPattern's Context percentage is also present on queue screens.
-    if (cliAdapter?.startupPendingPattern?.test(screen)) return hold();
-    return traexModelProgressVisible(screen)
+    return progressing
       || traexQueuedTypeAheadVisible(screen)
       || /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/.test(screen)
       || hold();
@@ -17474,6 +17490,9 @@ async function flushPending(): Promise<void> {
                 + `(${action.fromModel} -> ${action.toModel})`,
               );
               traexAutoModelController?.beginTurn(item.turnId, { retainCurrentModel: true });
+            }
+            if (traexAutoModelRuntimeEligible() && !traexAutoModelTurnReplayForbidden) {
+              traexAutoModelController?.markInputSubmitted(item.turnId);
             }
           }
           if (traexAutoModelRuntimeEligible()) {
@@ -18853,6 +18872,65 @@ function postTerminalPromptFenceHolds(
     return true;
   }
 }
+
+/** Claude ended a turn on an API error (`StopFailure` hook; it does not run
+ *  `Stop` hooks there). The transcript normally surfaces that failure on its
+ *  own API-error record; when the bridge has lost the turn nothing would, so
+ *  after a grace period the hook settles the open turn instead — the daemon
+ *  then continues or reports it like any other failed terminal — or, with no
+ *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
+function handleClaudeStopFailure(
+  msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>,
+  opts: { notifyOnly?: boolean } = {},
+): void {
+  if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) {
+    log(`Ignoring Claude StopFailure (${msg.report.error}): not a botmux-driven Claude session`);
+    return;
+  }
+  const cliSessionIds = new Set(bridgeKnownSessionIds);
+  for (const sid of [lastSpawnEffectiveCliSessionId, lastInitConfig?.cliSessionId]) {
+    if (sid) cliSessionIds.add(sid);
+  }
+  const timer = handleClaudeStopFailureReport(msg.report, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }, {
+    owner: { cliPid: bridgeCliPid, cliSessionIds, transcriptPath: bridgeJsonlPath },
+    activeTurn: { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
+    schedule: (delayMs, run) => setTimeout(run, delayMs),
+    catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
+    settledStatus: (turnId, dispatchAttempt) => emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt),
+    cliIdle: () => isPromptReady,
+    isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
+      || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
+    lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
+    now: Date.now,
+    emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
+      emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
+    },
+    notify: (errorCode, replyTurnId) => {
+      send({
+        type: 'user_notify',
+        ...(replyTurnId ? { turnId: replyTurnId } : {}),
+        message: t('worker.claude_stop_failure_unsettled', { cliName: cliName(), errorCode }),
+      });
+      lastTurnFailureSurfacedAtMs = Date.now();
+    },
+    log,
+  }, opts);
+  timer?.unref?.();
+}
+
+/** An isolated session's hook client falls back to the relay outbox once the
+ *  daemon refused its revoked turn capability; those reports may only notify.
+ *  See the relay-outbox section of services/claude-stop-failure.ts. */
+setInterval(() => {
+  const outbox = sandboxRelayOutbox;
+  if (!outbox || !cliAdapter?.claudeDataDir) return;
+  for (const entry of drainClaudeStopFailureOutbox(outbox)) {
+    handleClaudeStopFailure(
+      { type: 'claude_stop_failure', report: entry.report, ...(entry.turnId ? { turnId: entry.turnId } : {}) },
+      { notifyOnly: true },
+    );
+  }
+}, 1_000).unref?.();
 
 /** Claude transcript turn boundary, for the stale OSC 7501 fallback below. */
 const claudeTranscriptTurnEnd = new ClaudeTranscriptTurnEnd();
@@ -27360,6 +27438,9 @@ if(isTouch&&hasToken){(function(){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+/** When a failed/ambiguous terminal or failure notice last went out: lets a
+ *  Claude StopFailure report tell whether anything surfaced its failure. */
+let lastTurnFailureSurfacedAtMs: number | undefined;
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
 const turnExecutionClock = new TurnExecutionClock();
@@ -27393,13 +27474,14 @@ function emitTurnTerminal(
     { turnId, dispatchAttempt },
     cliSpawnGeneration,
   );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) {
+  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, status)) {
     // A duplicate terminal must not leave the start armed: the first emission
     // already published this turn's timing and consumed the entry, but a
     // *replay* whose first emission never ran through this path could.
     turnExecutionClock.forget(turnId, dispatchAttempt);
     return;
   }
+  if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
   traexAutoModelController?.endTurn(turnId);
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
   if (status !== 'completed') {
@@ -29168,6 +29250,11 @@ process.on('message', async (raw: unknown) => {
       }
       log(`Turn-idle report accepted (turn=${msg.turnId} seq=${msg.seq ?? '?'} pid=${msg.pid ?? '?'}) — firing structured idle`);
       idleDetector?.fireIdle();
+      break;
+    }
+
+    case 'claude_stop_failure': {
+      handleClaudeStopFailure(msg);
       break;
     }
 

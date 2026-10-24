@@ -9,7 +9,7 @@ import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const executable = process.env.BOTMUX_MCODE_E2E_BIN;
-const enabled = !!executable && process.env.BOTMUX_MCODE_LONG_E2E === '1';
+const enabled = process.env.BOTMUX_MCODE_LONG_E2E === '1';
 // Opt-in real time coverage of the former 600-second ceiling. Keep the normal
 // unit/e2e legs fast; an accelerated fake timer cannot establish native policy.
 const PROBE_DURATION_MS = 610_000;
@@ -120,6 +120,9 @@ async function probe(resume: boolean): Promise<void> {
 }
 
 it.skipIf(!enabled)('real mcode exec crosses ten minutes without a turn budget, fresh and resumed', async () => {
+  // An explicitly requested native check must fail rather than report a green
+  // skipped run when its environment is broken (including scheduled CI).
+  if (!executable) throw new Error('BOTMUX_MCODE_E2E_BIN is required when BOTMUX_MCODE_LONG_E2E=1');
   const results = await Promise.allSettled([probe(false), probe(true)]);
   for (const result of results) if (result.status === 'rejected') throw result.reason;
 }, PROBE_DURATION_MS + 120_000);

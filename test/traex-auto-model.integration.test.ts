@@ -51,7 +51,7 @@ function rows(path: string): any[] {
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
-  freshStart = false, activityMode?: 'working' | 'queue-after-second', terminalDelayMs = 0,
+  freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
   delaySecondModelOrderNoticeMs = 0) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
@@ -140,7 +140,12 @@ process.stdin.on('data', chunk => {
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
     submissionCount++;
-    if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working')} || submissionCount === 1)) {
+    if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
+      // Native submission is acknowledged before its first activity repaint.
+      // Keep the previous composer visible while follow-up IPC is received.
+      idle();
+      setTimeout(queued, 1_500);
+    } else if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working' || activityMode === 'delayed-first-queue')} || submissionCount === 1)) {
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else queued();
   }
@@ -255,6 +260,23 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('buffers rapid fresh-start follow-ups until capacity switches to a working model', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, true, 'delayed-first-queue');
+    f.child.send({ type: 'message', content: 'first request', turnId: 'om_first' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'first request before activity repaint');
+    f.child.send({ type: 'message', content: 'second request', turnId: 'om_second' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'third request', turnId: 'om_third' } satisfies DaemonToWorker);
+    await new Promise(resolveWait => setTimeout(resolveWait, 700));
+    expect(rows(f.submissions)).toHaveLength(1);
+    await f.wait(() => rows(f.submissions).length === 4, 'recovery and both buffered requests');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('first request'))).toHaveLength(1);
+    expect(rows(f.submissions).slice(-2).map(row => ({ text: row.text.split(/[\r\n]/)[0], model: row.model }))).toEqual([
+      { text: 'second request', model: 'backup' }, { text: 'third request', model: 'backup' },
+    ]);
+    expect(rows(f.launches)[1].args).toContain(f.nativeId);
+  }, 45_000);
+
   it('submits healthy running follow-ups in order on the current model', async () => {
     const f = await fixture(true, false, false, undefined, false, undefined, false, 'working');
     f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);

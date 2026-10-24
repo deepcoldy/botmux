@@ -280,6 +280,12 @@ export class TraexAutoModelController {
     return this.awaitingActivity;
   }
 
+  /** Submission can leave the previous composer visible until the first
+   * native activity frame. Keep follow-ups outside the CLI during that gap. */
+  markInputSubmitted(turnId: string): void {
+    if (turnId === this.turnId) this.awaitingActivity = true;
+  }
+
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
     const fromModel = this.currentModel();

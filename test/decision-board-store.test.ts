@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { BoardError, DecisionBoardStore, decisionBoardDbPath, decisionBoardFilesDir } from '../src/services/decision-board-store.js';
 
 const APP = 'cli_steward';
@@ -32,6 +33,16 @@ function decideItem(title = 'PR #1 要不要合', now = 1_000) {
     options: [{ key: 'A', label: '合' }, { key: 'B', label: '不合' }],
     recommend: 'A',
   }, 'sess-1', now).item;
+}
+
+/** 直接读 board_files.ord 列（按 ord 排）。 */
+function fileOrds(app: string): Array<{ name: string; ord: number }> {
+  const raw = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+  try {
+    return raw.prepare('SELECT name, ord FROM board_files WHERE app_id = ? ORDER BY ord').all(app) as Array<{ name: string; ord: number }>;
+  } finally {
+    raw.close();
+  }
 }
 
 describe('事项', () => {
@@ -95,9 +106,8 @@ describe('事项', () => {
   });
 
   it('关联对象去重并记一条历史', () => {
-    // 两次写入钉在同一毫秒：顺序只能靠插入序，不能靠时间戳碰巧相差 1ms。
-    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }, undefined, 1_000).item;
-    store.updateItem(APP, item.seq, { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] }, undefined, 1_000);
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }).item;
+    store.updateItem(APP, item.seq, { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] });
     expect(store.links(APP, item.seq)).toEqual([
       { kind: 'pr', ref: 'o/r#1', label: '主 PR' },
       { kind: 'chat', ref: 'oc_abc' },
@@ -105,6 +115,39 @@ describe('事项', () => {
     expect(store.events(APP, item.seq).filter(e => e.kind === 'link')).toHaveLength(2);
   });
 
+  it('同毫秒写入的关联保持写入顺序（created_at 打平时不退回 kind 字母序）', () => {
+    // 显式钉同一毫秒：CLI 在一次动作里先 add 再 update 时两次 Date.now() 可能相同。
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }, undefined, 1000).item;
+    store.updateItem(APP, item.seq,
+      { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] },
+      undefined, 1000);
+    expect(store.links(APP, item.seq)).toEqual([
+      { kind: 'pr', ref: 'o/r#1', label: '主 PR' },
+      { kind: 'chat', ref: 'oc_abc' },
+    ]);
+    // 单次写入多条、同毫秒时也按数组给出的顺序，不按 kind 字母序。
+    const other = store.addItem(APP, {
+      title: 't2',
+      links: [{ kind: 'pr', ref: 'o/r#2' }, { kind: 'chat', ref: 'oc_def' }, { kind: 'doc', ref: 'https://x' }],
+    }, undefined, 2000).item;
+    expect(store.links(APP, other.seq).map(l => l.kind)).toEqual(['pr', 'chat', 'doc']);
+  });
+
+  it('更新已有关联的 label 不占用新序号（ord 无空洞，严格等于出现顺序）', () => {
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }).item;
+    // 同一次调用里：pr 是已有关联（只改 label），chat 是新关联——chat 必须拿到 ord 1 而不是 2。
+    store.updateItem(APP, item.seq, {
+      links: [{ kind: 'pr', ref: 'o/r#1', label: '新标签' }, { kind: 'chat', ref: 'oc_gap' }],
+    });
+    const raw = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    const ords = raw.prepare('SELECT kind, ord FROM board_links WHERE app_id = ? ORDER BY ord').all(APP);
+    raw.close();
+    expect(ords).toEqual([{ kind: 'pr', ord: 0 }, { kind: 'chat', ord: 1 }]);
+    expect(store.links(APP, item.seq).find(l => l.kind === 'pr')?.label).toBe('新标签');
+  });
+});
+
+describe('同一毫秒写入的顺序', () => {
   it('同一毫秒加的关联按加入顺序排，已有的关联更新标签后不挪位置', () => {
     const item = store.addItem(APP, { title: 't', links: [
       { kind: 'url', ref: 'https://z.example' },
@@ -116,11 +159,19 @@ describe('事项', () => {
       .toEqual(['url:设计', 'session', 'commit', 'chat']);
   });
 
-  it('同一毫秒附的多张图按上传顺序列出', () => {
+  it('同一毫秒附的多张图按上传顺序编号（看板内序号从 1 起）', () => {
     const item = decideItem();
-    const names = ['a.png', 'b.png', 'c.png', 'd.png', 'e.png', 'f.png'];
+    const names = ['f.png', 'a.png', 'e.png', 'b.png'];
     store.attachFiles(APP, item.seq, names.map(name => ({ bytes: PNG, mime: 'image/png', name })), undefined, undefined, 2_000);
+    // 直接断言 ord 列：序号算错、占位符漏绑（被静默绑成 NULL）都会让列值本身出错。
+    expect(fileOrds(APP)).toEqual([
+      { name: 'f.png', ord: 1 }, { name: 'a.png', ord: 2 }, { name: 'e.png', ord: 3 }, { name: 'b.png', ord: 4 },
+    ]);
     expect(store.detail(APP, item.seq)!.files.map(f => f.name)).toEqual(names);
+    // owner 上传（还没归属事项）也占看板内序号，提交时补 seq 不会撞号。
+    store.addFile(APP, { bytes: PNG, mime: 'image/png', name: 'owner.png', by: 'owner' }, 2_000);
+    expect(fileOrds(APP).at(-1)).toEqual({ name: 'owner.png', ord: 5 });
+    expect(fileOrds(OTHER)).toEqual([]);
   });
 
   it('列表里时间相同的事项按编号排：待拍板先建的在前，其它视图新建的在前', () => {
@@ -306,5 +357,93 @@ describe('附件与批次投递状态', () => {
     store.close();
     store = DecisionBoardStore.open(dir);
     expect(store.listItems(APP, 'all')).toHaveLength(1);
+  });
+
+  it('v1 库重新打开时迁移到 v2：items 保留，links 表重建后可正常按顺序写入', () => {
+    decideItem();
+    store.close();
+    // 手工把库降成 v1 并换成无 ord 列的旧 links 表（开发机上唯一可能存在的旧形态）。
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.exec('DROP TABLE board_links;');
+    db.exec(`CREATE TABLE board_links (
+      app_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+      label TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, seq, kind, ref)
+    ) WITHOUT ROWID;`);
+    db.exec('PRAGMA user_version = 1;');
+    db.close();
+
+    store = DecisionBoardStore.open(dir);
+    // items/events 等其余数据保留。
+    expect(store.listItems(APP, 'all')).toHaveLength(1);
+    // links 表已按 v2 重建：同毫秒多关联保持写入顺序（这是 v2 的修复点）。
+    const item = store.listItems(APP, 'all')[0]!;
+    store.updateItem(APP, item.seq, {
+      links: [{ kind: 'pr', ref: 'o/r#9', label: 'PR' }, { kind: 'chat', ref: 'oc_mig' }],
+    }, undefined, 5000);
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
+    store.close();
+    // 再开一次已是 v2，不会重复迁移。
+    store = DecisionBoardStore.open(dir);
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
+  });
+
+  it('v2 库重新打开时迁移到 v3：board_files 补 ord 并按看板内 (created_at, id) 回填，links 等原有数据都在', () => {
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }, { kind: 'chat', ref: 'oc_a' }] }, undefined, 500).item;
+    const other = store.addItem(OTHER, { title: 'o' }, undefined, 500).item;
+    store.close();
+    // 手工降成 v2 的真实形态：board_files 没有 ord 列。老图同一毫秒、按 id 逆序写入，
+    // 回填的 tie-break 写错（id DESC）或漏按 app_id 分区都会让下面的断言变红。
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.exec('DROP TABLE board_files;');
+    db.exec(`CREATE TABLE board_files (
+      app_id TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER, sha256 TEXT NOT NULL, mime TEXT NOT NULL,
+      bytes INTEGER NOT NULL, name TEXT NOT NULL, uploader TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, id)
+    ) WITHOUT ROWID;`);
+    const seed = db.prepare(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at)
+      VALUES (?, ?, ?, 'x', 'image/png', 1, ?, 'steward', ?)`);
+    for (const id of ['zz', 'aa', 'mm', 'bb']) seed.run(APP, id, item.seq, `${id[0]}.png`, 1_000);
+    seed.run(OTHER, 'yy', other.seq, 'y.png', 1_000);
+    seed.run(OTHER, 'cc', other.seq, 'c.png', 900);
+    db.exec('PRAGMA user_version = 2;');
+    db.close();
+
+    store = DecisionBoardStore.open(dir);
+    expect(fileOrds(APP)).toEqual([
+      { name: 'a.png', ord: 1 }, { name: 'b.png', ord: 2 }, { name: 'm.png', ord: 3 }, { name: 'z.png', ord: 4 },
+    ]);
+    expect(fileOrds(OTHER)).toEqual([{ name: 'c.png', ord: 1 }, { name: 'y.png', ord: 2 }]);
+    expect(store.detail(APP, item.seq)!.files.map(f => f.name)).toEqual(['a.png', 'b.png', 'm.png', 'z.png']);
+    // v2 的 links 数据原样保留（v1→v2 是丢表重建，链式迁移容易连带丢掉它）。
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
+    // 迁移后新附的图接在后面。
+    store.attachFiles(APP, item.seq, [{ bytes: PNG, mime: 'image/png', name: 'new.png' }], undefined, undefined, 1_000);
+    expect(fileOrds(APP).at(-1)).toEqual({ name: 'new.png', ord: 5 });
+    // 序号按看板（app_id）各自计数，别的管家的看板不受影响。
+    store.attachFiles(OTHER, other.seq, [{ bytes: PNG, mime: 'image/png', name: 'other-new.png' }], undefined, undefined, 1_000);
+    expect(fileOrds(OTHER).at(-1)).toEqual({ name: 'other-new.png', ord: 3 });
+    store.close();
+
+    const check = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    expect((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
+    check.close();
+    // 再开一次已是 v3，不会重复回填。
+    store = DecisionBoardStore.open(dir);
+    expect(fileOrds(APP).map(f => f.ord)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('库的版本比本构建新时明确报错，不读写', () => {
+    store.close();
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.exec('PRAGMA user_version = 4;');
+    db.close();
+    expect(() => DecisionBoardStore.open(dir)).toThrow(/has schema v4, newer than this botmux \(v3\)/);
+    // 版本号原样保留（没被改写成 v3），恢复后让 afterEach 正常关库。
+    const after = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    after.exec('PRAGMA user_version = 3;');
+    after.close();
+    store = DecisionBoardStore.open(dir);
   });
 });
