@@ -12118,6 +12118,78 @@ function observeRestoredStartupHistoryOnScreen(): boolean {
   return true;
 }
 
+/**
+ * TraeX 0.211 paints the composer with cursor positioning, so its prompt need
+ * not have a newline in the PTY byte stream. Fresh startup also need not emit
+ * the old loading banner. Poll the rendered viewport during first-prompt
+ * admission independently of both flags; never seed from append-only history.
+ */
+function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): void {
+  if (lastInitConfig?.cliId !== 'traex' || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  const detector = idleDetector;
+  const adapter = cliAdapter;
+  const startedAt = Date.now();
+  const webInputGeneration = webTerminalInputGeneration;
+  const stillWaiting = (): boolean => awaitingFirstPrompt
+    && backend === observedBackend && idleDetector === detector
+    && webTerminalInputGeneration === webInputGeneration
+    && Date.now() - startedAt < FIRST_PROMPT_HARD_TIMEOUT_MS;
+  const check = async (): Promise<void> => {
+    try {
+      if (!stillWaiting() || !renderer || inflightInputs.hasUnacked()
+        || Date.now() - lastPtyOutputAtMs < 2_000) return;
+      const observedRenderer = renderer;
+      const revision = backendScreenRevision;
+      const outputGeneration = ptyOutputGeneration.snapshot();
+      // xterm writes asynchronously. Read only after its queue drains, and
+      // reject a concurrent redraw, resync, restart or web-terminal input.
+      await observedRenderer.writeAndFlush('');
+      if (!stillWaiting() || renderer !== observedRenderer || backendScreenRevision !== revision
+        || !ptyOutputGeneration.isCurrent(outputGeneration) || inflightInputs.hasUnacked()
+        || Date.now() - lastPtyOutputAtMs < 2_000) return;
+      const screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
+      if (!screen || !adapter?.startupReadyFromHistory?.(screen)) return;
+      if (detector?.observeStartupHistory(screen)) {
+        log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
+      }
+      // A loaded banner may already have retired startup without setting
+      // readySeen. Recheck even in that case. The detector's spinner/static
+      // busy guards and normal worker ready/input fences still own admission.
+      // startupReadyFromHistory being true implies readyPattern on this viewport.
+      detector?.seedReadyEvidence(true);
+    } catch (err: any) {
+      log(`${cliName()} first-prompt viewport check failed: ${err.message}`);
+    } finally {
+      if (stillWaiting()) {
+        const timer = setTimeout(() => { void check(); }, 1_000);
+        timer.unref?.();
+      }
+    }
+  };
+  const timer = setTimeout(() => { void check(); }, 1_000);
+  timer.unref?.();
+}
+
+/** Whether the current rendered viewport must veto a traex first-prompt ready
+ * edge. Only applies while the first prompt is still unadmitted on a backend
+ * whose screen evidence is authoritative (the same scope as the startup
+ * viewport poller; ZMX/non-authoritative screens keep the legacy stream-only
+ * decision), and only when the stream's ready evidence is WEAK — a match that
+ * exists solely through #2247's cursor-addressed rule arm. Strong evidence
+ * (line-anchored prompt or a `\d+% left` status bar) keeps the legacy
+ * admission path. An unreadable snapshot fails OPEN; the predicate itself
+ * rejects loading-cell, draft/picker and native-login frames. */
+function traexFirstPromptViewportRejects(): boolean {
+  if (lastInitConfig?.cliId !== 'traex' || !awaitingFirstPrompt
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (!idleDetector?.isReadyEvidenceWeak()) return false;
+  const predicate = cliAdapter?.startupReadyFromHistory;
+  if (!predicate) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  return !!screen && !predicate(screen);
+}
+
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
 function screenShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
@@ -16005,6 +16077,19 @@ function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
   if (idleDetector?.isStartupPending()) return;
+  // TraeX 0.211 cursor-paints its composer: the byte-stream readyPattern
+  // accepts a rule-joined prompt even while the model cell still reads
+  // "loading" or the surface owns an unsent draft. Such a match is tagged
+  // weak (it exists only through the rule arm); on a weak first-prompt edge
+  // require the adapter's rendered-viewport composer predicate. Strong
+  // evidence and all other CLIs keep the legacy stream admission path. The
+  // traex viewport poller (scheduleTraexFirstPromptReadiness) re-drives the
+  // edge once the initialized composer actually renders.
+  if (traexFirstPromptViewportRejects()) {
+    log('Holding traex first prompt: rendered viewport is not an initialized composer');
+    idleDetector?.reset();
+    return;
+  }
   if (remoteRunnerRecoveredTurnInFlight) {
     // A provider `ready`/startup timeout describes transport readiness, not an
     // idle turn boundary, while an adopted remote turn is still executing.
@@ -24626,6 +24711,7 @@ async function spawnCli(
     markPromptReady();
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
+  scheduleTraexFirstPromptReadiness(firstPromptBackend);
 
   // Remote backends (riff / mojo) have no local boot process — the backend is
   // ready immediately after spawn(). The idle detector never fires for them (no

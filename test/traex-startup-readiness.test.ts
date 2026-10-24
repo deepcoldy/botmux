@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { IdleDetector } from '../src/utils/idle-detector.js';
+import { traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 
 // Real PTY frames sampled from traex 0.205.1-alpha.3 with node-pty +
 // xterm-headless. At 0.6s the composer skeleton is already drawn (including
@@ -267,4 +268,47 @@ old completed response
     quiet();
     expect(idle).toHaveBeenCalledTimes(1);
   });
+});
+
+
+const INITIALIZED_COMPOSER = [
+  '──────────────────────────',
+  '❯ Use /skills to list available skills',
+  '──────────────────────────',
+  '  GPT-6-Astra xhigh · /tmp/project · Context —',
+  '  ☢ Full Access · ? for shortcuts',
+];
+
+describe('TraeX initialized composer', () => {
+  it.each([
+    ['fresh context', INITIALIZED_COMPOSER, true],
+    ['model still loading', INITIALIZED_COMPOSER.map(row => row.replace('GPT-6-Astra xhigh', 'loading')), false],
+    ['directory named loading', INITIALIZED_COMPOSER.map(row => row.replace('/tmp/project', '/tmp/loading')), true],
+  ])('%s has the expected initialization evidence', (_name, rows, expected) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(expected);
+  });
+
+  it.each([
+    ['Sign in to TraeCode CLI', 'Press enter to open browser', 'https://example.invalid/auth', 'waiting for authorization…'],
+    ['Sign in to TraeCode CLI', '', '', '', ''],
+    ['Press enter to open browser', '', '', '', ''],
+    ['waiting for authorization…', '', '', '', ''],
+  ].map(login => [login]))('holds an initialized composer while a login surface above it still owns input: %j', login => {
+    expect(traexRestoredComposerReady([...login, ...INITIALIZED_COMPOSER].join('\n'))).toBe(false);
+  });
+
+  it('does not treat a completed reply mentioning login as an active login surface', () => {
+    expect(traexRestoredComposerReady([
+      '◆ The previous login said: Sign in to TraeCode CLI',
+      '  It used open browser and authorization before completing.',
+      '■ Conversation interrupted',
+      ...INITIALIZED_COMPOSER,
+    ].join('\n'))).toBe(true);
+  });
+
+  it.each(['Sign in to TraeCode CLI', 'Press enter to open browser', 'waiting for authorization…'])(
+    'accepts an indented transcript continuation containing %s', line => {
+      expect(traexRestoredComposerReady(['◆ Previous instructions:', `  ${line}`,
+        '■ Conversation interrupted', ...INITIALIZED_COMPOSER].join('\n'))).toBe(true);
+    });
 });
