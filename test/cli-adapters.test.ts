@@ -276,6 +276,12 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('writes promptCacheTtl into --settings only when configured', () => {
+    const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false })).promptCacheTtl).toBeUndefined();
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false, promptCacheTtl: '1h' })).promptCacheTtl).toBe('1h');
+  });
+
   it('passes inline --settings that skips the dangerous-mode prompt', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     const idx = args.indexOf('--settings');

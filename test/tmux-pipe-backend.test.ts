@@ -27,6 +27,7 @@ vi.mock('node:child_process', () => {
   return {
     ...actual,
     execSync: vi.fn(),
+    execFile: vi.fn(),
     execFileSync: vi.fn(),
     spawnSync: vi.fn(),
   };
@@ -58,7 +59,7 @@ vi.mock('node:fs', () => {
   };
 });
 
-import { execSync, execFileSync, spawnSync } from 'node:child_process';
+import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync, createReadStream, openSync, closeSync, writeSync } from 'node:fs';
 import {
   TmuxPipeBackend,
@@ -793,6 +794,50 @@ describe('TmuxPipeBackend.captureViewport', () => {
     const out = be.captureViewport();
     expect(out.startsWith('\x1b[?1049h\x1b[H\x1b[2J')).toBe(true);
     expect(out).toContain('claude tui\r\n');
+  });
+});
+
+describe('TmuxPipeBackend.captureViewportAsync', () => {
+  it('reads the frozen native pane asynchronously without ANSI/history or sync mode probes', async () => {
+    const be = new TmuxPipeBackend('test:2.0', { socketName: 'private-test' });
+    let finish!: (error: Error | null, screen: string) => void;
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      finish = cb;
+      return {};
+    }) as any);
+    const syncCalls = vi.mocked(execSync).mock.calls.length;
+    const pending = be.captureViewportAsync();
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(vi.mocked(execFile).mock.calls.at(-1)?.slice(0, 3)).toEqual([
+      'tmux', ['-L', 'private-test', 'capture-pane', '-p', '-t', 'test:2.0'],
+      expect.objectContaining({ timeout: expect.any(Number), killSignal: 'SIGKILL', maxBuffer: expect.any(Number) }),
+    ]);
+    expect(vi.mocked(execSync).mock.calls).toHaveLength(syncCalls);
+    finish(null, '◆ Working…\n');
+    expect(await pending).toBe('◆ Working…\n');
+  });
+
+  it.each(['native error', 'exited'])('does not provide stale viewport evidence after %s', async failure => {
+    const be = new TmuxPipeBackend('test:0.0');
+    let finish!: (error: Error | null, screen: string) => void;
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      finish = cb;
+      return {};
+    }) as any);
+    const pending = be.captureViewportAsync();
+    if (failure === 'native error') {
+      finish(new Error('timeout'), '');
+      await expect(pending).rejects.toThrow('timeout');
+    } else {
+      // Normal teardown must invalidate a read already in flight too.
+      be.kill();
+      finish(null, 'old Working frame');
+      expect(await pending).toBe('');
+      expect(await be.captureViewportAsync()).toBe('');
+    }
   });
 });
 

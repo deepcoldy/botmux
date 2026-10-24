@@ -65,6 +65,8 @@ interface HerdrAgentFixture {
   agent_session?: { kind?: string; value?: string };
   pane_id?: string;
   terminal_id?: string;
+  workspace_id?: string;
+  tab_id?: string;
   cwd?: string;
   terminal_title?: string;
   terminal_title_stripped?: string;
@@ -75,6 +77,8 @@ interface HerdrPaneFixture {
   agent?: string;
   pane_id?: string;
   terminal_id?: string;
+  workspace_id?: string;
+  tab_id?: string;
   cwd?: string;
   foreground_cwd?: string;
   /** Manual pane label (`herdr pane rename`); only `pane list` exposes it. */
@@ -494,6 +498,73 @@ describe('discoverAdoptableSessions (herdr live title: pane label > terminal tit
     const traex = sessions.find(s => s.herdrPaneId === 'w1:p3')!;
     expect(traex).toMatchObject({ cliId: 'traex', cliPid: 4321, cwd: '/work/traex' });
     expect('title' in traex).toBe(false);
+  });
+});
+
+describe('discoverAdoptableSessions (herdr fields for the picker: ids, pane label, native title)', () => {
+  const herdrCalls = () => mockedExecFileSync.mock.calls.map(([, args]) => args as string[]);
+
+  it('copies workspace / tab ids and keeps pane label and native title apart, title unchanged', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: {
+        work: [
+          // Agent row with its own ids, a pane label and a /rename-style terminal title.
+          { name: 'cc', agent: 'claude', pane_id: 'w1:p1', workspace_id: 'w1', tab_id: 'w1:t1', cwd: '/work/demo', terminal_title_stripped: '整理笔记' },
+          // Agent row without ids: they come from its `pane list` record.
+          { name: 'c2', agent: 'claude', pane_id: 'w1:p2', cwd: '/work/demo', terminal_title_stripped: '修复登录页样式' },
+          // Generic terminal title: no native title (the picker may read the first prompt instead).
+          { name: 'c3', agent: 'claude', pane_id: 'w2:p1', workspace_id: 'w2', tab_id: 'w2:t1', cwd: '/work/demo', terminal_title_stripped: 'Claude Code' },
+        ],
+      },
+      panesBySession: {
+        work: [
+          { pane_id: 'w1:p1', workspace_id: 'w1', tab_id: 'w1:t1', label: 'demo-task' },
+          { pane_id: 'w1:p2', workspace_id: 'w1', tab_id: 'w1:t2' },
+          { pane_id: 'w2:p1', workspace_id: 'w2', tab_id: 'w2:t1' },
+        ],
+      },
+    });
+    const [labeled, renamed, generic] = discoverAdoptableSessions();
+    expect(labeled).toMatchObject({
+      herdrWorkspaceId: 'w1', herdrTabId: 'w1:t1', herdrPaneLabel: 'demo-task', herdrNativeTitle: '整理笔记', title: 'demo-task',
+    });
+    expect(renamed).toMatchObject({ herdrWorkspaceId: 'w1', herdrTabId: 'w1:t2', herdrNativeTitle: '修复登录页样式', title: '修复登录页样式' });
+    expect('herdrPaneLabel' in renamed!).toBe(false);
+    expect(generic).toMatchObject({ herdrWorkspaceId: 'w2', herdrTabId: 'w2:t1' });
+    expect('herdrNativeTitle' in generic!).toBe(false);
+    expect('title' in generic!).toBe(false);
+    // Zero new herdr calls: names are resolved later, by the picker only.
+    expect(herdrCalls().some(a => a.includes('workspace') || a.includes('tab'))).toBe(false);
+  });
+
+  it('takes the ids from the pane record on the supplement path', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: { work: [] },
+      panesBySession: {
+        work: [{ pane_id: 'w1:p3', workspace_id: 'w1', tab_id: 'w1:t2', terminal_id: 'term-3', cwd: '/work/traex' }],
+      },
+      processByPane: {
+        'work:w1:p3': { pid: 4321, name: 'traex', argv: ['traex'], cwd: '/work/traex' },
+      },
+    });
+    const [traex] = discoverAdoptableSessions('traex');
+    expect(traex).toMatchObject({ cliId: 'traex', herdrWorkspaceId: 'w1', herdrTabId: 'w1:t2' });
+    expect('title' in traex!).toBe(false);
+  });
+
+  it('gives non-Claude CLIs a pane label but never a native title from the terminal', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: {
+        work: [{ agent: 'codex', pane_id: 'w1:p1', tab_id: 'w1:t1', cwd: '/work/demo', terminal_title_stripped: '修复登录页样式' }],
+      },
+      panesBySession: { work: [{ pane_id: 'w1:p1', label: 'demo-task' }] },
+    });
+    const [codex] = discoverAdoptableSessions();
+    expect(codex).toMatchObject({ cliId: 'codex', herdrTabId: 'w1:t1', herdrPaneLabel: 'demo-task', title: 'demo-task' });
+    expect('herdrNativeTitle' in codex!).toBe(false);
   });
 });
 

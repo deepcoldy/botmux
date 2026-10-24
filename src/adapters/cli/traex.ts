@@ -241,6 +241,23 @@ export function traexModelProgressVisible(screen: string): boolean {
   return traexCurrentFooterState(screen) === 'progress';
 }
 
+/** Legacy TraeX can show current work immediately above next-turn parking.
+ * Parking alone is not capacity pressure or work evidence. Preserve that
+ * input surface only with its adjacent live spinner and native context footer;
+ * unknown/draft rows must not authorize a queued paste. This is input admission
+ * evidence only, not a signal for the capacity-switch controller. */
+export function traexQueuedTypeAheadVisible(screen: string): boolean {
+  const rows = screen.trimEnd().split(/\r?\n/).slice(-12);
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (!/^[ \t]*Queued for next turn[ \t]*$/.test(rows[index]!)) continue;
+    if (index === 0 || !traexModelProgressVisible(rows[index - 1]!)) return false;
+    const footer = rows.slice(index + 1).filter(row => row.trim());
+    return footer.length <= 1 && footer.every(row =>
+      /^[ \t]*(?:[^\r\n]* · )?Context \d+% (?:left|used)[ \t]*$/.test(row));
+  }
+  return false;
+}
+
 /** Rotating activity glyphs observed on live TraeX activity rows. */
 const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
 

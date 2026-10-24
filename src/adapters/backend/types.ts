@@ -328,6 +328,9 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /** Fresh, bounded viewport read without blocking the Worker event loop.
+   * Returns plain text; rejects or returns empty when the viewport is unknown. */
+  captureViewportAsync?(): Promise<string>;
   /**
    * Plain current viewport plus the real terminal cursor. Adopt-mode input
    * guards use this to detect an unsubmitted local composer draft before a

@@ -27,6 +27,7 @@ import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
+import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
@@ -3279,6 +3280,33 @@ export function clearUsageLimitState(ds: DaemonSession): void {
 
 export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
   return ds.lastScreenStatus === 'limited' ? ds.usageLimit : undefined;
+}
+
+/** Status for a streaming card re-rendered from cached daemon state alone (the
+ *  显示/隐藏输出 toggle). `lastScreenStatus` is runtime-only: a restored session
+ *  has none, and a worker that died keeps the last one it reported. With no
+ *  worker and no transfer bringing one, no CLI is running under this daemon,
+ *  so the card must not claim work — 「工作中」 also brings back a 「⏹ 停止」
+ *  that has nothing to stop. A usage limit is persisted and its retry revives
+ *  the CLI, so it keeps its own state. A worker that has not reported yet gets
+ *  what the turn's starting card shows. The field itself is left alone:
+ *  suspendWorker clears it on purpose, and the next turn's card and the idle
+ *  sweepers read it. */
+export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
+  if (hasNoCliUnderDaemon(ds)) return ds.usageLimit ? 'limited' : 'idle';
+  return ds.lastScreenStatus
+    ?? turnStartingCardStatus(ds, sessionCliId(ds, getBot(ds.larkAppId).config));
+}
+
+/** Header label paired with {@link cachedStreamingCardStatus}. Background
+ *  subtasks ran under the worker too, so a stale count is dropped with it;
+ *  the turn's own outcome labels still apply. */
+export function cachedStreamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : streamCardLabel(ds);
+}
+
+function hasNoCliUnderDaemon(ds: DaemonSession): boolean {
+  return !ds.worker && !isSessionTransferring(ds);
 }
 
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
@@ -10934,6 +10962,20 @@ export function sendWorkerSessionInput(
   return afterWorkerIpcBootstrap(worker, () => worker.send(annotated));
 }
 
+/** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
+ *  transfer buffer: a keep-alive is only worth sending to the CLI that holds
+ *  the warm cache right now, never replayed into a replacement worker. */
+export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || transferInputGates.has(ds)) return false;
+  const message: DaemonToWorker = { type: 'prompt_cache_keepalive', text };
+  try {
+    return afterWorkerIpcBootstrap(worker, () => worker.send(message));
+  } catch {
+    return false;
+  }
+}
+
 export type ExactTurnInterruptResult =
   | { ok: true }
   | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
@@ -13481,6 +13523,9 @@ function stampIdleSinceAt(
   } else if (ds.idleSinceAt !== undefined) {
     ds.idleSinceAt = undefined;
   }
+  // A prompt-cache keep-alive's own busy period is not activity: restore the
+  // idle stretch's original start so idleSuspendMinutes keeps counting.
+  notePromptCacheKeepaliveScreenStatus(ds, prev, now);
 }
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -14791,6 +14836,12 @@ export function forkWorker(
     // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
     ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
     promptInjection: sessionPromptInjection(ds),
+    // Claude Code prompt-cache lifetime (global promptCache ⊕ bot override),
+    // frozen at spawn; the adapter writes it into its process-level --settings.
+    ...(() => {
+      const ttl = agentCfg.cliId === 'claude-code' ? resolvedPromptCacheTtl(botCfg) : undefined;
+      return ttl ? { promptCacheTtl: ttl } : {};
+    })(),
     solo: ds.soloSession === true,
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
@@ -16289,6 +16340,12 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'prompt_cache_keepalive_result': {
+        if (!ownsLifecycleMutation()) break;
+        notePromptCacheKeepaliveResult(ds, msg.injected === true);
+        if (!msg.injected) logger.info(`[${t}] prompt-cache keep-alive refused by worker: ${msg.reason ?? 'unknown'}`);
+        break;
+      }
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
         // The ONLY set point for the in-memory readiness flag (design
@@ -18581,7 +18638,9 @@ function setupWorkerHandlers(
           && !streamingCardDisabled(ds, msg.turnId)
           && !botCfg.privateCard
           && replyCardModeFor(ds, msg.turnId) === 'legacy'
-          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
+          // 按本会话冻结沙箱判：续轮信封与回执口径必须同源于该 worker 的真实
+          // 采集能力（sandbox 改动 next-session-only，live 可能已翻转）。
+          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) === 'send';
         const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
           && terminalReceiptRouteEligible;
         // Interim-only turns get no synchronous footer decision. Wait for the
@@ -20162,7 +20221,9 @@ function markTurnReplyDelivered(
   if (msg.turnFailed) return;
   if (msg.kind && msg.kind !== 'bridge') return;
   if (ds.session.vcMeetingReceiver) return;
-  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) !== 'transcript') return;
+  // 冻结沙箱口径：final_output 是这个 worker 产的，投递模式必须按它 spawn 时的
+  // 采集能力判，不能看可能已翻转的 live config。
+  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) !== 'transcript') return;
   if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) return;
   ds.completedIdleTurnId = msg.turnId;
   // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
@@ -20610,8 +20671,8 @@ function deliverFinalOutput(
       } else if (!imOrigin
         && listenerOutputOwner
         && msg.dispatchAttempt !== undefined
-        && listenerOutputProtocol === 'decision_v1') {
-        const controlledOutput = parseVcMeetingListenerOutput(msg.content);
+        && (listenerOutputProtocol === 'decision_v1' || listenerOutputProtocol === 'final_summary_v1')) {
+        const controlledOutput = parseVcMeetingListenerOutput(msg.content, listenerOutputProtocol === 'final_summary_v1');
         if (!controlledOutput.ok) {
           ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
           logger.error(

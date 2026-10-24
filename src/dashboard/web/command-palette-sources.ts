@@ -369,6 +369,7 @@ export const SETTINGS_SEARCH_INDEX: readonly SettingsSearchEntry[] = [
   { id: 'settings-multi-topic', module: 'settings.moduleGeneral', section: 'settings.sectionMultiTopic', fields: ['settings.multiTopicEnable'] },
   { id: 'settings-repo-picker', module: 'settings.moduleGeneral', section: 'settings.sectionRepoPicker', fields: ['settings.repoPickerMode'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },
+  { id: 'settings-prompt-cache', module: 'settings.moduleGeneral', section: 'settings.sectionPromptCache', fields: ['promptCache.ttl', 'promptCache.keepalive'] },
   { id: 'settings-vc', module: 'settings.moduleMeeting', section: 'settings.sectionVcMeetingAgent', fields: ['settings.vcMeetingAgent'] },
   { id: 'settings-autostart', module: 'settings.moduleSystem', section: 'settings.sectionAutostart', fields: ['settings.autostartToggle'] },
   { id: 'settings-maintenance', module: 'settings.moduleSystem', section: 'settings.sectionMaintenance', fields: ['settings.autoUpdate', 'settings.autoRestart', 'settings.httpProxy'] },

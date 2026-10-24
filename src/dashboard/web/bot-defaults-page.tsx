@@ -5,6 +5,8 @@ import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js'
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import type { PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
@@ -17,6 +19,7 @@ import {
   fetchBotDefaults,
   fetchCliOptions,
   fetchCardBrandLabelEnabled,
+  fetchGlobalPromptCache,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -1109,6 +1112,10 @@ function BotDefaultsCard(props: {
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-cap')}><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
@@ -2402,7 +2409,7 @@ export function BotAgentSection(props: {
   const [nativeEffort, setNativeEffort] = useState<'' | NativeEffort>(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
   const [nativePolicyTouched, setNativePolicyTouched] = useState(false);
   const [nativePolicyErrors, setNativePolicyErrors] = useState<NativePolicyErrors>({ model: null, effort: null });
-  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty means
+  // dsh timeout / MiniMax turn budget, edited in minutes (bots.json stores ms). Empty means
   // no runner watchdog. `touched` gates whether a save sends the field
   // at all: an untouched field is omitted so the daemon preserves the exact
   // stored ms (including legal non-whole-minute values) instead of clearing it.
@@ -2621,12 +2628,12 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
-    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // Runner turn budget: validate the (touched) minutes input before saving
     // so an illegal value surfaces an inline error instead of silently clearing
     // the config. Untouched → omitted below so the daemon preserves the stored
     // ms exactly (including legal non-whole-minute values).
     let turnTimeoutField: number | '' | undefined;
-    if (cliKey === 'dsh' && turnTimeoutTouched) {
+    if (supportsTurnTimeout && turnTimeoutTouched) {
       const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
       if (parsed === 'invalid') {
         const text = tr('botDefaults.agentTurnTimeoutInvalid');
@@ -2689,10 +2696,9 @@ export function BotAgentSection(props: {
         ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
           ? { serviceTier }
           : {}),
-        // dsh-only: only send when the user actually edited the field. Omitting
-        // it makes the daemon preserve the current value; non-dsh selections
-        // never send it (the daemon drops any stored value for non-dsh CLIs).
-        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
+        // Only send a supported budget when edited. For supported runners, the
+        // server preserves omitted values; for unsupported CLIs, it deletes them.
+        ...(supportsTurnTimeout && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         // dsh-only runtime variant: only send when touched, same semantics as
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
@@ -2938,8 +2944,8 @@ export function BotAgentSection(props: {
   const isTraex = isBackendVariantCliId(selectedCliId);
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
-  // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = selectedCliId === 'dsh';
+  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax';
   const reasoningEffortOptions = useMemo(
     () => {
       const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
@@ -3361,10 +3367,14 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isDsh && (
+      {supportsTurnTimeout && (
         <div className="bd-row">
           <label>
-            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            {isDsh ? (
+              <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            ) : (
+              <FieldTitle help={tr('botDefaults.minimaxTurnBudgetHelp')}>{tr('botDefaults.minimaxTurnBudget')}</FieldTitle>
+            )}
             <input
               type="number"
               min={0}
@@ -7571,6 +7581,47 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         <button type="button" data-action="off-idle-ttl" disabled={busy} onClick={() => { setTtlInput(''); void saveTtl(null); }}>{tr('botDefaults.idleSuspendMinutesOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
+    </section>
+  );
+}
+
+function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [globalValue, setGlobalValue] = useState<PromptCacheConfig | null>(null);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchGlobalPromptCache().then(value => { if (alive) setGlobalValue(value); });
+    return () => { alive = false; };
+  }, []);
+
+  async function save(value: PromptCacheConfig | null): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/prompt-cache`, { promptCache: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.promptCache && typeof body.promptCache === 'object' ? body.promptCache as PromptCacheConfig : null;
+        props.patchBot(props.bot.larkAppId, { promptCache: next });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionPromptCache')}</h3>
+      <small className="bd-section-note">{tr('botDefaults.promptCacheNote')}</small>
+      <PromptCacheEditor
+        scope="bot"
+        value={props.bot.promptCache ?? null}
+        globalValue={globalValue}
+        disabled={busy}
+        onSave={save}
+      />
+      <StatusSpan status={status} attr={{ 'data-prompt-cache-status': '' }} />
     </section>
   );
 }

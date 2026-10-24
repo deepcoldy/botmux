@@ -75,11 +75,12 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     expect(codexSessionIdFromRolloutPath(segmented)).toBeUndefined();
     expect(traexSessionIdFromRolloutPath(segmented)).toBe(sid);
     expect(bridgeSpecFor('traex')?.adopt?.pidProbedSessionId?.(segmented)).toBe(sid);
-    // antigravity: held final committed on ingest only, birth-aware baseline, zero-prompt only, no adopt.
-    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware', zeroPromptOnly: true } });
+    // antigravity: held final committed on ingest only, birth-aware baseline, no adopt.
+    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware' } });
     expect(bridgeSpecFor('antigravity')?.adopt).toBeUndefined();
-    // cursor: no per-event timestamps → byte-offset baseline on adopt; zero-prompt only on spawn.
-    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { zeroPromptOnly: true } });
+    // cursor: no per-event timestamps → byte-offset baseline on adopt; the
+    // spawn bridge is always-on (send-marker-gated) since #932.
+    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { baseline: 'resume-aware' } });
     // id-addressed isolated sessions (no pid discovery) fall back to the adapter session id.
     for (const id of ['oh-my-pi', 'ebsd'] as const) {
       expect(bridgeSpecFor(id)?.locate.byPid).toBeUndefined();

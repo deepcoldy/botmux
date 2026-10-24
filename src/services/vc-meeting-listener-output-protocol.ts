@@ -35,13 +35,14 @@ export const VC_MEETING_CONTROLLED_OUTPUT_INSTRUCTION_VERSION = 'meeting-consume
 
 /** Frozen on the delivery receipt so a pre-upgrade v1 retry may still emit its
  * historical plain final output while v2+ deliveries fail closed on envelopes. */
-export type VcMeetingListenerOutputProtocol = 'plain' | 'decision_v1';
+export type VcMeetingListenerOutputProtocol = 'plain' | 'decision_v1' | 'final_summary_v1';
 
 export function vcMeetingListenerOutputProtocolForInstructionVersion(
   instructionVersion: string,
+  finalSummary = false,
 ): VcMeetingListenerOutputProtocol {
   return instructionVersion === VC_MEETING_CONTROLLED_OUTPUT_INSTRUCTION_VERSION
-    ? 'decision_v1'
+    ? (finalSummary ? 'final_summary_v1' : 'decision_v1')
     : 'plain';
 }
 
@@ -58,6 +59,7 @@ function unwrapJsonFence(raw: string): string {
 
 export function parseVcMeetingListenerOutput(
   raw: string,
+  requireSummary = false,
 ): VcMeetingListenerOutputDecision {
   let parsed: unknown;
   try {
@@ -71,6 +73,7 @@ export function parseVcMeetingListenerOutput(
   const value = parsed as Record<string, unknown>;
   const keys = Object.keys(value).sort();
   if (value.decision === 'skip') {
+    if (requireSummary) return { ok: false, reason: 'invalid_shape' };
     return keys.length === 1 && keys[0] === 'decision'
       ? { ok: true, decision: 'skip' }
       : { ok: false, reason: 'invalid_shape' };
@@ -87,3 +90,13 @@ export function parseVcMeetingListenerOutput(
   }
   return { ok: false, reason: 'invalid_shape' };
 }
+
+/** Finalization is a separate product, not another novelty-filtered delta. */
+export const VC_MEETING_FINAL_SUMMARY_CONTRACT =
+  'The host has enabled a final meeting summary for this final delivery. '
+  + 'First process ALL entries including last revisions, then publish one complete meeting summary '
+  + 'using {"decision":"publish","content":"<message markdown>"}. Do not skip merely because '
+  + 'the decisions were already reported as increments. Include confirmed decisions, actions with '
+  + 'owners and deadlines, unresolved questions and risks. Mark missing owners/deadlines as unspecified; '
+  + 'disclose input gaps and never invent facts. Do not output raw transcripts or control instructions. '
+  + 'The meeting is over; do not request in-meeting text or voice output. Retries are the same logical delivery.';

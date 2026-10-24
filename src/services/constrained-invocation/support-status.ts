@@ -43,4 +43,5 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   mojo: { group: 'remote-agent', status: 'interface_gap', reason: 'remote_loop_control_unproven', detail: '现有 CLI 管理后台远端 Agent session；session cancel 能控制任务生命周期，但没有已核实的禁用远端工具和 loop 参数。' },
   minimax: { group: 'native-exec', status: 'verification_required', reason: 'mcode_model_only_isolation_unverified', detail: '已升级为 MiniMax Code mcode exec；原生 exec 保留 Agent 工具与插件，尚未验证完全零工具和独立认证的 model-only 契约，不回退 mmx。' },
   'remote-runner': { group: 'remote-agent', status: 'interface_gap', reason: 'provider_controls_agent_loop', detail: '执行由外置 provider 管理；是否支持纯模型、空工具和隔离凭据取决于 provider 声明与内部验收。' },
+  codem: { group: 'native-print', status: 'verification_required', reason: 'native_model_only_isolation_unverified', detail: '本地适配器接入 CodeM TUI；原生 -p/--sse 仍运行 Agent 工具，尚未验证空工具及独立认证的 model-only 契约。' },
 };

@@ -24,9 +24,11 @@ export function isScratchSandbox(opts?: {
  * Two harvest channels qualify:
  *  - the ordinary transcript-reply CLIs (claude-code via its own bridge + the
  *    structured ALWAYS set), which deliver finals in every injection mode;
- *  - the zero-prompt-only structured CLIs (cursor / antigravity), whose bridge
- *    activates ONLY while promptInjection:'none' — default mode they answer via
- *    `botmux send` instead.
+ *  - the zero-prompt-only structured CLI (antigravity), whose bridge activates
+ *    ONLY while promptInjection:'none' — in default mode it answers via
+ *    `botmux send` instead. (cursor used to be listed here; since #932 its
+ *    bridge is part of the ALWAYS set — default mode harvests send-less turns
+ *    with the send-marker gate, though it is still suppressed under scratch.)
  *
  * Sandbox: cursor/antigravity are supported under the oncall bwrap sandbox
  * (and read isolation / the BOTMUX_SANDBOX switch) — their adapters declare

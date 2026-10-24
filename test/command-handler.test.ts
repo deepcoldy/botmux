@@ -485,6 +485,12 @@ vi.mock('../src/core/session-discovery.js', async (importOriginal) => {
   };
 });
 
+// The /adopt picker's live-name enrichment shells out to herdr and reads
+// ~/.claude transcripts; keep it out of these tests (pass sessions through).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: vi.fn(async (sessions: unknown[]) => sessions),
+}));
+
 // Resume-history tests swap in a fake on-disk store (`resumeStore.list`) so they
 // can see the exclude set the adapter receives; while it is unset every adapter
 // is the real one, so other tests are unaffected.
@@ -1721,6 +1727,8 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'minimax').size).toBe(0);
     // ebsd is interactive, but every external message must pass through the
     // service-user envelope and structured terminal-marker ledger.
     expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);

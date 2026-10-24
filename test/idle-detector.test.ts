@@ -153,6 +153,106 @@ describe('IdleDetector: onBusy()', () => {
     },
   );
 
+  describe('after a prompt-ready the worker published itself (first-prompt timeout probe)', () => {
+    const startupScreen = '\x1b[2J Claude Code\r\n❯ \r\n  ⏵⏵ bypass permissions on';
+
+    it('reports the next busy marker once the ready is adopted', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+      detector.feed(startupScreen);
+
+      detector.adoptPromptReady();
+      detector.feed('\x1b[2K• Working (1s • esc to interrupt)');
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.dispose();
+    });
+
+    it('without the adoption the whole next turn stays invisible', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+      detector.feed(startupScreen);
+
+      detector.feed('\x1b[2K• Working (1s • esc to interrupt)');
+      expect(cb).not.toHaveBeenCalled();
+      detector.dispose();
+    });
+
+    it('busy text streamed before the adoption does not count as the next turn', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+      detector.feed('• Working (1s • esc to interrupt)');
+      detector.feed(startupScreen);
+
+      detector.adoptPromptReady();
+      detector.feed('\x1b[2K❯ ');
+      expect(cb).not.toHaveBeenCalled();
+      detector.dispose();
+    });
+
+    it('a submit reset() after the adoption still disarms the edge', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+      detector.feed(startupScreen);
+
+      detector.adoptPromptReady();
+      detector.reset();
+      detector.feed('• Working (1s • esc to interrupt)');
+      expect(cb).not.toHaveBeenCalled();
+      detector.dispose();
+    });
+
+    it('an OSC 7501 working report after the adoption is reported as busy too', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+      detector.feed(startupScreen);
+
+      detector.adoptPromptReady();
+      detector.observeProgramStatus({ state: 'working' });
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.dispose();
+    });
+
+    it('is not adopted over an OSC 7501 working turn: its stale-working release stays available', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      detector.observeProgramStatus({ state: 'working' });
+
+      detector.adoptPromptReady();
+      expect(detector.isIdleNow()).toBe(false);
+      expect(detector.programStatusHeldWorking()).toBe(true);
+      expect(detector.releaseStaleProgramStatus()).toBe(true);
+      detector.dispose();
+    });
+
+    it('is not adopted over an OSC 7501 blocked turn (a pending permission prompt)', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      detector.observeProgramStatus({ state: 'blocked', kind: 'permission' });
+
+      detector.adoptPromptReady();
+      expect(detector.isIdleNow()).toBe(false);
+      detector.dispose();
+    });
+
+    it('is a no-op after the detector reported idle itself: no extra idle, one busy', () => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern, readyPattern: /❯/ }));
+      const idle = vi.fn();
+      const busy = vi.fn();
+      detector.onIdle(idle);
+      detector.onBusy(busy);
+
+      detector.fireIdle();
+      detector.adoptPromptReady();
+      detector.feed('• Working (1s • esc to interrupt)');
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(busy).toHaveBeenCalledTimes(1);
+      detector.dispose();
+    });
+  });
+
   it.each([
     {
       name: 'Genius',
@@ -1526,6 +1626,24 @@ describe('IdleDetector: first-prompt extended quiescence', () => {
     expect(cb).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1_200);
     expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('a prompt-ready the worker published itself counts as that first idle', () => {
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: 4_000 }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.feed('booting');
+    detector.adoptPromptReady();
+    expect(cb).not.toHaveBeenCalled();
+
+    // Same 3.2s landing as above: the extended window does not apply again.
+    detector.reset();
+    detector.feed('first turn output');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1_200);
+    expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
 

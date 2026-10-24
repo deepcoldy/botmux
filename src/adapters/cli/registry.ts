@@ -30,6 +30,7 @@ import { createCopilotAdapter } from './copilot.js';
 import { createOhMyPiAdapter, ompBridgeSpec } from './oh-my-pi.js';
 import { createEbsdAdapter, ebsdBridgeSpec } from './ebsd.js';
 import { createKimiAdapter } from './kimi.js';
+import { createCodemAdapter, defaultCodemExecutable } from './codem.js';
 import { createGrokAdapter, grokBridgeSpec } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
@@ -95,6 +96,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // MiniMax Code — native exec stream-json, wrapped by minimax-runner.
   minimax: 'mcode',
   'remote-runner': 'botmux-remote-runner',
+  codem: 'codem',
 };
 
 /**
@@ -114,7 +116,7 @@ export const ALL_CLI_IDS: readonly CliId[] = Object.keys(RAW_CLI_EXECUTABLES) as
 export function rawCliExecutable(id: CliId, pathOverride?: string): string | undefined {
   const normalized = id.toLowerCase() as CliId;
   const override = pathOverride?.trim();
-  return override || RAW_CLI_EXECUTABLES[normalized];
+  return override || (normalized === 'codem' ? defaultCodemExecutable() : RAW_CLI_EXECUTABLES[normalized]);
 }
 
 const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
@@ -246,7 +248,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: 
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {
@@ -275,6 +277,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'oh-my-pi': return createOhMyPiAdapter(pathOverride);
     case 'ebsd': return createEbsdAdapter(pathOverride);
     case 'kimi': return createKimiAdapter(pathOverride);
+    case 'codem': return createCodemAdapter(pathOverride);
     case 'grok': return createGrokAdapter(pathOverride);
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);

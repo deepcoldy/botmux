@@ -1197,7 +1197,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection, promptCacheTtl }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1273,6 +1273,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // 跟上 5h/7d 窗口滚动；快照 10 min 陈旧自动失效（STATUSLINE_STALE_MS）。
       if (variant.id === 'claude-code') {
         inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
+      }
+      // Prompt-cache lifetime (bots.json / config.json `promptCache.ttl`). Through a
+      // gateway Claude Code treats itself as an API-key client and asks for 5m;
+      // `promptCacheTtl` makes it request the lifetime the operator chose.
+      if (variant.id === 'claude-code' && promptCacheTtl) {
+        inlineSettings.promptCacheTtl = promptCacheTtl;
       }
       // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass
       // 键 / env）时才传，disableCliBypass 且无 env 下没东西可传就不传。

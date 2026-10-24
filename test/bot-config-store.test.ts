@@ -128,6 +128,76 @@ describe('bot-config store', () => {
     expect(readConfig().replyDelivery).toBe('send');
   });
 
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }, 'kimi'],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }, 'codex'],
+  ] as const)('/config cli switch %s -> %s drops the stranded structured runtime on disk and in memory', async (fromCli, runtime, toCli) => {
+    const { registry, store } = await loaded({
+      cliId: fromCli,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, toCli);
+    expect(changed).toMatchObject({ ok: true });
+    // Disk: descriptor and its equal downgrade shadow are both gone.
+    expect(readConfig()).toMatchObject({ cliId: toCli });
+    expect(readConfig().cliRuntime).toBeUndefined();
+    expect(readConfig().cliPathOverride).toBeUndefined();
+    // Memory config must match the persisted generation (new sessions read it).
+    const live = registry.getBot('app_default').config;
+    expect(live.cliRuntime).toBeUndefined();
+    expect(live.cliPathOverride).toBeUndefined();
+    // A fresh reload accepts the next generation instead of running one
+    // family's binary under the other family's interaction contract.
+    expect(() => registry.loadBotConfigs()).not.toThrow();
+  });
+
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }],
+  ] as const)('/config cli re-selecting the same %s family preserves its structured runtime', async (cliId, runtime) => {
+    const { store } = await loaded({
+      cliId,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, cliId);
+    expect(changed).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({
+      cliId,
+      cliRuntime: expect.objectContaining({ id: runtime.id }),
+      cliPathOverride: runtime.executable,
+    });
+  });
+
+  it('/config cli switch keeps an unrelated legacy cliPathOverride but clears a switch to an unsupported adapter', async () => {
+    // Legacy raw paths predate structured runtimes and are deliberately not
+    // scoped to an adapter family — same parity as setup edits.
+    {
+      const { store } = await loaded({ cliId: 'codex', cliPathOverride: '/opt/legacy-router' });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'kimi');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'kimi', cliPathOverride: '/opt/legacy-router' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+    }
+    // Structured runtime + switch to an adapter that has no runtime support:
+    // the descriptor is cleared, so the next generation reloads instead of
+    // failing the whole bots.json parse.
+    {
+      const { registry, store } = await loaded({
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' },
+        cliPathOverride: '/opt/bin/vendor-codex',
+      });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'claude-code');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'claude-code' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+      expect(readConfig().cliPathOverride).toBeUndefined();
+      expect(() => registry.loadBotConfigs()).not.toThrow();
+    }
+  });
+
   it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
     const { store } = await loaded({ cliId, replyDelivery: 'send' });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
@@ -1430,7 +1500,10 @@ describe('bot-config store', () => {
   });
 
   it('rejects replyDelivery=transcript for CLIs without transcript capture', async () => {
-    const { registry, store } = await loaded({ cliId: 'cursor' });
+    // antigravity has only zero-prompt transcript harvest and is still
+    // unsupported for ordinary transcript delivery; cursor used to be the
+    // exemplar here but gained the capability in #932.
+    const { registry, store } = await loaded({ cliId: 'antigravity' });
     const spec = store.findConfigField('replyDelivery')!;
     const before = store.getConfigSnapshot('app_default');
     expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
@@ -1445,6 +1518,64 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().replyDelivery).toBe('send');
     expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+  });
+
+  it('accepts replyDelivery=transcript for cursor (always-on structured fallback since #932)', async () => {
+    const { registry, store } = await loaded({ cliId: 'cursor' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+  });
+
+  it('rejects replyDelivery=transcript for cursor under scratch sandbox (host cannot read merged mirror; never a silent fallback)', async () => {
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('still accepts replyDelivery=transcript for an always-on non-cursor CLI (codex) under scratch — its bridge does not read a merged mirror', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('invariant backstop: switching cliId codex→cursor while scratch+transcript persist is rejected (the replyDelivery-only gate misses this edge)', async () => {
+    // 复现 pi 复审洞 1：replyDelivery 写入门禁只在 configKey==='replyDelivery' 时跑，
+    // 单查那条边会放行进 cursor 的切换，落盘永久无效组合（dashboard 显「已开启」、
+    // 运行时静默回落 send）。rmwBotEntry 的全局不变量必须在 cli 切换这条边拦下。
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'cursor');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('repair path: switching the invalid cursor+scratch+transcript entry to a supporting CLI (codex) succeeds', async () => {
+    // 不能把坏 entry 锁死：任何一个字段改到合法组合都必须能写，给运维修复出口。
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'codex');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    // 内存态可能由配置归一化填默认 false（盘上缺省才是契约）；关键是不能落成 scratch。
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {

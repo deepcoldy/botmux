@@ -61,6 +61,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/avatar', '/api/bot-avatar', 'raw'],
   ['PUT', '/api/bots/cli_a/max-live-workers', '/api/bot-max-live-workers', 'raw'],
   ['PUT', '/api/bots/cli_a/no-progress-notify', '/api/bot-no-progress-notify', 'raw'],
+  ['PUT', '/api/bots/cli_a/prompt-cache', '/api/bot-prompt-cache', 'raw'],
   ['PUT', '/api/bots/cli_a/idle-suspend-minutes', '/api/bot-idle-suspend-minutes', 'raw'],
   ['PUT', '/api/bots/cli_a/session-owner-reminder', '/api/bot-session-owner-reminder', 'raw'],
   ['GET', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'none'],

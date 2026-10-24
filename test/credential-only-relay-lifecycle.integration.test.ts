@@ -21,6 +21,7 @@ import {
   isolationPaneMarkerPath,
 } from '../src/adapters/cli/read-isolation.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
@@ -103,9 +104,7 @@ console.log('Ready >'); setInterval(() => {}, 1 << 30);
   const workers = new Set<ChildProcess>();
   const lab = {
     sessionId, dataDir, sessionRoot, outbox, capabilityLeaf,
-    reports: (): Array<{ relay: string | null }> => existsSync(report)
-      ? readFileSync(report, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
-      : [],
+    reports: (): Array<{ relay: string | null }> => readJsonLines(report),
     paneAlive: (): boolean => spawnSync(realTmux!, ['-S', socket, 'has-session', '-t', paneTarget]).status === 0,
     // HOST pid of the pane's process. (The fake CLI's own process.pid is
     // namespace-local under bwrap --unshare-pid and means nothing out here.)
