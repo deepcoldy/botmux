@@ -4,6 +4,7 @@ import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
 import { buildOncallGroupColumn } from './oncall-group.js';
+import { logger } from '../../utils/logger.js';
 
 export interface FeedbackCardState { feedbackId?: string; result?: string; reasonKey?: string; comment?: string }
 
@@ -66,14 +67,54 @@ function escapeRenderedMarkdown(content: string): string {
   return content.replace(/([\\`*_[\]<>!~&])/g, '\\$1');
 }
 
-function readbackCellText(value: unknown, markdown: boolean): string | undefined {
+function readbackCellText(value: unknown, markdown: boolean, protectStyleBoundary = false): string | undefined {
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
-    const parts = value.map(part => readbackCellText(part, markdown));
+    const runs: unknown[] = [];
+    for (const part of value) {
+      const previous = runs[runs.length - 1] as Record<string, any> | undefined;
+      const current = part as Record<string, any> | null;
+      const previousAttributes = previous?.property?.textStyle?.attributes;
+      const currentAttributes = current?.property?.textStyle?.attributes;
+      if (markdown && previous?.tag === 'plain_text' && current?.tag === 'plain_text'
+        && typeof previous.property?.content === 'string' && typeof current.property?.content === 'string'
+        && Array.isArray(previousAttributes) && Array.isArray(currentAttributes)
+        && previousAttributes.includes('bold') === currentAttributes.includes('bold')
+        && previousAttributes.includes('italic') === currentAttributes.includes('italic')) {
+        runs[runs.length - 1] = { ...previous, property: {
+          ...previous.property, content: previous.property.content + current.property.content,
+        } };
+      } else runs.push(part);
+    }
+    const hasAdjacentStyles = markdown && runs.length > 1 && runs.some(part => {
+      const node = part as Record<string, any> | null;
+      const attributes = node?.property?.textStyle?.attributes;
+      return node?.tag === 'plain_text' && Array.isArray(attributes)
+        && (attributes.includes('bold') || attributes.includes('italic'));
+    });
+    const parts = runs.map(part => readbackCellText(part, markdown, hasAdjacentStyles));
     return parts.every(part => part !== undefined) ? parts.join('') : undefined;
   }
   if (!value || typeof value !== 'object') return undefined;
   const node = value as Record<string, any>;
+  if (node.tag === 'list' && Array.isArray(node.property?.items)) {
+    const items: string[] = [];
+    const contentColumns: number[] = [];
+    for (const item of node.property.items) {
+      if (!item || typeof item !== 'object' || !Array.isArray(item.elements)) return undefined;
+      const content = readbackCellText(item.elements, markdown);
+      if (content === undefined || (item.type !== 'ol' && item.type !== 'ul')) return undefined;
+      const level = Number.isInteger(item.level) && item.level >= 0 ? item.level : 0;
+      const indentWidth = level === 0 ? 0 : contentColumns[level - 1] ?? level * 4;
+      const indent = ' '.repeat(indentWidth);
+      const marker = item.type === 'ol' ? `${Number.isInteger(item.order) && item.order > 0 ? item.order : 1}. ` : '- ';
+      contentColumns.length = level;
+      contentColumns[level] = indentWidth + Math.max(4, marker.length);
+      const continuation = indent + ' '.repeat(marker.length);
+      items.push(`${indent}${marker}${content.replace(/\n/g, `\n${continuation}`)}`);
+    }
+    return items.join('\n');
+  }
   let content: string | undefined;
   let direct = false;
   for (const candidate of [node.content, node.text?.content, node.property?.content, node.text]) {
@@ -86,7 +127,7 @@ function readbackCellText(value: unknown, markdown: boolean): string | undefined
   if (content === undefined) {
     for (const children of [node.property?.elements, node.elements, node.property?.markdownElements, node.markdownElements]) {
       if (!Array.isArray(children) || children.length === 0) continue;
-      content = readbackCellText(children, markdown && node.tag !== 'a' && node.tag !== 'code_span');
+      content = readbackCellText(children, markdown && !['a', 'link', 'code_span'].includes(node.tag));
       if (content !== undefined) break;
     }
   }
@@ -100,16 +141,39 @@ function readbackCellText(value: unknown, markdown: boolean): string | undefined
     const padding = /^[` ]|[` ]$/.test(content) ? ' ' : '';
     return `${fence}${padding}${content}${padding}${fence}`;
   }
-  if (node.tag === 'a') {
-    const href = node.href ?? node.property?.href ?? node.url ?? node.property?.url;
+  if (node.tag === 'a' || node.tag === 'link') {
+    const href = node.tag === 'link'
+      ? node.property?.url?.url ?? node.property?.url ?? node.property?.href
+      : node.href ?? node.property?.href ?? node.url ?? node.property?.url;
     if (typeof href === 'string') {
-      const destination = href.replace(/[()<>\s\\]/g, character => encodeURIComponent(character)
-        .replace(/[()]/g, delimiter => `%${delimiter.charCodeAt(0).toString(16).toUpperCase()}`))
+      const destination = href.replace(/[()<>\s\\]/g, character =>
+        character === '(' ? '%28' : character === ')' ? '%29' : encodeURIComponent(character))
         .replace(/&/g, '\\&');
       return `[${escapeRenderedMarkdown(content)}](${destination})`;
     }
   }
-  return direct && node.tag === 'plain_text' ? escapeRenderedMarkdown(content) : content;
+  if (direct && node.tag === 'plain_text') {
+    const rawParts = /^(\s*)([\s\S]*?)(\s*)$/.exec(content)!;
+    const characters = Array.from(rawParts[2]);
+    const reference = (character: string) => `&#${character.codePointAt(0)!};`;
+    const escaped = protectStyleBoundary && characters.length > 0
+      ? rawParts[1] + reference(characters[0])
+        + (characters.length > 1 ? escapeRenderedMarkdown(characters.slice(1, -1).join(''))
+          + reference(characters[characters.length - 1]) : '') + rawParts[3]
+      : escapeRenderedMarkdown(content);
+    const attributes = node.property?.textStyle?.attributes;
+    if (!Array.isArray(attributes)) return escaped;
+    const parts = /^(\s*)([\s\S]*?)(\s*)$/.exec(escaped)!;
+    if (!parts[2]) return escaped;
+    let styled = parts[2];
+    if (attributes.includes('bold')) styled = `**${styled}**`;
+    if (attributes.includes('italic')) {
+      const delimiter = attributes.includes('bold') ? '_' : '*';
+      styled = `${delimiter}${styled}${delimiter}`;
+    }
+    return parts[1] + styled + parts[3];
+  }
+  return content;
 }
 
 function normalizeReadbackTables(value: unknown): void {
@@ -129,6 +193,10 @@ function normalizeReadbackTables(value: unknown): void {
         if (!cell || typeof cell !== 'object') continue;
         const content = readbackCellText(cell, column.data_type === 'lark_md' || column.data_type === 'markdown');
         if (content !== undefined) row[column.name] = content;
+        else {
+          const tag = typeof cell.tag === 'string' ? cell.tag.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) : 'unknown';
+          logger.warn(`[feedback-card] unrecognized text table cell tag=${tag}`);
+        }
       }
     }
   }

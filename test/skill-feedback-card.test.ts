@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildCanonicalFinalReplyCard, buildMarkdownCard } from '../src/im/lark/md-card.js';
 import { renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
@@ -267,5 +267,176 @@ describe('final answer feedback card state machine', () => {
     const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
     const tokens = new MarkdownIt().parseInline(card.body.elements[0].rows[0].link, {})[0].children!;
     expect(tokens.find(token => token.type === 'link_open')?.attrGet('href')).toBe(href);
+  });
+
+  it('restores ordered, unordered, and nested lists from CardKit item nodes', () => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'steps', data_type: 'markdown' }],
+      rows: [{ steps: { tag: 'list', property: { items: [
+        { elements: [{ tag: 'code_span', property: { content: 'a.ts' } }],
+          level: 0, order: 1, type: 'ol' },
+        { elements: [{ tag: 'plain_text', property: { content: 'nested item' } }],
+          level: 1, type: 'ul' },
+        { elements: [{ tag: 'plain_text', property: { content: 'next item' } }],
+          level: 0, order: 2, type: 'ol' },
+      ] } } }],
+    });
+    const before = structuredClone(platformCard);
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const content = card.body.elements[0].rows[0].steps;
+    expect(content).toBe('1. `a.ts`\n    - nested item\n2. next item');
+    const tokens = new MarkdownIt().parse(content, {});
+    expect(tokens.filter(token => token.type === 'ordered_list_open'))
+      .toHaveLength(1);
+    expect(tokens.filter(token => token.type === 'bullet_list_open'))
+      .toHaveLength(1);
+    expect(tokens.filter(token => token.type === 'list_item_open'))
+      .toHaveLength(3);
+    expect(platformCard).toEqual(before);
+  });
+
+  it.each([
+    { url: { url: 'https://example.com/report?x=1&y=2' }, href: 'https://example.com/fallback' },
+    { url: 'https://example.com/report?x=1&y=2', href: 'https://example.com/fallback' },
+    { href: 'https://example.com/report?x=1&y=2' },
+  ])('preserves CardKit link nodes and their URL precedence: %j', (destination) => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table',
+      columns: [{ name: 'link', data_type: 'lark_md' }, { name: 'text', data_type: 'text' }],
+      rows: [{
+        link: { tag: 'link', property: { content: 'PR [925]', ...destination } },
+        text: { tag: 'link', property: { content: 'PR [925]', ...destination } },
+      }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const row = card.body.elements[0].rows[0];
+    const tokens = new MarkdownIt().parseInline(row.link, {})[0].children!;
+    expect(tokens.find(token => token.type === 'link_open')?.attrGet('href'))
+      .toBe('https://example.com/report?x=1&y=2');
+    expect(tokens.find(token => token.type === 'text')?.content).toBe('PR [925]');
+    expect(row.text).toBe('PR [925]');
+  });
+
+  it.each([
+    { attributes: ['bold'], expected: '<strong>important</strong>' },
+    { attributes: ['italic'], expected: '<em>important</em>' },
+    { attributes: ['bold', 'italic'], expected: '<em><strong>important</strong></em>' },
+  ])('preserves CardKit plain-text emphasis %j', ({ attributes, expected }) => {
+    const platformCard = structuredClone(baseCard);
+    const styled = { tag: 'plain_text', property: {
+      content: 'important', textStyle: { attributes },
+    } };
+    platformCard.body.elements.unshift({
+      tag: 'table',
+      columns: [{ name: 'markdown', data_type: 'markdown' }, { name: 'text', data_type: 'text' }],
+      rows: [{ markdown: styled, text: styled }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const row = card.body.elements[0].rows[0];
+    expect(new MarkdownIt().renderInline(row.markdown)).toBe(expected);
+    expect(row.text).toBe('important');
+  });
+
+  it('warns about unrecognized text cell tags without logging cell content', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const platformCard = structuredClone(baseCard);
+    const unknown = { tag: 'future_card_node', property: { secret: 'private answer content' } };
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'cell', data_type: 'lark_md' }],
+      rows: [{ cell: unknown }],
+    });
+    try {
+      const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+      expect(card.body.elements[0].rows[0].cell).toEqual(unknown);
+      const logs = stderr.mock.calls.map(([message]) => String(message)).join('');
+      expect(logs).toContain('[WARN]');
+      expect(logs).toContain('future_card_node');
+      expect(logs).not.toContain('private answer content');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('renders adjacent emphasized runs without exposing markdown delimiters', () => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: [{ detail: { tag: 'markdown', property: { elements: [
+        { tag: 'plain_text', property: { content: 'first', textStyle: { attributes: ['bold'] } } },
+        { tag: 'plain_text', property: { content: 'second', textStyle: { attributes: ['bold'] } } },
+      ] } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    expect(new MarkdownIt().renderInline(card.body.elements[0].rows[0].detail))
+      .toBe('<strong>firstsecond</strong>');
+  });
+
+  it('preserves mixed adjacent emphasis transitions without literal stars', () => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: [{ detail: { tag: 'markdown', property: { elements: [
+        { tag: 'plain_text', property: { content: 'first', textStyle: { attributes: ['bold'] } } },
+        { tag: 'plain_text', property: { content: 'second', textStyle: { attributes: ['bold', 'italic'] } } },
+        { tag: 'plain_text', property: { content: 'third', textStyle: { attributes: ['italic'] } } },
+      ] } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    expect(new MarkdownIt().renderInline(card.body.elements[0].rows[0].detail))
+      .toBe('<strong>first</strong><em><strong>second</strong></em><em>third</em>');
+  });
+
+  it('preserves text and per-character emphasis for every adjacent style transition', () => {
+    const styles = [[], ['bold'], ['italic'], ['bold', 'italic']];
+    const platformCard = structuredClone(baseCard);
+    const cases = styles.flatMap(first => styles.flatMap(second => styles.map(third => [first, second, third])));
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: cases.map(attributes => ({ detail: { tag: 'markdown', property: {
+        elements: attributes.map((style, index) => ({
+          tag: 'plain_text', property: { content: ['a', 'b', 'c'][index], textStyle: { attributes: style } },
+        })),
+      } } })),
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const parser = new MarkdownIt();
+    for (const [index, row] of card.body.elements[0].rows.entries()) {
+      const tokens = parser.parseInline(row.detail, {})[0].children!;
+      const actual: Array<{ character: string; bold: boolean; italic: boolean }> = [];
+      let bold = 0;
+      let italic = 0;
+      for (const token of tokens) {
+        if (token.type === 'strong_open') bold++;
+        if (token.type === 'strong_close') bold--;
+        if (token.type === 'em_open') italic++;
+        if (token.type === 'em_close') italic--;
+        if (token.type === 'text') {
+          for (const character of token.content) actual.push({ character, bold: bold > 0, italic: italic > 0 });
+        }
+      }
+      expect(actual).toEqual(cases[index].map((style: string[], position: number) => ({
+        character: ['a', 'b', 'c'][position], bold: style.includes('bold'), italic: style.includes('italic'),
+      })));
+    }
+  });
+
+  it('retains nested-list hierarchy below a three-digit ordered parent', () => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: [{ detail: { tag: 'list', property: { items: [
+        { elements: [{ tag: 'plain_text', property: { content: 'parent' } }],
+          level: 0, order: 100, type: 'ol' },
+        { elements: [{ tag: 'plain_text', property: { content: 'child' } }],
+          level: 1, type: 'ul' },
+      ] } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const tokens = new MarkdownIt().parse(card.body.elements[0].rows[0].detail, {});
+    expect(tokens.find(token => token.type === 'ordered_list_open')?.attrGet('start')).toBe(100);
+    expect(tokens.filter(token => token.type === 'bullet_list_open')).toHaveLength(1);
+    expect(tokens.filter(token => token.type === 'list_item_open')).toHaveLength(2);
   });
 });
