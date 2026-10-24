@@ -401,16 +401,10 @@ async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<Res
     // Origin and fallback title are both determined by the first meaningful
     // user turn. Do not reclassify an external session if it is later resumed
     // through botmux while we continue scanning for a rename.
-    if (!acc.fallbackTitle && rec.type === 'user') {
-      const raw = rawClaudeUserText(rec.message);
-      if (raw && isBotmuxInjected(raw)) { acc.botmux = true; return true; } // botmux-origin → drop
-      // isMeta turns are written by Claude itself (skill body expansion,
-      // local-command caveat, hook output), not typed by the user: they still
-      // go through the origin check above, but never become the title.
-      if (raw && rec.isMeta !== true) {
-        const clean = cleanUserPromptForTitle(raw);
-        if (clean) acc.fallbackTitle = truncateTitle(clean);
-      }
+    if (!acc.fallbackTitle) {
+      const turn = claudeFirstUserTurn(rec);
+      if (turn?.botmux) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (turn) acc.fallbackTitle = truncateTitle(turn.prompt);
     }
     return Boolean(acc.cwd && acc.fallbackTitle);
   });
@@ -427,6 +421,28 @@ async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<Res
     title,
     lastActivityAt: mtimeMs,
   };
+}
+
+/** The first-user-turn rule, fed one Claude transcript record at a time in
+ *  file order. Returns `{ botmux: true }` for a botmux envelope (the session's
+ *  origin is botmux), `{ botmux: false, prompt }` for the user's real first
+ *  prompt (trimmed, uncut), or undefined to keep scanning: sidechain, non-user
+ *  and tool-result-only records, isMeta turns and slash-command turns. History
+ *  titles use it through parseClaudeTranscript; live /adopt titles reuse it on
+ *  their own bounded head read, so both pick the same prompt. */
+export function claudeFirstUserTurn(
+  rec: Record<string, unknown>,
+): { botmux: true } | { botmux: false; prompt: string } | undefined {
+  if (rec.isSidechain === true || rec.type !== 'user') return undefined;
+  const raw = rawClaudeUserText(rec.message);
+  if (!raw) return undefined;
+  if (isBotmuxInjected(raw)) return { botmux: true };
+  // isMeta turns are written by Claude itself (skill body expansion,
+  // local-command caveat, hook output), not typed by the user: they still
+  // go through the origin check above, but never become the title.
+  if (rec.isMeta === true) return undefined;
+  const clean = cleanUserPromptForTitle(raw);
+  return clean ? { botmux: false, prompt: clean } : undefined;
 }
 
 /** Pull plain user text out of a Claude `message` field (string content or the

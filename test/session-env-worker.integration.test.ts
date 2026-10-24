@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 
 const hasTmux = process.platform === 'linux' && spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0;
 const backends = ['pty', ...(hasTmux ? ['tmux'] : [])] as const;
@@ -79,7 +80,8 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
     } finally {
       const exited = once(worker, 'exit');
       if (worker.connected) worker.send({ type: 'close' });
-      const killTimeout = setTimeout(() => worker.kill('SIGKILL'), 5000);
+      // With any tmux call still in flight, before the test's files go below.
+      const killTimeout = setTimeout(() => { void killProcessTree(worker); }, 5000);
       try { if (worker.exitCode === null && worker.signalCode === null) await exited; }
       finally { clearTimeout(killTimeout); }
       if (backendType === 'tmux') {

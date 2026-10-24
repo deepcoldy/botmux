@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
+import { createBracketedPasteCollector } from './helpers/bracketed-paste-collector.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -154,8 +155,6 @@ process.stdout.write(
 );
 }
 drawStartup();
-let input = '';
-let pasted = '';
 let submitCount = 0;
 let composerReleased = false;
 // A tmux pipe attaches after spawn; real TUIs redraw during initialization.
@@ -163,24 +162,7 @@ let composerReleased = false;
 for (const delay of [500, 1000]) {
   setTimeout(() => { if (submitCount === 0) drawStartup(); }, delay);
 }
-process.stdin.on('data', chunk => {
-  input += chunk;
-  while (true) {
-    const start = input.indexOf('\\x1b[200~');
-    if (start < 0) break;
-    const end = input.indexOf('\\x1b[201~', start + 6);
-    if (end < 0) break;
-    pasted = input.slice(start + 6, end);
-    input = input.slice(end + 6);
-  }
-  while (input.includes('\\r') || input.includes('\\n')) {
-    const cr = input.indexOf('\\r');
-    const lf = input.indexOf('\\n');
-    const at = cr < 0 ? lf : lf < 0 ? cr : Math.min(cr, lf);
-    input = input.slice(at + 1);
-    if (!pasted) continue;
-    const text = pasted;
-    pasted = '';
+const collectPaste = (${createBracketedPasteCollector.toString()})(text => {
     submitCount += 1;
     fs.appendFileSync(submissionsPath, JSON.stringify({ pid: process.pid, text }) + '\\n');
     if (submitCount <= 4) {
@@ -201,8 +183,8 @@ process.stdin.on('data', chunk => {
         '\\x1b[2J\\x1b[H⠋ Any second now…\\nQueued for next turn\\nContext 64% left\\n'
       );
     }
-  }
 });
+process.stdin.on('data', collectPaste);
 setInterval(() => {
   if (composerReleased || !fs.existsSync(releasePath)) return;
   composerReleased = true;

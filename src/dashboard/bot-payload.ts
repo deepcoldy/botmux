@@ -44,7 +44,7 @@ export interface DashboardBotDescriptor {
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
-  /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
+  /** dsh / MiniMax runner turn budget (ms). */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
   dshRuntime?: 'official' | 'tui' | null;
@@ -236,6 +236,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
+    promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

@@ -15,6 +15,8 @@ import {
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -98,6 +100,7 @@ interface DashboardSettings {
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
   sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
@@ -269,6 +272,7 @@ function parseSettings(s: any): DashboardSettings {
         ? Math.floor(s.sessionCleanup.intervalMinutes)
         : 60,
     },
+    promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
@@ -1114,6 +1118,15 @@ function SettingsBody(props: {
                 s => ({ ...s, sessionCleanup: { ...s.sessionCleanup, ...patch } }),
               );
             }}
+          />
+        </SettingsBlock>
+        <SettingsBlock id="settings-prompt-cache" title={tr('settings.sectionPromptCache')}>
+          <p className="settings-help">{tr('settings.promptCacheNote')}</p>
+          <PromptCacheEditor
+            scope="global"
+            value={settings.promptCache}
+            disabled={dis || savingKey === 'promptCache'}
+            onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
           />
         </SettingsBlock>
       </SettingsGroup>

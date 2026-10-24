@@ -1267,10 +1267,27 @@ function credentialBoundaryForPrompt(
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
  *  core/reply-delivery.ts）。缺参 / bot 未加载 / 任何异常 → 'send'（fail-closed：
- *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。 */
-function replyDeliveryFor(larkAppId?: string, cliId?: string, promptInjection?: PromptInjection): ReplyDelivery {
+ *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。
+ *  sessionSandbox：已存活会话续轮传 spawn 时冻结的 session.sandbox——sandbox
+ *  改动 next-session-only，续轮信封必须按该会话 worker 的真实采集能力判，不能
+ *  被随后关掉 sandbox 再开 transcript 的 live 配置骗成改口不 send（静默轮）。 */
+function replyDeliveryFor(
+  larkAppId?: string,
+  cliId?: string,
+  promptInjection?: PromptInjection,
+  sessionSandbox?: Session['sandbox'],
+): ReplyDelivery {
   if (!larkAppId || !cliId) return 'send';
-  try { return effectiveReplyDelivery(larkAppId, cliId, promptInjection); } catch { return 'send'; }
+  try {
+    return effectiveReplyDelivery(larkAppId, cliId, promptInjection,
+      sessionSandbox !== undefined ? { sessionSandbox } : undefined);
+  } catch { return 'send'; }
+}
+
+/** 已存活会话续轮用的冻结沙箱（无 session 行 / store poisoned → undefined，
+ *  回退 live+env 解析口径；不能让 poisoned store 把续轮信封构造整个抛掉）。 */
+function frozenSessionSandbox(sessionId: string): Session['sandbox'] | undefined {
+  try { return sessionStore.getSession(sessionId)?.sandbox; } catch { return undefined; }
 }
 
 /** All public builders share the durable session policy, including callers
@@ -1785,8 +1802,11 @@ function buildFollowUpBlocks(
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
   // reminder_no_transport）。bare = transcript + solo → 信封去壳。
+  // 沙箱用本会话 spawn 时的冻结值：live config 可能已把 sandbox 关掉并开了
+  // transcript（next-session-only 改动），但这个 worker 仍在 scratch overlay 里、
+  // 采集关闭，按 live 改口不 send 会静默（见 replyDeliveryFor 注释）。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection) === 'transcript';
+  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection, frozenSessionSandbox(sessionId)) === 'transcript';
   const bare = transcript && opts?.solo === true;
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
@@ -2088,7 +2108,8 @@ export function buildFollowUpCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
-    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
+    // 续轮：按本会话冻结沙箱判（与 buildFollowUpBlocks 同一口径）。
+    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection, frozenSessionSandbox(sessionId)),
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);

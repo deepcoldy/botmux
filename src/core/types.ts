@@ -537,6 +537,10 @@ export interface DaemonSession {
    * until its next real idle edge.
    */
   idleSinceAt?: number;
+  /** Prompt-cache keep-alive bookkeeping for the current idle stretch
+   *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
+   *  turn or busy edge that is not a keep-alive. */
+  promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still

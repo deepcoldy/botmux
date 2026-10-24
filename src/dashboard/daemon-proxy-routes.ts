@@ -206,6 +206,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('max-live-workers'),
   // no-progress-notify：`{ noProgressNotify: { enabled?, timeoutMs? } | null }`（null = 默认开启 + 90s）。
   putBotConfig('no-progress-notify'),
+  // prompt-cache：`{ promptCache: { ttl?, keepalive? } | null }`（null = 删除本 bot 覆盖、回落全局）。
+  putBotConfig('prompt-cache'),
   // idle-suspend-minutes：`{ idleSuspendMinutes: number | null }`（null = 关闭空闲 TTL）。
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。

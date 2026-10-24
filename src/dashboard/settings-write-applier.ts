@@ -35,6 +35,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
@@ -113,6 +114,9 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
+   *  null = not configured (off). Bots override it field by field. */
+  promptCache: PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
@@ -276,6 +280,7 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_promptCache'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
   | 'invalid_sessionCleanup_archiveCodex'
@@ -714,6 +719,18 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
+  if ('promptCache' in obj) {
+    // Whole-block replacement (the Settings form always sends every field it
+    // shows); null clears the machine-wide default. Same strict normalizer as
+    // the per-bot layer, so both doors reject the same typos.
+    let next: PromptCacheConfig | undefined;
+    try { next = normalizePromptCacheConfig(obj.promptCache); } catch {
+      return { ok: false, error: 'invalid_promptCache' };
+    }
+    deps.mergeGlobalConfig({ promptCache: next ?? null });
     touched = true;
   }
 

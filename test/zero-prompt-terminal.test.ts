@@ -12,6 +12,8 @@ const user = (uuid: string, text: string): TranscriptEvent => ({
 const final = (uuid: string, text: string): TranscriptEvent => ({
   type: 'assistant', uuid, message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
 });
+/** Claude Code's last record of a turn; a stop_reason alone is held for it. */
+const turnDuration = (uuid: string): TranscriptEvent => ({ type: 'system', subtype: 'turn_duration', uuid });
 
 describe('zero-prompt terminal replies', () => {
   it('captures a retry after 400 and later terminal rounds, ignoring model menus and history', () => {
@@ -33,7 +35,7 @@ describe('zero-prompt terminal replies', () => {
     expect(starts).toEqual([]);
     expect(q.drainEmittable()).toEqual([]);
     for (const [id, prompt] of [['retry', 'review task'], ['followup', 'continue checking']]) {
-      q.ingest([user(id, prompt), final(`${id}-final`, 'finished')]);
+      q.ingest([user(id, prompt), final(`${id}-final`, 'finished'), turnDuration(`${id}-duration`)]);
       const turn = q.drainEmittable({ explicitTerminalOnly: true })[0];
       expect(turn).toMatchObject({ turnId: `local-${id}`, isLocal: true, terminalOutcome: { status: 'completed' } });
       const gate = { ...turn, finalText: 'finished' };
@@ -91,9 +93,23 @@ describe('zero-prompt terminal replies', () => {
     expect(ds.session.quoteTargetId).toBe('om_b');
   });
 
+  it('keeps text arriving after an empty native end_turn in the same local turn', () => {
+    const starts: string[] = [];
+    const q = new BridgeTurnQueue(t => starts.push(t.turnId));
+    q.ingest([user('replayed', 'review again'), final('empty', '')]);
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+    q.ingest([final('late-final', 'review result'), turnDuration('d1')]);
+    expect(starts).toEqual(['local-replayed']);
+    expect(q.drainEmittable({ explicitTerminalOnly: true }).map(t => [t.turnId, t.assistantUuids])).toEqual([
+      ['local-replayed', ['late-final']],
+    ]);
+  });
+
   it('retains the reply address for text arriving after an empty native end_turn', () => {
     const starts: Array<{ turnId: string; replyContextTurnId?: string }> = [];
     const q = new BridgeTurnQueue(t => starts.push(t));
+    // A CLI shown not to write turn_duration settles on the stop_reason alone.
+    q.noteDurationMarkerWaitExpired();
     q.ingest([user('replayed', 'review again'), final('empty', '')]);
     q.drainEmittable({ explicitTerminalOnly: true });
     q.ingest([final('late-final', 'review result')]);

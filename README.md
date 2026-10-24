@@ -84,7 +84,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
 
-支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok，以及仅在零注入下启用转写采集的 Cursor、Antigravity（这两者常规模式仍通过 `botmux send` 回复，故默认不采集；均限 PTY、tmux 等本地后端，Codex / TraeX 可走 RPC 输入）。暂不支持远端后端和 v3 workflow；Cursor、Antigravity 的转写目录（`~/.cursor`、`~/.gemini`）在 oncall 沙箱（`sandbox: true`/`oncall`、读隔离、`BOTMUX_SANDBOX`）中以目录级 bind 直挂宿主真实路径，零注入可与其同时使用；全根 COW 的 `sandbox: "scratch"` 暂不支持这两者（结构化桥尚未解析 merged 视图，会直接报错而非静默丢回复）。Antigravity 的静默终态需经视口确认，故暂不支持 `zmx` 后端（Cursor 的终态即时采集，不受此限）。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
+支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor（普通 spawn 与零注入均始终启用，模型忘调 `botmux send` 时自动补发；可在 Bot 配置里显式开启 `replyDelivery: transcript` 后连逐轮信封也改为转写模式），以及仅在零注入下启用转写采集的 Antigravity（常规模式仍通过 `botmux send` 回复，故默认不采集；均限 PTY、tmux 等本地后端，Codex / TraeX 可走 RPC 输入）。暂不支持远端后端和 v3 workflow；Cursor、Antigravity 的转写目录（`~/.cursor`、`~/.gemini`）在 oncall 沙箱（`sandbox: true`/`oncall`、读隔离、`BOTMUX_SANDBOX`）中以目录级 bind 直挂宿主真实路径，零注入可与其同时使用；全根 COW 的 `sandbox: "scratch"` 暂不支持这两者（结构化桥读不到 merged 视图，零注入直接报错；Cursor 的 `replyDelivery: transcript` 在该模式下也不允许写入，避免模型被要求不调 send 而采集静默无回复）。Antigravity 的静默终态需经视口确认，故暂不支持 `zmx` 后端（Cursor 的终态即时采集，不受此限）。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
 
 普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。回答正文用完整显示名点名群内其它 bot（如 `@Reviewer 请合并`）时，与 `botmux send` 一样就地换成真正的 @，被点名的 bot 才会被唤醒；这时不再 @ 真人发起人，点名的 bot 解析不出身份时宁可不 @ 任何人，发起 bot 仍照常被 @。代码里的名字、私聊和失败通知不受影响。
 
@@ -98,7 +98,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`([MiniMax Code / mcode](docs/minimax-code.md)，支持文件与 Shell 工具、原生 Skills 和精确会话恢复；`mcode login` / `mcode login --region global` 登录，多账号用 `MINIMAX_DATA_DIR` 隔离) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`([MiniMax Code / mcode](docs/minimax-code.md)，支持文件与 Shell 工具、原生 Skills 和精确会话恢复；`mcode login` / `mcode login --region global` 登录，多账号用 `MINIMAX_DATA_DIR` 隔离) …
 
 `ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
 
@@ -165,6 +165,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 也可在 Dashboard 的「Bot 配置 → 卡片 → 最终回答反馈」编辑，或用 `/botconfig set feedback '<json>'` 热更新。策略支持本地团队 → bot → bot-scoped chat 分层，优先级为 chat > bot > team；Dashboard 可预览最终生效策略。策略修改只影响之后交付的新卡；已发送卡片继续使用发送时快照。Agent 主动发送可声明 `botmux send --response-kind progress ...` 或 `botmux send --response-kind final ...`；未声明时默认按 progress/非 final 发送，只有显式 final 才挂反馈与页脚品牌签名。数据仅落在本机 `botmux-feedback.sqlite`；可选 webhook 通过 durable outbox 投递 `turn.completed` 与 `feedback.revised` 事件。完整实现和边界见 [`docs/feedback-capability-current-implementation.md`](docs/feedback-capability-current-implementation.md)。
 
 严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
+
+兼容 Kimi TUI 交互的发行版也可保留 `cliId: "kimi"`，配置 `cliRuntime` 的 `id`、`displayName` 和 `executable`。例如 CodeM wrapper 可使用 `id: "codem"`、`displayName: "CodeM"`、`executable: "codem-wrapper"`、`update: { "provider": "none" }`；卡片、会话与终端提示显示发行版名称，交互仍由 Kimi 适配器处理。已有会话保留启动时的发行版快照，修改配置后在新话题验证。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 

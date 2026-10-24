@@ -256,6 +256,8 @@ export const messages: Record<string, string> = {
   'card.adopt.field_time_live': 'Uptime',
   'card.adopt.field_time_resume': 'Last active',
   'card.adopt.field_target': 'Location',
+  'card.adopt.location_with_workspace': '{workspace} ({target})',
+  'card.adopt.untitled_live': 'New session',
   'card.adopt.selected_tag': 'selected',
   'card.adopt.hint_pick_first': 'Click any session above to select it, then click the button below to adopt.',
   'card.adopt.btn_confirm_live': 'Take over into this topic',

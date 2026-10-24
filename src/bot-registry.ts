@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
@@ -24,6 +25,7 @@ import {
 import type { CliId } from './adapters/cli/types.js';
 import {
   normalizeCliRuntimeConfig,
+  supportsConfiguredCliRuntime,
   type CliRuntimeConfig,
 } from './adapters/cli/runtime.js';
 import {
@@ -72,6 +74,7 @@ import {
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy, type NoProgressNotifyPolicy } from './services/no-progress-notify-policy.js';
+import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
@@ -156,7 +159,7 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
 
 /**
- * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * Upper bound for a per-bot runner turn timeout. Node's `setTimeout` delay
  * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
  * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
  * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
@@ -474,6 +477,8 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
+  const listenerPolicy = normalizeVcMeetingListenerPolicy(entry.listenerPolicy);
+  if (listenerPolicy) out.listenerPolicy = listenerPolicy;
   // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
   // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
   // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
@@ -1328,6 +1333,7 @@ export interface SubstituteModeConfig {
 }
 
 export interface VcMeetingAgentConfig {
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Owner opt-in: verified inviters may manage only the invited meeting. Default false. */
   inviterManagementEnabled?: boolean;
   inviterManagementEnabledAt?: number;
@@ -1575,11 +1581,13 @@ export interface BotConfig {
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
-   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * Per-bot dsh / MiniMax runner timeout in milliseconds. The dsh adapter forwards
    * it as `--turn-timeout-ms` to arm the runner's idle watchdog (with a hard
    * cap of 4x this value). Positive integer only; unset/≤0/non-integer means
    * no watchdog is armed (the default — a turn runs until dsh reports idle).
-   * Only affects the `dsh` CLI adapter; other adapters ignore the field.
+   * MiniMax uses an opt-in total execution budget (human waits pause it).
+   * Both runners leave turn duration unlimited when this field is absent.
+   * Other adapters ignore the field.
    */
   turnTimeoutMs?: number;
   /**
@@ -1631,6 +1639,14 @@ export interface BotConfig {
    * keep-pending window. Missing preserves the built-in defaults (on, 90s).
    */
   noProgressNotify?: NoProgressNotifyPolicy;
+  /**
+   * Claude Code only: prompt-cache TTL and idle keep-alive for this bot. Each
+   * field overrides the machine-wide `promptCache` in config.json; whatever is
+   * unset here inherits it (services/prompt-cache-policy.ts). Missing on both
+   * layers = off. `ttl` applies from the next CLI spawn; keep-alive is read
+   * live by the daemon's idle sweep.
+   */
+  promptCache?: PromptCacheConfig;
   /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
@@ -3563,8 +3579,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // BotMux still launches the same distribution. Any unequal pair would make
     // old and new versions disagree, so it fails closed below.
     const entryCliId = entry.cliId ?? LEGACY_DEFAULT_CLI_ID;
-    if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
-      throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
+    if (entry.cliRuntime !== undefined && !supportsConfiguredCliRuntime(entryCliId)) {
+      throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex" or "kimi"`);
     }
     if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
       throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
@@ -4001,6 +4017,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexCapacityRecovery: entry.codexCapacityRecovery === true || undefined,
       suppressDeliveredFinalFailureNotice: entry.suppressDeliveredFinalFailureNotice === true || undefined,
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
+      promptCache: (() => {
+        if (entry.promptCache === undefined) return undefined;
+        try {
+          return normalizePromptCacheConfig(entry.promptCache);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid promptCache: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),

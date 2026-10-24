@@ -429,6 +429,57 @@ export class CodexBridgeQueue {
     return dropped;
   }
 
+  /** Refresh the bounded pre-start leases of EVERY queued head while the CLI
+   *  is visibly busy. Cursor's transcript mirror may not flush a turn's user
+   *  line until the first assistant step (a tool-less reply flushes the whole
+   *  turn at once, at the end), which can exceed the 20s lease measured from
+   *  write time; the worker ticks this every second while the CLI works, so
+   *  the countdown effectively starts at idle. Both unconfirmed attribution
+   *  leases AND submit-confirmed leases are refreshed: cursor's argv-baked
+   *  first turn is confirmPendingTurn'd at init (the most common spawn path)
+   *  yet its user line flushes just as late, and a type-ahead successor must
+   *  not be pruned behind a still-unstarted confirmed predecessor (the
+   *  started-predecessor shield in pruneExpiredPreStartHeads does not cover
+   *  that case).
+   *
+   *  Bounds preserved:
+   *  - rpc-active and provisional-task heads keep their own leases;
+   *  - a head with submit verification in flight keeps its verification
+   *    grace (the check owns that window);
+   *  - `maxSinceMarkMs` is a HARD ceiling measured from the mark: a false
+   *    "busy" screen (swallowed Enter / modal redraw) can refresh only up to
+   *    it, after which the head prunes and the structured_start_timeout /
+   *    successor queue recover — no permanent wedge.
+   *  Returns the number of refreshed heads. */
+  refreshUnstartedHeadAttributionLease(
+    nowMs: number = this.now(),
+    maxSinceMarkMs?: number,
+  ): number {
+    let refreshed = 0;
+    for (const head of this.queue) {
+      if (head.started || head.finalText !== undefined) continue;
+      if (head.rpcActive) continue;
+      if (this.isProvisionalTaskStart(head)) continue;
+      if (head.submitVerificationStartedAtMs !== undefined
+        && nowMs - head.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS) {
+        continue;
+      }
+      if (maxSinceMarkMs !== undefined
+        && head.markTimeMs !== undefined
+        && nowMs - head.markTimeMs > maxSinceMarkMs) {
+        continue;
+      }
+      if (head.submitConfirmedAtMs !== undefined) {
+        head.submitConfirmedAtMs = nowMs;
+        refreshed++;
+      } else if (head.unconfirmedAttributionStartedAtMs !== undefined) {
+        head.unconfirmedAttributionStartedAtMs = nowMs;
+        refreshed++;
+      }
+    }
+    return refreshed;
+  }
+
   /** Record positive submit evidence from an adapter/history check. The turn
    *  can still be waiting in the CLI's type-ahead queue, so this starts a
    *  bounded hand-off lease until its transcript user event appears. */

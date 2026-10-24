@@ -2055,6 +2055,71 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(sentMessages).toHaveLength(1);
   });
 
+  it('suppresses raw publication without losing transcript state or changing an in-flight policy', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        listenerChatId: 'oc_listener',
+        stabilizeMs: 1,
+        listenerPolicy: { rawMessages: false },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_activity_listener',
+      meeting: { id: 'm_listener', topic: 'Listener review' },
+      raw: {
+        event: {
+          meeting_actitivty_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_listener', topic: 'Listener review' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_listener',
+                  sender: { open_id: 'ou_a', user_name: 'Alice' },
+                  text: 'please sync this chat',
+                  send_time: '2026-07-01T16:00:00+08:00',
+                },
+              ],
+            },
+            {
+              activity_event_type: 'transcript_received',
+              meeting: { id: 'm_listener', topic: 'Listener review' },
+              transcript_received_items: [
+                {
+                  sentence_id: 'sent_listener',
+                  speaker: { open_id: 'ou_b', user_name: 'Bob' },
+                  text: 'stable transcript',
+                  start_time_ms: '2026-07-01T16:00:01+08:00',
+                  end_time_ms: '2026-07-01T16:00:02+08:00',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const result = await __vcMeetingAgentTest.flushListener(APP_ID, 'm_listener');
+
+    expect(result).toMatchObject({ ok: true, sent: 0 });
+    expect(sentMessages).toHaveLength(0);
+    const state = __vcMeetingAgentTest.sessionState(APP_ID, 'm_listener')!;
+    expect(Object.keys(state.dedup.transcriptBySentenceId)).toHaveLength(1);
+    registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code',
+      vcMeetingAgent: { enabled: true, listenerChatId: 'oc_listener', listenerPolicy: { rawMessages: true } } });
+    expect(await __vcMeetingAgentTest.flushListener(APP_ID, 'm_listener')).toMatchObject({ ok: true, sent: 0 });
+    expect(sentMessages).toHaveLength(0);
+  });
+
   it('reuses known actor names when chat push events only include operator ids', async () => {
     registerBot({
       larkAppId: APP_ID,

@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, resolveVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
 import { isVcMeetingInviterGrant, type VcMeetingInviterGrant } from './vc-meeting-inviter-policy.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -77,6 +78,7 @@ export interface VcMeetingRuntimeSessionRecord {
   textOutputPolicy?: VcMeetingOutputPolicy;
   voiceOutputPolicy?: VcMeetingOutputPolicy;
   syncIntervalMs?: number;
+  listenerPolicy?: VcMeetingListenerPolicy;
   consumerSelectionExpiresAt?: number;
   consumerCardMessageId?: string;
   /** Durable fence set when the listener bot's own participant_left event is observed. */
@@ -593,6 +595,7 @@ function normalizeRecord(value: unknown): VcMeetingRuntimeSessionRecord | undefi
       ...(typeof m.topic === 'string' && m.topic.trim() ? { topic: m.topic.trim() } : {}),
     },
     listenerChatId: r.listenerChatId.trim(),
+    ...(r.listenerPolicy !== undefined ? { listenerPolicy: resolveVcMeetingListenerPolicy(normalizeVcMeetingListenerPolicy(r.listenerPolicy)) } : {}),
     ...(Array.isArray(r.inviterManagers) && r.inviterManagers.every(isVcMeetingInviterGrant)
       ? { inviterManagers: r.inviterManagers.map(g => ({ ...g })) } : {}),
     ...(r.listenerChatCreatedForMeeting === true ? { listenerChatCreatedForMeeting: true } : {}),
@@ -838,6 +841,7 @@ export function recordVcMeetingRuntimeSession(
     textOutputPolicy?: VcMeetingOutputPolicy;
     voiceOutputPolicy?: VcMeetingOutputPolicy;
     syncIntervalMs?: number;
+    listenerPolicy?: VcMeetingListenerPolicy;
     consumerSelectionExpiresAt?: number;
     consumerCardMessageId?: string;
     listenerPresenceStale?: boolean;
@@ -887,6 +891,8 @@ export function recordVcMeetingRuntimeSession(
         ...(input.meeting.topic ? { topic: input.meeting.topic } : {}),
       },
       listenerChatId,
+      ...((prior ? prior.listenerPolicy : input.listenerPolicy) !== undefined
+        ? { listenerPolicy: resolveVcMeetingListenerPolicy(prior ? prior.listenerPolicy : input.listenerPolicy) } : {}),
       ...(input.inviterManagers ? { inviterManagers: input.inviterManagers.map(g => ({ ...g })) } : {}),
       ...(input.listenerChatCreatedForMeeting === true ? { listenerChatCreatedForMeeting: true } : {}),
       ...(input.attentionTargetOpenId ? { attentionTargetOpenId: input.attentionTargetOpenId } : {}),

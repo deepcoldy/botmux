@@ -32,7 +32,7 @@ import {
   findBotDefaultsSection,
   parseBotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults.js';
-import { BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotAgentSection, BotDefaultsTabs, readBotDefaultsDeepLink, resolveBotDefaultsTarget } from '../src/dashboard/web/bot-defaults-page.js';
 import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
@@ -163,7 +163,7 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx']
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx']
       .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
@@ -198,6 +198,43 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
   ];
 
   for (const locale of ['zh', 'en'] as const) {
+    it.each([
+      { cliId: 'dsh', field: 'botDefaults.agentTurnTimeout' },
+      { cliId: 'minimax', field: 'botDefaults.minimaxTurnBudget' },
+    ])(`finds the rendered $cliId budget field and preserves its deep link (${locale} UI)`, async ({ cliId, field }) => {
+      vi.stubGlobal('window', { localStorage: { getItem: () => null, setItem: () => {} } });
+      vi.stubGlobal('document', { documentElement: {}, addEventListener: () => {}, removeEventListener: () => {} });
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ models: [], profiles: [] }),
+      })));
+      ui.setLocale(locale);
+      let renderer: TestRenderer.ReactTestRenderer | undefined;
+      try {
+        await act(async () => {
+          renderer = TestRenderer.create(createElement(BotAgentSection, {
+            bot: { larkAppId: 'cli_budget_search', cliId, agentSelectionKey: cliId },
+            sessionFallback: cliId,
+            cliState: { options: [{ id: cliId, label: cliId }], ttadkModelDefault: '', ttadkModelSuggestions: [] },
+            patchBot: () => {},
+          }));
+        });
+        const label = renderer!.root.findByProps({ 'data-input': 'agentTurnTimeout' }).parent!
+          .findByProps({ className: 'bd-field-title-text' }).children.join('');
+        expect(label).toBe(createDashboardTranslator(locale)(field));
+        const items = buildBotDefaultsSectionItems();
+        const href = botDefaultsHref({ section: 'agent', field });
+        for (const query of [label, zh(field), en(field)]) {
+          expect(topItem(items, query)?.primary.href, query).toBe(href);
+        }
+        vi.stubGlobal('location', { hash: href });
+        expect(readBotDefaultsDeepLink()).toEqual({ tab: 'common', section: findBotDefaultsSection('agent'), field });
+      } finally {
+        if (renderer) act(() => renderer!.unmount());
+        ui.setLocale('zh');
+      }
+    });
+
     it(`finds the page, its categories and bots with ${locale} UI`, () => {
       vi.stubGlobal('window', { localStorage: { getItem: () => null, setItem: () => {} } });
       vi.stubGlobal('document', { documentElement: {} });

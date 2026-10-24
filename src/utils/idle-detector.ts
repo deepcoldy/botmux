@@ -508,6 +508,25 @@ export class IdleDetector {
     this.markIdle('external');
   }
 
+  /** The worker published prompt-ready on evidence of its own (the
+   *  first-prompt-timeout screen probe, a ready-gate settle, …) without this
+   *  detector having reported idle. Take that as this cycle's idle edge, minus
+   *  the callback the worker has just acted on, so the next explicit busy
+   *  marker is reported. Otherwise the edge stays disarmed until the detector
+   *  publishes an idle of its own — after the next turn — and that whole turn
+   *  reads as idle. No-op once this cycle already has its idle edge. */
+  adoptPromptReady(): void {
+    if (this.isIdle || this.busyTransitionArmed) return;
+    // An OSC 7501 working/blocked turn outranks a worker-side ready, as in
+    // fireIdle(): adopting it would mask the stale-working release and the
+    // busy edge that report must still produce.
+    if (this.programStatusAuthority && this.hasBusyProgramStatus()) return;
+    // The next feed() starts a fresh cycle from here (and drops the stale tail).
+    this.isIdle = true;
+    this.firstIdlePublished = true;
+    this.busyTransitionArmed = true;
+  }
+
   /** Read-only view of the current cycle's idle edge (no side effects). */
   isIdleNow(): boolean {
     return this.isIdle;

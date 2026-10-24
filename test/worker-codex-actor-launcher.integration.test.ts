@@ -12,6 +12,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveNodeExecutable, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
 const tmuxAvailable = process.platform === 'linux' && probeTmuxFunctional().ok;
@@ -164,11 +165,8 @@ exec '${node}' '${launcherScript}'
     ds.localProcessAttestation!.cliProcStart = 'stale';
     await expect(request()).resolves.toMatchObject({ ok: false, error: 'current_actor_unverified' });
   } finally {
-    if (worker && worker.exitCode === null && worker.signalCode === null) {
-      const exited = new Promise<void>(r => worker!.once('exit', () => r()));
-      worker.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (worker) await killProcessTree(worker);
     for (const pid of [peerPid, cliPids?.native, cliPids?.launcher]) {
       if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
     }

@@ -258,6 +258,8 @@ export const messages: Record<string, string> = {
   'card.adopt.field_time_live': '已运行',
   'card.adopt.field_time_resume': '最近活动',
   'card.adopt.field_target': '位置',
+  'card.adopt.location_with_workspace': '{workspace}（{target}）',
+  'card.adopt.untitled_live': '新会话',
   'card.adopt.selected_tag': '已选中',
   'card.adopt.hint_pick_first': '点击上方任意会话以选中，再点下方按钮确认接入。',
   'card.adopt.btn_confirm_live': '确认接管到本话题',

@@ -9,6 +9,7 @@ import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
@@ -2885,7 +2886,8 @@ export interface AdoptPickerEntry {
   /** resume: the CLI's native title when the transcript has one, else the
    *  first real user prompt (see ResumableSession.title); live: backend /
    *  CLI display name (herdr pane label / Claude terminal title / TraeX native
-   *  title, see AdoptableSession.title and ZellijAdoptableSession.title) or the
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title; herdr
+   *  entries whose tab was found are named after it, see herdrTabTitle) or the
    *  Orca terminal title, else project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
@@ -2896,6 +2898,10 @@ export interface AdoptPickerEntry {
   sessionId?: string;
   /** live: tmux/zellij/herdr target label. */
   target?: string;
+  /** live herdr: workspace name shown ahead of `target` on the Location line. */
+  targetWorkspace?: string;
+  /** Search-only text, never rendered (live herdr: workspace and tab names). */
+  searchAliases?: string[];
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
   /** One-based position among history candidates, for same-screen disambiguation. */
@@ -2927,6 +2933,25 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | Orca
   return `live:${adoptTargetKey(s)}`;
 }
 
+/** Title of a live herdr entry named after its tab. Alone in the tab: pane
+ *  label > the tab's given name > native title (Claude: terminal title, else
+ *  first prompt) > the tab's default name. Sharing the tab with other entries
+ *  of this card: `<tab> · <pane label | native title | untitled>`. Undefined
+ *  unless the picker's enrichment found the tab; the caller then keeps the
+ *  discovery title exactly as before. */
+function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string): string | undefined {
+  if (s.source !== 'herdr' || !s.herdrTabLabel || s.herdrTabAutoNamed === undefined) return undefined;
+  const groupKey = herdrTabGroupKey(s);
+  const native = s.herdrNativeTitle ?? s.herdrFirstPrompt;
+  if ((groupKey ? tabGroups.get(groupKey) ?? 0 : 0) > 1) {
+    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? untitled);
+  }
+  return s.herdrPaneLabel
+    ?? (s.herdrTabAutoNamed ? undefined : s.herdrTabLabel)
+    ?? native
+    ?? s.herdrTabLabel;
+}
+
 /** Fold both adopt sources into one uniform entry list. Live entries come
  *  first (they're the "act now" targets), resume entries after. Order is
  *  stable so pagination is deterministic across re-renders.
@@ -2940,8 +2965,11 @@ export function buildAdoptEntries(
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
+  locale?: Locale,
 ): AdoptPickerEntry[] {
   const customName = runtimeDisplayName?.trim();
+  const tabGroups = countHerdrTabGroups(sessions);
+  const untitledLive = t('card.adopt.untitled_live', undefined, locale);
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
@@ -2952,6 +2980,12 @@ export function buildAdoptEntries(
     if (isOrcaAdoptCandidate(s)) target = undefined;
     else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
     else target = adoptTargetLabel(s);
+    // Only herdr / tmux entries carry herdr names; zellij and Orca never do.
+    const herdrLike = isOrcaAdoptCandidate(s) || zellij ? undefined : s;
+    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive) : undefined;
+    const workspace = herdrLike?.herdrWorkspaceLabel;
+    const tabName = herdrLike?.herdrTabAutoNamed !== undefined ? herdrLike.herdrTabLabel : undefined;
+    const aliases = [workspace, tabName].filter((a): a is string => !!a);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
@@ -2960,11 +2994,13 @@ export function buildAdoptEntries(
         : zellij ? 'Zellij' : s.source === 'herdr' ? 'Herdr' : 'tmux',
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title,
+      title: tabTitle ?? title,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
       target,
+      ...(workspace ? { targetWorkspace: workspace } : {}),
+      ...(aliases.length > 0 ? { searchAliases: aliases } : {}),
       timeMs: s.startedAt,
     };
   });
@@ -2995,14 +3031,15 @@ export interface AdoptPickerState {
 const ADOPT_PICKER_PAGE_SIZE = 5;
 const ADOPT_SEARCH_FIELD = 'adopt_search_q';
 
-/** Case-insensitive substring over title / project / cwd / cliId / sessionId.
- *  Empty query matches everything. Includes sessionId so a user who knows the
- *  id can type it and jump straight to the entry. */
+/** Case-insensitive substring over title / project / cwd / cliId / sessionId /
+ *  target and the search-only aliases (herdr workspace / tab names, which the
+ *  title may not show). Empty query matches everything. Includes sessionId so a
+ *  user who knows the id can type it and jump straight to the entry. */
 function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefined): AdoptPickerEntry[] {
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target]
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target, ...(e.searchAliases ?? [])]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -3030,7 +3067,7 @@ export function buildAdoptSelectCard(
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName, locale);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;
@@ -3133,7 +3170,12 @@ export function buildAdoptSelectCard(
       `${labelDir}: ${inlineCode(e.cwd)}`,
     ];
     if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
-    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: ${inlineCode(e.target)}`);
+    if (e.kind === 'live' && e.target) {
+      const target = inlineCode(e.target);
+      lines.push(`${labelTarget}: ${e.targetWorkspace
+        ? t('card.adopt.location_with_workspace', { workspace: escapeMd(e.targetWorkspace), target }, locale)
+        : target}`);
+    }
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
       tag: 'interactive_container',

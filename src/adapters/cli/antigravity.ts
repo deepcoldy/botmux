@@ -289,7 +289,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
       return path && existsSync(path) ? path : undefined;
     },
   },
-  spawn: { sessionId: 'cli', baseline: 'birth-aware', zeroPromptOnly: true },
+  spawn: { sessionId: 'cli', baseline: 'birth-aware' },
 };
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {

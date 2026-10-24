@@ -45,6 +45,7 @@ import {
   type CodexAppSignedControlMarker,
 } from '../src/utils/codex-app-control.js';
 import type { CodexAppTurnInput } from '../src/types.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 const RUNNER_PATH = resolve('src/codex-app-runner.ts');
 const FAKE_SERVER_FIXTURE = resolve('test/fixtures/fake-codex-app-server.mjs');
@@ -561,8 +562,7 @@ async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
 }
 
 function readRequests(logPath: string): Array<Record<string, any>> {
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  return readJsonLines(logPath);
 }
 
 async function exerciseRunner(opts: {
@@ -685,6 +685,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const http = createHttpServer((req, res) => {
         let raw = ''; req.on('data', data => { raw += data; });
         req.on('end', () => { void (async () => {
+          // A loopback port-scanner probe (`GET /`, empty body) is not an ask.
+          if (raw.length === 0) { res.writeHead(400); res.end(); return; }
           const body = JSON.parse(raw); posts.push(body);
           const input = parseAskBody(body);
           if ('error' in input || !input.asyncUserInput) throw new Error('invalid async ask');
@@ -754,6 +756,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             await waitFor(harness, () => control.finals.length > 0);
             if (outcome === 'overlap') {
               expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
+              // The final came over the control socket; stdout has its own pipe.
+              await waitFor(harness, () => harness.stdout.includes('END EXAMPLE'));
               expect(harness.stdout.match(/END EXAMPLE/g)).toHaveLength(1);
             } else {
               expect(control.finals[0].content).toBe('Independent work completed');
@@ -858,7 +862,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
               expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
             } else {
               await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/interrupt'));
-              expect(harness.stdout).toContain('Codex user input failed');
+              // The runner prints this before it sends turn/interrupt, but the
+              // fake's request log is read straight off disk while stdout
+              // arrives over a pipe: seeing the interrupt does not mean the
+              // line has reached harness.stdout yet.
+              await waitFor(harness, () => harness.stdout.includes('Codex user input failed'));
               if (outcome === 'interrupt-error') {
                 await waitFor(harness, () => control.markers.some(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal'));
               } else {
