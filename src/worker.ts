@@ -90,9 +90,11 @@ import {
   restartInterruptionNotice,
   restartNoteInput,
   restartNoteMayPrefix,
+  shouldSuppressRestartInterruptionScan,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
+  type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
 import { saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
@@ -18837,7 +18839,7 @@ function resolveCliExtraArgs(): string[] {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string; restartCause?: 'traex-auto-model' } = {},
+  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
@@ -23125,10 +23127,12 @@ async function spawnCli(
   // This cause belongs only to this exact successful resume, never the stored
   // init config or a later crash/follow-up spawn. Keep any interruption saved
   // by an earlier genuine crash: deliverRestartInterruptionNote still owns it.
-  const plannedAutoModelResume = opts.restartCause === 'traex-auto-model'
-    && cfg.cliId === 'traex'
-    && opts.exactResumeSessionId !== undefined
-    && lastSpawnEffectiveCliSessionId === opts.exactResumeSessionId;
+  const plannedAutoModelResume = shouldSuppressRestartInterruptionScan({
+    restartCause: opts.restartCause,
+    cliId: cfg.cliId,
+    exactResumeSessionId: opts.exactResumeSessionId,
+    effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
+  });
   if (lastSpawnEffectiveResume && !actuallyReattachedPersistent && !cfg.adoptMode
     && !isCodexAppCliId(cfg.cliId) && !isRemoteBackendType(effectiveBackendType)
     && !plannedAutoModelResume) {
@@ -24652,7 +24656,7 @@ function stopOwnedSessionScope(reason: string): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: 'traex-auto-model' } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; exactResumeSessionId?: string; restartCause?: CliRestartCause } = {},
 ): Promise<void> {
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
