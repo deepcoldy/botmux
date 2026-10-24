@@ -223,6 +223,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 | `grantRequestToOwnerDm` | 默认关闭。设为 `true` 时，会话里没有管理员能点申请卡（群里查不到管理员，或私聊被挡）就把申请卡改发到主 owner 私聊，申请人只收到中性回执、处置结果回告原会话；有 owner 维度总量节流（每小时 20 张，发送失败不占名额），超限或发送失败时不发卡、下一条消息再重试。需 `autoGrantRequestCards` 未关闭。详见[权限与授权 · 授权申请卡](/permissions#授权申请卡) |
+| `trustSameOwnerBots` | 默认开启。管理员都是本 bot 管理员的同机 Bot（本机 `bots.json` 里的其它应用，按 union_id 识别）可以执行管理命令，@ 本 bot 时同一条消息里点名的人自动获得本群对话授权（额度 / 有效期同 `/grant` 默认值）。owner 不同的同机 Bot 不受影响。设为 `false` 时同机 Bot 只能对话。见 [权限与授权 · 同机 Bot](/permissions#同机-bot管理命令与点名授权-trustsameownerbots) |
 | `blockedUsers` | 黑名单（与 `allowedUsers` 同款标识：邮箱 / 手机号 / `on_xxx` / `ou_xxx`），sender 维度全局否决：群聊与私聊都生效，优先于 oncall / 整群放开 / 访客授权 / 团队信任等所有放行腿；被拉黑者被拦时不发授权申请卡。owner / 管理员不可被拉黑（写入口拒绝）。不影响消息监听器的监听匹配。也可在 Dashboard「Bot 配置」与群成员弹层维护。完整说明见[权限与授权 · 黑名单](/permissions#黑名单-blockedusers) |
 
 ## 文件沙盒

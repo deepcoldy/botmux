@@ -70,6 +70,7 @@ import {
 import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
+import { cliAvailabilityStatus, cliAvailabilityRevision, useCliAvailability } from './cli-availability.js';
 import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import type { RoleInjectMode } from './roles.js';
@@ -853,6 +854,7 @@ export function BotDefaultsPage() {
         bots={bots}
         cliState={cliState}
         patchBot={patchBot}
+        refreshBot={() => { void refresh(); }}
         brandEnabled={brandEnabled}
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -1006,6 +1008,7 @@ function BotDefaultsCard(props: {
   bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
+  refreshBot?(): void;
   brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
@@ -1198,7 +1201,7 @@ function BotDefaultsCard(props: {
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
-            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -1529,7 +1532,7 @@ function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow
   );
 }
 
-function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; refreshBot?(): void }) {
   const tr = useT();
   return (
     <section className="bd-section bd-runtime-env">
@@ -1541,7 +1544,8 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
           scope={{
             kind: 'bot',
             larkAppId: props.bot.larkAppId,
-            onPolicySaved: envPolicy => props.patchBot(props.bot.larkAppId, { envPolicy }),
+            onPolicySaved: envPolicy => { props.patchBot(props.bot.larkAppId, { envPolicy }); props.refreshBot?.(); },
+            onEnvSaved: props.refreshBot,
           }}
         />
       </div>
@@ -2495,6 +2499,7 @@ export function BotAgentSection(props: {
   ]);
 
   const option = selectedCliOption(cliState.options, cliKey);
+  const availabilityStatus = useCliAvailability(cliKey, option, bot.larkAppId, cliAvailabilityRevision(bot));
   const suggestions = modelSuggestionsForOption(option, cliState);
   const modelDisabledByCli = option?.gateway === 'ttadk' && option.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
@@ -3013,7 +3018,7 @@ export function BotAgentSection(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
-      label: option.available === false && !(option.id === 'codex' && usesAlternativeCodexExecutable)
+      label: (option.id === cliKey ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable' && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
     }));
@@ -3051,9 +3056,9 @@ export function BotAgentSection(props: {
             onChange={updateCli}
             notifyOnReselect
           />
-          {option?.available === false && !usesAlternativeCodexExecutable ? (
+          {availabilityStatus === 'unavailable' && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
-              {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
+              {tr('botDefaults.agentMissingHint', { command: option?.command ?? cliKey })}
             </small>
           ) : null}
         </div>
@@ -8554,6 +8559,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [ownerDm, setOwnerDm] = useState(props.bot.grantRequestToOwnerDm === true);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
+  const [trustSameOwner, setTrustSameOwner] = useState(props.bot.trustSameOwnerBots !== false);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
   const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
@@ -8581,6 +8587,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.p2pOpen]);
 
   useEffect(() => {
+    setTrustSameOwner(props.bot.trustSameOwnerBots !== false);
+  }, [props.bot.trustSameOwnerBots]);
+
+  useEffect(() => {
     const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
     setDuration(nextDuration);
     setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -8598,6 +8608,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       grantRequestToOwnerDm?: boolean;
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
+      trustSameOwnerBots?: boolean;
       grantDefaultDurationMs?: number | null;
       messageQuotaDefaultLimit?: number | null;
     },
@@ -8619,6 +8630,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         setOwnerDm(body.grantRequestToOwnerDm === true);
         setRestrict(body.restrictGrantCommands === true);
         setP2pOpen(body.p2pOpen === true);
+        setTrustSameOwner(body.trustSameOwnerBots !== false);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -8630,6 +8642,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           grantRequestToOwnerDm: body.grantRequestToOwnerDm === true,
           restrictGrantCommands: body.restrictGrantCommands === true,
           p2pOpen: body.p2pOpen === true,
+          trustSameOwnerBots: body.trustSameOwnerBots !== false,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
@@ -8763,6 +8776,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = p2pOpen;
             setP2pOpen(checked);
             void savePatch({ p2pOpen: checked }, 'p2pOpen', () => setP2pOpen(previous));
+          }}
+        />
+        <ToggleRow
+          checked={trustSameOwner}
+          disabled={busy !== null}
+          dataAction="toggle-trust-same-owner-bots"
+          title={tr('botDefaults.trustSameOwnerBots')}
+          help={tr('botDefaults.trustSameOwnerBotsHelp')}
+          onChange={checked => {
+            const previous = trustSameOwner;
+            setTrustSameOwner(checked);
+            void savePatch({ trustSameOwnerBots: checked }, 'trustSameOwner', () => setTrustSameOwner(previous));
           }}
         />
       </div>

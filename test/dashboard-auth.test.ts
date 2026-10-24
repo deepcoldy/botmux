@@ -1120,6 +1120,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/bots',
       '/api/skills',
       '/api/cli-options',
+      '/api/cli-options/availability',
       '/api/schedules/sched-1/logs',
       // Workflow projections contain user-authored goals and identifiers.
       '/api/v3/runs',

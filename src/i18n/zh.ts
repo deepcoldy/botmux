@@ -813,6 +813,7 @@ export const messages: Record<string, string> = {
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'config.label.p2pOpen': '私聊全开',
   'config.label.grantRequestToOwnerDm': '申请卡转投私聊',
+  'config.label.trustSameOwnerBots': '信任同 owner 的同机 Bot',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',
   'card.config.text_title': '✏️ {name} · 文本设置',

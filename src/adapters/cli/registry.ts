@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -121,6 +121,16 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
 
 const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
 
+function commandProbeArgv(sh: string, flags: string, cmd: string, useSetsid = true): string[] {
+  const args = [sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd];
+  return useSetsid && existsSync('/usr/bin/setsid') ? ['/usr/bin/setsid', '-w', ...args] : args;
+}
+
+function commandProbePath(stdout: string): string | undefined {
+  return stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    .reverse().find(line => isAbsolute(line));
+}
+
 /** macOS desktop apps bundle a standalone Codex binary even when `codex` is
  * not installed on PATH. ChatGPT is the current app name; keep the legacy
  * Codex.app locations so existing installations continue to work. */
@@ -142,7 +152,6 @@ export function resolveCommand(cmd: string): string {
   const shells = [shell, '/bin/zsh', '/bin/bash'].filter((v, i, a) => a.indexOf(v) === i);
   // `setsid` (util-linux) runs the probe in its own session with NO controlling
   // terminal. Absent on macOS — there the tty-free stdio below is the safeguard.
-  const setsidBin = existsSync('/usr/bin/setsid') ? '/usr/bin/setsid' : null;
   // -lc: login shell (sources .profile/.zprofile) — covers npm/nvm/fnm installs
   // -ic: interactive shell (sources .bashrc/.zshrc) — covers installers like opencode
   for (const flags of ['-lc', '-ic']) {
@@ -158,9 +167,7 @@ export function resolveCommand(cmd: string): string {
       // Without this, probing a CLI during `botmux setup` could silently
       // suspend setup (the reported "[1]+ Stopped" with no error). `-ic` is
       // kept so rc-only installs are still found.
-      const argv = setsidBin
-        ? [setsidBin, '-w', sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd]
-        : [sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd];
+      const argv = commandProbeArgv(sh, flags, cmd);
       const result = spawnSync(argv[0]!, argv.slice(1), {
         encoding: 'utf-8',
         timeout: 5_000,
@@ -170,8 +177,7 @@ export function resolveCommand(cmd: string): string {
       // the LAST absolute line — and only after a clean exit, so a failed
       // lookup can't let an echoed path-looking line masquerade as a result.
       if (result.status !== 0) continue;
-      const lines = (result.stdout ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-      const found = lines.reverse().find(line => isAbsolute(line));
+      const found = commandProbePath(result.stdout ?? '');
       if (found) return found;
     }
   }
@@ -181,6 +187,64 @@ export function resolveCommand(cmd: string): string {
     }
   }
   return cmd;
+}
+
+/**
+ * Dashboard probes use the same shells, lookup program and desktop fallback
+ * as the worker, without blocking the HTTP event loop. A timeout or broken
+ * shell is inconclusive, rather than evidence that a CLI is uninstalled.
+ */
+export async function resolveCommandAsync(
+  cmd: string,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<{ resolved: string; inconclusive: boolean }> {
+  if (isAbsolute(cmd)) return { resolved: cmd, inconclusive: false };
+  const env = opts.env ?? process.env;
+  const shells = [env.SHELL || '/bin/zsh', '/bin/zsh', '/bin/bash']
+    .filter((v, i, a) => a.indexOf(v) === i);
+  let inconclusive = false;
+  for (const flags of ['-lc', '-ic']) {
+    for (const sh of shells) {
+      // detached spawn already creates a new session on POSIX. Wrapping it
+      // in setsid again would fork out of the process group we reap below.
+      const argv = commandProbeArgv(sh, flags, cmd, false);
+      const result = await new Promise<{ stdout: string; status: number | null; failed: boolean }>(resolve => {
+        const child = spawn(argv[0]!, argv.slice(1), {
+          env, detached: true, stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        let stdout = '';
+        let settled = false;
+        const finish = (status: number | null, failed: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // Rc files can leave background children holding stdout open. Do not
+          // wait for their pipe EOF, and reap the isolated probe process group.
+          try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+          child.stdout?.destroy();
+          resolve({ stdout, status, failed });
+        };
+        const timer = setTimeout(() => finish(null, true), opts.timeoutMs ?? 5_000);
+        child.stdout?.setEncoding('utf8');
+        child.stdout?.on('data', (chunk: string) => {
+          stdout += chunk;
+          if (stdout.length > 64 * 1024) finish(null, true);
+        });
+        child.once('error', (err: NodeJS.ErrnoException) => finish(null, err.code !== 'ENOENT'));
+        child.once('close', status => finish(status, status === null || (status !== 0 && status !== 1 && status !== 127)));
+      });
+      inconclusive ||= result.failed;
+      if (result.status !== 0) continue;
+      const found = commandProbePath(result.stdout);
+      if (found) return { resolved: found, inconclusive: false };
+    }
+  }
+  if (process.platform === 'darwin' && cmd === 'codex') {
+    for (const candidate of macOSBundledCodexCandidates(env.HOME)) {
+      if (existsSync(candidate)) return { resolved: candidate, inconclusive: false };
+    }
+  }
+  return { resolved: cmd, inconclusive };
 }
 
 /**

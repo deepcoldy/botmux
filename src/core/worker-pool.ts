@@ -761,7 +761,7 @@ import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
-import { buildTerminalUrl } from './terminal-url.js';
+import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -1343,7 +1343,11 @@ function doneReactionEmojiFor(ds: DaemonSession): string {
 
 /** Worker lifecycle readiness is independent from Web Terminal availability.
  * Legacy/test sessions predate workerReady, so retain the old port inference
- * only while the explicit flag is absent. */
+ * only while the explicit flag is absent. A session restored after a daemon
+ * restart has no explicit flag either, and its persisted port outlives the
+ * worker that served it, so this also passes with no worker at all. Callers
+ * only re-render cached card state on that path; anything that needs a live
+ * worker checks `ds.worker` itself. */
 export function workerHasInitialized(ds: DaemonSession): boolean {
   return ds.workerReady === true
     || (ds.workerReady === undefined
@@ -1358,11 +1362,19 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
   return backendType === undefined || backendSupportsWebTerminal(backendType);
 }
 
-/** Empty means this session intentionally has no Web Terminal surface. */
+/** Empty means this session has no Web Terminal entry to offer.
+ *  Through the terminal proxy the link names only the session: the proxy routes
+ *  to the live worker or wakes one, so a session that has served a terminal
+ *  keeps its entry after a restart. A direct link embeds the port itself, and a
+ *  persisted port belongs to the current generation only while a worker exists
+ *  to listen on it (it is that worker's preferred port) — once restored without
+ *  one, it is the previous daemon's and nothing listens there. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
-  return sessionSupportsWebTerminal(ds) && (ds.workerPort ?? ds.session.webPort)
-    ? buildTerminalUrl(ds)
-    : '';
+  if (!sessionSupportsWebTerminal(ds)) return '';
+  const port = getTerminalProxyPort()
+    ? ds.workerPort ?? ds.session.webPort
+    : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
+  return port ? buildTerminalUrl(ds) : '';
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming

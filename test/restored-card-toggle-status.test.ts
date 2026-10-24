@@ -1,6 +1,6 @@
 /**
  * 「显示 / 隐藏输出」, 「刷新」 and the terminal keys re-render the streaming card
- * from cached daemon state.
+ * from cached daemon state — its status, and its Web Terminal link.
  *
  * `lastScreenStatus` lives only in memory: a session restored after a daemon
  * restart has none, and a worker that dies mid-turn leaves its last one behind.
@@ -8,7 +8,7 @@
  * back 「工作中」 and a 「⏹ 停止」 button — the restart-time reconcile has just
  * set that card to 「等待输入」, and the click used to undo it.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 const updateMessageMock = vi.fn(async (..._args: any[]) => {});
@@ -85,6 +85,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, sessionKey, type DaemonSession, type FrozenCard } from '../src/core/types.js';
 import { t } from '../src/i18n/index.js';
+import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const APP_ID = 'app_test';
 const ROOT_ID = 'om_root';
@@ -404,5 +405,48 @@ describe('historical cards with no worker', () => {
     expect(statusOf(result)).toBe(IDLE);
     expect(hasStopButton(result)).toBe(false);
     expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('Web Terminal link on a restored session', () => {
+  // A daemon shutdown leaves the last worker's port persisted (it is also the
+  // next fork's preferred listen port), so a restored session still carries it.
+  const PERSISTED_PORT = 31219;
+  const OPEN = label('card.btn.open_terminal');
+  const terminalLinkOf = (card: any): string | undefined =>
+    buttonsOf(card).find(b => b.text?.content === OPEN)?.multi_url?.url;
+  const restored = (overrides?: Partial<DaemonSession>): DaemonSession => {
+    const ds = makeRestoredDs(overrides);
+    Object.assign(ds.session, { backendType: 'tmux', webPort: PERSISTED_PORT });
+    return ds;
+  };
+
+  afterEach(() => resetTerminalProxy());
+
+  it('direct link: no link to the previous daemon\'s port, which stays persisted', async () => {
+    const ds = restored();
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`:${PERSISTED_PORT}`);
+    expect(ds.session.webPort).toBe(PERSISTED_PORT);
+  });
+
+  it('through the terminal proxy: keeps the session link, which wakes a worker', async () => {
+    setTerminalProxyPort(17_700);
+    const ds = restored();
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(`:17700/s/${ds.session.sessionId}`);
+  });
+
+  it('direct link with a running worker points at its port', async () => {
+    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001, lastScreenStatus: 'idle' });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(':40001');
+  });
+
+  it('direct link for a worker that has not reported its port yet uses the preferred one', async () => {
+    const ds = restored({ worker: makeFakeWorker() });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(`:${PERSISTED_PORT}`);
   });
 });

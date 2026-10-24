@@ -72,6 +72,15 @@ describe('SessionEnvEditor (bot scope)', () => {
     act(() => owner.unmount());
   });
 
+  it('notifies the Bot payload owner after a successful env save', async () => {
+    stubFetch(botView(true));
+    const onEnvSaved = vi.fn();
+    const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a', onEnvSaved } }));
+    await act(async () => { button(row(v, 'LANG'), 'remove-session-env')[0]!.props.onClick(); });
+    expect(onEnvSaved).toHaveBeenCalledOnce();
+    act(() => v.unmount());
+  });
+
   it('maps row actions to set-layer ops', async () => {
     const fetcher = stubFetch(botView(true));
     const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a' } }));

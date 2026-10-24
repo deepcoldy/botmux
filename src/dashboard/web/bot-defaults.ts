@@ -116,7 +116,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
       'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
-      'botDefaults.grantRequestToOwnerDm', 'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
+      'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDurationDefault',
+      'botDefaults.quotaDefault',
     ],
   },
   { id: 'blocked-users', tab: 'security', titleKey: 'blocked.sectionTitle' },
@@ -211,6 +212,7 @@ export type CliOption = {
   gateway?: 'ttadk';
   acceptsModel?: boolean;
   available?: boolean;
+  availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
@@ -266,6 +268,7 @@ export type BotSubstituteMode = {
 };
 
 export type BotDefaultsRow = {
+  envRevision?: string;
   larkAppId: string;
   botName?: string;
   cliId?: string;
@@ -454,6 +457,7 @@ export type BotDefaultsRow = {
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
   grantRequestToOwnerDm?: boolean;
+  trustSameOwnerBots?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;
