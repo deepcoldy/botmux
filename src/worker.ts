@@ -286,6 +286,7 @@ import { buildPlatformDashboardLoginUrl } from './core/dashboard-url.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import { InputTurnDeduper } from './core/input-turn-dedupe.js';
+import { isOrdinaryImTurnId } from './core/ordinary-im-turn.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -407,6 +408,7 @@ import { delay } from './utils/timing.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
+import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
@@ -418,6 +420,7 @@ import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { detectCliStartupBlocker, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
@@ -3269,6 +3272,168 @@ const FIRST_PROMPT_HARD_TIMEOUT_MS = CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS;
  *  by FIRST_PROMPT_HARD_TIMEOUT_MS, so the hold stays observable but can never
  *  outlive the first-prompt budget. */
 const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
+
+// ─── Startup blockers (folder trust / sign-in / update dialogs) ─────────────
+/** How long a visibly blocked startup keeps re-probing its screen and keeps
+ *  structured pre-start leases alive. The dialog waits for a human; once it is
+ *  answered the CLI continues on its own, so holding beats concluding the turn
+ *  was lost — but not without bound. 30 min: the notice reaches the thread
+ *  within seconds and a person who reacts to it at all does so well inside
+ *  that; past it the turn is reported as not started instead of held forever
+ *  (the queued input itself stays held — it is never typed into the dialog). */
+const STARTUP_BLOCKER_HOLD_MAX_MS = 30 * 60_000;
+/** Same cadence as the startup-banner recheck (FIRST_PROMPT_STARTUP_RECHECK_MS):
+ *  one viewport capture every 5s while blocked. */
+const STARTUP_BLOCKER_RECHECK_MS = FIRST_PROMPT_STARTUP_RECHECK_MS;
+/** promptReadyEdges when the current CLI process was freshly started; -1 for
+ *  a warm reattach, whose CLI was already past its startup screens. */
+let promptReadyEdgesAtFreshCliStart = -1;
+
+/** The current CLI was freshly started by Botmux and has shown no prompt-ready
+ *  evidence since — not even a rejected one. Outlives `awaitingFirstPrompt`,
+ *  which the hard-cap timeout clears whether or not the CLI ever came up. */
+function freshCliNeverReady(): boolean {
+  return !isPromptReady
+    && promptReadyEdgesAtFreshCliStart === promptReadyEdges
+    && structuredRejectedReadyEvidenceGeneration === undefined
+    && !lastInitConfig?.adoptMode;
+}
+
+/** Last blocker seen in THIS CLI generation before it was ever input-ready. */
+let startupBlocker: {
+  generation: number;
+  blocker: CliStartupBlocker;
+  visible: boolean;
+  notifiedKeys: Set<string>;
+} | null = null;
+
+function startupUpgradeHint(): string {
+  const upgrade = lastInitConfig?.cliUpgrade;
+  return upgrade
+    ? t('worker.startup_upgrade_hint', { cliName: cliName(), from: upgrade.from, to: upgrade.to })
+    : '';
+}
+
+function startupBlockerLabel(blocker: CliStartupBlocker): string {
+  return t(`worker.startup_blocker_label.${blocker.kind}`);
+}
+
+function startupBlockerNotice(blocker: CliStartupBlocker): string {
+  return t(`worker.startup_blocked.${blocker.kind}`, {
+    cliName: cliName(),
+    folder: blocker.folder ?? lastInitConfig?.workingDir ?? '',
+    upgrade: startupUpgradeHint(),
+  });
+}
+
+/** Read the authoritative viewport for a known startup blocker while this CLI
+ *  generation has never been input-ready; tell the thread once per distinct
+ *  blocker. Returns the blocker currently on screen, or null. Botmux-owned
+ *  local spawns only: an adopted pane belongs to the user, and remote backends
+ *  have no local viewport. */
+function probeStartupBlocker(source: string): CliStartupBlocker | null {
+  const be = backend;
+  if (!be || !lastInitConfig || !freshCliNeverReady()) return null;
+  if (isRemoteBackendType(lastInitConfig.backendType)) return null;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return null;
+  let screen = '';
+  try { screen = captureBackendScreen(be); } catch { return null; }
+  const blocker = detectCliStartupBlocker(screen);
+  const current = startupBlocker?.generation === cliSpawnGeneration ? startupBlocker : null;
+  if (!blocker) {
+    if (current) current.visible = false;
+    return null;
+  }
+  const state = current ?? { generation: cliSpawnGeneration, blocker, visible: true, notifiedKeys: new Set<string>() };
+  state.blocker = blocker;
+  state.visible = true;
+  startupBlocker = state;
+  const key = startupBlockerKey(blocker);
+  if (!state.notifiedKeys.has(key)) {
+    state.notifiedKeys.add(key);
+    log(`${source}: ${cliName()} startup is blocked on ${blocker.kind} (${blocker.rule})${blocker.folder ? ` for ${blocker.folder}` : ''}; holding queued input`);
+    // An explicit "do not trust" was already explained at spawn; the dialog it
+    // causes is the same story, so do not tell it twice.
+    const alreadyExplained = blocker.kind === 'folder_trust'
+      && reportedUntrustedWorkspaces.has(blocker.folder ?? lastInitConfig.workingDir);
+    if (!alreadyExplained) {
+      send({ type: 'user_notify', message: startupBlockerNotice(blocker), turnId: currentBotmuxTurnId });
+    }
+  }
+  return blocker;
+}
+
+/** A startup blocker is on screen right now in this CLI generation. */
+function startupBlockerVisibleNow(): boolean {
+  return startupBlocker?.generation === cliSpawnGeneration && startupBlocker.visible;
+}
+
+/** While a recognized startup blocker (trust / sign-in / update dialog) is on
+ *  screen, the CLI provably has not read its queued turn, so an unstarted
+ *  structured head is no evidence of a lost turn. Keep its pre-start lease
+ *  alive instead of concluding "the transcript never showed this turn" 20s
+ *  after spawn; once someone answers, the CLI starts the turn by itself and the
+ *  bridge collects it as usual. Bounded from each head's mark. Only on positive
+ *  evidence: a CLI that merely looks slow (or, like Pi, draws its composer
+ *  before consuming the argv prompt) keeps the normal lease. */
+function holdStructuredStartLeasesWhileCliStarting(): void {
+  if (!freshCliNeverReady() || !startupBlockerVisibleNow()) return;
+  codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), STARTUP_BLOCKER_HOLD_MAX_MS);
+}
+
+/** Notice for a structured turn dropped before it ever started. Behind a
+ *  recognized startup blocker the honest message is "not started", not "sent
+ *  but missing from the transcript"; a first turn that stalled right after a
+ *  CLI upgrade says so. */
+function uncollectedStructuredTurnNotice(): string {
+  const blocked = freshCliNeverReady() && startupBlocker?.generation === cliSpawnGeneration
+    ? startupBlocker.blocker
+    : null;
+  if (blocked) {
+    return t('worker.structured_turn_not_started_blocked', { cliName: cliName(), blocker: startupBlockerLabel(blocked) });
+  }
+  const firstTurnOfFreshStart = promptReadyEdges === promptReadyEdgesAtFreshCliStart && !lastInitConfig?.adoptMode;
+  return t('worker.structured_turn_not_collected', { cliName: cliName() })
+    + (firstTurnOfFreshStart ? startupUpgradeHint() : '');
+}
+
+/** Folders whose explicit "do not trust" this worker already reported. */
+const reportedUntrustedWorkspaces = new Set<string>();
+
+/** Pre-answer the CLI's own folder-trust question before a Botmux-owned
+ *  fresh/resume spawn (see CliAdapter.ensureWorkspaceTrust). Never throws. */
+async function preTrustCliWorkspace(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adapter: CliAdapter,
+): Promise<void> {
+  if (cfg.adoptMode || !adapter.ensureWorkspaceTrust || isRemoteBackendType(cfg.backendType)) return;
+  const tag = `[${adapter.id}-trust]`;
+  try {
+    const outcome = await adapter.ensureWorkspaceTrust(cfg.workingDir);
+    const where = outcome.folder === cfg.workingDir ? outcome.folder : `${outcome.folder} (cwd ${cfg.workingDir})`;
+    if (outcome.status === 'trusted') {
+      log(`${tag} Pre-accepted folder trust for ${where} in ${outcome.storePath}`);
+    } else if (outcome.status === 'explicitly-untrusted') {
+      log(`${tag} ${where} is explicitly untrusted in ${outcome.storePath}; leaving it as is`);
+      if (!reportedUntrustedWorkspaces.has(outcome.folder)) {
+        reportedUntrustedWorkspaces.add(outcome.folder);
+        send({
+          type: 'user_notify',
+          message: t('worker.workspace_trust_explicitly_denied', {
+            cliName: cliName(),
+            folder: outcome.folder,
+            store: outcome.storePath ?? '',
+          }),
+          turnId: currentBotmuxTurnId,
+        });
+      }
+    } else if (outcome.status === 'skipped') {
+      log(`${tag} pre-trust skipped for ${where}: ${outcome.reason ?? 'unknown reason'}`);
+    }
+  } catch (err: any) {
+    log(`${tag} pre-trust failed (ignored): ${err?.message ?? err}`);
+  }
+}
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
@@ -11198,7 +11363,7 @@ function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): v
     log(`Structured bridge could not collect turn ${turn.turnId}: no transcript start before the pre-start lease expired; notifying the thread`);
     send({
       type: 'user_notify',
-      message: t('worker.structured_turn_not_collected', { cliName: cliName() }),
+      message: uncollectedStructuredTurnNotice(),
       turnId: turn.turnId,
     });
   }
@@ -11210,6 +11375,7 @@ function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): v
  *  methods must never do this mutation invisibly: every removal funnels
  *  through this helper and drains ready output in the same call stack. */
 function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
+  holdStructuredStartLeasesWhileCliStarting();
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
   const dropped = pruneExpiredPreStartHeadsAndEmit(
@@ -18670,11 +18836,18 @@ function viewportShowsIdlePrompt(be: SessionBackend): boolean {
   }
 }
 
+/** 构造 CLI 进程存活探针：worker 持有的 pane 子进程（spawn 时同步绑定的
+ * cliPid，或 tmux pane 的实时子进程）。拿不到 pid 时返回 undefined，让适配
+ * 器回退到自身的状态库时效窗口。实现见 adapters/cli/backend-liveness.ts。 */
+function cliProcessAliveProbe(be: SessionBackend): () => boolean | undefined {
+  return () => cliProcessAliveFromBackend(be);
+}
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
+    isCliProcessAlive: cliProcessAliveProbe(be),
     getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
       ? () => captureBackendScreen(be) : undefined,
   })) {
@@ -18706,6 +18879,7 @@ function probeBusyPatternIdle(
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
+    isCliProcessAlive: cliProcessAliveProbe(be),
     getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
       ? () => captureBackendScreen(be) : undefined,
   })) {
@@ -20642,8 +20816,12 @@ async function spawnCli(
     mcpRuntimeManifest = opts.pluginGenerationPrepared
       ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
       : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter, !!opts.exactResumeSessionId);
+    // A fresh/resumed process re-reads the CLI's trust store at startup; a warm
+    // reattach is already past its trust question.
+    await preTrustCliWorkspace(cfg, cliAdapter);
   }
   if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  promptReadyEdgesAtFreshCliStart = willReattachPersistent ? -1 : promptReadyEdges;
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -24284,8 +24462,27 @@ async function spawnCli(
   // content written *after* this point appears in the card.
   const firstPromptBackend = backend;
   let requestedAidenResumeRedraw = false;
+  // A trust / sign-in / update dialog is waiting for a human. Never force the
+  // queue into it (pasted text can even answer it: Grok's trust dialog takes a
+  // bare `y` / `n`), tell the thread what is actually wrong, and keep
+  // re-checking so the normal timeout logic resumes once someone answers it in
+  // the Web terminal. One re-check chain at a time.
+  let startupBlockerRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+  const holdFirstPromptForStartupBlocker = (elapsedMs: number, forced: boolean): boolean => {
+    if (!probeStartupBlocker('First prompt timeout')) return false;
+    if (!startupBlockerRecheckTimer && elapsedMs < STARTUP_BLOCKER_HOLD_MAX_MS) {
+      const nextElapsedMs = elapsedMs + STARTUP_BLOCKER_RECHECK_MS;
+      startupBlockerRecheckTimer = setTimeout(() => {
+        startupBlockerRecheckTimer = null;
+        releaseFirstPromptTimeout(nextElapsedMs, forced || nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS);
+      }, STARTUP_BLOCKER_RECHECK_MS);
+      startupBlockerRecheckTimer.unref?.();
+    }
+    return true;
+  };
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    if (holdFirstPromptForStartupBlocker(elapsedMs, forced)) return;
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
     // normal idle detection and flushes it without replaying a pasted draft.
@@ -24329,7 +24526,7 @@ async function spawnCli(
         startupTimer.unref?.();
       } else {
         log(`WARN First prompt hard timeout — ${cliName()} startup readiness unconfirmed; keeping ${pendingMessages.length} input(s) queued`);
-        send({ type: 'user_notify', message: `${cliName()} 启动超过 90 秒仍未确认就绪；消息已保留在队列中，尚未提交。请检查终端中的加载状态或待处理对话框。`, turnId: currentBotmuxTurnId });
+        send({ type: 'user_notify', message: `${cliName()} 启动超过 90 秒仍未确认就绪${startupUpgradeHint()}；消息已保留在队列中，尚未提交。请检查终端中的加载状态或待处理对话框。`, turnId: currentBotmuxTurnId });
       }
       return;
     }
@@ -27484,7 +27681,9 @@ process.on('message', async (raw: unknown) => {
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined
         && !!msg.prompt
-        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
+        // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
+        // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
+        && isOrdinaryImTurnId(msg.turnId)
         ? msg.turnId
         : undefined;
       if (lastInitConfig) {
@@ -28031,7 +28230,9 @@ process.on('message', async (raw: unknown) => {
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       const ordinaryImTurnId = !messageAdoptMode
         && msg.dispatchAttempt === undefined
-        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
+        // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
+        // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
+        && isOrdinaryImTurnId(msg.turnId)
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {

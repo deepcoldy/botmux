@@ -108,6 +108,7 @@ import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from '
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
@@ -178,8 +179,9 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js';
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
-import { checkCliAvailability } from './setup/cli-availability.js';
+import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -4287,6 +4289,21 @@ const server = createServer(async (req, res) => {
       workbenchIdentity: workbenchOnlyIdentity,
     });
 
+    // 决策看板事项链接的路径入口（飞书侧栏 AppLink 指向它）。只做跳转、不返回数据，所以放在
+    // 401 之前：已登录 → SPA 的 #/board/...；未登录且配了 H5 免登 → 先走飞书免登再回到这里；
+    // 其余交给 SPA 的登录层。用路径不用 #，是因为平台冷访问 SSO 只把 pathname+search 带进 next。
+    const boardEntry = req.method === 'GET' || req.method === 'HEAD'
+      ? decisionBoardEntryRedirect(url.pathname, {
+        signedIn: decisionBoardAccess(requestIdentity, canManageHost),
+        h5: dashboardH5AuthConfig,
+      })
+      : null;
+    if (boardEntry) {
+      res.writeHead(302, { location: boardEntry, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -5776,6 +5793,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── 决策看板（管家 bot 的 daemon 是唯一写入方）──────────────────────────────
+    if (await handleDecisionBoardApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      proxyToDaemon,
+      readJsonBody,
+      bots: () => {
+        const online = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+        return monitorBotConfigs().map(cfg => ({
+          larkAppId: cfg.larkAppId,
+          botName: online.get(cfg.larkAppId) || cfg.displayName || cfg.larkAppId,
+          ...(cfg.steward ? { steward: cfg.steward } : {}),
+          online: online.has(cfg.larkAppId),
+        }));
+      },
+    })) {
+      return;
+    }
+
     // ─── Agent 配置模板（agents.json）─────────────────────────────────────────
     // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；写操作在 handler 内另要 canManageHost。
     if (await handleAgentProfilesApi(req, res, url, {
@@ -5824,11 +5860,11 @@ const server = createServer(async (req, res) => {
           // Keep the all-options scan shell-free so opening the form remains
           // instant even when most of the 20+ CLIs are absent. The selected
           // option is checked again with shell/rc resolution on submit/save.
-          const availability = checkCliAvailability({
+          const availability = preliminaryCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
-          }, { shellFallback: false });
+          });
           // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
           // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
@@ -5842,6 +5878,7 @@ const server = createServer(async (req, res) => {
             id: o.key,
             label: o.label,
             available: availability.available,
+            availabilityStatus: availability.status,
             command: availability.command,
             availabilityReason: availability.reason,
             ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
@@ -5861,6 +5898,22 @@ const server = createServer(async (req, res) => {
         // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
         ...(webSession ? { webSession } : {}),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/availability') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const appId = url.searchParams.get('bot')?.trim();
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId) : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      return jsonRes(res, response.statusCode, response.body);
     }
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），

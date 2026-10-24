@@ -677,6 +677,8 @@ async function readCode(req: IncomingMessage): Promise<{ code: string; resultOnl
 
 export function safeDashboardH5ReturnTo(value: string | null | undefined): string {
   if (!value || value.length > 1_024) return '/';
+  // 决策看板事项链接（飞书侧栏 AppLink → /board/<app>/<seq> → 免登 → 回到这里）。
+  if (/^\/board\/[A-Za-z0-9_-]{1,64}\/\d{1,9}$/.test(value)) return value;
   if (/^\/plugin-result-access\/[A-Za-z0-9_-]{20,256}$/.test(value)
     || /^\/plugin-results\/[A-Za-z0-9_-]{20,256}$/.test(value)) return value;
   if (!value.startsWith('/#/agent-workbench')) return '/';

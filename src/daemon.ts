@@ -1,5 +1,10 @@
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
-import { isCurrentBotInChat } from './im/lark/client.js';
+import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
+import { DecisionBoardService } from './core/decision-board/service.js';
+import { resolveDashboardOrigin } from './core/workbench-link.js';
+import { getAttachmentsDir } from './core/attachment-path.js';
+import { scheduleTimeZone } from './utils/timezone.js';
 import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-policy.js';
 import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
@@ -89,6 +94,7 @@ import {
   getAllBots,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
+  getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
@@ -442,7 +448,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -484,6 +490,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
+import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
@@ -509,6 +516,7 @@ import {
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
+  deliverOwnerBatchTurn,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -781,6 +789,37 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   if (!desc || desc.larkAppId !== larkAppId) return;
   desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+}
+
+/**
+ * 每个 bot 发布自己管理员的 union_id，供同机兄弟 bot 判断「是不是同一个 owner」（见
+ * services/bot-admin-unions-store.ts）。ou_ → union_id 必须用签发它的应用凭证，所以只发
+ * 本 bot 自己的。启动时 allowedUsers 解析完才登记；之后心跳里顺带 publish，解析结果
+ * （含 /botconfig、Dashboard 改 owner、解析重试）变了才重算，没变不打 API。
+ */
+const adminUnionsPublishers = new Map<string, { publish: () => Promise<void> }>();
+
+function startAdminUnionsPublisher(larkAppId: string): void {
+  const publisher = createBotAdminUnionsPublisher({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    readState: () => {
+      try {
+        const bot = getBot(larkAppId);
+        return { rawAllowedUsers: bot.config.allowedUsers ?? [], resolution: bot.rawAllowedUserResolution };
+      } catch {
+        return undefined;
+      }
+    },
+    lookupUnion: async (openId) => {
+      const r = await resolveUnionIdFromOpenIdStrict(larkAppId, openId);
+      if (r.status === 'resolved') return r.unionId;
+      return r.status === 'unavailable' ? null : undefined;
+    },
+    onError: err => logger.warn(`[${larkAppId}] publish admin union_ids failed: ${err instanceof Error ? err.message : String(err)}`),
+  });
+  adminUnionsPublishers.set(larkAppId, publisher);
+  void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
@@ -5326,10 +5365,17 @@ function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
     const oldVersion = cached?.version;
     cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
     setCurrentCliVersion(newVersion, key);
+    // Persisted so an upgrade that happened while the daemon was down is still
+    // known as one (startup-stall notices quote it).
+    const record = noteObservedCliVersion(key, newVersion, { nowMs: now });
 
     if (oldVersion && oldVersion !== newVersion) {
       logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
       return true;
+    }
+    if (!oldVersion && record?.previousVersion && record.changedAtMs === now) {
+      logger.info(`CLI version changed since last seen: ${record.previousVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
+      return false;
     }
 
     logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
@@ -30318,6 +30364,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then(() => undefined);
     },
     onQueuedActivationSubmitted,
+    // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
+    // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
+    onBoardTurnDeliveryFailed(ds, context) {
+      if (ds.larkAppId !== cfg.larkAppId) return;
+      try {
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+      } catch (err) {
+        logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
     async onOrdinaryImInputRejected(ds, context) {
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
@@ -30892,6 +30948,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     claimOccupancy();
+    for (const publisher of adminUnionsPublishers.values()) void publisher.publish();
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -31119,6 +31176,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     }
+    if (!cfg.apiOnly) startAdminUnionsPublisher(cfg.larkAppId);
 
     // Resolve blockedUsers 黑名单（P1c）。复用 allowedUsers 同一套解析器与同一
     // sidecar（retainKeys 取两侧并集，见 resolveCacheRetainKeys）。与 allowed 块的
@@ -32200,6 +32258,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
+
+  // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。
+  const decisionBoard = new DecisionBoardService({
+    dataDir: config.session.dataDir,
+    larkAppId: () => cfg.larkAppId,
+    steward: () => getBot(cfg.larkAppId).config.steward,
+    locale: () => localeForBot(cfg.larkAppId),
+    brand: () => getBotBrand(cfg.larkAppId),
+    dashboardOrigin: () => resolveDashboardOrigin(),
+    ownerOpenId: () => getOwnerOpenId(cfg.larkAppId),
+    ownerName: async () => {
+      const owner = getOwnerOpenId(cfg.larkAppId);
+      return owner ? (await resolveSender(cfg.larkAppId, owner, 'user'))?.name : undefined;
+    },
+    timeZone: () => scheduleTimeZone(),
+    batchAttachmentsDir: batchId => getAttachmentsDir(cfg.larkAppId, `board-${batchId}`),
+    banner: ({ batchId, count, locale }) => tr('decisionBoard.batch_banner', { id: batchId, count }, locale),
+    deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      banner: input.banner,
+      attachments: input.attachments,
+      ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+      ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+      sessionTitle: input.sessionTitle,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    })),
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  });
+  setDecisionBoardService(decisionBoard);
+  // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
+  setTimeout(() => {
+    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));
+  }, 30_000).unref?.();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity

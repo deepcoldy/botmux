@@ -1,6 +1,8 @@
 import { isAbsolute } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { locateOnPath, rawCliExecutable, resolveCommand } from '../adapters/cli/registry.js';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { locateOnPath, rawCliExecutable, resolveCommand, resolveCommandAsync } from '../adapters/cli/registry.js';
+import { locateExecutable } from '../utils/executable.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { parseWrapperCli } from './cli-selection.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
@@ -20,6 +22,15 @@ export interface CliAvailability {
   command?: string;
   resolvedPath?: string;
   reason?: string;
+}
+
+export type CliAvailabilityStatus = 'available' | 'unavailable' | 'unknown';
+export type CliAvailabilityProbe = CliAvailability & { status: CliAvailabilityStatus };
+
+/** A shell-free PATH miss is only preliminary, including Forge doctor. */
+export function preliminaryCliAvailability(input: CliAvailabilityInput): CliAvailabilityProbe {
+  const result = checkCliAvailability(input, { shellFallback: false });
+  return { ...result, status: result.available && input.cliLaunchMode !== 'forge-traex' ? 'available' : 'unknown' };
 }
 
 export function hasAgentLaunchConfigChanged(
@@ -47,12 +58,12 @@ export function hasAgentLaunchConfigChanged(
  *
  * Mira and Riff are API-backed and therefore have no local CLI requirement.
  */
-function requiredCommand(input: CliAvailabilityInput): string | undefined {
+function requiredCommand(input: CliAvailabilityInput, env: NodeJS.ProcessEnv = process.env): string | undefined {
   const wrapperBin = input.wrapperCli ? parseWrapperCli(input.wrapperCli)[0] : undefined;
   if (wrapperBin) return wrapperBin;
 
   if (input.cliId === 'riff' || input.cliId === 'mira') return undefined;
-  if (input.cliId === 'mir') return input.cliPathOverride?.trim() || process.env.MIRCLI_BIN?.trim() || 'mircli';
+  if (input.cliId === 'mir') return input.cliPathOverride?.trim() || env.MIRCLI_BIN?.trim() || 'mircli';
   return rawCliExecutable(input.cliId, input.cliPathOverride);
 }
 
@@ -137,6 +148,52 @@ export function checkCliAvailability(
   }
 
   return checkCommand(command, opts);
+}
+
+/** Complete, nonblocking selected-Agent probe. Never executes the CLI itself,
+ * except the existing Forge doctor readiness check. */
+export async function checkCliAvailabilityAsync(
+  input: CliAvailabilityInput,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number; shellFallback?: boolean } = {},
+): Promise<CliAvailabilityProbe> {
+  const env = opts.env ?? process.env;
+  const check = async (command: string | undefined): Promise<CliAvailabilityProbe> => {
+    if (!command) return { available: true, localExecutableRequired: false, status: 'available' };
+    let found = locateExecutable(command, env);
+    let inconclusive = false;
+    if (!found && opts.shellFallback !== false) {
+      const resolved = await resolveCommandAsync(command, { env, timeoutMs: opts.timeoutMs });
+      found = locateExecutable(resolved.resolved, env);
+      inconclusive = resolved.inconclusive;
+    }
+    return found
+      ? { available: true, localExecutableRequired: true, command, resolvedPath: found, status: 'available' }
+      : {
+          available: false, localExecutableRequired: true, command,
+          status: inconclusive ? 'unknown' : 'unavailable',
+          reason: inconclusive ? 'CLI 检测未完成，请稍后重试' : `找不到可执行文件「${command}」`,
+        };
+  };
+  try {
+    if (input.cliLaunchMode !== 'forge-traex') return await check(requiredCommand(input, env));
+    if (input.cliId !== 'traex') {
+      return { available: false, localExecutableRequired: true, status: 'unavailable', reason: 'Forge x TraeX 只能用于 cliId "traex"' };
+    }
+    const traex = await check(requiredCommand({ cliId: 'traex' }, env));
+    if (!traex.available) return traex;
+    const forge = await check('forge');
+    if (!forge.available) return forge;
+    try {
+      await promisify(execFile)(forge.resolvedPath!, ['doctor'], {
+        env, timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024,
+      });
+      return forge;
+    } catch (err: any) {
+      return { ...forge, available: false, status: err?.killed ? 'unknown' : 'unavailable', reason: 'forge doctor 检查失败' };
+    }
+  } catch {
+    return { available: false, localExecutableRequired: true, status: 'unknown', reason: 'CLI 检测未完成，请稍后重试' };
+  }
 }
 
 export function cliUnavailableMessage(input: CliAvailabilityInput, displayName?: string): string | undefined {
