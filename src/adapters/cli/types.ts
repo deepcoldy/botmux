@@ -530,6 +530,11 @@ export interface CliAdapter {
      *  以 additionalContext 注入为该轮 system-reminder；缺 env/未命中时
      *  空输出 exit 0（fail-open）。 */
     readonly userPromptSubmitCommand?: string;
+    /** 可选：StopFailure hook 命令。
+     *  - claude-settings：写进全局 settings.json 的 hooks.StopFailure
+     *  Claude 只在回合因 API 错误结束时跑它（不跑 Stop），worker 据此兜底
+     *  transcript 没收口的失败回合；缺 env 时静默 exit 0。 */
+    readonly stopFailureCommand?: string;
   };
 
   /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask

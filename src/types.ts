@@ -1990,7 +1990,19 @@ type DaemonToWorkerBase =
   // 必须把 claim 与本进程当前回合、当前 dispatch 代际逐字比对，不一致（含缺代际）
   // 一律丢弃：宁可让这一轮晚一轮由别的证据收口，也不能把一个正忙的 CLI 判成空闲
   // （会提前写消息、提前翻卡片）。seq / pid 只用于诊断。
-  | { type: 'turn_idle'; turnId?: string; dispatchAttempt?: number; seq?: number; pid?: number };
+  | { type: 'turn_idle'; turnId?: string; dispatchAttempt?: number; seq?: number; pid?: number }
+  // Claude StopFailure：回合因 API 错误结束（这条路径不跑 Stop hook）。CLI hook 经
+  // `botmux __claude-stop-failure-v1` 调到 daemon，daemon 校验后转给 worker。
+  // turnId / dispatchAttempt 是上报者读到的 active-turn marker（claim，不是凭据）。
+  // report 须来自本会话的 Claude 进程；宽限期后若 transcript 没把这次失败呈现出来，
+  // worker 为仍无终态、且与 claim 逐字相符的当前回合补发终态，没有可收口的回合时
+  // 改发一条提示。
+  | {
+    type: 'claude_stop_failure';
+    report: import('./services/claude-stop-failure.js').ClaudeStopFailureReport;
+    turnId?: string;
+    dispatchAttempt?: number;
+  };
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
