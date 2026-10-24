@@ -129,7 +129,10 @@ describe('auto-model Worker admission and original-input retirement', () => {
       h.scope.flushPending = vi.fn(() => reset());
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
       loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
-      await vi.runOnlyPendingTimersAsync();
+      // advanceTimersToNextTimerAsync is available on both vitest and the
+      // bun:test shim (runOnlyPendingTimersAsync is not); here the rename
+      // timeout is the single pending timer, so they are equivalent.
+      await vi.advanceTimersToNextTimerAsync();
 
       expect(h.scope.flushPending).toHaveBeenCalledOnce();
       expect(h.controller.currentModel()).toBe('core');
