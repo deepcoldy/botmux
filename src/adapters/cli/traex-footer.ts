@@ -79,9 +79,10 @@ const EMPTY_COMPOSER_HINTS = new Set([
 ]);
 
 /**
- * Resume can paint a loading banner, then replace it with history and a fully
- * initialized composer without repainting the resolved banner cells. Only the
- * bottom input surface and its model/context footer can release that hold.
+ * Fresh 0.211 startup and resume can paint an initialized composer without
+ * the old model/directory banner. Only the bottom input surface and its
+ * model/context footer can prove initialization. Context — is the native
+ * empty-session footer before token usage exists.
  * The worker supplies an authoritative rendered viewport, never raw PTY bytes.
  */
 export function traexRestoredComposerReady(screen: string): boolean {
@@ -90,12 +91,19 @@ export function traexRestoredComposerReady(screen: string): boolean {
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
   if (composer < 0 || !EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
   const footer = rows.slice(composer + 1).filter(row => row.trim());
-  // TraeX 0.209/0.210: optional bottom rule, initialized model/context row,
+  // TraeX 0.209–0.211: optional bottom rule, initialized model/context row,
   // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
   if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
-  if (!/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context \d+% (?:left|used)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+  if (!/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+  // Only the model cell is initialization evidence; a cwd named "loading"
+  // in a later footer cell must not strand an otherwise initialized prompt.
+  if (/\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
   if (footer.length === 2 && !/^[ \t]*(?:☢ )?(?:Full Access|Read Only|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
+  // A login banner can be taller than the nearby live-status region. Inspect
+  // all rows above the composer for native login prompts, but do not treat
+  // a transcript sentence mentioning login as an active input owner.
+  if (rows.slice(0, composer).some(row => /^(?:Sign in\b|Press (?:enter|return) to open (?:the )?browser\b|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))) return false;
   // Check the live area above the composer, not stale quoted transcript rows.
   const live = rows.slice(Math.max(0, composer - 3), composer + 1).join('\n');
   return !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);

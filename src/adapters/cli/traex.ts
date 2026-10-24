@@ -580,6 +580,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // long near-miss chunks. Keep its glyphs aligned with the clear guard
     // in IdleDetector.
     readyPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Pre-#2247 shape of readyPattern: without the cursor-addressed rule arm.
+    // A match that only exists through the rule arm is tagged weak so the
+    // worker can demand the rendered composer predicate during first-prompt
+    // admission (a rule-joined ❯ can be a still-loading cell or a draft).
+    readyPatternStrong: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
     // Skeleton composer gate, same cells and regexes as Codex (fork). Real
     // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
     // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the

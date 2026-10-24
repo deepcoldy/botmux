@@ -100,6 +100,10 @@ export class IdleDetector {
   private staticBusyClearPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
+  /** Stricter readyPattern without the cursor-addressed rule arm. */
+  private readyPatternStrong: RegExp | undefined;
+  /** Whether the current ready evidence matches ONLY via a weak rule arm. */
+  private readyEvidenceWeak = false;
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
@@ -138,6 +142,7 @@ export class IdleDetector {
     this.staticBusyPattern = cli.staticBusyPattern;
     this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
+    this.readyPatternStrong = cli.readyPatternStrong;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
     this.startupResume = cli.startupResume;
@@ -181,6 +186,9 @@ export class IdleDetector {
     }
     if (this.isIdle || (this.readySeen && !recheckExisting)) return false;
     this.readySeen = true;
+    // Viewport-verified seeding (recheckExisting) has already passed the
+    // adapter's rendered composer predicate; it is never weak evidence.
+    if (recheckExisting) this.readyEvidenceWeak = false;
     this.clearTimer();
     this.quiescenceCheck();
     return true;
@@ -244,6 +252,7 @@ export class IdleDetector {
     );
     if (readyMatched) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
 
     // Pre-idle static-busy latch (capacity-queue screens).
@@ -338,6 +347,7 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.readyEvidenceWeak = false;
     this.staticBusyLatch = false;
     this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
@@ -720,7 +730,29 @@ export class IdleDetector {
       this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)
     )) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
+  }
+
+  /** Tag the latest ready match weak when it exists only through the
+   *  cursor-addressed rule arm (the strong sibling matches neither the
+   *  current chunk nor the rolling tail). Adapters without a declared strong
+   *  pattern always produce strong evidence. */
+  private tagReadyEvidence(stripped: string): void {
+    if (!this.readyPatternStrong) {
+      this.readyEvidenceWeak = false;
+      return;
+    }
+    const strong = this.readyPatternStrong.test(stripped)
+      || this.readyPatternStrong.test(this.outputTail);
+    this.readyEvidenceWeak = !strong;
+  }
+
+  /** True when the current ready evidence matched ONLY the weak rule-joined
+   *  arm. The worker requires a rendered-viewport composer check before
+   *  admitting a first prompt on weak traex evidence. */
+  isReadyEvidenceWeak(): boolean {
+    return this.readyEvidenceWeak;
   }
 
   private hasBusyProgramStatus(): boolean {

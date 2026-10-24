@@ -78,7 +78,7 @@ const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', c
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
 const workerSource = ts.createSourceFile('worker.ts', readFileSync('src/worker.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'markPromptReady'].map(name => {
+const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'traexFirstPromptViewportRejects', 'markPromptReady'].map(name => {
   const node = workerSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
   if (!node) throw new Error(`missing worker function ${name}`);
   return node.getText(workerSource);
@@ -89,7 +89,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
   const scope = {
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
-    idleDetector: { isStartupPending: () => false, reset: vi.fn() },
+    idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },
     remoteRunnerRecoveredTurnInFlight: false,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
@@ -102,6 +102,10 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
     releaseActiveTurnAuthority: release,
+    // These cases drive a turn already in flight, so the first prompt has been
+    // admitted; the traex viewport veto (covered by the startup integration
+    // suite) is inert here.
+    awaitingFirstPrompt: false,
   };
   const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
   try { run(); } catch (err) { if (err !== released) throw err; }
