@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { BoardError, DecisionBoardStore, decisionBoardDbPath, decisionBoardFilesDir } from '../src/services/decision-board-store.js';
 
 const APP = 'cli_steward';
@@ -102,6 +103,37 @@ describe('事项', () => {
       { kind: 'chat', ref: 'oc_abc' },
     ]);
     expect(store.events(APP, item.seq).filter(e => e.kind === 'link')).toHaveLength(2);
+  });
+
+  it('同毫秒写入的关联保持写入顺序（created_at 打平时不退回 kind 字母序）', () => {
+    // 显式钉同一毫秒：CLI 在一次动作里先 add 再 update 时两次 Date.now() 可能相同。
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }, undefined, 1000).item;
+    store.updateItem(APP, item.seq,
+      { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] },
+      undefined, 1000);
+    expect(store.links(APP, item.seq)).toEqual([
+      { kind: 'pr', ref: 'o/r#1', label: '主 PR' },
+      { kind: 'chat', ref: 'oc_abc' },
+    ]);
+    // 单次写入多条、同毫秒时也按数组给出的顺序，不按 kind 字母序。
+    const other = store.addItem(APP, {
+      title: 't2',
+      links: [{ kind: 'pr', ref: 'o/r#2' }, { kind: 'chat', ref: 'oc_def' }, { kind: 'doc', ref: 'https://x' }],
+    }, undefined, 2000).item;
+    expect(store.links(APP, other.seq).map(l => l.kind)).toEqual(['pr', 'chat', 'doc']);
+  });
+
+  it('更新已有关联的 label 不占用新序号（ord 无空洞，严格等于出现顺序）', () => {
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }).item;
+    // 同一次调用里：pr 是已有关联（只改 label），chat 是新关联——chat 必须拿到 ord 1 而不是 2。
+    store.updateItem(APP, item.seq, {
+      links: [{ kind: 'pr', ref: 'o/r#1', label: '新标签' }, { kind: 'chat', ref: 'oc_gap' }],
+    });
+    const raw = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    const ords = raw.prepare('SELECT kind, ord FROM board_links WHERE app_id = ? ORDER BY ord').all(APP);
+    raw.close();
+    expect(ords).toEqual([{ kind: 'pr', ord: 0 }, { kind: 'chat', ord: 1 }]);
+    expect(store.links(APP, item.seq).find(l => l.kind === 'pr')?.label).toBe('新标签');
   });
 });
 
@@ -278,5 +310,34 @@ describe('附件与批次投递状态', () => {
     store.close();
     store = DecisionBoardStore.open(dir);
     expect(store.listItems(APP, 'all')).toHaveLength(1);
+  });
+
+  it('v1 库重新打开时迁移到 v2：items 保留，links 表重建后可正常按顺序写入', () => {
+    decideItem();
+    store.close();
+    // 手工把库降成 v1 并换成无 ord 列的旧 links 表（开发机上唯一可能存在的旧形态）。
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.exec('DROP TABLE board_links;');
+    db.exec(`CREATE TABLE board_links (
+      app_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+      label TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, seq, kind, ref)
+    ) WITHOUT ROWID;`);
+    db.exec('PRAGMA user_version = 1;');
+    db.close();
+
+    store = DecisionBoardStore.open(dir);
+    // items/events 等其余数据保留。
+    expect(store.listItems(APP, 'all')).toHaveLength(1);
+    // links 表已按 v2 重建：同毫秒多关联保持写入顺序（这是 v2 的修复点）。
+    const item = store.listItems(APP, 'all')[0]!;
+    store.updateItem(APP, item.seq, {
+      links: [{ kind: 'pr', ref: 'o/r#9', label: 'PR' }, { kind: 'chat', ref: 'oc_mig' }],
+    }, undefined, 5000);
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
+    store.close();
+    // 再开一次已是 v2，不会重复迁移。
+    store = DecisionBoardStore.open(dir);
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
   });
 });

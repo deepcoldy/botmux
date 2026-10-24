@@ -212,10 +212,39 @@ const TRAEX_CAPACITY_QUEUE_PATTERN = new RegExp(
 const TRAEX_PROGRESS_PATTERN = new RegExp(
   `^[ \t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \t]+(?:${TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued')).join('|')})(?:[ \t]*\\([^\\r\\n]*esc to interrupt\\))?[ \t]*$`, 'i');
 
+/** The native pending-input panel can push live activity above the final
+ * twelve rows. Only skip a verified panel between its exact header and the
+ * bottom composer/footer; quoted or arbitrary history keeps the narrow scan. */
+function traexCurrentActivityRows(screen: string): string[] {
+  const rows = screen.trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+  if (composer >= 0) {
+    const footer = rows.slice(composer + 1).filter(row => row.trim());
+    if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
+    const nativeFooter = footer.length >= 1 && footer.length <= 2
+      && /^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|[—–-])(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
+      && (footer.length === 1 || /^[ \t]*(?:☢ )?(?:Full Access|Read Only|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!));
+    if (nativeFooter) {
+      let sawInput = false;
+      for (let index = composer - 1; index >= 0; index--) {
+        const row = rows[index]!;
+        if (/^Send after tool call[ \t]+[·•][ \t]+esc to interrupt and send[ \t]+[·•][ \t]+↑ to edit[ \t]*$/.test(row)) {
+          if (sawInput) return rows.slice(0, index).slice(-12);
+          break;
+        }
+        if (/^[›❯](?:[ \t]|$)/.test(row)) sawInput = true;
+        else if (!/^[ \t]*$|^[ \t]*─+[ \t]*$|^ {2}\S/.test(row)) break;
+      }
+    }
+  }
+  return rows.slice(-12);
+}
+
 function traexCurrentFooterState(screen: string): 'capacity' | 'progress' | 'other' | undefined {
   // In no-alt-screen mode an earlier queue row can remain above the current
   // thinking row. The latest activity, rather than elapsed time, wins.
-  for (const row of screen.split(/\r?\n/).slice(-12).reverse()) {
+  for (const row of traexCurrentActivityRows(screen).reverse()) {
     if (TRAEX_PROGRESS_PATTERN.test(row)) return 'progress';
     if (TRAEX_CAPACITY_QUEUE_PATTERN.test(row)) return 'capacity';
     if (/Queued for next turn/.test(row)) return 'other';
@@ -229,7 +258,7 @@ export function traexCapacityQueueVisible(screen: string): boolean {
 
 export function traexCapacityQueuePosition(screen: string): number | undefined {
   if (!traexCapacityQueueVisible(screen)) return undefined;
-  const match = screen.split(/\r?\n/).slice(-12).join('\n').match(
+  const match = traexCurrentActivityRows(screen).join('\n').match(
     /^[ \t]*(?:[└├│][ \t]*)?Too many requests right now\. You're in the queue at position[ \t]+(\d+)\.[ \t]*$/im,
   );
   const position = match ? Number(match[1]) : undefined;

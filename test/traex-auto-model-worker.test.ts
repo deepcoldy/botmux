@@ -59,6 +59,93 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
 }
 
 describe('auto-model Worker admission and original-input retirement', () => {
+  it('does not admit a follow-up on the stale composer after the first input was submitted', async () => {
+    const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+    h.scope.backend.captureViewportAsync = async () => '◆ Working… (2s • esc to interrupt)';
+    expect(await h.admit()).toBe(true);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
+  it.each([
+    { name: 'Herdr viewport', authoritative: true, capture: 'captureViewport' },
+    { name: 'Herdr current screen', authoritative: true, capture: 'captureCurrentScreen' },
+    { name: 'ZMX snapshot', authoritative: false, capture: 'captureViewport' },
+  ])('$name holds successors until activity or terminal, while permitting exact recovery', async ({ authoritative, capture }) => {
+    for (const waiting of ['submitted', 'switched']) {
+      const syncRead = vi.fn(() => '❯ Ask anything');
+      const h = admissionHarness({ backend: { [capture]: syncRead },
+        backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative });
+      const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+      controller.beginTurn('turn');
+      if (waiting === 'submitted') controller.markInputSubmitted('turn');
+      else expect(controller.commitSwitch(action)).toBe(true);
+      expect(controller.awaitingModelActivity()).toBe(true);
+      expect(await h.admit()).toBe(false);
+      expect(h.scope.pendingMessages).toEqual([h.item]);
+      h.scope.pendingMessages[0] = { content: 'continue', turnId: 'turn', traexAutoModelRecovery: true };
+      expect(await h.admit()).toBe(true);
+      h.scope.pendingMessages[0] = { content: 'unrelated recovery', turnId: 'other', traexAutoModelRecovery: true };
+      expect(await h.admit()).toBe(false);
+      h.scope.pendingMessages[0] = h.item;
+      controller.observeCapacityQueue({ turnId: 'turn', queued: false, progressing: true, nowMs: 1 });
+      expect(await h.admit()).toBe(true);
+      controller.markInputSubmitted('turn');
+      expect(await h.admit()).toBe(false);
+      controller.endTurn('turn');
+      expect(await h.admit()).toBe(true);
+      expect(syncRead).not.toHaveBeenCalled();
+    }
+  });
+
+  it('releases a parked legacy successor once model activity clears the awaiting latch', async () => {
+    const h = harness();
+    h.controller.commitSwitch(action);
+    const screen = '⠋ Any second now…\nQueued for next turn\nContext 65% left';
+    expect(traexModelProgressVisible(screen)).toBe(false);
+    expect(traexQueuedTypeAheadVisible(screen)).toBe(true);
+    Object.assign(h.scope, { isPromptReady: false, currentBotmuxTurnId: 'turn',
+      traexCapacityQueueVisible, traexCapacityQueuePosition: () => undefined,
+      traexModelProgressVisible, traexQueuedTypeAheadVisible, flushPending: vi.fn() });
+    const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
+    observe(screen);
+    expect(h.controller.awaitingModelActivity()).toBe(false);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    observe(screen);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an async viewport result captured before a model switch', async () => {
+    let finish!: (screen: string) => void;
+    const h = admissionHarness({ backend: { captureViewportAsync: () => new Promise<string>(resolve => { finish = resolve; }) } });
+    const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+    controller.beginTurn('turn');
+    const pending = h.admit();
+    expect(controller.commitSwitch(action)).toBe(true);
+    finish('◆ Working… (2s • esc to interrupt)');
+    expect(await pending).toBe(false);
+    expect(controller.currentModel()).toBe('backup');
+    expect(controller.awaitingModelActivity()).toBe(true);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+  });
+
+  it('uses the authoritative terminal to release awaiting input when the ready observer is skipped', async () => {
+    const h = harness();
+    h.controller.markInputSubmitted('turn');
+    Object.assign(h.scope, { isPromptReady: true });
+    loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope)('◆ Working… (2s • esc to interrupt)');
+    expect(h.controller.awaitingModelActivity()).toBe(true);
+    const admission = admissionHarness({ traexAutoModelController: h.controller,
+      backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    expect(await admission.admit()).toBe(false);
+    h.controller.endTurn('turn');
+    expect(h.controller.awaitingModelActivity()).toBe(false);
+    expect(await admission.admit()).toBe(true);
+  });
+
   it('recovers the actual live model and its settings after a worker upgrade, and persists a same-model hold change', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000,
       modelSettings: { core: { reasoningEffort: 'high', modelBackendVariant: 'max' },
@@ -341,7 +428,7 @@ describe('Auto live follow-up input policy', () => {
     let frame = '❯ Ask anything';
     Object.assign(h.scope, { isPromptReady: false, backend: {}, commandLineWritesPending: 0,
       currentBotmuxTurnId: 'turn', captureBackendScreen: () => frame,
-      traexCapacityQueueVisible, traexModelProgressVisible, traexCapacityQueuePosition: () => undefined,
+      traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible, traexCapacityQueuePosition: () => undefined,
       flushPending: vi.fn(async () => {}), publishActiveRuntime: vi.fn() });
     const hold = loadWorkerFunction<() => boolean>('traexAutoModelInputHold', h.scope);
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
@@ -508,7 +595,7 @@ describe('Worker read-only capacity query', () => {
       cliAdapter: { resolvedBin: 'traex' }, buildSessionChildEnv, botInjectedEnv,
       process: { env: { HTTP_PROXY: 'host-proxy', API_TOKEN: 'host-token', KEEP: 'yes' } },
       traexCapacityQueueVisible: () => true, traexCapacityQueuePosition: () => undefined,
-      traexModelProgressVisible: () => false, readTraexModelLoads: read,
+      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false, readTraexModelLoads: read,
       executeTraexAutoModelSwitch: vi.fn(), publishActiveRuntime: vi.fn(), send: vi.fn(), log: vi.fn(),
     };
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
