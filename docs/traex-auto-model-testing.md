@@ -48,4 +48,4 @@ BOTMUX_TEST_WORKER_BINARY=/tmp/botmux-auto-model \
 新启动或重启会话加载配置。部署本地测试构建前备份配置和会话数据库，重启后分别核对磁盘版本、运行进程、原生会话 ID、tmux pane PID 以及 Dashboard HTTP。手动 `botmux upgrade` 会替换本地测试包，正式版本是否包含此功能应以合入状态为准。
 
 
-手写配置的共享 `reasoningEffort` 与逐模型设置都只做语法校验，支持表允许的 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`，不因静态能力表滞后而静默丢弃共享设置。Dashboard 保存仍用可用的 live catalog 验证能力；手写配置的真实支持范围由 CLI 决定。容量切换保持共享设置，不把它降级为 CLI 默认值。其它 CLI 的静态能力校验保持原合同。
+TraeX 手写配置的共享 `reasoningEffort` 与逐模型设置都只做语法校验，接受 `low` / `medium` / `high` / `xhigh` / `max` / `ultra`，不因静态能力表滞后而静默丢弃共享设置。固定模型的首次启动、恢复以及 `/t /effort` 使用同一口径。Dashboard 保存仍用可用的 live catalog 验证能力；真实支持范围由 CLI 决定。容量切换保持共享设置，不把它降级为 CLI 默认值。其它 CLI 的静态能力校验保持原合同。

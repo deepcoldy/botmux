@@ -4474,10 +4474,10 @@ function executeTraexAutoModelSwitch(
   lastInitConfig.model = action.toModel;
   const settings = resolveTraexAutoModelSettings(traexAutoModelController.config, action.toModel,
     traexAutoModelController.sharedSettings ?? lastInitConfig);
-  lastInitConfig.reasoningEffort = settings.reasoningEffort;
-  lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
   // Handwritten shared settings, like per-model settings, are syntax-checked
   // at load time; the live CLI catalog may support efforts absent locally.
+  lastInitConfig.reasoningEffort = settings.reasoningEffort;
+  lastInitConfig.modelBackendVariant = settings.modelBackendVariant;
   // Native resume owns the original ask. Retire its transport replay before
   // teardown can synchronously call onCliExit and stash it ahead of recovery.
   inflightInputs.retireTurn(action.turnId);
