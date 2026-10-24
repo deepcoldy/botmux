@@ -95,13 +95,41 @@ describe('事项', () => {
   });
 
   it('关联对象去重并记一条历史', () => {
-    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }).item;
-    store.updateItem(APP, item.seq, { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] });
+    // 两次写入钉在同一毫秒：顺序只能靠插入序，不能靠时间戳碰巧相差 1ms。
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'pr', ref: 'o/r#1' }] }, undefined, 1_000).item;
+    store.updateItem(APP, item.seq, { links: [{ kind: 'pr', ref: 'o/r#1', label: '主 PR' }, { kind: 'chat', ref: 'oc_abc' }] }, undefined, 1_000);
     expect(store.links(APP, item.seq)).toEqual([
       { kind: 'pr', ref: 'o/r#1', label: '主 PR' },
       { kind: 'chat', ref: 'oc_abc' },
     ]);
     expect(store.events(APP, item.seq).filter(e => e.kind === 'link')).toHaveLength(2);
+  });
+
+  it('同一毫秒加的关联按加入顺序排，已有的关联更新标签后不挪位置', () => {
+    const item = store.addItem(APP, { title: 't', links: [
+      { kind: 'url', ref: 'https://z.example' },
+      { kind: 'session', ref: 'abcdef12' },
+      { kind: 'commit', ref: 'o/r@abcdef1' },
+    ] }, undefined, 1_000).item;
+    store.updateItem(APP, item.seq, { links: [{ kind: 'chat', ref: 'oc_a' }, { kind: 'url', ref: 'https://z.example', label: '设计' }] }, undefined, 1_000);
+    expect(store.links(APP, item.seq).map(l => `${l.kind}${l.label ? `:${l.label}` : ''}`))
+      .toEqual(['url:设计', 'session', 'commit', 'chat']);
+  });
+
+  it('同一毫秒附的多张图按上传顺序列出', () => {
+    const item = decideItem();
+    const names = ['a.png', 'b.png', 'c.png', 'd.png', 'e.png', 'f.png'];
+    store.attachFiles(APP, item.seq, names.map(name => ({ bytes: PNG, mime: 'image/png', name })), undefined, undefined, 2_000);
+    expect(store.detail(APP, item.seq)!.files.map(f => f.name)).toEqual(names);
+  });
+
+  it('列表里时间相同的事项按编号排：待拍板先建的在前，其它视图新建的在前', () => {
+    const a = store.addItem(APP, { title: 'a', state: 'decide' }, undefined, 1_000).item;
+    const b = store.addItem(APP, { title: 'b', state: 'decide' }, undefined, 1_000).item;
+    const c = store.addItem(APP, { title: 'c', state: 'active' }, undefined, 1_000).item;
+    const d = store.addItem(APP, { title: 'd', state: 'active' }, undefined, 1_000).item;
+    expect(store.listItems(APP, 'decide').map(i => i.seq)).toEqual([a.seq, b.seq]);
+    expect(store.listItems(APP, 'active').map(i => i.seq)).toEqual([d.seq, c.seq]);
   });
 });
 

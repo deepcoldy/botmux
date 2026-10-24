@@ -197,6 +197,9 @@ export class DecisionBoardStore {
           ref TEXT NOT NULL,
           label TEXT,
           created_at INTEGER NOT NULL,
+          -- 事项内的插入序号。WITHOUT ROWID 表没有 rowid 可当插入序，同一毫秒写入的几行
+          -- created_at 相同，只按时间排会退化成按主键（kind 字典序）排。
+          ord INTEGER NOT NULL,
           PRIMARY KEY (app_id, seq, kind, ref)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS board_events (
@@ -222,6 +225,8 @@ export class DecisionBoardStore {
           name TEXT NOT NULL,
           uploader TEXT NOT NULL,
           created_at INTEGER NOT NULL,
+          -- 看板内的插入序号（同上：主键 id 是随机串，同一毫秒的几张图按它排才是上传顺序）。
+          ord INTEGER NOT NULL,
           PRIMARY KEY (app_id, id)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS board_drafts (
@@ -351,9 +356,11 @@ export class DecisionBoardStore {
   private addLinks(appId: string, seq: number, links: BoardLink[], at: number, actorRef?: string): number {
     let added = 0;
     for (const l of links) {
-      const r = this.stmt(`INSERT INTO board_links (app_id, seq, kind, ref, label, created_at) VALUES (?, ?, ?, ?, ?, ?)
+      // ord 只在真正插入时取「本事项当前最大 + 1」；已有的关联只更新标签，保留原来的位置。
+      const r = this.stmt(`INSERT INTO board_links (app_id, seq, kind, ref, label, created_at, ord)
+        VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(ord), 0) + 1 FROM board_links WHERE app_id = ? AND seq = ?))
         ON CONFLICT(app_id, seq, kind, ref) DO UPDATE SET label = COALESCE(excluded.label, board_links.label)`)
-        .run(appId, seq, l.kind, l.ref, l.label ?? null, at);
+        .run(appId, seq, l.kind, l.ref, l.label ?? null, at, appId, seq);
       if (Number(r.changes) > 0) added++;
     }
     const count = (this.stmt('SELECT COUNT(*) AS n FROM board_links WHERE app_id = ? AND seq = ?').get(appId, seq) as { n: number }).n;
@@ -483,7 +490,7 @@ export class DecisionBoardStore {
   }
 
   links(appId: string, seq: number): BoardLink[] {
-    return (this.stmt('SELECT kind, ref, label FROM board_links WHERE app_id = ? AND seq = ? ORDER BY created_at, kind, ref')
+    return (this.stmt('SELECT kind, ref, label FROM board_links WHERE app_id = ? AND seq = ? ORDER BY ord')
       .all(appId, seq) as Array<{ kind: string; ref: string; label: string | null }>)
       .map(r => ({ kind: r.kind as BoardLink['kind'], ref: r.ref, ...(r.label ? { label: r.label } : {}) }));
   }
@@ -502,7 +509,7 @@ export class DecisionBoardStore {
   }
 
   listItems(appId: string, view: BoardView, opts: { author?: string; query?: string } = {}): ItemSummary[] {
-    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ?').all(appId) as ItemRow[];
+    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
     const drafts = new Set(opts.author
       ? (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ?').all(appId, opts.author) as Array<{ seq: number }>).map(r => r.seq)
       : []);
@@ -527,8 +534,11 @@ export class DecisionBoardStore {
         unseen: !!item.stewardEventAt && (!item.ownerSeenAt || item.stewardEventAt > item.ownerSeenAt),
       });
     }
-    // 待拍板按进入该状态的时间（先进先拍）；其它按最近更新。
-    out.sort((a, b) => view === 'decide' ? a.stateAt - b.stateAt : b.updatedAt - a.updatedAt);
+    // 待拍板按进入该状态的时间（先进先拍）；其它按最近更新。时间相同时按编号：
+    // 待拍板里编号小的在前（先建的先拍），其它视图编号大的在前（新建的在前）。
+    out.sort((a, b) => view === 'decide'
+      ? a.stateAt - b.stateAt || a.seq - b.seq
+      : b.updatedAt - a.updatedAt || b.seq - a.seq);
     return out;
   }
 
@@ -547,7 +557,7 @@ export class DecisionBoardStore {
   detail(appId: string, seq: number, author?: string): ItemDetail | undefined {
     const item = this.getItem(appId, seq);
     if (!item) return undefined;
-    const files = (this.stmt('SELECT * FROM board_files WHERE app_id = ? AND seq = ? ORDER BY created_at').all(appId, seq) as FileRow[]).map(rowToFile);
+    const files = (this.stmt('SELECT * FROM board_files WHERE app_id = ? AND seq = ? ORDER BY ord').all(appId, seq) as FileRow[]).map(rowToFile);
     return {
       item,
       links: this.links(appId, seq),
@@ -581,9 +591,9 @@ export class DecisionBoardStore {
     }
     const id = randomUUID().replace(/-/g, '').slice(0, 20);
     if (input.seq !== undefined && !this.itemRow(appId, input.seq)) throw new BoardError('item_not_found', `没有 #${input.seq}`);
-    this.stmt(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, id, input.seq ?? null, sha256, input.mime, input.bytes.length,
-      input.name, input.by, now);
+    this.stmt(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at, ord)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(ord), 0) + 1 FROM board_files WHERE app_id = ?))`)
+      .run(appId, id, input.seq ?? null, sha256, input.mime, input.bytes.length, input.name, input.by, now, appId);
     return { id, ...(input.seq !== undefined ? { seq: input.seq } : {}), sha256, mime: input.mime, bytes: input.bytes.length,
       name: input.name, by: input.by, createdAt: now };
   }
@@ -625,7 +635,8 @@ export class DecisionBoardStore {
   }
 
   listDrafts(appId: string, author: string): BoardDraft[] {
-    const seqs = (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ? ORDER BY updated_at')
+    // 同一毫秒保存的几份草稿按编号排，不留给 SQLite 自行决定。
+    const seqs = (this.stmt('SELECT seq FROM board_drafts WHERE app_id = ? AND author = ? ORDER BY updated_at, seq')
       .all(appId, author) as Array<{ seq: number }>).map(r => r.seq);
     return seqs.map(seq => this.getDraft(appId, seq, author)!).filter(Boolean);
   }
