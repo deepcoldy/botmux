@@ -36,6 +36,7 @@ export interface LinkRefRuntime {
     key: LinkRefTurnKey,
     mode: LinkRefMode,
     payload: OutboundLinkRefPayload,
+    responseKind?: import('./final-link-integrity.js').LinkIntegrityResponseKind,
   ): ResolvedOutboundLinkRefs;
   restoreMode(key: LinkRefTurnKey): 'enabled' | undefined;
   prepareFinalDraft(input: {
@@ -172,11 +173,11 @@ export function createLinkRefRuntime(
         return { stats: extraction.stats };
       }
     },
-    resolveForDaemon(key, mode, payload) {
+    resolveForDaemon(key, mode, payload, responseKind) {
       if (mode === 'disabled' || mode === 'observe') return { ...payload, refCount: 0 };
       const startedAt = performance.now();
       try {
-        const resolved = resolveOutboundLinkRefs(ledger(), key, payload);
+        const resolved = resolveOutboundLinkRefs(ledger(), key, payload, responseKind);
         recordDiagnostic({
           mode,
           outcome: 'resolved',
@@ -208,7 +209,13 @@ export function createLinkRefRuntime(
       if (mode !== 'enabled') return { content, draftPending: false };
       const executable = findExecutableLinkRefs(content);
       if (executable.refIds.length === 0) {
-        return { content: executable.expand(new Map()), draftPending: false };
+        try {
+          const resolved = resolveOutboundLinkRefs(ledger(), key, { text: content }, 'final');
+          return { content: resolved.text ?? content, draftPending: false };
+        } catch (error) {
+          if (error instanceof LinkRefError) throw error;
+          throw new LinkRefError('link_ref_ledger_unavailable');
+        }
       }
       const store = ledger();
       let draft: string;
@@ -220,7 +227,7 @@ export function createLinkRefRuntime(
         throw new LinkRefError('link_ref_ledger_unavailable');
       }
       try {
-        const resolved = runtime.resolveForDaemon(key, mode, { text: draft });
+        const resolved = runtime.resolveForDaemon(key, mode, { text: draft }, 'final');
         return { content: resolved.text ?? draft, draftPending: true };
       } catch (error) {
         if (error instanceof LinkRefError) throw error;

@@ -1949,7 +1949,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/link-refs/resolve', async (req, res, 
       ...(origin.dispatchAttempt !== undefined
         ? { dispatchAttempt: origin.dispatchAttempt }
         : {}),
-    }, 'enabled', parsed.payload);
+    }, 'enabled', parsed.payload, parsed.responseKind);
     return jsonRes(res, 200, { ok: true, payload });
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error

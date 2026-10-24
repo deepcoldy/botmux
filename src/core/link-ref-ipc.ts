@@ -28,6 +28,7 @@ export interface McpHostDeliveryLinkRefRequest {
   turnId: string;
   dispatchAttempt?: number;
   linkRefMode: 'enabled';
+  responseKind: 'final' | 'auxiliary';
   payload: OutboundLinkRefPayload;
 }
 
@@ -138,6 +139,7 @@ export function resolveMcpHostDeliveryLinkRefsFromWorker(input: {
   if (!input.ownsWorkerSession
     || request.sessionId !== daemonSession.sessionId
     || !request.turnId
+    || (request.responseKind !== 'final' && request.responseKind !== 'auxiliary')
     || !boundedJsonValue(request.payload, LINK_REF_RESOLVE_MAX_BODY_BYTES)) {
     return { ok: false, error: 'link_ref_identity_mismatch' };
   }
@@ -149,7 +151,12 @@ export function resolveMcpHostDeliveryLinkRefsFromWorker(input: {
     }
     return {
       ok: true,
-      payload: input.runtime.resolveForDaemon(key, 'enabled', request.payload),
+      payload: input.runtime.resolveForDaemon(
+        key,
+        'enabled',
+        request.payload,
+        request.responseKind,
+      ),
     };
   } catch (error) {
     return { ok: false, error: stableLinkRefError(error) };
@@ -166,6 +173,7 @@ const REGISTER_BODY_KEYS = new Set([
 ]);
 const RESOLVE_BODY_KEYS = new Set([
   'payload',
+  'responseKind',
   'originCapability',
   'originTurnId',
   'originDispatchAttempt',
@@ -182,7 +190,8 @@ function plainRecord(value: unknown): value is Record<string, unknown> {
 
 export function parseLinkRefResolveBody(
   value: unknown,
-): { ok: true; payload: OutboundLinkRefPayload } | { ok: false } {
+): { ok: true; payload: OutboundLinkRefPayload; responseKind?: 'progress' | 'final' | 'auxiliary' }
+  | { ok: false } {
   if (!plainRecord(value) || Object.keys(value).some(key => !RESOLVE_BODY_KEYS.has(key))) {
     return { ok: false };
   }
@@ -190,6 +199,11 @@ export function parseLinkRefResolveBody(
   if (!plainRecord(payload) || Object.keys(payload).some(key => !RESOLVE_PAYLOAD_KEYS.has(key))) {
     return { ok: false };
   }
+  const responseKind = value.responseKind;
+  if (responseKind !== undefined
+    && responseKind !== 'progress'
+    && responseKind !== 'final'
+    && responseKind !== 'auxiliary') return { ok: false };
   if (payload.text !== undefined && typeof payload.text !== 'string') return { ok: false };
   if (payload.preparedText !== undefined && typeof payload.preparedText !== 'string') return { ok: false };
   if (payload.card !== undefined && !plainRecord(payload.card)) return { ok: false };
@@ -197,7 +211,11 @@ export function parseLinkRefResolveBody(
   if (payload.expectedLinks !== undefined
     && (!Array.isArray(payload.expectedLinks)
       || payload.expectedLinks.some(link => typeof link !== 'string'))) return { ok: false };
-  return { ok: true, payload: payload as OutboundLinkRefPayload };
+  return {
+    ok: true,
+    payload: payload as OutboundLinkRefPayload,
+    ...(responseKind === undefined ? {} : { responseKind }),
+  };
 }
 
 export function emptyLinkRefExtractionStats(): LinkRefExtractionStats {
