@@ -543,6 +543,21 @@ export class IdleDetector {
     return this.isIdle;
   }
 
+  /** Whether the input prompt is CURRENTLY rendered on screen, regardless of
+   *  the quiescence window that gates `isIdle`. The prompt can be visible
+   *  hundreds of milliseconds before the idle edge fires: callers that hold a
+   *  bounded wait for transcript closing records use this to stand down when
+   *  the idle edge is imminent instead of racing it. A `working` screen
+   *  (spinner, no prompt) returns false, so a turn stuck under a held busy
+   *  status with no idle edge still gets its fallback exit. */
+  screenShowsPrompt(): boolean {
+    if (!this.readyPattern) return false;
+    let screen = '';
+    try { screen = this.captureStartupScreen?.() ?? ''; } catch { return false; }
+    const stripped = this.stripAnsi(screen);
+    return this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail);
+  }
+
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
   isStartupPending(): boolean {
     return this.startupPending && !this.startupComplete;
