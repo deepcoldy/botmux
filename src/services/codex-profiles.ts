@@ -55,6 +55,27 @@ export function assertCodexProfileRuntime(cfg: ProfileLaunch): void {
   if (!['linux', 'darwin'].includes(process.platform)) fail('unsupported_launch');
   if (envSandboxMode(process.env.BOTMUX_SANDBOX) !== 'off') fail('unsupported_launch');
 }
+/**
+ * Loader-level content gate reusable by every bots.json WRITE surface without
+ * pulling the whole registry parser (which would couple the low-level config
+ * primitive to the giant bot-registry module and break under partial mocks).
+ * Only entries this write creates or changes are checked — an unchanged legacy
+ * entry must never block an edit to another bot (same semantics as
+ * assertChangedBotConfigInvariants). It mirrors exactly the two calls
+ * parseBotConfigsFromText runs for this field (name normalization + config
+ * launch assertion), so a profile entry that passes here parses there too.
+ */
+export function assertChangedBotsCodexProfile(previous: any[], next: any[]): void {
+  for (let index = 0; index < next.length; index++) {
+    const entry = next[index] as (ProfileLaunch & { codexProfile?: unknown; larkAppId?: string });
+    const previousEntry = entry?.larkAppId
+      ? previous.find(candidate => candidate?.larkAppId === entry.larkAppId)
+      : previous[index];
+    if (previousEntry !== undefined && JSON.stringify(previousEntry) === JSON.stringify(entry)) continue;
+    const codexProfile = normalizeCodexProfile(entry?.codexProfile);
+    if (codexProfile) assertCodexProfileConfig(entry);
+  }
+}
 export function codexProfileEnvironment(cfg: ProfileLaunch): NodeJS.ProcessEnv {
   return { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy) };
 }

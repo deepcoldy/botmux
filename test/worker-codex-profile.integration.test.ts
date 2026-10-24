@@ -5,6 +5,7 @@ import { expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 for (const [backendType, mode] of [['pty', 'valid'], ['tmux', 'valid'], ['pty', 'missing'], ['tmux', 'rpc'], ['pty', 'isolated'], ['pty', 'adopt']] as const) {
@@ -22,11 +23,11 @@ fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({pid:process.pid, arg
 process.stdout.write('› Ask Codex to do anything\\n  explicit-model · /tmp\\n');
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });
-  if (backendType === 'tmux') execFileSync('tmux', ['new-session', '-d', '-s', 'fixture', 'sleep 60'], { env: { ...process.env, TMUX_TMPDIR: dir } });
+  if (backendType === 'tmux') execFileSync('tmux', ['new-session', '-d', '-s', 'fixture', 'sleep 60'], { env: privateTmuxEnv(dir) });
   if (mode === 'missing') rmSync(join(home, 'selected.config.toml'));
   const sessionId = randomUUID();
   const child = spawnTsScript(resolve('src/worker.ts'), [], {
-    cwd: resolve('.'), env: { ...process.env, TMUX_TMPDIR: dir, SESSION_DATA_DIR: data, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'profile_test', LARK_APP_SECRET: 'test' },
+    cwd: resolve('.'), env: privateTmuxEnv(dir, { SESSION_DATA_DIR: data, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'profile_test', LARK_APP_SECRET: 'test' }),
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   let logs = '';
@@ -48,7 +49,7 @@ setInterval(() => {}, 1000);
       return;
     }
     if (backendType === 'tmux' && !existsSync(report)) {
-      try { logs += execFileSync('tmux', ['capture-pane', '-p', '-t', `bmx-${sessionId.slice(0, 8)}`], { env: { ...process.env, TMUX_TMPDIR: dir }, encoding: 'utf8' }); } catch { /* logs still explain failure */ }
+      try { logs += execFileSync('tmux', ['capture-pane', '-p', '-t', `bmx-${sessionId.slice(0, 8)}`], { env: privateTmuxEnv(dir), encoding: 'utf8' }); } catch { /* logs still explain failure */ }
     }
     expect(existsSync(report), logs).toBe(true);
     const launch = JSON.parse(readFileSync(report, 'utf8'));
@@ -59,7 +60,7 @@ setInterval(() => {}, 1000);
     if (child.connected) child.send!({ type: 'close' }, () => {});
     await new Promise<void>(r => { if (child.exitCode !== null) return r(); const timer = setTimeout(() => { child.kill('SIGKILL'); r(); }, 3000); child.once('exit', () => { clearTimeout(timer); r(); }); });
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: dir }, stdio: 'ignore' }); } catch { /* stopped already */ }
+      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(dir), stdio: 'ignore' }); } catch { /* stopped already */ }
     }
     if (existsSync(report)) {
       try { process.kill(JSON.parse(readFileSync(report, 'utf8')).pid, 'SIGKILL'); } catch { /* already exited */ }

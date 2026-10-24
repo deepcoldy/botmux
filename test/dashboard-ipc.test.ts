@@ -8132,6 +8132,8 @@ esac
       expect(await (await save({ cliId: 'claude-code', codexProfile: null })).json()).toMatchObject({ cliId: 'claude-code', codexProfile: null });
       expect((await save({ cliId: 'claude-code', model: 'sonnet' })).status).toBe(200);
     });
+    // 非文本断言：经 esbuild 把 BotAgentSection 打包后交给真实 Chromium 驱动，
+    // 断言的是页面交互与网络保存行为，不对读入的组件源码文本做任何断言。
     it.skipIf(process.env.BOTMUX_PROFILE_BROWSER !== '1')('scans, searches, saves, refreshes and clears profiles through real browser controls', async () => {
       const { chromium } = await import('playwright');
       const { build } = await import('esbuild');

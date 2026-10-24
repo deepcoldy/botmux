@@ -10,7 +10,7 @@ import { assertCodexInstanceConfigWrite } from '../services/codex-instance-confi
 import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
 import { assertDurableConfigMutationAllowed } from '../services/durable-config-mutation.js';
-import { assertNextBotsGenerationParses } from '../services/config-store.js';
+import { assertNextBotsGenerationContent } from '../services/config-store.js';
 
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   assertDurableConfigMutationAllowed('bots');
@@ -25,7 +25,7 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
     assertQuotaFallbackGraphAcyclic(bots);
     // Same loader-level gate as the daemon's writeRawConfigAtomic: never persist
     // a changed entry parseBotConfigsFromText would reject on the next startup.
-    assertNextBotsGenerationParses(previous, bots);
+    assertNextBotsGenerationContent(previous, bots);
     // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
     const tmp = botsJsonPath + '.tmp';
     writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });

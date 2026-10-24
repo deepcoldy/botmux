@@ -3,10 +3,11 @@
  * oncall-store 与 grant-store 共用，保证对同一 bots.json 的并发写不丢更新。
  */
 import { promises as fsp } from 'node:fs';
-import { getLoadedConfigPath, parseBotConfigsFromText } from '../bot-registry.js';
+import { getLoadedConfigPath } from '../bot-registry.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
+import { assertChangedBotsCodexProfile } from './codex-profiles.js';
 import {
   assertChangedBotConfigInvariants,
   botConfigInvariantError,
@@ -25,26 +26,15 @@ export async function readRawConfig(path: string): Promise<any[]> {
 }
 
 /**
- * Run the same content parse the daemon loader uses, but only for entries this
- * write creates or changes. Every bots.json write surface must leave the bots
- * it touched in a loader-accepted shape: one changed entry failing a content
- * gate (e.g. a codexProfile combined with an unsupported launch) makes
- * parseBotConfigsFromText throw for the WHOLE file and blocks every Bot on the
- * next daemon start. An UNCHANGED legacy entry that a newer build would reject
- * is deliberately skipped (same semantics as
- * assertChangedBotConfigInvariants), so one invalid legacy bot cannot prevent
- * repairing another. Cross-entry structural checks (quota graph, invariants)
- * run separately on the whole generation.
+ * Content gate every changed bots.json entry must pass before persistence.
+ * Mirrors the codexProfile checks the daemon loader runs, so no write surface
+ * (/config, config cards, setup/onboarding, rmwBotEntry callers) can persist a
+ * profile combined with an unsupported launch — a combination that would make
+ * parseBotConfigsFromText reject the WHOLE file on the next startup. Unchanged
+ * legacy entries are skipped, like assertChangedBotConfigInvariants.
  */
-export function assertNextBotsGenerationParses(previous: any[], next: any[]): void {
-  for (let index = 0; index < next.length; index++) {
-    const entry = next[index];
-    const previousEntry = entry?.larkAppId
-      ? previous.find(candidate => candidate?.larkAppId === entry.larkAppId)
-      : previous[index];
-    if (previousEntry !== undefined && JSON.stringify(previousEntry) === JSON.stringify(entry)) continue;
-    parseBotConfigsFromText(JSON.stringify([entry]));
-  }
+export function assertNextBotsGenerationContent(previous: any[], next: any[]): void {
+  assertChangedBotsCodexProfile(previous, next);
 }
 
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
@@ -56,7 +46,7 @@ export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<vo
   // Validate the complete next generation, not the currently loaded registry.
   // Callers invoke this while holding the cross-process lock.
   assertQuotaFallbackGraphAcyclic(raw);
-  assertNextBotsGenerationParses(previous, raw);
+  assertNextBotsGenerationContent(previous, raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
   await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
@@ -89,20 +79,30 @@ export async function rmwBotEntry<T>(
       const raw = await readRawConfig(path);
       const idx = findEntryIndex(raw, larkAppId);
       if (idx < 0) return { ok: false as const, reason: 'bot_not_in_config' };
+      // mutate() edits `raw` in place; keep the on-disk generation for the
+      // changed-entry diff the parser gate needs.
+      const previousRaw: any[] = JSON.parse(JSON.stringify(raw));
       const entry = raw[idx];
       const out = await mutate(entry, raw);
-      const persist = async () => {
-        // Loader-level gates (parseBotConfigsFromText included) can still reject
-        // a mutation whose field-specific checks passed (e.g. a codexProfile
-        // combined with a field another write path just changed). Surface that
-        // as a structured failure instead of a throw, so callers keep the old
-        // in-memory config and return an error to the operator.
+      // Content gate only: a changed entry the loader would parse-reject is a
+      // field-combination error (e.g. codexProfile + unsupported launch), so it
+      // is surfaced as a structured { ok:false } like the invariant checks and
+      // no tmp file is touched. Genuine persistence errors below (ENOSPC /
+      // read-only fs / lock timeout) must still THROW: callers such as grant
+      // revoke rely on the rejection for their error/rollback path.
+      const changedEntryParseError = (): string | undefined => {
         try {
-          await writeRawConfigAtomic(path, raw);
-          return { ok: true as const };
+          assertNextBotsGenerationContent(previousRaw, raw);
+          return undefined;
         } catch (error) {
-          return { ok: false as const, reason: (error as Error).message };
+          return (error as Error).message;
         }
+      };
+      const persist = async () => {
+        const parseError = changedEntryParseError();
+        if (parseError) return { ok: false as const, reason: parseError };
+        await writeRawConfigAtomic(path, raw);
+        return { ok: true as const };
       };
       if (out && typeof out === 'object' && 'write' in (out as any)) {
         const wrap = out as { write: boolean; result: T };
