@@ -224,6 +224,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 | `grantRequestToOwnerDm` | 默认关闭。设为 `true` 时，会话里没有管理员能点申请卡（群里查不到管理员，或私聊被挡）就把申请卡改发到主 owner 私聊，申请人只收到中性回执、处置结果回告原会话；有 owner 维度总量节流（每小时 20 张，发送失败不占名额），超限或发送失败时不发卡、下一条消息再重试。需 `autoGrantRequestCards` 未关闭。详见[权限与授权 · 授权申请卡](/permissions#授权申请卡) |
 | `blockedUsers` | 黑名单（与 `allowedUsers` 同款标识：邮箱 / 手机号 / `on_xxx` / `ou_xxx`），sender 维度全局否决：群聊与私聊都生效，优先于 oncall / 整群放开 / 访客授权 / 团队信任等所有放行腿；被拉黑者被拦时不发授权申请卡。owner / 管理员不可被拉黑（写入口拒绝）。不影响消息监听器的监听匹配。也可在 Dashboard「Bot 配置」与群成员弹层维护。完整说明见[权限与授权 · 黑名单](/permissions#黑名单-blockedusers) |
+| `grantDelegateBots` | 默认未配置（空名单 = 行为完全不变）。一组受信 bot 的身份标识（本 bot 视角的 `ou_` open_id，也接受 `cli_` app_id）。名单里的 bot 在群里发消息 @ 本 bot 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**（写 `chatGrants`，仅 talk、不授管理权），额度 / 有效期与 `/grant` 默认值一致（未配置时 3 条 / 1 小时），并回一张授权结果卡。适合外部平台用自己的 bot 建群、发开场卡点名提需求者的场景。已能对话者、发送方自己、@所有人、黑名单用户跳过（委托 bot 自己被拉黑时整条跳过）；不写 `allowedUsers` / `allowedChatGroups` / `globalGrants`。详见[权限与授权 · 委托授权 bot](/permissions#委托授权-bot-grantdelegatebots) |
 
 ## 文件沙盒
 

@@ -47,6 +47,7 @@ import {
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
+import { applyDelegatedGrants } from './delegated-grant.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
@@ -5061,6 +5062,16 @@ export function createLarkEventDispatcherRuntime(
         // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
         // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
         await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
+        // 委托授权：grantDelegateBots 里的 bot @ 本 bot 时，把它同时点名的人写进本群 chatGrants
+        // （talk-only）。必须排在 bindDefaultOncallBeforeTalk **之后**：applyDelegatedGrants
+        // 用 evaluateTalk 判「已能说话就跳过」，而 defaultOncall 群的 oncall 绑定要到这行才
+        // 伏写入；顺序反了就会给本就能在 oncall 群里说话的人白落一条 chatGrant + 一张
+        // 「已获授权」卡。同样排在发送方自己的 talk 闸之前：授权对象是**被点名者**，与
+        // 委托 bot 自己能否发言无关（它自己被拦时下游照旧拦）。
+        await applyDelegatedGrants(larkAppId, message, {
+          chatType,
+          senderIds: [sender.sender_id?.open_id, sender.sender_id?.app_id],
+        }).catch(err => logger.warn(`[grant:${larkAppId}] delegated grant failed: ${err}`));
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({

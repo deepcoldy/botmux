@@ -2071,6 +2071,14 @@ export interface BotConfig {
    */
   grantRequestToOwnerDm?: boolean;
   /**
+   * 委托授权 bot（open_id 取本 bot 视角，也接受 app_id）。这些 bot 在群里发消息 @ 本 bot 时，
+   * 同一条消息里被它 @ 的其他人自动获得本群对话授权（写 chatGrants，talk-only，额度/有效期
+   * 同 /grant 默认值）—— 与 owner 在授权卡上点「本群」同效。适合外部平台用自己的 bot 建群、
+   * 发开场卡点名提需求的人。不写 allowedUsers / allowedChatGroups / globalGrants，不授 canOperate。
+   * 见 im/lark/delegated-grant.ts。
+   */
+  grantDelegateBots?: string[];
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -3797,6 +3805,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const grantDefaultDurationMs = isGrantDurationOption(entry.grantDefaultDurationMs)
       ? entry.grantDefaultDurationMs
       : undefined;
+    const grantDelegateBots = normalizeStringList(entry.grantDelegateBots);
 
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
     // 名字内空白按 `-` 连接（/Ultra Goal → /ultra-goal）、自动补前导 `/`、
@@ -4185,6 +4194,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       // 默认关，只落显式 true。
       grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
+      grantDelegateBots: grantDelegateBots.length ? grantDelegateBots : undefined,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,

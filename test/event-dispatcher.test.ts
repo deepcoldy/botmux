@@ -157,6 +157,14 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
+// 委托授权（delegated-grant）只在本文件验证接线：它对 grant-store 的写入用 mock 接住，
+// 写入内容与卡片语义由 test/delegated-grant.test.ts 覆盖。
+const mockAddChatGrant = vi.fn(async () => ({ ok: true as const, created: true }));
+vi.mock('../src/services/grant-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/grant-store.js')>()),
+  addChatGrant: (...args: any[]) => mockAddChatGrant(...(args as [string, string, string, number | undefined, number | undefined])),
+}));
+
 const mockIsSubstituteEnabledForChat = vi.fn(() => true);
 vi.mock('../src/services/substitute-chat-toggle-store.js', () => ({
   isSubstituteEnabledForChat: (...args: any[]) => mockIsSubstituteEnabledForChat(...args),
@@ -889,6 +897,7 @@ function setupBotState(opts?: {
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
 	  grantRequestToOwnerDm?: boolean;
+	  grantDelegateBots?: string[];
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
 	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
@@ -930,6 +939,7 @@ function setupBotState(opts?: {
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
       grantRequestToOwnerDm: opts?.grantRequestToOwnerDm,
+      grantDelegateBots: opts?.grantDelegateBots,
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
 	      commandTriggers: opts?.commandTriggers,
@@ -4707,6 +4717,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
+    mockAddChatGrant.mockClear();
     setupBotState();
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
@@ -5475,6 +5486,100 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('delegated grant: a configured delegate bot grants the people it @-mentions in the group', async () => {
+    // 接线级回归：bot 发送方分支在 @ 闸之后、路由之前必须调用 applyDelegatedGrants。
+    // 删掉 dispatcher 里那一行调用，本用例必须变红（grant 语义本身在 delegated-grant.test.ts）。
+    setupBotState({ allowedUsers: ['ou_owner'], grantDelegateBots: ['ou_platform_bot'] });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // cross-ref 空 → 委托 bot 自身仍是 unknown peer
+    mockIsHumanOpenId.mockResolvedValueOnce(true);
+    const event = makeBotMessageEvent({
+      senderOpenId: 'ou_platform_bot',
+      rootId: undefined,
+      content: JSON.stringify({ text: '@_user_1 @_user_2 开工吧' }),
+      mentions: [
+        { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_2', name: '提需求的人', id: { open_id: 'ou_req_person' } },
+      ],
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockAddChatGrant).toHaveBeenCalledTimes(1);
+    expect(mockAddChatGrant).toHaveBeenCalledWith(
+      MY_APP_ID, 'chat-001', 'ou_req_person', expect.any(Number), expect.any(Number),
+    );
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID, 'msg-001', expect.any(String), 'interactive',
+    );
+    // 委托 bot 自己没有 talk 权（unknown peer）→ 授权完人群后消息仍不路由给 CLI。
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('delegated grant: runs after the defaultOncall lazy bind, so oncall-blessed people are not re-granted', async () => {
+    // defaultOncall 群的 oncall 绑定是首条消息时才懒写入的。applyDelegatedGrants 用
+    // evaluateTalk 判「已能说话就跳过」：若它跑在 ensureDefaultOncallBound 之前，就看不到
+    // 那一刻刚建立的 oncall 绑定 → 给本来就能说话的人白写一条 chatGrant、并回一张
+    // 「你已获授权」卡（oncall 群里纯噪音，也把 chatGrants 弄脏）。
+    setupBotState({ allowedUsers: ['ou_owner'], grantDelegateBots: ['ou_platform_bot'] });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：锁内 RMW + 磁盘写之后才把绑定发布进内存态（findOncallChat 读的那份）。
+      await Promise.resolve();
+      await Promise.resolve();
+      const entry = { chatId: 'chat-001', workingDir: '/repo' };
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: 'ou_platform_bot',
+      rootId: undefined,
+      content: JSON.stringify({ text: '@_user_1 @_user_2 开工吧' }),
+      mentions: [
+        { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_2', name: '提需求的人', id: { open_id: 'ou_req_person' } },
+      ],
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // oncall 腿放行 → 跳过落库、不发卡。
+    expect(mockAddChatGrant).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalledWith(
+      MY_APP_ID, 'msg-001', expect.any(String), 'interactive',
+    );
+  });
+
+  it('delegated grant: bot senders not in grantDelegateBots grant nothing', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      rootId: undefined,
+      content: JSON.stringify({ text: '@_user_1 @_user_2 开工吧' }),
+      mentions: [
+        { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_2', name: '提需求的人', id: { open_id: 'ou_req_person' } },
+      ],
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockAddChatGrant).not.toHaveBeenCalled();
   });
 
   it('still drops an unknown-peer bot even when it sends /t (no force-topic gate bypass)', async () => {
