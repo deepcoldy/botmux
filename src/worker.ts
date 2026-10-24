@@ -4545,7 +4545,7 @@ function observeTraexAutoModelCapacity(screen: string): void {
     return;
   }
   const awaitingActivity = controller.awaitingModelActivity();
-  const progressing = traexModelProgressVisible(screen);
+  const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
     queued: traexCapacityQueueVisible(screen),
@@ -16735,7 +16735,9 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 function traexAutoModelInputHold(): boolean {
   return traexAutoModelRuntimeEligible() && (
     traexAutoModelSwitching
-    || traexAutoModelController?.awaitingModelActivity() === true
+    // Native async admission checks activity on the actual pane. A rendered
+    // display snapshot may omit the first row when rebuilding a full viewport.
+    || (traexAutoModelController?.awaitingModelActivity() === true && !backend?.captureViewportAsync)
     // Other native screen backends retain their existing admission path.
     // tmux uses fresh async reads below; PTY uses the drained renderer.
     || (!isPromptReady && !!backend && !backend.captureViewportAsync
@@ -16769,11 +16771,14 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   const generation = cliSpawnGeneration;
   const turnId = currentBotmuxTurnId;
   const poolTurnId = controller?.currentTurnId();
+  const poolModel = controller?.currentModel();
+  const awaitingActivity = controller?.awaitingModelActivity();
   const targetRenderer = renderer;
   const revision = backendScreenRevision;
   const gridRevision = observedPaneGridRevision;
   const current = () => backend === target && cliSpawnGeneration === generation
     && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
+    && controller?.currentModel() === poolModel && controller?.awaitingModelActivity() === awaitingActivity
     && currentBotmuxTurnId === turnId && pendingMessages[0] === item
     && renderer === targetRenderer && !cliRestartInProgress
     && !traexAutoModelSwitching && traexAutoModelRuntimeEligible();
@@ -16781,9 +16786,7 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     retryTraexAutoModelAdmission();
     return false;
   };
-  if (!target || !current()
-    || (controller?.awaitingModelActivity()
-      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
+  if (!target || !current()) return hold();
   // Keep other native screen/history backends on their existing admission
   // contract. Do not disguise their synchronous capture as an async read.
   if (!backendScreenEvidenceIsAuthoritativeForMutation()
@@ -16803,15 +16806,18 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     if (!current() || backendScreenRevision !== revision || observedPaneGridRevision !== gridRevision
       || commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight()
       || currentInputDeliveryQuarantine() || currentPostTerminalInputFence()
-      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)
-      || (controller?.awaitingModelActivity()
-        && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
-    if (!screen || traexCapacityQueueVisible(screen)) return hold();
+      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)) return hold();
+    if (!screen || traexCapacityQueueVisible(screen) || cliAdapter?.startupPendingPattern?.test(screen)) return hold();
+    const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+    if (controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId)) {
+      if (!progressing) return hold();
+      controller.observeCapacityQueue({ turnId: poolTurnId, queued: false, progressing: true, nowMs: Date.now() });
+    }
     // Absence of Queued is insufficient: empty/skeleton/unknown frames cannot
     // grant input. Use positive model activity or the actual composer marker;
     // readyPattern's Context percentage is also present on queue screens.
-    if (cliAdapter?.startupPendingPattern?.test(screen)) return hold();
-    return traexModelProgressVisible(screen)
+    return progressing
       || traexQueuedTypeAheadVisible(screen)
       || /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/.test(screen)
       || hold();
@@ -17223,6 +17229,9 @@ async function flushPending(): Promise<void> {
                 + `(${action.fromModel} -> ${action.toModel})`,
               );
               traexAutoModelController?.beginTurn(item.turnId, { retainCurrentModel: true });
+            }
+            if (traexAutoModelRuntimeEligible() && !traexAutoModelTurnReplayForbidden) {
+              traexAutoModelController?.markInputSubmitted(item.turnId);
             }
           }
           if (traexAutoModelRuntimeEligible()) {

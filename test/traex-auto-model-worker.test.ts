@@ -59,6 +59,17 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
 }
 
 describe('auto-model Worker admission and original-input retirement', () => {
+  it('does not admit a follow-up on the stale composer after the first input was submitted', async () => {
+    const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+    h.scope.backend.captureViewportAsync = async () => '◆ Working… (2s • esc to interrupt)';
+    expect(await h.admit()).toBe(true);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
   it('recovers the actual live model and its settings after a worker upgrade, and persists a same-model hold change', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000,
       modelSettings: { core: { reasoningEffort: 'high', modelBackendVariant: 'max' },
@@ -341,7 +352,7 @@ describe('Auto live follow-up input policy', () => {
     let frame = '❯ Ask anything';
     Object.assign(h.scope, { isPromptReady: false, backend: {}, commandLineWritesPending: 0,
       currentBotmuxTurnId: 'turn', captureBackendScreen: () => frame,
-      traexCapacityQueueVisible, traexModelProgressVisible, traexCapacityQueuePosition: () => undefined,
+      traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible, traexCapacityQueuePosition: () => undefined,
       flushPending: vi.fn(async () => {}), publishActiveRuntime: vi.fn() });
     const hold = loadWorkerFunction<() => boolean>('traexAutoModelInputHold', h.scope);
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
@@ -508,7 +519,7 @@ describe('Worker read-only capacity query', () => {
       cliAdapter: { resolvedBin: 'traex' }, buildSessionChildEnv, botInjectedEnv,
       process: { env: { HTTP_PROXY: 'host-proxy', API_TOKEN: 'host-token', KEEP: 'yes' } },
       traexCapacityQueueVisible: () => true, traexCapacityQueuePosition: () => undefined,
-      traexModelProgressVisible: () => false, readTraexModelLoads: read,
+      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false, readTraexModelLoads: read,
       executeTraexAutoModelSwitch: vi.fn(), publishActiveRuntime: vi.fn(), send: vi.fn(), log: vi.fn(),
     };
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
