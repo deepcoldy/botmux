@@ -520,6 +520,114 @@ describe('isOpenCodeSessionBusy V2', () => {
     expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => true)).toBe(true);
     expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => false)).toBe(false);
   });
+
+  // —— 坏数据隔离（单行形态不标准不得毒化整个 busy 查询；withDb 会把抛错吞成
+  //    null → busy=false，恰好退回本 PR 要修的假空闲方向）——
+  const insertRawV2 = (
+    db: DatabaseSync,
+    sid: string,
+    type: string,
+    created: number,
+    rawData: string,
+    updated?: number,
+  ) => {
+    db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
+      .run(`msg_${++idSeq}`, sid, type, created, updated ?? created, rawData);
+  };
+
+  it('A: stays busy when a scalar-string content row coexists with an open user turn', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_poison_scalar_content';
+    const now = Date.now();
+    // 合法 JSON，但 content 是字符串标量（2.0.x 最终回复行真实可能的形状）
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 5_000, { content: 'Here is my answer' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 1_000, { time: { created: now - 1_000 }, text: 'go' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('B: stays busy when a content array holding a plain string element coexists with an open turn', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_poison_string_element';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 5_000, { content: ['plain string element'] });
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 1_000, { time: { created: now - 1_000 }, text: 'go' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('C: stays busy when a malformed-data row coexists with an open user turn', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_poison_malformed_data';
+    const now = Date.now();
+    // data 列本身不是合法 JSON，任何裸 json_extract 都会抛 malformed JSON
+    insertRawV2(db, sid, 'assistant', now - 5_000, '{not valid json');
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 1_000, { time: { created: now - 1_000 }, text: 'go' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('D: stays busy when a real nested running row coexists with a string-element row', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_poison_string_element_with_running';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 4_000, { content: ['plain string element'] });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 2_000,
+      assistant(now - 2_000, undefined, [toolPart('running')]), now - 500);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('E: reports idle without throwing when only bad rows exist and the turn is closed', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_poison_only_closed';
+    const now = Date.now();
+    insertRawV2(db, sid, 'assistant', now - 5_000, '{not valid json');
+    // 合法行须已 completed，否则会被「未完成 assistant」信号正常命中
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 4_000,
+      { time: { created: now - 4_000, completed: now - 3_900 }, content: 'scalar text' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 3_000,
+      { time: { created: now - 3_000, completed: now - 2_900 }, content: ['plain'] });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
+  });
+
+  it('F: isolates a running part by time_updated when its row was created before the idle marker', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_long_running_part_created_before_idle';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 40_000, { time: { created: now - 40_000 }, text: 'long turn' });
+    // 最近一条 idle（上一轮收工）晚于本回合 assistant 行的创建时间
+    insertV2(db, sid, `msg_${++idSeq}`, 'idle', now - 20_000, { time: { created: now - 20_000 }, outcome: 'succeeded' });
+    // 顶层已 completed（堵住 incomplete 信号），但嵌套 part 仍 running；行创建早于
+    // idle、在 idle 之后仍被刷新，且无 cutoff 之后的 user 行——只有按 time_updated
+    // 比较的嵌套查询能抓住它（time_created 比较会漏）。
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 30_000,
+      assistant(now - 30_000, now - 25_000, [toolPart('running')]), now - 500);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('G: reports idle after two finished turns, scoping by the latest idle marker (MAX not MIN)', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_two_finished_turns';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 60_000, { time: { created: now - 60_000 }, text: 'one' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'idle', now - 50_000, { time: { created: now - 50_000 }, outcome: 'succeeded' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 30_000, { time: { created: now - 30_000 }, text: 'two' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 20_000,
+      assistant(now - 20_000, now - 10_000, [{ type: 'text' }]));
+    insertV2(db, sid, `msg_${++idSeq}`, 'idle', now - 5_000, { time: { created: now - 5_000 }, outcome: 'succeeded' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
+  });
 });
 
 describe('createOpenCodeAdapter isSessionBusy', () => {

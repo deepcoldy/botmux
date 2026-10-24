@@ -295,6 +295,11 @@ export function isOpenCodeSessionBusy(
         "SELECT COALESCE(MAX(time_created), 0) AS t FROM session_message " +
         "WHERE session_id = ? AND type = 'idle'"
       ).get(cliSessionId) as { t?: number } | undefined;
+      // 各结构信号统一用「严格晚于 turnCutoff」做回合内隔离（time_updated /
+      // time_created > turnCutoff）。若某行的更新时刻与 idle 标记恰好同毫秒，该行
+      // 会被划到上一回合而漏判一步；实测 idle 落在最后一条 assistant completed
+      // 之后数毫秒，该窗口概率极低，且即使误判也只多等一个探测周期、下一条 idle
+      // 即可自愈，故保留严格大于（不用 >=）以免把刚闭合回合的收尾行重新判忙。
       const turnCutoff = lastIdle?.t ?? 0;
 
       // 第一步：纯结构性地判断回合是否尚未闭合，**不做任何时效筛选**。
@@ -309,26 +314,47 @@ export function isOpenCodeSessionBusy(
       //    100% 漏检。按行 time_updated 落在 idle 标记之后做回合内隔离：长工具
       //    的 time_created 可能很旧，但完成时 time_updated 会刷新；顶层查询保留
       //    作旧/未来行形状的防御性兜底。
+      //
+      //    坏数据隔离：同一会话里任意一行 data 非法、`content` 不是数组、或
+      //    content 元素是非 JSON 文本（实测 2.0.x 最终回复行 content 可能是纯
+      //    字符串标量、数组里也可能混普通字符串），都不能让整条 busy 查询抛错
+      //    而 fail-open——withDb 会把异常吞成 null → busy=false，恰好退回本函数
+      //    要修的假空闲。两道防护：
+      //    a) json_each 入口只对「合法 data 且 content 是数组」展开，否则给空数组
+      //       （坏 data / 标量 content 不产生任何元素）；
+      //    b) 元素取值用 CASE：json_each 对对象元素返回的 p.value 也是该对象的
+      //       JSON 文本（typeof 恒为 'text'），故 json_valid(p.value) 同时覆盖
+      //       真实对象 part 与「字符串元素里包着 JSON 文本」两种形状；普通字符串
+      //       /数字/null/布尔/嵌套数组由 json_valid 或 json_extract 返回 NULL 自然
+      //       排除。注意不要改成 json_type(p.value)='object'：它会把裸 JSON 文本
+      //       二次解析成 object 而转去取路径值，在字符串元素上路径为 NULL 反致漏检。
+      //    status 用 = 'running' 精确匹配：大小写变体（"Running"）或数值（42）不
+      //    算运行中（2.0.32 实测线形状恒为小写）；要容忍大小写须显式 lower()。
       const nestedRunningTool = db.prepare(
         "SELECT 1 AS busy FROM session_message AS m, " +
-        "json_each(json_extract(m.data, '$.content')) AS p " +
+        "json_each(CASE WHEN json_valid(m.data) AND json_type(m.data, '$.content') = 'array' " +
+        "THEN json_extract(m.data, '$.content') ELSE json_array() END) AS p " +
         "WHERE m.session_id = ? AND m.time_updated > ? " +
-        "  AND json_extract(p.value, '$.state.status') = 'running' " +
+        "  AND CASE WHEN json_valid(p.value) THEN json_extract(p.value, '$.state.status') END = 'running' " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
 
+      // 顶层 running 兜底：json_extract 必须包在顺序无关的 CASE 里（不能写
+      // `json_valid(data) AND json_extract(...)`——SQLite 不保证 AND 求值顺序，
+      // 反序或在 SELECT 投影里会对坏 data 抛 malformed JSON）。
       const topLevelRunning = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
         "WHERE session_id = ? AND time_updated > ? " +
-        "  AND json_extract(data, '$.state.status') = 'running' " +
+        "  AND CASE WHEN json_valid(data) THEN json_extract(data, '$.state.status') END = 'running' " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
 
-      // 2. 回合内已有 assistant message 但尚未 completed（模型生成中）。
+      // 2. 回合内已有 assistant message 但尚未 completed（模型生成中）。同样用
+      //    顺序无关 CASE 包住 json_extract，避免坏 data 行抛错毒化整个回调。
       const incompleteAssistant = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
         "WHERE session_id = ? AND type = 'assistant' AND time_updated > ? " +
-        "  AND json_extract(data, '$.time.completed') IS NULL " +
+        "  AND CASE WHEN json_valid(data) THEN json_extract(data, '$.time.completed') IS NULL ELSE 0 END " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
 
@@ -355,6 +381,14 @@ export function isOpenCodeSessionBusy(
       //  - 进程已退出：fail-open（与旧版孤儿保护意图一致）。opencode 下次打开
       //    该会话会自行对账：实测被杀会话残留的 running part 在 resume 时被
       //    改写为 tool/error、补齐 assistant completed，再正常写 idle 标记。
+      //
+      // 已知取舍（无上界）：若库里从无 idle 标记（旧版本写过的历史会话，或某次
+      // idle 落库失败）而 CLI 进程一直存活，turnCutoff=0、上面的结构信号恒真，
+      // busy 会一直保持——「从未 idle + 行全部陈旧 + 末条已 completed」与「长 relay
+      // 步骤间空档」仅凭 DB 无法区分（后者本就要求进程存活时继续判忙），故不做
+      // DB 侧超时兜底；进程退出即靠上面的 fail-open 解除。90s 首次就绪硬超时是
+      // worker 侧的独立逃生阀。如未来需要更早放行，应叠加「屏幕已出现 composer」
+      // 之类非 DB 信号，而不是给结构判据加时效。
       const liveness = isCliProcessAlive?.();
       if (liveness === true) return true;
       if (liveness === false) return false;
