@@ -15,6 +15,7 @@ import {
 } from './update-action.js';
 import { ui } from './ui.js';
 import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import { confirm } from './confirm-modal.js';
@@ -817,7 +818,7 @@ function SettingsPage() {
   );
 }
 
-function SettingsBody(props: {
+export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
   bound: boolean;
@@ -1282,52 +1283,31 @@ function focusSettingsTarget(sectionId: string, fieldTitle: string | null): void
   window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
 }
 
-function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+/** 导航按 SETTINGS_SECTIONS 生成：它的顺序就是页面区块的顺序，导航与区块一一对应。 */
+export function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
   const tr = props.tr;
-  const groups = [
-    {
-      label: tr('settings.moduleGeneral'),
-      items: [
-        { id: 'settings-access', label: tr('settings.sectionAccess') },
-        { id: 'settings-session-env', label: tr('sessionEnv.sectionTitle') },
-        { id: 'settings-cards', label: tr('settings.sectionCards') },
-        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
-        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
-        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
-        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
-        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
-        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
-      ],
-    },
-    {
-      label: tr('settings.moduleMeeting'),
-      items: [
-        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
-      ],
-    },
-    {
-      label: tr('settings.moduleSystem'),
-      items: [
-        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
-        { id: 'settings-update', label: tr('settings.sectionUpdate') },
-      ],
-    },
-  ];
+  const groups: Array<{ module: string; items: SettingsSection[] }> = [];
+  for (const section of SETTINGS_SECTIONS) {
+    const last = groups[groups.length - 1];
+    if (last?.module === section.module) last.items.push(section);
+    else groups.push({ module: section.module, items: [section] });
+  }
   return (
     <nav className="settings-nav" aria-label={tr('settings.title')}>
       {groups.map(group => (
-        <div key={group.label} className="settings-nav-group">
-          <p className="settings-nav-group-label">{group.label}</p>
+        <div key={group.module} className="settings-nav-group">
+          <p className="settings-nav-group-label">{tr(group.module)}</p>
           {group.items.map(item => (
             <button
               key={item.id}
               type="button"
               className="settings-nav-link"
+              data-section={item.id}
               onClick={() => {
                 document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
             >
-              {item.label}
+              {tr(item.section)}
             </button>
           ))}
         </div>
@@ -2077,7 +2057,7 @@ function TraexPluginEditor(props: {
   );
 }
 
-function AutostartCard(props: {
+export function AutostartCard(props: {
   canWrite: boolean;
   state: AutostartState | null;
   loading: boolean;
@@ -2129,7 +2109,7 @@ function AutostartCard(props: {
   return <SettingsBlock id="settings-autostart" title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
-function UpdateCard(props: {
+export function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
   statusError: string | null;

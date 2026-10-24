@@ -1,4 +1,5 @@
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -81,7 +82,7 @@ import {
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
-import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -1034,6 +1035,21 @@ export function renderProjectGroupModeBlock(
   }
 }
 
+/**
+ * 管家群里唯一常驻的一行：只有「开了管家的 bot × 它的管家群」才有，别的 bot、别的群一律空。
+ * 规则正文不常驻，由 `botmux board guide` 按需输出。零注入的会话在更早处整体返回，不走到这里。
+ */
+export function renderStewardContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
+  if (!larkAppId || !chatId) return '';
+  try {
+    const steward = getBot(larkAppId).config.steward;
+    if (steward?.enabled !== true || steward.chatId !== chatId) return '';
+    return renderStewardHintBlock(chatId);
+  } catch {
+    return '';
+  }
+}
+
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
@@ -1042,6 +1058,7 @@ function renderApplicationRoleBlock(
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
     renderProjectGroupModeBlock(larkAppId, chatId),
+    renderStewardContextBlock(larkAppId, chatId),
   ].filter(Boolean).join('\n\n');
 }
 
@@ -4949,6 +4966,229 @@ export async function executeScheduledTask(
     ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+  });
+}
+
+// ─── 决策看板：owner 提交的一批决定 → 管家群会话的一个回合 ─────────────────────
+
+export interface OwnerBatchTurnInput {
+  larkAppId: string;
+  /** 管家所在群（bots.json steward.chatId）。 */
+  chatId: string;
+  /** 回合 id：`board:<appId>:<batchId>`，按批次稳定；同批次重投 / 补投沿用，worker 内存去重据此挡重复执行。 */
+  turnId: string;
+  prompt: string;
+  /** 管家群里的横幅（等同 owner 发了一条消息；也是话题群 / new-topic 模式下的落点）。 */
+  banner: string;
+  attachments: LarkAttachment[];
+  /** 提交人 = 管家 bot 的 owner（本 app 视角的 open_id）。拿不到就按无身份投递。 */
+  ownerOpenId?: string;
+  ownerName?: string;
+  sessionTitle: string;
+}
+
+/**
+ * 把看板批次作为一个回合送进管家群的 chat 级会话：会话在跑就续接（忙时走 worker 现有排队），
+ * 挂起就冷启续接，没有就新建。落点规则与定时任务的 chat 级顶层执行相同（话题群 /
+ * new-topic 模式下以横幅开新话题，shared 模式回复挂在横幅下）。
+ *
+ * 不复用 executeScheduledTask：它的尾段交织着定时任务专属状态（silent、task 位置的虚拟锚点
+ * 与提升、deferredScheduleRun），看板批次一个都不需要；这里只组合同一批底层原语。
+ *
+ * 身份按「owner 刚发的一条消息」处理（senderType=user）：批次就是 owner 刚点的提交，
+ * 不是定时触发；回合 id 的 `board:` 前缀足以在审计里区分来源。
+ */
+export async function deliverOwnerBatchTurn(
+  input: OwnerBatchTurnInput,
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion,
+  runtime?: {
+    prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  },
+): Promise<{ sessionId: string }> {
+  const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
+  if (!bot) throw new Error(`steward bot ${input.larkAppId} is not loaded`);
+  const { larkAppId, chatId, turnId } = input;
+  const { getChatMode, sendMessage } = await import('../im/lark/client.js');
+  const chatMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+  const chatType: 'p2p' | 'group' = chatMode === 'p2p' ? 'p2p' : 'group';
+  const regularGroupMode = chatType === 'p2p' ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  // 横幅的发送时机分两种：
+  //  - 话题群 / new-topic：横幅本身就是新话题锚点，全新 om_ id 下不可能有正在开场的会话，
+  //    锁外发（与定时任务 new-topic 落点同形）；
+  //  - shared / chat / p2p：锚点就是 chatId，横幅只是通知和 shared 模式的回复根。必须等锁内
+  //    开场保留 / 恢复归属检查通过后再发——否则管家会话还在选仓库时投递被拒，页面每重投一次
+  //    群里就多一条横幅。
+  const independentByMode = chatMode === 'topic' || regularGroupMode === 'new-topic';
+  let bannerId: string | undefined;
+  let bannerAttempted = false;
+  const postBanner = async (): Promise<string | undefined> => {
+    if (bannerAttempted) return bannerId;
+    bannerAttempted = true;
+    try {
+      bannerId = await sendMessage(larkAppId, chatId, input.banner);
+    } catch (err: any) {
+      logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+    }
+    return bannerId;
+  };
+  if (independentByMode) await postBanner();
+  // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
+  const opensIndependentTopic = independentByMode && !!bannerId;
+  const anchor = opensIndependentTopic ? bannerId! : chatId;
+  const sharedRootFor = (id: string | undefined): string | undefined =>
+    !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
+  const trustedCaller: CliTurnPayload['trustedCaller'] = input.ownerOpenId
+    ? { requestUserOpenId: input.ownerOpenId, requestLarkAppId: larkAppId, senderType: 'user' }
+    : undefined;
+  const sender: ResolvedSender | undefined = input.ownerOpenId
+    ? { openId: input.ownerOpenId, type: 'user', ...(input.ownerName ? { name: input.ownerName } : {}) }
+    : undefined;
+
+  refreshCliVersion(bot.config);
+  const key = sessionKey(anchor, larkAppId);
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    const existing = activeSessions.get(key);
+    if (existing) {
+      const reservedState = existing.pendingRepo
+        ? 'pending_repo'
+        : existing.pendingRepoCommitInFlight
+          ? 'pending_repo_commit'
+          : existing.initialStartPending
+            ? 'initial_start_pending'
+            : existing.worktreeCreating
+              ? 'worktree_creating'
+              : existing.session.queued
+                ? 'queued_backlog'
+                : undefined;
+      // 管家会话还在等开场（选仓库、建 worktree…）：不能抢在开场 prompt 前面，留给重投。
+      if (reservedState) throw new Error(`steward session ${existing.session.sessionId} is in ${reservedState}`);
+      if (hasProtectedSessionMutationOwnership(existing)) {
+        throw new Error(`steward session ${existing.session.sessionId} is being recovered`);
+      }
+      if (isRelayableRealSession(existing) || existing.session.suspendedColdResume) {
+        await runtime?.prepareTurnIdentity?.(existing, turnId);
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
+        }
+        // 开场检查过了才发横幅（shared 模式用它做这一回合的回复根）。
+        const sharedTopicRootId = sharedRootFor(await postBanner());
+        // 批次就是 owner 刚点的提交：按真人入站同口径刷新人活动钟，并清掉管家的决策举手
+        // （否则 Dashboard「需要你」常亮，且空闲自动关闭会一直跳过这个会话）。
+        markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
+        clearAgentAttention(existing);
+        ensureSessionWhiteboard(existing);
+        if (sharedTopicRootId) {
+          beginReplyTargetTurn(existing, sharedTopicRootId, turnId);
+          sessionStore.updateSession(existing.session);
+        }
+        const payload = buildFollowUpCliInput(input.prompt, existing.session.sessionId, {
+          isAdoptMode: false,
+          cliId: existing.session.cliLaunchSnapshot?.cliId ?? existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliLaunchSnapshot?.cliPathOverride ?? existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          locale: localeForBot(larkAppId),
+          larkAppId,
+          chatId,
+          whiteboardId: existing.session.whiteboardId,
+          sessionBackendType: existing.session.backendType,
+          promptInjection: sessionPromptInjection(existing),
+          attachments: input.attachments,
+          sender,
+          turnId,
+          trustedCaller,
+        });
+        rememberLastCliInput(existing, input.prompt, payload);
+        if (existing.worker && !existing.worker.killed) {
+          try {
+            if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
+              logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
+              return { sessionId: existing.session.sessionId };
+            }
+          } catch (err: any) {
+            logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
+          }
+        }
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
+        }
+        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
+        return { sessionId: existing.session.sessionId };
+      }
+      if (isDisposableCommandScratch(existing)) {
+        await closeSession(existing.session.sessionId);
+        if (activeSessions.get(key) === existing) activeSessions.delete(key);
+      }
+    }
+
+    const runtimeScope: 'thread' | 'chat' = anchor === chatId ? 'chat' : 'thread';
+    // 确定要新建会话了（chat/shared/p2p 路径的横幅拖到这里才发）。
+    const sharedTopicRootId = sharedRootFor(await postBanner());
+    const session = sessionStore.createSession(chatId, anchor, input.sessionTitle, chatType, undefined, { source: 'ordinary-feishu' });
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = runtimeScope;
+    if (input.ownerOpenId) {
+      session.ownerOpenId = input.ownerOpenId;
+      // 批次按 owner 本人的消息投递，新人活动钟与真人开话题同口径（follow-active 据此落点）。
+      stampHumanActivity(session, now);
+    }
+    session.lastMessageAt = new Date(now).toISOString();
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType,
+      scope: runtimeScope,
+      spawnedAt: sessionCreatedAtMs(session),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: effectiveDefaultWorkingDir(bot.config),
+      initialStartPending: true,
+      pendingPrompt: input.prompt,
+    };
+    if (sharedTopicRootId) {
+      beginReplyTargetTurn(ds, sharedTopicRootId, turnId);
+      sessionStore.updateSession(ds.session);
+    }
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
+      ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
+      input.attachments, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId },
+      localeForBot(larkAppId), sender, {
+        larkAppId,
+        chatId,
+        whiteboardId: ds.session.whiteboardId,
+        trustedCaller,
+        promptInjection: sessionPromptInjection(ds),
+        larkToolResume: false,
+        turnId,
+      });
+    try {
+      await runtime?.prepareTurnIdentity?.(ds, turnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
+    if (!setActiveSessionIfActive(activeSessions, key, ds)) {
+      const winner = activeSessions.get(key);
+      await closeSession(session.sessionId);
+      throw new Error(`decision board batch lost active-session registration for ${anchor}`
+        + (winner ? ` to ${winner.session.sessionId}` : ''));
+    }
+    rememberLastCliInput(ds, input.prompt, prompt);
+    forkWorker(ds, prompt, turnId);
+    ds.initialStartPending = false;
+    ds.pendingPrompt = undefined;
+    logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
+    return { sessionId: session.sessionId };
   });
 }
 

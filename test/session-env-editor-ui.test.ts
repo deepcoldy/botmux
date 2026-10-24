@@ -2,10 +2,12 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionEnvEditor, SessionEnvLiveModal } from '../src/dashboard/web/session-env-editor.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => vi.unstubAllGlobals());
 
 const SECRET = 'raw-secret-sentinel-9999';
+const zh = createDashboardTranslator('zh');
 
 function botView(canReveal: boolean) {
   return {
@@ -30,6 +32,9 @@ function botView(canReveal: boolean) {
       { key: 'ANTHROPIC_AUTH_TOKEN', state: 'set', source: 'bot', entry: 'set', value: '••••••9999', masked: true,
         lower: { source: 'host', state: 'inherited', value: '••••••0000', masked: true } },
       { key: 'BYTECLOUD_AUTH_AS', state: 'unset', source: 'global', value: '••••••', masked: true },
+      { key: 'EDITOR', state: 'inherited', source: 'host', value: 'vim' },
+      { key: 'HTTPS_PROXY', state: 'set', source: 'global', value: 'http://proxy.example.com:8080',
+        lower: { source: 'host', state: 'inherited', value: 'http://corp-proxy.example.com:3128' } },
       { key: 'LANG', state: 'inherited', source: 'host', value: 'C' },
       { key: 'PATH', state: 'inherited', source: 'host', value: '/usr/bin', lock: 'no-unset' },
     ],
@@ -54,6 +59,10 @@ async function render(el: React.ReactElement) {
 const text = (v: TestRenderer.ReactTestRenderer) => JSON.stringify(v.toJSON());
 const row = (v: TestRenderer.ReactTestRenderer, key: string) => v.root.find(n => n.props['data-env-row'] === key);
 const button = (n: TestRenderer.ReactTestInstance, action: string) => n.findAll(c => c.type === 'button' && c.props['data-action'] === action);
+const shownRows = (v: TestRenderer.ReactTestRenderer) => v.root.findAll(n => n.type === 'tr' && n.props['data-env-row'] !== undefined).map(n => n.props['data-env-row']);
+const foldRow = (v: TestRenderer.ReactTestRenderer) => v.root.find(n => n.type === 'tr' && n.props['data-session-env-inherited'] !== undefined);
+const nodeText = (n: TestRenderer.ReactTestInstance): string => n.children.map(c => typeof c === 'string' ? c : nodeText(c)).join('');
+const toggleInherited = (v: TestRenderer.ReactTestRenderer) => act(() => v.root.findByProps({ 'data-action': 'toggle-inherited' }).props.onClick());
 
 describe('SessionEnvEditor (bot scope)', () => {
   it('shows masked values and offers reveal only to the owner', async () => {
@@ -76,6 +85,7 @@ describe('SessionEnvEditor (bot scope)', () => {
     stubFetch(botView(true));
     const onEnvSaved = vi.fn();
     const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a', onEnvSaved } }));
+    toggleInherited(v);
     await act(async () => { button(row(v, 'LANG'), 'remove-session-env')[0]!.props.onClick(); });
     expect(onEnvSaved).toHaveBeenCalledOnce();
     act(() => v.unmount());
@@ -85,6 +95,7 @@ describe('SessionEnvEditor (bot scope)', () => {
     const fetcher = stubFetch(botView(true));
     const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a' } }));
     const put = () => fetcher.mock.calls.filter(c => (c[1] as RequestInit | undefined)?.method === 'PUT');
+    toggleInherited(v);
 
     // own entry → restore = reset
     await act(async () => { button(row(v, 'ANTHROPIC_AUTH_TOKEN'), 'reset-session-env')[0]!.props.onClick(); });
@@ -99,6 +110,34 @@ describe('SessionEnvEditor (bot scope)', () => {
     expect(button(row(v, 'PATH'), 'remove-session-env')).toHaveLength(0);
     expect(button(row(v, 'PATH'), 'override-session-env')).toHaveLength(1);
     expect(button(row(v, 'BYTECLOUD_AUTH_AS'), 'remove-session-env')).toHaveLength(0);
+    act(() => v.unmount());
+  });
+
+  it('shows only this layer\'s own entries; everything inherited (incl. the global layer\'s changes) folds into one row', async () => {
+    stubFetch(botView(true));
+    const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a' } }));
+    expect(shownRows(v)).toEqual(['ANTHROPIC_AUTH_TOKEN']);
+    expect(foldRow(v).props['data-session-env-inherited']).toBe('closed');
+    // 摘要里点明有几条来自全局层的设置 / 去掉，不点开也知道。
+    expect(nodeText(foldRow(v))).toContain(zh('sessionEnv.inheritedShowGlobal', { count: 5, global: 2 }));
+
+    toggleInherited(v);
+    // 展开后全局层的改动排在宿主继承前面。
+    expect(shownRows(v)).toEqual(['ANTHROPIC_AUTH_TOKEN', 'BYTECLOUD_AUTH_AS', 'HTTPS_PROXY', 'EDITOR', 'LANG', 'PATH']);
+    expect(foldRow(v).props['data-session-env-inherited']).toBe('open');
+    toggleInherited(v);
+    expect(shownRows(v)).toEqual(['ANTHROPIC_AUTH_TOKEN']);
+    act(() => v.unmount());
+  });
+
+  it('searches the folded variables too, without expanding first', async () => {
+    stubFetch(botView(true));
+    const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'bot', larkAppId: 'app_a' } }));
+    act(() => v.root.findByProps({ 'data-input': 'session-env-filter' }).props.onChange({ currentTarget: { value: 'lan' } }));
+    expect(shownRows(v)).toEqual(['LANG']);
+    expect(button(row(v, 'LANG'), 'remove-session-env')).toHaveLength(1);
+    act(() => v.root.findByProps({ 'data-input': 'session-env-filter' }).props.onChange({ currentTarget: { value: '' } }));
+    expect(shownRows(v)).toEqual(['ANTHROPIC_AUTH_TOKEN']);
     act(() => v.unmount());
   });
 
@@ -136,6 +175,39 @@ describe('SessionEnvEditor (bot scope)', () => {
       method: 'PUT', body: JSON.stringify({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY', 'NO_PROXY'] } }),
     }));
     expect(onPolicySaved).toHaveBeenCalledWith({ mode: 'strict', inherit: ['HTTPS_PROXY', 'NO_PROXY'] });
+    act(() => v.unmount());
+  });
+});
+
+describe('SessionEnvEditor (global scope)', () => {
+  it('shows only the global entries and keeps both tmux server tables collapsed until opened', async () => {
+    stubFetch({
+      ok: true,
+      scope: 'global',
+      canReveal: true,
+      reserved: { keys: ['TMPDIR'], prefixes: ['BOTMUX'] },
+      redactedHostKeys: [],
+      conflicts: [],
+      sessions: [],
+      rows: [
+        { key: 'EDITOR', state: 'inherited', source: 'host', value: 'vim' },
+        { key: 'HTTPS_PROXY', state: 'set', source: 'global', entry: 'set', value: 'http://proxy.example.com:8080' },
+        { key: 'LANG', state: 'inherited', source: 'host', value: 'C' },
+      ],
+      tmuxServers: [
+        { socket: null, managed: false, found: true, vars: [{ key: 'A', value: '1' }] },
+        { socket: 'botmux', managed: true, found: true, vars: [{ key: 'B', value: '2' }] },
+      ],
+    });
+    const v = await render(React.createElement(SessionEnvEditor, { scope: { kind: 'global' } }));
+    expect(shownRows(v)).toEqual(['HTTPS_PROXY']);
+    expect(nodeText(foldRow(v))).toContain(zh('sessionEnv.inheritedShow', { count: 2 }));
+    const tmux = v.root.find(n => n.props['data-session-env-tmux'] === '');
+    const servers = tmux.findAll(n => n.type === 'details');
+    expect(servers).toHaveLength(2);
+    expect(servers.map(d => !!d.props.open)).toEqual([false, false]);
+    // 表格还在，展开就能看到并移除（<details> 的展开由浏览器负责）。
+    expect(tmux.findAll(n => n.type === 'tr').map(n => nodeText(n.findAll(c => c.type === 'td')[0]!))).toEqual(['A', 'B']);
     act(() => v.unmount());
   });
 });

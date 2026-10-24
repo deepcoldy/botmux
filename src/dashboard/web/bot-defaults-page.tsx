@@ -108,6 +108,17 @@ import {
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
+import { fetchStewardGuide } from './decision-board-api.js';
+import {
+  DECISION_BOARD_CHANGED_EVENT,
+  boardSummaryHash,
+  stewardErrorText,
+  stewardFormFrom,
+  stewardGuideProblem,
+  stewardPayload,
+  type StewardForm,
+  type StewardGuideMode,
+} from './decision-board-model.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
@@ -1109,6 +1120,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
@@ -6116,6 +6128,197 @@ function SessionModeSection(props: {
         </div>
         <div className="actions"><StatusSpan status={docStatus} attr={{ 'data-doc-subscribe-mode-status': '' }} /></div>
       </div>
+    </section>
+  );
+}
+
+/**
+ * 管家（决策看板）：开关、管家所在群、提示词（预置 + 追加 / 替换）。三样存在 bots.json 的
+ * `steward` 一个字段里，所以每次保存都发完整对象：开关和选群立刻保存（带上已保存的提示词，
+ * 不顺手把没点保存的文本框内容写进去）；提示词点「保存提示词」才写。
+ */
+export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
+  const tr = useT();
+  const appId = props.bot.larkAppId;
+  const savedForm = useMemo(() => stewardFormFrom(props.bot.steward), [props.bot.steward]);
+  const [enabled, setEnabled] = useState(savedForm.enabled);
+  const [chatId, setChatId] = useState(savedForm.chatId);
+  const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
+  const [guideText, setGuideText] = useState(savedForm.guideText);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [guideStatus, setGuideStatus] = useState<StatusMessage>(null);
+  const [chats, setChats] = useState<GroupChat[] | null>(null);
+  const [guide, setGuide] = useState<{ preset: string; effective: string } | 'offline' | null>(null);
+  // 群列表要完整矩阵（memberBots），很大：只在「会话」分类打开、且开了管家时每 bot 拉一次。
+  const chatsGateRef = useRef(createOncePerKeyGate());
+  const guideGateRef = useRef(createOncePerKeyGate());
+  const pickerId = useId();
+  const guideTextId = useId();
+
+  // 各自只在自己那部分的已保存值变化时同步：保存开关后不能把没保存的提示词冲掉。
+  useEffect(() => { setEnabled(savedForm.enabled); }, [appId, savedForm.enabled]);
+  useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
+  useEffect(() => {
+    setGuideMode(savedForm.guideMode);
+    setGuideText(savedForm.guideText);
+  }, [appId, savedForm.guideMode, savedForm.guideText]);
+  useEffect(() => { setStatus(null); setGuideStatus(null); }, [appId]);
+
+  useEffect(() => {
+    if (!props.active || !enabled) return;
+    if (!chatsGateRef.current.claim(appId)) return;
+    setChats(null);
+    void fetchGroupsSnapshot().then(snapshot => {
+      if (!chatsGateRef.current.claimed(appId)) return;
+      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === appId && member.inChat)));
+    }).catch(() => {
+      setChats([]);
+      chatsGateRef.current.release(appId);
+    });
+  }, [appId, props.active, enabled]);
+
+  const loadGuide = useCallback(() => {
+    void fetchStewardGuide(appId).then(next => {
+      if (guideGateRef.current.claimed(appId)) setGuide(next);
+    }).catch(() => {
+      if (guideGateRef.current.claimed(appId)) setGuide('offline');
+    });
+  }, [appId]);
+
+  useEffect(() => {
+    if (!props.active || !enabled) return;
+    if (!guideGateRef.current.claim(appId)) return;
+    setGuide(null);
+    loadGuide();
+  }, [appId, props.active, enabled, loadGuide]);
+
+  async function save(next: StewardForm, setSlot: (status: StatusMessage) => void, rollback?: () => void): Promise<boolean> {
+    return saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/steward`, { steward: stewardPayload(next) }),
+      setStatus: setSlot,
+      setBusy,
+      saved: tr('botDefaults.stewardSaved'),
+      errorText: res => stewardErrorText(res.body?.error ?? res.status, tr),
+      onSaved: body => {
+        props.patchBot(appId, { steward: body.steward ?? null });
+        // 侧边栏的「决策看板」按有没有管家决定显示与否。
+        window.dispatchEvent(new Event(DECISION_BOARD_CHANGED_EVENT));
+        if (guideGateRef.current.claimed(appId)) loadGuide();
+      },
+      rollback,
+    });
+  }
+
+  function toggleEnabled(on: boolean): void {
+    const previous = enabled;
+    setEnabled(on);
+    void save({ ...savedForm, enabled: on }, setStatus, () => setEnabled(previous));
+  }
+
+  function changeChat(next: string): void {
+    const previous = chatId;
+    setChatId(next);
+    void save({ ...savedForm, chatId: next }, setStatus, () => setChatId(previous));
+  }
+
+  function saveGuide(): void {
+    const form: StewardForm = { ...savedForm, guideMode, guideText };
+    if (stewardGuideProblem(form) === 'replace_empty') {
+      setGuideStatus({ text: `✗ ${tr('botDefaults.stewardGuideReplaceEmpty')}` });
+      return;
+    }
+    void save(form, setGuideStatus);
+  }
+
+  const guideDirty = guideMode !== savedForm.guideMode || guideText.trim() !== savedForm.guideText.trim();
+  const chatOptions = chats
+    ? [...chats, ...(chatId && !chats.some(chat => chat.chatId === chatId) ? [{ chatId }] : [])]
+    : (chatId ? [{ chatId }] : []);
+  const selectedChat = chats?.find(chat => chat.chatId === chatId);
+  const missingChat: StatusMessage = enabled && !chatId ? { text: tr('botDefaults.stewardChatMissing') } : null;
+
+  return (
+    <section className="bd-section bd-steward-section" aria-busy={busy} data-steward-section>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSteward')}</h3>
+      <p className="bd-section-note">{tr('botDefaults.stewardIntro')}</p>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-steward"
+        title={tr('botDefaults.stewardEnabled')}
+        help={tr('botDefaults.stewardEnabledHelp')}
+        onChange={toggleEnabled}
+      />
+      <div className="bd-mode-group-side"><StatusSpan status={status ?? missingChat} attr={{ 'data-steward-status': '' }} /></div>
+      {enabled ? (
+        <>
+          <div className="bd-row bd-steward-chat">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.stewardChatHelp')}>{tr('botDefaults.stewardChat')}</FieldTitle>
+              <SearchableGroupPicker
+                id={pickerId}
+                label={tr('botDefaults.stewardChat')}
+                groups={chatOptions}
+                value={chatId}
+                disabled={busy || chats === null}
+                placeholder={chats === null ? tr('botDefaults.stewardChatLoading') : tr('botDefaults.stewardChatPlaceholder')}
+                searchPlaceholder={tr('botDefaults.stewardChatSearch')}
+                emptyLabel={tr('botDefaults.stewardChatEmpty')}
+                selectedCountLabel={count => String(count)}
+                onChange={value => changeChat(String(value))}
+              />
+              {selectedChat?.chatMode === 'topic' ? <p className="bd-section-note">{tr('botDefaults.stewardChatTopic')}</p> : null}
+            </div>
+          </div>
+          <div className="bd-row bd-steward-guide">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.stewardGuideHelp')}>{tr('botDefaults.stewardGuide')}</FieldTitle>
+              <details className="bd-steward-preset">
+                <summary>{tr('botDefaults.stewardPreset')}</summary>
+                {guide === null
+                  ? <p className="bd-section-note">{tr('botDefaults.stewardPresetLoading')}</p>
+                  : guide === 'offline'
+                    ? <p className="bd-section-note">{tr('botDefaults.stewardPresetOffline')}</p>
+                    : <pre className="bd-steward-guide-text">{guide.preset}</pre>}
+              </details>
+              <div className="bd-steward-mode" role="radiogroup" aria-label={tr('botDefaults.stewardModeLabel')}>
+                <label>
+                  <input type="radio" name={`steward-mode-${appId}`} checked={guideMode === 'append'} disabled={busy} onChange={() => setGuideMode('append')} />
+                  <span>{tr('botDefaults.stewardModeAppend')}</span>
+                </label>
+                <label>
+                  <input type="radio" name={`steward-mode-${appId}`} checked={guideMode === 'replace'} disabled={busy} onChange={() => setGuideMode('replace')} />
+                  <span>{tr('botDefaults.stewardModeReplace')}</span>
+                </label>
+              </div>
+              {guideMode === 'replace' ? <p className="bd-section-note">{tr('botDefaults.stewardModeReplaceHint')}</p> : null}
+              <textarea
+                id={guideTextId}
+                className="bd-steward-guide-input"
+                aria-label={tr('botDefaults.stewardGuide')}
+                value={guideText}
+                rows={5}
+                maxLength={20_000}
+                disabled={busy}
+                placeholder={tr('botDefaults.stewardGuidePlaceholder')}
+                onChange={event => setGuideText(event.currentTarget.value)}
+              />
+              <div className="actions bd-steward-guide-actions">
+                <button type="button" className="primary" disabled={busy || !guideDirty} onClick={saveGuide}>{tr('botDefaults.stewardGuideSave')}</button>
+                <StatusSpan status={guideStatus} attr={{ 'data-steward-guide-status': '' }} />
+              </div>
+              {guide && guide !== 'offline' && savedForm.guideText ? (
+                <details className="bd-steward-preset">
+                  <summary>{tr('botDefaults.stewardEffective')}</summary>
+                  <pre className="bd-steward-guide-text">{guide.effective}</pre>
+                </details>
+              ) : null}
+            </div>
+          </div>
+          <a className="bd-steward-open" href={boardSummaryHash({ appId })}>{tr('botDefaults.stewardOpenBoard')} →</a>
+        </>
+      ) : null}
     </section>
   );
 }

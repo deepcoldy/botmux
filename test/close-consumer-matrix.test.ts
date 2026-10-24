@@ -171,6 +171,13 @@ const CONSUMERS: Record<string, Rule> = {
       + 'closeSession itself. No user surface at schedule time.',
     count: 2,
   },
+  'core/session-manager.ts::deliverOwnerBatchTurn::closeSession': {
+    category: 'background',
+    why: 'Decision-board batch delivery reclaims either a disposable scratch at the '
+      + 'steward anchor or its own candidate that lost the active-session CAS. No user '
+      + 'surface: a refusal leaves the row active and is logged by closeSession itself.',
+    count: 2,
+  },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Host recovery uses the native background wrapper to log refusal and '

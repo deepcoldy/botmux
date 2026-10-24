@@ -672,6 +672,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
 import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
@@ -818,6 +819,7 @@ import {
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
+import { recentCliUpgrade } from './cli-version-history.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -1091,6 +1093,15 @@ export interface WorkerPoolCallbacks {
       activeController?: TrustedCaller;
     },
   ) => boolean | Promise<boolean>;
+  /** A decision-board batch turn (`board:<app>:<batchId>`) never got a
+   * confirmed worker receipt (watchdog expiry or authoritative rejection).
+   * The pool does NOT post its usual group failure card for these turns:
+   * the owner is on the dashboard, where the batch row carries the failure
+   * and the re-deliver action. The daemon marks the batch failed here. */
+  onBoardTurnDeliveryFailed?: (
+    ds: DaemonSession,
+    context: { turnId: string; reason: string; messageKey: string },
+  ) => void;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -10546,6 +10557,25 @@ function failOrdinaryImDelivery(
     );
     return;
   }
+  // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
+  // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
+  // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
+  if (record.turnId.startsWith('board:')) {
+    try {
+      const handled = requireCallbacks().onBoardTurnDeliveryFailed?.(
+        record.ds,
+        { turnId: record.turnId, reason, messageKey },
+      );
+      void Promise.resolve(handled).catch(err => logger.error(
+        `[${tag(record.ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
+      ));
+    } catch (err) {
+      logger.error(
+        `[${tag(record.ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return;
+  }
   // Plan B: a meeting agent is an ordinary chat-scope session. This tracker only
   // ever holds ORDINARY IM turns (durable transcript deliveries use the receipt
   // path, not this map), so a plain user turn's delivery failure must be reported
@@ -10709,12 +10739,18 @@ function sendOrdinaryImDeliveryTracked(
   return sendOrdinaryImDeliveryAttempt(record);
 }
 
+/**
+ * 哪些回合走「ordinary turn 投递协议」：daemon 侧 begin/complete 投递追踪（收据
+ * ACK + 同代重试 + 终态失败上报），worker 侧收到/提交内存去重，冷启动 preload 补
+ * 收据。前缀族只有 isOrdinaryImTurnId 这一处定义：真人 om_ 消息、bmx-recovery-
+ * 恢复回合、board: 决策看板批次（id 按批次稳定）。名字保留 "Im" 是因为整套协议
+ * 是按「owner 的一条普通消息」建模的——看板批次在 daemon 里也正是这种身份。
+ */
 function shouldTrackOrdinaryImDelivery(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
 ): boolean {
-  return !!message.turnId
-    && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
+  return isOrdinaryImTurnId(message.turnId)
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
     && !isSharedAdoptSession(ds)
@@ -14683,6 +14719,12 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
+    // Lets a startup-stall notice say "just upgraded to x.y.z".
+    cliUpgrade: recentCliUpgrade(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,

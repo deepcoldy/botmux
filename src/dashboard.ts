@@ -108,6 +108,7 @@ import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from '
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
@@ -4288,6 +4289,21 @@ const server = createServer(async (req, res) => {
       workbenchIdentity: workbenchOnlyIdentity,
     });
 
+    // 决策看板事项链接的路径入口（飞书侧栏 AppLink 指向它）。只做跳转、不返回数据，所以放在
+    // 401 之前：已登录 → SPA 的 #/board/...；未登录且配了 H5 免登 → 先走飞书免登再回到这里；
+    // 其余交给 SPA 的登录层。用路径不用 #，是因为平台冷访问 SSO 只把 pathname+search 带进 next。
+    const boardEntry = req.method === 'GET' || req.method === 'HEAD'
+      ? decisionBoardEntryRedirect(url.pathname, {
+        signedIn: decisionBoardAccess(requestIdentity, canManageHost),
+        h5: dashboardH5AuthConfig,
+      })
+      : null;
+    if (boardEntry) {
+      res.writeHead(302, { location: boardEntry, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -5774,6 +5790,25 @@ const server = createServer(async (req, res) => {
     }
 
     if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // ─── 决策看板（管家 bot 的 daemon 是唯一写入方）──────────────────────────────
+    if (await handleDecisionBoardApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      proxyToDaemon,
+      readJsonBody,
+      bots: () => {
+        const online = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+        return monitorBotConfigs().map(cfg => ({
+          larkAppId: cfg.larkAppId,
+          botName: online.get(cfg.larkAppId) || cfg.displayName || cfg.larkAppId,
+          ...(cfg.steward ? { steward: cfg.steward } : {}),
+          online: online.has(cfg.larkAppId),
+        }));
+      },
+    })) {
       return;
     }
 

@@ -114,6 +114,7 @@ import {
 } from './services/traex-auto-model.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import { cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
+import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -2367,6 +2368,13 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
+   * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
+   * 该群里常驻一行 `<botmux_steward>` 提示。缺省 = 关，老用户行为不变。
+   * 校验与「等于默认不写盘」见 core/decision-board/model.ts 的 normalizeStewardConfig。
+   */
+  steward?: StewardConfig;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -4319,6 +4327,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
+      steward: (() => {
+        const parsed = normalizeStewardConfig(entry.steward);
+        return parsed.ok ? parsed.value ?? undefined : undefined;
+      })(),
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
