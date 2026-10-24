@@ -3690,6 +3690,13 @@ export async function handleCommand(
         break;
       }
 
+      case '/dash': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, 'link', rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard link command handled`);
+        break;
+      }
+
       // 两条入口在 classifySlash 之后直接派发 /sessions，进不到这个 case。
       // 留着是 schema↔switch 对齐守卫的锚点，删了测试会红。
       case '/sessions': {
@@ -6240,6 +6247,7 @@ export async function handleCommand(
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.dash', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),

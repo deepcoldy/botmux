@@ -969,6 +969,7 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.sessions': '/sessions   - List this bot\'s topic sessions in the current group and open or resume a topic',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
+  'help.dash': '/dash - Get the full current dashboard admin home link via private message (alias of /dashboard link); no session or worktree is created',
   'help.issue': '/issue      - Open the Issue Board and claim a platform task right from the card (auto-creates a group and starts work); inside the task group use `/issue status` to inspect, `/issue done` to accept, `/issue release` to hand it back',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
@@ -1592,11 +1593,18 @@ export const messages: Record<string, string> = {
     '• `groups`     — group matrix\n' +
     '• `schedules`  — scheduled tasks\n' +
     '• `settings`   — global settings (admins only)\n' +
+    '• `link`       — admin home link via DM (alias: bare `/dash`)\n' +
     '• `help`       — this help\n\n' +
     'Without a subcommand, defaults to `overview`. The entire group is restricted to bot admins (allowedUsers).',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
   'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to you.',
   'card.dashboard.dm_failed': '⚠️ Failed to DM you the dashboard reply: {reason}',
+  'card.dashboard.link.title': '🔗 Dashboard Admin Home',
+  'card.dashboard.link.body': 'Dashboard admin home (full management access):\n{url}',
+  'card.dashboard.link.loopback_hint': '⚠️ The dashboard is bound to loopback only; this link can only be opened on the machine running BotMux.',
+  'card.dashboard.link.dm_sent': '📬 The dashboard admin home link was DMed to you.',
+  'card.dashboard.link.delivery_failed': '⚠️ Private delivery of the dashboard link failed; the link was not posted in this group. Check your DM permissions with the bot and retry.',
+  'card.dashboard.link.unavailable': '⚠️ Cannot read the dashboard port or admin token right now; make sure the dashboard is running.',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard Sessions',
   'card.dashboard.sessions.count_summary': 'Active {active} · Closed {closed} · Page {page}/{totalPages}',

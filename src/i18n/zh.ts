@@ -966,6 +966,7 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.sessions': '/sessions   - 列出当前机器人在本群的话题会话，并可返回或恢复话题',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
+  'help.dash': '/dash - 私信获取当前 Dashboard 管理首页完整链接（等价于 /dashboard link），不创建会话或 worktree',
   'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
@@ -1593,11 +1594,18 @@ export const messages: Record<string, string> = {
     '• `groups`     — 群组矩阵\n' +
     '• `schedules`  — 定时任务\n' +
     '• `settings`   — 全局设置（仅管理员）\n' +
+    '• `link`       — 管理首页链接（私信；等价裸 `/dash`）\n' +
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
   'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给你。',
   'card.dashboard.dm_failed': '⚠️ 给你发送 Dashboard 私聊失败：{reason}',
+  'card.dashboard.link.title': '🔗 Dashboard 管理首页',
+  'card.dashboard.link.body': 'Dashboard 管理首页（完整管理权限）：\n{url}',
+  'card.dashboard.link.loopback_hint': '⚠️ Dashboard 当前仅监听本机回环地址，该链接只能在运行 BotMux 的机器本机打开。',
+  'card.dashboard.link.dm_sent': '📬 Dashboard 管理首页链接已私信给你。',
+  'card.dashboard.link.delivery_failed': '⚠️ Dashboard 链接的私密投递失败，未在群内展示链接。请检查与机器人的私聊权限后重试。',
+  'card.dashboard.link.unavailable': '⚠️ 当前无法读取 Dashboard 端口或管理员 token，请确认 Dashboard 已在运行。',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard 会话',
   'card.dashboard.sessions.count_summary': '活跃 {active} · 已关闭 {closed} · 第 {page}/{totalPages} 页',

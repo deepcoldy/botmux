@@ -18,7 +18,7 @@ import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
-import { commandSpec } from '../../core/command-schema.js';
+import { commandSpec, isBuiltinMentionlessInvocation } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
@@ -3603,6 +3603,38 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
+ * 入站消息是否为「单行命令同构」形态：dispatcher 路由文本与 daemon 命令车道文本
+ * 会逐字一致（剥 @ 后）。
+ *
+ * - `text` 消息：一致。
+ * - `post` 富文本：仅当**恰好一个段落**且节点只含 text / at 时一致 ——
+ *   多段落会被 daemon 按 `\n` 拼接；img/file/media 渲染成 `[图片 N]`/`[文件]`，
+ *   超链接 `a` 会补成 `text(href)`，`code_block` 会展开成多行围栏代码块，
+ *   而路由侧只拼 text 节点、把这些全部丢掉或改写成不同文本，二者不再相同。
+ *
+ * 用来约束内置免 @ 控制命令：只在两侧解析器必然得到同一结论时才放行，避免
+ * 「/dash + 图片/链接/代码块」这类富文本在群闸被当命令放行、daemon 却判为普通
+ * 正文去建会话/worktree。节点黑名单必须与 message-parser 的 renderPostNode
+ * 分支一一对应，新增富文本节点类型时这里也要评估。
+ */
+function isSingleLineCommandShape(message: any): boolean {
+  const msgType = message?.message_type;
+  if (msgType !== 'post') return true;
+  try {
+    const parsed = JSON.parse(message?.content ?? '{}');
+    const inner = parsed?.zh_cn ?? parsed?.en_us ?? parsed;
+    const paragraphs = inner?.content;
+    if (!Array.isArray(paragraphs) || paragraphs.length !== 1) return false;
+    const nodes = Array.isArray(paragraphs[0]) ? paragraphs[0] : [];
+    // 与 renderPostNode 中会产生额外文本/多行的节点保持同步：text、at 之外
+    // 全部判为非同构。
+    return nodes.every((node: any) => node?.tag === 'text' || node?.tag === 'at');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 路由侧判「这是不是指令头」时的 @ 剥离，必须与 daemon 侧**逐字同源**。
  *
  * daemon 走两道：先按位置剥前导 @（谁的都剥），再按身份剥本 bot 的 @（任意位置）。
@@ -5660,6 +5692,28 @@ export function createLarkEventDispatcherRuntime(
           ? { ...commandTriggerEntry, args: commandTriggerArgs(strippedRoutingText) }
           : undefined;
         const commandTriggerRelax = !!commandTrigger;
+        // 内置保留控制命令（`/dash`、裸 `/dashboard link`）在**所有群形态**
+        // （普通群、话题群、话题回复）都免 @ 寻址本 bot。与用户配置的
+        // commandTriggers 正交：那条只放普通群且带 prompt 模板语义，这里不打
+        // commandTrigger 标记，原文进 daemon 后由 classifySlash 按 sessionless
+        // daemon 命令认领，不建会话、不起 CLI、不建 worktree。仍要求 isAllowed
+        // （canTalk 入口闸）；未授权者在 daemon 侧被 canOperate / 命令内管理员闸
+        // 拒绝。@ 别的成员的让路礼仪与 commandTriggers 同款（命令在前的 @参数
+        // 不算让路）。
+        //
+        // 关键：dispatcher 用来取首 token 的 routingText 对富文本 post 只拼各段
+        // text 节点（img/file 节点丢弃、段落间无换行），而 daemon 命令车道会把
+        // 图片渲染成 `[图片 N]`、按段落 join 成多行。多段 post「/dash + 图片」在
+        // routingText 下像单行 `/dash`，daemon 的 parseSlashCommandInvocation 却会
+        // 因第二行非空且 /dash 非多行命令而判 discussion，消息落回建会话路径并可能
+        // 触发 auto-worktree。因此只在「单行同构」（text 消息，或 post 仅一段且无
+        // img/file/media 节点）时放行 —— 该形态下两侧解析逐字一致。
+        const builtinMentionlessCommand = isAllowed
+          && (!mentionsOther || commandLeadsMessage)
+          && isSingleLineCommandShape(message)
+          && isBuiltinMentionlessInvocation(triggeredCommand, strippedRoutingText)
+          ? triggeredCommand
+          : undefined;
         // replyRootId means this turn has already been explicitly addressed
         // to the bot by shared-topic logic (possibly from inside an existing
         // Lark thread). Do not re-run the generic group @ gate, which would
@@ -5705,12 +5759,20 @@ export function createLarkEventDispatcherRuntime(
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
+          || !!builtinMentionlessCommand
           || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
             `${commandTrigger?.prompt ? '（模板）' : '（原文）'} chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+          );
+        }
+        if (builtinMentionlessCommand) {
+          logger.info(
+            `[builtin-command:${larkAppId}] ${builtinMentionlessCommand} 内置免@ 命中 ` +
+            `source=${routingSource} chat=${chatId.substring(0, 12)} msg=${messageId.substring(0, 12)} ` +
+            `sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
         }
         if (!relax) {
