@@ -107,9 +107,40 @@ describe('auto-model Worker admission and original-input retirement', () => {
     expect(h.tracker.onCliExit()).toBe(0);
     expect(h.scope.restartCliProcess).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       exactResumeSessionId: 'native', skipRestartBudget: true, preservePending: true,
+      restartCause: 'traex-auto-model',
     }));
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(false);
     expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it('keeps interruption scanning enabled when rename timeout resets the model with an unfinished predecessor', async () => {
+    vi.useFakeTimers();
+    try {
+      const successor = { content: 'next ask', turnId: 'next' };
+      const h = harness({ pendingMessages: [successor] });
+      expect(h.controller.commitSwitch(action)).toBe(true);
+      h.scope.lastInitConfig.model = 'backup';
+      Object.assign(h.scope, {
+        isPromptReady: false, queuedTypeAheadTurns: [], traexAutoModelInputHold: () => true,
+        sessionRenamePhase: 'sent', sessionRenameIdleTimer: null, SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
+        executeTraexAutoModelSwitch: h.switchModel,
+      });
+      const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+      h.scope.flushPending = vi.fn(() => reset());
+      expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
+      loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(h.scope.flushPending).toHaveBeenCalledOnce();
+      expect(h.controller.currentModel()).toBe('core');
+      expect(h.scope.pendingMessages).toEqual([successor]);
+      expect(h.scope.restartCliProcess).toHaveBeenCalledOnce();
+      const restartOptions = h.scope.restartCliProcess.mock.calls[0][1];
+      expect(restartOptions.exactResumeSessionId).toBe('native');
+      expect(restartOptions).not.toHaveProperty('restartCause');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('still delivers unfinished work saved by an earlier crash when an Auto continuation is queued', () => {

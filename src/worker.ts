@@ -4526,7 +4526,7 @@ function executeTraexAutoModelSwitch(
       // native conversation before the allowlist is exhausted.
       skipRestartBudget: true,
       exactResumeSessionId: nativeSessionId,
-      restartCause: 'traex-auto-model',
+      ...(opts.resumeCurrentTurn ? { restartCause: 'traex-auto-model' as const } : {}),
     },
   );
   return true;
