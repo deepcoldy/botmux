@@ -66,6 +66,18 @@ afterEach(() => {
 });
 
 describe('final_output → durable usage persistence (memory + disk + restart)', () => {
+  it.each(['turn_budget_exhausted', 'execution_failed'])('persists %s instead of a completed diagnostic', errorCode => {
+    const ds = armedDs('sess-native-failure', 'trg_failure');
+    asyncTriggerStore.recordPending('sess-native-failure', 'trg_failure', 1, 'cli_test');
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalMsg('trg_failure', false), turnFailed: true, turnFailureCode: errorCode,
+    }, 'tag', 0);
+    expect(ds.asyncTriggerResults.get('trg_failure')).toMatchObject({ status: 'failed', terminalErrorCode: errorCode });
+    expect(asyncTriggerStore.lookup('sess-native-failure', 'trg_failure')?.result).toMatchObject({
+      status: 'failed', terminalErrorCode: errorCode,
+    });
+    expect(asyncTriggerStore.lookup('sess-native-failure', 'trg_failure')?.result.content).toBeUndefined();
+  });
   it('expands an enabled LinkRef before resolving an HTTP wait sink and clears its draft', () => {
     const resolve = vi.fn();
     const clearPendingDraft = vi.fn();
