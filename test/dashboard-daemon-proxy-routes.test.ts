@@ -24,6 +24,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/cantalk-daemon-commands', '/api/bot-cantalk-daemon-commands', 'raw'],
   ['PUT', '/api/bots/cli_a/launch-shell', '/api/bot-launch-shell', 'raw'],
   ['PUT', '/api/bots/cli_a/oncall-group', '/api/bot-oncall-group', 'raw'],
+  ['PUT', '/api/bots/cli_a/steward', '/api/bot-steward', 'json'],
   ['PUT', '/api/bots/cli_a/actor-owner-bindings', '/api/bot-actor-owner-bindings', 'raw'],
   ['PUT', '/api/bots/cli_a/feedback', '/api/bot-feedback', 'raw'],
   ['PUT', '/api/bots/cli_a/chats/oc_1/feedback', '/api/chat-feedback/oc_1', 'raw'],

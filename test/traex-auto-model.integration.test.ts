@@ -21,6 +21,23 @@ const interruptionNotices = (messages: WorkerToDaemon[]) => messages.filter(mess
     message.message === restartInterruptionNotice(interruptedTurn, {
       cliName: lookupCliDisplayName('traex') ?? 'CLI', noteDelivered,
     })));
+import { messages as zhMessages } from '../src/i18n/zh.js';
+
+// Structural match for the capacity-switch notice, not a hard-coded copy line:
+// take the longest placeholder-free literal of the SAME zh template the worker
+// renders (the test worker runs with the default zh locale). A copy edit in
+// zh.ts then moves this fragment, the assertion and the worker-side delay hook
+// together, so the hook can never silently stop matching.
+const modelOrderNoticeFragment = zhMessages['worker.traex_auto_model.available_model']
+  .split(/\{[^}]*\}/).map(part => part.trim()).filter(part => part.length >= 4)
+  .sort((a, b) => b.length - a.length)[0];
+// Fail at module load with an actionable message if the template is ever edited
+// down to placeholders only: otherwise the value would silently be undefined,
+// the worker delay hook would never match, and the regression would only show
+// up as a confusing notice-count timeout deep inside the test.
+if (!modelOrderNoticeFragment) {
+  throw new Error('worker.traex_auto_model.available_model has no >=4-char literal fragment to match');
+}
 
 const children: ChildProcess[] = [];
 const roots: string[] = [];
@@ -46,7 +63,7 @@ function rows(path: string): any[] {
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
   freshStart = false, activityMode?: 'working' | 'queue-after-second', terminalDelayMs = 0,
-  exitFirstReplacement = false) {
+  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -187,25 +204,49 @@ setInterval(() => {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
   };
   let entry = resolve('src/worker.ts');
-  if (activityMode && !binary) {
-    // Observe the real Worker loop and native captures without changing their
-    // behavior. The bootstrap lives inside this fixture's already-cleaned root.
-    entry = join(root, 'observed-worker.mts');
-    writeFileSync(entry, `
+  if (!binary && (activityMode || delaySecondModelOrderNoticeMs > 0)) {
+    // Test-only worker bootstrap, generated into the fixture's cleaned root.
+    // - activityMode: heartbeats + capture timing for admission measurements;
+    // - delaySecondModelOrderNoticeMs: delay the worker-side send of the 2nd
+    //   capacity-switch notice, reproducing IPC/backpressure delivery lag. The
+    //   notice rides the worker IPC channel while the relaunched CLI's
+    //   submission rides the PTY channel; the notice leads the 3rd submission
+    //   by only a few seconds locally, so 4s reliably inverts their arrival.
+    const tmuxImport = JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href);
+    const workerImport = JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href);
+    const heartbeatProbe = activityMode ? `
 let previous = performance.now();
 setInterval(() => {
   const now = performance.now();
   if (process.connected) process.send?.({ type: 'admission_heartbeat', atMs: Date.now(), gapMs: now - previous });
   previous = now;
 }, 5).unref();
-const { TmuxPipeBackend } = await import(${JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href)});
+const { TmuxPipeBackend } = await import(${tmuxImport});
 const capture = TmuxPipeBackend.prototype.captureViewportAsync;
 TmuxPipeBackend.prototype.captureViewportAsync = async function () {
   const started = performance.now();
   try { return await capture.call(this); }
   finally { if (process.connected) process.send?.({ type: 'admission_capture', elapsedMs: performance.now() - started }); }
 };
-await import(${JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href)});
+` : '';
+    const delayedNoticeSend = delaySecondModelOrderNoticeMs > 0 ? `
+const __modelOrderNoticeFragment = ${JSON.stringify(modelOrderNoticeFragment)};
+let __modelOrderNotices = 0;
+const __realSend = process.send?.bind(process);
+if (__realSend) process.send = function (msg: any, callback?: any): boolean {
+  if (msg && msg.type === 'user_notify' && typeof msg.message === 'string'
+    && msg.message.includes(__modelOrderNoticeFragment)) {
+    __modelOrderNotices++;
+    if (__modelOrderNotices === 2) {
+      setTimeout(() => __realSend(msg, callback), ${delaySecondModelOrderNoticeMs});
+      return true;
+    }
+  }
+  return __realSend(msg, callback) as boolean;
+} as typeof process.send;
+` : '';
+    entry = join(root, activityMode ? 'observed-worker.mts' : 'delayed-notice-worker.mts');
+    writeFileSync(entry, `${delayedNoticeSend}${heartbeatProbe}await import(${workerImport});
 `);
   }
   const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
@@ -269,7 +310,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
   }, 60_000);
 
   it('reports a replacement that exits before its first prompt instead of inheriting the planned cause', async () => {
-    const f = await fixture(true, 'busy', false, undefined, false, undefined, false, undefined, 0, true);
+    const f = await fixture(true, 'busy', false, undefined, false, undefined, false, undefined, 0, 0, true);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
     await f.wait(() => f.messages.some(message => message.type === 'claude_exit'), 'replacement exited before prompt');
     expect(f.messages.filter(message => message.type === 'prompt_ready')).toHaveLength(1);
@@ -515,7 +556,9 @@ describe('TraeX auto-model real Worker and PTY', () => {
   }, 55_000);
 
   it('prefers the earlier available model, proceeds if it queues, then retains it for the next turn', async () => {
-    const f = await fixture(true, 'ordered');
+    // Last positional arg: hold the 2nd capacity-switch notice in the worker
+    // for 4s (deterministic stand-in for CI IPC scheduling lag — see fixture).
+    const f = await fixture(true, 'ordered', false, undefined, undefined, undefined, undefined, undefined, undefined, 4_000);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'earlier available backup');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
@@ -531,7 +574,17 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.launches)[2].args).toContain('model_backend_variant="max"');
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(0);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original ask'))).toHaveLength(1);
-    expect(f.messages.filter(message => message.type === 'user_notify' && message.message.includes('按你的模型顺序'))).toHaveLength(2);
+    // The switch notice travels on the worker IPC channel, the submission on
+    // the PTY channel: submissions===3 does not imply both notices arrived.
+    // Wait on the SAME channel we assert (loaded CI runners otherwise see 1);
+    // this test injects a worker-side delay on the 2nd notice via
+    // delaySecondModelOrderNoticeMs to make that ordering deterministic.
+    await f.wait(
+      () => f.messages.filter(message => message.type === 'user_notify'
+        && message.message.includes(modelOrderNoticeFragment)).length === 2,
+      'both capacity-switch notices (core→backup, backup→last)',
+    );
+    expect(f.messages.filter(message => message.type === 'user_notify' && message.message.includes(modelOrderNoticeFragment))).toHaveLength(2);
     for (const launch of rows(f.launches)) {
       expect(launch.args[0]).toBe('resume');
       expect(launch.args.at(-1)).toBe(f.nativeId);

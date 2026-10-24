@@ -3309,6 +3309,55 @@ describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   });
 });
 
+describe('PUT /api/bot-grant-prefs — trustSameOwnerBots (信任同一 owner 的同机 Bot)', () => {
+  it('is on in the Bot Defaults payload by default, persists an explicit off and drops the key when back on', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-same-owner-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-same-owner-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).trustSameOwnerBots).toBe(true);
+
+      const off = await put({ trustSameOwnerBots: false });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, trustSameOwnerBots: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].trustSameOwnerBots).toBe(false);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).trustSameOwnerBots).toBe(false);
+
+      const on = await put({ trustSameOwnerBots: true });
+      expect(await on.json()).toMatchObject({ ok: true, trustSameOwnerBots: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].trustSameOwnerBots).toBeUndefined();
+
+      const bogus = await put({ trustSameOwnerBots: 'off' });
+      expect(bogus.status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].trustSameOwnerBots).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-grant-prefs — grantRequestToOwnerDm (申请卡转投 owner 私聊)', () => {
   it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-owner-dm-'));

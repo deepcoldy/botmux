@@ -191,13 +191,15 @@ describe('asynchronous shell discovery', () => {
 
 
 describe('async shell process-group retirement', () => {
+  /** Still running? An exited process stays visible to kill(0) as a zombie (Z)
+   *  until its parent reaps it, and as dead (X) while that reap is in progress. */
   function live(pid: number): boolean {
     try { process.kill(pid, 0); } catch { return false; }
     try {
       const state = process.platform === 'linux'
         ? readFileSync(`/proc/${pid}/status`, 'utf8').match(/^State:\s*(\w)/m)?.[1]
         : execFileSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' }).trim()[0];
-      return state !== 'Z';
+      return state !== 'Z' && state !== 'X';
     } catch { return false; }
   }
 
@@ -227,9 +229,15 @@ describe('async shell process-group retirement', () => {
       expect(pids().length).toBeGreaterThan(0);
       if (mode === 'complete') expect(result.resolved).toBe(tool);
       else expect(result.inconclusive).toBe(true);
+      // Having exited is final, so assert on the observation that ended the wait
+      // rather than on a second read taken after it.
       const deadline = Date.now() + 2_000;
-      while (pids().some(live) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-      expect(pids().filter(live)).toEqual([]);
+      let running = pids().filter(live);
+      while (running.length && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        running = pids().filter(live);
+      }
+      expect(running).toEqual([]);
     } finally {
       for (const pid of [...manual, ...pids()]) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
       rmSync(root, { recursive: true, force: true });

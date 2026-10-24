@@ -60,6 +60,7 @@ import {
 } from './agent-workbench-capabilities.js';
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
 import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
+import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
 import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
@@ -120,6 +121,8 @@ const MANAGE_ROUTES = [
 
 
 let pinnedPluginNavItems: NavItem[] = [];
+/** 至少有一个 Bot 设为管家时，侧边栏才显示「决策看板」（见 loadDecisionBoardNav）。 */
+let decisionBoardNavVisible = false;
 /** 全部插件 Dashboard 页面（含没置顶的）；⌘K 收录全部，侧边栏只放置顶的。 */
 let pluginPageNavItems: NavItem[] = [];
 
@@ -183,6 +186,7 @@ function sidebarNavItems(): NavItem[] {
     if (clientShell && item.id === 'workflows') return false;
     // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
     if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
+    if (item.id === 'decision-board') return decisionBoardNavVisible;
     return true;
   });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
@@ -453,10 +457,13 @@ function loadCommandPalette(): Promise<CommandPaletteModule> {
 }
 
 /** 当前 hash 是否落在无边框工作台壳上（没有顶栏 / 侧栏，也不挂 ⌘K 面板）；见 DashboardShell 里的说明。 */
-function framelessWorkbenchSurface(hash: string): 'dock' | 'appCenter' | null {
+function framelessWorkbenchSurface(hash: string): 'dock' | 'appCenter' | 'board' | null {
   if (!readDashboardClientShell() && !readDashboardWorkbenchShell()) return null;
   if (hash.startsWith('#/agent-workbench-dock')) return 'dock';
   if (hash.startsWith('#/agent-workbench')) return 'appCenter';
+  // 决策看板的直达入口（飞书侧栏 AppLink → /board/<app>/<seq>）带沉浸式标记：侧栏只有
+  // 350–800px，不放 Dashboard 的顶栏和侧栏；从 Dashboard 侧边栏点进来仍是正常壳。
+  if (readDashboardWorkbenchShell() && hash.startsWith('#/board')) return 'board';
   return null;
 }
 
@@ -1471,7 +1478,7 @@ function DashboardShell(): React.JSX.Element {
     setLocale,
     openCreateSession: requestOpenCreateSession,
     openCreateBot: openCreateBotFromPalette,
-  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, pluginPageNavItems, ui.hostTerminal]);
+  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, pluginPageNavItems, ui.hostTerminal, decisionBoardNavVisible]);
   if (workbenchSurface) {
     return (
       <>
@@ -1764,6 +1771,24 @@ async function loadPinnedPluginNavItems(): Promise<void> {
   }
 }
 
+/**
+ * 侧边栏要不要显示「决策看板」：问一次 /api/decision-board/boards（只列开了管家的 Bot）。
+ * 本机管理身份和飞书 H5 免登身份都能读；其它身份（匿名、平台访客）对它是既定的 401，
+ * 所以走 origFetch，不让全局 401 包装弹登录浮层。失败一律当作没有看板。
+ */
+async function loadDecisionBoardNav(): Promise<void> {
+  let visible = false;
+  if (ui.authed || ui.workbenchAuthed) {
+    try {
+      const r = await origFetch('/api/decision-board/boards', { cache: 'no-store' });
+      visible = r.ok && boardsFromResponse(await r.json().catch(() => null)).length > 0;
+    } catch { /* 当作没有看板 */ }
+  }
+  if (visible === decisionBoardNavVisible) return;
+  decisionBoardNavVisible = visible;
+  renderShell();
+}
+
 async function persistLocale(locale: DashboardLocale): Promise<void> {
   if (!isAuthed) return;
   try {
@@ -1927,6 +1952,9 @@ void (async () => {
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   void loadPinnedPluginNavItems();
+  // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
+  window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
+  void loadDecisionBoardNav();
   void checkUpdateBadge();
   window.setInterval(() => {
     if (document.hidden) return;

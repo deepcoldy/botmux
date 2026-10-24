@@ -1,4 +1,5 @@
 import { parseGroupCreationDefaults } from './group-creation-options.js';
+import { normalizeStewardConfig } from '../core/decision-board/model.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
@@ -154,6 +155,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
+  { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则"}；默认关闭；unset 关闭（看板数据保留）' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
@@ -170,6 +172,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'grantRequestToOwnerDm', configKey: 'grantRequestToOwnerDm', kind: 'boolean', effect: 'immediate', clearable: false, hint: '授权申请卡转投 owner 私聊 on|off（默认 off）：会话里没有管理员（群里查不到管理员、或私聊被挡）时，申请卡发到主 owner 私聊，申请人只收到中性回执；适合 owner 不进群的用法' },
+  { key: 'trustSameOwnerBots', configKey: 'trustSameOwnerBots', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '信任同一 owner 的同机 Bot on|off（默认 on）：本机 bots.json 里管理员都是本 bot 管理员的 bot 可执行管理命令，@ 本 bot 时同条消息点名的人自动获本群对话授权（额度/有效期同授权卡）；多一个本 bot 不认的管理员就不受信任；off 则同机 bot 只能对话' },
   { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat', 'group'], hint: '私聊单聊模式 thread|chat|group；默认 chat=扁平连续会话，thread=每条 DM 独立会话，group=每条 DM 自动建专属会话群（chat/unset 回默认）' },
   { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
@@ -998,7 +1001,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1115,6 +1118,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'steward') {
+          const steward = normalizeStewardConfig(parsed);
+          return steward.ok ? { ok: true, value: steward.value } : { ok: false, reason: `invalid_steward: ${steward.reason}` };
+        }
         if (spec.configKey === 'botActorOwnerBindings') {
           try {
             const bindings = normalizeBotActorOwnerBindings(parsed);

@@ -80,6 +80,13 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle',
     ],
   },
+  // 管家：和「群负责人」同属「谁来接待 / 跟进」一类开关，紧挨着会话模式那一格放。
+  {
+    id: 'steward',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionSteward',
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardGuide'],
+  },
   {
     id: 'substitute',
     tab: 'sessions',
@@ -116,7 +123,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
       'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
-      'botDefaults.grantRequestToOwnerDm', 'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
+      'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDurationDefault',
+      'botDefaults.quotaDefault',
     ],
   },
   { id: 'blocked-users', tab: 'security', titleKey: 'blocked.sectionTitle' },
@@ -414,6 +422,8 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** 管家（决策看板）配置；null / 缺省 = 未开启。 */
+  steward?: import('../../core/decision-board/model.js').StewardConfig | null;
   /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */
@@ -456,6 +466,7 @@ export type BotDefaultsRow = {
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
   grantRequestToOwnerDm?: boolean;
+  trustSameOwnerBots?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;

@@ -134,6 +134,16 @@ export const TMUX_INITIAL_PROMPT_ARG_BUDGET = 8192;
  *  {@link TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
 export const GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET = 4096;
 
+/** Result of {@link CliAdapter.ensureWorkspaceTrust}. `folder` is the key the
+ *  CLI itself consults (e.g. a git root), not necessarily the working dir. */
+export interface WorkspaceTrustOutcome {
+  status: 'trusted' | 'already-trusted' | 'explicitly-untrusted' | 'not-needed' | 'skipped';
+  folder: string;
+  /** The CLI's trust store that was (or would have been) edited. */
+  storePath?: string;
+  reason?: string;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -553,6 +563,14 @@ export interface CliAdapter {
     /** Only supplied for an authoritative current viewport. Adapters may use
      * explicit terminal interruption evidence when native state omits it. */
     getCurrentScreen?: () => string;
+    /** 该会话对应的 CLI 进程是否存活（worker 持有 pane 子进程 pid）：
+     *  - true：进程存活。native state 里存在「回合未闭合」结构信号时应判忙，
+     *    即使状态库长时间无写入——前台长工具期间落库可能静默数分钟
+     *    （实测 opencode2 sleep 150：149s 零行更新，progress 为 ephemeral）；
+     *  - false：进程已退出，未闭合结构按崩溃 / 孤儿 fail-open；
+     *  - undefined：拿不到 pid（如无 pid 的 adopt），适配器回退到自身的
+     *    状态库时效窗口。 */
+    isCliProcessAlive?: () => boolean | undefined;
   }) => boolean;
 
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
@@ -809,6 +827,15 @@ export interface CliAdapter {
    *  interactive trust dialog). `~/.claude.json` for Claude Code; inside the
    *  data root for forks that set CLAUDE_CONFIG_DIR. */
   readonly claudeStateJsonPath?: string;
+
+  /** Pre-answer the CLI's OWN startup folder-trust question for `workingDir`
+   *  before a Botmux-owned fresh/resume spawn (never adopt, never a warm
+   *  reattach, never a remote backend). Claude-family trust is seeded from
+   *  `claudeStateJsonPath` and Codex trust rides on its argv; this hook is for
+   *  CLIs whose trust lives in a store the worker must edit (Grok). Must never
+   *  throw: failures come back as `skipped` and the spawn proceeds — the
+   *  startup-blocker probe then reports the dialog if it does appear. */
+  readonly ensureWorkspaceTrust?: (workingDir: string) => Promise<WorkspaceTrustOutcome>;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
    *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem

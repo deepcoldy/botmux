@@ -88,6 +88,13 @@ vi.mock('../src/services/oncall-store.js', async (importOriginal) => ({
   ensureDefaultOncallBound: (...args: any[]) => mockEnsureDefaultOncallBound(...(args as [string, string, string])),
 }));
 
+// 委托授权的语义由 test/delegated-grant.test.ts 用真实模块覆盖；这里只盯接线：bot 发送方
+// 分支要在 defaultOncall 懒绑定之后，带着飞书盖章的发送方身份调用它。
+const mockApplyDelegatedGrants = vi.fn(async (..._args: any[]) => [] as string[]);
+vi.mock('../src/im/lark/delegated-grant.js', () => ({
+  applyDelegatedGrants: (...args: any[]) => mockApplyDelegatedGrants(...args),
+}));
+
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
@@ -4707,10 +4714,40 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
+    mockApplyDelegatedGrants.mockClear();
     setupBotState();
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('delegated grant: a bot @ hands its Lark-stamped identity to applyDelegatedGrants after the defaultOncall bind', async () => {
+    // 删掉 dispatcher 里那次调用、丢掉 union_id，或把它挪到 ensureDefaultOncallBound 之前
+    // （会给 oncall 群里本就能说话的人白落授权），本用例都要变红。
+    const order: string[] = [];
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => { order.push('bind'); return undefined; });
+    mockApplyDelegatedGrants.mockImplementationOnce(async () => { order.push('delegate'); return []; });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderAppId: 'cli_sibling_app',
+      content: JSON.stringify({ text: '@_user_1 @_user_2 开工吧' }),
+      mentions: [
+        { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_2', name: '提需求的人', id: { open_id: 'ou_req_person' } },
+      ],
+    });
+    (event.sender.sender_id as any).union_id = 'on_sibling_bot';
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockApplyDelegatedGrants).toHaveBeenCalledTimes(1);
+    expect(mockApplyDelegatedGrants).toHaveBeenCalledWith(MY_APP_ID, event.message, {
+      chatType: 'group',
+      senderIds: [OTHER_BOT_OPEN_ID, 'cli_sibling_app'],
+      senderUnionId: 'on_sibling_bot',
+    });
+    expect(order).toEqual(['bind', 'delegate']);
   });
 
   it('blocks /introduce for restricted chat-granted users before recording bots', async () => {

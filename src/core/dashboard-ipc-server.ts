@@ -1,4 +1,5 @@
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
+import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
@@ -1131,7 +1132,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|decision-board|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1533,6 +1534,10 @@ function composeDashboardSessionRows(
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+let decisionBoardService: DecisionBoardService | null = null;
+/** daemon 启动时注入（只有 daemon 进程会写看板；core-only / 测试缺省为 null → 503）。 */
+export function setDecisionBoardService(service: DecisionBoardService | null): void { decisionBoardService = service; }
 
 ipcRoute('GET', '/api/sessions/:sessionId/turns/:turnId/result', (req, res, params) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { status: 'unavailable', reason: 'trusted_host_required' });
@@ -3599,6 +3604,139 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
           : 502;
     return jsonRes(res, status, { ok: false, error: detail });
   }
+});
+
+// ─── 决策看板（管家 bot 的 daemon 是唯一写入方）──────────────────────────────
+
+const DECISION_BOARD_BODY_MAX_BYTES = 16 * 1024 * 1024;
+const DECISION_BOARD_AUTHOR_RE = /^(?:owner|local|u:[A-Za-z0-9_-]{1,128})$/;
+
+/** `botmux board …`：会话内 CLI，用本会话轮换的 capability 鉴权（同 /project）。 */
+ipcRoute('POST', '/api/sessions/:sessionId/decision-board', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req, DECISION_BOARD_BODY_MAX_BYTES).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  const service = decisionBoardService;
+  if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
+  try {
+    const result = await service.cli((body ?? {}) as BoardCliRequest, { sessionId: ds.session.sessionId });
+    return jsonRes(res, 200, { ok: true, ...result });
+  } catch (error) {
+    const mapped = boardErrorStatus(error);
+    return jsonRes(res, mapped.status, { ok: false, error: mapped.error, message: mapped.message });
+  }
+});
+
+function decisionBoardAuthor(raw: unknown): string | null {
+  return typeof raw === 'string' && DECISION_BOARD_AUTHOR_RE.test(raw) ? raw : null;
+}
+
+function decisionBoardSeq(raw: string): number | null {
+  return /^\d{1,9}$/.test(raw) ? Number(raw) : null;
+}
+
+/** 以下 Dashboard 路由走 host HMAC（外层默认闸）；提交人身份由 Dashboard 按请求身份填好。 */
+function decisionBoardRoute(method: string, path: string,
+  handler: (service: DecisionBoardService, req: IncomingMessage, res: ServerResponse, params: Record<string, string>) => Promise<void> | void): void {
+  ipcRoute(method, path, async (req, res, params) => {
+    const service = decisionBoardService;
+    if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
+    try {
+      await handler(service, req, res, params);
+    } catch (error) {
+      const mapped = boardErrorStatus(error);
+      if (!res.headersSent) jsonRes(res, mapped.status, { ok: false, error: mapped.error, message: mapped.message });
+    }
+  });
+}
+
+decisionBoardRoute('GET', '/api/decision-board/meta', (service, _req, res) => {
+  jsonRes(res, 200, { ok: true, ...service.meta() });
+});
+
+decisionBoardRoute('GET', '/api/decision-board', (service, req, res) => {
+  const url = new URL(req.url!, 'http://localhost');
+  const author = decisionBoardAuthor(url.searchParams.get('author'));
+  if (!author) return jsonRes(res, 400, { ok: false, error: 'invalid_author' });
+  const viewRaw = url.searchParams.get('view');
+  const view = viewRaw === 'decide' || viewRaw === 'active' || viewRaw === 'all' ? viewRaw : 'decide';
+  const query = url.searchParams.get('q')?.slice(0, 200) ?? undefined;
+  jsonRes(res, 200, { ok: true, view, ...service.list(view, author, query) });
+});
+
+decisionBoardRoute('GET', '/api/decision-board/guide', (service, _req, res) => {
+  jsonRes(res, 200, { ok: true, ...service.guide() });
+});
+
+decisionBoardRoute('GET', '/api/decision-board/items/:seq', (service, req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  const author = decisionBoardAuthor(new URL(req.url!, 'http://localhost').searchParams.get('author'));
+  if (seq === null || !author) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...service.detail(seq, author) });
+});
+
+decisionBoardRoute('POST', '/api/decision-board/items/:seq/seen', (service, _req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  if (seq === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  service.markSeen(seq);
+  jsonRes(res, 200, { ok: true });
+});
+
+decisionBoardRoute('POST', '/api/decision-board/items/:seq/draft', async (service, req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  const body = await readJsonBody<Record<string, unknown>>(req, 1024 * 1024).catch(() => undefined);
+  const author = decisionBoardAuthor(body?.author);
+  if (seq === null || !body || !author) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...service.putDraft(seq, author, body) });
+});
+
+decisionBoardRoute('POST', '/api/decision-board/files', async (service, req, res) => {
+  const body = await readJsonBody<Record<string, unknown>>(req, DECISION_BOARD_BODY_MAX_BYTES).catch(() => undefined);
+  if (!body || !decisionBoardAuthor(body.author)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...service.upload(body.image) });
+});
+
+decisionBoardRoute('GET', '/api/decision-board/files/:id', (service, _req, res, params) => {
+  if (!/^[A-Za-z0-9]{8,40}$/.test(params.id)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const found = service.readFile(params.id);
+  if (!found) return jsonRes(res, 404, { ok: false, error: 'file_not_found' });
+  res.writeHead(200, {
+    'content-type': found.file.mime,
+    'content-length': String(found.data.length),
+    'cache-control': 'private, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+  });
+  res.end(found.data);
+});
+
+decisionBoardRoute('POST', '/api/decision-board/submit', async (service, req, res) => {
+  const body = await readJsonBody<Record<string, unknown>>(req, 1024 * 1024).catch(() => undefined);
+  const author = decisionBoardAuthor(body?.author);
+  const items = Array.isArray(body?.items) ? body!.items : null;
+  if (!body || !author || !items || typeof body.nonce !== 'string') return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const parsedItems: Array<{ seq: number; draftUpdatedAt: number }> = [];
+  for (const raw of items) {
+    const it = raw as { seq?: unknown; draftUpdatedAt?: unknown };
+    if (typeof it?.seq !== 'number' || !Number.isSafeInteger(it.seq) || typeof it.draftUpdatedAt !== 'number') {
+      return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+    }
+    parsedItems.push({ seq: it.seq, draftUpdatedAt: it.draftUpdatedAt });
+  }
+  const authorName = typeof body.authorName === 'string' ? body.authorName.trim().slice(0, 80) : undefined;
+  const submitter = decisionBoardAuthor(body.submitter) ?? undefined;
+  const result = await service.submit({
+    author, ...(submitter ? { submitter } : {}), ...(authorName ? { authorName } : {}), nonce: body.nonce, items: parsedItems,
+  });
+  jsonRes(res, 200, { ok: true, ...result });
+});
+
+decisionBoardRoute('POST', '/api/decision-board/batches/:id/redeliver', async (service, _req, res, params) => {
+  const id = decisionBoardSeq(params.id);
+  if (id === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...(await service.redeliver(id)) });
 });
 
 /** Trusted Dashboard creates or refreshes the one pinned pre-project guide. */
@@ -7953,6 +8091,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
+    steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
@@ -7962,6 +8101,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
+    trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -8280,6 +8420,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantRequestToOwnerDm: boolean       — 无管理员可点卡时申请卡转投 owner 私聊
 //   • messageQuotaDefaultLimit: number|null — 授权卡访客额度覆盖（null = 卡片内置 3 条）；Oncall 恒不限额、不读它
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
+//   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -8294,6 +8435,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantRequestToOwnerDm?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
+    trustSameOwnerBots?: unknown;
   };
 
   const patch: {
@@ -8303,11 +8445,13 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantRequestToOwnerDm?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
+    trustSameOwnerBots?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
+  if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
@@ -9403,6 +9547,15 @@ botConfigPutRoute<{ canTalkDaemonCommands?: unknown }>('/api/bot-cantalk-daemon-
 botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShell', {
   normalize: (body, spec) => optionalTextField(spec, body.launchShell),
   respond: value => ({ ok: true, launchShell: (value as string | null) ?? '' }),
+});
+
+// 管家（决策看板）：`{ steward: {...} | null }`，校验与「等于默认不写盘」同 /config steward。
+botConfigPutRoute<{ steward?: unknown }>('/api/bot-steward', 'steward', {
+  normalize: (body, spec) => {
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.steward ?? null));
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, steward: value ?? null }),
 });
 
 botConfigPutRoute<{ oncallGroup?: unknown }>('/api/bot-oncall-group', 'oncallGroup', {

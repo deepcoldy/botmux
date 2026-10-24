@@ -71,12 +71,34 @@ export interface ResolvedWorkbenchUrl {
  * 不会被截断（见 dashboard-url.ts:workbenchEntryUrl）——这条链接除了当按钮目标，
  * 还会被 owner 从工作台「常驻链接」面板 / 终端 `botmux dashboard` 里复制去收藏。
  */
+/** dashboard 落盘的实际端口（端口探测可能落在 7891 之外），读不到回落配置值。 */
+function persistedDashboardPort(dir: string): string {
+  const portFile = join(dir, '.dashboard-port');
+  return (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || String(config.dashboard.port);
+}
+
+/**
+ * 不带凭证的 Dashboard 对外 origin（远程访问 / 反代 / Devbox / 局域网，与
+ * {@link buildDashboardUrls} 同一条优先级）。给会发进群里的链接用（决策看板事项链接）：
+ * 链接本身不携带 token，进页面靠平台 SSO / H5 免登 / 已有登录态。
+ */
+export function resolveDashboardOrigin(): string | undefined {
+  try {
+    const { url } = buildDashboardUrls({
+      host: getDashboardExternalHost(),
+      port: persistedDashboardPort(join(homedir(), '.botmux')),
+    });
+    return new URL(url).origin;
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveWorkbenchUrl(): ResolvedWorkbenchUrl | undefined {
   try {
     const dir = join(homedir(), '.botmux');
-    const portFile = join(dir, '.dashboard-port');
-    const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
-      || String(config.dashboard.port);
+    const port = persistedDashboardPort(dir);
     let token: string | null = null;
     try {
       token = loadPersistedToken(join(dir, '.dashboard-token'));

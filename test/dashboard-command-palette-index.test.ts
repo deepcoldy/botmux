@@ -13,7 +13,6 @@ import { createElement } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { searchPalette, type PaletteItem } from '../src/dashboard/web/command-palette-model.js';
 import {
-  SETTINGS_SEARCH_INDEX,
   buildActionItems,
   buildBotDefaultsSectionItems,
   buildBotDefaultsTabItems,
@@ -23,6 +22,7 @@ import {
   buildSettingItems,
   type PalettePageEntry,
 } from '../src/dashboard/web/command-palette-sources.js';
+import { SETTINGS_SECTIONS } from '../src/dashboard/web/settings-sections.js';
 import {
   BOT_DEFAULTS_SECTIONS,
   BOT_DEFAULTS_TABS,
@@ -114,7 +114,7 @@ describe('⌘K index coverage', () => {
     expect(blocks.length).toBeGreaterThan(10);
     const ids = blocks.map(attrs => /\bid="([^"]+)"/.exec(attrs)?.[1] ?? null);
     expect(ids.filter(id => id === null), 'SettingsBlock without an id').toEqual([]);
-    const indexed = new Set(SETTINGS_SEARCH_INDEX.map(entry => entry.id));
+    const indexed = new Set(SETTINGS_SECTIONS.map(entry => entry.id));
     expect(ids.filter(id => !indexed.has(id!)), 'settings blocks missing from the index').toEqual([]);
   });
 
