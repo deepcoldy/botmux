@@ -678,6 +678,7 @@ import {
   CodexAppTurnLiveness,
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
+import { captureAttachedCodexAppProcessIdentity, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -5405,6 +5406,7 @@ let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppRunnerProcessIdentity: CodexAppProcessIdentity | undefined;
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -5499,6 +5501,7 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  codexAppRunnerProcessIdentity = undefined;
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
   // after the old runner proves a warm reattach; stale queued entries must not
@@ -14223,6 +14226,31 @@ async function handleTrustedCodexAppMarker(
   }
 
   if (kind === 'state' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    if (payload.processIdentity === undefined && !codexAppRunnerProcessIdentity) {
+      const backendPid = backend?.getChildPid?.() ?? undefined;
+      const identity = captureAttachedCodexAppProcessIdentity(backendPid, lastInitConfig!.sessionId, process.execPath);
+      if (identity) {
+        codexAppRunnerProcessIdentity = identity;
+        publishLocalProcessAttestation(backendPid);
+      }
+    }
+    if (payload.processIdentity !== undefined) {
+      const backendPid = backend?.getChildPid?.() ?? undefined;
+      const identity = verifyCodexAppProcessIdentity(payload.processIdentity, backendPid);
+      if (!identity) {
+        rejectCodexAppControlMarker('unverified app-server process identity');
+        return false;
+      }
+      // Publish once for this control generation, before admitting input. Do
+      // not resnapshot current tools on every busy/idle state from the runner.
+      if (!codexAppRunnerProcessIdentity) {
+        codexAppRunnerProcessIdentity = identity;
+        publishLocalProcessAttestation(backendPid);
+      } else if (JSON.stringify(identity) !== JSON.stringify(codexAppRunnerProcessIdentity)) {
+        rejectCodexAppControlMarker('app-server process changed within control generation');
+        return false;
+      }
+    }
     const readiness = codexAppSignedStateReadiness(payload);
     if (readiness === 'invalid') {
       rejectCodexAppControlMarker('signed state missing boolean acceptingInput');
@@ -27164,10 +27192,12 @@ function rejectOrdinaryImTurn(
 
 function publishLocalProcessAttestation(
   cliPid?: number,
-  enginePid = codexRpcEngine?.appServerPid,
+  enginePid = codexRpcEngine?.appServerPid ?? codexAppRunnerProcessIdentity?.enginePid,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  const engineProcStart = codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
+    ? codexAppRunnerProcessIdentity.engineProcStart
+    : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
