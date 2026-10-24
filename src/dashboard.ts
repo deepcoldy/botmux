@@ -178,8 +178,9 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js';
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
-import { checkCliAvailability } from './setup/cli-availability.js';
+import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -5824,11 +5825,11 @@ const server = createServer(async (req, res) => {
           // Keep the all-options scan shell-free so opening the form remains
           // instant even when most of the 20+ CLIs are absent. The selected
           // option is checked again with shell/rc resolution on submit/save.
-          const availability = checkCliAvailability({
+          const availability = preliminaryCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
-          }, { shellFallback: false });
+          });
           // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
           // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
@@ -5842,6 +5843,7 @@ const server = createServer(async (req, res) => {
             id: o.key,
             label: o.label,
             available: availability.available,
+            availabilityStatus: availability.status,
             command: availability.command,
             availabilityReason: availability.reason,
             ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
@@ -5861,6 +5863,22 @@ const server = createServer(async (req, res) => {
         // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
         ...(webSession ? { webSession } : {}),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/availability') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const appId = url.searchParams.get('bot')?.trim();
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId) : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      return jsonRes(res, response.statusCode, response.body);
     }
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），

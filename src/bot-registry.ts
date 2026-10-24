@@ -2071,6 +2071,16 @@ export interface BotConfig {
    */
   grantRequestToOwnerDm?: boolean;
   /**
+   * 信任同一 owner 的同机 Bot。默认开启（undefined = on），只有显式 false 才关。
+   * 「同机 Bot」= 本机 bots.json 里登记的另一个 Bot，身份由飞书盖章的 union_id 精确对上；
+   * 「同一 owner」= 对方 Bot 的每个管理员都是本 Bot 的管理员（按 union_id 比，见
+   * services/bot-admin-unions-store.ts）。命中后：
+   * - 对方可以对本 Bot 执行管理命令（canOperate，与跨部署团队 Bot 同权）；
+   * - 对方在群里 @ 本 Bot 时，同一条消息里点名的人自动获得本群对话授权（见 im/lark/delegated-grant.ts）。
+   * owner 不同的同机 Bot 不受影响（仍只能对话）；关闭后所有同机 Bot 都只能对话。
+   */
+  trustSameOwnerBots?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -3513,6 +3523,35 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
   }
 }
 
+/**
+ * {@link loadBotConfigs} 的按原文缓存版：bots.json 内容没变就复用上次的解析结果（几十个 bot
+ * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
+ * 读文件失败的语义与 loadBotConfigs 一致。
+ */
+let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
+export function loadBotConfigsCached(): readonly BotConfig[] {
+  const synthetic = maybeSynthesizeCoreOnlyConfig();
+  if (synthetic) return synthetic;
+  const filePath = resolveBotConfigPath();
+  let text: string;
+  try {
+    text = readFileSync(filePath, 'utf-8');
+  } catch {
+    return parseBotConfigFile(filePath);
+  }
+  if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {
+    return parsedBotConfigsCache.configs;
+  }
+  let configs: BotConfig[];
+  try {
+    configs = parseBotConfigsFromText(text);
+  } catch (err: any) {
+    throw new Error(`${err?.message ?? err} (file: ${filePath})`);
+  }
+  parsedBotConfigsCache = { path: filePath, text, configs };
+  return configs;
+}
+
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
@@ -4185,6 +4224,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       // 默认关，只落显式 true。
       grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
+      // 默认开，只落显式 false。
+      trustSameOwnerBots: entry.trustSameOwnerBots === false ? false : undefined,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,

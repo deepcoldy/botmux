@@ -632,4 +632,14 @@ describe('dashboard bot payload helpers', () => {
     expect(sparseOverridesFromRawBotConfig({ quotaFallbackBot: fallback }).quotaFallbackBot).toBe(fallback);
     expect(sparseOverridesFromRawBotConfig({ autoInviteOwnerOnGroupAdd: true }).autoInviteOwnerOnGroupAdd).toBe(true);
   });
+
+  it('trustSameOwnerBots is on by default and an explicit off survives offline recovery rows', () => {
+    const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+      { larkAppId: 'cli_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+    );
+    expect(offlineRow({}).trustSameOwnerBots).toBe(true);
+    expect(offlineRow({ trustSameOwnerBots: false }).trustSameOwnerBots).toBe(false);
+    expect(offlineRow({ trustSameOwnerBots: 'off' }).trustSameOwnerBots).toBe(true);
+  });
 });

@@ -37,7 +37,9 @@ export function isSessionEnvName(key: unknown): key is string {
  * deterministic launch failure, measured between 16.3 and 16.5 KiB). Two full
  * layers (8 KiB) plus the wrapper script (~2.6 KiB) and botmux's own per-session
  * values + CLI argv leave ~1.5 KiB measured headroom; see the real-tmux fit
- * test in session-env-backends.test.ts.
+ * test in session-env-backends.test.ts. tmux panes now read that command from
+ * a private launch file (backend/pane-launch.ts), so tmux no longer binds it;
+ * the budget is unchanged.
  */
 export const MAX_SESSION_ENV_LAYER_BYTES = 4 * 1024;
 /** One value can never exceed the whole layer budget, counted in UTF-8 bytes

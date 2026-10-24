@@ -16,7 +16,7 @@ import { useT } from './react-hooks.js';
 
 export type SessionEnvScope =
   | { kind: 'global' }
-  | { kind: 'bot'; larkAppId: string; onPolicySaved?(policy: SessionEnvPolicy): void };
+  | { kind: 'bot'; larkAppId: string; onPolicySaved?(policy: SessionEnvPolicy): void; onEnvSaved?(): void };
 
 export interface SessionEnvPolicy { mode: 'inherit' | 'strict'; inherit?: string[] }
 
@@ -378,6 +378,7 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
       const res = await sendJson('PUT', url, { ops });
       if (!res.ok) { setStatus({ text: `✗ ${opsErrorText(tr, res.body)}` }); return false; }
       setView(res.body as ScopeView);
+      if (scope.kind === 'bot') scope.onEnvSaved?.();
       setStatus({ text: `✓ ${tr('sessionEnv.saved')}`, ok: true });
       return true;
     } catch (e: any) {

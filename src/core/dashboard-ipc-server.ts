@@ -12,7 +12,8 @@ import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
@@ -45,7 +46,7 @@ import {
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
-import { botOneShotEnv } from './session-env-resolve.js';
+import { botOneShotProbeEnv } from './session-env-resolve.js';
 import {
   botSessionEnvView,
   globalSessionEnvView,
@@ -300,7 +301,8 @@ import {
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
-import { checkCliAvailability } from '../setup/cli-availability.js';
+import { type CliAvailabilityProbe } from '../setup/cli-availability.js';
+import { agentSaveProbePlan, probeAgentSaveAvailability, AgentSaveProbeError } from '../dashboard/agent-save-probe.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 import {
@@ -7823,9 +7825,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   } catch { /* none */ }
   // Values are write-only in Dashboard; expose names for policy diagnosis.
   const env = '';
+  let envRevision: string | undefined;
   let envKeys: string[] = [];
   try {
     const e = getBot(cachedLarkAppId).config.env;
+    envRevision = botOneShotProbeEnv(process.env, getBot(cachedLarkAppId).config).fingerprint;
     if (e && typeof e === 'object') envKeys = Object.keys(e).sort();
   } catch { /* none */ }
   // defaultWorkingDir — the "仅默认目录" mode source. Mutually exclusive with
@@ -7958,6 +7962,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
+    trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -7985,6 +7990,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    envRevision,
     envKeys,
     riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
@@ -8275,6 +8281,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantRequestToOwnerDm: boolean       — 无管理员可点卡时申请卡转投 owner 私聊
 //   • messageQuotaDefaultLimit: number|null — 授权卡访客额度覆盖（null = 卡片内置 3 条）；Oncall 恒不限额、不读它
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
+//   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -8289,6 +8296,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantRequestToOwnerDm?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
+    trustSameOwnerBots?: unknown;
   };
 
   const patch: {
@@ -8298,11 +8306,13 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantRequestToOwnerDm?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
+    trustSameOwnerBots?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
+  if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
@@ -8718,9 +8728,58 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   }
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
-  let availability!: ReturnType<typeof checkCliAvailability>;
+  let availability!: CliAvailabilityProbe;
   let availabilityWarning: string | undefined;
   let runtimeProbe: { version: string; updateProvider: string } | undefined;
+
+  let preflight: ReturnType<typeof agentSaveProbePlan>;
+  let preflightEntry: BotConfig;
+  try {
+    const raw = await readRawConfig(requireConfigPath());
+    const index = findEntryIndex(raw, larkAppId);
+    if (index < 0) return jsonRes(res, 400, { ok: false, error: 'bot_not_in_config' });
+    preflightEntry = raw[index];
+    preflight = agentSaveProbePlan(preflightEntry, key, body, process.env);
+  } catch (err) {
+    return jsonRes(res, 400, { ok: false, error: err instanceof AgentSaveProbeError ? err.code : 'invalid_cli_runtime', message: ipcErrorText(err) });
+  }
+  const probeResult = await probeAgentSaveAvailability(preflight);
+  let runtimeProbeFailure: { error: string; message?: string } | undefined;
+  // An inconclusive shell probe cannot reject an rc-only executable or run
+  // its bare name without that shell. The worker's launch preflight decides.
+  if (Object.prototype.hasOwnProperty.call(body, 'cliRuntime') && preflight.runtime) {
+    if (probeResult.availability.status === 'unavailable') {
+      runtimeProbeFailure = { error: 'runtime_unavailable', message: probeResult.availability.reason };
+    } else if (probeResult.availability.status === 'available') {
+      try {
+        const { stdout } = await promisify(execFile)(probeResult.availability.resolvedPath ?? preflight.runtime.executable,
+          ['--version'], { env: preflight.env, encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 });
+        const version = stdout.trim().match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
+        if (!version) throw new Error(`无法识别 --version 输出：${stdout.slice(0, 120)}`);
+        runtimeProbe = { version, updateProvider: preflight.runtime.update?.provider ?? 'auto' };
+      } catch (err) {
+        runtimeProbeFailure = { error: 'runtime_version_probe_failed', message: ipcErrorText(err) };
+      }
+    }
+  }
+  // Catalog exec also belongs outside the bots.json lock; all locked consumers
+  // use the same fenced probe result and executable, never a bare-name fallback.
+  const preflightAuto = autoFieldPresent ? requestedAuto.config : normalizeTraexAutoModelConfig(preflightEntry.traexAutoModel).config;
+  const preflightEffort = reasoningEffortFieldPresent ? reasoningEffort : preflightEntry.reasoningEffort;
+  const preflightVariant = modelBackendVariantFieldPresent ? modelBackendVariant : preflightEntry.modelBackendVariant;
+  const preflightNeedsCatalog = preflight.selection.cliId === 'traex'
+    && (model.toLowerCase() === TRAEX_AUTO_MODEL_ID
+      ? Object.values(preflightAuto?.modelSettings ?? {}).some(setting => setting.reasoningEffort || setting.modelBackendVariant)
+      : !!preflightEffort && (!!preflightVariant || !cliModelSupportsReasoningEffort('traex', model, preflightEffort)));
+  const preflightCatalog = preflightNeedsCatalog
+    ? await detectModelCapabilitiesViaExec(probeResult.availability.resolvedPath ?? preflight.runtime?.executable ?? preflight.legacyPath ?? 'traex', preflight.env)
+    : null;
+  const preflightTier = supportsServiceTier
+    ? (serviceTierFieldPresent ? serviceTier ?? undefined : preflightEntry.serviceTier)
+    : undefined;
+  const preflightTierResult = preflightTier && preflightTier !== 'default' && !preflight.selection.wrapperCli
+    ? await validateCodexServiceTier({ cliBin: probeResult.availability.resolvedPath ?? 'codex', env: preflight.env, model, serviceTier: preflightTier })
+    : undefined;
 
   return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation. Close admission
@@ -8819,60 +8878,26 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       })) {
         return { write: false, result: { error: 'read_isolation_unsupported' } };
       }
-      availability = checkCliAvailability({
-        cliId: selected.cliId,
-        wrapperCli: selected.wrapperCli,
-        cliPathOverride: effectivePath,
-        cliLaunchMode: selected.cliLaunchMode,
-      }, { shellFallback: !selected.wrapperCli });
-      // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
-      // separately so a missing dsh-tui install surfaces as a save-time warning
-      // rather than a spawn-time ENOENT crash-loop.
-      let dshTuiAvailability: { available: boolean; command?: string; reason?: string } | undefined;
-      if (supportsDshRuntime && nextDshRuntime === 'tui') {
-        dshTuiAvailability = checkCliAvailability({ cliId: 'dsh-tui' });
+      const lockedPlan = agentSaveProbePlan(entry, key, body, process.env);
+      if (lockedPlan.fingerprint !== preflight.fingerprint
+        || (supportsServiceTier && (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier) !== preflightTier)) {
+        return { write: false, result: { error: 'agent_probe_changed', message: '启动配置在检测期间已变化，请重新保存。' } };
       }
-      if (runtimeFieldPresent && nextRuntime) {
-        if (!availability.available) {
-          return { write: false, result: {
-            error: 'runtime_unavailable',
-            message: availability.reason ?? 'runtime executable is unavailable',
-          } };
-        }
-        try {
-          const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
-            encoding: 'utf8',
-            timeout: 5_000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            maxBuffer: 2 * 1024 * 1024,
-          }).trim();
-          const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
-          if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-          runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
-        } catch (err) {
-          return { write: false, result: {
-            error: 'runtime_version_probe_failed',
-            message: ipcErrorText(err),
-          } };
-        }
-      }
-      // Existing Bot edits remain saveable (operators may intentionally configure
-      // first and install second), but the response is explicit so Dashboard never
-      // claims a missing Agent was saved successfully without qualification.
-      availabilityWarning = availability.available
-        ? undefined
-        : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
-      if (dshTuiAvailability && !dshTuiAvailability.available) {
+      availability = probeResult.availability;
+      if (runtimeProbeFailure) return { write: false, result: runtimeProbeFailure };
+      // Only definitive absence warns; a preliminary miss/timeout is unknown.
+      availabilityWarning = availability.status === 'unavailable'
+        ? `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`
+        : undefined;
+      const dshTuiAvailability = probeResult.dshTuiAvailability;
+      if (dshTuiAvailability?.status === 'unavailable') {
         const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
         availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
       }
       if (model.toLowerCase() === TRAEX_AUTO_MODEL_ID && nextTraexAutoModel?.modelSettings) {
         const settingsEntries = Object.entries(nextTraexAutoModel.modelSettings)
           .filter(([, settings]) => settings.reasoningEffort || settings.modelBackendVariant);
-        const catalog = settingsEntries.length ? await detectModelCapabilitiesViaExec(
-          availability.resolvedPath ?? effectivePath ?? 'traex',
-          botOneShotEnv(process.env, entry),
-        ) : null;
+        const catalog = preflightCatalog;
         for (const [modelId, settings] of settingsEntries) {
           const capability = catalog?.find(item => item.slug.toLowerCase() === modelId.toLowerCase());
           const variant = capability?.contextVariants?.find(item => item.id === settings.modelBackendVariant);
@@ -8896,13 +8921,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         // A bare Codex catalog cannot attest a wrapper-selected provider/profile.
         // Never execute arbitrary wrappers or hooks as a capability probe.
         if (selected.wrapperCli) return { write: false, result: { error: 'service_tier_catalog_unavailable' } };
-        const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
-        const tierCheck = await validateCodexServiceTier({
-          cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
-          env: botOneShotEnv(process.env, entry),
-          model,
-          serviceTier: effectiveServiceTier,
-        });
+        const tierCheck = preflightTierResult ?? { ok: false as const, error: 'catalog_unavailable' as const };
         if (!tierCheck.ok) {
           return { write: false, result: {
             error: `service_tier_${tierCheck.error}`,
@@ -8925,8 +8944,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       let fixedTraexEfforts: string[] | undefined;
       if (selected.cliId === 'traex' && model.toLowerCase() !== TRAEX_AUTO_MODEL_ID && nextReasoningEffort
         && (nextModelBackendVariant || !cliModelSupportsReasoningEffort('traex', model, nextReasoningEffort))) {
-        const capabilities = await detectModelCapabilitiesViaExec(
-          availability.resolvedPath ?? effectivePath ?? 'traex', botOneShotEnv(process.env, entry));
+        const capabilities = preflightCatalog;
         const capability = capabilities?.find(item => item.slug.toLowerCase() === model.toLowerCase());
         fixedTraexEfforts = capability?.contextVariants?.find(item => item.id === nextModelBackendVariant)?.reasoningEfforts
           ?? capability?.reasoningEfforts;
@@ -9046,6 +9064,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
+      if (r.result.error === 'agent_probe_changed') return jsonRes(res, 409, { ok: false, error: r.result.error, message: r.result.message });
       if (r.result.error === 'launch_mode_sandbox_conflict') {
         return jsonRes(res, 400, {
           ok: false,

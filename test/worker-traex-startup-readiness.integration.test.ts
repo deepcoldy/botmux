@@ -70,10 +70,15 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
         ...COMPOSER.map(row => row.replace(' · ~ · ', ' · /tmp/loading · '))]
       : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
-  // This is the missing evidence: a real row-anchored prompt in the viewport
-  // but no newline/prompt match or numeric context footer in the byte stream.
+  // #2247 later taught the byte-stream readyPattern the same cursor-painted
+  // shape: the stripped redraw now matches through the preceding rule, so
+  // recognition no longer depends on the viewport poller. The same rule arm
+  // also matches the loading-cell hostile frame below, so first-prompt
+  // admission additionally requires the adapter's rendered-viewport composer
+  // predicate (a gate on the ready edge); the viewport poller re-drives that
+  // edge once the initialized composer renders.
   const pattern = createTraexAdapter('/bin/true').readyPattern!;
-  expect(pattern.test(redraw(COMPOSER).replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''))).toBe(false);
+  expect(pattern.test(redraw(COMPOSER).replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''))).toBe(true);
   expect(pattern.test(COMPOSER.join('\n'))).toBe(true);
   paint(initial);
   writeFileSync(history, '');
