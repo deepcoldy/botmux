@@ -4,6 +4,7 @@ import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/t
 
 export interface DelegatedScheduleRuntimeDependencies {
   runEnabled: boolean;
+  validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
   hostRunScopes: readonly TriggerUserAuthTool[];
   triggerUserAuthTools: readonly TriggerUserAuthTool[];
   adminOpenIds: readonly string[];
@@ -47,6 +48,10 @@ export async function authorizeDelegatedScheduleRun(
   authority: ScheduleAuthorityRecord,
   deps: DelegatedScheduleRuntimeDependencies,
 ): Promise<AuthorizedDelegatedScheduleRun> {
+  if (authority.grantId?.startsWith('bot-policy:')) {
+    if (!deps.validateBotGrant) throw new Error('schedule bot grant validator unavailable');
+    deps.validateBotGrant(authority);
+  }
   if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
   if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
@@ -69,13 +74,20 @@ export async function authorizeScheduleSelfManage(
   deps: Pick<DelegatedScheduleRuntimeDependencies,
     'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'> & {
       selfManageEnabled: boolean;
+      allowPaused?: boolean;
+      validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
       targetChatId: string;
     },
 ): Promise<void> {
+  if (authority.grantId?.startsWith('bot-policy:')) {
+    if (!deps.validateBotGrant) throw new Error('schedule bot grant validator unavailable');
+    deps.validateBotGrant(authority);
+  }
   const completedRunStillLive = authority.state === 'completed'
     && authority.task.enabled === false
     && authority.task.disabledReason === 'once_completed';
-  if (authority.state !== 'active' && !completedRunStillLive) {
+  if (authority.state !== 'active' && !completedRunStillLive
+    && !(deps.allowPaused && authority.state === 'paused' && authority.grantId?.startsWith('bot-policy:'))) {
     throw new Error(`schedule authority state is ${authority.state}`);
   }
   if (authority.kind === 'direct') {

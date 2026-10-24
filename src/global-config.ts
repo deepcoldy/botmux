@@ -184,8 +184,20 @@ export interface SessionCleanupGlobalConfig {
  * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
  * is a separate emergency revocation switch so stopping new grants does not
  * silently change the meaning of already committed tasks. */
+export interface ScheduleBotGrant {
+  /** Stable host-managed grant id; never supplied by a worker. */
+  id: string;
+  sourceAppId: string;
+  targetAppIds: string[];
+  chatIds: string[];
+  /** Accountable administrator, resolved separately in each app. No tool credentials are delegated. */
+  controllerUnionId: string;
+}
+
 export interface ScheduleDelegationGlobalConfig {
-  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  /** Explicit bot service authority, including bot/report-triggered source turns. Default empty. */
+  botGrants?: ScheduleBotGrant[];
+  /** Allow schedule:create via a direct human or explicit bot grant. Default off. */
   createEnabled?: boolean;
   /** Allow already committed delegated schedules to run. Missing means on. */
   runEnabled?: boolean;
@@ -637,6 +649,23 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
     ))];
     if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
+  }
+  if (Array.isArray(value.botGrants)) {
+    const grants = value.botGrants.filter((raw): raw is ScheduleBotGrant => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+      const g = raw as Record<string, unknown>;
+      return typeof g.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(g.id)
+        && typeof g.sourceAppId === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(g.sourceAppId)
+        && typeof g.controllerUnionId === 'string' && /^on_[A-Za-z0-9_-]{1,128}$/.test(g.controllerUnionId)
+        && Array.isArray(g.targetAppIds) && g.targetAppIds.length > 0
+        && g.targetAppIds.every(id => typeof id === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(id))
+        && Array.isArray(g.chatIds) && g.chatIds.length > 0
+        && g.chatIds.every(id => typeof id === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(id));
+    });
+    // Ambiguous grant ids fail closed, rather than choosing an arbitrary scope.
+    out.botGrants = grants.filter(g => grants.filter(other => other.id === g.id).length === 1)
+      .map(g => ({ id: g.id, sourceAppId: g.sourceAppId, controllerUnionId: g.controllerUnionId,
+        targetAppIds: [...new Set(g.targetAppIds)], chatIds: [...new Set(g.chatIds)] }));
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

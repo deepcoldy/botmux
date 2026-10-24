@@ -48,3 +48,49 @@
 - v2 capability 没有独立的墙钟 TTL：它的寿命严格等于目标 Bot 的同一个 live dispatch turn。新 turn、worker generation 变化或来源记录不再匹配都会拒绝兑换；很长的 turn 会在其整个生命周期内保留创建权。
 - 一个 turn 可以创建多个不同任务，但最多为 `scheduleDelegation.maxTasksPerTurn`（默认 64，宿主可在 1–1024 间配置）。相同 canonical request 返回同一任务回执且不重复计数，超过上限明确拒绝。
 - `scheduleDelegation.runScopes: ["bytedcli"]` 与 `selfManageEnabled: true` 都是显式 opt-in；关闭或收窄后，后续 trigger/self-management 立即 fail closed。旧 v2 记录缺少这些字段时按空 scope、不可自管理解释。
+
+## 显式机器人服务授权（可选）
+
+上述真人直接签发路径保持不变。需要“触发机器人 → 主控 → 阶段机器人”及 report
+续跑时，可以由管理员在共享宿主配置 `scheduleDelegation.botGrants`。这是一项独立的
+服务授权，不是继承或伪造真人 current actor；普通 chatGrant 仍只授对话权。
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "selfManageEnabled": true,
+    "botGrants": [{
+      "id": "team-polling",
+      "sourceAppId": "cli_controller",
+      "targetAppIds": ["cli_generation", "cli_risk", "cli_decision", "cli_release"],
+      "chatIds": ["oc_team"],
+      "controllerUnionId": "on_accountable_admin"
+    }]
+  }
+}
+```
+
+- 配置中的 app、群和 union_id 均须替换为已核验的真实身份；不使用跨应用复制的
+  open_id。控制管理员仍须在来源、目标应用有管理权限，并满足目标群成员检查。
+- `--bot-app` 受管派单命中唯一授权时自动签发，无需每次添加 `--delegate`；
+  `--no-delegate schedule:create` 仍可单次禁用。只允许配置的来源、全部目标和群；
+  重叠授权、无效字段及重复 id 不会产生可用授权。
+- 来源仍必须是宿主认证的 live turn，并遵守输出位置、协作准入及实际消息签名绑定。
+  不要求该 turn 是人发起；主控的外部事件、机器人派单或 report 轮次均可命中。
+  管理员授予的是来源机器人本身的调度能力，所以其可接受输入的对话/触发策略也应配置妥当。
+- 新能力不传递控制管理员的即时工具身份，`tools` 与持久 `runScopes` 均为空。
+  它只解决 BotMux 调度；需要个人 API 凭据的查询仍按原工具身份策略单独授权，
+  不会自动获得审批、合并或生产部署权限。
+- 每次目标兑换、定时 admission 和自管理重新检查当前 grant。删除 grant、修改其
+  来源/目标/群/控制管理员，或关闭 createEnabled，会撤销该服务授权后续准入；
+  runEnabled=false 仍是所有委托任务的执行急停开关。已发出的外部调用不承诺中止。
+- 权威任务记录的 grant_id 保存 `bot-policy` 来源和策略标识。后续派单使用主控自己
+  当前的配置重新签发，不把上游 capability 当作可无限转授的凭证。
+- 开启 selfManageEnabled 后，服务授权任务可在自己的定时轮次中 pause/remove；
+  同一目标机器人还可在原群、原话题的后续轮次中 pause/remove 自己的此类任务，
+  包括已暂停任务。跨话题、旧任务、update/resume/run 均不因此放权。
+- 已有 direct/legacy/旧 delegated 任务不自动升级，旧任务清理仍按其原授权处理。
+
+配置仅属于同一宿主信任域；跨部署不共享签名存储时不适用。PR 不修改实际团队授权
+或重启服务。上线时应先在隔离测试群验证机器人触发、report 后再次派单、精确清理和撤权。
