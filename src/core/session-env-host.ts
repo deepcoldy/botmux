@@ -195,36 +195,60 @@ export function sessionEnvTmuxSockets(): Array<{ socket: string | null; managed:
  *  Each record begins with `NAME=` (set) or `-NAME` (unset); any subsequent
  *  physical lines that do not start with a new record belong to the value of
  *  the previous record (joined with `\n`).
+ *
+ *  Note on wire-format ambiguity: `tmux show-environment` does not offer a
+ *  NUL-delimited or structured format, so a continuation line that itself
+ *  happens to match `NAME=` (a valid env name without whitespace followed by '=')
+ *  is inherently indistinguishable from a new record and will be parsed as one.
+ *  Records whose key contains characters outside `ENV_NAME_RE` (e.g. hyphens or
+ *  dots) are rejected as invalid keys and reset the active key rather than
+ *  bleeding into predecessor records.
  */
 export function parseTmuxShowEnvironmentOutput(output: string): Record<string, string> {
   const vars: Record<string, string> = {};
   let currentKey: string | null = null;
 
-  for (const line of String(output).split('\n')) {
-    if (!line) continue;
+  const lines = String(output).split('\n');
+  // Strip only the trailing empty line appended by tmux at the end of output;
+  // interior empty lines are part of multiline values.
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+
+  for (const line of lines) {
+    if (line === '') {
+      if (currentKey !== null) vars[currentKey] += '\n';
+      continue;
+    }
+
+    const eq = line.indexOf('=');
 
     // `-NAME` marks an explicitly removed entry; it holds no value.
-    if (line.startsWith('-')) {
-      const removedKey = line.slice(1);
-      if (ENV_NAME_RE.test(removedKey)) {
+    if (line.startsWith('-') && eq < 0) {
+      if (!/\s/.test(line.slice(1))) {
         currentKey = null;
         continue;
       }
     }
 
-    const eq = line.indexOf('=');
     if (eq > 0) {
       const key = line.slice(0, eq);
-      if (ENV_NAME_RE.test(key)) {
-        currentKey = key;
-        vars[key] = line.slice(eq + 1);
+      if (!/\s/.test(key)) {
+        if (ENV_NAME_RE.test(key)) {
+          currentKey = key;
+          vars[key] = line.slice(eq + 1);
+        } else {
+          // Unrepresentable key name: treat as record boundary and discard,
+          // avoiding value bleeding into preceding variables.
+          currentKey = null;
+        }
         continue;
       }
     }
 
     // Continuation line of a multiline value.
     if (currentKey !== null) {
-      vars[currentKey] = `${vars[currentKey]}\n${line}`;
+      vars[currentKey] += `\n${line}`;
     }
   }
 

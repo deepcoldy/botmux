@@ -75,20 +75,26 @@ describe('machine baseline views', () => {
 const hasTmux = process.platform === 'linux' && spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0;
 
 describe('tmux servers', () => {
-  it('parses tmux show-environment output preserving multiline values and ignoring unsets', () => {
+  it('parses tmux show-environment output preserving multiline values, internal blank lines, and ignoring unsets', () => {
     const raw = [
       'SINGLE=one',
       '-REMOVED_VAR',
+      'stray line after unset',
       'MULTI=line1',
-      'line2',
-      'line3 continued',
+      '',
+      'line3 after empty line',
+      'NON_IDENTIFIER_RECORD-WITH-HYPHEN=secret',
+      'trailing after rejected record',
+      'VALID_RECORD=val',
+      '-LIKE_UNSET',
       'AFTER=next',
       '',
     ].join('\n');
 
     expect(parseTmuxShowEnvironmentOutput(raw)).toEqual({
       SINGLE: 'one',
-      MULTI: 'line1\nline2\nline3 continued',
+      MULTI: 'line1\n\nline3 after empty line',
+      VALID_RECORD: 'val',
       AFTER: 'next',
     });
   });
