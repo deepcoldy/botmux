@@ -171,7 +171,18 @@ process.stdin.on('data', chunk => {
         items: [{ type: 'function_call', name: 'read_file', call_id: turnId, arguments: '{"path":"src/a.ts"}' }] },
     }) + '\\n');
     submissionCount++;
-    if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working')} || submissionCount === 1)) {
+    // The preferred-model successor starts on core only AFTER the pool walk
+    // already reached 'last' (a prior launch row exists). Its turn is open
+    // work — the release file was removed by the last model — not a capacity
+    // queue. Painting Queued here would start a second pool walk for the
+    // successor turn and race the later crash (observed under the tmux
+    // backend, whose slower restart window let the walk fire first).
+    const successorAfterReset = ${JSON.stringify(holdPreferredSuccessor)} && model === 'core'
+      && fs.existsSync(${JSON.stringify(launches)})
+      && fs.readFileSync(${JSON.stringify(launches)}, 'utf8').includes('"model":"last"');
+    if (successorAfterReset) {
+      process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
+    } else if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working')} || submissionCount === 1)) {
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else queued();
   }
