@@ -11,6 +11,14 @@
 //   - a run whose queue job started earlier and is still waiting is ahead.
 // The Feishu job starts once neither exists. Runs from before this queue (no
 // queue job) hold the slot while their Feishu job is in progress.
+//
+// The run list filtered by `status=in_progress` once left out a run whose
+// Feishu job had been running for an hour (2026-10-22: run 39813063870 got the
+// slot while 39803710703 held it). Two fleets of daemons for the same bots
+// then split every app's events between them — a group-mode case waited four
+// minutes for a reply the other run's daemon had swallowed. So the candidates
+// come from three listings, every candidate's jobs are read (the jobs API is
+// per run and current), and the slot is only taken after two clear checks.
 
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -28,8 +36,13 @@ export function slotBlockers({ selfRunId, selfStartedAt, runs }) {
     if (run.id === selfRunId) continue;
     const queue = run.jobs.find((job) => job.name === QUEUE_JOB_NAME);
     const feishu = run.jobs.find((job) => job.name === FEISHU_JOB_NAME);
-    if (!feishu) continue;
-    const feishuActive = feishu.status !== 'completed';
+    // A job that `needs` another is not listed until it can be queued: while a
+    // run waits, only its queue job is there, and once it took the slot its
+    // Feishu job may not be listed yet. Skipping runs without a Feishu job let
+    // every waiter start together when the holder finished (2026-10-24: three
+    // Feishu jobs started within 7 seconds and split the bots' events).
+    if (!queue && !feishu) continue;
+    const feishuActive = !feishu || feishu.status !== 'completed';
     if (queue) {
       if (queue.status === 'completed') {
         if (queue.conclusion === 'success' && feishuActive) blockers.push({ run, reason: 'holds the slot' });
@@ -38,7 +51,7 @@ export function slotBlockers({ selfRunId, selfStartedAt, runs }) {
           queue.started_at < selfStartedAt || (queue.started_at === selfStartedAt && run.id < selfRunId);
         if (ahead) blockers.push({ run, reason: 'is queued ahead' });
       }
-    } else if (feishu.status === 'in_progress') {
+    } else if (feishu && feishu.status === 'in_progress') {
       blockers.push({ run, reason: 'holds the slot (run from before the queue)' });
     }
   }
@@ -63,10 +76,41 @@ async function runJobs(runId) {
   return jobs;
 }
 
+/**
+ * Runs that may hold or wait for the slot: every run some listing does not
+ * report as completed, once each, never this run.
+ * @param {Array<{ workflow_runs: Array<{ id: number, status: string }> }>} listings
+ * @param {number} selfRunId
+ */
+export function candidateRuns(listings, selfRunId) {
+  const runs = new Map();
+  for (const { workflow_runs: listed } of listings) {
+    for (const run of listed ?? []) {
+      if (run.id === selfRunId || run.status === 'completed' || runs.has(run.id)) continue;
+      runs.set(run.id, run);
+    }
+  }
+  return [...runs.values()];
+}
+
+async function slotCheck(workflow, selfRunId, selfStartedAt) {
+  const listings = await Promise.all(
+    ['per_page=100', 'status=in_progress&per_page=100', 'status=queued&per_page=100'].map((query) =>
+      github(`/actions/workflows/${workflow}/runs?${query}`),
+    ),
+  );
+  const runs = [];
+  for (const run of candidateRuns(listings, selfRunId)) {
+    runs.push({ id: run.id, headBranch: run.head_branch, htmlUrl: run.html_url, jobs: await runJobs(run.id) });
+  }
+  return slotBlockers({ selfRunId, selfStartedAt, runs });
+}
+
 async function main() {
   const selfRunId = Number(process.env.GITHUB_RUN_ID);
   const workflow = process.env.QUEUE_WORKFLOW_FILE ?? 'midscene-e2e.yml';
   const pollMs = Number(process.env.QUEUE_POLL_SECONDS ?? 60) * 1000;
+  const confirmMs = Number(process.env.QUEUE_CONFIRM_SECONDS ?? 20) * 1000;
   const maxWaitMs = Number(process.env.QUEUE_MAX_WAIT_MINUTES ?? 280) * 60_000;
   const self = (await runJobs(selfRunId)).find((job) => job.name === QUEUE_JOB_NAME);
   const selfStartedAt = self?.started_at ?? new Date().toISOString();
@@ -75,15 +119,12 @@ async function main() {
   for (;;) {
     let blockers = [];
     try {
-      const { workflow_runs: inProgress } = await github(
-        `/actions/workflows/${workflow}/runs?status=in_progress&per_page=100`,
-      );
-      const runs = [];
-      for (const run of inProgress) {
-        if (run.id === selfRunId) continue;
-        runs.push({ id: run.id, headBranch: run.head_branch, htmlUrl: run.html_url, jobs: await runJobs(run.id) });
+      blockers = await slotCheck(workflow, selfRunId, selfStartedAt);
+      if (blockers.length === 0) {
+        // A clear check must hold a little later too before the slot is taken.
+        await new Promise((resolve) => setTimeout(resolve, confirmMs));
+        blockers = await slotCheck(workflow, selfRunId, selfStartedAt);
       }
-      blockers = slotBlockers({ selfRunId, selfStartedAt, runs });
     } catch (error) {
       // A transient API failure must not hand out the slot; keep waiting.
       console.log(`Queue check failed, retrying: ${error.message}`);

@@ -26,7 +26,8 @@ Every `cases/*.yaml` file is a lane, run as the Midscene project
 `feishu-<file stem>`. Lanes run concurrently (`FEISHU_E2E_CONCURRENCY`,
 default 4); cases inside one lane run in order. A lane groups cases that must
 not overlap — `full-group.yaml` stays serial because its no-mention case
-asserts that no bot answered.
+asserts that no bot answered. The longest lane, `core-group-modes`, starts
+first (`LONG_LANES_FIRST` in `lanes.ts`); on CI a failed case runs once more.
 
 | Lane | Covers |
 |:--|:--|

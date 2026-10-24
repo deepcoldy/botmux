@@ -43,6 +43,9 @@ import {
   clickDirectStartAfter,
   sendAndAwaitReply,
   scrollConversation,
+  clickChatFilter,
+  MESSAGES_FILTER,
+  findTopicIcon,
 } from './helpers.js';
 import { publishLabeledPageVideo } from './e2e-video.js';
 import { dmLeaseKey, holdLeaseForPage } from './chat-lease.js';
@@ -311,21 +314,26 @@ async function openSessionGroup({ agent, page }: BrowserSession, groupName: stri
   await openGroupChat(page, agent, groupName, { lease: false, timeoutMs: 90_000 });
 }
 
-/** `/dismiss` asks for a one-time confirmation token; send it back. */
+/** `/dismiss` answers with a confirmation card; its button disbands the group. */
 async function dismissSessionGroup({ agent, page }: BrowserSession): Promise<void> {
   try {
-    const [, token] = await sendAndAwaitReply(
-      page,
-      () => typeChatMessage(agent, page, '/dismiss'),
-      '/dismiss',
-      /\/dismiss --confirm=([0-9a-f]{64})/,
-    );
-    await typeChatMessage(agent, page, `/dismiss --confirm=${token}`);
+    await typeChatMessage(agent, page, '/dismiss');
+    const confirm = page.getByText(DISMISS_CONFIRM_LABEL).last();
+    const deadline = Date.now() + 60_000;
+    while (!(await confirm.isVisible().catch(() => false))) {
+      if (Date.now() > deadline) throw new Error('no /dismiss confirmation card within 60s');
+      await scrollConversation(page);
+      await page.waitForTimeout(2_000);
+    }
+    await confirm.click({ timeout: 10_000 });
     await page.waitForTimeout(5_000);
   } catch (error) {
     console.warn('[chat-modes] Dismissing the session group failed; it is left behind:', error);
   }
 }
+
+// The card's button: `cmd.dismiss.confirm_button` in src/i18n (zh / en).
+const DISMISS_CONFIRM_LABEL = /^\s*(确认解散|Disband)\s*$/;
 
 // ---------------------------------------------------------------------------
 // Regular-group modes
@@ -336,10 +344,29 @@ const GROUP_SETTINGS = {
   mention: { command: '/mention-mode', status: '当前群 @ 策略：', updated: '已切换当前群 @ 策略为：' },
 } as const;
 
+/** Reload and open the group: also renders a view that stopped updating. */
 async function reopenGroup({ agent, page }: BrowserSession): Promise<void> {
   // Reload resets the 「话题」 filter that openThreadForMessage leaves selected.
   await navigateToMessenger(page);
   await openGroupChat(page, agent, getGroupChatName());
+}
+
+/**
+ * Back to the group from a topic without a reload: switch the filter column
+ * back to 「消息」 and open the group. CI restores failed when the reload they
+ * used could not load Messenger while four lanes were busy.
+ */
+async function backToGroup(session: BrowserSession): Promise<void> {
+  const { agent, page } = session;
+  try {
+    if (await clickChatFilter(page, MESSAGES_FILTER)) {
+      await openGroupChat(page, agent, getGroupChatName());
+      return;
+    }
+  } catch (error) {
+    console.warn(`[chat-modes] Returning to the group in place failed: ${(error as Error).message.split('\n')[0]}`);
+  }
+  await reopenGroup(session);
 }
 
 /** Set a per-group mode for `bot`, run, then put the previous mode back. */
@@ -352,12 +379,15 @@ async function withGroupSetting(
 ): Promise<void> {
   const { agent, page } = session;
   const setting = GROUP_SETTINGS[kind];
+  const reopen = () => reopenGroup(session);
   const set = (label: string) =>
     sendAndAwaitReply(
       page,
       () => sendMentionMessage(page, agent, bot, `${setting.command} ${label}`),
       `${setting.command} ${label}`,
       new RegExp(`${setting.updated}${label}`),
+      90_000,
+      reopen,
     );
   const original = await baselineMode(`${kind}:${bot}`, async () => {
     const [, label] = await sendAndAwaitReply(
@@ -365,13 +395,15 @@ async function withGroupSetting(
       () => sendMentionMessage(page, agent, bot, setting.command),
       setting.command,
       new RegExp(`${setting.status}\\s*([a-z-]+)`),
+      90_000,
+      reopen,
     );
     return label;
   });
   await set(mode);
   await withRestore(run, () =>
     restoreWithRetry(`${bot} group ${kind} ${original}`, async () => {
-      await reopenGroup(session);
+      await backToGroup(session);
       await set(original);
     }),
   );
@@ -395,15 +427,32 @@ function resetGroupSession(session: BrowserSession, bot: ChatModeBot): Promise<v
 async function openNativeTopic({ agent, page }: BrowserSession, p: string): Promise<void> {
   const bubble = page.getByText(messageTag(p), { exact: false }).last();
   for (let attempt = 1; attempt <= 3; attempt++) {
-    await bubble.scrollIntoViewIfNeeded({ timeout: 10_000 });
-    await bubble.hover({ timeout: 10_000 });
+    // hover() scrolls the bubble into view and looks it up again when Feishu
+    // swaps the just-sent message for the delivered one; scrollIntoViewIfNeeded
+    // does neither ("Element is not attached to the DOM" failed CI cases).
+    try {
+      await bubble.hover({ timeout: 15_000 });
+    } catch (error) {
+      console.warn(`[chat-modes] Hovering ${messageTag(p)} failed (attempt ${attempt}): ${(error as Error).message.split('\n')[0]}`);
+      await scrollConversation(page);
+      continue;
+    }
     await page.waitForTimeout(800);
-    await agent.aiAct(
-      `鼠标正悬停在我发出的、正文以"${messageTag(p)}"开头的那条群消息上，它右上方浮出一排小图标：` +
-        '点赞、对话气泡（引用回复）、箭头（转发）、方框卡片形状的话题图标、"⋯"。' +
-        '点击第 4 个、即"转发"箭头与"⋯"之间的话题图标（悬停提示为"回复话题"或"话题回复"）。' +
-        '只点这条消息的图标，不要点机器人卡片上的图标，不要点对话气泡或转发箭头。',
-    );
+    // The icon is found from the toolbar's geometry; the vision click is only
+    // the fallback (it tapped empty space until the replanning limit in CI).
+    const box = await bubble.boundingBox().catch(() => null);
+    const icon = box ? await findTopicIcon(page, box) : null;
+    if (icon) {
+      await page.mouse.click(icon.x + icon.width / 2, icon.y + icon.height / 2);
+    } else {
+      console.warn(`[chat-modes] No toolbar found next to ${messageTag(p)} (attempt ${attempt}); asking the vision agent`);
+      await agent.aiAct(
+        `鼠标正悬停在我发出的、正文以"${messageTag(p)}"开头的那条群消息上，它右上方浮出一排小图标：` +
+          '点赞、对话气泡（引用回复）、箭头（转发）、方框卡片形状的话题图标、"⋯"。' +
+          '点击第 4 个、即"转发"箭头与"⋯"之间的话题图标（悬停提示为"回复话题"或"话题回复"）。' +
+          '只点这条消息的图标，不要点机器人卡片上的图标，不要点对话气泡或转发箭头。',
+      );
+    }
     await page.waitForTimeout(1_000);
     if (await page.getByText('创建群组并转发').isVisible().catch(() => false)) {
       console.warn(`[chat-modes] Opening the topic of ${messageTag(p)} hit Forward (attempt ${attempt}); retrying`);
@@ -449,6 +498,7 @@ async function groupReplyMode(
   mode: GroupReplyMode,
 ): Promise<void> {
   const { agent, page } = session;
+  const reopen = () => reopenGroup(session);
   await openGroupChat(page, agent, getGroupChatName());
   await withGroupSetting(session, bot, 'reply', mode, async () => {
     await resetGroupSession(session, bot);
@@ -459,9 +509,9 @@ async function groupReplyMode(
     if (mode === 'chat' || mode === 'chat-topic') {
       // Top level: inline replies, one continuous group session.
       await sendMentionMessage(page, agent, bot, p1);
-      await waitForReplyLine(page, line(p1), { agent });
+      await waitForReplyLine(page, line(p1), { agent, reopen });
       await sendMentionMessage(page, agent, bot, p2);
-      await waitForReplyLine(page, line(p2, p1), { agent });
+      await waitForReplyLine(page, line(p2, p1), { agent, reopen });
       // A native topic: `chat` folds it into the group session, `chat-topic`
       // gives the topic a session of its own. It hangs off a fresh plain
       // message — p2 already carries the bot's quote replies (「2 条回复」),
@@ -503,6 +553,7 @@ async function groupMentionMode(
   mode: GroupMentionMode,
 ): Promise<void> {
   const { agent, page } = session;
+  const reopen = () => reopenGroup(session);
   await openGroupChat(page, agent, getGroupChatName());
   await withGroupSetting(session, bot, 'mention', mode, async () => {
     await resetGroupSession(session, bot);
@@ -516,26 +567,30 @@ async function groupMentionMode(
         await expectNoReplyLine(page, answered(p1));
         const p2 = probe(`${label}-2`);
         await sendMentionMessage(page, agent, bot, p2);
-        await waitForReplyLine(page, answered(p2), { agent });
+        await waitForReplyLine(page, answered(p2), { agent, reopen });
         return;
       }
       case 'never': {
         await typeChatMessage(agent, page, p1);
-        await waitForReplyLine(page, answered(p1), { agent });
+        await waitForReplyLine(page, answered(p1), { agent, reopen });
         return;
       }
       case 'ambient': {
         // Answers without an @, but yields when the message @s someone else.
         await typeChatMessage(agent, page, p1);
-        await waitForReplyLine(page, answered(p1), { agent });
+        await waitForReplyLine(page, answered(p1), { agent, reopen });
+        // The redirect is a probe as well. `other` answers it from a session
+        // that never saw p1; `bot` could only answer it from the session that
+        // holds p1, so its reply — and only its — would recall p1. A vision
+        // check of "no reply from <bot>" twice took the other bot's card for it.
         const other = otherBot(bot);
-        const redirect = testMessage(`${label}-2`, { plain: true });
+        const redirect = probe(`${label}-2`);
         await sendMentionMessage(page, agent, other, redirect);
-        await page.waitForTimeout(45_000);
-        await agent.aiAssert(
-          `群聊里在包含"${redirect}"的那条（@了 ${other} 的）消息之后，没有 ${bot} 发出的任何回复消息或卡片；` +
-            `${other} 的回复可以有`,
-        );
+        await waitForReplyLine(page, answered(redirect), { agent, reopen });
+        // `bot` would answer from a live session, within seconds of `other`;
+        // a reply later than this window goes unnoticed. That is the price of
+        // not waiting a fixed 45s before a vision check, as this case did.
+        await expectNoReplyLine(page, line(redirect, p1), 30_000);
         return;
       }
       case 'topic': {
