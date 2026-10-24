@@ -947,6 +947,7 @@ describe('spawnDashboardSession — default working dir missing', () => {
   // Starting without a pick would land in the bot's default working dir, which
   // is gone: forkWorker refuses it. The session waits on the missing-directory
   // picker instead (manual entry even with nothing to scan, no 「直接开启会话」).
+  // Keep `_`: markdown escaping must differ from the visible path we assert.
   const MISSING = `${process.env.TMPDIR ?? '/tmp'}/botmux-dash-missing-${process.pid}/gone_dir/botmux`;
 
   beforeEach(() => {

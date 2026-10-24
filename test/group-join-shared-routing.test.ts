@@ -787,6 +787,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_missing_default';
     const chatId = 'oc_join_missing_default';
+    // Keep `_`: markdown escaping must differ from the visible path we assert.
     const missing = join(tempRoot, 'gone_dir', 'botmux');
     registry.registerBot({
       larkAppId: appId,

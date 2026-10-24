@@ -18413,9 +18413,16 @@ function setupWorkerHandlers(
                 `[${t}] Ignored failed terminal for completed async HTTP turn `
                 + msg.turnId.substring(0, 8),
               );
-            } else {
-              if (asyncResult?.status === 'pending') {
-                if (msg.status === 'cancelled') {
+            } else if (msg.status !== 'cancelled'
+              || asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+              // MiniMax's bare cancellation interrupts a pending trigger only.
+              // remote-runner sends turnFailed first: retain that failure and
+              // upgrade its generic code with this terminal's provider code.
+              // Use the same snapshot for memory and disk; a virtual/headless
+              // sink alone must not create a cancelled trigger out of nothing.
+              const interrupted = msg.status === 'cancelled' && asyncResult?.status === 'pending';
+              if (asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+                if (interrupted) {
                   asyncResult.status = 'interrupted';
                   asyncResult.interruptedAt = failedAt;
                 } else {
@@ -18426,7 +18433,7 @@ function setupWorkerHandlers(
                 }
               }
               try {
-                const outcome = msg.status === 'cancelled'
+                const outcome = interrupted
                   ? asyncTriggerStore.recordInterruptedStrict(ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId)
                   : asyncTriggerStore.recordTerminalFailureStrict(
                   ds.session.sessionId,
@@ -18453,7 +18460,7 @@ function setupWorkerHandlers(
               ds.idempotentAsyncTurns?.delete(msg.turnId);
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
-                + `failed (${failureCode})`,
+                + `${interrupted ? 'interrupted' : 'failed'} (${failureCode})`,
               );
             }
           }
@@ -20409,7 +20416,7 @@ function deliverFinalOutput(
     ).target) };
   }
   const cb = requireCallbacks();
-  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   const groupContextAuthorOrigin = !msg.turnFailed && (!msg.kind || msg.kind === 'bridge')
     ? readGroupContextAuthorOrigin({
         appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: msg.turnId,
@@ -20771,6 +20778,8 @@ function deliverFinalOutput(
         // MiniMax uses the legacy reply-card path. Keep the machine-readable
         // reason visible on that actual carrier, even when the native message
         // is generic; the ordered terminal independently owns settlement.
+        // This bounded, allowlisted code row fits within fitBuiltCard's
+        // CARD_LATE_CHROME_RESERVE_BYTES (2000) for late card chrome.
         const failedCard = JSON.parse(cardJson);
         failedCard.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_error',
           content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });

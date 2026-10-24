@@ -153,6 +153,7 @@ const OPENING = '用一句话回答 1+1 等于几';
 mkdirSync(mocks.dataDir, { recursive: true });
 const tmpRoot = mkdtempSync(join(mocks.dataDir, 'dirs-'));
 // No `-` in the name: git is never asked where a deleted worktree came from.
+// Keep `_`: markdown escaping must differ from the visible path we assert.
 const GONE = join(tmpRoot, 'gone_dir', 'botmux');
 
 afterAll(() => {

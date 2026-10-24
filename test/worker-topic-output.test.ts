@@ -91,11 +91,15 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe('worker final-output topic transport', () => {
-  it.each(['turn_budget_exhausted', 'execution_failed'])(
-    'renders MiniMax %s on the actual reply card and retains it in the result', async errorCode => {
-      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'minimax',
+  it.each([
+    ['turn_budget_exhausted', false], ['execution_failed', false],
+    ['turn_budget_exhausted', true], ['execution_failed', true],
+  ] as const)(
+    'renders MiniMax %s on the actual reply card and retains it in the result (snapshot: %s)', async (errorCode, snapshot) => {
+      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: snapshot ? 'codex' : 'minimax',
         turnResults: { enabled: true }, replyCardMode: 'legacy' });
-      ds.session.cliId = 'minimax';
+      ds.session.cliId = snapshot ? 'codex' : 'minimax';
+      if (snapshot) ds.session.cliLaunchSnapshot = { cliId: 'minimax' } as any;
       observeTurnResultTerminal(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
         turnId: 'om_turn_old', status: 'failed', errorCode }, 1);
       await new Promise<void>(resolve => deliverFinalOutput(ds, {
