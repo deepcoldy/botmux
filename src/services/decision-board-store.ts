@@ -190,8 +190,9 @@ export class DecisionBoardStore {
       // v1→v2：board_links 加 ord 列。功能尚未发版，v1 只可能存在于开发机，里面是合成数据；
       // links 无 FK 引用，直接丢表由下面的 CREATE 重建，items/events/批次数据保留。
       if (version === 1) db.exec('DROP TABLE IF EXISTS board_links;');
-      // v2→v3：board_files 加 ord 列并回填（v1 库同样缺这一列，走同一段）。
-      if (version < 3) migrateBoardFilesOrd(db);
+      // v2→v3：v1/v2 库的 board_files 都可能没有 ord 列；helper 按列存在性决定是否迁移，
+      // 与版本号无关（本身幂等），所以不加版本门槛。
+      migrateBoardFilesOrd(db);
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
           app_id TEXT NOT NULL,

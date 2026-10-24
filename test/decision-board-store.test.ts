@@ -433,6 +433,42 @@ describe('附件与批次投递状态', () => {
     expect(fileOrds(APP).map(f => f.ord)).toEqual([1, 2, 3, 4, 5]);
   });
 
+  it('v1 库重新打开时一次迁到 v3：links 丢表重建、board_files 补 ord 回填，版本变 3', () => {
+    const item = store.addItem(APP, { title: 't', links: [{ kind: 'url', ref: 'https://old.example' }] }, undefined, 500).item;
+    store.close();
+    // 降成 v1 的真实形态：board_links 与 board_files 都没有 ord 列；老图同一毫秒、按 id 逆序写入。
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.exec('DROP TABLE board_links;');
+    db.exec(`CREATE TABLE board_links (
+      app_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+      label TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, seq, kind, ref)
+    ) WITHOUT ROWID;`);
+    db.exec('DROP TABLE board_files;');
+    db.exec(`CREATE TABLE board_files (
+      app_id TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER, sha256 TEXT NOT NULL, mime TEXT NOT NULL,
+      bytes INTEGER NOT NULL, name TEXT NOT NULL, uploader TEXT NOT NULL, created_at INTEGER NOT NULL,
+      PRIMARY KEY (app_id, id)
+    ) WITHOUT ROWID;`);
+    const seed = db.prepare(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at)
+      VALUES (?, ?, ?, 'x', 'image/png', 1, ?, 'steward', ?)`);
+    for (const id of ['zz', 'aa', 'mm', 'bb']) seed.run(APP, id, item.seq, `${id[0]}.png`, 1_000);
+    db.exec('PRAGMA user_version = 1;');
+    db.close();
+
+    store = DecisionBoardStore.open(dir);
+    // v1→v2 是丢表重建（#2282 的既定行为，老关联不保留）：重建后新写的关联按写入顺序。
+    store.updateItem(APP, item.seq, { links: [{ kind: 'pr', ref: 'o/r#9' }, { kind: 'chat', ref: 'oc_v1' }] }, undefined, 5_000);
+    expect(store.links(APP, item.seq).map(l => l.kind)).toEqual(['pr', 'chat']);
+    expect(fileOrds(APP)).toEqual([
+      { name: 'a.png', ord: 1 }, { name: 'b.png', ord: 2 }, { name: 'm.png', ord: 3 }, { name: 'z.png', ord: 4 },
+    ]);
+    expect(store.detail(APP, item.seq)!.files.map(f => f.name)).toEqual(['a.png', 'b.png', 'm.png', 'z.png']);
+    const check = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    expect((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
+    check.close();
+  });
+
   it('库的版本比本构建新时明确报错，不读写', () => {
     store.close();
     const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
