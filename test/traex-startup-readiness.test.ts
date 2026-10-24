@@ -185,4 +185,47 @@ old completed response
   GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
   ☢ Full Access · ? for shortcuts`)).toBe(true);
   });
+
+  // TraeX 0.211.1 redraws adjacent rows with CUP instead of newlines.
+  // Stripping ANSI therefore joins the rule and composer as `────❯ …`.
+  it.each(['─', '━'])('releases the composer following a %s rule in a cursor-addressed PTY frame', rule => {
+    detector.feed(`\x1b[12;1H${rule.repeat(160)}\x1b[13;1H\x1b[1m❯\x1b[0m Ask TRAE CLI to do anything\x1b[14;1H${rule.repeat(160)}`);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('recognizes a rule and composer arriving in separate PTY chunks', () => {
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}`);
+    detector.feed('\x1b[13;1H\x1b[1m❯\x1b[0m Ask TRAE CLI to do anything');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('still holds a loading banner with a cursor-addressed composer', () => {
+    detector.feed(LOADING);
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ Ask TRAE CLI to do anything`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed(LOADED);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not release numbered picker rows after a rule', () => {
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ 1. Continue`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed('\r❯ Ask TRAE CLI to do anything');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears a capacity hold when the cursor-addressed composer returns', () => {
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ Ask TRAE CLI to do anything`);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
 });
