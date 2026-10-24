@@ -18499,7 +18499,7 @@ function setupWorkerHandlers(
           );
         }
         let nonLarkFailureHandled = false;
-        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous')
+        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous' || msg.status === 'cancelled')
           && !ds.session.vcMeetingReceiver) {
           const failureCode = msg.errorCode ?? msg.status;
           const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
@@ -18533,15 +18533,29 @@ function setupWorkerHandlers(
                 `[${t}] Ignored failed terminal for completed async HTTP turn `
                 + msg.turnId.substring(0, 8),
               );
-            } else {
-              if (asyncResult?.status === 'pending') {
-                asyncResult.status = 'failed';
-                asyncResult.failedAt = failedAt;
-                asyncResult.errorCode = 'trigger_failed';
-                asyncResult.terminalErrorCode = failureCode;
+            } else if (msg.status !== 'cancelled'
+              || asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+              // MiniMax's bare cancellation interrupts a pending trigger only.
+              // remote-runner sends turnFailed first: retain that failure and
+              // upgrade its generic code with this terminal's provider code.
+              // Use the same snapshot for memory and disk; a virtual/headless
+              // sink alone must not create a cancelled trigger out of nothing.
+              const interrupted = msg.status === 'cancelled' && asyncResult?.status === 'pending';
+              if (asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+                if (interrupted) {
+                  asyncResult.status = 'interrupted';
+                  asyncResult.interruptedAt = failedAt;
+                } else {
+                  asyncResult.status = 'failed';
+                  asyncResult.failedAt = failedAt;
+                  asyncResult.errorCode = 'trigger_failed';
+                  asyncResult.terminalErrorCode = failureCode;
+                }
               }
               try {
-                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                const outcome = interrupted
+                  ? asyncTriggerStore.recordInterruptedStrict(ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId)
+                  : asyncTriggerStore.recordTerminalFailureStrict(
                   ds.session.sessionId,
                   msg.turnId,
                   failedAt,
@@ -18566,7 +18580,7 @@ function setupWorkerHandlers(
               ds.idempotentAsyncTurns?.delete(msg.turnId);
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
-                + `failed (${failureCode})`,
+                + `${interrupted ? 'interrupted' : 'failed'} (${failureCode})`,
               );
             }
           }
@@ -20526,7 +20540,7 @@ function deliverFinalOutput(
     ).target) };
   }
   const cb = requireCallbacks();
-  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   const groupContextAuthorOrigin = !msg.turnFailed && (!msg.kind || msg.kind === 'bridge')
     ? readGroupContextAuthorOrigin({
         appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: msg.turnId,
@@ -20883,6 +20897,18 @@ function deliverFinalOutput(
             presentation: renderSnapshot,
             ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
+      if (effectiveCliId === 'minimax' && msg.turnFailed
+          && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
+        // MiniMax uses the legacy reply-card path. Keep the machine-readable
+        // reason visible on that actual carrier, even when the native message
+        // is generic; the ordered terminal independently owns settlement.
+        // This bounded, allowlisted code row fits within fitBuiltCard's
+        // CARD_LATE_CHROME_RESERVE_BYTES (2000) for late card chrome.
+        const failedCard = JSON.parse(cardJson);
+        failedCard.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_error',
+          content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
+        cardJson = JSON.stringify(failedCard);
+      }
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }

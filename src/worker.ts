@@ -611,6 +611,7 @@ import { readTraexModelLoads } from './services/traex-model-load.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
+import { runnerFinalOutcome } from './services/runner-final-outcome.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   CODEX_APP_ACTIVE_WRITER_EXIT_CODE,
@@ -4713,7 +4714,7 @@ function observeTraexAutoModelCapacity(screen: string): void {
     return;
   }
   const awaitingActivity = controller.awaitingModelActivity();
-  const progressing = traexModelProgressVisible(screen);
+  const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
   const action = controller.observeCapacityQueue({
     turnId: active.turnId,
     queued: traexCapacityQueueVisible(screen),
@@ -14676,6 +14677,7 @@ async function handleTrustedCodexAppMarker(
 
   if (kind === 'final' && typeof payload.content === 'string') {
     const finalContent = payload.content;
+    const outcome = runnerFinalOutcome(lastInitConfig?.cliId, payload.errorCode);
     // Blocking 1 N-final expansion: a `steer_superseded` disposition marks one of
     // the first N−1 members of an ordered steered group. It advances the worker
     // FIFO (durable settlement) but is NEVER delivered, carries no usage, and does
@@ -14798,7 +14800,9 @@ async function handleTrustedCodexAppMarker(
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }
-    if (deliverableContent && startedAtMs !== undefined) {
+    // A native failure is a separate diagnostic, not a duplicate model reply.
+    // Earlier explicit output must not hide the budget/execution failure.
+    if (deliverableContent && startedAtMs !== undefined && outcome.status === 'completed') {
       const suppressMarkers = readSendMarkers();
       // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
       // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
@@ -14894,7 +14898,7 @@ async function handleTrustedCodexAppMarker(
           && !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
         return false;
       }
-      if (finalContent && !suppressDelivery) {
+      if (finalContent && !suppressDelivery && outcome.status !== 'cancelled') {
       send({
         type: 'final_output',
         content: deliverableContent,
@@ -14903,6 +14907,11 @@ async function handleTrustedCodexAppMarker(
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(linkRefMode ? { linkRefMode } : {}),
+        ...(outcome.status === 'failed' ? {
+          turnFailed: true,
+          turnFailureCode: outcome.errorCode,
+          turnFailureNotice: deliverableContent,
+        } : {}),
       });
       } else if (isSuperseded) {
         // A superseded member still emits a final_output so the daemon (and any
@@ -14949,7 +14958,7 @@ async function handleTrustedCodexAppMarker(
     // The app-server runner timestamps its own completion; prefer that instant
     // over "whenever this worker got around to handling the marker". The clock
     // clamps it to now, so a skewed runner cannot mint a future completion.
-    emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt, undefined, undefined, completedAtMs);
+    emitTurnTerminal(turnId, outcome.status, outcome.errorCode, dispatchAttempt, undefined, undefined, completedAtMs);
     return true;
   }
   rejectCodexAppControlMarker(`unsupported signed ${kind}`);
@@ -16994,7 +17003,9 @@ function codexAppRuntimeTypeAheadReady(): boolean {
 function traexAutoModelInputHold(): boolean {
   return traexAutoModelRuntimeEligible() && (
     traexAutoModelSwitching
-    || traexAutoModelController?.awaitingModelActivity() === true
+    // Native async admission checks activity on the actual pane. A rendered
+    // display snapshot may omit the first row when rebuilding a full viewport.
+    || (traexAutoModelController?.awaitingModelActivity() === true && !backend?.captureViewportAsync)
     // Other native screen backends retain their existing admission path.
     // tmux uses fresh async reads below; PTY uses the drained renderer.
     || (!isPromptReady && !!backend && !backend.captureViewportAsync
@@ -17028,11 +17039,14 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   const generation = cliSpawnGeneration;
   const turnId = currentBotmuxTurnId;
   const poolTurnId = controller?.currentTurnId();
+  const poolModel = controller?.currentModel();
+  const awaitingActivity = controller?.awaitingModelActivity();
   const targetRenderer = renderer;
   const revision = backendScreenRevision;
   const gridRevision = observedPaneGridRevision;
   const current = () => backend === target && cliSpawnGeneration === generation
     && traexAutoModelController === controller && controller?.currentTurnId() === poolTurnId
+    && controller?.currentModel() === poolModel && controller?.awaitingModelActivity() === awaitingActivity
     && currentBotmuxTurnId === turnId && pendingMessages[0] === item
     && renderer === targetRenderer && !cliRestartInProgress
     && !traexAutoModelSwitching && traexAutoModelRuntimeEligible();
@@ -17040,13 +17054,14 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     retryTraexAutoModelAdmission();
     return false;
   };
-  if (!target || !current()
-    || (controller?.awaitingModelActivity()
-      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
+  if (!target || !current()) return hold();
   // Keep other native screen/history backends on their existing admission
   // contract. Do not disguise their synchronous capture as an async read.
   if (!backendScreenEvidenceIsAuthoritativeForMutation()
-    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) return true;
+    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) {
+    return controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId) ? hold() : true;
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const read = async (): Promise<string> => {
@@ -17062,15 +17077,18 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     if (!current() || backendScreenRevision !== revision || observedPaneGridRevision !== gridRevision
       || commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight()
       || currentInputDeliveryQuarantine() || currentPostTerminalInputFence()
-      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)
-      || (controller?.awaitingModelActivity()
-        && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId))) return hold();
-    if (!screen || traexCapacityQueueVisible(screen)) return hold();
+      || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)) return hold();
+    if (!screen || traexCapacityQueueVisible(screen) || cliAdapter?.startupPendingPattern?.test(screen)) return hold();
+    const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
+    if (controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId)) {
+      if (!progressing) return hold();
+      controller.observeCapacityQueue({ turnId: poolTurnId, queued: false, progressing: true, nowMs: Date.now() });
+    }
     // Absence of Queued is insufficient: empty/skeleton/unknown frames cannot
     // grant input. Use positive model activity or the actual composer marker;
     // readyPattern's Context percentage is also present on queue screens.
-    if (cliAdapter?.startupPendingPattern?.test(screen)) return hold();
-    return traexModelProgressVisible(screen)
+    return progressing
       || traexQueuedTypeAheadVisible(screen)
       || /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/.test(screen)
       || hold();
@@ -17482,6 +17500,9 @@ async function flushPending(): Promise<void> {
                 + `(${action.fromModel} -> ${action.toModel})`,
               );
               traexAutoModelController?.beginTurn(item.turnId, { retainCurrentModel: true });
+            }
+            if (traexAutoModelRuntimeEligible() && !traexAutoModelTurnReplayForbidden) {
+              traexAutoModelController?.markInputSubmitted(item.turnId);
             }
           }
           if (traexAutoModelRuntimeEligible()) {

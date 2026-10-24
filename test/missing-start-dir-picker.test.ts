@@ -12,6 +12,7 @@
  *
  * Run: bun x vitest run --project unit test/missing-start-dir-picker.test.ts
  */
+import { cardVisibleText } from './helpers/card-visible-text.js';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
@@ -152,7 +153,8 @@ const OPENING = '用一句话回答 1+1 等于几';
 mkdirSync(mocks.dataDir, { recursive: true });
 const tmpRoot = mkdtempSync(join(mocks.dataDir, 'dirs-'));
 // No `-` in the name: git is never asked where a deleted worktree came from.
-const GONE = join(tmpRoot, 'gone', 'botmux');
+// Keep `_`: markdown escaping must differ from the visible path we assert.
+const GONE = join(tmpRoot, 'gone_dir', 'botmux');
 
 afterAll(() => {
   rmSync(mocks.dataDir, { recursive: true, force: true });
@@ -235,7 +237,7 @@ describe('default working dir missing → the repo picker, not a start in that d
     // Manual entry even with an empty scan; no 「直接开启会话」 into the missing dir.
     expect(cards[0]).toContain('repo_manual_submit');
     expect(cards[0]).not.toContain('skip_repo');
-    expect(cards[0]).toContain(GONE);
+    expect(cardVisibleText(cards[0])).toContain(GONE);
     expect(cards[0]).toContain('不用重发');
     expect(ds.repoCardMessageId).toBe(CARD_ID);
     expect(ds.workingDirRecovery?.cardMessageId).toBe(CARD_ID);
