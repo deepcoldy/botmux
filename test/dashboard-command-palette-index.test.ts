@@ -37,6 +37,8 @@ import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashbo
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { REPLY_FOOTER_KEYS } from '../src/services/reply-footer.js';
+import { STREAMING_CARD_BUTTON_IDS } from '../src/im/lark/streaming-card-buttons.js';
 import { knownBots, loadNameMaps, t, ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -62,6 +64,71 @@ function subPages(): PalettePageEntry[] {
 function topItem(items: PaletteItem[], query: string): PaletteItem | undefined {
   const row = searchPalette({ items, query, scope: 'all' }).rows[0];
   return row?.type === 'item' ? row.item : undefined;
+}
+
+function extractTagOpeningBodies(source: string, tagName: string): string[] {
+  const bodies: string[] = [];
+  const tagStart = `<${tagName}`;
+  let pos = 0;
+
+  while (pos < source.length) {
+    const idx = source.indexOf(tagStart, pos);
+    if (idx === -1) break;
+    const afterChar = source[idx + tagStart.length];
+    if (afterChar && !/[\s/>]/.test(afterChar)) {
+      pos = idx + tagStart.length;
+      continue;
+    }
+
+    let i = idx + tagStart.length;
+    let braceDepth = 0;
+    let inString: string | null = null;
+    const bodyStart = i;
+
+    while (i < source.length) {
+      const ch = source[i]!;
+      if (inString !== null) {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === inString) {
+          inString = null;
+        }
+        i++;
+        continue;
+      }
+
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inString = ch;
+        i++;
+        continue;
+      }
+
+      if (ch === '{') {
+        braceDepth++;
+        i++;
+        continue;
+      }
+      if (ch === '}') {
+        if (braceDepth > 0) braceDepth--;
+        i++;
+        continue;
+      }
+
+      if (ch === '>' && braceDepth === 0) {
+        bodies.push(source.slice(bodyStart, i));
+        pos = i + 1;
+        break;
+      }
+
+      i++;
+    }
+
+    if (i >= source.length) break;
+  }
+
+  return bodies;
 }
 
 describe('⌘K index coverage', () => {
@@ -163,7 +230,7 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx']
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
       .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
@@ -171,11 +238,84 @@ describe('⌘K index coverage', () => {
         expect(en(key), key).not.toBe(key);
       }
       for (const key of section.fieldKeys ?? []) {
-        // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名或开关行标题。
-        const asLabel = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
-        expect(asLabel, key).toBe(true);
+        // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名、开关行标题或复选框 span 文本。
+        const asLiteral = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
+        const asCheckboxSpan = sources.includes(`<span>{tr('${key}')}</span>`);
+        const asQuietPreset = key.startsWith('quietPreset.') && sources.includes(`{tr('${key}')}`);
+        const asFooter = key.startsWith('botDefaults.replyFooter')
+          && REPLY_FOOTER_KEYS.some(k => `botDefaults.${k}` === key)
+          && sources.includes('title={tr(`botDefaults.${key}`)}');
+        const asStreamingButton = key.startsWith('botDefaults.streamingButton.')
+          && STREAMING_CARD_BUTTON_IDS.some(id => `botDefaults.streamingButton.${id}` === key)
+          && sources.includes('tr(`botDefaults.streamingButton.${id}`)');
+        const asTernary = (key === 'botDefaults.cotEnabled' || key === 'botDefaults.replyCardTools')
+          && sources.includes("title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}");
+        expect(asLiteral || asCheckboxSpan || asQuietPreset || asFooter || asStreamingButton || asTernary, key).toBe(true);
       }
     }
+  });
+
+  // 源码结构护栏(K4)：JSX 标签解析回归护栏；
+  // 守的是「ToggleRow 属性中包含带有 => 箭头函数或大于号时，避免正则提前闭合导致 title 属性漏解析」。
+  it('extracts ToggleRow title even when attributes before title contain arrow functions with >', () => {
+    const fixture = '<ToggleRow onChange={v => { doSomething(v > 0); }} title={tr(\'botDefaults.arrowRegressionTestKey\')} />';
+    const bodies = extractTagOpeningBodies(fixture, 'ToggleRow');
+    expect(bodies.length).toBe(1);
+    const match = /\btitle=\{tr\('([^']+)'\)\}/.exec(bodies[0]!);
+    expect(match?.[1]).toBe('botDefaults.arrowRegressionTestKey');
+  });
+
+  // 源码结构护栏(K4)：配置项标签写在各区块组件内部，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
+  // 守的是「区块组件里新增了可见配置项或选项组标签，却忘记在 BOT_DEFAULTS_SECTIONS.fieldKeys 登记」——
+  // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
+  it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
+    const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
+      .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+
+    const fieldTitleMatches = [...sources.matchAll(/\{tr\('([^']+)'\)\}<\/FieldTitle>/g)].map(m => m[1]!);
+    const groupNameMatches = [...sources.matchAll(/groupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
+    // 覆盖 TraexAutoModelEditor 等复选框标签
+    const autoModelMatches = [...sources.matchAll(/<label className="bd-auto-model-toggle">[\s\S]*?<span>\{tr\('([^']+)'\)\}<\/span>/g)].map(m => m[1]!);
+    // 覆盖 QuietPresetSection 内联一键静默预设模块的可见标题与开关
+    const quietPresetSource = readFileSync(new URL('../src/dashboard/web/quiet-preset-section.tsx', import.meta.url), 'utf8');
+    const quietPresetMatches = [...quietPresetSource.matchAll(/\{tr\('(quietPreset\.(?:title|switch))'\)\}/g)].map(m => m[1]!);
+
+    // 提取 ToggleRow 上的 title（通过花括号状态机配对，彻底消除 => 截断缺陷）
+    const toggleRowBodies = extractTagOpeningBodies(sources, 'ToggleRow');
+    const toggleRowTitles: string[] = [];
+    const toggleRowTernaries: string[] = [];
+    for (const body of toggleRowBodies) {
+      const tm = /\btitle=\{tr\('([^']+)'\)\}/.exec(body);
+      if (tm) toggleRowTitles.push(tm[1]!);
+      const tern = /\btitle=\{tr\([^?]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(body);
+      if (tern) {
+        toggleRowTernaries.push(tern[1]!);
+        toggleRowTernaries.push(tern[2]!);
+      }
+    }
+
+    // 识别通过常量列表动态展开的标签键
+    const dynamicFooterKeys = sources.includes('title={tr(`botDefaults.${key}`)}')
+      ? REPLY_FOOTER_KEYS.map(k => `botDefaults.${k}`)
+      : [];
+    const dynamicStreamingKeys = sources.includes('tr(`botDefaults.streamingButton.${id}`)')
+      ? STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`)
+      : [];
+
+    const renderedKeys = new Set([
+      ...fieldTitleMatches,
+      ...groupNameMatches,
+      ...autoModelMatches,
+      ...quietPresetMatches,
+      ...toggleRowTitles,
+      ...toggleRowTernaries,
+      ...dynamicFooterKeys,
+      ...dynamicStreamingKeys,
+    ]);
+    const unindexedKeys = [...renderedKeys].filter(key =>
+      (key.startsWith('botDefaults.') || key.startsWith('sessionEnv.') || key.startsWith('quietPreset.')) && !indexedKeys.has(key));
+    expect(unindexedKeys, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
   });
 });
 
