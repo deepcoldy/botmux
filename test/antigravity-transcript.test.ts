@@ -572,6 +572,33 @@ describe('transcript_full.jsonl vs the compact transcript.jsonl', () => {
     expect(mapAntigravityCompactOffsetToFull(logs.compactPath, compactAll, logs.fullPath)).toBeUndefined();
   });
 
+  it('refuses to map from a compact log that was truncated or replaced under the consumed offset', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const consumed = Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 5)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath))
+      .toBe(Buffer.byteLength(jsonl(logs.fullRecords.slice(0, 5))));
+    // Cut back to one record: mapping would land after record 1 of the full
+    // log and replay records 2–5 as new.
+    writeFileSync(logs.compactPath, jsonl(logs.compactRecords.slice(0, 1)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+    // Emptied: mapping would land at byte 0 and replay the whole conversation.
+    writeFileSync(logs.compactPath, '');
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+    // Same length again but only blank lines before the offset: no record boundary.
+    writeFileSync(logs.compactPath, '\n'.repeat(consumed));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+  });
+
+  it('refuses to map when the full log does not start at the same first record', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    // A full log that began mid-conversation can still agree on the N-th
+    // record by coincidence of shape; the first record anchors it.
+    const shifted = [{ ...logs.fullRecords[0], step_index: 40 }, ...logs.fullRecords.slice(1)];
+    writeFileSync(logs.fullPath, jsonl(shifted));
+    const consumed = Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 12)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+  });
+
   it('maps a consumed final record that has no trailing newline yet', () => {
     const logs = writeAntigravityTwoLogs(brainDir(), CID);
     const compactText = jsonl(logs.compactRecords).replace(/\n$/, '');

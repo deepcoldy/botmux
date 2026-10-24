@@ -89,7 +89,7 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
@@ -191,10 +191,13 @@ function stepIdentity(line: string): string | undefined {
  * never be used against the full file directly.
  *
  * Returns undefined — the caller stays on the compact log and retries later —
- * when the offset is negative/unsafe, the full log has not yet written all N
- * records as complete lines (it trails the compact log by a few ms), or the
- * N-th records disagree on step_index/type (never observed; refuse rather than
- * misalign).
+ * when the offset is negative/unsafe, the compact log is now shorter than the
+ * consumed offset or covers no record before it (it was replaced/truncated:
+ * the drainer holds on that, and a mapping from it would land mid-history or
+ * at byte 0 of the full log and replay those records), the full log has not
+ * yet written all N records as complete lines (it trails the compact log by a
+ * few ms), or the first or N-th records disagree on step_index/type (never
+ * observed; refuse rather than misalign).
  */
 export function mapAntigravityCompactOffsetToFull(
   compactPath: string,
@@ -202,13 +205,21 @@ export function mapAntigravityCompactOffsetToFull(
   fullPath: string,
 ): number | undefined {
   if (!Number.isSafeInteger(compactOffset) || compactOffset < 0 || !existsSync(fullPath)) return undefined;
+  if (compactOffset === 0) return 0;
+  try {
+    if (statSync(compactPath).size < compactOffset) return undefined;
+  } catch {
+    return undefined;
+  }
   let records = 0;
+  let firstLine: string | undefined;
   let lastLine: string | undefined;
   const compact = scanJsonlFromOffset(compactPath, 0, {
     endOffset: compactOffset,
     onLine: line => {
       if (!line.trim()) return;
       records++;
+      firstLine ??= line;
       lastLine = line;
     },
   });
@@ -217,11 +228,13 @@ export function mapAntigravityCompactOffsetToFull(
   // it parses (newOffset = size); the scan leaves that record in pendingTail.
   if (compact.pendingTail.trim()) {
     records++;
+    firstLine ??= compact.pendingTail;
     lastLine = compact.pendingTail;
   }
-  if (records === 0) return 0;
+  if (records === 0) return undefined;
+  const origin = stepIdentity(firstLine!);
   const boundary = stepIdentity(lastLine!);
-  if (boundary === undefined) return undefined;
+  if (origin === undefined || boundary === undefined) return undefined;
 
   let seen = 0;
   let mapped: number | undefined;
@@ -230,6 +243,10 @@ export function mapAntigravityCompactOffsetToFull(
     onLine: (line, lineStart) => {
       if (!aligned || mapped !== undefined || !line.trim()) return;
       seen++;
+      if (seen === 1 && stepIdentity(line) !== origin) {
+        aligned = false;
+        return;
+      }
       if (seen < records) return;
       if (stepIdentity(line) !== boundary) {
         aligned = false;
