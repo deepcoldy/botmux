@@ -13,7 +13,9 @@ const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'
 
 /** Body of a top-level `function name(` up to the next top-level declaration. */
 function topLevelFunction(name: string): string {
-  const start = source.indexOf(`\nfunction ${name}(`);
+  const syncStart = source.indexOf(`\nfunction ${name}(`);
+  const asyncStart = source.indexOf(`\nasync function ${name}(`);
+  const start = syncStart >= 0 ? syncStart : asyncStart;
   expect(start, name).toBeGreaterThanOrEqual(0);
   const next = /\n(?:export )?(?:async )?(?:function|type|interface|class|const|let) /g;
   next.lastIndex = start + 1;
@@ -33,5 +35,25 @@ describe('cursor attach baseline is footer-aware', () => {
     expect(attach.match(/baselineCursorTranscript\(/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
     // Adopt reaches the skip-tail branch only through cursorBridgeAttach's mode mapping.
     expect(topLevelFunction('cursorBridgeAttach')).toContain("'baseline-existing-skip-tail'");
+  });
+});
+
+describe('fresh TRAE RPC bridge attachment', () => {
+  it('binds the app-server thread when no persisted CLI session id exists yet', () => {
+    const spawn = topLevelFunction('spawnCli');
+    expect(spawn).toContain('cliSessionId: effectiveCliSessionId ?? opts.rpcThreadId');
+  });
+
+  it('captures the RPC thread before spawn and drains after releasing a fast terminal', () => {
+    expect(source).toContain('const rpcThreadIdAtSpawn = rpcDecision.engaged ? remoteThreadId : undefined');
+    expect(source).toContain('rpcThreadId: rpcThreadIdAtSpawn');
+    expect(source).toContain('codexBridgeDrainAndMaybeEmit({ signalIdle: false })');
+  });
+
+  it('emits a structured final without waiting for TUI ready detection', () => {
+    const ingest = topLevelFunction('codexBridgeIngest');
+    expect(ingest).toContain(
+      "if (structuredBridgeIs('traex') && hasAssistantFinal) emitReadyCodexTurns()",
+    );
   });
 });

@@ -10706,6 +10706,7 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  const hasAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
   observeStructuredBackgroundTasks(result);
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
@@ -10721,6 +10722,10 @@ function codexBridgeIngest(opts: {
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
+  // TRAE's structured assistant_final is authoritative. Emit immediately so
+  // result delivery never depends on the remote TUI composer being recognized
+  // as ready after ANSI/CUP redraws.
+  if (structuredBridgeIs('traex') && hasAssistantFinal) emitReadyCodexTurns();
   // Transcript-driven idle: a normal `assistant_final` or no-output
   // `turn_aborted` is Codex declaring end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
@@ -10736,7 +10741,7 @@ function codexBridgeIngest(opts: {
   // about to wake the planner for another round.
   if (opts.signalIdle !== false
     && !structuredBridgeIs('antigravity')
-    && result.events.some(event => event.kind === 'assistant_final')) {
+    && hasAssistantFinal) {
     idleDetector?.fireIdle();
   }
 }
@@ -18836,7 +18841,11 @@ function resolveCliExtraArgs(): string[] {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string } = {},
+  opts: {
+    pluginGenerationPrepared?: boolean;
+    exactResumeSessionId?: string;
+    rpcThreadId?: string;
+  } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
@@ -23606,7 +23615,10 @@ async function spawnCli(
     // sandbox (the host-side transcript reader can't resolve its mirror).
     attachStructuredBridgeAtSpawn(cfg, spawnBridge, {
       resume: effectiveResume,
-      cliSessionId: effectiveCliSessionId,
+      // A fresh RPC turn executes on an app-server thread before the remote
+      // viewer starts. Its first turn bypasses writeInput, so this is the only
+      // attach boundary that can bind the rollout from byte zero.
+      cliSessionId: effectiveCliSessionId ?? opts.rpcThreadId,
       adapterSessionId: effectiveAdapterSessionId,
     });
   } else if (cfg.cliId === 'coco') {
@@ -27702,7 +27714,11 @@ process.on('message', async (raw: unknown) => {
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
-        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        const rpcThreadIdAtSpawn = rpcDecision.engaged ? remoteThreadId : undefined;
+        await spawnCli(msg, {
+          pluginGenerationPrepared: rpcPluginGenerationPrepared,
+          rpcThreadId: rpcThreadIdAtSpawn,
+        });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
@@ -27713,6 +27729,10 @@ process.on('message', async (raw: unknown) => {
             deferred.identity,
             deferred.generation,
           );
+          // A fast first RPC turn may persist task_complete while the remote
+          // viewer is still spawning. Drain at the attach/deferral boundary
+          // instead of waiting for the next bridge timer tick.
+          codexBridgeDrainAndMaybeEmit({ signalIdle: false });
         }
 
         // Queue the initial prompt — flushed when CLI shows idle.
