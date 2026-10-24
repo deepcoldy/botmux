@@ -37,6 +37,8 @@ import { dashboardRoutes, findDashboardRoute } from '../src/dashboard/web/dashbo
 import { INSIGHT_TABS } from '../src/dashboard/web/insight-tabs.js';
 import { NAV_ITEMS, NAV_SUBPAGES, PALETTE_UNINDEXED_ROUTES, type NavItem } from '../src/dashboard/web/nav-items.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { REPLY_FOOTER_KEYS } from '../src/services/reply-footer.js';
+import { STREAMING_CARD_BUTTON_IDS } from '../src/im/lark/streaming-card-buttons.js';
 import { knownBots, loadNameMaps, t, ui } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -172,8 +174,16 @@ describe('⌘K index coverage', () => {
       }
       for (const key of section.fieldKeys ?? []) {
         // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名或开关行标题。
-        const asLabel = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
-        expect(asLabel, key).toBe(true);
+        const asLiteral = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
+        const asFooter = key.startsWith('botDefaults.replyFooter')
+          && REPLY_FOOTER_KEYS.some(k => `botDefaults.${k}` === key)
+          && sources.includes('title={tr(`botDefaults.${key}`)}');
+        const asStreamingButton = key.startsWith('botDefaults.streamingButton.')
+          && STREAMING_CARD_BUTTON_IDS.some(id => `botDefaults.streamingButton.${id}` === key)
+          && sources.includes('tr(`botDefaults.streamingButton.${id}`)');
+        const asTernary = (key === 'botDefaults.cotEnabled' || key === 'botDefaults.replyCardTools')
+          && sources.includes("title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}");
+        expect(asLiteral || asFooter || asStreamingButton || asTernary, key).toBe(true);
       }
     }
   });
@@ -188,9 +198,37 @@ describe('⌘K index coverage', () => {
 
     const fieldTitleMatches = [...sources.matchAll(/\{tr\('([^']+)'\)\}<\/FieldTitle>/g)].map(m => m[1]!);
     const groupNameMatches = [...sources.matchAll(/groupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
-    const toggleRowMatches = [...sources.matchAll(/<ToggleRow[^>]*\btitle=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
 
-    const renderedKeys = new Set([...fieldTitleMatches, ...groupNameMatches, ...toggleRowMatches]);
+    // 提取 ToggleRow 上的 title（支持属性跨行与 => 箭头函数，匹配到组件闭合）
+    const toggleRowBlocks = [...sources.matchAll(/<ToggleRow\b([\s\S]*?)(?:\/?>)/g)].map(m => m[1]!);
+    const toggleRowTitles: string[] = [];
+    const toggleRowTernaries: string[] = [];
+    for (const block of toggleRowBlocks) {
+      const tm = /\btitle=\{tr\('([^']+)'\)\}/.exec(block);
+      if (tm) toggleRowTitles.push(tm[1]!);
+      const tern = /\btitle=\{tr\([^?]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(block);
+      if (tern) {
+        toggleRowTernaries.push(tern[1]!);
+        toggleRowTernaries.push(tern[2]!);
+      }
+    }
+
+    // 识别通过常量列表动态展开的标签键
+    const dynamicFooterKeys = sources.includes('title={tr(`botDefaults.${key}`)}')
+      ? REPLY_FOOTER_KEYS.map(k => `botDefaults.${k}`)
+      : [];
+    const dynamicStreamingKeys = sources.includes('tr(`botDefaults.streamingButton.${id}`)')
+      ? STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`)
+      : [];
+
+    const renderedKeys = new Set([
+      ...fieldTitleMatches,
+      ...groupNameMatches,
+      ...toggleRowTitles,
+      ...toggleRowTernaries,
+      ...dynamicFooterKeys,
+      ...dynamicStreamingKeys,
+    ]);
     const unindexedKeys = [...renderedKeys].filter(key => key.startsWith('botDefaults.') && !indexedKeys.has(key));
     expect(unindexedKeys, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
   });
