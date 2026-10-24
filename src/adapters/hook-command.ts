@@ -148,6 +148,19 @@ export function userPromptHookCommand(): string {
 }
 
 /**
+ * 构造 Claude Code `StopFailure` hook 的 shell 命令字符串 → `botmux __claude-stop-failure-v1`。
+ * 与 userPromptHookCommand 同策略写全局 settings.json。Claude 只在回合因 API 错误结束时
+ * 跑它（这条路径不跑 Stop hook），hook 子进程靠继承的 BOTMUX_SESSION_ID /
+ * BOTMUX_LARK_APP_ID 上报给本会话 worker，worker 在 transcript 没收口该回合时兜底。
+ * 缺 env / daemon 不可达时静默 exit 0；StopFailure 的输出与退出码 Claude 本就忽略。
+ * 子命令名带版本、`__` 前缀，与 `__turn-idle-v2` 同理：载荷形状变了就换名字，
+ * 新旧混装时旧 CLI 不认识新名字，一个请求都不发。
+ */
+export function claudeStopFailureHookCommand(): string {
+  return renderShellCommand(undefined, '__claude-stop-failure-v1');
+}
+
+/**
  * 构造 Claude Code `statusLine.command` 的 shell 命令字符串 → `botmux statusline`。
  * 与 sessionReadyHookCommand 同策略，但写进**进程级** `--settings`（不写全局：全局只能
  * 有一个 statusLine，写进去会覆盖用户自己的；被 wrapperCli 剥掉时卡片省略即可）。

@@ -33,6 +33,9 @@ export interface HookInstallConfig {
   /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
    *  仅 claude-settings：写全局 settings.json 的 hooks.UserPromptSubmit。 */
   readonly userPromptSubmitCommand?: string;
+  /** 可选：StopFailure hook 命令。
+   *  仅 claude-settings：写全局 settings.json 的 hooks.StopFailure。 */
+  readonly stopFailureCommand?: string;
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -279,6 +282,24 @@ function removeBotmuxPromptHookGroups(hooks: Record<string, ClaudeHookGroup[]>, 
   else hooks[eventName] = filtered;
 }
 
+/** 判断某 hook group 是否是 botmux StopFailure hook（用于幂等替换），同上结构化识别。 */
+function isBotmuxStopFailureHookGroup(group: ClaudeHookGroup): boolean {
+  return Array.isArray(group?.hooks) && group.hooks.some(
+    (e) =>
+      !!e &&
+      e.type === 'command' &&
+      typeof e.command === 'string' &&
+      isBotmuxHookCommand(e.command, '__claude-stop-failure-v1'),
+  );
+}
+
+function removeBotmuxStopFailureHookGroups(hooks: Record<string, ClaudeHookGroup[]>, eventName: string): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxStopFailureHookGroup(g));
+  if (filtered.length === 0) delete hooks[eventName];
+  else hooks[eventName] = filtered;
+}
+
 /**
  * Read-only preflight used by the worker before it arms the ready gate.
  * Installation is intentionally best-effort, so the gate must not assume that
@@ -359,6 +380,7 @@ function installClaudeSettings(
   inheritClaudeEnvFrom?: string,
   userPromptSubmitCommand?: string,
   inheritClaudeEnvExclude: readonly string[] = [],
+  stopFailureCommand?: string,
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -430,6 +452,17 @@ function installClaudeSettings(
     existingHooks['UserPromptSubmit'] = [
       ...(existingHooks['UserPromptSubmit'] ?? []),
       { hooks: [{ type: 'command', command: userPromptSubmitCommand, timeout: 10 }] },
+    ];
+  }
+
+  // StopFailure hook（幂等替换旧的 botmux 条目）。不写 matcher = 所有错误类型，
+  // 分类在 worker 侧做（与 transcript 同一个分类器）。Claude 不等 StopFailure hook
+  // 跑完；timeout 10s 只为收掉意外挂住的子进程（客户端只发一次本地 IPC）。
+  if (stopFailureCommand) {
+    removeBotmuxStopFailureHookGroups(existingHooks, 'StopFailure');
+    existingHooks['StopFailure'] = [
+      ...(existingHooks['StopFailure'] ?? []),
+      { hooks: [{ type: 'command', command: stopFailureCommand, timeout: 10 }] },
     ];
   }
 
@@ -925,6 +958,7 @@ export function installHook(
           hookInstall.inheritClaudeEnvFrom,
           hookInstall.userPromptSubmitCommand,
           hookInstall.inheritClaudeEnvExclude,
+          hookInstall.stopFailureCommand,
         );
         break;
       case 'opencode-plugin':

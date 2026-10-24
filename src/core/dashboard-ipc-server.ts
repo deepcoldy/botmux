@@ -1127,6 +1127,10 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // aperture the outer 401 makes that fence unreachable and the channel is
   // silently dead in every isolated (bwrap / read-isolated) session.
   if (method === 'POST' && pathname === '/api/turn-idle') return true;
+  // Claude's StopFailure hook client (`botmux __claude-stop-failure-v1`) runs
+  // inside the CLI process for the same reason and gets the same treatment:
+  // its handler verifies the rotating capability and binds the claimed turn.
+  if (method === 'POST' && pathname === '/api/claude-stop-failure') return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn

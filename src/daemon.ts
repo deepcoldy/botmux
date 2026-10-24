@@ -1057,6 +1057,7 @@ import {
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
+import { normalizeClaudeStopFailureReport } from './services/claude-stop-failure.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -8953,6 +8954,93 @@ ipcRoute('POST', '/api/turn-idle', async (req, res) => {
       logger.info(`[${sessionId.slice(0, 8)}] turn-idle signal forwarded to worker (turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
     } catch (err) {
       logger.warn(`turn-idle forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
+// ─── claude-stop-failure IPC route (internal: Claude 回合因 API 错误结束) ──────────
+//
+// NOT an agent-facing command. Claude Code 的 StopFailure hook 经
+// `botmux __claude-stop-failure-v1`（cli.ts cmdClaudeStopFailure）调到这里。这条
+// 路径上 Claude 不跑 Stop hook，transcript 跟丢了这一轮时就没有任何东西收口它：
+// 不续跑、不发失败卡，用户对着已经停下的任务干等。daemon 把错误类型、发起方
+// 身份与上报者读到的回合身份转给 worker；worker 先给 transcript 留宽限期，到期
+// 这次失败仍没呈现出来，才为仍开着的回合补发终态，或发一条提示（见
+// services/claude-stop-failure.ts）。
+//
+// 鉴权与 /api/turn-idle 同构，同样不放行 receiver 会话：转发可能让 worker 发出
+// 回合终态，属可观测副作用；声明的回合也必须正是该 capability 对应的 live
+// origin，绑定失败 403、不转发。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一次兜底只是退回既有行为。
+ipcRoute('POST', '/api/claude-stop-failure', async (req, res) => {
+  let raw: Record<string, unknown>;
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+  const report = normalizeClaudeStopFailureReport(raw);
+  if (!report) return jsonRes(res, 400, { ok: false, error: 'missing_error' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  const claimedTurnId = typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined;
+  const claimedDispatchAttempt = positiveInt(raw.originDispatchAttempt);
+  if (!isTrustedHostIpcRequest(req)) {
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+    // Same binding as /api/turn-idle: a live token proves only "current turn
+    // of this session", so the claimed tuple must be the one it was minted for.
+    const binding = decideTurnIdleReport({
+      reportedTurnId: claimedTurnId,
+      reportedDispatchAttempt: claimedDispatchAttempt,
+      activeTurnId: ds?.managedTurnOrigin?.turnId,
+      activeDispatchAttempt: ds?.managedTurnOrigin?.dispatchAttempt,
+      promptReady: false,
+    });
+    if (!binding.accept) {
+      logger.warn(`[${sessionId.slice(0, 8)}] claude-stop-failure claim refused (${binding.reason})`);
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'claude_stop_failure',
+        report,
+        turnId: claimedTurnId,
+        dispatchAttempt: claimedDispatchAttempt,
+      } as DaemonToWorker);
+      // WARN, not info: an API error ended this turn, which is exactly the event
+      // that has to be reconstructable afterwards.
+      logger.warn(`[${sessionId.slice(0, 8)}] Claude StopFailure (${report.error}) forwarded to worker (turn=${claimedTurnId?.slice(0, 12) ?? '?'})`);
+    } catch (err) {
+      logger.warn(`claude-stop-failure forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return jsonRes(res, 200, { ok: true });
