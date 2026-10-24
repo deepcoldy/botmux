@@ -7,6 +7,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 
@@ -31,15 +32,42 @@ describe('privateTmuxEnv', () => {
 });
 
 describe('tmux test isolation guard', () => {
-  // 剥离 TMUX 的写法，或改用显式 -L / -S socket（显式 socket 不受 TMUX 影响）。
+  // 其它隔离形态沿用文件级信号；privateTmuxEnv 必须是语法上的真实调用。
   const ISOLATED = [
-    /privateTmuxEnv\(/,
     /delete\s+[\w.]+\.TMUX\b/,
     /delete\s+[\w.]+\[['"]TMUX['"]\]/,
     /\bTMUX:\s*(?:''|""|undefined)/,
     /['"]-L['"]\s*,/,
     /['"]-S['"]\s*,/,
   ];
+  const callsPrivateTmuxEnv = (src: string): boolean => {
+    // Preserve comment/template boundaries but avoid parsing thousands of unrelated lines.
+    const relevant = src.split('\n').filter(line => /privateTmuxEnv|\/\*|\*\/|`/.test(line)).join('\n');
+    const sf = ts.createSourceFile('tmux-test.ts', relevant, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    let found = false;
+    const visit = (node: ts.Node): void => {
+      if (found) return;
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        found = ts.isIdentifier(callee) && callee.text === 'privateTmuxEnv'
+          || ts.isPropertyAccessExpression(callee) && callee.name.text === 'privateTmuxEnv';
+      }
+      if (!found) ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return found;
+  };
+  const isIsolated = (src: string): boolean => ISOLATED.some(re => re.test(src)) || callsPrivateTmuxEnv(src);
+
+  it('does not accept privateTmuxEnv mentioned only in a comment', () => {
+    const unsafe = `
+      // privateTmuxEnv() keeps tests away from the host server (but is not actually called).
+      const env = { ...process.env, TMUX_TMPDIR: root };
+      spawnSync('tmux', ['kill-server'], { env });
+    `;
+    expect(isIsolated(unsafe)).toBe(false);
+    expect(callsPrivateTmuxEnv('const env = privateTmuxEnv(root);')).toBe(true);
+  });
 
   it('every test that kills a TMUX_TMPDIR-isolated tmux server strips the inherited TMUX', () => {
     const dir = join(process.cwd(), 'test');
@@ -51,7 +79,7 @@ describe('tmux test isolation guard', () => {
         if (!/\.(?:test\.)?[cm]?[jt]s$/.test(ent.name) || p.endsWith('tmux-test-isolation-guard.test.ts')) continue;
         const src = readFileSync(p, 'utf8');
         if (!src.includes('TMUX_TMPDIR') || !/['"]kill-server['"]/.test(src)) continue;
-        if (!ISOLATED.some(re => re.test(src))) offenders.push(p.slice(dir.length + 1));
+        if (!isIsolated(src)) offenders.push(p.slice(dir.length + 1));
       }
     };
     walk(dir);
