@@ -20,6 +20,7 @@ import {
   botSessionEnvView,
   globalSessionEnvView,
   liveSessionEnvView,
+  parseTmuxShowEnvironmentOutput,
   readTmuxServerGlobalEnv,
   removeTmuxServerGlobalEnv,
   revealLiveSessionEnvValue,
@@ -74,6 +75,30 @@ describe('machine baseline views', () => {
 const hasTmux = process.platform === 'linux' && spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status === 0;
 
 describe('tmux servers', () => {
+  it('parses tmux show-environment output preserving multiline values, internal blank lines, and ignoring unsets', () => {
+    const raw = [
+      'SINGLE=one',
+      '-REMOVED_VAR',
+      'stray line after unset',
+      'MULTI=line1',
+      '',
+      'line3 after empty line',
+      'NON_IDENTIFIER_RECORD-WITH-HYPHEN=secret',
+      'trailing after rejected record',
+      'VALID_RECORD=val',
+      '-LIKE_UNSET',
+      'AFTER=next',
+      '',
+    ].join('\n');
+
+    expect(parseTmuxShowEnvironmentOutput(raw)).toEqual({
+      SINGLE: 'one',
+      MULTI: 'line1\n\nline3 after empty line',
+      VALID_RECORD: 'val',
+      AFTER: 'next',
+    });
+  });
+
   it('lists the default server and the managed socket, marking where new managed sessions go', () => {
     expect(sessionEnvTmuxSockets()).toEqual([{ socket: null, managed: false }, { socket: 'botmux', managed: true }]);
   });
