@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -1687,6 +1687,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
       // 装了也是每轮空跑一个子进程）。
       userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
+      // StopFailure 兜底（API 错误结束的回合不跑 Stop hook，transcript 跟丢时没人收口）：
+      // 同样写全局 settings.json。只给 claude-code：该事件在 Claude Code 2.1.x 实测存在，
+      // seed/relay 等共享 adapter 的 variant 未验证。
+      stopFailureCommand: variant.id === 'claude-code' ? claudeStopFailureHookCommand() : undefined,
     },
     // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
     // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的

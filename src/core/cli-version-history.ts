@@ -8,17 +8,20 @@
  * day before. Startup-stall notices read this to say "just upgraded to x.y.z",
  * which is usually the real explanation for a CLI that suddenly stops starting.
  *
- * One small JSON file shared by every daemon on the host (keys are runtime
- * installation keys, which are the same across bots using the same binary).
- * Each write re-reads the file first and only touches its own key; two daemons
- * racing on the same transition write equivalent records.
+ * One small JSON file PER RUNTIME under the shared data dir (runtime
+ * installation keys are the same across bots using the same binary, so every
+ * daemon on the host observes the same transitions). Separate files mean a
+ * daemon recording one runtime can never clobber another runtime's record —
+ * a single shared map rewritten without a lock could. Two daemons racing on
+ * the same runtime write equivalent records.
  */
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-const HISTORY_FILE = 'cli-version-history.json';
+const HISTORY_DIR = 'cli-version-history';
 /** How long after a detected version change a startup stall is reported as
  *  "just upgraded". 3 days: a daily scheduled task's next run, even when the
  *  upgrade lands right before a weekend. */
@@ -44,16 +47,24 @@ export function normalizeCliVersion(raw: string): string {
   return m ? m[0] : raw.trim();
 }
 
-function historyPath(dataDir: string): string {
-  return join(dataDir, HISTORY_FILE);
+function recordPath(dataDir: string, runtimeKey: string): string {
+  const name = createHash('sha256').update(runtimeKey).digest('hex').slice(0, 32);
+  return join(dataDir, HISTORY_DIR, `${name}.json`);
 }
 
-function readHistory(dataDir: string): Record<string, CliVersionRecord> {
+function readRecord(dataDir: string, runtimeKey: string): CliVersionRecord | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(historyPath(dataDir), 'utf-8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    const parsed = JSON.parse(readFileSync(recordPath(dataDir, runtimeKey), 'utf-8'));
+    // The key is stored alongside so a (vanishingly unlikely) name collision
+    // reads as "no record" instead of another runtime's history.
+    if (!parsed || parsed.runtimeKey !== runtimeKey || typeof parsed.version !== 'string') return undefined;
+    return {
+      version: parsed.version,
+      ...(typeof parsed.previousVersion === 'string' ? { previousVersion: parsed.previousVersion } : {}),
+      ...(typeof parsed.changedAtMs === 'number' ? { changedAtMs: parsed.changedAtMs } : {}),
+    };
   } catch {
-    return {};
+    return undefined;
   }
 }
 
@@ -68,15 +79,15 @@ export function noteObservedCliVersion(
   if (!version) return undefined;
   const dataDir = opts.dataDir ?? config.session.dataDir;
   try {
-    const history = readHistory(dataDir);
-    const prior = history[runtimeKey];
-    if (prior && typeof prior.version === 'string' && prior.version === version) return prior;
-    const next: CliVersionRecord = prior && typeof prior.version === 'string'
+    const prior = readRecord(dataDir, runtimeKey);
+    if (prior?.version === version) return prior;
+    const next: CliVersionRecord = prior
       ? { version, previousVersion: prior.version, changedAtMs: opts.nowMs ?? Date.now() }
       // First sighting: no transition is known, so never claim an upgrade.
       : { version };
-    history[runtimeKey] = next;
-    atomicWriteFileSync(historyPath(dataDir), `${JSON.stringify(history, null, 2)}\n`);
+    const path = recordPath(dataDir, runtimeKey);
+    mkdirSync(join(dataDir, HISTORY_DIR), { recursive: true });
+    atomicWriteFileSync(path, `${JSON.stringify({ runtimeKey, ...next }, null, 2)}\n`);
     return next;
   } catch {
     return undefined;
@@ -89,7 +100,7 @@ export function recentCliUpgrade(
   runtimeKey: string,
   opts: { dataDir?: string; nowMs?: number; windowMs?: number } = {},
 ): CliUpgrade | undefined {
-  const record = readHistory(opts.dataDir ?? config.session.dataDir)[runtimeKey];
+  const record = readRecord(opts.dataDir ?? config.session.dataDir, runtimeKey);
   if (!record?.previousVersion || typeof record.changedAtMs !== 'number') return undefined;
   const age = (opts.nowMs ?? Date.now()) - record.changedAtMs;
   if (age < 0 || age > (opts.windowMs ?? RECENT_CLI_UPGRADE_WINDOW_MS)) return undefined;

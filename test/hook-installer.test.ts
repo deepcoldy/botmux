@@ -439,6 +439,45 @@ describe('installHook — claude-settings', () => {
     expect(settings.hooks?.UserPromptSubmit ?? []).toHaveLength(1);
   });
 
+  it('(j) stopFailureCommand 时写入 StopFailure hook：无 matcher、幂等且换安装路径不叠加', () => {
+    const nodeCmd = '/usr/bin/node /path/to/cli.js __claude-stop-failure-v1';
+    const binCmd = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" __claude-stop-failure-v1';
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: nodeCmd }, hookCommand);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: nodeCmd }, hookCommand);
+    expect(readFileSync(configPath, 'utf-8')).toBe(afterFirst);
+
+    let groups: any[] = JSON.parse(afterFirst).hooks?.StopFailure ?? [];
+    expect(groups).toHaveLength(1);
+    // 不写 matcher：所有错误类型都上报，分类由 worker 用 transcript 同一个分类器做。
+    expect(groups[0].matcher).toBeUndefined();
+    expect(groups[0].hooks[0].command).toBe(nodeCmd);
+
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: binCmd }, hookCommand);
+    groups = JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure ?? [];
+    expect(groups).toHaveLength(1);
+    expect(groups[0].hooks[0].command).toBe(binCmd);
+  });
+
+  it('(k) StopFailure 与用户自装的 StopFailure hook 共存（如 claude-auto-retry）', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    const userGroup = { matcher: 'overloaded|server_error', hooks: [{ type: 'command', command: 'claude-auto-retry _stopfailure-hook' }] };
+    writeFileSync(configPath, JSON.stringify({ hooks: { StopFailure: [userGroup] } }));
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      stopFailureCommand: '/usr/bin/node /path/to/cli.js __claude-stop-failure-v1',
+    }, hookCommand);
+    const groups: any[] = JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure ?? [];
+    expect(groups).toContainEqual(userGroup);
+    expect(groups.filter((g) => g.hooks?.some((e: any) => e.command.endsWith('__claude-stop-failure-v1')))).toHaveLength(1);
+  });
+
+  it('(l) 不传 stopFailureCommand 时不写 StopFailure（保持旧行为）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    expect(JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure).toBeUndefined();
+  });
+
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {
     const globalPath = join(tmpDir, '.claude-global', 'settings.json');
     mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });

@@ -39,7 +39,7 @@ export const decisionBoardDbPath = (dataDir: string): string => join(dataDir, 'd
 export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
   join(dataDir, 'decision-board', appId, 'files');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /** 管家写入的字段补丁。undefined = 不动；null = 清空（仅可选字段）。 */
 export interface ItemPatch {
@@ -165,6 +165,10 @@ export class DecisionBoardStore {
       if (version > SCHEMA_VERSION) {
         throw new Error(`decision board store ${path} has schema v${version}, newer than this botmux (v${SCHEMA_VERSION})`);
       }
+      // v1→v2：board_links 加 ord 列（WITHOUT ROWID 表不能 ADD COLUMN）。功能尚未发版，
+      // v1 只可能存在于开发机，里面是合成数据；links 无 FK 引用，直接丢表由下面的
+      // CREATE 重建，items/events/批次数据保留。
+      if (version === 1) db.exec('DROP TABLE IF EXISTS board_links;');
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
           app_id TEXT NOT NULL,
@@ -197,6 +201,10 @@ export class DecisionBoardStore {
           ref TEXT NOT NULL,
           label TEXT,
           created_at INTEGER NOT NULL,
+          -- 同一事项内严格单调的写入序号：created_at 只有毫秒精度，一次动作里多条关联
+          -- （或先 add 后 update 落在同一毫秒）时间戳会打平，ord 保证按管家给出的顺序展示，
+          -- 不退回主键的 kind/ref 字母序。upsert 已存在的关联时不改 ord。
+          ord INTEGER NOT NULL,
           PRIMARY KEY (app_id, seq, kind, ref)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS board_events (
@@ -350,11 +358,22 @@ export class DecisionBoardStore {
 
   private addLinks(appId: string, seq: number, links: BoardLink[], at: number, actorRef?: string): number {
     let added = 0;
+    let nextOrd = (this.stmt('SELECT COALESCE(MAX(ord), -1) + 1 AS n FROM board_links WHERE app_id = ? AND seq = ?')
+      .get(appId, seq) as { n: number }).n;
+    // 先尝试纯插入：changes=1 才是新关联（此时才分配 ord）；冲突（DO NOTHING，changes=0）
+    // 说明关联已存在，仅在本次带了 label 时更新显示名。这样 ord 严格按「新关联出现的顺序」
+    // 单调、无空洞——不能用 upsert DO UPDATE 的 changes() 判断，它在命中更新时也返回 1。
+    const insertLink = this.stmt(`INSERT INTO board_links (app_id, seq, kind, ref, label, created_at, ord)
+      VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(app_id, seq, kind, ref) DO NOTHING`);
+    const relabelLink = this.stmt(`UPDATE board_links SET label = ?
+      WHERE app_id = ? AND seq = ? AND kind = ? AND ref = ?`);
     for (const l of links) {
-      const r = this.stmt(`INSERT INTO board_links (app_id, seq, kind, ref, label, created_at) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(app_id, seq, kind, ref) DO UPDATE SET label = COALESCE(excluded.label, board_links.label)`)
-        .run(appId, seq, l.kind, l.ref, l.label ?? null, at);
-      if (Number(r.changes) > 0) added++;
+      if (Number(insertLink.run(appId, seq, l.kind, l.ref, l.label ?? null, at, nextOrd).changes) > 0) {
+        added++;
+        nextOrd++;
+      } else if (l.label !== undefined) {
+        relabelLink.run(l.label, appId, seq, l.kind, l.ref);
+      }
     }
     const count = (this.stmt('SELECT COUNT(*) AS n FROM board_links WHERE app_id = ? AND seq = ?').get(appId, seq) as { n: number }).n;
     if (count > BOARD_LIMITS.linksPerItem) throw new BoardError('too_many_links', `关联对象最多 ${BOARD_LIMITS.linksPerItem} 个`);
@@ -483,7 +502,8 @@ export class DecisionBoardStore {
   }
 
   links(appId: string, seq: number): BoardLink[] {
-    return (this.stmt('SELECT kind, ref, label FROM board_links WHERE app_id = ? AND seq = ? ORDER BY created_at, kind, ref')
+    // ord 是同一事项内严格单调的写入序号（见建表注释），单独按它排序即得稳定的作者顺序。
+    return (this.stmt('SELECT kind, ref, label FROM board_links WHERE app_id = ? AND seq = ? ORDER BY ord')
       .all(appId, seq) as Array<{ kind: string; ref: string; label: string | null }>)
       .map(r => ({ kind: r.kind as BoardLink['kind'], ref: r.ref, ...(r.label ? { label: r.label } : {}) }));
   }

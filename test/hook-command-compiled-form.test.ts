@@ -36,6 +36,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  claudeStopFailureHookCommand,
   cursorUsageHookCommand,
   hookCommandParts,
   hookCommandFor,
@@ -61,6 +62,7 @@ describe('hook-command — compiled binary form', () => {
       hookCommandFor('claude-code'),
       sessionReadyHookCommand(),
       userPromptHookCommand(),
+      claudeStopFailureHookCommand(),
       statuslineHookCommand(),
       cursorUsageHookCommand(),
       nativeSubagentRuntimeHookCommand(),
@@ -82,6 +84,7 @@ describe('hook-command — compiled binary form', () => {
     expect(hookCommandFor('claude-code')).toBe(`"${process.execPath}" hook claude-code`);
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" user-prompt-hook`);
+    expect(claudeStopFailureHookCommand()).toBe(`"${process.execPath}" __claude-stop-failure-v1`);
     // statusLine.command 走进程级 --settings，同样由 Claude 经 shell 执行。
     expect(statuslineHookCommand()).toBe(`"${process.execPath}" statusline`);
     expect(cursorUsageHookCommand()).toContain(`"${process.execPath}" __cursor-usage-v1`);
@@ -143,6 +146,7 @@ describe('hook-command — Node form stays byte-identical', () => {
     const script = hookCommandParts('x').args[0];
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" "${script}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" "${script}" user-prompt-hook`);
+    expect(claudeStopFailureHookCommand()).toBe(`"${process.execPath}" "${script}" __claude-stop-failure-v1`);
     expect(statuslineHookCommand()).toBe(`"${process.execPath}" "${script}" statusline`);
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,

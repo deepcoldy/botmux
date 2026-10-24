@@ -1392,6 +1392,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ {cliName} 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
   'worker.local_turn_failed': '⚠️ {cliName} 执行失败（{errorCode}）。失败的这一轮没有对应的飞书消息（例如在终端里直接输入的内容，或接续上一轮的输出），所以不会自动重试。请检查 Web 终端，需要时重新发送。',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} 因 API 错误中断了这一轮（{errorCode}），但 botmux 没能把这次中断对应到正在跟踪的回合，所以不会自动续跑，任务可能停在中途。请检查 Web 终端，需要时回复「继续」。',
 
   // ─── Turn-failure card (通用失败卡：@人 + 重试按钮) ────────────────────────
   'card.turn_failed.title': '⚠️ {cliName} 本轮执行失败',

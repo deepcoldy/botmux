@@ -1,0 +1,50 @@
+
+ [38;5;74m▝[38;5;110m▜[38;5;140m▄[38;5;139m [38;5;174m [39m    [38;5;231m▗█▀▀▜▙▝█▛▀▀▌▜██▖▟██▘▜█▘▜██▖▝█▛▝█▛
+[39m [38;5;74m [38;5;110m [38;5;140m▝[38;5;139m▜[38;5;174m▄[39m    [38;5;231m█▌     █▙▟  ▐█▝█▛▐█ ▐█ ▐█▝█▖█▌ █▌
+[39m [38;5;74m [38;5;110m▗[38;5;140m▟[38;5;139m▀[38;5;174m [39m    [38;5;231m▜▙ ▝█▛ █▌▝ ▖▐█   ▐█ ▐█ ▐█ ▝██▌ █▌
+[39m [38;5;74m▝[38;5;110m▀[38;5;140m  [38;5;139m [38;5;174m [39m   [38;5;231m ▀▀▀▀▘▝▀▀▀▀▘▀▀▘  ▀▀▘▀▀▘▀▀▘ ▝▀▀▝▀▀
+
+[39m [1m[38;5;231mGemini CLI[0m[38;5;248m[49m v0.65.0
+
+
+
+[38;5;231mTips for getting started:
+1. Create [1mGEMINI.md[0m[38;5;231m[49m files to customize your interactions
+2. [38;5;248m/help[38;5;231m for more information
+3. Ask coding questions, edit code or run commands
+4. Be specific for the best results
+
+[38;5;229mℹ Skipping project agents due to untrusted folder. To enable, ensure that the project root is trusted.
+
+[39m [38;5;229m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+[39m [38;5;229m│[39m                                                                                                                                                            [38;5;229m│
+[39m [38;5;229m│[39m [1m[38;5;231mDo you trust the files in this folder?[0m[39m[49m                                                                                                                     [38;5;229m│
+[39m [38;5;229m│[39m                                                                                                                                                            [38;5;229m│
+[39m [38;5;229m│[39m [38;5;231mTrusting a folder allows Gemini CLI to load its local configurations, including custom commands, hooks, MCP servers, agent skills, and settings. These[39m     [38;5;229m│
+[39m [38;5;229m│[39m [38;5;231mconfigurations could execute code on your behalf or change the behavior of the CLI.[39m                                                                        [38;5;229m│
+[39m [38;5;229m│[39m                                                                                                                                                            [38;5;229m│
+[39m [38;5;229m│[39m                                                                                                                                                            [38;5;229m│
+[39m [38;5;229m│[39m [38;5;194m[48;5;28m●[39m [38;5;194m1.[39m [38;5;194mTrust folder (ec-apply-access)[39m [49m                                                                                                                       [38;5;229m│
+[39m [38;5;229m│[39m [38;5;231m [39m [38;5;231m2.[39m [38;5;231mTrust parent folder (gem-work2)[39m                                                                                                                       [38;5;229m│
+[39m [38;5;229m│[39m [38;5;231m [39m [38;5;231m3.[39m [38;5;231mDon't trust[39m                                                                                                                                           [38;5;229m│
+[39m [38;5;229m│[39m                                                                                                                                                            [38;5;229m│
+[39m [38;5;229m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
