@@ -60,6 +60,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffModel', 'botDefaults.riffReasoningEffort',
       'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
+      'botDefaults.autoModelTitle', 'botDefaults.autoModelReselectPerTurn',
     ],
   },
   {
@@ -186,7 +187,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'runtime-env',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionRuntimeEnv',
-    fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel'],
+    fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText'] },
 ];
