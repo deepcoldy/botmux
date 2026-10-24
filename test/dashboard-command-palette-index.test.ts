@@ -230,7 +230,7 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx']
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
       .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
@@ -241,6 +241,7 @@ describe('⌘K index coverage', () => {
         // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名、开关行标题或复选框 span 文本。
         const asLiteral = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
         const asCheckboxSpan = sources.includes(`<span>{tr('${key}')}</span>`);
+        const asQuietPreset = key.startsWith('quietPreset.') && sources.includes(`{tr('${key}')}`);
         const asFooter = key.startsWith('botDefaults.replyFooter')
           && REPLY_FOOTER_KEYS.some(k => `botDefaults.${k}` === key)
           && sources.includes('title={tr(`botDefaults.${key}`)}');
@@ -249,7 +250,7 @@ describe('⌘K index coverage', () => {
           && sources.includes('tr(`botDefaults.streamingButton.${id}`)');
         const asTernary = (key === 'botDefaults.cotEnabled' || key === 'botDefaults.replyCardTools')
           && sources.includes("title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}");
-        expect(asLiteral || asCheckboxSpan || asFooter || asStreamingButton || asTernary, key).toBe(true);
+        expect(asLiteral || asCheckboxSpan || asQuietPreset || asFooter || asStreamingButton || asTernary, key).toBe(true);
       }
     }
   });
@@ -269,13 +270,16 @@ describe('⌘K index coverage', () => {
   // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
   it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
     const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx']
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
       .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
 
     const fieldTitleMatches = [...sources.matchAll(/\{tr\('([^']+)'\)\}<\/FieldTitle>/g)].map(m => m[1]!);
     const groupNameMatches = [...sources.matchAll(/groupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
     // 覆盖 TraexAutoModelEditor 等复选框标签
     const autoModelMatches = [...sources.matchAll(/<label className="bd-auto-model-toggle">[\s\S]*?<span>\{tr\('([^']+)'\)\}<\/span>/g)].map(m => m[1]!);
+    // 覆盖 QuietPresetSection 内联一键静默预设模块的可见标题与开关
+    const quietPresetSource = readFileSync(new URL('../src/dashboard/web/quiet-preset-section.tsx', import.meta.url), 'utf8');
+    const quietPresetMatches = [...quietPresetSource.matchAll(/\{tr\('(quietPreset\.(?:title|switch))'\)\}/g)].map(m => m[1]!);
 
     // 提取 ToggleRow 上的 title（通过花括号状态机配对，彻底消除 => 截断缺陷）
     const toggleRowBodies = extractTagOpeningBodies(sources, 'ToggleRow');
@@ -303,13 +307,14 @@ describe('⌘K index coverage', () => {
       ...fieldTitleMatches,
       ...groupNameMatches,
       ...autoModelMatches,
+      ...quietPresetMatches,
       ...toggleRowTitles,
       ...toggleRowTernaries,
       ...dynamicFooterKeys,
       ...dynamicStreamingKeys,
     ]);
     const unindexedKeys = [...renderedKeys].filter(key =>
-      (key.startsWith('botDefaults.') || key.startsWith('sessionEnv.')) && !indexedKeys.has(key));
+      (key.startsWith('botDefaults.') || key.startsWith('sessionEnv.') || key.startsWith('quietPreset.')) && !indexedKeys.has(key));
     expect(unindexedKeys, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
   });
 });

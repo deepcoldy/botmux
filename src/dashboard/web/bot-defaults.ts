@@ -143,6 +143,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.streamingButton.output', 'botDefaults.streamingButton.terminal',
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
+      'quietPreset.title', 'quietPreset.switch',
     ],
   },
   { id: 'feedback', tab: 'cards', titleKey: 'botDefaults.sectionFeedback' },
