@@ -13931,14 +13931,6 @@ async function cmdAuth(rest: string[]): Promise<void> {
     // tuple. Absence of both env markers is the host case, never a missing turn.
     const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
       || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
-    let claim: ManagedOriginCapabilityClaim | undefined;
-    if (isolatedPane && !toolBinding) {
-      const read = readManagedOriginCapability(
-        resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
-      claim = read;
-    }
     const deadline = Date.now() + 300_000;
     while (true) {
       const remaining = deadline - Date.now();
@@ -13946,6 +13938,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
         console.log(JSON.stringify({ ok: false, status: 'pending', error: 'auth_request_timeout' }));
         process.exitCode = 1;
         return;
+      }
+      let claim: ManagedOriginCapabilityClaim | undefined;
+      if (isolatedPane && !toolBinding) {
+        const read = readManagedOriginCapability(
+          resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+        );
+        if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
+        claim = read;
       }
       const authBody = parsed.command === 'request'
         ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
@@ -17867,6 +17867,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
   else if (__entrySubcommand === 'lark-tool-runner') {
     await import('./lark-tool-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
+  else if (__entrySubcommand === 'cli-identity-runner') {
+    await import('./cli-identity-runner.js');
     process.exit(process.exitCode ?? 0);
   }
   // The entry module now drives the process (top-level main() keeps the event

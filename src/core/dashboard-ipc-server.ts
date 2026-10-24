@@ -114,10 +114,16 @@ import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
 import {
   CURRENT_ACTOR_ROUTE,
 } from '../cli/current-actor.js';
-import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/current-execution.js';
+import {
+  CURRENT_EXECUTION_ROUTE,
+  CURRENT_EXECUTION_SCHEMA,
+  CURRENT_EXECUTION_IDENTITY_ROUTE,
+  CURRENT_EXECUTION_IDENTITY_SCHEMA,
+} from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import {
-  attestCurrentTurnLoopbackPeer,
+  attestCurrentExecutionLoopbackPeer,
+  currentTurnPeerAttestationStable,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -263,7 +269,7 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery } from './worker-pool.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, identityStorageModelForDaemonSession, identityDecisionConflict } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -481,8 +487,9 @@ import { clampSessionTagName, defaultSessionTagName } from '../services/feed-gro
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
-import { refreshSessionIdentity } from './cli-identity.js';
+import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
@@ -1155,6 +1162,9 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // capability because those are writable by an unconfined same-UID Agent.
   if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
   if (method === 'POST' && pathname === CURRENT_EXECUTION_ROUTE) return true;
+  // Same lineage proof as current-execution; the reply carries identity env
+  // CONTENT, so it is admitted only through this exact route.
+  if (method === 'POST' && pathname === CURRENT_EXECUTION_IDENTITY_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -1437,6 +1447,57 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   if (!peer.ok) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
+});
+
+/** Storage model the daemon publishes for a managed session is resolved with
+ *  the same predicate (worker-pool.identityStorageModelForDaemonSession) the
+ *  worker uses to render the wrapper; they must never disagree for one session. */
+ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
+  const blocked = {
+    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified',
+  };
+  let body: unknown;
+  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  catch (error) {
+    if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked);
+  }
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown> : undefined;
+  const sessionId = typeof record?.sessionId === 'string' && record.sessionId && record.sessionId.length <= 256
+    ? record.sessionId : undefined;
+  // The Codebase CLI companion mirrors bytedcli's proven identity, so its
+  // wrapper uses the same proof channel and tool name.
+  const identityRouteTools = ['lark-cli', 'bytedcli', 'codebase'] as const;
+  type IdentityRouteTool = typeof identityRouteTools[number];
+  const toolValue = typeof record?.tool === 'string' ? record.tool : '';
+  const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
+    ? toolValue as IdentityRouteTool : '';
+  if (!sessionId || !tool) return jsonRes(res, 400, blocked);
+  const peer = resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
+  });
+  if (!peer.ok) return jsonRes(res, 403, blocked);
+  const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  if (!document) return jsonRes(res, 403, blocked);
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
+  const identityTurnId = document.identityTurnId ?? document.turnId;
+  const env = recallProvenIdentityContent(config.session.dataDir, sessionId, identityTurnId, tool);
+  if (!env) {
+    // Lineage is proven, but no identity material exists for this turn (never
+    // prepared, collected at a terminal boundary, daemon restart). Distinct
+    // from a proof failure so the wrapper denies without confusing the two.
+    return jsonRes(res, 404, {
+      schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'identity_material_unavailable',
+    });
+  }
+  return jsonRes(res, 200, {
+    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
+    sessionId, larkAppId: document.larkAppId, tool, identityTurnId, env,
+  });
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
@@ -3113,7 +3174,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = origin?.callerOpenId;
   const turnId = origin?.turnId;
   if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
-  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  const identityTurnId = origin?.identityTurnId;
+  const peer = process.platform === 'linux' ? resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
+  }) : undefined;
+  const executionInput = peer?.ok
+    ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;
+  const execution = executionInput ? attestCurrentExecutionLoopbackPeer(executionInput) : undefined;
+  if (process.platform === 'linux' && !execution) {
+    return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
+  }
+  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId);
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -3135,8 +3206,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
-  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
-    || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
+  if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+    || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+    || execution && !currentTurnPeerAttestationStable(execution, executionInput!)
+    || ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+    || ds.managedTurnOrigin?.identityTurnId !== identityTurnId
+    || JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
   if (!resolved.ok && resolved.reason === 'platform') {
@@ -3151,23 +3226,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   });
 });
 
-const sessionAuthRequests = new Map<string, {
-  sessionId: string;
-  appId: string;
-  /** Human who approved this grant, frozen at request creation. The live origin
-   *  of a later auth-status call may already belong to another turn or another
-   *  person; this frozen id is the only safe same-principal reference. */
-  callerOpenId: string;
-  authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
-  /** Creating-turn closure: true only while the exact originating turn is live. */
-  isCurrent: () => boolean;
-  /** Session/app liveness used to keep or retire the daemon-side background poll. */
-  isValid: () => boolean;
-  status: 'pending' | 'ready' | 'failed';
-  expiresAt: number;
-  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
-  dispose: () => void;
-}>();
+// Pending auth-request registry (session-scoped singleton) lives in
+// session-auth-requests.js so terminal identity GC can read it too.
 
 // The daemon owns device-grant completion. Ending an Agent turn must not abandon
 // a link already sent to its verified user. This never dispatches a new turn or
@@ -3228,7 +3288,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const origin = ds?.managedTurnOrigin;
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
-      || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      || !origin?.turnId || !origin.capability) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
     // Two proof modes for "this request belongs to the current turn":
@@ -3251,7 +3311,7 @@ for (const action of ['auth-request', 'auth-status']) {
         remotePort: req.socket.remotePort,
         localPort: req.socket.localPort,
       });
-      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+      if (!peer.ok || !attestCurrentExecutionLoopbackPeer({
         sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
       })) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
@@ -3263,13 +3323,14 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
-      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId);
+      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.identityTurnId ?? liveOrigin.turnId);
       if (!grant) return liveOrigin.callerOpenId;
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
         || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
       return grant.targetOpenId;
     };
-    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, origin.turnId);
+    const identityTurnId = origin.identityTurnId ?? origin.turnId;
+    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
     const callerOpenId = requestingUser();
     if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     const originCallerOpenId = origin.callerOpenId;
@@ -3282,8 +3343,9 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.session.status === 'active' && ds.worker === worker && !worker.killed
       && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === originCallerOpenId
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
+      && (ds.managedTurnOrigin.identityTurnId ?? ds.managedTurnOrigin.turnId) === identityTurnId
       && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
-      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
+      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId)) === JSON.stringify(delegated);
     // An accepted grant outlives its originating turn: the daemon-side poll
     // keeps completing it while the session/app stay valid (isAuthorizationValid),
     // and auth-status publishes the token only to a live turn whose caller is
@@ -3305,17 +3367,35 @@ for (const action of ['auth-request', 'auth-status']) {
       if (!request.isValid()) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
+      // F3: the live worker's spawn decision conflicts with this session's
+      // structural binding — publish on neither model; stop the CLI wait.
+      if (!boundTool && identityDecisionConflict(ds)) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_identity_decision_conflict' });
+      }
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
       if (result.status === 'failed') {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
       }
       if (isCurrent() && request.isCurrent()) {
-        if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-          tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
-          openId: callerOpenId,
-        })) {
-          return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+        if (!boundTool) {
+          const storageModel = identityStorageModelForDaemonSession(ds);
+          if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+            tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId: identityTurnId,
+            openId: callerOpenId,
+          }, storageModel)) {
+            // Material for this turn is gone for good (collected / never
+            // prepared / daemon restarted): polling until the deadline could
+            // never succeed. Only while the material still exists does the
+            // failure mean "worker has not flipped the live turn yet", which
+            // keeps the client polling.
+            if (!sessionIdentityMaterialPresent(
+              config.session.dataDir, params.sessionId, 'lark-cli', identityTurnId, storageModel,
+            )) {
+              return jsonRes(res, 409, { ok: false, error: 'auth_identity_snapshot_missing' });
+            }
+            return jsonRes(res, 200, { ok: true, status: 'pending' });
+          }
         }
         return jsonRes(res, 200, { ok: true, status: 'ready' });
       }
@@ -3337,17 +3417,25 @@ for (const action of ['auth-request', 'auth-status']) {
       if (boundTool) {
         return jsonRes(res, 200, { ok: true, status: 'ready' });
       }
+      const storageModel = identityStorageModelForDaemonSession(ds);
+      const liveIdentityTurnId = liveOrigin!.identityTurnId ?? liveOrigin!.turnId!;
       if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli',
         appId: cfg.larkAppId,
         userAccessToken: result.token,
-        turnId: liveOrigin!.turnId!,
+        turnId: liveIdentityTurnId,
         openId: request.callerOpenId,
-      })) {
+      }, storageModel)) {
         // The worker has not started executing the live turn yet; the request
         // stays registered until TTL, so the waiting CLI polls again and the
         // same-principal mapping is retried once the live turn marker flips.
-        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+        // If the live turn's material is already gone, polling cannot succeed.
+        if (!sessionIdentityMaterialPresent(
+          config.session.dataDir, params.sessionId, 'lark-cli', liveIdentityTurnId, storageModel,
+        )) {
+          return jsonRes(res, 409, { ok: false, error: 'auth_identity_snapshot_missing' });
+        }
+        return jsonRes(res, 200, { ok: true, status: 'pending' });
       }
       return jsonRes(res, 200, { ok: true, status: 'ready' });
     }
@@ -3410,7 +3498,7 @@ for (const action of ['auth-request', 'auth-status']) {
           && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
       } catch { return false; }
     };
-    for (const [requestId, request] of sessionAuthRequests) {
+    for (const [requestId, request] of sessionAuthRequests.entries()) {
       if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
         && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
         && request.expiresAt > Date.now()
@@ -3430,7 +3518,7 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
     accepted = true;
     trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
-      callerOpenId, authorization, isCurrent, isValid: isAuthorizationValid });
+      callerOpenId, identityTurnId, authorization, isCurrent, isValid: isAuthorizationValid });
     return jsonRes(res, 200, {
       ok: true, authUrl: authorization.authUrl, requestId,
       scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
@@ -10665,8 +10753,7 @@ export function startIpcServer(opts: {
       .catch(error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`));
     server.once('close', () => {
       workspaceRecycleRuntime.stop();
-      for (const request of sessionAuthRequests.values()) request.dispose();
-      sessionAuthRequests.clear();
+      sessionAuthRequests.disposeAndClear();
     });
     return {
     port,

@@ -818,7 +818,9 @@ export interface DaemonSession {
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
+    identityTurnId?: string;
     dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller | null;
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
@@ -828,6 +830,26 @@ export interface DaemonSession {
      * this turn authority was published. Actor callers may not traverse one of
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
+  };
+  /** Worker-reported identity storage decision for the CURRENT worker
+   *  generation. Only the worker knows the effective spawn shape (the
+   *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt
+   *  really engaged, and whether the daemon loopback is reachable inside the
+   *  spawn), so the daemon publishes identity material per this report instead
+   *  of deriving sandbox facts itself. Absent (nothing reported yet, or after a
+   *  daemon restart) is consumed fail-closed: publication uses the legacy
+   *  'single' shape and the proven content route refuses. `conflict` marks a
+   *  report the daemon's structural binding check cannot honor (e.g. binding
+   *  disabled after restart): identity publication is withheld on both models
+   *  until a live worker reports again. */
+  reportedIdentityModel?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    sandboxEngaged: boolean;
+    loopbackShared: boolean;
+    workerPid: number;
+    workerGeneration: number;
+    reportedAt: number;
+    conflict?: string;
   };
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */

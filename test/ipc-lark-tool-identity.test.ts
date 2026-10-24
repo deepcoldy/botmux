@@ -10,7 +10,8 @@ import * as tokens from '../src/utils/user-token.js';
 import { config } from '../src/config.js';
 import { prepareLarkToolEnv, larkToolBindingPath, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -24,8 +25,11 @@ beforeEach(async () => {
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
-    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { killed: false },
-    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' },
+    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
+    localProcessAttestation: { backendType: 'pty', workerGeneration: 1,
+      cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
+    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender',
+      preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
@@ -135,7 +139,7 @@ describe('session application identity route', () => {
     await delegate({ targetOpenId: 'ou_later', turnId: 'om_queued' });
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
-    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
@@ -230,6 +234,57 @@ describe('session application identity route', () => {
     vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'wrong-turn-token'; });
     const response = await request('user');
     expect(response.status).toBe(409); expect(await response.text()).not.toContain('wrong-turn-token');
+  });
+  it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
+    await delegate();
+    delete session.managedTurnOrigin.callerOpenId;
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+  });
+  it.skipIf(process.platform !== 'linux').each(['generation', 'attempt', 'capability', 'identity'])(
+    'withholds a token when the execution changes during resolution (%s)', async change => {
+      vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+        if (change === 'generation') session.workerGeneration++;
+        if (change === 'attempt') session.managedTurnOrigin.dispatchAttempt = 2;
+        if (change === 'capability') session.managedTurnOrigin.capability = 'next-capability';
+        if (change === 'identity') session.managedTurnOrigin.identityTurnId = 'other-identity';
+        return 'late-token';
+      });
+      const response = await request('user');
+      expect(response.status).toBe(409);
+      expect(await response.text()).not.toContain('late-token');
+    },
+  );
+  it.skipIf(process.platform !== 'linux')('rejects a new tool child of an old shell after another user takes over', async () => {
+    const url = `http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`;
+    const source = `const response = await fetch(${JSON.stringify(url)}, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': ${JSON.stringify(binding.accessKey)} },
+      body: JSON.stringify({ mode: 'user' }) });
+      console.log(JSON.stringify({ status: response.status, body: await response.json() }));`;
+    const shell = spawnTsEvalWithRepoImports(`
+      import { spawnTsEval } from './test/helpers/ts-runner.js';
+      process.once('message', () => {
+        const tool = spawnTsEval(${JSON.stringify(source)}, { stdio: ['ignore', 'inherit', 'inherit'] });
+        tool.once('close', code => process.exit(code ?? 1));
+      });
+      process.send('ready');
+    `, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    let output = '';
+    shell.stdout!.on('data', data => { output += data; });
+    try {
+      await new Promise<void>((resolve, reject) => { shell.once('message', () => resolve()); shell.once('error', reject); });
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_new', callerOpenId: 'ou_new',
+        capability: 'new-capability', preexistingProcessIdentities: [
+          ...session.managedTurnOrigin.preexistingProcessIdentities,
+          `${shell.pid}:${readProcessStartIdentity(shell.pid!)}`,
+        ] };
+      const finished = new Promise<number | null>(resolve => shell.once('close', resolve));
+      shell.send('run');
+      expect(await finished).toBe(0);
+      expect(JSON.parse(output)).toEqual({ status: 403, body: { ok: false, error: 'current_execution_unverified' } });
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    } finally { shell.kill(); }
   });
   it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');

@@ -765,6 +765,7 @@ import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
+import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -807,7 +808,18 @@ import { recordDispatchInputCommit, resolveProseBotMentions } from './dispatch.j
 import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
-import { clearAllSessionIdentities } from './cli-identity.js';
+import {
+  activeIdentityTurns,
+  clearActiveIdentityTurns,
+  releaseActiveIdentityTurn,
+} from './active-identity-turns.js';
+import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
+import {
+  identityBindingAllowsProven,
+  type IdentityStorageModel,
+} from './lark-tool-binding.js';
+import { larkToolDelegationTurnIds } from './lark-tool-delegation.js';
+import { sessionAuthRequests } from './session-auth-requests.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   MAX_STARTUP_AUTO_RETRIES,
@@ -1236,6 +1248,139 @@ export function findActiveBySessionId(sessionId: string): DaemonSession | undefi
   if (!activeSessionsRegistry) return undefined;
   for (const s of activeSessionsRegistry.values()) if (s.session.sessionId === sessionId) return s;
   return undefined;
+}
+
+/** Identity storage model the daemon publishes a managed session with.
+ *
+ * Single source of truth: the CURRENT worker generation's
+ * `session_identity_decision` report, computed from the actual spawn (env
+ * override, remote bypass, real bwrap/Seatbelt engagement, loopback sharing).
+ * The daemon deliberately does NOT re-derive sandbox/network facts from frozen
+ * config — that re-derivation is the split-brain this removes.
+ *
+ * Fail-closed defaults:
+ *  - no report yet (cold start, daemon restart before the worker re-reported):
+ *    'single'. A proven wrapper cannot exist before its decision was reported,
+ *    and the proven content route refuses non-proven sessions.
+ *  - a report structurally impossible on the daemon side (conflict): 'single',
+ *    and identityDecisionConflict() withholds publication on BOTH models. */
+export function identityStorageModelForDaemonSession(ds: DaemonSession): IdentityStorageModel {
+  const report = ds.reportedIdentityModel;
+  if (!report) return 'single';
+  if (identityDecisionConflict(ds)) return 'single';
+  return report.model;
+}
+
+/** Env-independent structural half the daemon can check against a report:
+ *  Linux + managed lark-tool binding on the frozen session shape. Sandbox and
+ *  loopback facts are NOT re-derived here (the worker owns those). */
+function provenStructurallyPossible(ds: DaemonSession): boolean {
+  const bot = getBot(ds.larkAppId).config;
+  return identityBindingAllowsProven({
+    platform: process.platform,
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    apiOnly: bot.apiOnly,
+    adoptMode: !!ds.session.adoptedFrom,
+    existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
+    backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
+    larkToolBinding: true,
+  });
+}
+
+/** Non-undefined when the worker's reported identity decision cannot be
+ *  honored: either the report is for a session whose structure forbids proven
+ *  on the daemon side (binding disabled after a config change, adopt/remote/
+ *  apiOnly — the env-independent half the daemon CAN check), or the report's
+ *  shape is malformed. Publication is withheld and the proven route refuses
+ *  until a live worker reports again. */
+export function identityDecisionConflict(ds: DaemonSession): string | undefined {
+  const report = ds.reportedIdentityModel;
+  if (!report) return undefined;
+  if (report.conflict) return report.conflict;
+  if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    return 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  return undefined;
+}
+
+/** Store a fresh worker identity decision. Called only from the private worker
+ *  IPC channel (already gated to the current worker generation). */
+export function recordWorkerIdentityDecision(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  workerGeneration: number,
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
+): void {
+  let conflict: string | undefined;
+  if (report.model !== 'single' && report.model !== 'proven') {
+    conflict = `malformed identity model report: ${String(report.model)}`;
+  } else if (typeof report.sandboxEngaged !== 'boolean' || typeof report.loopbackShared !== 'boolean') {
+    conflict = 'malformed identity decision report: spawn facts are not booleans';
+  } else if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    conflict = 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  if (conflict) {
+    logger.error(`[${ds.session.sessionId}] ${conflict}; withholding identity publication until a live worker reports again`);
+  }
+  ds.reportedIdentityModel = {
+    model: conflict ? 'single' : report.model,
+    sandboxEngaged: report.sandboxEngaged === true,
+    loopbackShared: report.loopbackShared === true,
+    workerPid: worker.pid ?? -1,
+    workerGeneration,
+    reportedAt: Date.now(),
+    ...(conflict ? { conflict } : {}),
+  };
+}
+
+/**
+ * Identity turns whose proven material must survive terminal collection.
+ *
+ * Computed ONLY from daemon-owned state, never from the CLI-writable PID marker
+ * or session files:
+ *  1. the current execution identity (stays on the opening principal across the
+ *     isolation-off envelope adoption chain);
+ *  2. turns dispatched but not started, and the prepare→publish window;
+ *  3. scheduled runs and failed-turn/readonly continuations;
+ *  4. turns with a pending authorization request (the grant lands after the
+ *     human taps the link, potentially several turns later);
+ *  5. turns still referenced by an in-memory lark-tool delegation;
+ * plus every accepted turn that has not produced an exact terminal/rejection
+ * (covers the worker's type-ahead queue, which is otherwise daemon-invisible).
+ */
+function retainedIdentityTurns(ds: DaemonSession): Set<string> | 'all' {
+  const retain = new Set<string>();
+  const add = (turnId?: string | null): void => { if (turnId) retain.add(turnId); };
+  add(ds.managedTurnOrigin?.identityTurnId ?? ds.managedTurnOrigin?.turnId);
+  add(ds.session.queuedActivationTurnId);
+  add(ds.pendingRawTurnId);
+  for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) add(turnId);
+  for (const turnId of ds.silentScheduledTurns?.keys() ?? []) add(turnId);
+  add(ds.session.deferredScheduleRun?.turnId);
+  add(ds.session.ordinaryTurnRecovery?.currentTurnId);
+  add(ds.session.readonlyTaskContinuation?.currentTurnId);
+  for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+    if (entry.state === 'accepted' || entry.state === 'prepared') add(entry.turnId);
+  }
+  for (const turnId of sessionAuthRequests.identityTurnsFor(ds.session.sessionId)) add(turnId);
+  for (const turnId of larkToolDelegationTurnIds(config.session.dataDir, ds.session.sessionId)) add(turnId);
+  // A saturated accept ledger cannot distinguish queued from dead: retain
+  // every proven turn for the session rather than risk collecting in-flight.
+  const acceptedTurns = activeIdentityTurns(config.session.dataDir, ds.session.sessionId);
+  if (acceptedTurns === null) return 'all';
+  for (const turnId of acceptedTurns) add(turnId);
+  return retain;
+}
+
+/** Forget proven identity contents for turns no longer referenced by any live
+ *  session state. No-op for single-model sessions (they keep no in-memory
+ *  contents). Returns the removed turn ids. */
+export function collectSessionTurnGarbage(ds: DaemonSession): string[] {
+  const retained = retainedIdentityTurns(ds);
+  if (retained === 'all') return [];
+  return collectProvenIdentityContents(config.session.dataDir, ds.session.sessionId, retained);
 }
 
 /** Direct access to the active-sessions Map. Reserved for callers that need
@@ -9882,7 +10027,10 @@ export async function closeSession(
   // Trigger-user credentials die with the session. These files hold a live user
   // token, so a closed session must not leave one on disk for a future session
   // (or an operator inspecting the data dir) to pick up.
-  try { clearAllSessionIdentities(config.session.dataDir, sessionId); }
+  try {
+    clearAllSessionIdentities(config.session.dataDir, sessionId);
+    clearActiveIdentityTurns(config.session.dataDir, sessionId);
+  }
   catch { /* best-effort; absence is the desired state */ }
 
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
@@ -15237,9 +15385,17 @@ function isMeetingDrivenTurn(
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
 }
 
-function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
-  // The daemon owns this per-turn sender map. The worker contributes only the
-  // turn id over private IPC; it can never choose which human that id denotes.
+export function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+  const origin = ds.managedTurnOrigin;
+  if (origin?.turnId === turnId) {
+    // trustedCaller is a tri-state published on every republication: an object
+    // names the caller, null is an explicit callerless delegation, and a
+    // missing field means the publisher is an older worker. The callerless case
+    // must NOT fall through to reply-target recovery, which would borrow a
+    // human caller and form a (null principal, human caller) mixed tuple.
+    if (origin.trustedCaller === null) return undefined;
+    if (origin.trustedCaller !== undefined) return origin.callerOpenId;
+  }
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
   const recovered = ds.session.failedTurnRecovery;
@@ -15749,6 +15905,15 @@ function setupWorkerHandlers(
         }
         discardTriggerStreamingCard(ds, msg.turnId);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
+        // The turn never started and will never terminal. Run GC, but do NOT
+        // release this turn's own ledger anchor here: a same-turnId redelivery
+        // to a new dispatch attempts re-registers on accept, and the rejected
+        // message carries no dispatchAttempt to prove it is not stale. Dropping
+        // the anchor before that re-register lands could let a periodic sweep
+        // collect the re-accepted material. The rejected turn is collected on
+        // a later terminal GC once no live structure names it (and always on
+        // teardown); a small retention lag beats a fail-closed 77 window.
+        collectSessionTurnGarbage(ds);
         break;
       }
       case 'native_input_consumed': {
@@ -18961,6 +19126,19 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // The turn reached a terminal boundary; release its publication anchor
+        // and forget proven material for every turn no live state still names
+        // (queued turns and continuations stay retained). No-op for sessions on
+        // the single-snapshot model. When cross-principal isolation is off, an
+        // adoption chain keeps the OPENING turn's identity for the whole chain
+        // (envelope=B executes as A); release that retained anchor here too —
+        // GC re-pins it if any still-live origin references the same id.
+        releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, msg.turnId);
+        const terminalIdentityTurn = ds.managedTurnOrigin?.identityTurnId;
+        if (terminalIdentityTurn && terminalIdentityTurn !== msg.turnId) {
+          releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
+        }
+        collectSessionTurnGarbage(ds);
         break;
       }
 
@@ -18988,6 +19166,23 @@ function setupWorkerHandlers(
           dispatchAttempt: msg.dispatchAttempt,
           workerGeneration,
           disposition: msg.disposition,
+        });
+        break;
+      }
+
+      case 'session_identity_decision': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored session_identity_decision from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped session_identity_decision with mismatched sessionId`);
+          break;
+        }
+        recordWorkerIdentityDecision(ds, worker, workerGeneration, {
+          model: msg.model,
+          sandboxEngaged: msg.sandboxEngaged,
+          loopbackShared: msg.loopbackShared,
         });
         break;
       }
@@ -19044,19 +19239,38 @@ function setupWorkerHandlers(
             break;
           }
         }
-        const callerOpenId = msg.turnId
-          ? currentGatewayCallerOpenId(ds, msg.turnId)
-          : undefined;
-        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
+        const callerOpenId = msg.trustedCaller !== undefined
+          ? msg.trustedCaller?.requestUserOpenId
+          : msg.turnId ? currentGatewayCallerOpenId(ds, msg.turnId) : undefined;
+        const identityTurnId = msg.identityTurnId ?? msg.turnId;
+        const previousOrigin = ds.managedTurnOrigin;
+        const sameExecution = previousOrigin?.capability && identityTurnId
+          && (previousOrigin.identityTurnId ?? previousOrigin.turnId) === identityTurnId
+          && (previousOrigin.turnId !== msg.turnId || previousOrigin.dispatchAttempt === msg.dispatchAttempt)
+          && previousOrigin.callerOpenId === callerOpenId
+          && (previousOrigin.trustedCaller === msg.trustedCaller
+            || sameTrustedPrincipal(previousOrigin.trustedCaller ?? undefined, msg.trustedCaller ?? undefined));
+        const preexistingProcessIdentities = (sameExecution ? previousOrigin.preexistingProcessIdentities : undefined)
+          ?? currentTurnProcessIdentities(ds, msg.turnId);
         noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.identityTurnId ? { identityTurnId: msg.identityTurnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
+          // A republication of the SAME execution that omits the field (an
+          // older worker in a mixed fleet) carries forward the previous
+          // frame's value, so an explicit callerless null is not lost to a
+          // reply-target fallback. A different turn starts without one.
+          ...(msg.trustedCaller !== undefined
+            ? { trustedCaller: msg.trustedCaller }
+            : previousOrigin && previousOrigin.turnId === msg.turnId
+              ? { trustedCaller: previousOrigin.trustedCaller }
+              : {}),
           ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities

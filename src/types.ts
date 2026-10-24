@@ -20,6 +20,7 @@ import type { CliLaunchMode } from './core/cli-launch-mode.js';
 import type { TurnTerminalCarrierKind } from './core/types.js';
 import type { LinkRefTurnEnvelope } from './services/link-ref-types.js';
 import type { TurnSendKind } from './services/turn-send-ledger.js';
+import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -2312,7 +2313,22 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; linkRefMode?: 'observe' | 'enabled' }
+  /** Worker→daemon single-source identity storage decision, sent right after
+   *  the worker resolved the actual spawn (or RPC engine): the effective model
+   *  plus the spawn facts it was derived from. The daemon publishes identity
+   *  material ONLY per the latest report from its current worker; it never
+   *  re-derives sandbox/network facts itself. Re-sent on every (re)spawn so a
+   *  model switch (e.g. BOTMUX_SANDBOX changed before a restart) converges. */
+  | {
+      type: 'session_identity_decision';
+      sessionId: string;
+      model: IdentityStorageModel;
+      /** Whether a local sandbox actually wraps the spawned process. */
+      sandboxEngaged: boolean;
+      /** Whether the daemon loopback is reachable inside the spawn. */
+      loopbackShared: boolean;
+    }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
