@@ -1,11 +1,12 @@
 /**
- * 「显示 / 隐藏输出」 re-renders the streaming card from cached daemon state.
+ * 「显示 / 隐藏输出」, 「刷新」 and the terminal keys re-render the streaming card
+ * from cached daemon state.
  *
  * `lastScreenStatus` lives only in memory: a session restored after a daemon
  * restart has none, and a worker that dies mid-turn leaves its last one behind.
- * With no worker there is no CLI behind the card, so a toggle must not bring
+ * With no worker there is no CLI behind the card, so a click must not bring
  * back 「工作中」 and a 「⏹ 停止」 button — the restart-time reconcile has just
- * set that card to 「等待输入」, and the toggle used to undo it.
+ * set that card to 「等待输入」, and the click used to undo it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
@@ -79,6 +80,7 @@ import {
   reconcileRestoredStreamingCardStatus,
   setActiveSessionsRegistry,
   transferSession,
+  workerHasInitialized,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, sessionKey, type DaemonSession, type FrozenCard } from '../src/core/types.js';
@@ -96,6 +98,7 @@ const STARTING = label('card.status.starting');
 const LIMITED = label('card.status.limited');
 const STOP = label('card.btn.stop');
 const UNAVAILABLE = label('card.status.screenshot_unavailable');
+const FAILED = label('card.status.idle_failed');
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -123,7 +126,6 @@ function makeRestoredDs(overrides?: Partial<DaemonSession>): DaemonSession {
       chatType: 'group',
     },
     worker: null,
-    workerReady: false,
     workerPort: null,
     workerToken: null,
     larkAppId: APP_ID,
@@ -151,20 +153,25 @@ function activate(ds: DaemonSession): CardHandlerDeps {
   return { activeSessions: sessions, sessionReply: vi.fn(async () => 'om_new'), lastRepoScan: new Map() } as any;
 }
 
-function toggle(cardNonce = NONCE, messageId = CARD_ID) {
+function cardClick(action: string, extra: Record<string, unknown> = {}, cardNonce = NONCE, messageId = CARD_ID) {
   return {
     action: {
       value: {
-        action: 'toggle_display',
+        action,
         root_id: ROOT_ID,
         session_id: 'sid-toggle-status',
         card_nonce: cardNonce,
         stream_card_version: STREAMING_CARD_PATCH_VERSION,
+        ...extra,
       },
     },
     operator: { open_id: 'ou_user' },
     context: { open_message_id: messageId },
   };
+}
+
+function toggle(cardNonce = NONCE, messageId = CARD_ID) {
+  return cardClick('toggle_display', {}, cardNonce, messageId);
 }
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -324,6 +331,60 @@ describe('toggle status without a fresh worker report', () => {
     const card = await toggleCurrent(ds, activate(ds));
     expect(statusOf(card)).toBe(WORKING);
     expect(hasStopButton(card)).toBe(true);
+  });
+
+  it('worker gone after a failed turn → keeps 执行失败', async () => {
+    // failedIdleTurnId is runtime-only and the exit path keeps it.
+    const ds = makeRestoredDs({ failedIdleTurnId: 'turn-failed' });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(statusOf(card)).toBe(FAILED);
+    expect(hasStopButton(card)).toBe(false);
+  });
+});
+
+describe('刷新 / terminal keys on a restored session', () => {
+  // A daemon shutdown drops ds.worker before the worker's exit event, so the
+  // exit path never clears the persisted Web Terminal port. Restore keeps it and
+  // leaves workerReady unset, which workerHasInitialized() reads as a ready
+  // worker — so these clicks rebuild the card even though no CLI runs.
+  const restoredWithWebPort = (overrides?: Partial<DaemonSession>): DaemonSession => {
+    const ds = makeRestoredDs({ displayMode: 'screenshot', ...overrides });
+    Object.assign(ds.session, { backendType: 'tmux', webPort: 31219 });
+    return ds;
+  };
+  const clicks: Array<[string, Record<string, unknown>]> = [
+    ['refresh_screenshot', {}],
+    ['term_action', { key: 'esc' }],
+  ];
+
+  it.each(clicks)('%s keeps 等待输入, with no stop button', async (action, extra) => {
+    const ds = restoredWithWebPort();
+    expect(workerHasInitialized(ds)).toBe(true);
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(IDLE);
+    expect(hasStopButton(card)).toBe(false);
+    expect(ds.lastScreenStatus).toBeUndefined();
+  });
+
+  it.each(clicks)('%s on a restored usage-limited session keeps 限额已达 with its retry time', async (action, extra) => {
+    // Restore puts a persisted limit back as lastScreenStatus = 'limited'.
+    const ds = restoredWithWebPort({
+      lastScreenStatus: 'limited',
+      usageLimit: { limited: true, kind: 'usage', retryAtMs: Date.now() + 3_600_000, retryLabel: '23:59', retryReady: false },
+    });
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(LIMITED);
+    expect(markdownOf(card).some(md => md.includes('23:59'))).toBe(true);
+    expect(hasStopButton(card)).toBe(false);
+  });
+
+  it.each(clicks)('%s on a running worker still shows 工作中 with the stop button', async (action, extra) => {
+    const worker = makeFakeWorker();
+    const ds = restoredWithWebPort({ worker, workerReady: true, lastScreenStatus: 'working' });
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(WORKING);
+    expect(hasStopButton(card)).toBe(true);
+    expect(worker.send).toHaveBeenCalled();
   });
 });
 

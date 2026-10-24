@@ -72,8 +72,8 @@ describe('getQuotedMessageDetail', () => {
     expect(getMessageDetailMock).toHaveBeenCalledTimes(1);
   });
 
-  it('propagates a failed fallback without retrying again', async () => {
-    const fallbackError = larkApiError('get message', { code: 230002, msg: 'not in chat' });
+  it.each([230002, 2200])('propagates a failed fallback code %s without retrying again', async code => {
+    const fallbackError = larkApiError('get message', { code, msg: 'fallback failed' });
     getMessageDetailMock
       .mockRejectedValueOnce(larkApiError('get message', { code: 2200, msg: 'internal error' }))
       .mockRejectedValueOnce(fallbackError);
@@ -117,7 +117,9 @@ describe('getQuotedMessageDetail', () => {
     });
 
     const detail = await getQuotedMessageDetail('app_x', 'om_quoted', getMessageDetailMock);
-    const out = await renderQuotedMessage('app_x', detail.items[0], expandMergeForward);
+    const out = await renderQuotedMessage('app_x', detail.items[0], expandMergeForward, undefined, detail);
+    expect(getMessageDetailMock.mock.calls.filter(call => call[1] === 'om_quoted')).toHaveLength(2);
+    expect(detail.items.find((item: any) => item.message_id === 'om_card').body.content).not.toContain('recovered card body');
     expect(out.msgType).toBe('merge_forward_expanded');
     expect(out.content).toContain('<forwarded_messages>');
     expect(out.content).toContain('type="merged_forward"');

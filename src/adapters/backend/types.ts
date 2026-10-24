@@ -218,6 +218,12 @@ export interface SpawnOpts {
    * global env have been applied, so those sources cannot re-add them.
    */
   unsetEnv?: string[];
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */

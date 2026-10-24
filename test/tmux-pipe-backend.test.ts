@@ -11,8 +11,8 @@
  *   - getChildPid resolves through display-message, not list-panes
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -70,6 +70,9 @@ import {
 } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
+import { takePaneLaunchFile } from './helpers/pane-launch.js';
+import { TmuxCommandTooLongError } from '../src/adapters/backend/pane-launch.js';
+import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 
 // Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
 // stub the sleep for the whole suite so retry tests don't add real seconds.
@@ -105,12 +108,17 @@ function getExecFileCalls() {
     .filter(call => !(call[1] as string[]).includes('display-message'));
 }
 
+// tmux is mocked, so no pane shell ever reads (and deletes) a launch file.
+const paneLaunchRoot = mkdtempSync(join(tmpdir(), 'bmx-pipe-launch-'));
+afterAll(() => rmSync(paneLaunchRoot, { recursive: true, force: true }));
+
 function spawnOpts() {
   return {
     cwd: '/tmp',
     cols: 200,
     rows: 50,
     env: process.env as Record<string, string>,
+    paneLaunchDir: paneLaunchRoot,
   };
 }
 
@@ -887,6 +895,137 @@ describe('normaliseCaptureLineEndings', () => {
   });
 });
 
+describe('TmuxPipeBackend managed launch file', () => {
+  const SECRET_PROMPT = '部署口令-不得外泄';
+  const SECRET_VALUE = 'provider-secret-0123456789';
+
+  function freshLaunchDir(): string {
+    const dir = join(paneLaunchRoot, `case-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(dir);
+    return dir;
+  }
+
+  function secretSpawn(be: TmuxPipeBackend, launchDir: string) {
+    be.spawn('/usr/local/bin/grok', ['--rules', `规则 ${SECRET_PROMPT}`], {
+      ...spawnOpts(),
+      env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-secret' },
+      injectEnv: { PROVIDER_TOKEN: SECRET_VALUE },
+      unsetEnv: ['MIDSCENE_MODEL_API_KEY'],
+      launchShell: '/bin/sh',
+      paneLaunchDir: launchDir,
+    });
+  }
+
+  /** An execFileSync failure exactly as Node/Bun build it: the message echoes
+   *  the whole command, stderr carries tmux's reason. */
+  function execFailure(args: string[], stderr: string) {
+    return Object.assign(new Error(`Command failed: tmux ${args.join(' ')} ${SECRET_PROMPT} PROVIDER_TOKEN=${SECRET_VALUE}\n${stderr}\n`), {
+      status: 1, signal: null, stderr: Buffer.from(`${stderr}\n`),
+    });
+  }
+
+  function captureWrites() {
+    const out: string[] = [];
+    const err: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: any) => { out.push(String(chunk)); return true; }) as any);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: any) => { err.push(String(chunk)); return true; }) as any);
+    return { out, err, restore: () => { outSpy.mockRestore(); errSpy.mockRestore(); } };
+  }
+
+  it('a tmux rejection reaches the caller as its reason only; the command goes to stdout', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args.includes('new-session')) throw execFailure(args, 'command too long');
+      return '' as any;
+    }) as any);
+    const launchDir = freshLaunchDir();
+    const io = captureWrites();
+    let thrown: unknown;
+    try {
+      secretSpawn(new TmuxPipeBackend('bmx-secret', { createSession: true, ownsSession: true }), launchDir);
+    } catch (err) { thrown = err; } finally { io.restore(); }
+    expect(thrown).toBeInstanceOf(TmuxCommandTooLongError);
+    const message = (thrown as Error).message;
+    expect(message).toContain('启动命令过长，被 tmux 拒绝');
+    for (const leaked of [SECRET_PROMPT, SECRET_VALUE, 'MIDSCENE_MODEL_API_KEY', '/usr/bin:/bin', 'new-session']) {
+      expect(message).not.toContain(leaked);
+      // stderr feeds the startup-failure card's recent-output block.
+      expect(io.err.join('')).not.toContain(leaked);
+    }
+    expect(io.out.join('')).toMatch(/new-session bmx-secret failed: command too long\n.*tmux new-session -d/s);
+    // Nothing will ever read the file now; its env values do not stay on disk.
+    expect(readdirSync(launchDir)).toEqual([]);
+  });
+
+  it('keeps the transient signature of an exhausted connect failure, without the command', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args.includes('new-session')) throw execFailure(args, 'error connecting to /tmp/tmux-0/botmux (Connection refused)');
+      return '' as any;
+    }) as any);
+    const launchDir = freshLaunchDir();
+    const io = captureWrites();
+    let thrown: unknown;
+    try {
+      secretSpawn(new TmuxPipeBackend('bmx-secret', { createSession: true, ownsSession: true }), launchDir);
+    } catch (err) { thrown = err; } finally { io.restore(); }
+    const message = (thrown as Error).message;
+    expect(message).toBe('tmux 创建会话失败：error connecting to /tmp/tmux-0/botmux (Connection refused)');
+    expect(isTransientStartupFailure(message)).toBe(true);
+    // The two retry notices on stderr carry the same summary, not the echo.
+    expect(io.err.filter(line => line.includes('retrying: error connecting to'))).toHaveLength(2);
+    expect(io.err.join('')).not.toContain(SECRET_VALUE);
+    expect(readdirSync(launchDir)).toEqual([]);
+  });
+
+  it('refuses a command past the tmux cap before running tmux', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => (args?.[0] === '-V' ? 'tmux 3.3a' : '')) as any);
+    const launchDir = freshLaunchDir();
+    const io = captureWrites();
+    let thrown: unknown;
+    try {
+      new TmuxPipeBackend('bmx-huge', { createSession: true, ownsSession: true }).spawn('sleep', ['60'], {
+        ...spawnOpts(),
+        // Rides in the tmux command itself (`new-session -e`), not in the file.
+        env: { PATH: '/usr/bin:/bin', BOTMUX_CODEX_INSTANCE_BINDING: 'b'.repeat(17_000) },
+        paneLaunchDir: launchDir,
+      });
+    } catch (err) { thrown = err; } finally { io.restore(); }
+    expect(thrown).toBeInstanceOf(TmuxCommandTooLongError);
+    expect(mockedExecFileSync.mock.calls.some(([, args]) => (args as string[]).includes('new-session'))).toBe(false);
+    expect(readdirSync(launchDir)).toEqual([]);
+  });
+
+  it('destroySession takes an unread launch file along; a plain detach leaves it for the pane', () => {
+    const detachedDir = freshLaunchDir();
+    const detached = new TmuxPipeBackend('bmx-detach', { createSession: true, ownsSession: true });
+    detached.spawn('/bin/echo', ['hi'], { ...spawnOpts(), paneLaunchDir: detachedDir });
+    detached.kill();
+    expect(readdirSync(detachedDir)).toHaveLength(1);
+
+    const destroyedDir = freshLaunchDir();
+    const destroyed = new TmuxPipeBackend('bmx-destroy', { createSession: true, ownsSession: true });
+    destroyed.spawn('/bin/echo', ['hi'], { ...spawnOpts(), paneLaunchDir: destroyedDir });
+    destroyed.destroySession();
+    expect(readdirSync(destroyedDir)).toEqual([]);
+  });
+
+  it('a fresh session drops older unread files of the same session, never a recent one', () => {
+    const launchDir = freshLaunchDir();
+    const stale = join(launchDir, 'launch-00000000000000aa.sh');
+    const recent = join(launchDir, 'launch-00000000000000bb.sh');
+    const unrelated = join(launchDir, 'notes.txt');
+    for (const path of [stale, recent, unrelated]) writeFileSync(path, 'x');
+    const twoMinutesAgo = new Date(Date.now() - 120_000);
+    utimesSync(stale, twoMinutesAgo, twoMinutesAgo);
+    utimesSync(unrelated, twoMinutesAgo, twoMinutesAgo);
+    new TmuxPipeBackend('bmx-sweep', { createSession: true, ownsSession: true })
+      .spawn('/bin/echo', ['hi'], { ...spawnOpts(), paneLaunchDir: launchDir });
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(recent)).toBe(true);
+    expect(existsSync(unrelated)).toBe(true);
+    expect(readdirSync(launchDir).filter(name => /^launch-[0-9a-f]{16}\.sh$/.test(name))).toHaveLength(2);
+  });
+});
+
 describe('TmuxPipeBackend managed session', () => {
   it('creates detached session and applies botmux tmux options', () => {
     const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
@@ -919,22 +1058,22 @@ describe('TmuxPipeBackend managed session', () => {
 
       const args = newSessionArgs();
       const cIdx = scriptIndex(args);
-      const script = args[cIdx + 1] ?? '';
-      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
-      expect(args[cIdx + 2]).toBe('/tmp');
-      expect(args[cIdx + 2]).not.toBe('_');
-      expect(script).toContain('cd -- $argv[1]');
-      expect(script).toContain('set -e argv[1]');
-      expect(script).toContain('exec /usr/bin/env $argv');
-      expect(script).not.toContain('cd -- "$1" && shift');
-      expect(script).not.toContain('"$@"');
-      expect(script).not.toMatch(/\bshift\b/);
+      // fish gets its post-script args as $argv: no POSIX `_` sentinel.
+      expect(args.slice(cIdx - 2)).toEqual([shell.path, '-i', '-c', 'source $argv[1]', args[cIdx + 2]]);
+      const { body } = takePaneLaunchFile(args);
+      expect(body).toContain(`set argv '/tmp'`);
+      expect(body).toContain('cd -- $argv[1]');
+      expect(body).toContain('set -e argv[1]');
+      expect(body).toContain('exec /usr/bin/env $argv');
+      expect(body).not.toContain('cd -- "$1" && shift');
+      expect(body).not.toContain('"$@"');
+      expect(body).not.toMatch(/\bshift\b/);
     } finally {
       cleanupFakeShell(shell);
     }
   });
 
-  it('keeps the POSIX launch argv unchanged for sh-compatible shells', () => {
+  it('sh-compatible shells source the POSIX launch file', () => {
     const be = new TmuxPipeBackend('bmx-posix-pipe', { createSession: true, ownsSession: true });
     be.spawn('/bin/echo', ['hello'], {
       ...spawnOpts(),
@@ -944,10 +1083,11 @@ describe('TmuxPipeBackend managed session', () => {
 
     const args = newSessionArgs();
     const cIdx = scriptIndex(args);
-    const script = args[cIdx + 1] ?? '';
-    expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', script, '_', '/tmp']);
-    expect(script).toContain('cd -- "$1" && shift');
-    expect(script).toContain('exec /usr/bin/env "$@"');
+    expect(args.slice(cIdx - 1)).toEqual(['/bin/sh', '-c', '. "$1"', '_', args[cIdx + 3]]);
+    const { body } = takePaneLaunchFile(args);
+    expect(body).toContain(`set -- '/tmp'`);
+    expect(body).toContain('cd -- "$1" && shift');
+    expect(body).toContain('exec /usr/bin/env "$@"');
   });
 
   it('resizes owned tmux sessions and only records adopted pane resize', () => {

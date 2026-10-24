@@ -13,6 +13,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
@@ -755,6 +756,30 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
 
     detector.feed('Queued for capacity\nContext 100% left\n› Ask TraeCode CLI to do anything');
     vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('checks the clear match start rather than rule characters elsewhere in the match', () => {
+    const detector = new IdleDetector(makeCli({
+      staticBusyPattern: /QUEUED/,
+      staticBusyClearPattern: /PROMPT>[^\n]*/,
+      readyPattern: /PROMPT>/,
+    }));
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+    detector.feed('QUEUED\nPROMPT> ───');
+    vi.advanceTimersByTime(5_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('preserves MiniMax line-start clearing when a running marker precedes its prompt', () => {
+    const detector = new IdleDetector(createMinimaxAdapter('/bin/true'));
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+    detector.feed('[MiniMax Code] running…\n›');
+    vi.advanceTimersByTime(5_500);
     expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });

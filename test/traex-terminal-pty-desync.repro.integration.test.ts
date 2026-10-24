@@ -5,13 +5,13 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
@@ -94,15 +94,7 @@ function rolloutTerminal(turnId: string): string {
 }
 
 function readSubmissions(path: string): Array<{ pid: number; text: string }> {
-  try {
-    return readFileSync(path, 'utf8')
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map(line => JSON.parse(line) as { pid: number; text: string });
-  } catch {
-    return [];
-  }
+  return readJsonLines<{ pid: number; text: string }>(path);
 }
 
 describe('TraeX transcript-terminal / PTY-readiness desync reproduction', () => {

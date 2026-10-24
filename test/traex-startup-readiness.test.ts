@@ -40,6 +40,11 @@ afterEach(() => { detector.dispose(); vi.useRealTimers(); });
 
 function quiet() { vi.advanceTimersByTime(95_000); }
 
+function cursorAddressedComposer(width = 40): string {
+  const rule = '─'.repeat(width);
+  return `\x1b[12;1H${rule}\x1b[13;1H❯ Ask TRAE CLI to do anything\x1b[14;1H${rule}`;
+}
+
 describe('TraeX startup readiness', () => {
   it('does not release input during a silent loading skeleton, even though the frame already has the ❯ prompt', () => {
     detector.feed(LOADING);
@@ -184,5 +189,82 @@ old completed response
 ──────────────────────────
   GPT-6.1-Sol (MAX) xhigh · ~ · Context 89% left
   ☢ Full Access · ? for shortcuts`)).toBe(true);
+  });
+
+  // TraeX 0.211.1 redraws adjacent rows with CUP instead of newlines.
+  // Stripping ANSI therefore joins the rule and composer as `────❯ …`.
+  it.each(['─', '━'])('releases the composer following a %s rule in a cursor-addressed PTY frame', rule => {
+    detector.feed(`\x1b[12;1H${rule.repeat(160)}\x1b[13;1H\x1b[1m❯\x1b[0m Ask TRAE CLI to do anything\x1b[14;1H${rule.repeat(160)}`);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('recognizes a rule and composer arriving in separate PTY chunks', () => {
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}`);
+    detector.feed('\x1b[13;1H\x1b[1m❯\x1b[0m Ask TRAE CLI to do anything');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('still holds a loading banner with a cursor-addressed composer', () => {
+    detector.feed(LOADING);
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ Ask TRAE CLI to do anything`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed(LOADED);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not release numbered picker rows after a rule', () => {
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ 1. Continue`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed('\r❯ Ask TRAE CLI to do anything');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears a capacity hold when the cursor-addressed composer returns', () => {
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed(`\x1b[12;1H${'─'.repeat(160)}\x1b[13;1H❯ Ask TRAE CLI to do anything`);
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['queue-first', 'Queued for capacity'],
+    ['queue-first', '⠋ Queued for capacity'],
+    ['composer-first', 'Queued for capacity'],
+    ['composer-first', '⠋ Queued for capacity'],
+  ])('holds a same-chunk queue and cursor-addressed composer (%s, %s)', (order, label) => {
+    const queue = `\x1b[11;1H\x1b[2K${label}`;
+    const composer = cursorAddressedComposer();
+    // Preserve the queue line boundary when it follows the composer.
+    detector.feed(order === 'queue-first' ? queue + composer : `${composer}\n${queue}`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+
+    // A later composer-only repaint clears the hold; stale tail evidence
+    // must not re-arm it when just the status bar redraws afterwards.
+    detector.feed(composer);
+    detector.feed('\x1b[15;1HContext 100% left');
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps same-chunk queue evidence that has scrolled out of the rolling tail', () => {
+    detector.feed(`\x1b[11;1H\x1b[2KQueued for capacity${cursorAddressedComposer(320)}`);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    detector.feed('Context 100% left');
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+
+    detector.feed(cursorAddressedComposer());
+    quiet();
+    expect(idle).toHaveBeenCalledTimes(1);
   });
 });

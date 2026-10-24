@@ -340,7 +340,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -3149,11 +3149,9 @@ async function configuredBotDefaultsRecoveryRows(
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
-          quotaFallbackBot: rawEntry?.quotaFallbackBot,
-          autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
-          // 离线行也要带上磁盘里的排版配置，否则 daemon 不在线时 Dashboard
-          // 会把已配置的竖放布局显示回 compact（payload 层 fail-soft 归一化）。
-          askOptionLayout: rawEntry?.askOptionLayout,
+          // 离线行也要带上磁盘里的保存值（如竖放排版、默认关的 larkToolBinding），
+          // 否则 daemon 不在线时 Dashboard 会把已保存的非默认态显示回默认态。
+          ...sparseOverridesFromRawBotConfig(rawEntry),
         });
         return {
           ...payload,

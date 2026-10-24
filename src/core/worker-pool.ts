@@ -1874,6 +1874,17 @@ function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
 }
 
+/** 「会话启动失败」notice: the reason plus where to look. The session tag is
+ *  what this daemon's log lines are prefixed with, and the worker writes the
+ *  full failing command there (never into the chat). */
+function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string, loc: ReturnType<typeof botLocale>): string {
+  const botIndex = process.env.BOTMUX_BOT_INDEX;
+  const logPath = botIndex !== undefined && /^\d+$/.test(botIndex)
+    ? `~/.botmux/logs/daemon-${botIndex}-*.log`
+    : tr('worker.start_failed_log_fallback', {}, loc);
+  return tr('worker.start_failed', { cliName, reason, sessionId: tag(ds), logPath }, loc);
+}
+
 /** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
  *  'dsh': 'tui' means the worker spawns the PTY-driven dsh-tui adapter (a real
  *  interactive TUI), so `/compact` affordances stay enabled. Read from the LIVE
@@ -14578,8 +14589,7 @@ export function forkWorker(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
@@ -15435,8 +15445,7 @@ function setupWorkerHandlers(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, loc);
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
     try {
       await scopedReply(message, 'text', turnId);
     } catch (err: any) {
@@ -21467,10 +21476,7 @@ export function forkAdoptWorker(
     logger.error(`[${t}] Adopt worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    const message = tr('worker.start_failed', {
-      cliName: sessionCliDisplayName(ds, botCfg),
-      reason,
-    }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_fork_error',
       message: reason,

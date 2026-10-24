@@ -11,6 +11,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -2741,6 +2742,9 @@ export function closeSession(
     removePromptContextDir(sessionId);
     // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
     removeStatuslineDir(config.session.dataDir, sessionId);
+    // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
+    // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
+    removePaneLaunchDir(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);

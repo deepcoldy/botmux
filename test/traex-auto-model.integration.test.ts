@@ -34,7 +34,7 @@ function rows(path: string): any[] {
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
-  freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue') {
+  freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -135,8 +135,12 @@ process.stdin.on('data', chunk => {
 setInterval(() => {
   if (submitted && !completed && fs.existsSync(release)) {
     completed = true;
-    line({ type: 'task_complete', turn_id: turnId, last_agent_message: 'done', duration_ms: 1000 });
-    idle();
+    const complete = () => line({ type: 'task_complete', turn_id: turnId, last_agent_message: 'done', duration_ms: 1000 });
+    // terminalDelayMs paints the composer BEFORE the authoritative terminal:
+    // the exact window where a capacity-held follow-up must not be type-ahead
+    // written into the still-running degraded pane.
+    if (${terminalDelayMs} > 0) { idle(); setTimeout(complete, ${terminalDelayMs}); }
+    else { complete(); idle(); }
   }
 }, 100);
 }
@@ -352,7 +356,10 @@ describe('TraeX auto-model real Worker and PTY', () => {
   }, 45_000);
 
   it('resumes exact native history through exhaustion, then runs the next input on the preferred model', async () => {
-    const f = await fixture(true, false, true);
+    // Composer repaint precedes the authoritative terminal by 5.5s. A
+    // follow-up stamped while capacity owns the pane must survive that gap
+    // and still be submitted as its own turn after the preferred reset.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 1, 'original submit');
     // Arrives during the queue: stays a distinct turn through both restarts.
@@ -386,6 +393,38 @@ describe('TraeX auto-model real Worker and PTY', () => {
         && nextSubmissions.length === 1
         && nextSubmissions[0]!.model === 'core';
     }, 'next ask relaunched on the preferred model after reset');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
+  }, 100_000);
+
+  it('keeps a follow-up arriving after exhaustion (but before the terminal) out of the degraded pane', async () => {
+    // Both queue-walk-off branches clear queueSinceMs at the moment of
+    // exhaustion, while the pane is STILL parked on the last fallback model
+    // and the predecessor turn owns it. A follow-up arriving here must be
+    // tagged from the latched exhausted state plus the live queued pane — not
+    // type-ahead written into "last". Composer still precedes the terminal.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500);
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original submit');
+    await f.wait(() => f.messages.some(message => message.type === 'screen_update'
+      && message.content.includes('position 1590')), 'first model capacity viewport');
+    await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.message.includes('均持续排队')), 'exhaustion', 55_000);
+    // Only now does the follow-up arrive: exhausted latch is set, queueSinceMs
+    // is cleared, but the live pane still shows the queue at the last model.
+    f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(0);
+    const notices = f.messages.filter(message => message.type === 'user_notify' && message.message.includes('均持续排队')).length;
+    await new Promise(resolveWait => setTimeout(resolveWait, 6_000));
+    expect(rows(f.launches)).toHaveLength(3);
+    expect(f.messages.filter(message => message.type === 'user_notify' && message.message.includes('均持续排队'))).toHaveLength(notices);
+    writeFileSync(f.release, 'go');
+    await f.wait(() => {
+      const nextSubmissions = rows(f.submissions).filter(row => row.text.startsWith('next ask'));
+      return rows(f.launches).length === 4
+        && nextSubmissions.length === 1
+        && nextSubmissions[0]!.model === 'core';
+    }, 'next ask relaunched on the preferred model, never written to the fallback pane');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
   }, 100_000);
