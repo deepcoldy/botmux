@@ -24495,6 +24495,15 @@ async function spawnCli(
     lastCliExitCode = code;
     lastCliExitSignal = signal;
     previousCliEndedAtMs = Date.now();
+    // A genuine crash can never paint the first-activity frame a submitted
+    // input was waiting for; disarm the view latch so the crash-restarted
+    // process's recovery input is not held for a dead process's screen.
+    // Planned model switches keep it: their replacement owns the wait.
+    // Regression coverage for this wiring is the tmux backend only
+    // (traex-auto-model.integration "runs the next input on the preferred
+    // model"): under pty the pane observes an activity frame before the
+    // crash, so deleting this line still passes pty but fails tmux.
+    if (!intentionalRestart) traexAutoModelController?.noteProcessExited(false);
     const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh

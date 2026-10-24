@@ -286,6 +286,15 @@ export class TraexAutoModelController {
     if (turnId === this.turnId) this.awaitingActivity = true;
   }
 
+  /** An unplanned process death can never paint the activity frame a
+   *  submitted input was waiting for: the crash-restarted process evaluates
+   *  the turn afresh, so its recovery input must not be held for a dead
+   *  process's frame. A PLANNED model switch keeps the latch — its
+   *  replacement owns the same waiting window and buffering contract. */
+  noteProcessExited(planned: boolean): void {
+    if (!planned) this.awaitingActivity = false;
+  }
+
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
     const fromModel = this.currentModel();

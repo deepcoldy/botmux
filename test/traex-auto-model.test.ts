@@ -477,6 +477,20 @@ describe('current footer capacity evidence', () => {
     controller.endTurn('first');
     expect(controller.awaitingModelActivity()).toBe(false);
   });
+
+  it('disarms the activity latch on a crash exit but keeps it for a planned switch', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    controller.observeCapacityQueue({ turnId: 'turn', queued: false, nowMs: 0 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A planned model switch's replacement owns the same waiting window.
+    controller.noteProcessExited(true);
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A genuine crash can never paint the frame the dead process owed.
+    controller.noteProcessExited(false);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
   it('does not switch during a long ordinary reasoning interval', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
     controller.beginTurn('turn');
