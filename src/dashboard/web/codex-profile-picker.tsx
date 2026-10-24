@@ -27,6 +27,26 @@ export function CodexProfilePicker(props: {
     return () => { stale = true; abort.abort(); };
   }, [key]);
   const missing = !!props.value && !!catalog && !catalog.candidates.some(p => p.name === props.value && p.available);
+  // Catalog-level failures carry a machine code; show a localized reason while
+  // keeping the code in parentheses for diagnostics. Unknown codes still render.
+  const errorDetail = (code: string): string => {
+    const map: Record<string, string> = {
+      unsupported_launch: tr('botDefaults.codexProfileErrorUnsupportedLaunch'),
+      unsupported_rpc: tr('botDefaults.codexProfileErrorUnsupportedRpc'),
+      unsupported_service_tier: tr('botDefaults.codexProfileErrorUnsupportedServiceTier'),
+      capability_unconfirmed: tr('botDefaults.codexProfileErrorCapabilityUnconfirmed'),
+      version_unknown: tr('botDefaults.codexProfileErrorVersionUnknown'),
+      parameter_unsupported: tr('botDefaults.codexProfileErrorParameterUnsupported'),
+      binary_unavailable: tr('botDefaults.codexProfileErrorBinaryUnavailable'),
+      not_found: tr('botDefaults.codexProfileErrorNotFound'),
+      unreadable: tr('botDefaults.codexProfileErrorUnreadable'),
+      scan_failed: tr('botDefaults.codexProfileErrorScanFailed'),
+      home_must_be_absolute: tr('botDefaults.codexProfileErrorHomeAbsolute'),
+      instance_unavailable: tr('botDefaults.codexProfileErrorInstanceUnavailable'),
+    };
+    const text = map[code];
+    return text ? `${text} (${code})` : code;
+  };
   return <div className="bd-row bd-codex-profile" data-section="codex-profile">
     <label>Codex profile</label>
     <div className="bd-codex-profile-controls">
@@ -42,10 +62,11 @@ export function CodexProfilePicker(props: {
     </div>
     <p className={`bd-aux-note ${missing || (catalog && !['ok', 'empty'].includes(catalog.status)) ? 'bd-aux-err' : ''}`} role="status">
       {catalog ? tr(`botDefaults.codexProfileStatus.${catalog.status}`) : tr('botDefaults.codexProfileLoading')}
-      {catalog?.error ? ` (${catalog.error})` : ''}
+      {catalog?.error ? ` · ${errorDetail(catalog.error)}` : ''}
       {missing ? ` · ${tr('botDefaults.codexProfileMissing')}: ${props.value}` : ''}
     </p>
     {catalog && <p className="bd-aux-note" style={{ overflowWrap: 'anywhere' }}>Codex {catalog.version ?? '—'} · {catalog.format === 'files' ? tr('botDefaults.codexProfileFiles') : catalog.format === 'legacy' ? tr('botDefaults.codexProfileLegacy') : '—'} · {catalog.source ?? '—'}</p>}
+    {catalog?.status === 'empty' && <p className="bd-aux-note">{tr('botDefaults.codexProfileEmptyHint', { source: catalog.source ?? '~/.codex' })}</p>}
     {props.launchChanged && <p className="bd-aux-note bd-aux-err">{tr('botDefaults.codexProfileSaveLaunch')}</p>}
     <p className="bd-aux-note">{tr('botDefaults.codexProfileHelp')}</p>
     <p className="bd-aux-note">{tr('botDefaults.codexProfileScope')}</p>

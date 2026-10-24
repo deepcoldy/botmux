@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { validateCodexProfile } from './services/codex-profiles.js';
+import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
 import { captureCodexNativeProcesses, waitForCodexNativeRelease } from './core/codex-native-release.js';
 import { freezeCodexCleanupLaunch } from './core/codex-cleanup-launch.js';
 import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
@@ -19179,6 +19179,10 @@ async function spawnCli(
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
+  // Probed once at the early gate and reused at the final child-env gate so a
+  // launch runs --version/--help only once; profile FILES are re-read at both
+  // gates (the late scan still catches a deletion mid-setup).
+  let codexProfileReady: { home: string; capability: CodexProfileCapability } | undefined;
   if (cfg.codexProfile) {
     if (cfg.adoptMode || cfg.existingAppServerEndpoint || isWorkflowWorker() || !cfg.codexProfileHome) {
       throw new Error('Codex profile unsupported for adopted/external/workflow sessions or missing frozen home');
@@ -19186,7 +19190,9 @@ async function spawnCli(
     if (cfg.cliInstanceBinding && realpathSync(cfg.cliInstanceBinding.codexHome) !== realpathSync(cfg.codexProfileHome)) {
       throw new Error('Codex profile home does not match the frozen instance');
     }
-    await validateCodexProfile({ ...cfg, cliId: cfg.cliId as CliId }, cfg.codexProfile, cfg.codexProfileHome);
+    const profileCfg = { ...cfg, cliId: cfg.cliId as CliId };
+    codexProfileReady = await probeCodexProfileCapability(profileCfg, cfg.codexProfileHome);
+    await validateCodexProfile(profileCfg, cfg.codexProfile, cfg.codexProfileHome, codexProfileReady);
     process.env.CODEX_HOME = cfg.codexProfileHome;
   }
   if (cfg.adoptMode && cfg.serviceTier) {
@@ -21796,7 +21802,9 @@ async function spawnCli(
   }
   applyCodexInstanceEnv(childEnv, cfg.cliInstanceBinding);
   if (cfg.codexProfile) {
-    await validateCodexProfile({ ...cfg, cliId: cfg.cliId as CliId }, cfg.codexProfile, cfg.codexProfileHome);
+    // Late re-validation reuses the probed capability (no extra --version/
+    // --help execs) but re-reads the frozen profile files.
+    await validateCodexProfile({ ...cfg, cliId: cfg.cliId as CliId }, cfg.codexProfile, cfg.codexProfileHome, codexProfileReady);
     childEnv.CODEX_HOME = cfg.codexProfileHome;
   }
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') childEnv.BOTMUX_CODEX_INSTANCE_BINDING = codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime);

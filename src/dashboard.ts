@@ -342,7 +342,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -3071,7 +3071,7 @@ function configuredBrands(): Map<string, string | undefined> {
 
 type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
   'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
-  | 'modelBackendVariant' | 'reasoningEffort' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
   | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
 >> & { cliId?: string };
 
@@ -3090,6 +3090,7 @@ function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
       traexAutoModel: b.traexAutoModel,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
+      codexProfile: b.codexProfile ?? undefined,
       serviceTier: b.serviceTier,
       nativeSubagentRuntime: b.nativeSubagentRuntime,
       turnTimeoutMs: b.turnTimeoutMs,
@@ -3142,6 +3143,7 @@ async function configuredBotDefaultsRecoveryRows(
           codexRpcInput: bot.codexRpcInput,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
+          codexProfile: bot.codexProfile ?? null,
           serviceTier: bot.serviceTier,
           nativeSubagentRuntime: bot.nativeSubagentRuntime,
           turnTimeoutMs: bot.turnTimeoutMs,
@@ -3184,6 +3186,7 @@ function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgen
     traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
     serviceTier: bot.serviceTier || fallback?.serviceTier,
     nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
@@ -7345,38 +7348,7 @@ const server = createServer(async (req, res) => {
             return { ...botDefaultsPayload(d, undefined, `http_${r.status}`), botIndex: d.botIndex };
           }
           const j = await r.json() as any;
-          return { ...botDefaultsPayload({
-            ...d,
-            botName: d.botName ?? j.botName,
-            cliId: j.cliId || d.cliId,
-            // New daemons return explicit null for Official/no legacy path.
-            // Respect that instead of reviving a stale fallback descriptor;
-            // older daemons omit the fields and still use bots.json fallback.
-            cliRuntime: Object.prototype.hasOwnProperty.call(j, 'cliRuntime')
-              ? j.cliRuntime ?? undefined
-              : d.cliRuntime,
-            cliPathOverride: Object.prototype.hasOwnProperty.call(j, 'cliPathOverride')
-              ? j.cliPathOverride ?? undefined
-              : d.cliPathOverride,
-            wrapperCli: j.wrapperCli || d.wrapperCli,
-            cliLaunchMode: Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode')
-              ? j.cliLaunchMode ?? undefined
-              : d.cliLaunchMode,
-            model: j.model || d.model,
-            traexAutoModel: Object.prototype.hasOwnProperty.call(j, 'traexAutoModel')
-              ? j.traexAutoModel ?? undefined
-              : d.traexAutoModel,
-            modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
-              ? j.modelBackendVariant ?? undefined
-              : d.modelBackendVariant,
-            reasoningEffort: j.reasoningEffort || d.reasoningEffort,
-            serviceTier: j.serviceTier || d.serviceTier,
-            nativeSubagentRuntime: Object.prototype.hasOwnProperty.call(j, 'nativeSubagentRuntime')
-              ? j.nativeSubagentRuntime ?? undefined
-              : d.nativeSubagentRuntime,
-            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
-            dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
-          }, j), botIndex: d.botIndex };
+          return { ...botDefaultsPayload(mergeBotOncallFields(d, j), j), botIndex: d.botIndex };
         } catch (e: any) {
           return { ...botDefaultsPayload(d, undefined, e?.message ?? String(e)), botIndex: d.botIndex };
         }

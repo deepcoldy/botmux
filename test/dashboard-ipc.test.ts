@@ -8318,7 +8318,12 @@ esac
       [{ cliLaunchMode: 'forge-traex' }, 'wrapper_launch_mode_conflict'],
     ])('validates the final locked shape even if disk changed after loading: %j', async (extra, error) => {
       await setup({ cliId: 'codex', wrapperCli: 'codex --profile withhooks' });
-      await rmwBotEntry(appId, entry => { Object.assign(entry, extra); return { write: true, result: null }; });
+      // Simulate an EXTERNAL hand-edit of bots.json under the lock: botmux's own
+      // rmwBotEntry can no longer persist a generation the loader rejects, but
+      // the save path must still re-validate a disk shape changed out of band.
+      const externallyEdited = JSON.parse(readFileSync(configPath, 'utf8')) as any[];
+      Object.assign(externallyEdited[0]!, extra);
+      writeFileSync(configPath, JSON.stringify(externallyEdited));
       const before = readFileSync(configPath, 'utf8');
       const response = await save({ cliId: 'codex', model: 'new' });
       expect(response.status).toBe(400);

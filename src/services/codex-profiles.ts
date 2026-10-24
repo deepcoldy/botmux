@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { parse } from 'smol-toml';
 import type { BotConfig } from '../bot-registry.js';
 import { botInjectedEnv, buildSessionChildEnv } from '../core/env-policy.js';
+import { envSandboxMode } from '../adapters/cli/sandbox-mode.js';
 
 export type ProfileStatus = 'ok' | 'empty' | 'unreadable' | 'unsupported' | 'scan_failed';
 export interface CodexProfileCatalog {
@@ -27,15 +28,32 @@ export function normalizeCodexProfile(raw: unknown): string | undefined {
   return raw as string;
 }
 export type ProfileLaunch = Pick<Partial<BotConfig>, 'cliId' | 'wrapperCli' | 'cliLaunchMode' | 'cliPathOverride' | 'env' | 'envPolicy' | 'sandbox' | 'readIsolation' | 'codexAuthSync' | 'codexInstancePool' | 'existingAppServer' | 'startupCommands' | 'backendType' | 'serviceTier' | 'codexRpcInput'> & { cliRuntime?: { executable: string } };
-/** Do not probe launchers or borrow the Dashboard process's configuration. Called in the bound daemon. */
-export function assertCodexProfileLaunch(cfg: ProfileLaunch): void {
-  if (!['linux', 'darwin'].includes(process.platform) || cfg.cliId !== 'codex' || cfg.wrapperCli || cfg.cliLaunchMode || (cfg.cliPathOverride && !cfg.cliRuntime)
+export type CodexProfileCapability = { version: string; format: 'files' | 'legacy' };
+/**
+ * 配置层门控：结论只由 bots.json 条目自身的字段决定，不读任何 process.env、
+ * 平台或其它进程/机器事实。配置解析与每个 bots.json 持久化写入面共用它，
+ * 因此同一份配置文件在任何启动环境下的解析结果完全一致，不会因 env 不同
+ * 而让整份 bots.json 加载失败。
+ */
+export function assertCodexProfileConfig(cfg: ProfileLaunch): void {
+  if (cfg.cliId !== 'codex' || cfg.wrapperCli || cfg.cliLaunchMode || (cfg.cliPathOverride && !cfg.cliRuntime)
       || cfg.existingAppServer || cfg.startupCommands?.length || cfg.env?.PATH
       || cfg.codexInstancePool?.enabled || cfg.codexAuthSync === 'isolated'
-      || cfg.readIsolation || (cfg.sandbox && cfg.sandbox !== 'off') || process.env.BOTMUX_SANDBOX === '1'
+      || cfg.readIsolation || (cfg.sandbox && cfg.sandbox !== 'off')
       || (cfg.backendType && !['pty', 'tmux'].includes(cfg.backendType))) fail('unsupported_launch');
   if (cfg.codexRpcInput && cfg.backendType === 'tmux') fail('unsupported_rpc');
   if (cfg.serviceTier && cfg.serviceTier !== 'default') fail('unsupported_service_tier');
+}
+/**
+ * 运行时门控：配置层通过后，再按「这台机器、这个进程」的事实拒绝——平台
+ * 支持情况与机器级强制沙箱开关（BOTMUX_SANDBOX 的 1/oncall/scratch 三个
+ * 激活值，非法值由 envSandboxMode 自身 fail-closed 抛错）。只在真实扫描、
+ * 保存探测和 worker 启动路径调用，绝不用于配置解析。
+ */
+export function assertCodexProfileRuntime(cfg: ProfileLaunch): void {
+  assertCodexProfileConfig(cfg);
+  if (!['linux', 'darwin'].includes(process.platform)) fail('unsupported_launch');
+  if (envSandboxMode(process.env.BOTMUX_SANDBOX) !== 'off') fail('unsupported_launch');
 }
 export function codexProfileEnvironment(cfg: ProfileLaunch): NodeJS.ProcessEnv {
   return { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy) };
@@ -78,6 +96,18 @@ async function capability(cfg: ProfileLaunch, home: string) {
     return fail('capability_unconfirmed');
   }
 }
+/**
+ * Probe the target CLI's version/--profile support once. The result is tied to
+ * a frozen home, so callers that validate twice in one launch (worker: early
+ * gate + final child-env gate) can reuse it; the on-disk profile files are
+ * still re-read on every scan, so a deletion between the two checks is caught.
+ */
+export async function probeCodexProfileCapability(cfg: ProfileLaunch, frozenHome?: string): Promise<{ home: string; capability: CodexProfileCapability }> {
+  assertCodexProfileRuntime(cfg);
+  const home = frozenHome ?? resolveCodexProfileHome(cfg);
+  if (!isAbsolute(home)) fail('home_must_be_absolute');
+  return { home, capability: await capability(cfg, home) };
+}
 const MAX_FILE_BYTES = 256 * 1024;
 /** No symlinks, no devices/FIFOs, bounded reads, and never expose parser error snippets. */
 function readToml(home: string, name: string): Record<string, unknown> {
@@ -118,14 +148,23 @@ function errorCode(error: unknown): string {
   const code = (error as NodeJS.ErrnoException)?.code;
   return code === 'ENOENT' ? 'not_found' : code === 'EACCES' || code === 'EPERM' ? 'unreadable' : 'scan_failed';
 }
-export async function scanCodexProfiles(cfg: ProfileLaunch, frozenHome?: string): Promise<CodexProfileCatalog> {
+/**
+ * @param pre Probed capability/home from {@link probeCodexProfileCapability}.
+ * Reusing it skips the --version/--help execs (a worker launch validates twice);
+ * every call still re-reads the profile files, so a mid-launch deletion fails.
+ */
+export async function scanCodexProfiles(
+  cfg: ProfileLaunch,
+  frozenHome?: string,
+  pre?: { home: string; capability: CodexProfileCapability },
+): Promise<CodexProfileCatalog> {
   const result: CodexProfileCatalog = { status: 'scan_failed', candidates: [] };
   try {
-    assertCodexProfileLaunch(cfg);
-    const home = frozenHome ?? resolveCodexProfileHome(cfg);
+    assertCodexProfileRuntime(cfg);
+    const home = pre?.home ?? frozenHome ?? resolveCodexProfileHome(cfg);
     if (!isAbsolute(home)) fail('home_must_be_absolute');
     result.source = home;
-    Object.assign(result, await capability(cfg, home));
+    Object.assign(result, pre?.capability ?? await capability(cfg, home));
     const canonical = safeHome(home);
     if (result.format === 'legacy') {
       const profiles = readToml(canonical, 'config.toml').profiles;
@@ -162,9 +201,14 @@ export async function scanCodexProfiles(cfg: ProfileLaunch, frozenHome?: string)
   }
   return result;
 }
-export async function validateCodexProfile(cfg: ProfileLaunch, name: string, frozenHome?: string): Promise<string> {
+export async function validateCodexProfile(
+  cfg: ProfileLaunch,
+  name: string,
+  frozenHome?: string,
+  pre?: { home: string; capability: CodexProfileCapability },
+): Promise<string> {
   normalizeCodexProfile(name);
-  const result = await scanCodexProfiles(cfg, frozenHome);
+  const result = await scanCodexProfiles(cfg, frozenHome, pre);
   if (!['ok', 'empty'].includes(result.status)) fail(result.error ?? result.status);
   const candidate = result.candidates.find(p => p.name === name);
   if (!candidate) return fail('not_found');

@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, resolveCodexProfileHome, type ProfileLaunch } from '../src/services/codex-profiles.js';
+import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, resolveCodexProfileHome, assertCodexProfileConfig, assertCodexProfileRuntime, type ProfileLaunch } from '../src/services/codex-profiles.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })); });
@@ -79,5 +80,41 @@ describe('Codex profiles: bounded, target-local and non-executing scan', () => {
   it.each([{ wrapperCli: 'do-not-execute --hooks' }, { sandbox: true }, { readIsolation: true }, { codexAuthSync: 'isolated' }, { cliId: 'claude-code' }, { cliPathOverride: '/arbitrary/wrapper' }, { startupCommands: ['export CODEX_HOME=/other'] }])('refuses unsupported launch without probing %j', async overrides => {
     const catalog = await scanCodexProfiles({ cliId: 'codex', ...overrides } as ProfileLaunch);
     expect(catalog).toMatchObject({ status: 'unsupported', error: 'unsupported_launch', candidates: [] });
+  });
+});
+
+describe('Codex profile gates: config layer is env-independent; runtime gate owns BOTMUX_SANDBOX', () => {
+  const profileConfigText = () => JSON.stringify([{
+    larkAppId: 'app', larkAppSecret: 's', cliId: 'codex', codexProfile: 'selected',
+  }]);
+  it.each(['unset', '', '0', '1', 'oncall', 'scratch'] as const)('parser accepts the identical profile config under BOTMUX_SANDBOX=%j', value => {
+    if (value === 'unset') delete process.env.BOTMUX_SANDBOX;
+    else vi.stubEnv('BOTMUX_SANDBOX', value);
+    const parsed = parseBotConfigsFromText(profileConfigText());
+    expect(parsed[0]!.codexProfile).toBe('selected');
+  });
+  it('config-layer gate never reads BOTMUX_SANDBOX even when it is force-enabled', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'oncall');
+    expect(() => assertCodexProfileConfig({ cliId: 'codex' })).not.toThrow();
+  });
+  it('runtime gate refuses every active sandbox value before probing', async () => {
+    const { cfg } = fixture();
+    for (const value of ['1', 'oncall', 'scratch'] as const) {
+      vi.stubEnv('BOTMUX_SANDBOX', value);
+      await expect(scanCodexProfiles(cfg)).resolves.toMatchObject({ status: 'unsupported', error: 'unsupported_launch', candidates: [] });
+    }
+  });
+  it('runtime gate allows unset and 0 (scan proceeds to the CLI probe)', async () => {
+    for (const value of ['unset', '0'] as const) {
+      const { cfg } = fixture();
+      if (value === 'unset') delete process.env.BOTMUX_SANDBOX;
+      else vi.stubEnv('BOTMUX_SANDBOX', value);
+      // Empty temp CODEX_HOME: capability probes pass, status is empty (not blocked).
+      await expect(scanCodexProfiles(cfg)).resolves.toMatchObject({ status: 'empty' });
+    }
+  });
+  it('fails closed on an unrecognised BOTMUX_SANDBOX value', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', 'bogus');
+    expect(() => assertCodexProfileRuntime({ cliId: 'codex' })).toThrow();
   });
 });

@@ -20,6 +20,8 @@ Dashboard 在目标 Bot 的 daemon 上扫描候选，提供可搜索下拉、刷
 
 新会话创建时冻结 profile 名称（包括“不指定”）和配置目录，保存于会话存储；恢复、fork、冷启动、daemon 重启沿用该选择，旧版本已创建会话不补入当前 Bot 的 profile。冻结选择，不冻结文件内容。profile 的更改不会主动关闭已有会话。
 
+门控分两层：**配置层**断言只依据 bots.json 条目自身字段（cliId/wrapper/隔离/sandbox 配置值/backend/serviceTier 等），不读任何进程环境——配置解析（`parseBotConfigsFromText`）与每个 bots.json 持久化写入面共用它，同一份配置在任何启动 env 下结论一致；**运行时**门控在扫描、保存探测与 worker 启动时再叠加机器事实（平台、`BOTMUX_SANDBOX` 的 1/oncall/scratch 三个激活值，非法值 fail-closed）。所有 bots.json 写入面（Dashboard、/config 与配置卡片、setup/onboarding、各 store）在落盘前都会对「被改动的条目」跑同一配置层解析，未改动的历史遗留条目不阻断修别的 Bot。worker 一次启动只做一轮 `--version`/`--help` 能力探测，后续复检复用探测结果但仍重读 profile 文件。
+
 安全策略保持现状。显式模型、思考强度等 CLI 覆盖值优先于 profile；未指定值交由 Codex 配置层解析。“不指定”只是不传 `--profile`，基础配置仍然有效。TOML 语法正确不等于所有配置键、hooks 或模型都可用。
 
 ## 首版支持矩阵

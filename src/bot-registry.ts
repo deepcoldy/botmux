@@ -1,4 +1,4 @@
-import { normalizeCodexProfile, assertCodexProfileLaunch } from './services/codex-profiles.js';
+import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
@@ -3636,7 +3636,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
     }
     const codexProfile = normalizeCodexProfile(entry.codexProfile);
-    if (codexProfile) assertCodexProfileLaunch(entry);
+    // 配置层门控：只看条目自身字段（不读 env/平台），与所有 bots.json 写入面共用。
+    if (codexProfile) assertCodexProfileConfig(entry);
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
