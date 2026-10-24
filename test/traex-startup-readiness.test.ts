@@ -223,4 +223,10 @@ describe('TraeX initialized composer', () => {
       ...INITIALIZED_COMPOSER,
     ].join('\n'))).toBe(true);
   });
+
+  it.each(['Sign in to TraeCode CLI', 'Press enter to open browser', 'waiting for authorization…'])(
+    'accepts an indented transcript continuation containing %s', line => {
+      expect(traexRestoredComposerReady(['◆ Previous instructions:', `  ${line}`,
+        '■ Conversation interrupted', ...INITIALIZED_COMPOSER].join('\n'))).toBe(true);
+    });
 });

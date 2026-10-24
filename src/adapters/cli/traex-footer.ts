@@ -103,7 +103,7 @@ export function traexRestoredComposerReady(screen: string): boolean {
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
   // a transcript sentence mentioning login as an active input owner.
-  if (rows.slice(0, composer).some(row => /^[ \t]*(?:Sign in\b|Press (?:enter|return) to open (?:the )?browser\b|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))) return false;
+  if (rows.slice(0, composer).some(row => /^(?:Sign in\b|Press (?:enter|return) to open (?:the )?browser\b|(?:waiting for|awaiting) authori[sz]ation\b)/i.test(row))) return false;
   // Check the live area above the composer, not stale quoted transcript rows.
   const live = rows.slice(Math.max(0, composer - 3), composer + 1).join('\n');
   return !/(?:model|directory):[ \t]*loading\b|Resuming session|esc to interr?upt|Queued for (?:capacity|next turn)|Too many requests right now/i.test(live);
