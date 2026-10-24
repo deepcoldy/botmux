@@ -209,6 +209,8 @@ export class TraexAutoModelController {
   private currentIndex = 0;
   private turnId: string | undefined;
   private queueSinceMs: number | undefined;
+  /** Latest live "this pane is parked in a capacity queue" observation. */
+  private liveCapacityQueued = false;
   private exhausted = false;
   private lastSwitchAtMs: number | undefined;
   private queuePositions = new Map<number, { position: number; atMs: number }>();
@@ -245,6 +247,7 @@ export class TraexAutoModelController {
     this.exhausted = false;
     this.searchingBackups = false;
     this.queueSinceMs = undefined;
+    this.liveCapacityQueued = false;
   }
 
   currentModel(): string {
@@ -263,6 +266,14 @@ export class TraexAutoModelController {
     return this.queueSinceMs !== undefined || this.exhausted;
   }
 
+  /** Capacity still owns the live input surface: either a queue-confirmation
+   *  window is open, or the pool was declared exhausted while the pane is
+   *  STILL parked in the queue (the exhausted latch outlives queueSinceMs,
+   *  which both walk-off branches clear at the moment of exhaustion). */
+  capacityCurrentlyBlocking(): boolean {
+    return this.queueSinceMs !== undefined || (this.exhausted && this.liveCapacityQueued);
+  }
+
   /** A resumed continuation must show activity before queued corrections can
    * follow it; process startup alone does not finish a capacity transition. */
   awaitingModelActivity(): boolean {
@@ -275,6 +286,7 @@ export class TraexAutoModelController {
     if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === 0) {
       this.turnId = turnId;
       this.queueSinceMs = undefined;
+      this.liveCapacityQueued = false;
       if (this.config.reselectPerTurn) this.exhausted = false;
       this.searchingBackups = false;
       this.progressSinceMs = undefined;
@@ -304,6 +316,7 @@ export class TraexAutoModelController {
     this.currentIndex = action.toIndex;
     this.turnId = action.turnId;
     this.queueSinceMs = undefined;
+    this.liveCapacityQueued = false;
     this.exhausted = action.reason === 'shortest_queue' || action.reason === 'lowest_load';
     this.searchingBackups = action.reason !== 'new_turn' && !this.exhausted;
     this.awaitingActivity = action.reason !== 'new_turn';
@@ -322,6 +335,9 @@ export class TraexAutoModelController {
     this.awaitingActivity = false;
     this.turnId = undefined;
     this.queueSinceMs = undefined;
+    // liveCapacityQueued describes the PANE, not the turn: a structured
+    // terminal does not repaint the queued pane, so keep that fact across
+    // endTurn until the next beginTurn/commitSwitch/observeRunningModel.
     this.searchingBackups = false;
     this.progressSinceMs = undefined;
     this.queuePositions.clear();
@@ -383,6 +399,10 @@ export class TraexAutoModelController {
     nowMs: number;
     queuePosition?: number;
   }): TraexAutoModelAction {
+    // Record the live viewport fact before any early return: the exhausted
+    // latch outlives queueSinceMs, so "still parked in the queue" is an
+    // observation of the current pane, independent of turn-id ownership.
+    this.liveCapacityQueued = input.queued;
     if (!input.turnId || input.turnId !== this.turnId) return { kind: 'none' };
     if (input.queued || input.progressing) this.awaitingActivity = false;
     if (!input.queued) {

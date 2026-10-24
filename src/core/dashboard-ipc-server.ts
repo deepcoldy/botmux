@@ -7963,6 +7963,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     p2pMode,
     envelopeInjection,
     triggerUserAuth,
+    larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,

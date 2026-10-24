@@ -996,6 +996,8 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     let child: ChildProcess | undefined;
     const logs: string[] = [];
     const dump = join(root, 'jwts.txt');
+    // The fake mojo appends while this polls: a line without its newline is not written yet.
+    const dumpedLines = () => (existsSync(dump) ? readFileSync(dump, 'utf-8').split('\n').slice(0, -1) : []);
     try {
       const appId = 'app_mojo_clear';
       const botsPath = join(root, 'bots.json');
@@ -1044,7 +1046,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       } as DaemonToWorker);
 
       await waitFor(
-        () => existsSync(dump) && readFileSync(dump, 'utf-8').trim().split('\n').length >= 1,
+        () => dumpedLines().length >= 1,
         20_000,
         () => `first turn never ran\n${logs.join('')}`,
       );
@@ -1058,12 +1060,12 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       } as DaemonToWorker);
 
       await waitFor(
-        () => readFileSync(dump, 'utf-8').trim().split('\n').length >= 2,
+        () => dumpedLines().length >= 2,
         20_000,
         () => `second turn never ran\n${logs.join('')}`,
       );
 
-      const seen = readFileSync(dump, 'utf-8').trim().split('\n');
+      const seen = dumpedLines();
       expect(seen[0]).toBe('[stale-A]');
       // Cleared means cleared: neither the jwtEnv value nor the ambient token may
       // stand in for it.

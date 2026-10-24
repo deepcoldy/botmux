@@ -4500,13 +4500,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        // workerHasInitialized() also passes for a restored session that kept
+        // its Web Terminal port, so the status cannot assume a running CLI.
+        const status = cachedStreamingCardStatus(ds);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
+          status,
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
@@ -4514,13 +4517,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
-          cardUsageLimit(ds),
+          status === 'limited' ? ds.usageLimit : undefined,
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          streamCardLabel(ds),
+          cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -4784,13 +4787,16 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        // workerHasInitialized() also passes for a restored session that kept
+        // its Web Terminal port, so the status cannot assume a running CLI.
+        const status = cachedStreamingCardStatus(ds);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
+          status,
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
@@ -4798,13 +4804,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           isSharedAdoptSession(ds),
           false,
           localeForBot(ds.larkAppId),
-          cardUsageLimit(ds),
+          status === 'limited' ? ds.usageLimit : undefined,
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          streamCardLabel(ds),
+          cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );

@@ -287,3 +287,27 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }
+
+/**
+ * Sparse `botDefaultsPayload` overrides lifted verbatim from a raw bots.json
+ * entry, used by the offline recovery rows (configuredBotDefaultsRecoveryRows
+ * in dashboard.ts): when the bot's daemon is down the dashboard cannot GET
+ * /api/bot-default-oncall, so fields whose saved value would otherwise be
+ * misread as their default have to come from disk here. Only fields that need
+ * that fidelity belong in this map; everything else keeps the payload layer's
+ * normalization. `larkToolBinding` in particular is default-on, so an explicit
+ * `false` dropped here renders a disabled binding back as enabled.
+ */
+export function sparseOverridesFromRawBotConfig(rawEntry: any): {
+  quotaFallbackBot: any;
+  autoInviteOwnerOnGroupAdd: any;
+  larkToolBinding: boolean | undefined;
+  askOptionLayout: any;
+} {
+  return {
+    quotaFallbackBot: rawEntry?.quotaFallbackBot,
+    autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+    larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    askOptionLayout: rawEntry?.askOptionLayout,
+  };
+}

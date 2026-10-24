@@ -10,6 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { chatSafeFatalErrorMessage } from '../src/core/startup-failure-reason.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -78,6 +79,7 @@ describe('worker fatal error — correlated restart receipts', () => {
       pendingLaunchConvergence: { attemptId: 'folded-attempt', requested: {} },
       sendAndFlush: vi.fn(async (msg: Record<string, unknown>) => { sent.push(msg); }),
       log: vi.fn(),
+      chatSafeFatalErrorMessage,
       process: { exit: vi.fn() },
     };
     const fatal = loadWorkerFunction<(err: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', scope);

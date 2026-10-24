@@ -35,6 +35,15 @@ import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
+import {
+  assertTmuxCommandFits,
+  paneLaunchLoader,
+  TMUX_COMMAND_MAX_BYTES,
+  TmuxCommandTooLongError,
+  tmuxCommandBytes,
+  writePaneLaunchFile,
+  type PaneLaunchFile,
+} from './pane-launch.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
@@ -309,6 +318,32 @@ function parseSessionIdentity(raw: string): string | null {
   return /^\d+ \$\d+ \d+$/.test(identity) ? identity : null;
 }
 
+/**
+ * Why a startup tmux command failed, WITHOUT the command itself: an
+ * execFileSync error message is "Command failed: tmux <every argument>", and
+ * the worker forwards that message into the chat. Keeps tmux's own words and
+ * the errno, which isTransientStartupFailure classifies.
+ */
+export function tmuxStartupFailureSummary(err: any): string {
+  if (isExecTimeoutError(err)) return 'tmux 命令超时（ETIMEDOUT）';
+  const stderrLine = String(err?.stderr ?? '').split('\n').map(line => line.trim()).find(Boolean);
+  if (stderrLine) return stderrLine.length > 300 ? `${stderrLine.slice(0, 300)}…` : stderrLine;
+  if (typeof err?.code === 'string') return `无法执行 tmux（${err.code}）`;
+  if (typeof err?.status === 'number') return `tmux 退出码 ${err.status}`;
+  if (err?.signal) return `tmux 被信号 ${err.signal} 终止`;
+  return '未知错误';
+}
+
+/** The public error for a failed `new-session`. */
+export function tmuxNewSessionError(err: any, commandBytes: number): Error {
+  const summary = tmuxStartupFailureSummary(err);
+  if (/command too long|failed to send command/i.test(summary)
+    && (commandBytes > TMUX_COMMAND_MAX_BYTES || /command too long/i.test(summary))) {
+    return new TmuxCommandTooLongError(commandBytes, summary);
+  }
+  return new Error(`tmux 创建会话失败：${summary}`);
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
@@ -383,6 +418,9 @@ export class TmuxPipeBackend implements SessionBackend {
    *  that session — never a same-named one another generation created. The
    *  server pid matters: session ids restart at `$0` with every new server. */
   private createdSession: { id: string; identity: string } | null = null;
+  /** The file this spawn's pane sources (see pane-launch.ts). Its shell deletes
+   *  it on read; kept so a pane we kill before that can take it along. */
+  private launchFile: PaneLaunchFile | null = null;
   private readonly createSession: boolean;
   private readonly ownsSession: boolean;
   private readonly _isReattach: boolean;
@@ -819,6 +857,7 @@ export class TmuxPipeBackend implements SessionBackend {
     this.kill();
     if (this.ownsSession) {
       TmuxBackend.killSession(this.paneTarget, this.socketName);
+      this.discardLaunchFile();
     }
   }
 
@@ -1171,12 +1210,25 @@ export class TmuxPipeBackend implements SessionBackend {
     // conservative path (never send a flag the server may not understand).
     const tmuxVersion = getTmuxVersionCached();
     const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
+    // The launch itself goes through a private file (pane-launch.ts): the
+    // shell, wrapper and argv are exactly what used to follow `--` inline.
+    // Strict panes keep their direct `env -i` exec; /bin/sh -c reads no
+    // profile, so it only loads the argv before exec'ing it.
     const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
-    const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv);
-    const script = shellWrapperScript(
-      resolveBotmuxWrapperBinDir(opts.env ?? process.env),
-      shellKindForPath(shellSpec.shell),
-    );
+    const shellKind = shellKindForPath(shellSpec.shell);
+    const launchFile = writePaneLaunchFile(opts.paneLaunchDir, opts.strictEnv
+      ? { kind: shellKind, script: 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
+      : {
+        kind: shellKind,
+        script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
+        argv: [
+          opts.cwd,
+          ...buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv),
+          bin, ...args,
+        ],
+      });
+    this.launchFile = launchFile;
+    const loader = paneLaunchLoader(shellKind);
     const argv = [
       'new-session',
       '-d',
@@ -1191,12 +1243,30 @@ export class TmuxPipeBackend implements SessionBackend {
       // adopted via the duplicate path below.
       ...(instanceIdentity && newSessionAcceptsE ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
       '--',
-      ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
-        opts.cwd,
-        ...envAssignments,
-        bin, ...args,
-      ])),
+      ...(opts.strictEnv
+        ? [shellSpec.shell, '-c', loader, '_', launchFile.path]
+        : shellCommandArgv(shellSpec, loader, [launchFile.path])),
     ];
+    const commandBytes = tmuxCommandBytes(argv);
+    // Every failure below ends here. The chat only ever sees `error` (tmux's
+    // reason, never the argv); the command goes to the worker's stdout, i.e.
+    // the daemon's local out log. The launch file goes too: no pane we can
+    // vouch for will read it, and it holds the per-bot env values.
+    const fail = (error: Error, detail: string): Error => {
+      launchFile.discard();
+      this.launchFile = null;
+      process.stdout.write(
+        `[tmux-pipe-backend] new-session ${this.paneTarget} failed: ${detail}\n`
+        + `[tmux-pipe-backend]   command (${commandBytes}/${TMUX_COMMAND_MAX_BYTES} bytes): tmux ${[...this.tmuxArgs, ...argv].join(' ')}\n`
+        + `[tmux-pipe-backend]   launch file ${launchFile.path}: ${launchFile.bytes} bytes, ${launchFile.argc} args, cli ${opts.cliBin ?? bin}\n`,
+      );
+      return error;
+    };
+    try {
+      assertTmuxCommandFits(argv);
+    } catch (err: any) {
+      throw fail(err, err?.message ?? String(err));
+    }
     // Bounded retries against a stalled shared server (instant clean
     // ECONNREFUSED under backlog overflow), a command timeout, or a
     // spawn-level EMFILE/EAGAIN. A server-answered deterministic rejection
@@ -1217,17 +1287,18 @@ export class TmuxPipeBackend implements SessionBackend {
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
         if (attempt > 0 && /duplicate session/i.test(stderrText)) {
-          if (opts.strictEnv) throw new Error('Refusing unverified strict tmux-pipe generation after a startup retry');
+          if (opts.strictEnv) throw fail(new Error('Refusing unverified strict tmux-pipe generation after a startup retry'), stderrText);
           // Either an earlier timed-out attempt of ours or a racing creator made
           // it — unprovable, so this spawn never claims (or retires) it.
           break;
         }
         if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
-          if (opts.strictEnv) throw new Error('Strict tmux pane startup failed (command environment redacted)');
-          throw err;
+          if (opts.strictEnv) throw fail(new Error('Strict tmux pane startup failed (command environment redacted)'), tmuxStartupFailureSummary(err));
+          throw fail(tmuxNewSessionError(err, commandBytes), tmuxStartupFailureSummary(err));
         }
+        // stderr feeds the startup-failure card's recent-output block: summary only.
         process.stderr.write(
-          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${opts.strictEnv ? 'strict command environment redacted' : stderrText || err?.message || err}\n`,
+          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${opts.strictEnv ? 'strict command environment redacted' : tmuxStartupFailureSummary(err)}\n`,
         );
         startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
       }
@@ -1237,6 +1308,9 @@ export class TmuxPipeBackend implements SessionBackend {
     this.createdSession = createdIdentity
       ? { id: createdIdentity.split(' ')[1]!, identity: createdIdentity }
       : null;
+    // This session now owns the name, so an older unread file of the same
+    // session can no longer be read by anyone.
+    launchFile.sweepStaleSiblings();
     // Pre-3.2 (or unknown) tmux: persist the binding in the session
     // environment AFTER a proven-fresh creation, since new-session could not
     // set it atomically. set-environment exists on every supported tmux and
@@ -1289,7 +1363,14 @@ export class TmuxPipeBackend implements SessionBackend {
     }
     if (!outcome.split('\n').includes(RETIRE_KILLED)) return false;
     this.createdSession = null;
+    this.discardLaunchFile();
     return true;
+  }
+
+  /** The pane is gone or going: its launch file, if still unread, never will be. */
+  private discardLaunchFile(): void {
+    this.launchFile?.discard();
+    this.launchFile = null;
   }
 
   private applySessionOptions(): void {

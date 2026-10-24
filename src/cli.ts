@@ -9101,7 +9101,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
     // Interactive cards are re-resolved inside the render pipeline (both
     // im.message.get representations unioned, content + resources replaced
     // wholesale with fresh [图片 N] numbering — see renderQuotedMessage).
-    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent);
+    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent, detail);
     if (rawFlag) {
       if (rendered.mergedStructuredContent !== undefined) {
         // --raw: surface the full structured card JSON (v2 body/elements) so
