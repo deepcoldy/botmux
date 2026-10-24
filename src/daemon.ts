@@ -24817,9 +24817,9 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return true;
     }
-    // `/tw /<passthrough>`：主干的 worktree 生命周期变体要先建 worktree 再起 CLI，所以不走
-    // 冷启动透传（那条路会直接在基目录 fork）；落到下面的常规建会话路径。
-    if (forceTopicMode !== 'worktree' && slashDecision.kind === 'passthrough') {
+    // `/th|/tw /<passthrough>`：生命周期变体的目录（当前群会话目录 / 先建的 worktree）只在
+    // 下面的常规建会话路径解析，冷启动透传会直接在 bot 默认目录 fork，所以两者都不走它。
+    if (forceTopicMode === 'default' && slashDecision.kind === 'passthrough') {
       if (slashDecision.delivery === 'cold_start') {
         await startInitialPassthroughSession({
           promptResources: resources,
