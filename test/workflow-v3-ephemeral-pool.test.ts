@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
-import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, type RunNodeRequest } from '../src/workflows/v3/contract.js';
+import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL_COMMAND_CLIS, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
@@ -792,6 +792,91 @@ describe('v3 ephemeral pool', () => {
     expect(isBotmuxGoalObjective(`  ${GOAL_COMMAND_OBJECTIVE.replace(/ /g, '\n')}  `)).toBe(true);
     expect(isBotmuxGoalObjective(`${GOAL_COMMAND} ship the release notes`)).toBe(false);
     expect(isBotmuxGoalObjective(`Please explain: ${GOAL_COMMAND_OBJECTIVE}`)).toBe(false);
+  });
+
+  describe('goal 输入按 CLI 形态区分 /goal 前缀', () => {
+    // request() hardcodes one attempt dir; a second runNode in the same test
+    // must not re-arm the worker fence there, so give each variant its own.
+    const withCli = (
+      cliId: RunNodeRequest['botSnapshot']['cliId'],
+      suffix = '',
+    ): RunNodeRequest => {
+      const req = request();
+      const oldAttemptDir = req.attemptDir;
+      const attemptDir = join(dir, `research${suffix}`, 'attempts', '001');
+      const retarget = (path: string): string => path.replace(oldAttemptDir, attemptDir);
+      return {
+        ...req,
+        runId: `run-v3${suffix}`,
+        attemptId: `research${suffix}/attempts/001`,
+        botSnapshot: { ...req.botSnapshot, cliId },
+        attemptDir,
+        inputsPath: retarget(req.inputsPath),
+        outputDir: retarget(req.outputDir),
+        env: Object.fromEntries(
+          Object.entries(req.env).map(([key, value]) => [
+            key,
+            key === GOAL_ENV.V3_MARKER ? value : retarget(value),
+          ]),
+        ),
+      };
+    };
+
+    it.each(V3_NATIVE_GOAL_COMMAND_CLIS)('%s 保留原生 /goal 前缀', (cliId) => {
+      expect(buildGoalCommand(withCli(cliId))).toBe(`${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`);
+    });
+
+    it('minimax（ACP runner）收到裸 objective，不含 /goal，且仍是单行', () => {
+      const cmd = buildGoalCommand(withCli('minimax'));
+      expect(cmd).toBe(GOAL_COMMAND_OBJECTIVE);
+      expect(cmd.startsWith(GOAL_COMMAND)).toBe(false);
+      expect(cmd).not.toContain('\n');
+      expect(isBotmuxGoalObjective(cmd)).toBe(true);
+    });
+
+    it('minimax 节点实际投递的 raw_input 就是裸 objective', async () => {
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const promise = pool.runNode(withCli('minimax', '-mmx-input'));
+      await worker.waitForInit();
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      expect(worker.rawInputs).toEqual([GOAL_COMMAND_OBJECTIVE]);
+      worker.emitExit(0);
+      await promise;
+    });
+
+    it('minimax init 把内层 turn 超时设到节点硬截止之后，其它 CLI 不带该字段', async () => {
+      const minimax = new ScriptedWorker();
+      const poolMinimax = createEphemeralPool({
+        factory: factoryFor(minimax),
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const mmxRun = poolMinimax.runNode(withCli('minimax', '-mmx-timeout'));
+      await minimax.waitForInit();
+      expect(typeof minimax.init.turnTimeoutMs).toBe('number');
+      expect(minimax.init.turnTimeoutMs).toBeGreaterThan(60_000);
+      minimax.emitExit(0);
+      await mmxRun;
+
+      const claude = new ScriptedWorker();
+      const poolClaude = createEphemeralPool({
+        factory: factoryFor(claude),
+        workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const claudeRun = poolClaude.runNode(withCli('claude-code', '-claude-timeout'));
+      await claude.waitForInit();
+      expect(claude.init.turnTimeoutMs).toBeUndefined();
+      claude.emitExit(0);
+      await claudeRun;
+    });
   });
 
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {

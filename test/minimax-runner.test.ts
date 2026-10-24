@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { createMinimaxAdapter, minimaxDataDir } from '../src/adapters/cli/minimax.js';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
@@ -190,8 +191,9 @@ it('accepts a buffer at the frame limit and closes on overflow without native ex
 it('SIGTERM aborts the active native process and never executes queued turns or reports a final', async () => {
   const { h, send } = runner();
   send('hang', 'active'); send('must-not-run', 'queued');
-  await waitFor(() => existsSync(h.log));
-  const call = JSON.parse(readFileSync(h.log, 'utf8').trim());
+  // The native process creates the log before it finishes writing its line.
+  await waitFor(() => readJsonLines(h.log).length > 0);
+  const [call] = readJsonLines(h.log);
   expect(call.input).toBe('hang');
   h.child.kill('SIGTERM');
   await waitFor(() => h.child.exitCode !== null);

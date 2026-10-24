@@ -471,3 +471,90 @@ describe('Auto policy setting presence', () => {
     expect(traexAutoModelPolicyKey(base)).not.toBe(traexAutoModelPolicyKey({ ...base, modelSettings: { backup: {} } }));
   });
 });
+
+describe('capacityCurrentlyBlocking contract (pane ownership across a terminal)', () => {
+  // The worker tags an incoming message with queueAfterActiveTurn from this
+  // predicate. A structured terminal does NOT repaint the pane, so the queued
+  // pane fact must survive endTurn — otherwise a follow-up landing between
+  // turn_terminal and the next prompt_ready is written into the degraded pane.
+  const base = { enabled: true as const, models: ['core', 'backup-1', 'backup-2'],
+    queueTimeoutMs: 10_000, switchCooldownMs: 1_000 };
+  let now = 0;
+  const tick = (controller: TraexAutoModelController, ms: number) => {
+    now += ms;
+    return controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now });
+  };
+  /** Walk the pool to its last model, then exhaust there — the state where a
+   *  follow-up must wait for both the terminal and the preferred-model reset. */
+  function exhaustOnLastModel(controller: TraexAutoModelController): void {
+    now = 1_000;
+    controller.beginTurn('turn-1');
+    for (const expected of ['backup-1', 'backup-2']) {
+      tick(controller, 0);                          // opens the queue window
+      // The observation that elapses the window is the one that asks for loads.
+      expect(tick(controller, 10_000).kind).toBe('load_check');
+      controller.resolveModelLoads('turn-1', null);
+      now += 100;
+      const switched = controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now });
+      expect(switched).toMatchObject({ kind: 'switch', toModel: expected });
+      if (switched.kind === 'switch') expect(controller.commitSwitch(switched, now)).toBe(true);
+      now += 5_000;
+    }
+    tick(controller, 0);                          // opens the queue window
+    expect(tick(controller, 1_000).kind).toBe('load_check');
+    controller.resolveModelLoads('turn-1', null);
+    now += 100;
+    expect(controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now }).kind).toBe('exhausted');
+    expect(controller.currentModel()).toBe('backup-2');
+  }
+
+  it('keeps blocking across the terminal while the exhausted pane is still queued', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    // Both walk-off branches cleared queueSinceMs at the moment of exhaustion;
+    // only the exhausted latch plus the live pane observation can block here.
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    controller.endTurn('turn-1');
+    // A terminal does not repaint the queued pane, so the fact must survive.
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+  });
+
+  it('releases as soon as the live pane stops showing the queue', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    controller.observeCapacityQueue({ turnId: 'turn-1', queued: false, nowMs: now + 500 });
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('never leaks a stale queue fact into a later unrelated turn', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    // reselectPerTurn is off by default, so the exhausted latch itself persists;
+    // only the pane observation may keep blocking, and beginTurn clears it.
+    controller.beginTurn('turn-2');
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('holds blocking across the proposed preferred-model reset', () => {
+    const controller = new TraexAutoModelController({ ...base, reselectPerTurn: true });
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    // beginTurn only PROPOSES the reset; the pane still shows the fallback.
+    const reset = controller.beginTurn('turn-2');
+    expect(reset).toMatchObject({ kind: 'switch', reason: 'new_turn', toModel: 'core' });
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    if (reset.kind === 'switch') expect(controller.commitSwitch(reset, now + 1_000)).toBe(true);
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('releases on the successor turn when per-turn reselection is off', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    controller.beginTurn('turn-2');
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+});

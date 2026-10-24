@@ -23,6 +23,7 @@ import {
   grokSessionExists,
   matchGrokPromptAppend,
 } from '../../services/grok-transcript.js';
+import { ensureGrokFolderTrust } from '../../services/grok-folder-trust.js';
 import { builtinSkillBlockForInjectsSessionContext } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
@@ -122,6 +123,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  Claude disallows EnterPlanMode/ExitPlanMode for Feishu UX (blocking
  *  approval). Grok's TUI equivalent is `--no-plan`.
  *
+ *  ## Folder trust (≥1.0.64)
+ *  While any user-level hook exists (Botmux installs its own under
+ *  `$GROK_HOME/hooks/`), Grok opens on "Do you trust the contents of this
+ *  directory?" in every untrusted folder, before the composer — the argv
+ *  prompt never starts. `ensureWorkspaceTrust` pre-writes the workspace root
+ *  into `$GROK_HOME/trusted_folders.toml` under Grok's own flock, never
+ *  overriding an explicit `trusted = false` (see grok-folder-trust.ts).
+ *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
  *  (session_search.sqlite, worktrees.db); under the deny-by-default file sandbox
@@ -178,6 +187,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // `deferFirstPromptTimeoutUntilReady: true` to detect composer readiness.
     injectsSessionContext: true,
     deferFirstPromptTimeoutUntilReady: true,
+    ensureWorkspaceTrust: workingDir => ensureGrokFolderTrust(workingDir),
 
     buildArgs({
       sessionId,

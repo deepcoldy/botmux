@@ -1178,15 +1178,44 @@ describe('replyDelivery=transcript envelope', () => {
     expect(out).not.toContain('- @Bot');
   });
 
-  it('transcript + solo：cursor 的 <sender_note> 随 sender 一起消失', () => {
+  it('transcript + solo：cursor 与其它转写 CLI 一样去壳去 reminder（#932 起普通 spawn 也有转写采集）', () => {
     mockBotConfig.replyDelivery = 'transcript';
-    // cursor 没有转写采集 → effectiveReplyDelivery 回落 send，信封与 send 逐字相同。
-    const transcript = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    const out = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    expect(out).not.toContain('<botmux_reminder>');
+    expect(out).not.toContain('<user_message>');
+    expect(out).not.toContain('<sender');
+  });
+
+  it('transcript + antigravity：没有普通转写采集，回落 send，信封与 send 逐字相同', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    // antigravity 只有零注入转写 → effectiveReplyDelivery 回落 send。
+    const transcript = buildFollowUpContent('继续', 'sess-t3b', { ...base, cliId: 'antigravity', solo: true, selfMention });
     mockBotConfig.replyDelivery = 'send';
-    const send = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    const send = buildFollowUpContent('继续', 'sess-t3b', { ...base, cliId: 'antigravity', solo: true, selfMention });
     expect(transcript).toBe(send);
     expect(transcript).toContain('<botmux_reminder>');
     expect(transcript).toContain('<sender ');
+  });
+
+  it('冻结 sandbox 边（pi 复审第三边）：live 已关 sandbox+开 transcript，但存活会话冻结为 scratch → 续轮保持 send 信封（reminder 仍在）', () => {
+    // 复现：会话 A 以 cursor+scratch 起（session.sandbox='scratch' 冻结）；运维
+    // dashboard 关 sandbox（entry 无 sandbox）再开 replyDelivery=transcript。
+    // live 解析放行 transcript，但该 worker 仍在 COW overlay 里采集关闭——改口
+    // 不 send 就是静默轮。续轮信封必须按冻结沙箱保持 send。
+    mockBotConfig.replyDelivery = 'transcript';
+    mockGetSession.mockReset();
+    mockGetSession.mockReturnValue({ sessionId: 'sess-frozen-scratch', sandbox: 'scratch' });
+    const out = buildFollowUpContent('继续', 'sess-frozen-scratch', { ...base, cliId: 'cursor', attachments, mentions });
+    expect(out).toContain('<botmux_reminder>');
+    expect(out).toContain('<user_message>');
+  });
+
+  it('冻结 sandbox=false 的同形会话：live transcript 正常改口（对照组，证明上面的拦截来自冻结 scratch 而非别的路径）', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    mockGetSession.mockReset();
+    mockGetSession.mockReturnValue({ sessionId: 'sess-frozen-off', sandbox: false });
+    const out = buildFollowUpContent('继续', 'sess-frozen-off', { ...base, cliId: 'cursor', attachments, mentions });
+    expect(out).not.toContain('<botmux_reminder>');
   });
 
   it('noTransport 与 transcript 同时：reminder_no_transport 仍在，壳仍在', () => {

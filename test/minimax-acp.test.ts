@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
@@ -21,7 +22,7 @@ function fixture() {
   const options: MinimaxAcpOptions = { executable, cwd: root, env: { ...process.env, MINIMAX_DATA_DIR: join(root, 'data'),
     MCODE_TEST_LOG: log, BOTMUX_OWNER_OPEN_ID: 'ou_owner', __OWNER_OPEN_ID: 'ou_stale' },
     content: 'hello', permission: 'full', timeoutMs: 5000, onUserInput: async () => ({ action: 'accept', content: {} }) };
-  return { root, log, options, calls: () => readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l)) };
+  return { root, log, options, calls: () => readJsonLines(log) };
 }
 function durableFixture() {
   const f = fixture(); mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });

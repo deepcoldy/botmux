@@ -241,6 +241,23 @@ export function traexModelProgressVisible(screen: string): boolean {
   return traexCurrentFooterState(screen) === 'progress';
 }
 
+/** Legacy TraeX can show current work immediately above next-turn parking.
+ * Parking alone is not capacity pressure or work evidence. Preserve that
+ * input surface only with its adjacent live spinner and native context footer;
+ * unknown/draft rows must not authorize a queued paste. This is input admission
+ * evidence only, not a signal for the capacity-switch controller. */
+export function traexQueuedTypeAheadVisible(screen: string): boolean {
+  const rows = screen.trimEnd().split(/\r?\n/).slice(-12);
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (!/^[ \t]*Queued for next turn[ \t]*$/.test(rows[index]!)) continue;
+    if (index === 0 || !traexModelProgressVisible(rows[index - 1]!)) return false;
+    const footer = rows.slice(index + 1).filter(row => row.trim());
+    return footer.length <= 1 && footer.every(row =>
+      /^[ \t]*(?:[^\r\n]* · )?Context \d+% (?:left|used)[ \t]*$/.test(row));
+  }
+  return false;
+}
+
 /** Rotating activity glyphs observed on live TraeX activity rows. */
 const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
 
@@ -546,17 +563,28 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // TRAEX_STATIC_BUSY_PATTERN comment.
     staticBusyPattern: TRAEX_STATIC_BUSY_PATTERN,
     // Clear the static-busy latch only on real composer evidence (line-start
-    // ›/❯, excluding numbered selector rows). The broad readyPattern also
+    // or cursor-addressed rule followed by ›/❯, excluding numbered selector
+    // rows). The broad readyPattern also
     // matches `\d+% left` (status bar), which the queue screen itself
     // carries — using it to clear the latch would re-open the ZMX false-idle
     // bug when queue and status bar arrive in separate chunks.
-    staticBusyClearPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/,
+    staticBusyClearPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)/,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
     // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
-    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // v0.211.1 uses cursor movement between the rule and composer; stripping
+    // ANSI joins them without a newline, so accept the preceding rule too.
+    // Anchor to the start of each rule run to avoid quadratic retries on
+    // long near-miss chunks. Keep its glyphs aligned with the clear guard
+    // in IdleDetector.
+    readyPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Pre-#2247 shape of readyPattern: without the cursor-addressed rule arm.
+    // A match that only exists through the rule arm is tagged weak so the
+    // worker can demand the rendered composer predicate during first-prompt
+    // admission (a rule-joined ❯ can be a still-loading cell or a draft).
+    readyPatternStrong: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
     // Skeleton composer gate, same cells and regexes as Codex (fork). Real
     // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
     // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the

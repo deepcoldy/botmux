@@ -44,6 +44,7 @@ import {
 } from '../src/adapters/cli/read-isolation.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { recordedSandboxTreeFlavour } from '../src/adapters/backend/sandbox-tree-teardown.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 type SandboxFlavour = 'off' | 'credential-only' | 'oncall' | 'scratch';
 type Backend = 'tmux' | 'pty';
@@ -252,9 +253,7 @@ exec '${realTmux}' -S '${socket}' "$@"
   const tmuxCommand = (args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
   const lab = {
     sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script,
-    reports: (): Report[] => existsSync(reportFile())
-      ? readFileSync(reportFile(), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
-      : [],
+    reports: (): Report[] => readJsonLines<Report>(reportFile()),
     starts: (): Report[] => lab.reports().filter(entry => entry.event === 'start'),
     paneAlive: (): boolean => tmuxCommand(['has-session', '-t', paneTarget]).status === 0,
     // HOST pid of the pane's process. (The fake CLI's own process.pid is

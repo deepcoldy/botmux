@@ -10,6 +10,7 @@ import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
@@ -89,8 +90,7 @@ function spawnRunner(
 }
 
 function readLog(h: Harness): any[] {
-  if (!existsSync(h.logPath)) return [];
-  return readFileSync(h.logPath, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  return readJsonLines(h.logPath);
 }
 
 /** Only the session/prompt entries (initialize and phase markers filtered out). */
@@ -370,6 +370,9 @@ describe('dsh-runner', () => {
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('你好，我是 dsh。');
     // The fixture logs phase markers: notifications must precede the response.
+    // It logs the response phase only after sending the response, so the final
+    // marker can show up before that line is written.
+    await waitFor(() => readLog(h!).some((r: any) => r.phase === 'response'), { label: 'response phase logged' });
     const phases = readLog(h).filter((r: any) => r.phase).map((r: any) => r.phase);
     expect(phases).toEqual(['notifications', 'response']);
   });

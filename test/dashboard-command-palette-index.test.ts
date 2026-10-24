@@ -13,7 +13,6 @@ import { createElement } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { searchPalette, type PaletteItem } from '../src/dashboard/web/command-palette-model.js';
 import {
-  SETTINGS_SEARCH_INDEX,
   buildActionItems,
   buildBotDefaultsSectionItems,
   buildBotDefaultsTabItems,
@@ -23,6 +22,7 @@ import {
   buildSettingItems,
   type PalettePageEntry,
 } from '../src/dashboard/web/command-palette-sources.js';
+import { SETTINGS_SECTIONS } from '../src/dashboard/web/settings-sections.js';
 import {
   BOT_DEFAULTS_SECTIONS,
   BOT_DEFAULTS_TABS,
@@ -114,7 +114,7 @@ describe('⌘K index coverage', () => {
     expect(blocks.length).toBeGreaterThan(10);
     const ids = blocks.map(attrs => /\bid="([^"]+)"/.exec(attrs)?.[1] ?? null);
     expect(ids.filter(id => id === null), 'SettingsBlock without an id').toEqual([]);
-    const indexed = new Set(SETTINGS_SEARCH_INDEX.map(entry => entry.id));
+    const indexed = new Set(SETTINGS_SECTIONS.map(entry => entry.id));
     expect(ids.filter(id => !indexed.has(id!)), 'settings blocks missing from the index').toEqual([]);
   });
 
@@ -163,7 +163,7 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx']
+    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx']
       .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {

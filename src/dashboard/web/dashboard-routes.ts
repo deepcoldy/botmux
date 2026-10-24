@@ -92,6 +92,8 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
   pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
+  // 决策看板：`#/board`（汇总）、`#/board/<app>`、`#/board/<app>/<seq>`（详情）。没有别的路由以 `#/board` 开头。
+  pageRoute('decision-board', '#/board', () => import('./decision-board-page.js'), 'renderDecisionBoardPage'),
   pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),

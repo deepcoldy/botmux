@@ -70,6 +70,9 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
       'remote-runner': 'none',
+      // The initial TUI adapter leaves CodeM's own native skills untouched;
+      // no Botmux skill-directory delivery is advertised.
+      codem: 'none',
       // MiniMax Code loads native skills from its persistent data directory.
       minimax: 'global',
     };

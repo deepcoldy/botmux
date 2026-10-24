@@ -45,6 +45,7 @@ import {
   type CodexAppSignedControlMarker,
 } from '../src/utils/codex-app-control.js';
 import type { CodexAppTurnInput } from '../src/types.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 const RUNNER_PATH = resolve('src/codex-app-runner.ts');
 const FAKE_SERVER_FIXTURE = resolve('test/fixtures/fake-codex-app-server.mjs');
@@ -561,8 +562,7 @@ async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
 }
 
 function readRequests(logPath: string): Array<Record<string, any>> {
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  return readJsonLines(logPath);
 }
 
 async function exerciseRunner(opts: {
