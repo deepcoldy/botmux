@@ -16956,7 +16956,10 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
   // Keep other native screen/history backends on their existing admission
   // contract. Do not disguise their synchronous capture as an async read.
   if (!backendScreenEvidenceIsAuthoritativeForMutation()
-    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) return true;
+    || (!target.captureViewportAsync && (target.captureViewport || target.captureCurrentScreen))) {
+    return controller?.awaitingModelActivity()
+      && (!item.traexAutoModelRecovery || item.turnId !== poolTurnId) ? hold() : true;
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const read = async (): Promise<string> => {
