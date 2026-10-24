@@ -360,6 +360,38 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.checked).toBe(true);
   });
 
+  it('shows the same-owner bot trust toggle on by default and saves turning it off', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url, body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: false,
+          grantRequestToOwnerDm: false,
+          trustSameOwnerBots: false,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const toggle = root.findByProps({ 'data-action': 'toggle-trust-same-owner-bots' });
+    expect(toggle.props.checked).toBe(true);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: false } }));
+
+    expect(requests).toEqual([{ url: '/api/bots/app_grant/grant-prefs', body: { trustSameOwnerBots: false } }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ trustSameOwnerBots: false }));
+    expect(root.findByProps({ 'data-action': 'toggle-trust-same-owner-bots' }).props.checked).toBe(false);
+    expect(renderGrantSection({ trustSameOwnerBots: false }).root
+      .findByProps({ 'data-action': 'toggle-trust-same-owner-bots' }).props.checked).toBe(false);
+  });
+
   it('greys out the owner-DM forwarding toggle while auto grant cards are off', () => {
     (globalThis as any).fetch = vi.fn();
     const off = renderGrantSection({ autoGrantRequestCards: false, grantRequestToOwnerDm: true });

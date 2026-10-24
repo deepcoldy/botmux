@@ -17,6 +17,8 @@ botmux schedule add "0 18 * * *" "check deployment status" --topic
 
 `--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
+Existing-task operations use the current bot's live operator allowlist and the human caller attested for the current turn. They do not require an additional `union_id` mapping. The bot, session, turn and permissions must still match; a bot-authored message, old turn, another app's `open_id`, or caller-supplied identity does not grant access. New-task ownership and cross-bot delegation keep their existing identity requirements. Upgrade the CLI and owning daemon together; a missing operator attestation is rejected rather than treated as standalone authority.
+
 ## Cross-bot delegated creation
 
 When a human explicitly asks Bot A to have Bot B create a schedule, A must request the persistent capability on the managed dispatch:

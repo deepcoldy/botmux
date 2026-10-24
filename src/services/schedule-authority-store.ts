@@ -294,6 +294,7 @@ export class ScheduleAuthorityStore {
     try {
       const existing = this.getRecord(appId, task.id);
       if (existing) {
+        if (existing.state === 'revoked') throw new Error('schedule_task_id_conflict');
         if (taskHash(existing.task) !== taskHash(task)) throw new Error('schedule_task_id_conflict');
         this.db.exec('COMMIT;');
         return existing.task;

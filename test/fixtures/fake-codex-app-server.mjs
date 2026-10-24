@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -23,11 +23,19 @@ const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
+// 前 N 次 thread/read 成功响应延迟 M 毫秒——模拟繁忙机器上慢的 app-server，
+// 让单次响应耗时超过调用方的整段等待预算（waitForThreadPreview 的 deadline
+// 超时容错只在这种条件下可复现）。只影响成功响应，不影响错误分支。
+const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? '0');
+const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
-if (pidPath) writeFileSync(pidPath, String(process.pid));
+// 结尾换行表示 PID 已写完整（test/helpers/pid-file.ts 据此判断）：writeFileSync
+// 先建空文件再写入，轮询方在这个窗口读到 ''，Number('') 是 0，而 process.kill(0, 0)
+// 探测的是测试自己的进程组，永远成功，「已回收」就永远等不到。
+if (pidPath) writeFileSync(pidPath, `${process.pid}\n`);
 if (process.env.FAKE_CODEX_INHERITED_STDIO) {
   // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
   spawn(process.execPath, ['-e', `
@@ -55,6 +63,7 @@ if (envLogPath) {
 let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
+let nameSetSeen = false;
 let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
@@ -462,6 +471,14 @@ function handle(request) {
 
   if (request.method === 'initialize') {
     if (behavior === 'hang-initialize') return;
+    if (behavior === 'close-stdin-after-initialize') {
+      // 先关读端再回响应：client 收到响应时管道已无人读，它接下来的任何写入都是
+      // EPIPE。libuv 不会替 stdin.destroy() 关掉 0 号 fd，所以显式 closeSync(0)。
+      // 进程本身保持存活，由 client 负责回收。
+      process.stdin.destroy();
+      closeSync(0);
+      setTimeout(() => {}, 60_000);
+    }
     respond(request.id, { userAgent: 'fake-codex-app-server' });
     return;
   }
@@ -530,7 +547,7 @@ function handle(request) {
       reject(request.id, -32600, `thread not loaded: ${request.params.threadId}`);
       return;
     }
-    respond(request.id, {
+    const sendThreadRead = () => respond(request.id, {
       thread: {
         id: request.params.threadId,
         ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
@@ -539,6 +556,14 @@ function handle(request) {
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
+    // 慢响应只作用在「第一次 thread/name/set 之前」的等待阶段；写入后的
+    // 校验 thread/read 必须保持即时，否则调用方短预算会卡在校验环节而不
+    // 是待测的等待环节。
+    if (threadReadDelayMs > 0 && threadReadAttempt <= threadReadDelayReads && !nameSetSeen) {
+      setTimeout(sendThreadRead, threadReadDelayMs);
+      return;
+    }
+    sendThreadRead();
     return;
   }
   if (request.method === 'thread/archive' || request.method === 'thread/unarchive') {
@@ -549,6 +574,7 @@ function handle(request) {
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
+    nameSetSeen = true;
     respond(request.id, {});
     return;
   }

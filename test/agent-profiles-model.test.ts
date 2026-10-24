@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   AGENT_BACKEND_TYPES,
   agentBotDrift,
-  agentHasSections,
   agentLinkedBots,
   agentPushRequests,
   agentZeroPromptConflict,
@@ -198,8 +197,6 @@ describe('agentPushRequests', () => {
   it('can be limited to the drifted sections only', () => {
     expect(agentPushRequests(fullAgent, 'cli_a', ['sandbox']).map(request => request.section)).toEqual(['sandbox']);
     expect(agentPushRequests({}, 'cli_a')).toEqual([]);
-    expect(agentHasSections({})).toBe(false);
-    expect(agentHasSections({ sandbox: { mode: 'off' } })).toBe(true);
   });
 });
 

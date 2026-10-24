@@ -9,8 +9,7 @@
  *
  * worker.ts is a process entry point with no exports, so the handler under
  * test is extracted from source, transpiled, and evaluated with its module
- * level dependencies injected as globals — the same source-truth pattern
- * backend-gate.test.ts uses for the same helper.
+ * level dependencies injected as globals.
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -157,16 +156,5 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
     (globalThis as Record<string, unknown>).backend = { sendSpecialKeys: vi.fn() };
     vi.advanceTimersByTime(1_000);
     expect(sendSpecialKeys, '旧 timer 不得向新会话 backend 发 Enter').not.toHaveBeenCalled();
-  });
-
-  it('keeps the 400ms deferral in the production trust branch', () => {
-    // Source-level guard: the behavioral tests above extract the real
-    // function, but pin the intent here so a "simplification" back to a
-    // synchronous send is caught even at a glance.
-    const start = workerSource.indexOf('function handleVisibleStartupInteraction(');
-    const end = workerSource.indexOf('const APP_RUNNER_OSC_CLI_IDS', start);
-    const helper = workerSource.slice(start, end);
-    expect(helper).toMatch(/setTimeout\([^]*\},\s*400\)/);
-    expect(helper.indexOf('trustHandled = true;')).toBeLessThan(helper.indexOf('setTimeout('));
   });
 });

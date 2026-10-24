@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -592,5 +592,76 @@ describe('worktree semantic slug helpers', () => {
     expect(slugFromWorktreeText('新建 worktree 和分支')).toBe('worktree');
     expect(slugFromWorktreeText('看下新开工作树的命名逻辑')).toBeUndefined();
     expect(localWorktreeSlugFromContext('修复卡片重复点击')).toBeUndefined();
+  });
+});
+
+describe('deleted worktree recovery', () => {
+  it('reads the branch off a registration that rm -rf left behind, then rebuilds it in place', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const created = await createRepoWorktree(repo, { branch: 'wt/review-pr-1809-cd' });
+    writeFileSync(join(created.path, 'note.txt'), 'kept');
+    git(created.path, 'add', 'note.txt');
+    git(created.path, 'commit', '-m', 'work');
+    rmSync(created.path, { recursive: true, force: true });
+
+    const origin = await resolveDeletedWorktreeOrigin(created.path);
+    expect(origin).toEqual({ repo, branch: 'wt/review-pr-1809-cd' });
+
+    const rebuilt = await restoreDeletedWorktree(origin!, created.path);
+    expect(rebuilt.path).toBe(created.path);
+    expect(rebuilt.branch).toBe('wt/review-pr-1809-cd');
+    expect(existsSync(join(created.path, 'note.txt'))).toBe(true);
+    expect(git(created.path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('wt/review-pr-1809-cd');
+  });
+
+  it('only clears the rebuilt path, leaving other stale registrations alone', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const a = await createRepoWorktree(repo, { branch: 'feat/a' });
+    const b = await createRepoWorktree(repo, { branch: 'feat/b' });
+    rmSync(a.path, { recursive: true, force: true });
+    rmSync(b.path, { recursive: true, force: true });
+
+    await restoreDeletedWorktree({ repo, branch: 'feat/a' }, a.path);
+    const listing = git(repo, 'worktree', 'list', '--porcelain');
+    expect(listing).toContain(`worktree ${b.path}`);
+  });
+
+  it('matches the branch by directory suffix once the registration was pruned', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const created = await createRepoWorktree(repo, { branch: 'wt/botmux-claude-review-pr-1809-cd' });
+    rmSync(created.path, { recursive: true, force: true });
+    git(repo, 'worktree', 'prune');
+
+    expect(await resolveDeletedWorktreeOrigin(created.path)).toEqual({
+      repo,
+      branch: 'wt/botmux-claude-review-pr-1809-cd',
+    });
+  });
+
+  it('does not let a sibling linked worktree with a shorter name claim the path', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    // `proj-wt` is itself a linked worktree; `proj-wt-x` belongs to `proj`.
+    await createRepoWorktree(repo, { branch: 'side', worktreePath: join(tempRoot, 'proj-wt') });
+    const target = await createRepoWorktree(repo, { branch: 'wt/x' });
+    expect(target.path).toBe(join(tempRoot, 'proj-wt-x'));
+    rmSync(target.path, { recursive: true, force: true });
+
+    expect(await resolveDeletedWorktreeOrigin(target.path)).toEqual({ repo, branch: 'wt/x' });
+  });
+
+  it('returns null when no sibling main checkout owns the name', async () => {
+    expect(await resolveDeletedWorktreeOrigin(join(tempRoot, 'nothing-wt-here'))).toBeNull();
+  });
+
+  it('returns null when two branches flatten to the same directory suffix', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    git(repo, 'branch', 'wt/a-b');
+    git(repo, 'branch', 'wt-a/b');
+    expect(await resolveDeletedWorktreeOrigin(join(tempRoot, 'proj-wt-a-b'))).toBeNull();
   });
 });

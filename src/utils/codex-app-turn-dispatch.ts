@@ -14,6 +14,7 @@ export interface CodexAppTurnDispatchReservation {
   turnId: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   recovered?: boolean;
   /** Frozen steer authorization COPIED from the daemon-admitted head (R4-B4).
    * A `steer_superseded` settlement is only legitimate for a steerable head; the
@@ -29,6 +30,7 @@ export type CodexAppTurnDispatchSettlement =
       turnId: string;
       replyTurnId?: string;
       dispatchAttempt?: number;
+      linkRefMode?: 'observe' | 'enabled';
       nativeTurnId?: string;
       codexAppSteerable?: true;
       remaining: number;
@@ -53,6 +55,7 @@ export class CodexAppTurnDispatchQueue {
     recovered = false,
     replyTurnId?: string,
     codexAppSteerable?: true,
+    linkRefMode?: 'observe' | 'enabled',
   ): CodexAppTurnDispatchReservation {
     if (!turnId) throw new Error('Codex App dispatch turn id must be non-empty');
     const reservation = {
@@ -63,6 +66,7 @@ export class CodexAppTurnDispatchQueue {
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(recovered ? { recovered: true } : {}),
       ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(linkRefMode ? { linkRefMode } : {}),
     };
     this.queue.push(reservation);
     return { ...reservation };
@@ -90,10 +94,11 @@ export class CodexAppTurnDispatchQueue {
     dispatchAttempt?: number;
     replyTurnId?: string;
     codexAppSteerable?: true;
+    linkRefMode?: 'observe' | 'enabled';
   }>): void {
     if (this.queue.length > 0) throw new Error('Codex App dispatch queue is already populated');
     for (const entry of entries) {
-      this.reserve(entry.turnId, entry.dispatchAttempt, entry.dispatchId, true, entry.replyTurnId, entry.codexAppSteerable);
+      this.reserve(entry.turnId, entry.dispatchAttempt, entry.dispatchId, true, entry.replyTurnId, entry.codexAppSteerable, entry.linkRefMode);
     }
   }
 
@@ -191,6 +196,7 @@ export class CodexAppTurnDispatchQueue {
         : {}),
       ...(nativeTurnId ? { nativeTurnId } : {}),
       ...(head.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(head.linkRefMode ? { linkRefMode: head.linkRefMode } : {}),
       remaining: this.queue.length - (consume ? 0 : 1),
     };
   }

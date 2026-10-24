@@ -439,6 +439,45 @@ describe('installHook — claude-settings', () => {
     expect(settings.hooks?.UserPromptSubmit ?? []).toHaveLength(1);
   });
 
+  it('(j) stopFailureCommand 时写入 StopFailure hook：无 matcher、幂等且换安装路径不叠加', () => {
+    const nodeCmd = '/usr/bin/node /path/to/cli.js __claude-stop-failure-v1';
+    const binCmd = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" __claude-stop-failure-v1';
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: nodeCmd }, hookCommand);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: nodeCmd }, hookCommand);
+    expect(readFileSync(configPath, 'utf-8')).toBe(afterFirst);
+
+    let groups: any[] = JSON.parse(afterFirst).hooks?.StopFailure ?? [];
+    expect(groups).toHaveLength(1);
+    // 不写 matcher：所有错误类型都上报，分类由 worker 用 transcript 同一个分类器做。
+    expect(groups[0].matcher).toBeUndefined();
+    expect(groups[0].hooks[0].command).toBe(nodeCmd);
+
+    installHook('claude-code', { configPath, format: 'claude-settings', stopFailureCommand: binCmd }, hookCommand);
+    groups = JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure ?? [];
+    expect(groups).toHaveLength(1);
+    expect(groups[0].hooks[0].command).toBe(binCmd);
+  });
+
+  it('(k) StopFailure 与用户自装的 StopFailure hook 共存（如 claude-auto-retry）', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    const userGroup = { matcher: 'overloaded|server_error', hooks: [{ type: 'command', command: 'claude-auto-retry _stopfailure-hook' }] };
+    writeFileSync(configPath, JSON.stringify({ hooks: { StopFailure: [userGroup] } }));
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      stopFailureCommand: '/usr/bin/node /path/to/cli.js __claude-stop-failure-v1',
+    }, hookCommand);
+    const groups: any[] = JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure ?? [];
+    expect(groups).toContainEqual(userGroup);
+    expect(groups.filter((g) => g.hooks?.some((e: any) => e.command.endsWith('__claude-stop-failure-v1')))).toHaveLength(1);
+  });
+
+  it('(l) 不传 stopFailureCommand 时不写 StopFailure（保持旧行为）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    expect(JSON.parse(readFileSync(configPath, 'utf-8')).hooks?.StopFailure).toBeUndefined();
+  });
+
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {
     const globalPath = join(tmpDir, '.claude-global', 'settings.json');
     mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });
@@ -790,6 +829,11 @@ describe('cleanupTraexAskHooks', () => {
   });
 });
 
+const OPENCODE_PLUGIN_CASES = [
+  { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
+  { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
+];
+
 /**
  * The generated plugins must not reach a loopback service through the global
  * `fetch`, and — the part a `toContain` check cannot see — the helper they call
@@ -809,12 +853,7 @@ describe('cleanupTraexAskHooks', () => {
  * corporate proxy, not just a failed reply.
  */
 describe('generated OpenCode plugins — loopback requests bypass the proxy', () => {
-  const CASES = [
-    { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
-    { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
-  ];
-
-  for (const { label, cliId, format } of CASES) {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
     it(`${label}: defines loopbackSafeFetch wherever it is called`, () => {
       const dir = makeTmpDir();
       const configPath = join(dir, 'plugin', 'botmux-ask.js');
@@ -887,6 +926,37 @@ describe('generated OpenCode plugins — loopback requests bypass the proxy', ()
       } finally {
         await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
       }
+    });
+  }
+});
+
+/**
+ * A hook that dies before reading its stdin (crashes at startup, gets killed)
+ * turns the plugin's pending stdin write into EPIPE. The plugin runs inside
+ * OpenCode's own process, so an unhandled stream error there takes OpenCode down;
+ * the ask must fall back to passthrough instead. Executed rather than grepped for
+ * the reason given above: the guard has to exist in BOTH emitted templates.
+ */
+describe('generated OpenCode plugins — a hook that exits before reading stdin', () => {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
+    it(`${label}: askBotmux resolves passthrough instead of throwing EPIPE`, async () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+      const from = src.indexOf('function askBotmux');
+      expect(from).toBeGreaterThan(-1);
+      const askSrc = src.slice(from, src.indexOf('\n}', from) + 2);
+
+      const hook = join(dir, 'hook.mjs');
+      writeFileSync(hook, 'process.exit(7);\n');
+      const { spawn } = await import('node:child_process');
+      // eslint-disable-next-line no-new-func
+      const askBotmux = new Function('spawn', 'CMD', 'ARGS', `${askSrc}\nreturn askBotmux;`)(
+        spawn, process.execPath, [hook],
+      ) as (payload: string) => Promise<string>;
+      // Larger than the pipe buffer, so the write is still pending when the hook exits.
+      await expect(askBotmux(JSON.stringify({ text: 'x'.repeat(256 * 1024) }))).resolves.toBe('');
     });
   }
 });

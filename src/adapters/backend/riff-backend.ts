@@ -12,6 +12,7 @@ import type {
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
+import { detectImageFormat } from '../../core/attachment-image-format.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -2141,7 +2142,10 @@ export class RiffBackend implements SessionBackend {
   private async readFileAsBlob(path: string): Promise<Blob> {
     const { readFile } = await import('node:fs/promises');
     const buf = await readFile(path);
-    return new Blob([buf]);
+    // Riff validates the multipart media type; synthetic filenames may have
+    // missing or incorrect extensions, so identify images from their bytes.
+    const type = detectImageFormat(buf)?.mimeType ?? 'application/octet-stream';
+    return new Blob([buf], { type });
   }
 
   /**

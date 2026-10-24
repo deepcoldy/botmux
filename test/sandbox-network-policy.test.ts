@@ -1,24 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, networkPolicyAllows, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, type NetworkMode } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
 
 const base = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
-const modes: NetworkMode[] = ['allow', 'block', 'allowlist', 'denylist'];
 describe('network policy', () => {
-  for (const publicMode of modes) for (const privateMode of modes) {
-    it(`${publicMode}/${privateMode} are independent`, () => {
-      const p = parseSandboxNetworkPolicy({ version: 1,
-        public: { mode: publicMode, ...(['allowlist', 'denylist'].includes(publicMode) ? { rules: [{ cidr: '8.8.8.8', protocol: 'tcp', ports: [443] }] } : {}) },
-        private: { mode: privateMode, ...(['allowlist', 'denylist'].includes(privateMode) ? { rules: [{ cidr: '10.1.2.3', protocol: 'tcp', ports: [443] }] } : {}) },
-      });
-      for (const [ip, mode] of [['8.8.8.8', publicMode], ['10.1.2.3', privateMode]] as const) {
-        expect(networkPolicyAllows(p, ip, 'tcp', 443)).toBe(mode === 'allow' || mode === 'allowlist');
-        expect(networkPolicyAllows(p, ip, 'udp', 443)).toBe(mode === 'allow' || mode === 'denylist');
-        expect(networkPolicyAllows(p, ip, 'tcp', 444)).toBe(mode === 'allow' || mode === 'denylist');
-      }
-    });
-  }
   it.each(['10.0.0.1','127.0.0.1','169.254.0.1','100.64.0.1','192.168.1.1','198.18.0.1','224.0.0.1','0.0.0.0','255.255.255.255','::1','::','fe80::1','fc00::1','ff02::1','2001:db8::1','2002::1','64:ff9b::a00:1','::ffff:127.0.0.1','3fff::1'])('special/private %s', ip => expect(networkZone(ip)).toBe('private'));
   it.each(['8.8.8.8','1.1.1.1','2606:4700:4700::1111','::ffff:8.8.8.8'])('public %s', ip => expect(networkZone(ip)).toBe('public'));
   it('normalizes CIDR and IPv4 mappings', () => {
@@ -33,10 +19,6 @@ describe('network policy', () => {
     { ...base, private: { mode: 'denylist', rules: [{ cidr: '::/0', protocol: 'icmp' }] } },
     { ...base, dnsServers: ['10.0.2.3'] }, { ...base, dnsServers: ['::1'] },
   ])('rejects invalid or unsupported policies %#', raw => expect(() => parseSandboxNetworkPolicy(raw)).toThrow());
-  it('empty lists have explicit inverse semantics', () => {
-    expect(networkPolicyAllows(parseSandboxNetworkPolicy({ ...base, public: { mode: 'allowlist', rules: [] } }), '8.8.8.8', 'tcp', 443)).toBe(false);
-    expect(networkPolicyAllows(parseSandboxNetworkPolicy({ ...base, public: { mode: 'denylist', rules: [] } }), '8.8.8.8', 'tcp', 443)).toBe(true);
-  });
   it('freezes workflow policy with no shared mutable lists', () => {
     const policy = parseSandboxNetworkPolicy({ ...base, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] } });
     const init = workflowSandboxInitFields({ sandbox: true, sandboxNetworkPolicy: policy });

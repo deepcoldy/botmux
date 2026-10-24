@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from '../adapters/cli/registry.js';
 import { JsonRpcStdioCore } from '../utils/jsonrpc-stdio.js';
+import { MIN_POLL_REQUEST_BUDGET_MS } from '../core/codex-poll-budget.js';
 
 type JsonObject = Record<string, any>;
 
@@ -15,6 +16,19 @@ class CodexAppServerRequestError extends Error {
     payload: unknown,
   ) {
     super(`${method}: ${JSON.stringify(payload)}`);
+  }
+}
+
+/** withTimeout 自己的客户端预算超时（区别于服务器返回的 JSON-RPC 错误）。
+ *  轮询用 instanceof + label 识别「我自己发出的这次 thread/read 等光了
+ *  预算」，而不是在 catch 里拿墙钟和 deadline 比时刻。 */
+class CodexAppRequestTimeoutError extends Error {
+  constructor(
+    readonly label: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`Codex app-server ${label} timed out after ${timeoutMs}ms`);
+    this.name = 'CodexAppRequestTimeoutError';
   }
 }
 
@@ -74,6 +88,15 @@ function isThreadNotLoadedError(error: unknown, threadId: string): boolean {
     && error.method === 'thread/read'
     && error.code === -32600
     && error.serverMessage === `thread not loaded: ${threadId}`;
+}
+
+/** 这次错误是不是元数据轮询自己发出的 thread/read 客户端超时。轮询只对
+ *  「拿走了整段剩余预算」的那次请求认这个降级（见调用点的 exhaustsBudget），
+ *  不能在 catch 里用 Date.now() >= deadline 判断：setTimeout 由单调时钟
+ *  调度、Date.now 是墙钟，二者存在毫秒级相位差，繁忙时 catch 可能在
+ *  deadline 前 1ms 读到墙钟，超时错误照样穿透、兜底标题不写。 */
+function isOwnThreadReadTimeout(error: unknown): error is CodexAppRequestTimeoutError {
+  return error instanceof CodexAppRequestTimeoutError && error.label === 'thread/read';
 }
 
 export interface CodexAppThreadSummary {
@@ -172,6 +195,12 @@ class CodexAppServerProbe {
     });
     this.unregisterForceClose = registerForceClose?.(() => this.forceClose());
     this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
+    // An app-server that stops reading (crashed, closed stdin) makes the next
+    // write fail asynchronously with EPIPE. Unhandled, that stream 'error' is
+    // thrown at process level, and the daemon runs these probes with no
+    // uncaughtException trap. Fail what is pending with the cause; every caller
+    // closes the probe (and reaps the child) on the way out.
+    this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       this.lastStderr = (this.lastStderr + chunk.toString('utf8')).slice(-8000);
     });
@@ -290,13 +319,21 @@ class CodexAppServerProbe {
     for (;;) {
       if (this.closed) throw new Error('Codex app-server is closed');
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return undefined;
+      // 这次请求拿走整段剩余预算（没被 2000ms cap 截断）时，它的客户端
+      // 超时就是预算耗尽点：catch 只认「自己这条 read 的预算超时」降级，
+      // 不与墙钟比时刻；2000ms 窗口中部的超时、not-loaded、其他传输错误
+      // （含尾窗非超时错误）都不走降级。
+      const requestTimeoutMs = Math.min(remaining, 2000);
+      const exhaustsBudget = requestTimeoutMs === remaining;
       let preview: string | undefined;
       try {
-        ({ preview } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000)));
+        ({ preview } = await this.readThreadMetadata(threadId, requestTimeoutMs));
       } catch (err) {
+        if (exhaustsBudget && isOwnThreadReadTimeout(err)) return undefined;
+        // 尾窗收到 not-loaded 时继续转一轮，由下一轮的 floor 判定退出；
+        // 其余错误穿透抛出。
         if (!isThreadNotLoadedError(err, threadId)) throw err;
-        if (Date.now() >= deadline) return undefined;
       }
       if (preview) return preview;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
@@ -305,13 +342,16 @@ class CodexAppServerProbe {
 
   async waitForThreadUpdatedAfter(threadId: string, baseline: number, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
-    while (!this.closed && Date.now() < deadline) {
+    while (!this.closed) {
       const remaining = deadline - Date.now();
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return;
+      const requestTimeoutMs = Math.min(remaining, 2000);
+      const exhaustsBudget = requestTimeoutMs === remaining;
       let updatedAt: number | undefined;
       try {
-        ({ updatedAt } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000)));
+        ({ updatedAt } = await this.readThreadMetadata(threadId, requestTimeoutMs));
       } catch (err) {
-        if (Date.now() >= deadline) return;
+        if (exhaustsBudget && isOwnThreadReadTimeout(err)) return;
         throw err;
       }
       if (updatedAt !== undefined && updatedAt > baseline) return;
@@ -323,7 +363,7 @@ class CodexAppServerProbe {
     const result = await this.withTimeout(this.request('thread/read', {
       threadId,
       includeTurns: false,
-    }), timeoutMs, 'thread/read');
+    }), timeoutMs, 'thread/read', (ms, label) => new CodexAppRequestTimeoutError(label, ms));
     const name = typeof result?.thread?.name === 'string' ? result.thread.name.trim() : '';
     const preview = typeof result?.thread?.preview === 'string' ? result.thread.preview.trim() : '';
     const updatedAt = typeof result?.thread?.updatedAt === 'number' ? result.thread.updatedAt : undefined;
@@ -358,13 +398,19 @@ class CodexAppServerProbe {
     this.failAll(new Error('Codex app-server probe force-closed'));
   }
 
-  async withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    label: string,
+    onTimeout: (timeoutMs: number, label: string) => Error = (ms, timeoutLabel) =>
+      new Error(`Codex app-server ${timeoutLabel} timed out after ${ms}ms`),
+  ): Promise<T> {
     let timer: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
         promise,
         new Promise<T>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`Codex app-server ${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+          timer = setTimeout(() => reject(onTimeout(timeoutMs, label)), timeoutMs);
         }),
       ]);
     } finally {

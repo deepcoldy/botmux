@@ -6,6 +6,9 @@
  * Run:  pnpm vitest run test/riff-backend.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -61,6 +64,87 @@ describe('RiffBackend', () => {
   }
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  describe('attachment multipart uploads', () => {
+    let dir: string;
+    let be: RiffBackend;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'riff-attachments-'));
+      be = makeBackend({ injectStatusLines: false });
+      let taskNumber = 0;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        calls.push({ url: u, init });
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        if (u.includes('/api/task-execute') || u.includes('/api/task-follow-up')) {
+          return taskResponse(`task-${++taskNumber}`);
+        }
+        return Response.json({ success: true, data: { task: {} } });
+      });
+    });
+
+    afterEach(() => {
+      be.kill();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    const cases = [
+      { label: 'PNG without an extension', name: 'image', bytes: Buffer.from('89504e470d0a1a0a', 'hex'), mime: 'image/png', tag: 'image' },
+      { label: 'JPEG with a PNG extension', name: 'photo.png', bytes: Buffer.from('ffd8ffe0', 'hex'), mime: 'image/jpeg', tag: 'image' },
+      { label: 'GIF89a with a JPEG extension', name: 'animation.jpg', bytes: gif, mime: 'image/gif', tag: 'image' },
+      { label: 'GIF87a', name: 'old.gif', bytes: Buffer.concat([Buffer.from('GIF87a'), gif.subarray(6)]), mime: 'image/gif', tag: 'image' },
+      { label: 'WebP with an uppercase extension', name: 'picture.PNG', bytes: Buffer.from('RIFF0000WEBPVP8X'), mime: 'image/webp', tag: 'image' },
+      { label: 'PNG sent as a file', name: 'upload.bin', bytes: Buffer.from('89504e470d0a1a0a', 'hex'), mime: 'image/png', tag: 'file' },
+      { label: 'ordinary binary file', name: 'data.bin', bytes: Buffer.from([0, 1, 2, 255]), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'unknown bytes with an image extension', name: 'unknown.png', bytes: Buffer.from('not an image'), mime: 'application/octet-stream', tag: 'image' },
+      { label: 'empty image', name: 'empty.jpg', bytes: Buffer.alloc(0), mime: 'application/octet-stream', tag: 'image' },
+      { label: 'JSON text', name: 'data.json', bytes: Buffer.from('{"ok":true}'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'TXT text', name: 'notes.txt', bytes: Buffer.from('text'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'LOG text', name: 'service.log', bytes: Buffer.from('log'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'Markdown text', name: 'README.md', bytes: Buffer.from('# title'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'CSV text', name: 'rows.csv', bytes: Buffer.from('a,b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YAML text', name: 'config.yaml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
+      { label: 'YML text', name: 'config.yml', bytes: Buffer.from('a: b'), mime: 'application/octet-stream', tag: 'file' },
+    ];
+
+    describe.each(['task-execute', 'task-follow-up'])('%s', (endpoint) => {
+      it.each(cases)('preserves the MIME type and bytes of $label on the wire', async ({ name, bytes, mime, tag }) => {
+        const path = join(dir, name);
+        writeFileSync(path, bytes);
+        if (endpoint === 'task-follow-up') {
+          be.write('first message');
+          await (be as any).writeChain;
+        }
+
+        be.write(`inspect this <attachments><${tag} path="${path}" name="${name}"/></attachments>`);
+        await (be as any).writeChain;
+
+        const upload = calls.find(c => c.url.endsWith(`/api/${endpoint}`));
+        expect(upload).toBeDefined();
+        expect(upload!.init?.body).toBeInstanceOf(FormData);
+        // Check serialized bytes directly: runtime multipart parsers may
+        // normalize headers or binary parts and mask wire-level regressions.
+        const request = new Request(upload!.url, upload!.init);
+        const serialized = Buffer.from(await request.clone().arrayBuffer());
+        const multipart = serialized.toString('latin1');
+        const fileHeader = `filename="${name}"\r\nContent-Type: ${mime}\r\n\r\n`;
+        const fileHeaderOffset = multipart.indexOf(fileHeader);
+        expect(fileHeaderOffset).toBeGreaterThanOrEqual(0);
+        expect(multipart.toLowerCase()).not.toContain('charset=');
+        const contentOffset = fileHeaderOffset + Buffer.byteLength(fileHeader, 'latin1');
+        expect(serialized.subarray(contentOffset, contentOffset + bytes.length)).toEqual(bytes);
+        expect(serialized.subarray(contentOffset + bytes.length, contentOffset + bytes.length + 2).toString('latin1')).toBe('\r\n');
+        const form = await request.formData();
+        const payload = JSON.parse(String(form.get('payload')));
+        const prompt = endpoint === 'task-execute' ? payload.config.userPrompt : payload.prompt;
+        expect(prompt).toContain('inspect this');
+        expect(prompt).not.toContain('<attachments>');
+        if (endpoint === 'task-follow-up') expect(payload.parentTaskId).toBe('task-1');
+      });
+    });
+  });
 
   describe('write serialization', () => {
     it('queues a second write until the first task-execute returns (no duplicate createTask)', async () => {

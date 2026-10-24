@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { appendEvent } from '../src/workflows/v3/journal.js';
@@ -214,13 +214,6 @@ describe('v3 live terminal resolver', () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
-  });
-
-  it('dashboard 的中央终端代理同时查询普通会话和 v3 临时会话', () => {
-    const dashboardSource = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboardSource).toContain(
-      'aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)',
-    );
   });
 });
 

@@ -12,7 +12,7 @@
  * Dedicated lifecycle cases below use a fake child process to cover the real
  * daemon-side detach fence.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -103,6 +103,7 @@ import {
   rollbackRejectedSessionAndGetWinner,
   sendWorkerInput,
   sendWorkerSessionInput,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -113,6 +114,9 @@ import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 import type { Session } from '../src/types.js';
 import {
   __testOnly_resetBotTurnMutationGates,

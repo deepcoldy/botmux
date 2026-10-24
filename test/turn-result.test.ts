@@ -22,6 +22,16 @@ function complete(store: TurnResultStore, current = binding, content = output.co
 }
 
 describe('ordinary turn result snapshots', () => {
+  it.each(['turn_budget_exhausted', 'execution_failed', 'cancelled'])('retains %s in result execution metadata', errorCode => {
+    const store = new TurnResultStore();
+    store.begin(binding);
+    store.recordDelivery(binding, output, receipt);
+    store.recordTerminal(binding, { status: errorCode === 'cancelled' ? 'cancelled' : 'failed', errorCode });
+    expect(store.read(binding.ref)).toMatchObject({ status: 'ready', result: {
+      execution: { status: errorCode === 'cancelled' ? 'cancelled' : 'failed', errorCode },
+      output: { status: 'unavailable' },
+    } });
+  });
   it.each(['terminal', 'delivery'])('joins terminal and delivery when %s arrives first', first => {
     const store = new TurnResultStore();
     store.begin(binding);

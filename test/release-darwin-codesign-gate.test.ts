@@ -284,6 +284,8 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
     expect(STABLE_SIGN).toContain('shasum -a 256 "$binary_name" > "$binary_name.sha256"');
   });
 
+  // 源码结构护栏(K1)：编译态单文件二进制里 node-pty 的 spawn-helper 是内嵌后落盘的，发版 smoke 必须经由
+  // 内嵌原生模块真正 fork 一次才能证明它可用；这是二进制形态的约束，只在 tag 发版时才会被执行到。
   it('uses a native PTY probe that reaches the embedded spawn-helper without tty.ReadStream', () => {
     expect(CLI).toContain("case '__pty-smoke'");
     expect(PTY_SMOKE).toContain("loadNativeModule('pty')");

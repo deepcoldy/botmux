@@ -4,6 +4,8 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 
 **Applies to**: the dashboard / web terminal won't open or you need to change the bind address, pin a port, switch the pty/tmux backend, or find where config / logs / credentials live.
 
+> This page covers botmux's own process environment. Which variables a session (CLI) receives is viewed and edited in the Dashboard under "Settings → Session environment" and "Bot settings → Advanced → Startup environment → Session environment"; see [Session environment](./bots-json.md#session-environment-global-and-per-bot-layers).
+
 ## Environment variables (set in `~/.botmux/.env`)
 
 | Variable | Default | Description |
@@ -38,6 +40,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | Allow tokenless access to the Dashboard's allow-listed read-only APIs / SSE. Once this switch has been saved in Dashboard Settings, the value persisted in `~/.botmux/config.json` takes precedence over this environment variable |
 | `BOTMUX_COMPANION_SECRET_FILE` | _(unset)_ | Dedicated HMAC secret-file path for the closed [Local Companion API](/en/companion-api), normally set by `start/restart --companion-secret-file`. Botmux strictly requires a canonical absolute path, current-user ownership, non-symlink regular file, `0600`, and nonempty content. It is not passed to session CLIs and never falls back to `.dashboard-secret`. |
 | `BOTMUX_COMPANION_BOT_APP_ID` | _(unset)_ | The single isolated test Bot bound to the Companion API, normally set by `start/restart --companion-bot`. Callers cannot select a Bot. |
+| `BOTMUX_LOOPBACK_PEERS` | _(empty)_ | Extra source addresses accepted by the seven local-origin gates (dashboard auth, daemon-to-daemon calls, Workflow v3 IPC, session-migration IPC, dispatch-launch IPC, native-subagent runtime IPC, current-actor resolution). Comma-separated IPs/CIDRs, e.g. `10.0.0.5,192.168.0.0/16,fd00::/64`. Only needed on hosts whose customized kernel reports a same-machine loopback peer as a LAN IP. **Empty default = only `127.0.0.1`/`::1` are accepted, identical to older versions.** Malformed or overly broad entries (`/0`–`/7`, which would allow the whole internet) are ignored with a startup warning. A dual-stack host reports IPv4 peers as `::ffff:a.b.c.d`, so an IPv6 entry covering that mapped block is judged by its effective IPv4 prefix (`::/80` and `::ffff:0:0/96` equal v4 `/0` and are rejected; `::ffff:10.0.0.0/104` equals `10.0.0.0/8` and is allowed). **This relaxes ONLY the "source must be local" layer — HMAC signature, timestamp and nonce checks are still required**, so a request from an allowed address with a bad signature is still rejected, and the last gate additionally verifies the peer socket belongs to a local process. Prefer a `/32` single address or the narrowest real subnet. For IPv4 peers use an IPv4 entry: `10.0.0.0/8` matches both a native `10.x` peer and its dual-stack mapped form `::ffff:10.x`; an `::ffff:10.0.0.0/104`-style IPv6 entry matches only mapped-form peers. |
 
 ## File locations
 

@@ -1722,6 +1722,7 @@ async function triggerSessionTurnAdmitted(
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
   if (hasReasoningControl && effectiveReasoningEffort
+      && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,

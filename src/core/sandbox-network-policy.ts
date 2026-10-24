@@ -99,14 +99,6 @@ export function parseSandboxNetworkPolicy(raw: unknown): SandboxNetworkPolicy {
   return { version: 1, public: zone(obj.public, 'public'), private: zone(obj.private, 'private'), ...(dnsServers ? { dnsServers } : {}), ...(obj.proxyMode !== undefined ? { proxyMode: obj.proxyMode as 'reject' | 'trusted-egress' } : {}) };
 }
 
-export function networkPolicyAllows(policy: SandboxNetworkPolicy, ip: string, protocol: 'tcp' | 'udp', port: number): boolean {
-  const z = policy[networkZone(ip)];
-  if (z.mode === 'allow') return true;
-  if (z.mode === 'block') return false;
-  const matched = z.rules?.some(r => addressMatches(ip, r.cidr) && (!r.protocol || r.protocol === protocol) && (!r.ports || r.ports.includes(port))) ?? false;
-  return z.mode === 'allowlist' ? matched : !matched;
-}
-
 export function compileNetworkNft(raw: SandboxNetworkPolicy): string {
   const p = parseSandboxNetworkPolicy(raw);
   const zone = (name: 'public' | 'private') => {

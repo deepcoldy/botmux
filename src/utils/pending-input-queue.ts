@@ -5,6 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
@@ -18,6 +19,8 @@ export interface PendingCliInput {
   dispatchAttempt?: number;
   /** This item belongs to the durable-primary Lark Inbox commit protocol. */
   durablePrimaryInbox?: true;
+  /** Admission-frozen mode for the exact queued turn. */
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside
    *  the live-turn marker so the identity wrapper can keep a same-principal
    *  credential across consecutive turns. */
@@ -57,7 +60,15 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  /** Worker-authored continuation after a TraeX capacity model switch. It keeps
+   * the original turn id for reply attribution but is never merged with a
+   * later user input. */
+  traexAutoModelRecovery?: true;
   taskContinuation?: TaskContinuationDispatchMarker;
+  /** `content` as it was before a restart note was put in front of it (see
+   *  services/restart-interruption.ts). Lets a replay of this input after a
+   *  second restart carry only the newest note. */
+  restartNoteOriginalContent?: string;
 }
 
 /**
@@ -116,6 +127,7 @@ export function mergeQueuedCliInput(
   if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
     || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.traexAutoModelRecovery || next.traexAutoModelRecovery
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput

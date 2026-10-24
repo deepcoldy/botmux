@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  authorizeVcMeetingSummaryShare,
   evaluateVcMeetingManagedOriginClaim,
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -37,6 +38,7 @@ function seed(
   responseMode: 'silent' | 'listener_thread',
   outputPlacement: 'auto' | 'chat' | 'topic' = 'auto',
   listenerOutputProtocol: 'plain' | 'decision_v1' = 'plain',
+  allowSummarySharing?: boolean,
 ): void {
   applyVcMeetingMemberProjection(dir, {
     ...memberKey,
@@ -54,6 +56,7 @@ function seed(
     receiverSessionId: 'receiver-session',
     outputChatId: 'listener-chat',
     outputPlacement,
+    ...(allowSummarySharing !== undefined ? { listenerPolicy: { allowSummarySharing } } : {}),
   });
   acceptVcMeetingDelivery(dir, {
     ...memberKey,
@@ -420,5 +423,37 @@ describe('evaluateVcMeetingManagedSend', () => {
       claimedTurnId: 'delivery-key',
       claimedDispatchAttempt: 1,
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+  });
+});
+
+describe('human summary-share authority', () => {
+  function input() {
+    const grant = { ...imOrigin, replyTargetSenderOpenId: 'ou_human', summaryShareTargetChatId: 'oc_destination' };
+    return { agentAppId: 'agent', session: { sessionId: grant.receiverSessionId, vcMeetingImTurnOrigins: { om_current: grant } },
+      liveOrigin: { capability: 'live-secret', turnId: 'om_current' } as { capability: string; turnId: string; dispatchAttempt?: number },
+      claimedCapability: 'live-secret' };
+  }
+  it('authorizes an exact human turn even after automatic delivery has completed', () => {
+    seed('listener_thread', 'auto', 'decision_v1', true);
+    completeVcMeetingDelivery(dir, { ...memberKey, deliveryKey: 'delivery-key' }, { dispatchAttempt: 1 });
+    expect(authorizeVcMeetingSummaryShare(dir, input()).summaryShareTargetChatId).toBe('oc_destination');
+  });
+  it('keeps sharing disabled for an old or explicitly disabled meeting', () => {
+    seed('listener_thread');
+    expect(() => authorizeVcMeetingSummaryShare(dir, input())).toThrow('human_share_authorization_required');
+  });
+  it('rejects stale capabilities, automatic deliveries, other apps and subsequent human turns', () => {
+    seed('listener_thread', 'auto', 'decision_v1', true);
+    const request = input();
+    for (const changed of [
+      { ...request, claimedCapability: 'old-secret' },
+      { ...request, agentAppId: 'other-app' },
+      { ...request, liveOrigin: { ...request.liveOrigin, dispatchAttempt: 1 } },
+      { ...request, liveOrigin: { ...request.liveOrigin, turnId: 'delivery-key' } },
+      { ...request, liveOrigin: { ...request.liveOrigin, turnId: 'om_next' } },
+      { ...request, session: { ...request.session, sessionId: 'other-session' } },
+    ]) expect(() => authorizeVcMeetingSummaryShare(dir, changed)).toThrow();
+    request.session.vcMeetingImTurnOrigins.om_current.membershipGeneration += 1;
+    expect(() => authorizeVcMeetingSummaryShare(dir, request)).toThrow();
   });
 });

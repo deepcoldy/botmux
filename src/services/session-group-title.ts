@@ -23,7 +23,7 @@ import { credentialIsolationRequired, deviceCredentialIsolationMarkerPath } from
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE } from '../platform/device-paths.js';
 import { cliConfigDirEnvKey } from '../core/cli-config-dir.js';
-import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../core/env-policy.js';
+import { botOneShotEnv, type SessionEnvBotInput } from '../core/session-env-resolve.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
 import { renameChat } from './groups-store.js';
 import {
@@ -46,7 +46,12 @@ export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
  *  `cliPathOverride` when configured. Prompt is appended as the last arg. */
 export const ONE_SHOT_ARGV: Record<string, string[]> = {
-  'claude-code': ['claude', '-p'],
+  // Pin the permission mode: the bot's profile (oneShotProfileEnv →
+  // CLAUDE_CONFIG_DIR) may set `permissions.defaultMode: "bypassPermissions"`,
+  // which Claude Code refuses under root without IS_SANDBOX ("--dangerously-
+  // skip-permissions cannot be used with root/sudo privileges"), failing every
+  // title. A title call needs no tools, so never inherit bypass either way.
+  'claude-code': ['claude', '-p', '--permission-mode', 'dontAsk'],
   codex: ['codex', 'exec', '--skip-git-repo-check'],
   // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
   traex: ['traex', 'exec', '--skip-git-repo-check'],
@@ -96,11 +101,8 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(botEnv: unknown, envPolicy?: EnvPolicy): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...buildSessionChildEnv(process.env, envPolicy),
-    ...botInjectedEnv(botEnv, envPolicy),
-  };
+export function buildOneShotEnv(bot: SessionEnvBotInput = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = botOneShotEnv(process.env, bot);
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
   delete env.BOTMUX_SESSION_ID;
@@ -250,7 +252,7 @@ export async function generateOneShotTitle(opts: {
   const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
   const runOnce = () => new Promise<string>((resolve, reject) => {
-    const env = { ...buildOneShotEnv(cfg.env, cfg.envPolicy), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
+    const env = { ...buildOneShotEnv(cfg), ...wrapperEnv, ...oneShotProfileEnv(cfg) };
     const child = execFile(argv[0], [...argv.slice(1), prompt], {
       timeout: TITLE_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,

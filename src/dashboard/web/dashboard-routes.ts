@@ -18,6 +18,22 @@ export function hashQueryParam(name: string, hash = typeof location === 'undefin
   return new URLSearchParams(hash.slice(queryIndex + 1)).get(name) || null;
 }
 
+/**
+ * 去掉当前 hash 上的某个查询参数：一次性深链（打开抽屉 / 滚到区块）消费完就清掉，
+ * 免得刷新页面又触发一次。走 replaceState，不产生 hashchange，也就不会重挂载页面。
+ */
+export function clearHashQueryParam(name: string): void {
+  if (typeof location === 'undefined' || typeof history === 'undefined') return;
+  const hash = location.hash;
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return;
+  const params = new URLSearchParams(hash.slice(queryIndex + 1));
+  if (!params.has(name)) return;
+  params.delete(name);
+  const query = params.toString();
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${hash.slice(0, queryIndex)}${query ? `?${query}` : ''}`);
+}
+
 function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
   id: string,
   routePrefix: string,
@@ -76,6 +92,8 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
   pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
+  // 决策看板：`#/board`（汇总）、`#/board/<app>`、`#/board/<app>/<seq>`（详情）。没有别的路由以 `#/board` 开头。
+  pageRoute('decision-board', '#/board', () => import('./decision-board-page.js'), 'renderDecisionBoardPage'),
   pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),

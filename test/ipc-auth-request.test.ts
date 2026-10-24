@@ -294,6 +294,73 @@ describe('agent authorization', () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
   });
+
+  it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
+    requestId = (await (await post()).json()).requestId;
+    // The originating turn is gone; the daemon keeps polling but must not
+    // publish credentials into any stale turn.
+    session.managedTurnOrigin = undefined;
+    expect(tokens.requestUserAuthorization.mock.calls[0][5]()).toBe(true);
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    await vi.waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 3_000 });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    // The same human's follow-up turn claims the already-completed grant.
+    session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_next', openId: 'ou_sender',
+    });
+  });
+
+  it('reuses a pending link across turns without extending its deadline', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const first = await (await post()).json();
+      vi.setSystemTime(Date.now() + 30_000);
+      session.managedTurnOrigin.turnId = 'om_next';
+      const next = await (await post('auth-request', { originTurnId: 'om_next' })).json();
+      expect(next).toMatchObject({ requestId: first.requestId, authUrl: first.authUrl, expiresIn: 570 });
+      expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not expose another speaker or application grant to the current turn', async () => {
+    requestId = (await (await post()).json()).requestId;
+    // A different human is a turn change; a different application means the
+    // tracked grant itself no longer applies — the two refusals must stay
+    // distinguishable so each guard call point is pinned.
+    session.managedTurnOrigin.callerOpenId = 'ou_other';
+    let response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    session.larkAppId = 'cli_other';
+    response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_request_expired' });
+    expect(poll).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['closed', 'replaced', 'secret_changed'])('invalidates an issued grant when the session is %s', async change => {
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    if (change === 'closed') session.session.status = 'closed';
+    if (change === 'replaced') session = { ...session };
+    if (change === 'secret_changed') vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'new-secret',
+    } } as any);
+    expect(isGrantValid()).toBe(false);
+  });
+
+  it('stops grant completion when the IPC server closes', async () => {
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    await ipc.close();
+    expect(isGrantValid()).toBe(false);
+    expect(poll).not.toHaveBeenCalled();
+  });
 });
 
 // A managed host session has no relay/channel injected, so it presents no

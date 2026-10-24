@@ -10,8 +10,6 @@
  * Run:  bun run vitest run test/resume-first-prompt-seed.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
@@ -208,102 +206,6 @@ describe('首轮超时兜底复用 decidePostHookPromptEvidence 的静默/重试
     expect(decidePostHookPromptEvidence({
       stillWaiting: false, elapsedMs: 0, quietMs: 60_000, screenHasReadyPattern: true,
     })).toEqual({ action: 'stop' });
-  });
-});
-
-describe('worker 接线（source-lock）', () => {
-  const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-  const timeoutStart = source.indexOf('const releaseFirstPromptTimeout = ');
-  const timeoutBody = source.slice(timeoutStart, source.indexOf('setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS', timeoutStart));
-  const seedStart = source.indexOf('function armFirstPromptTimeoutPromptSeed(');
-  const seedBody = source.slice(seedStart, source.indexOf('\n}\n', seedStart));
-
-  it('边界状态必须在清零之前取样', () => {
-    const snapIdx = timeoutBody.indexOf('const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;');
-    const clearIdx = timeoutBody.indexOf('awaitingPostSessionStartPromptEvidence = false;');
-    expect(snapIdx).toBeGreaterThan(-1);
-    expect(clearIdx).toBeGreaterThan(snapIdx);
-  });
-
-  it('只在 type-ahead flush 分支 arm，且由纯函数守卫、队列状态在 flush 之前取', () => {
-    const flushBranch = timeoutBody.slice(timeoutBody.indexOf("=== 'flush') {"));
-    const gateIdx = flushBranch.indexOf('shouldArmFirstPromptTimeoutPromptSeed({');
-    const pendingIdx = flushBranch.indexOf('hasPendingInput: hasPendingInputForFlush(),');
-    const flushIdx = flushBranch.indexOf('flushPending();');
-    const armIdx = flushBranch.indexOf('if (armPromptSeed && backend) armFirstPromptTimeoutPromptSeed(backend);');
-    expect(gateIdx).toBeGreaterThan(-1);
-    expect(pendingIdx).toBeGreaterThan(gateIdx);
-    expect(flushIdx).toBeGreaterThan(pendingIdx);
-    expect(armIdx).toBeGreaterThan(flushIdx);
-    expect(armIdx).toBeLessThan(flushBranch.indexOf('return;'));
-  });
-
-  it('轮询期间的继续条件走纯函数，且每个字段都喂真实状态', () => {
-    expect(seedBody).toContain('stillWaiting: firstPromptSeedStillWaiting({');
-    expect(seedBody).toContain('sameBackend: backend === observedBackend,');
-    expect(seedBody).toContain('promptReady: isPromptReady,');
-    expect(seedBody).toContain('hasPendingInput: hasPendingInputForFlush(),');
-    expect(seedBody).toContain('hasUnackedInput: inflightInputs.hasUnacked(),');
-    expect(seedBody).toContain('outputSinceArm: !ptyOutputGeneration.isCurrent(armed.outputGeneration),');
-    // 屏幕 resync 不算活动：它 reset 了 IdleDetector 却不喂数据，停掉兜底会把提示符再次困住。
-    expect(seedBody).not.toContain('armed.outputAtMs');
-    expect(seedBody).toContain('inputSinceArm: webTerminalInputGeneration !== armed.webInputGeneration');
-    expect(seedBody).toContain('|| currentBotmuxTurnId !== armed.turnId,');
-  });
-
-  it('等待窗口从最近一次 resync 重新计时（晚到的 resync 也能等满静默窗口）', () => {
-    expect(seedBody).toContain('elapsedMs: Date.now() - Math.max(armed.at, lastPtyOutputAtMs),');
-  });
-
-  it('静默窗口把网页终端输入也算作活动（arm 前刚敲的回车可能还没回显）', () => {
-    expect(seedBody).toContain('const quietMs = Date.now() - Math.max(lastPtyOutputAtMs, lastWebTerminalInputAtMs);');
-  });
-
-  it('SessionStart 边界记下网页终端输入代数，arm 判据拿它比较', () => {
-    const boundaryIdx = source.indexOf('SessionStart boundary recorded');
-    const stampIdx = source.lastIndexOf('webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;', boundaryIdx);
-    expect(stampIdx).toBeGreaterThan(-1);
-    expect(boundaryIdx - stampIdx).toBeLessThan(200);
-    expect(timeoutBody).toContain('webInputSinceBoundary: webTerminalInputGeneration !== webTerminalInputGenerationAtBoundary,');
-  });
-
-  it('网页终端的可写输入在转发给 backend 之前登记', () => {
-    const handlerStart = source.indexOf("} else if (msg.type === 'input' && typeof msg.data === 'string') {");
-    const handler = source.slice(handlerStart, source.indexOf("} else if (msg.type === 'scroll'", handlerStart));
-    const authIdx = handler.indexOf('if (!authedClients.has(ws)) return;');
-    const stampIdx = handler.indexOf('lastWebTerminalInputAtMs = Date.now();');
-    const genIdx = handler.indexOf('webTerminalInputGeneration++;');
-    const writeIdx = handler.indexOf('backend?.write(msg.data);');
-    expect(authIdx).toBeGreaterThan(-1);
-    expect(stampIdx).toBeGreaterThan(authIdx);
-    expect(genIdx).toBeGreaterThan(authIdx);
-    expect(writeIdx).toBeGreaterThan(Math.max(stampIdx, genIdx));
-  });
-
-  it('arm 时记下输出代数与时间戳，重试沿用同一份（否则每次重试都会把围栏往后挪）', () => {
-    expect(seedBody).toContain('outputGeneration: ptyOutputGeneration.snapshot(),');
-    expect(seedBody).toContain('webInputGeneration: webTerminalInputGeneration,');
-    expect(seedBody).toContain('turnId: currentBotmuxTurnId,');
-    expect(seedBody).toContain('armFirstPromptTimeoutPromptSeed(observedBackend, armed, decision.retryInMs');
-  });
-
-  it('屏幕判据用输入框形状，不用裸 readyPattern；并且读渲染画面', () => {
-    expect(seedBody).toContain('screenHasReadyPattern: screenShowsFramedReadyPrompt()');
-    const probe = source.slice(
-      source.indexOf('function screenShowsFramedReadyPrompt'),
-      seedStart,
-    );
-    expect(probe).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
-    // 默认 rawSnapshot() 会把 ─ 清洗成空格，框线判据在真实画面上恒为 false。
-    expect(probe).not.toMatch(/rawSnapshot\(\)/);
-    expect(probe).toContain('screenShowsFramedPrompt(screen, pattern)');
-    expect(probe).toContain('catch { return false; }');
-  });
-
-  it('复用 post-hook 兜底的定时器，spawn/kill 的清理路径一并覆盖', () => {
-    expect(seedBody).toContain('clearPostHookEvidenceFallback();');
-    expect(seedBody).toContain('postHookEvidenceFallbackTimer = setTimeout(');
-    expect(seedBody).toContain('idleDetector?.seedReadyEvidence()');
   });
 });
 

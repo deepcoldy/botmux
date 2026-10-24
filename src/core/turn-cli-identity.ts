@@ -24,9 +24,15 @@ import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
 import {
   triggerUserAuthApplies,
+  credentialSourceOf,
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthTool,
 } from '../services/trigger-user-auth.js';
+import {
+  resolvePlatformIdentity,
+  platformAuthorizeUrl,
+  type PlatformIdentityResolution,
+} from './platform-credential-source.js';
 import {
   writeSessionIdentity,
   clearSessionIdentity,
@@ -156,12 +162,24 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
 async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
   if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
   let identity: CliIdentity | null = null;
-  if (tool === 'bytedcli') {
+  // Platform first (same person, keyed by the issuer-scoped open_id the daemon
+  // verified). In strict `platform` mode a non-grant is final; in `auto` an
+  // already-provisioned local HOME is still honoured below.
+  const source = credentialSourceOf(args.botConfig.triggerUserAuth);
+  if (source !== 'local') {
+    const platform = await resolvePlatformIdentity({
+      botConfig: args.botConfig, tool, openId: user.credentialOpenId,
+      sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
+    });
+    if (platform.state === 'granted') identity = platform.identity;
+    else if (source === 'platform') return denyDelegated(tool, args, user);
+  }
+  if (!identity && tool === 'bytedcli') {
     // Keep the issuer-scoped credential key; do not copy a source open_id into
     // the target app or duplicate/extend the lifetime of the user's login.
     const jwt = await mintBytedcliJwts(user.credentialOpenId);
     if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
-  } else {
+  } else if (!identity && tool === 'lark-cli') {
     const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
     if (home) identity = { tool, mode: 'user-home', home };
     else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
@@ -194,15 +212,86 @@ async function publishOne(
   // creator's or the owner's credentials to fill the gap.
   if (!senderOpenId) return await withheld();
 
+  const publish = (identity: CliIdentity): ToolIdentityOutcome => {
+    writeSessionIdentity(sessionDataDir, sessionId, {
+      ...identity,
+      ...(turnId ? { turnId } : {}),
+      openId: senderOpenId,
+    });
+    return { tool, state: 'user' };
+  };
+
+  // Credential source matrix (docs/lark-tool-identity.md, 凭据来源):
+  //   local            → this machine's per-person HOME only (below).
+  //   auto, unbound    → same as local, including auto-starting a local login.
+  //   auto, bound      → platform grant; else an EXISTING local HOME; else a
+  //                      refusal that points at the platform. A bound machine
+  //                      never starts a new local login on its own.
+  //   platform         → platform grant or refusal; local is never consulted.
+  const source = credentialSourceOf(botConfig.triggerUserAuth);
+  if (source !== 'local') {
+    const platform = await resolvePlatformIdentity({
+      botConfig, tool, openId: senderOpenId, sessionId, ...(turnId ? { turnId } : {}),
+    });
+    if (platform.state === 'granted') return publish(platform.identity);
+    if (source === 'platform' || platform.state !== 'unbound') {
+      if (source === 'auto') {
+        const local = await resolveIdentityFor(tool, botConfig, senderOpenId);
+        if (local) return publish(local);
+      }
+      return refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, platform);
+    }
+  }
+
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return await withheld();
+  return publish(identity);
+}
 
-  writeSessionIdentity(sessionDataDir, sessionId, {
-    ...identity,
-    ...(turnId ? { turnId } : {}),
-    ...(senderOpenId ? { openId: senderOpenId } : {}),
-  });
-  return { tool, state: 'user' };
+/**
+ * The refusal a bound machine publishes: it names the platform, not a local
+ * device login, as the way to authorize. `unavailable` is reported as such so
+ * the agent stops retrying instead of asking the person to authorize again.
+ */
+function refuseViaPlatform(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  sessionDataDir: string,
+  sessionId: string,
+  senderOpenId: string,
+  locale: Locale | undefined,
+  turnId: string | undefined,
+  platform: Exclude<PlatformIdentityResolution, { state: 'granted' }>,
+): ToolIdentityOutcome {
+  const provider = tool === 'bytedcli' ? 'ByteCloud' : t('trigger_user_auth.provider_lark', undefined, locale);
+  const vars = { tool, provider };
+  let tail: string[];
+  let state: ToolIdentityOutcome['state'] = 'needs-authorization';
+  switch (platform.state) {
+    case 'unbound':
+      tail = [t('trigger_user_auth.denied_platform_unbound', vars, locale)];
+      break;
+    case 'not_authorized': {
+      const url = platform.authorizeUrl ?? platformAuthorizeUrl();
+      tail = [
+        t(platform.consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login', vars, locale),
+        ...(url ? [url] : []),
+        t('trigger_user_auth.denied_platform_retry', undefined, locale),
+      ];
+      break;
+    }
+    case 'denied':
+      tail = [platform.reason === 'not_teammate'
+        ? t('trigger_user_auth.denied_platform_not_teammate', vars, locale)
+        : t('trigger_user_auth.denied_platform_forbidden', { ...vars, detail: platform.detail }, locale)];
+      break;
+    case 'unavailable':
+      tail = [t('trigger_user_auth.denied_platform_unavailable', vars, locale)];
+      state = 'unavailable';
+      break;
+  }
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, undefined, tail);
+  return { tool, state };
 }
 
 /**
@@ -271,6 +360,9 @@ function writeDenial(
   locale: Locale | undefined,
   turnId: string | undefined,
   authUrl?: string,
+  /** Replaces the local-login tail (auto-link or /login how-to) when the
+   *  authorization lives elsewhere — e.g. on the central platform. */
+  tailOverride?: string[],
 ): void {
   try {
     const name = senderOpenId && botConfig.larkAppId
@@ -304,7 +396,7 @@ function writeDenial(
         // one-tap instruction and a clear "authorize once" framing so it reads
         // as "one step left", not as a broken bot. Without a link (fetch failed
         // or no human sender), fall back to the /login instructions.
-        ...(authUrl
+        ...(tailOverride ? tailOverride : authUrl
           ? [
               t('trigger_user_auth.denied_auto_login', { tool, provider }, locale),
               authUrl,

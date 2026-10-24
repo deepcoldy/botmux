@@ -177,6 +177,13 @@ export const INVOKER_TERMINAL_ENV_KEYS = [
   'TERM_PROGRAM',
   'TERM_PROGRAM_VERSION',
   'TERM_SESSION_ID',
+  // Orca pins these to the relay version that launched the invoking terminal.
+  // Keeping them in a daemon bypasses the updated ~/.orca-relay/bin/orca
+  // defaults after Orca reconnects or upgrades, so /adopt queries a stale socket.
+  'ORCA_RELAY_DIR',
+  'ORCA_RELAY_SOCKET_PATH',
+  'ORCA_RELAY_CREDENTIAL_FILE',
+  'ORCA_RELAY_NODE_PATH',
   // CI / agent-harness flags
   'CI',
   'CODEX_CI',
@@ -266,6 +273,13 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // boundary is safe. Kept as a string literal (like the keys above) with a
   // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
   'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+  // Daemon-only LinkRef rollout authority. Workers and CLI children receive
+  // only the frozen typed turn mode through authenticated IPC.
+  'BOTMUX_LINK_REFS_MODE',
+  // Set only on the narrow host relay re-exec after it has authenticated the
+  // exact live turn. An ordinary child must not inherit or replay either bit.
+  'BOTMUX_LINK_REF_TURN_MODE',
+  'BOTMUX_HOST_RELAY_AUTHORIZED',
 ] as const;
 
 /**
@@ -423,6 +437,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
   // fallback cannot drift to the default when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -574,6 +589,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
   // env is never a config input for it.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',

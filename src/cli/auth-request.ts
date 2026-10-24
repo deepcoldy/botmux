@@ -4,7 +4,9 @@ export const AUTH_REQUEST_USAGE = `用法: botmux auth request [--scope "<scope1
 为当前会话的本轮发起人生成飞书授权链接，返回 daemon 的 JSON 结果。
 --scope 指定本次所需权限，以空格或逗号分隔；省略时使用默认授权。
 --allow-unknown (或 --force) 允许放行未录入静态清单的合法格式权限（运行时逃生通道）。
-由 Agent 通过 botmux send 将 authUrl 发给用户，再用 auth wait 等待授权就绪。
+补授权前先核对当前任务已确定的操作，把所需的多个权限合并到一次 --scope 请求，不要逐项发链接或申请无关权限。
+由 Agent 通过 botmux send 将 authUrl 发给用户，可用 auth wait 等待授权就绪。
+Daemon 自动完成授权；本轮结束后，用户也可在有效期内授权，再发消息恢复操作。
 wait 每 2 秒查询一次，最多等待 5 分钟，返回 JSON。`;
 
 export function parseAuthRequestArgs(args: string[]):

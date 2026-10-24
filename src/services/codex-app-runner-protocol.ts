@@ -89,21 +89,8 @@ export type CodexAppLifecycleEvent =
     category: 'transport' | 'rpc' | 'protocol' | 'runtime';
   });
 
-export interface AppRunnerFinalIds {
-  lastUuid: string;
-  turnId: string;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function optionalNonEmptyString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-function optionalFiniteNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function optionalLifecycleId(value: unknown): string | undefined {
@@ -156,19 +143,6 @@ export function decodeCodexAppRunnerInput(line: string): CodexAppRunnerInput | u
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(value.codexAppSteerable === true ? { codexAppSteerable: true } : {}),
-  };
-}
-
-export function normalizeAppRunnerFinalMarker(payload: unknown): CodexAppFinalMarker | undefined {
-  if (!isRecord(payload) || typeof payload.content !== 'string') return undefined;
-  return {
-    content: payload.content,
-    startedAtMs: optionalFiniteNumber(payload.startedAtMs),
-    completedAtMs: optionalFiniteNumber(payload.completedAtMs),
-    appTurnId: optionalNonEmptyString(payload.appTurnId),
-    replyTurnId: optionalNonEmptyString(payload.replyTurnId),
-    legacyTurnId: optionalNonEmptyString(payload.turnId),
-    usage: normalizeFinalUsage(payload.usage),
   };
 }
 
@@ -278,19 +252,4 @@ export function normalizeCodexAppLifecycleEvent(payload: unknown): CodexAppLifec
     default:
       return undefined;
   }
-}
-
-export function projectAppRunnerFinalIds(
-  marker: CodexAppFinalMarker,
-  fallbackTurnId: string | undefined,
-  generatedFallbackId: string,
-): AppRunnerFinalIds {
-  if (marker.appTurnId) {
-    return {
-      lastUuid: marker.appTurnId,
-      turnId: marker.replyTurnId ?? fallbackTurnId ?? marker.appTurnId,
-    };
-  }
-  const legacyId = marker.legacyTurnId ?? fallbackTurnId ?? generatedFallbackId;
-  return { lastUuid: legacyId, turnId: legacyId };
 }

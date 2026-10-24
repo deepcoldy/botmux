@@ -2,7 +2,7 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
-import { detectModelsViaExec, parseDebugModelsJson } from './model-catalog-json.js';
+import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaExec } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
@@ -15,10 +15,13 @@ import {
   findTraexRolloutByPid,
   findTraexRolloutBySessionId,
   traexSessionIdFromRolloutPath,
+  readTraexThreadDetails,
+  readTraexThreadIndex,
+  traexRolloutUserInputs,
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
-import { traexViewportFooterBusy } from './traex-footer.js';
+import { traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -191,6 +194,99 @@ const TRAEX_QUEUE_STATIC_ARMS = [
   "Too many requests right now\\. You're in the queue",
 ];
 
+/** Capacity-only evidence for the experimental auto-model pool.
+ *
+ * This is deliberately narrower than TRAEX_ACTIVE_BUSY_PATTERN: ordinary
+ * working labels, `Queued for next turn`, and generic interrupt footers must
+ * never rotate a model. The worker also requires an exact active managed turn
+ * before acting on this display-only signal.
+ */
+const TRAEX_CAPACITY_QUEUE_PATTERN = new RegExp(
+  [
+    `^[ \\t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \\t]+Queued for capacity[ \\t]+\\([^\\r\\n]*esc to interrupt\\)[ \\t]*$`,
+    `^[ \\t]*(?:[└├│][ \\t]*)?Too many requests right now\\. You're in the queue(?: at position[ \\t]+\\d+)?\\.[ \\t]*$`,
+  ].join('|'),
+  'im',
+);
+
+const TRAEX_PROGRESS_PATTERN = new RegExp(
+  `^[ \t]*[${TRAEX_SPINNER_FRAMES}⋄✧◇✦❖◈◆][ \t]+(?:${TRAEX_SPINNER_LABELS.filter(label => !label.startsWith('Queued')).join('|')})(?:[ \t]*\\([^\\r\\n]*esc to interrupt\\))?[ \t]*$`, 'i');
+
+/** The native pending-input panel can push live activity above the final
+ * twelve rows. Only skip a verified panel between its exact header and the
+ * bottom composer/footer; quoted or arbitrary history keeps the narrow scan. */
+function traexCurrentActivityRows(screen: string): string[] {
+  const rows = screen.trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+  if (composer >= 0) {
+    const footer = rows.slice(composer + 1).filter(row => row.trim());
+    if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
+    const nativeFooter = footer.length >= 1 && footer.length <= 2
+      && /^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|[—–-])(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
+      && (footer.length === 1 || /^[ \t]*(?:☢ )?(?:Full Access|Read Only|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!));
+    if (nativeFooter) {
+      let sawInput = false;
+      for (let index = composer - 1; index >= 0; index--) {
+        const row = rows[index]!;
+        if (/^Send after tool call[ \t]+[·•][ \t]+esc to interrupt and send[ \t]+[·•][ \t]+↑ to edit[ \t]*$/.test(row)) {
+          if (sawInput) return rows.slice(0, index).slice(-12);
+          break;
+        }
+        if (/^[›❯](?:[ \t]|$)/.test(row)) sawInput = true;
+        else if (!/^[ \t]*$|^[ \t]*─+[ \t]*$|^ {2}\S/.test(row)) break;
+      }
+    }
+  }
+  return rows.slice(-12);
+}
+
+function traexCurrentFooterState(screen: string): 'capacity' | 'progress' | 'other' | undefined {
+  // In no-alt-screen mode an earlier queue row can remain above the current
+  // thinking row. The latest activity, rather than elapsed time, wins.
+  for (const row of traexCurrentActivityRows(screen).reverse()) {
+    if (TRAEX_PROGRESS_PATTERN.test(row)) return 'progress';
+    if (TRAEX_CAPACITY_QUEUE_PATTERN.test(row)) return 'capacity';
+    if (/Queued for next turn/.test(row)) return 'other';
+  }
+  return undefined;
+}
+
+export function traexCapacityQueueVisible(screen: string): boolean {
+  return !!screen && traexCurrentFooterState(screen) === 'capacity';
+}
+
+export function traexCapacityQueuePosition(screen: string): number | undefined {
+  if (!traexCapacityQueueVisible(screen)) return undefined;
+  const match = traexCurrentActivityRows(screen).join('\n').match(
+    /^[ \t]*(?:[└├│][ \t]*)?Too many requests right now\. You're in the queue at position[ \t]+(\d+)\.[ \t]*$/im,
+  );
+  const position = match ? Number(match[1]) : undefined;
+  return Number.isSafeInteger(position) && position! >= 0 ? position : undefined;
+}
+
+/** Positive work evidence, scoped to the current footer, not quoted history. */
+export function traexModelProgressVisible(screen: string): boolean {
+  return traexCurrentFooterState(screen) === 'progress';
+}
+
+/** Legacy TraeX can show current work immediately above next-turn parking.
+ * Parking alone is not capacity pressure or work evidence. Preserve that
+ * input surface only with its adjacent live spinner and native context footer;
+ * unknown/draft rows must not authorize a queued paste. This is input admission
+ * evidence only, not a signal for the capacity-switch controller. */
+export function traexQueuedTypeAheadVisible(screen: string): boolean {
+  const rows = screen.trimEnd().split(/\r?\n/).slice(-12);
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (!/^[ \t]*Queued for next turn[ \t]*$/.test(rows[index]!)) continue;
+    if (index === 0 || !traexModelProgressVisible(rows[index - 1]!)) return false;
+    const footer = rows.slice(index + 1).filter(row => row.trim());
+    return footer.length <= 1 && footer.every(row =>
+      /^[ \t]*(?:[^\r\n]* · )?Context \d+% (?:left|used)[ \t]*$/.test(row));
+  }
+  return false;
+}
+
 /** Rotating activity glyphs observed on live TraeX activity rows. */
 const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
 
@@ -348,7 +444,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     /** Import path: TRAE writes Codex-family rollout files under
      *  `<TRAE_HOME>/cli/sessions`. */
     listResumableSessions({ limit, exclude }) {
-      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
+      // Ordering needs only the cheap per-thread index; prompt-bearing detail
+      // columns are read lazily for the candidates discovery actually parses.
+      const metadataById = new Map([...readTraexThreadIndex()].map(([id, entry]) => [id, {
+        cwd: entry.cwd,
+        lastActivityAt: entry.updatedAtMs,
+        rolloutPath: entry.rolloutPath,
+      }]));
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude, {
+        dialect: 'traex',
+        metadataById,
+        loadSessionDetails: ids => readTraexThreadDetails(ids),
+        userInputTexts: traexRolloutUserInputs,
+        sessionIdFromPath: traexSessionIdFromRolloutPath,
+      });
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -483,17 +592,28 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // TRAEX_STATIC_BUSY_PATTERN comment.
     staticBusyPattern: TRAEX_STATIC_BUSY_PATTERN,
     // Clear the static-busy latch only on real composer evidence (line-start
-    // ›/❯, excluding numbered selector rows). The broad readyPattern also
+    // or cursor-addressed rule followed by ›/❯, excluding numbered selector
+    // rows). The broad readyPattern also
     // matches `\d+% left` (status bar), which the queue screen itself
     // carries — using it to clear the latch would re-open the ZMX false-idle
     // bug when queue and status bar arrive in separate chunks.
-    staticBusyClearPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/,
+    staticBusyClearPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)/,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
     // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
-    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // v0.211.1 uses cursor movement between the rule and composer; stripping
+    // ANSI joins them without a newline, so accept the preceding rule too.
+    // Anchor to the start of each rule run to avoid quadratic retries on
+    // long near-miss chunks. Keep its glyphs aligned with the clear guard
+    // in IdleDetector.
+    readyPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Pre-#2247 shape of readyPattern: without the cursor-addressed rule arm.
+    // A match that only exists through the rule arm is tagged weak so the
+    // worker can demand the rendered composer predicate during first-prompt
+    // admission (a rule-joined ❯ can be a still-loading cell or a draft).
+    readyPatternStrong: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
     // Skeleton composer gate, same cells and regexes as Codex (fork). Real
     // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
     // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the
@@ -506,6 +626,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // first-prompt timeouts wait for this gate without worker-side changes.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
+    startupReadyFromHistory: traexRestoredComposerReady,
     systemHints: BOTMUX_SHELL_HINTS,
     // Healthy TraeX turns accept parked input while working. The worker fences
     // delivery independently after a terminal/composer conflict or an unknown
@@ -543,6 +664,9 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // picker 回退到上面的 modelChoices。
     async detectModels(): Promise<readonly string[] | null> {
       return detectModelsViaExec(this.resolvedBin, ['debug', 'models'], parseDebugModelsJson);
+    },
+    async detectModelCapabilities(options) {
+      return detectModelCapabilitiesViaExec(this.resolvedBin, options?.env);
     },
     // RPC mode bridges native AskUserQuestion directly. Keep the normal
     // botmux-ask skill available too: TraeX sessions can fail closed to a

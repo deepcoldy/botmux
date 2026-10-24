@@ -68,6 +68,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
+import { takePaneLaunchFile } from './helpers/pane-launch.js';
 
 setStartupTmuxRetrySleepForTests(() => {});
 
@@ -297,9 +298,6 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       pendingProvenancePresent: false,
       isolationMarkerReattachSafe: false,
     } as any).action).toBe('refuse-inconclusive-probe');
-    expect(workerSource).toMatch(
-      /if \(appliedIsolationCapabilities\.length > 0 && persistentSessionName && !willReattachPersistent\)/,
-    );
   });
 
   it('fails CLOSED when the biased reattach meets a pane that is really gone', () => {
@@ -340,7 +338,8 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     });
     const newSession = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('new-session'));
     expect(newSession).toBeDefined();
-    expect((newSession![1] as string[]).join(' ')).toContain('first user message');
+    // The CLI argv reaches the pane through its launch file, not the tmux command.
+    expect(takePaneLaunchFile(newSession![1] as string[]).body).toContain(`'first user message'`);
   });
 
   it('keeps the fresh-path invariant: a predicted-fresh create that collides throws (no duplicate swallowing)', () => {
@@ -361,27 +360,14 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
   });
 });
 
-describe('worker wiring (source pins)', () => {
-  it('gates tmux through the tri-state resolver, not the boolean hasSession', () => {
-    expect(workerSource).not.toMatch(/hasExistingSession = TmuxBackend\.hasSession\(/);
-    expect(workerSource).toMatch(/resolveTmuxBackendGate\(\{/);
-    expect(workerSource).toMatch(/TmuxBackend\.probeSessionWithRetry\(tmuxSessionName\)/);
-    expect(workerSource).toMatch(/persistentReattachBias\(resolvedTmuxSessionProbe\)/);
-  });
-
-  it('re-probes an indeterminate reattach before the first selection', () => {
-    const reconcileAt = workerSource.indexOf('reconcileBiasedReattachProbe(before');
-    const selectAt = workerSource.indexOf('let selectedBackend = selectBackend();');
-    expect(reconcileAt).toBeGreaterThan(0);
-    expect(reconcileAt).toBeLessThan(selectAt);
-  });
-
-  it('resets the frozen tmux probe to missing after every post-kill re-selection', () => {
-    expect(workerSource.match(/resolvedTmuxSessionProbe = 'missing';/g)?.length).toBeGreaterThanOrEqual(2);
-    expect(workerSource).toMatch(/resolvedTmuxSessionProbe = postKillProbe === 'exists' \? 'exists' : 'missing';/);
-  });
-
-  it('routes an args-baked prompt through the queue on a predicted reattach', () => {
-    expect(workerSource).toMatch(/shouldDeferInitialPromptForReattach\(\{\s*willReattachPersistent,/);
+describe('worker consumes the reattach prediction at spawn', () => {
+  // 源码结构护栏(K2/K3)：worker.ts 是无导出的进程入口，下面两处消费 willReattachPersistent 的分支在
+  // spawn 闭包里，没有行为 seam（上面的链路用例跑的是它们调用的纯函数）。#833 写明预测 reattach 时：
+  // ① 读隔离不得为未执行 wrapper 的旧 pane 写 fresh boot marker——那等于伪造隔离证明（K2）；
+  // ② argv 传首条 prompt 的 CLI 必须改走输入队列——reattach 不执行启动 argv，原来会静默丢首条消息（K3）。
+  it('never writes a fresh isolation proof nor bakes the first prompt into argv on a predicted reattach', () => {
+    const markerGate = workerSource.match(/if \(appliedIsolationCapabilities\.length > 0 && [^)]*\)/);
+    expect(markerGate?.[0]).toContain('!willReattachPersistent');
+    expect(workerSource).toMatch(/shouldDeferInitialPromptForReattach\(\{[^}]*\bwillReattachPersistent\b/);
   });
 });

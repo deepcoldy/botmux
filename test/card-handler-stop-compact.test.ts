@@ -96,6 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 
@@ -389,7 +390,7 @@ describe('compact_session card action', () => {
   // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
   // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
   // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
-  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app', 'minimax'])(
     'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
     async (cliId) => {
       const ds = makeDs({ sessionOverrides: { cliId } as any });

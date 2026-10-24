@@ -6,6 +6,7 @@ import {
   ensureManagedOriginAttestationDirectory,
   managedOriginAttestationProofPath,
 } from './managed-origin-capability.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 
 const REQUEST_DOMAIN = 'botmux-native-subagent-runtime/v1/request';
 const RESPONSE_DOMAIN = 'botmux-native-subagent-runtime/v1/response';
@@ -53,10 +54,6 @@ interface NativeSubagentRuntimeResponseBinding extends NativeSubagentRuntimeBind
   requestNonce: string;
   status: number;
   body: string | Uint8Array;
-}
-
-function isLoopback(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || Boolean(address?.endsWith('::ffff:127.0.0.1'));
 }
 
 function isValidBinding(input: NativeSubagentRuntimeBinding): boolean {
@@ -207,7 +204,7 @@ export function verifyNativeSubagentRuntimeCapabilityRequest(
     nowMs?: number;
   },
 ): NativeSubagentRuntimeCapabilityVerifyResult {
-  if (!isLoopback(input.remoteAddress)) return { ok: false, reason: 'remote_not_loopback' };
+  if (!isLoopbackPeer(input.remoteAddress)) return { ok: false, reason: 'remote_not_loopback' };
   const timestamp = headerValue(input.headers, NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.timestamp);
   const nonce = headerValue(input.headers, NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.nonce);
   const signature = headerValue(input.headers, NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.requestSignature);

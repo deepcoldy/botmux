@@ -7,7 +7,6 @@ import {
   claimIssueIntoGroup,
   claimMarker,
   issueDetailUrl,
-  matchesClaimMarker,
   type ClaimFlowDeps,
 } from '../src/services/issue-claim-flow.js';
 import {
@@ -16,7 +15,6 @@ import {
   getClaimIntent,
   listBindings,
   listClaimIntents,
-  listDanglingClaimIntents,
   listOutbox,
 } from '../src/services/issue-board-store.js';
 
@@ -74,11 +72,9 @@ function deps(over: Partial<ClaimFlowDeps> = {}) {
 }
 
 describe('领取标记', () => {
-  it('取 claimId 前 8 位，能从群名反查', () => {
+  it('取 claimId 前 8 位', () => {
     const id = 'abcdef0123456789abcdef0123456789';
     expect(claimMarker(id)).toBe('#abcdef01');
-    expect(matchesClaimMarker(`修一个 bug ${claimMarker(id)}`, id)).toBe(true);
-    expect(matchesClaimMarker('修一个 bug #deadbeef', id)).toBe(false);
   });
 });
 
@@ -297,7 +293,7 @@ describe('失败留下的状态必须可对账', () => {
     });
     const r = await claimIssueIntoGroup(d, ARGS);
     expect(r).toMatchObject({ ok: false, stage: 'group', reason: 'lark 5xx', claimId: 'c'.repeat(32) });
-    const dangling = listDanglingClaimIntents(dataDir);
+    const dangling = listClaimIntents(dataDir);
     expect(dangling).toHaveLength(1);
     expect(dangling[0].issueId).toBe('iss-1');
     expect(dangling[0].anchorId).toBeUndefined(); // 群没建出来，anchor 自然没有
@@ -369,7 +365,6 @@ describe('群名长度', () => {
     const name = claimGroupName('很长的标题'.repeat(20), ID);
     expect(name.length).toBeLessThanOrEqual(50);
     expect(name.endsWith(claimMarker(ID))).toBe(true);
-    expect(matchesClaimMarker(name, ID)).toBe(true);
     expect(name).toContain('…');
   });
 
@@ -379,13 +374,13 @@ describe('群名长度', () => {
 
   it('标题只有空白也拼得出可反查的群名', () => {
     const name = claimGroupName('   ', ID);
-    expect(matchesClaimMarker(name, ID)).toBe(true);
+    expect(name).toContain(claimMarker(ID));
   });
 
   it('实际建群用的就是这个名字', async () => {
     const { d, groupOpts } = deps();
     await claimIssueIntoGroup(d, { ...ARGS, issue: { ...ISSUE, title: '很长的标题'.repeat(20) } });
     expect(groupOpts[0].name.length).toBeLessThanOrEqual(50);
-    expect(matchesClaimMarker(groupOpts[0].name, 'c'.repeat(32))).toBe(true);
+    expect(groupOpts[0].name).toContain(claimMarker('c'.repeat(32)));
   });
 });

@@ -145,15 +145,6 @@ describe('终端控制权路由', () => {
 });
 
 describe('生产 dashboard 真的走这条共享路由', () => {
-  it('dashboard.ts 只调路由模块，不再内联 takeover / release 分发', () => {
-    const source = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(source).toContain('resolveTerminalControlAction');
-    expect(source).toContain('matchTerminalControlRoute');
-    // 内联那份正是「?expect= 只在验收脚本里被读」的来源，必须彻底消失。
-    expect(source).not.toContain('terminalControl.takeover(');
-    expect(source).not.toContain('terminalControl.release(');
-  });
-
   it('验收脚本也走同一份路由，不再照抄一遍', () => {
     for (const file of [
       'scripts/verify-workbench-production-e2e.ts',

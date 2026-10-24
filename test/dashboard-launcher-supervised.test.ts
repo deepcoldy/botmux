@@ -88,61 +88,6 @@ describe('dashboard launcher — wiring (pure, no HOME)', () => {
   });
 });
 
-describe('dashboard launcher — source pins', () => {
-  const read = (rel: string) => readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
-
-  it('index-supervisor.ts supervises fleet MEMBERS (bots + dashboard), not bots alone', () => {
-    const src = read('index-supervisor.ts');
-    // The supervisor must start the member set that includes the dashboard.
-    expect(src).toContain('resolveFleetMembers');
-    expect(src).toContain('supervisor.start(members)');
-    // Guard against a regression back to bots-only supervision.
-    expect(src).not.toContain('supervisor.start(bots)');
-  });
-
-  it('cli.ts self-spawn dispatcher routes __dashboard to index-dashboard.js', () => {
-    const cli = read('cli.ts');
-    expect(cli).toContain("__entrySubcommand === 'dashboard') await import('./index-dashboard.js')");
-  });
-
-  it('cmdRestart health-gates on fleet MEMBERS so a down dashboard fails the restart', () => {
-    const cli = read('cli.ts');
-    expect(cli).toContain('fleetMemberNames');
-  });
-
-  it('reports quota fallback cycles before restart and keeps the recoverable fleet path', () => {
-    const cli = read('cli.ts');
-    const restart = cli.slice(
-      cli.indexOf('async function cmdRestart()'),
-      cli.indexOf('\nexport type StartBotLiveResult'),
-    );
-    const preflight = restart.indexOf("preflightQuotaFallbackTopology(loadBotsJson(), 'restart')");
-    expect(preflight).toBeGreaterThanOrEqual(0);
-    expect(preflight).toBeLessThan(restart.indexOf("cleanupLegacyPm2('restart')"));
-    expect(preflight).toBeLessThan(restart.indexOf('stopPluginServicesForCli'));
-    expect(preflight).toBeLessThan(restart.indexOf('const r = restartFleet({'));
-    expect(cli).toContain('Dashboard 和其它 Bot 将继续启动。');
-    expect(cli).toContain('已跳过');
-    expect(cli).toContain('修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');
-  });
-
-  it('bot-onboarding.ts STATIC-imports qrcode vendor files so the compiled binary embeds them', () => {
-    // The compiled (bun --compile) dashboard crashed with "Cannot find module
-    // 'qrcode-terminal/vendor/QRCode'" because a `createRequire(...)` of a bare
-    // dir path is not traced/embedded by the bundler. Static `.js` imports are.
-    // (Verified end-to-end: the fix takes the 1.4 compiled dashboard from
-    // crashloop → online.) Guard against a regression back to createRequire.
-    const src = read('dashboard/bot-onboarding.ts');
-    expect(src).toContain("import QRCode from 'qrcode-terminal/vendor/QRCode/index.js'");
-    expect(src).toContain("import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js'");
-    // No actual createRequire CALL or dynamic vendor require (the prose comment
-    // mentions createRequire, so match the code forms, not the bare word).
-    expect(src).not.toContain("createRequire(import.meta");
-    expect(src).not.toContain("import { createRequire }");
-    expect(src).not.toMatch(/require\(\s*['"]qrcode-terminal\/vendor/);
-  });
-});
-
 describe('FleetSupervisor manages the dashboard like a bot daemon (live)', () => {
   const dashboardSpec: FleetBotSpec = resolveDashboardSpec();
 

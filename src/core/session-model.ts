@@ -1,11 +1,19 @@
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
+import {
+  TRAEX_AUTO_MODEL_ID,
+  validTraexAutoModelRuntime,
+  type TraexAutoModelConfig,
+  type TraexAutoModelRuntimeState,
+} from '../services/traex-auto-model.js';
 
 /** Minimal shape of the runtime session needed to resolve a launch model. */
 export type LaunchModelSession = {
   session: {
     cliId?: CliId;
     model?: string;
+    cliSessionId?: string;
+    traexAutoModelRuntime?: TraexAutoModelRuntimeState;
     groupDefaultModels?: GroupDefaultModels;
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
@@ -23,7 +31,59 @@ export function resolveSessionGroupSettings(ds: LaunchModelSession, cliId: strin
 }
 
 /** Minimal shape of the live bot config needed to resolve a launch model. */
-export type LaunchModelBotConfig = { cliId?: CliId; model?: string };
+export type LaunchModelBotConfig = {
+  cliId?: CliId;
+  model?: string;
+  traexAutoModel?: TraexAutoModelConfig;
+};
+
+export type SessionLaunchModelChoice = {
+  model?: string;
+  traexAutoModel?: TraexAutoModelConfig;
+};
+
+/**
+ * Resolve both the concrete launch model and the optional virtual-auto policy.
+ *
+ * `auto` is reserved as a BotMux virtual model for TraeX. It is never forwarded
+ * to the CLI. A valid ordered allowlist resolves it to the first model; a
+ * missing/invalid policy resolves to no model instead of accidentally asking
+ * TraeX or a future provider to interpret a different `auto` meaning.
+ */
+export function resolveSessionLaunchModelChoice(
+  ds: LaunchModelSession,
+  botCfg?: LaunchModelBotConfig,
+): SessionLaunchModelChoice {
+  const cliId = ds.session.cliId ?? botCfg?.cliId;
+  let logicalModel: string | undefined;
+  if (ds.session.dispatchLaunchSpec) {
+    logicalModel = ds.session.dispatchLaunchSpec.effective.model;
+  } else if (ds.spawnModelOverride) {
+    logicalModel = ds.spawnModelOverride;
+  } else {
+    const groupModel = resolveSessionGroupSettings(ds, cliId).model;
+    if (groupModel) {
+      logicalModel = groupModel;
+    } else if (!botCfg) {
+      logicalModel = ds.session.model;
+    } else {
+      const sessionCliId = ds.session.cliId;
+      const cliMatchesBot = !sessionCliId || !botCfg.cliId || sessionCliId === botCfg.cliId;
+      logicalModel = cliMatchesBot ? botCfg.model : ds.session.model;
+    }
+  }
+
+  if (cliId !== 'traex' || logicalModel?.trim().toLowerCase() !== TRAEX_AUTO_MODEL_ID) {
+    return { model: logicalModel };
+  }
+  const auto = botCfg?.traexAutoModel;
+  if (!auto?.enabled || auto.models.length === 0) return {};
+  const runtime = ds.session.traexAutoModelRuntime;
+  return {
+    model: validTraexAutoModelRuntime(auto, runtime, ds.session.cliSessionId) ? runtime.model : auto.models[0],
+    traexAutoModel: auto,
+  };
+}
 
 /**
  * The model botmux passes to the CLI for a given session's next spawn.
@@ -61,15 +121,5 @@ export function resolveSessionLaunchModel(
   ds: LaunchModelSession,
   botCfg?: LaunchModelBotConfig,
 ): string | undefined {
-  if (ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.model;
-  if (ds.spawnModelOverride) return ds.spawnModelOverride;
-  const cliId = ds.session.cliId ?? botCfg?.cliId;
-  const groupModel = resolveSessionGroupSettings(ds, cliId).model;
-  if (groupModel) return groupModel;
-  // No live config to consult (deregistered bot / display surfaces that tolerate
-  // a missing registry entry) → the session's own record is the best we have.
-  if (!botCfg) return ds.session.model;
-  const sessionCliId = ds.session.cliId;
-  const cliMatchesBot = !sessionCliId || !botCfg.cliId || sessionCliId === botCfg.cliId;
-  return cliMatchesBot ? botCfg.model : ds.session.model;
+  return resolveSessionLaunchModelChoice(ds, botCfg).model;
 }

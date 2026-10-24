@@ -35,6 +35,9 @@ import { join, resolve } from 'node:path';
 import { execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -200,6 +203,7 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
   const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-migration-'));
+  const managedSocket = preferredManagedTmuxSocket(privateTmuxEnv(root));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
   const eventsFile = join(root, 'events');
@@ -227,12 +231,25 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
   try {
     const spawnOptions: SpawnOptions = {
       cwd: resolve('.'),
-      env: {
-        ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      env: privateTmuxEnv(root, {
+        SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
         ...(scenario.workflow ? { BOTMUX_WORKFLOW: '1' } : {}),
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     };
+    if (backendType === 'tmux') {
+      // Managed sessions share one long-lived server in production. Alone on a
+      // private server, the CLI's session takes the server down with it when
+      // the CLI crashes, and a liveness probe caught in the few ms the server
+      // spends exiting reads "server exited unexpectedly" — a connection-level
+      // answer the tmux backend deliberately does not count as death — so the
+      // crash is reported one 9s probe period later: ~22s instead of ~13s,
+      // past waitFor's 20s (CI 2026-10-21, 2026-10-23). A session of the
+      // test's own keeps the server up, so a dead pane always reads as missing
+      // from a live server.
+      execFileSync('tmux', [...tmuxSocketArgs(managedSocket), 'new-session', '-d', '-s', 'test-keepalive', 'sleep 86400'],
+        { env: spawnOptions.env, stdio: 'ignore' });
+    }
     child = spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
     child.on('message', m => messages.push(m as WorkerToDaemon));
     child.stdout?.on('data', b => logs.push(b.toString()));
@@ -254,16 +271,15 @@ async function runScenario(scenario: Scenario, drive: (ctx: ScenarioContext) => 
       detail,
     });
   } finally {
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // Together with any tmux call it still has in flight: TMUX_TMPDIR goes below.
+    if (child) await killProcessTree(child);
     if (existsSync(cliPidFile)) {
       try { process.kill(Number(readFileSync(cliPidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root }, stdio: 'ignore' }); } catch { /* exited */ }
+      for (const socket of new Set([undefined, managedSocket])) {
+        try { execFileSync('tmux', [...tmuxSocketArgs(socket), 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }

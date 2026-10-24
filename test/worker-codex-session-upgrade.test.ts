@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CodexExecutable, CodexProcess } from '../src/services/codex-session-upgrade.js';
+import { classifyMergedRestart, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
 
 const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 const parsed = ts.createSourceFile('worker.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -100,13 +101,25 @@ function harness() {
     sandboxEnabled: () => false,
     setTimeout,
     clearTimeout,
+    // Correlated restart attempt bookkeeping (#1863).
+    activeRestartAttemptId: undefined,
+    restartWindowLaunch: undefined,
+    pendingLaunchConvergence: undefined,
+    decideRestartReceipt,
+    classifyMergedRestart,
+    decideUpgradeLaunchConvergence,
+    restartLaunchSettings,
   };
   const oldBackend = { destroySession: vi.fn(async () => { steps.push('destroy'); }) };
   state.backend = oldBackend;
-  state.killCli = vi.fn(() => {
+  // Mirrors the real killCli's queue semantics: accepted input and accepted
+  // slash injections survive only when the caller asks for it.
+  state.killCli = vi.fn((opts: { preservePending?: boolean; preserveInjections?: boolean } = {}) => {
     steps.push('kill');
     state.backend = null;
     state.remoteThreadId = undefined;
+    if (!opts.preservePending) state.pendingMessages.length = 0;
+    if (!opts.preserveInjections) state.pendingInjections.length = 0;
   });
   state.waitForCodexExit = vi.fn(async () => { steps.push('exit confirmed'); });
   state.codexRpcEligible = vi.fn(() => false);
@@ -133,6 +146,10 @@ function harness() {
     return new Set([threadId]);
   });
   state.codexUpgradeBlocked = evaluate<() => string | undefined>('codexUpgradeBlocked', state);
+  state.settleRestartAttemptOnReady = evaluate<(trigger: string) => void>('settleRestartAttemptOnReady', state);
+  state.foldRestartIntoWindow = evaluate<(attemptId?: string) => void>('foldRestartIntoWindow', state);
+  state.adoptPendingLaunchConvergence = evaluate<() => void>('adoptPendingLaunchConvergence', state);
+  state.failPendingLaunchConvergence = evaluate<() => void>('failPendingLaunchConvergence', state);
   state.releaseRawInputRestartGate = evaluate<() => void>('releaseRawInputRestartGate', state);
   state.flushPendingInjections = vi.fn(async () => {
     steps.push('injections flush requested');
@@ -348,6 +365,8 @@ describe('worker Codex session automatic upgrade', () => {
     await settleMicrotasks();
     expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
     expect(h.state.replacementSpawnInProgress).toBe(true);
+    // restoreCfg('thread') strips both model and reasoningEffort so the same
+    // configuration upgrade resumes the native thread's own model / effort.
     expect(h.state.spawnCli).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'botmux-session', workingDir: '/project', cliId: 'codex',
       resume: true, cliSessionId: threadId, prompt: '', forkSession: false,
@@ -484,24 +503,204 @@ describe('worker Codex session automatic upgrade', () => {
     expect(h.state.flushPendingInjections).not.toHaveBeenCalled();
   });
 
-  it.each(['workingDir', 'env'] as const)('rejects a concurrent %s change before releasing accepted input', async field => {
+  /** Run until the n-th restore pass has spawned its replacement. */
+  async function untilSpawned(h: ReturnType<typeof harness>, n: number) {
+    await vi.waitFor(() => expect(h.state.spawnCli).toHaveBeenCalledTimes(n));
+  }
+
+  it.each(['workingDir', 'env'] as const)('converges a concurrent %s change with a second verified restore pass instead of failing', async field => {
     const h = harness();
     const done = h.run();
-    await settleMicrotasks();
+    await untilSpawned(h, 1);
     h.state.pendingMessages.push({ text: 'keep this accepted turn' });
     h.state.pendingInjections.push({ kind: 'cwd', cwd: '/new-project' });
     if (field === 'workingDir') h.state.lastInitConfig.workingDir = '/new-project';
     else h.state.lastInitConfig.env = { CODEX_TEST_SETTING: 'changed' };
     h.ready();
-    expect(await done).toEqual(new Error('Session launch settings changed during upgrade; restart is required'));
+    await untilSpawned(h, 2);
+    // Still inside the upgrade: inputs fenced, nothing flushed.
+    expect(h.state.codexAutoUpgrade?.stage).toBe('restoring');
+    expect(h.state.cliRestartInProgress).toBe(true);
+    expect(h.state.rawInputRestartGate).toBe(true);
+    expect(h.state.flushPending).not.toHaveBeenCalled();
+    const converged = h.state.spawnCli.mock.calls[1][0];
+    expect(converged).toMatchObject({
+      cliPathOverride: target.path, cliSessionId: threadId, resume: true, forkSession: false,
+      ...(field === 'workingDir' ? { workingDir: '/new-project' } : { env: { CODEX_TEST_SETTING: 'changed' } }),
+    });
+    h.ready();
+    expect(await done).toBeUndefined();
+    // Both passes verified the runtime and the exact thread.
+    expect(h.state.inspectCodexUpgradeRuntime).toHaveBeenCalledTimes(2);
+    expect(h.state.waitForCodexExit).toHaveBeenNthCalledWith(2, replacement);
+    expect(h.state.codexAutoUpgrade).toBeUndefined();
+    expect(h.state.pendingInjections).toEqual([{ kind: 'cwd', cwd: '/new-project' }]);
+    expect(h.state.flushPendingInjections).toHaveBeenCalled();
+    expect(h.state.send.mock.calls.some((call: any[]) => call[0]?.type === 'user_notify')).toBe(false);
+  });
+
+  // #1863: a correlated restart that lands during the upgrade window is folded
+  // in (foldRestartIntoWindow, called by the worker's merge guard). Never
+  // settled by the replacement's ready edge — the upgrade verifies runtime and
+  // thread only afterwards. Same launch settings as the upgrade replacement →
+  // settled after verification; different (by value) → another restore pass
+  // that inherits the whole upgrade context, settled only once it is verified;
+  // upgrade failure → failed.
+  function restartReceipts(h: ReturnType<typeof harness>) {
+    return h.state.send.mock.calls.map((call: any[]) => call[0]).filter((m: any) => m?.type === 'restart_result');
+  }
+
+  it('settles a folded restart the upgrade replacement satisfies, only after verification and without another pass', async () => {
+    const h = harness();
+    // The upgrade replacement follows the native thread model and effort;
+    // neither override is present in this same-settings restart request.
+    h.state.lastInitConfig.model = undefined;
+    h.state.lastInitConfig.reasoningEffort = undefined;
+    const done = h.run();
+    await untilSpawned(h, 1);
+    h.state.foldRestartIntoWindow('folded-same-settings');
+    expect(h.state.activeRestartAttemptId).toBe('folded-same-settings');
+    expect(h.state.pendingLaunchConvergence).toBeUndefined();
+
+    // The replacement's ready edge (markPromptReady → shared settle helper).
+    h.state.isPromptReady = true;
+    h.state.settleRestartAttemptOnReady('prompt-ready');
+    expect(restartReceipts(h)).toEqual([]);
+
+    h.ready();
+    expect(await done).toBeUndefined();
+    expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
+    expect(restartReceipts(h)).toEqual([
+      { type: 'restart_result', attemptId: 'folded-same-settings', status: 'succeeded', category: 'prompt_ready' },
+    ]);
+    // After verification published the runtime version, prompt_ready first
+    // (the daemon cleared cliReady when it requested this attempt).
+    const sent = h.state.send.mock.calls.map((call: any[]) => call[0]?.type);
+    const receiptAt = sent.indexOf('restart_result');
+    expect(receiptAt).toBeGreaterThan(sent.indexOf('cli_runtime_version'));
+    expect(sent[receiptAt - 1]).toBe('prompt_ready');
+  });
+
+  it.each([
+    ['larkToolBinding', (cfg: any) => { cfg.larkToolBinding = false; }, { larkToolBinding: false }],
+    ['model', (cfg: any) => { cfg.model = 'gpt-6-edited'; }, { model: 'gpt-6-edited' }],
+    ['reasoningEffort', (cfg: any) => { cfg.reasoningEffort = 'xhigh'; }, { reasoningEffort: 'xhigh' }],
+    ['modelBackendVariant', (cfg: any) => { cfg.modelBackendVariant = 'max'; }, { modelBackendVariant: 'max' }],
+  ] as const)('converges a folded restart that changed %s after the upgrade snapshot with a pass that keeps the upgrade context', async (_field, edit, expected) => {
+    const h = harness();
+    h.state.lastInitConfig.model = undefined;
+    const done = h.run();
+    await untilSpawned(h, 1);
+    // Accepted during the upgrade fence: input and a whitelisted slash injection.
+    h.state.pendingMessages.push({ text: 'keep this accepted turn' });
+    h.state.pendingInjections.push({ kind: 'slash', command: '/compact' });
+    // The merge guard applies the request to lastInitConfig, then folds it.
+    edit(h.state.lastInitConfig);
+    h.state.foldRestartIntoWindow('folded-config-edit');
+    expect(h.state.pendingLaunchConvergence?.attemptId).toBe('folded-config-edit');
+
+    h.state.isPromptReady = true;
+    h.state.settleRestartAttemptOnReady('prompt-ready');
+    h.ready();
+    await untilSpawned(h, 2);
+    // The upgrade pass verified, but its replacement runs the old setting: no
+    // receipt; the convergence pass owns the attempt and the fences.
+    expect(restartReceipts(h)).toEqual([]);
+    expect(h.state.activeRestartAttemptId).toBe('folded-config-edit');
+    expect(h.state.pendingLaunchConvergence).toBeUndefined();
+    expect(h.state.cliRestartInProgress).toBe(true);
+    expect(h.state.flushPending).not.toHaveBeenCalled();
+    // Inherited upgrade context: the verified executable (not PATH codex), the
+    // exact thread, the requested launch setting, and preserved queues through
+    // the real killCli options.
+    expect(h.state.spawnCli.mock.calls[1][0]).toMatchObject({
+      cliPathOverride: target.path, cliSessionId: threadId, resume: true, forkSession: false,
+      nativeSessionTitle: undefined, ...expected,
+    });
+    expect(h.state.killCli).toHaveBeenNthCalledWith(2, {
+      preservePending: true, preservePolicyCapability: true, preserveInjections: true,
+    });
+    expect(h.state.pendingInjections).toEqual([{ kind: 'slash', command: '/compact' }]);
+    expect(h.state.pendingMessages).toEqual([{ text: 'keep this accepted turn' }]);
+
+    // Settled only after the convergence pass is ready AND verified.
+    h.state.isPromptReady = true;
+    h.state.settleRestartAttemptOnReady('prompt-ready');
+    expect(restartReceipts(h)).toEqual([]);
+    h.ready();
+    expect(await done).toBeUndefined();
+    expect(h.state.inspectCodexUpgradeRuntime).toHaveBeenCalledTimes(2);
+    expect(restartReceipts(h)).toEqual([
+      { type: 'restart_result', attemptId: 'folded-config-edit', status: 'succeeded', category: 'prompt_ready' },
+    ]);
+    const steps = h.steps;
+    expect(steps.lastIndexOf('verify thread fd')).toBeGreaterThan(steps.lastIndexOf('spawn'));
+    expect(h.state.flushPendingInjections).toHaveBeenCalled();
+  });
+
+  it('fails the folded restart when the convergence pass fails verification, keeping input fenced', async () => {
+    const h = harness();
+    h.state.lastInitConfig.model = undefined;
+    h.state.inspectCodexUpgradeRuntime
+      .mockResolvedValueOnce(replacement)
+      .mockResolvedValueOnce([{ ...replacement[0]!, version: '0.146.0' }]);
+    const done = h.run();
+    await untilSpawned(h, 1);
+    h.state.lastInitConfig.larkToolBinding = false;
+    h.state.foldRestartIntoWindow('folded-before-failure');
+    h.ready();
+    await untilSpawned(h, 2);
+    h.ready();
+    expect(await done).toEqual(new Error('Replacement Codex runtime or thread identity did not match'));
+    expect(restartReceipts(h)).toEqual([
+      { type: 'restart_result', attemptId: 'folded-before-failure', status: 'failed', category: 'spawn_failed' },
+    ]);
     expect(h.state.codexAutoUpgrade).toEqual({ stage: 'failed', threadId });
     expect(h.state.cliRestartInProgress).toBe(true);
     expect(h.state.rawInputRestartGate).toBe(true);
-    expect(h.state.replacementSpawnInProgress).toBe(false);
-    expect(h.state.pendingMessages).toEqual([{ text: 'keep this accepted turn' }]);
-    expect(h.state.pendingInjections).toEqual([{ kind: 'cwd', cwd: '/new-project' }]);
     expect(h.state.flushPending).not.toHaveBeenCalled();
-    expect(h.state.flushPendingInjections).not.toHaveBeenCalled();
+  });
+
+  it('fails a folded restart when the upgrade pass itself fails', async () => {
+    const h = harness();
+    h.state.inspectCodexUpgradeRuntime.mockResolvedValue([{ ...replacement[0]!, version: '0.146.0' }]);
+    const done = h.run();
+    await untilSpawned(h, 1);
+    h.state.pendingMessages.push({ text: 'keep this accepted turn' });
+    h.state.lastInitConfig.larkToolBinding = false;
+    h.state.foldRestartIntoWindow('folded-before-failure');
+
+    h.ready();
+    expect(await done).toEqual(new Error('Replacement Codex runtime or thread identity did not match'));
+    expect(restartReceipts(h)).toEqual([
+      { type: 'restart_result', attemptId: 'folded-before-failure', status: 'failed', category: 'spawn_failed' },
+    ]);
+    expect(h.state.pendingLaunchConvergence).toBeUndefined();
+    expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
+    // Input stays fenced until the next /restart, matching the daemon fence.
+    expect(h.state.codexAutoUpgrade).toEqual({ stage: 'failed', threadId });
+    expect(h.state.cliRestartInProgress).toBe(true);
+    expect(h.state.rawInputRestartGate).toBe(true);
+    expect(h.state.flushPending).not.toHaveBeenCalled();
+  });
+
+  it('gives up (input fenced, folded attempt failed) when launch settings keep changing across passes', async () => {
+    const h = harness();
+    h.state.lastInitConfig.model = undefined;
+    const done = h.run();
+    for (let pass = 1; pass <= 3; pass++) {
+      await untilSpawned(h, pass);
+      h.state.lastInitConfig.larkToolBinding = pass % 2 === 1 ? false : true;
+      h.state.foldRestartIntoWindow(`folded-${pass}`);
+      h.ready();
+    }
+    expect(await done).toEqual(new Error('Session launch settings kept changing during upgrade; restart is required'));
+    expect(h.state.spawnCli).toHaveBeenCalledTimes(3);
+    // Every still-outstanding folded attempt is failed; none succeeded.
+    const receipts = restartReceipts(h);
+    expect(receipts).toContainEqual({ type: 'restart_result', attemptId: 'folded-3', status: 'failed', category: 'spawn_failed' });
+    expect(receipts.every((r: any) => r.status === 'failed')).toBe(true);
+    expect(h.state.codexAutoUpgrade).toEqual({ stage: 'failed', threadId });
   });
 
   it('restores RPC ownership and plugin generation before spawning the original thread viewer', async () => {

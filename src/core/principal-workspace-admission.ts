@@ -2,12 +2,6 @@ import { createHash } from 'node:crypto';
 
 export const PRINCIPAL_WORKSPACE_GROUP_KEY_VERSION = 2 as const;
 const PRINCIPAL_WORKSPACE_GROUP_DOMAIN = 'botmux.principal-workspace.group';
-export const PRINCIPAL_WORKSPACE_TICKET_VERSION = 1 as const;
-export const PRINCIPAL_WORKSPACE_TICKET_SEQUENCE_VERSION = 1 as const;
-export const PRINCIPAL_WORKSPACE_TICKET_NAMESPACE_VERSION = 1 as const;
-export const PRINCIPAL_WORKSPACE_TICKET_RECORD_VERSION = 1 as const;
-export const PRINCIPAL_WORKSPACE_TICKET_PAYLOAD_ENCODING = 'canonical-json-utf8-base64' as const;
-const PRINCIPAL_WORKSPACE_TICKET_DOMAIN = 'botmux.principal-workspace.ticket';
 
 export type PrincipalWorkspaceGroupPhase = 'active' | 'closing' | 'closed' | 'quarantined';
 export type PrincipalWorkspaceMemberPhase = 'active' | 'closing' | 'closed' | 'quarantined';
@@ -39,59 +33,6 @@ export interface PrincipalWorkspaceMember {
   updatedAt: string;
   quarantineReason?: string;
 }
-
-export type PrincipalWorkspaceTicketStatus =
-  | 'queued'
-  | 'attempting'
-  | 'completed'
-  | 'cancelled'
-  | 'unknown';
-
-export interface PrincipalWorkspaceTicketLocator {
-  namespaceVersion: typeof PRINCIPAL_WORKSPACE_TICKET_NAMESPACE_VERSION;
-  namespace: string;
-  recordVersion: typeof PRINCIPAL_WORKSPACE_TICKET_RECORD_VERSION;
-  recordId: string;
-  turnId: string;
-  payloadEncoding: typeof PRINCIPAL_WORKSPACE_TICKET_PAYLOAD_ENCODING;
-  payloadHash: string;
-  exactFileLength: number;
-}
-
-export interface PrincipalWorkspaceTicketSequence {
-  version: typeof PRINCIPAL_WORKSPACE_TICKET_SEQUENCE_VERSION;
-  groupId: string;
-  lastSequence: number;
-  revision: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PrincipalWorkspaceTicket {
-  version: typeof PRINCIPAL_WORKSPACE_TICKET_VERSION;
-  ticketId: string;
-  groupId: string;
-  sequence: number;
-  sourceSessionId: string;
-  laneId: string;
-  sessionId: string;
-  workspaceEpoch: number;
-  turnId: string;
-  status: PrincipalWorkspaceTicketStatus;
-  revision: number;
-  locator: PrincipalWorkspaceTicketLocator;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export type PrincipalWorkspaceTicketAuditEvent =
-  | 'enqueued'
-  | 'turn_record_conflict'
-  | 'record_ticket_conflict'
-  | 'ticket_id_collision'
-  | 'ticket_row_corruption'
-  | 'sequence_corruption'
-  | 'counter_corruption';
 
 function lengthPrefixed(value: string): Buffer {
   const bytes = Buffer.from(value, 'utf8');
@@ -127,34 +68,6 @@ export function principalWorkspaceGroupIdV2(larkAppId: string, canonicalCwd: str
     hash.update(lengthPrefixed(value));
   }
   return `principal-workspace:v2:${hash.digest('hex')}`;
-}
-
-/** Deterministic cross-process ticket identity. Record identity is excluded on
- * purpose: one exact turn always has one ticket id, while a different record
- * for that turn is an explicit conflict rather than a second ticket. */
-export function principalWorkspaceTicketIdV1(args: {
-  groupId: string;
-  sourceSessionId: string;
-  laneId: string;
-  sessionId: string;
-  turnId: string;
-}): string {
-  const hash = createHash('sha256');
-  hash.update(lengthPrefixed(PRINCIPAL_WORKSPACE_TICKET_DOMAIN));
-  const version = Buffer.allocUnsafe(4);
-  version.writeUInt32BE(PRINCIPAL_WORKSPACE_TICKET_VERSION, 0);
-  hash.update(version);
-  for (const [name, value] of [
-    ['groupId', args.groupId],
-    ['sourceSessionId', args.sourceSessionId],
-    ['laneId', args.laneId],
-    ['sessionId', args.sessionId],
-    ['turnId', args.turnId],
-  ] as const) {
-    hash.update(lengthPrefixed(name));
-    hash.update(lengthPrefixed(value));
-  }
-  return `principal-workspace-ticket:v1:${hash.digest('hex')}`;
 }
 
 export function validPrincipalWorkspaceGroupIdentity(args: {
@@ -237,105 +150,4 @@ export function parsePrincipalWorkspaceMember(value: unknown):
     return { ok: false, error: 'invalid_member_metadata' };
   }
   return { ok: true, value: candidate as unknown as PrincipalWorkspaceMember };
-}
-
-function safePositive(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 1;
-}
-
-function safeNonnegative(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-function hexSha256(value: unknown): value is string {
-  return typeof value === 'string' && /^sha256:[a-f0-9]{64}$/.test(value);
-}
-
-export function parsePrincipalWorkspaceTicketLocator(value: unknown):
-  | { ok: true; value: PrincipalWorkspaceTicketLocator }
-  | { ok: false; error: string } {
-  const candidate = record(value);
-  if (!candidate
-      || candidate.namespaceVersion !== PRINCIPAL_WORKSPACE_TICKET_NAMESPACE_VERSION
-      || !nonempty(candidate.namespace)
-      || !/^plq_v1_[a-f0-9]{64}$/.test(candidate.namespace)
-      || candidate.recordVersion !== PRINCIPAL_WORKSPACE_TICKET_RECORD_VERSION
-      || !nonempty(candidate.recordId)
-      || !/^plr_v1_[a-f0-9]{64}$/.test(candidate.recordId)
-      || !nonempty(candidate.turnId)
-      || candidate.payloadEncoding !== PRINCIPAL_WORKSPACE_TICKET_PAYLOAD_ENCODING
-      || !hexSha256(candidate.payloadHash)
-      || !safePositive(candidate.exactFileLength)
-      || Number(candidate.exactFileLength) > 2 * 1024 * 1024) {
-    return { ok: false, error: 'invalid_ticket_locator' };
-  }
-  const keys = Object.keys(candidate).sort().join('\0');
-  if (keys !== [
-    'exactFileLength', 'namespace', 'namespaceVersion', 'payloadEncoding',
-    'payloadHash', 'recordId', 'recordVersion', 'turnId',
-  ].sort().join('\0')) {
-    return { ok: false, error: 'invalid_ticket_locator_shape' };
-  }
-  return { ok: true, value: candidate as unknown as PrincipalWorkspaceTicketLocator };
-}
-
-export function parsePrincipalWorkspaceTicketSequence(value: unknown):
-  | { ok: true; value: PrincipalWorkspaceTicketSequence }
-  | { ok: false; error: string } {
-  const candidate = record(value);
-  if (!candidate || candidate.version !== PRINCIPAL_WORKSPACE_TICKET_SEQUENCE_VERSION
-      || !nonempty(candidate.groupId)
-      || !safeNonnegative(candidate.lastSequence)
-      || !safePositive(candidate.revision)
-      || !timestamp(candidate.createdAt) || !timestamp(candidate.updatedAt)) {
-    return { ok: false, error: 'invalid_ticket_sequence' };
-  }
-  if (Object.keys(candidate).sort().join('\0') !== [
-    'createdAt', 'groupId', 'lastSequence', 'revision', 'updatedAt', 'version',
-  ].sort().join('\0')) {
-    return { ok: false, error: 'invalid_ticket_sequence_shape' };
-  }
-  return { ok: true, value: candidate as unknown as PrincipalWorkspaceTicketSequence };
-}
-
-export function parsePrincipalWorkspaceTicket(value: unknown):
-  | { ok: true; value: PrincipalWorkspaceTicket }
-  | { ok: false; error: string } {
-  const candidate = record(value);
-  if (!candidate || candidate.version !== PRINCIPAL_WORKSPACE_TICKET_VERSION
-      || !nonempty(candidate.ticketId) || !nonempty(candidate.groupId)
-      || !safePositive(candidate.sequence)
-      || !nonempty(candidate.sourceSessionId) || !nonempty(candidate.laneId)
-      || !nonempty(candidate.sessionId) || !safePositive(candidate.workspaceEpoch)
-      || !nonempty(candidate.turnId)
-      || !['queued', 'attempting', 'completed', 'cancelled', 'unknown'].includes(
-        String(candidate.status),
-      )
-      || !safePositive(candidate.revision)
-      || !timestamp(candidate.createdAt) || !timestamp(candidate.updatedAt)) {
-    return { ok: false, error: 'invalid_ticket_metadata' };
-  }
-  if (Object.keys(candidate).sort().join('\0') !== [
-    'createdAt', 'groupId', 'laneId', 'locator', 'revision', 'sequence', 'sessionId',
-    'sourceSessionId', 'status', 'ticketId', 'turnId', 'updatedAt', 'version',
-    'workspaceEpoch',
-  ].sort().join('\0')) {
-    return { ok: false, error: 'invalid_ticket_shape' };
-  }
-  const locator = parsePrincipalWorkspaceTicketLocator(candidate.locator);
-  if (!locator.ok || locator.value.turnId !== candidate.turnId) {
-    return { ok: false, error: locator.ok ? 'ticket_turn_mismatch' : locator.error };
-  }
-  const expectedId = principalWorkspaceTicketIdV1({
-    groupId: candidate.groupId,
-    sourceSessionId: candidate.sourceSessionId,
-    laneId: candidate.laneId,
-    sessionId: candidate.sessionId,
-    turnId: candidate.turnId,
-  });
-  if (candidate.ticketId !== expectedId) return { ok: false, error: 'ticket_id_mismatch' };
-  return {
-    ok: true,
-    value: { ...candidate, locator: locator.value } as unknown as PrincipalWorkspaceTicket,
-  };
 }

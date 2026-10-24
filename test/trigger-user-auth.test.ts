@@ -19,11 +19,9 @@ import { describe, it, expect } from 'vitest';
 import {
   parseTriggerUserAuthConfig,
   triggerUserAuthApplies,
-  unauthorizedOutcomeFor,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection,
-} from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf } from '../src/services/trigger-user-auth.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('treats an absent field as "not configured at all"', () => {
@@ -34,6 +32,7 @@ describe('parseTriggerUserAuthConfig', () => {
   it('defaults to disabled when the object omits `enabled`', () => {
     expect(parseTriggerUserAuthConfig({})).toEqual({
       enabled: false,
+      credentialSource: 'auto',
       tools: [...TRIGGER_USER_AUTH_TOOLS],
       fallback: 'bot-identity',
     });
@@ -112,34 +111,6 @@ describe('triggerUserAuthApplies', () => {
   });
 });
 
-describe('unauthorizedOutcomeFor', () => {
-  it('leaves ungoverned tools on their existing behavior', () => {
-    expect(unauthorizedOutcomeFor(null, 'bytedcli')).toBe('bot-identity');
-    const larkOnly = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
-    expect(unauthorizedOutcomeFor(larkOnly, 'bytedcli')).toBe('bot-identity');
-  });
-
-  it('lets lark-cli degrade to the bot\'s own identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true });
-    expect(unauthorizedOutcomeFor(config, 'lark-cli')).toBe('bot-identity');
-  });
-
-  // bytedcli offers only SSO personal login: no service account, no AK/SK.
-  // Reporting `bot-identity` here would produce a call that fails anyway, with
-  // a misleading reason.
-  it('fails for bytedcli even under fallback: bot-identity', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
-    expect(unauthorizedOutcomeFor(config, 'bytedcli')).toBe('fail');
-  });
-
-  it('fails for every governed tool under fallback: none', () => {
-    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'none' });
-    for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-      expect(unauthorizedOutcomeFor(config, tool)).toBe('fail');
-    }
-  });
-});
-
 // An honest report, not a reassurance. Botmux keeps each token 0600, but the
 // agent runs as the SAME OS user, so without the file sandbox it can read every
 // person's token file directly. Per-person storage still fixes attribution and
@@ -197,5 +168,24 @@ describe('git attribution settings', () => {
     expect(() => parseTriggerUserAuthConfig({
       enabled: true, gitTokenExchangeUrl: 'not-a-url',
     })).toThrow(/absolute URL/);
+  });
+});
+
+describe('credentialSource', () => {
+  it('defaults to auto when absent', () => {
+    const cfg = parseTriggerUserAuthConfig({ enabled: true });
+    expect(cfg?.credentialSource).toBe('auto');
+    expect(credentialSourceOf(cfg)).toBe('auto');
+    expect(credentialSourceOf(null)).toBe('auto');
+    expect(credentialSourceOf({})).toBe('auto');
+  });
+
+  it.each(['auto', 'platform', 'local'] as const)('accepts %s', (source) => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, credentialSource: source })?.credentialSource).toBe(source);
+  });
+
+  it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
+      .toThrow(/credentialSource must be one of auto \| platform \| local/);
   });
 });

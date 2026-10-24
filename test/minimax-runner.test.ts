@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { createMinimaxAdapter, minimaxDataDir } from '../src/adapters/cli/minimax.js';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
@@ -144,6 +145,14 @@ describe('MiniMax Code adapter', () => {
     expect(minimaxDataDir({ MINIMAX_DATA_DIR: '/tmp/primary', MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/primary');
     expect(minimaxDataDir({ MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/legacy');
   });
+  it.each([false, true])('forwards a configured long-review budget on spawn (resume: %s)', resume => {
+    const f = fixture(); vi.stubEnv('MINIMAX_DATA_DIR', join(f.root, 'data'));
+    const adapter = createMinimaxAdapter(f.executable);
+    const options = { sessionId: 'budget', resume, ...(resume ? { resumeSessionId: 'native' } : {}) };
+    expect(adapter.buildArgs(options)).not.toContain('--turn-timeout-ms');
+    const args = adapter.buildArgs({ ...options, turnTimeoutMs: 3_600_000 });
+    expect(args[args.indexOf('--turn-timeout-ms') + 1]).toBe('3600000');
+  });
 });
 
 it.each([
@@ -182,8 +191,9 @@ it('accepts a buffer at the frame limit and closes on overflow without native ex
 it('SIGTERM aborts the active native process and never executes queued turns or reports a final', async () => {
   const { h, send } = runner();
   send('hang', 'active'); send('must-not-run', 'queued');
-  await waitFor(() => existsSync(h.log));
-  const call = JSON.parse(readFileSync(h.log, 'utf8').trim());
+  // The native process creates the log before it finishes writing its line.
+  await waitFor(() => readJsonLines(h.log).length > 0);
+  const [call] = readJsonLines(h.log);
   expect(call.input).toBe('hang');
   h.child.kill('SIGTERM');
   await waitFor(() => h.child.exitCode !== null);
@@ -289,10 +299,50 @@ it.each([
     content, nativeSessionId: 'session_fixture', timeoutMs: 5000, permission: 'full' }, AbortSignal.timeout(8000))).rejects.toThrow(error);
 });
 
+it('reports native exec failure with its cause and resumes the next turn', async () => {
+  const { h, send } = runner();
+  const finals = () => markers(h.stdout).filter(m => m.kind === 'final').map(m => m.payload);
+  send('failed', 'failed');
+  await waitFor(() => finals().length === 1);
+  expect(finals()[0]).toMatchObject({ turnId: 'failed', errorCode: 'execution_failed',
+    content: expect.stringContaining('INTERACTION_NOT_AVAILABLE') });
+  send('healthy', 'next');
+  await waitFor(() => finals().length === 2);
+  expect(finals()[1]).toMatchObject({ turnId: 'next', content: 'answer:healthy' });
+  expect(finals()[1].errorCode).toBeUndefined();
+  const calls = readFileSync(h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(calls[1].args[calls[1].args.indexOf('--session') + 1]).toBe('session_fixture');
+});
+
 it('kills a hung invocation and permits a later turn in the same native session', async () => {
   const { h, send } = runner(['--turn-timeout-ms', '1000']); send('hang', 'one');
   await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
-  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('中断或超时');
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.errorCode).toBe('turn_budget_exhausted');
   send('next', 'two'); await waitFor(() => markers(h.stdout).filter(m => m.kind === 'final').length === 2);
   expect(markers(h.stdout).filter(m => m.kind === 'final')[1].payload.content).toBe('answer:next');
+});
+
+it('rejects a timer overflow before starting native work', async () => {
+  const { h } = runner(['--turn-timeout-ms', '2147483648']);
+  await waitFor(() => h.child.exitCode !== null);
+  expect(await h.closed).toEqual({ code: 2, signal: null });
+  expect(h.stderr.length).toBeGreaterThan(0);
+  expect(existsSync(h.log)).toBe(false);
+});
+
+it.each([false, true])('does not inject a native exec timeout unless configured (resume: %s)', async resume => {
+  const { h, send } = runner(resume ? ['--native-session-id', 'session_fixture'] : []);
+  send('healthy', 'unbounded');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload).toMatchObject({ content: 'answer:healthy', turnId: 'unbounded' });
+  const calls = readFileSync(h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(calls[0].args).not.toContain('--timeout');
+});
+
+it('forwards an explicit budget to native exec', async () => {
+  const { h, send } = runner(['--turn-timeout-ms', '3600000']);
+  send('healthy', 'bounded');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  const call = JSON.parse(readFileSync(h.log, 'utf8').trim());
+  expect(call.args[call.args.indexOf('--timeout') + 1]).toBe('3600000ms');
 });

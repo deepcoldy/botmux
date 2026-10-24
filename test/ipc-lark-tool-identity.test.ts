@@ -14,6 +14,8 @@ import { spawnTsScript } from './helpers/ts-runner.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
+import { createServer, type Server } from 'node:http';
+import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 const botToken = vi.fn<() => Promise<unknown>>();
@@ -259,5 +261,139 @@ describe('session application identity route', () => {
     const res = await request('bot');
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-bot-token' });
+  });
+});
+
+describe('platform-issued user credentials in a bound session', () => {
+  // Nobody but the bot owner can grant the bot's own application (its
+  // availability range excludes them), so their --as user comes from the platform.
+  const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
+  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none', ...(credentialSource ? { credentialSource } : {}) } });
+  let grants: any[];
+  beforeEach(() => {
+    grants = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM,
+      resolveUnionId: async () => 'on_sender',
+      requestGrant: async req => {
+        grants.push(req);
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'platform-user-token' } } } as any;
+      },
+    });
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot() } as any);
+  });
+  afterEach(() => __setPlatformCredentialDepsForTest(null));
+  const runTool = (args: string[], port: number) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
+    const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', ...args], {
+      env: { ...process.env, BOTMUX_DAEMON_IPC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '', err = ''; child.stdout!.on('data', b => out += b); child.stderr!.on('data', b => err += b);
+    child.on('error', reject); child.on('close', code => resolve({ code, out, err }));
+  });
+  const installFakeTool = () => {
+    const real = join(dir, 'real-lark');
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
+    binding.realBinary = real; delete (binding as any).ipcPort;
+    writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
+  };
+
+  it('serves a person without a bot-app grant from the platform, under the platform application', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, appId: 'cli_platform', mode: 'user', credentialType: 'user_access_token',
+      credential: 'platform-user-token', issuer: 'platform' });
+    expect(grants[0]).toMatchObject({ tool: 'lark-cli', unionId: 'on_sender', appId: 'cli_bound', sessionId: 'tool-session', turnId: 'om_turn' });
+  });
+  it('keeps the bot-app grant for a person who has one, without asking the platform', async () => {
+    const response = await request('user');
+    expect(await response.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
+    expect(grants).toHaveLength(0);
+  });
+  it('platform mode ignores the bot-app grant', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot('platform') } as any);
+    expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_platform', issuer: 'platform' });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('refuses with the platform page, not a bot-app login, when the platform has nothing for the person', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
+    });
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ ok: false, authorizeUrl: 'https://platform.example.test/credentials' });
+  });
+  it('does not hand out a platform credential when the turn changes while it is being fetched', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => {
+        session.managedTurnOrigin.turnId = 'om_later';
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'wrong-turn-token' } } } as any;
+      },
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('wrong-turn-token');
+  });
+  it('bot calls stay on the bound application', async () => {
+    expect(await (await request('bot')).json()).toMatchObject({ appId: 'cli_bound', mode: 'bot' });
+    expect(grants).toHaveLength(0);
+  });
+  it('auth request sends a person without a bot-app grant to the platform page instead of a bot-app device link', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
+      authUrl: 'https://platform.example.test/credentials' });
+    expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'bot-app-token'; });
+    const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('runs the real tool with the platform application for user calls and the bound one for bot calls', async () => {
+    installFakeTool();
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const user = await runTool(['docs', '+fetch', '--as=user'], ipc!.port); expect(user.code, user.err).toBe(0);
+    expect(user.out).toBe('cli_platform|||platform-user-token|docs +fetch --as user');
+    const bot = await runTool(['docs', '+fetch'], ipc!.port); expect(bot.code, bot.err).toBe(0);
+    expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
+  });
+  describe('the runner trusts a different application only for an explicit platform user grant', () => {
+    let fake: Server; let reply: Record<string, unknown>;
+    beforeEach(async () => {
+      fake = createServer((_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(reply)); });
+      await new Promise<void>(r => fake.listen(0, '127.0.0.1', r));
+      installFakeTool();
+    });
+    afterEach(() => new Promise<void>(r => fake.close(() => r())));
+    const port = () => (fake.address() as { port: number }).port;
+    it.each([
+      ['another application without the platform marker', { ok: true, appId: 'cli_other', mode: 'user', credentialType: 'user_access_token', credential: 'x' }, ['--as=user']],
+      ['a platform marker with a malformed application id', { ok: true, appId: 'not an app', mode: 'user', credentialType: 'user_access_token', credential: 'x', issuer: 'platform' }, ['--as=user']],
+      ['a platform marker on a bot call', { ok: true, appId: 'cli_other', mode: 'bot', credentialType: 'tenant_access_token', credential: 'x', issuer: 'platform' }, []],
+    ])('refuses %s', async (_label, body, extra) => {
+      reply = body;
+      const run = await runTool(['docs', '+fetch', ...extra as string[]], port());
+      expect(run.code).not.toBe(0);
+      expect(run.out).toBe('');
+    });
   });
 });

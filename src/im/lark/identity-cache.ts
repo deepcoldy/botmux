@@ -25,8 +25,8 @@ import { join, dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { larkGet, getMessageDetail } from './client.js';
-import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
+import { larkGet, getMessageDetail, getLarkErrorCode } from './client.js';
+import { LARK_CODE_APP_SCOPE_MISSING, classifyContactErrorCode } from './lark-errors.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -382,6 +382,215 @@ export async function resolveVerifiedUserIdentity(
   } catch (err: any) {
     logger.debug(
       `[identity] strict contact lookup for ${openId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
+}
+
+interface VerifiedUnionIdentity {
+  openId: string;
+  unionId: string;
+  type: 'user';
+  name?: string;
+  email?: string;
+}
+
+/**
+ * HTTP budget for the strict bot-owner lookup. This runs on the inbound
+ * admission path (every recognised team-bot turn), so it must be far tighter
+ * than the SDK-wide 15s fallback while still giving a healthy Contact API
+ * time to answer.
+ */
+const STRICT_OWNER_RESOLVE_BUDGET_MS = 3_000;
+/**
+ * How long a DETERMINISTIC negative (the contact API answered but the person
+ * cannot mint an owner: invisible / no open_id / union_id mismatch / no
+ * email, or a definitive contact error code) suppresses repeat lookups.
+ * Transient failures are never cached. Roster membership already propagates
+ * with delay, so a sub-minute staleness bound here does not change when an
+ * owner can take effect.
+ */
+const OWNER_NEGATIVE_CACHE_TTL_MS = 60_000;
+/** Bound on remembered negatives. The real key space is app × roster owners
+ *  and stays tiny; this only guards an unbounded roster. Mirrors
+ *  userProfileCache's cap in client.ts. */
+const OWNER_NEGATIVE_CACHE_MAX = 1_000;
+const ownerInflightUnions = new Map<string, Promise<VerifiedUnionIdentity | undefined>>();
+const ownerNegativeUnions = new Map<string, number>();
+/**
+ * Attempt identity per key: every NEW fetch (only created after the previous
+ * attempt was evicted) gets a fresh token. A budget-expired fetch is NOT
+ * cancelled — the SDK's token POST cannot be aborted and its business request
+ * may already be in flight — so it can settle AFTER a newer attempt started.
+ * Its verdict must not then overwrite the newer attempt's conclusions (a stale
+ * 41050 would otherwise suppress a just-verified owner for a full TTL; a stale
+ * 99991672 would trip the scope breaker under a recovering app). Every
+ * credential-affecting side write compares against this token first.
+ */
+const ownerAttemptTokens = new Map<string, number>();
+let ownerAttemptSeq = 0;
+
+export const __testOnly_ownerNegativeCacheSize = (): number => ownerNegativeUnions.size;
+
+function rememberOwnerNegative(key: string, attemptToken: number): void {
+  if (ownerAttemptTokens.get(key) !== attemptToken) return;
+  if (ownerNegativeUnions.size >= OWNER_NEGATIVE_CACHE_MAX) ownerNegativeUnions.clear();
+  ownerNegativeUnions.set(key, Date.now());
+}
+
+/** Trip the SHARED per-app scope breaker (also used by sender name resolution)
+ *  when contact:user.base:readonly is missing. This SDK is axios-based, so
+ *  99991672 arrives both as an HTTP-200 body code and as a thrown AxiosError —
+ *  callers from either shape must land here. Gated by the attempt token: a
+ *  stale fetch from an evicted attempt must not flip the breaker while a newer
+ *  attempt for the same app is already succeeding. */
+function tripOwnerScopeBreaker(larkAppId: string, negativeKey: string, attemptToken: number): void {
+  if (ownerAttemptTokens.get(negativeKey) !== attemptToken) return;
+  if (scopeUnavailable.has(larkAppId)) return;
+  scopeUnavailable.add(larkAppId);
+  logger.warn(
+    `[identity] [${larkAppId}] contact:user.base:readonly 未开通，bot owner 解析将跳过 Contact API (code=99991672)`,
+  );
+}
+
+/**
+ * Resolve a deployment-configured Owner union_id through the receiving bot app.
+ *
+ * Admission-path protections (mirroring ensureContactProfile's shape):
+ * - a strict wall-clock budget over the WHOLE SDK call, INCLUDING the SDK's
+ *   await on tenant-token acquisition — that token POST carries no per-request
+ *   timeout, so without this race a cold start / token refresh could add the
+ *   SDK-wide 15s default before the business request's own timeout starts;
+ * - a per-app scope breaker (99991672, body OR thrown shape) so a bot missing
+ *   `contact:user.base:readonly` does not fire a doomed request every turn;
+ * - in-flight de-duplication for concurrent turns of the same owner;
+ * - a short negative cache for deterministic "cannot mint an owner" answers:
+ *   a code-0 unusable payload AND definitive error codes (41050 not-visible /
+ *   41012 / 40001 / 99992361), in both body and thrown shapes;
+ * - attempt-token fencing: a fetch whose budget expired keeps running (it
+ *   cannot be aborted mid-flight), but its late verdict is discarded unless it
+ *   is still the current attempt — stale negatives never override a newer
+ *   conclusion.
+ * Successful results are intentionally NOT cached: botOwner is credential
+ * material and, like resolveVerifiedUserIdentity, must be read fresh on every
+ * turn (a stale email/open_id must never authorize a new credential choice).
+ * Transient errors (timeout/network/other API codes) stay retryable.
+ */
+export async function resolveVerifiedUserIdentityByUnionId(
+  larkAppId: string,
+  unionId: string,
+): Promise<VerifiedUnionIdentity | undefined> {
+  if (!unionId.startsWith('on_')) return undefined;
+  if (scopeUnavailable.has(larkAppId)) return undefined;
+  const key = `${larkAppId}:${unionId}`;
+  const negativeAt = ownerNegativeUnions.get(key);
+  if (negativeAt !== undefined) {
+    if (Date.now() - negativeAt < OWNER_NEGATIVE_CACHE_TTL_MS) return undefined;
+    ownerNegativeUnions.delete(key);
+  }
+  let pending = ownerInflightUnions.get(key);
+  if (!pending) {
+    const attemptToken = ++ownerAttemptSeq;
+    ownerAttemptTokens.set(key, attemptToken);
+    pending = fetchVerifiedUnionIdentity(larkAppId, unionId, key, attemptToken);
+    ownerInflightUnions.set(key, pending);
+  }
+  try {
+    // Each waiter races the SAME shared fetch against its own budget, so a
+    // stall BEFORE the axios request (token fetch) is covered as well.
+    return await withTimeout(pending, STRICT_OWNER_RESOLVE_BUDGET_MS);
+  } catch {
+    // Budget elapsed: fail closed to undefined. The fetch is NOT cancelled —
+    // the SDK token POST takes no abort signal and the business request may be
+    // in flight — so it can settle AFTER eviction, potentially after a newer
+    // attempt already concluded. Its side writes (negative cache, scope
+    // breaker) are attempt-token gated inside fetchVerifiedUnionIdentity, and
+    // its late return value reaches only waiters that all already resolved
+    // undefined. Eviction lets the next turn start a fresh attempt.
+    return undefined;
+  } finally {
+    // Identity guard: a caller whose budget expired must not evict a newer
+    // attempt that already replaced this map entry.
+    if (ownerInflightUnions.get(key) === pending) ownerInflightUnions.delete(key);
+  }
+}
+
+async function fetchVerifiedUnionIdentity(
+  larkAppId: string,
+  unionId: string,
+  negativeKey: string,
+  attemptToken: number,
+): Promise<VerifiedUnionIdentity | undefined> {
+  try {
+    const c = getBotClient(larkAppId);
+    // timeoutMs caps the business HTTP request at the transport layer; the
+    // caller's withTimeout wraps the whole call and covers token acquisition.
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(unionId)}`, {
+      user_id_type: 'union_id',
+    }, { timeoutMs: STRICT_OWNER_RESOLVE_BUDGET_MS });
+    if (res?.code === 0) {
+      const user = res?.data?.user;
+      const openId = typeof user?.open_id === 'string' ? user.open_id.trim() : '';
+      const returnedUnionId = typeof user?.union_id === 'string' ? user.union_id.trim() : unionId;
+      const rawName: unknown = user?.name;
+      const rawEmail: unknown = user?.enterprise_email ?? user?.email;
+      const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+      const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+      const usable = openId.startsWith('ou_')
+        && returnedUnionId === unionId
+        && !!email && email.includes('@');
+      if (!usable) {
+        // Deterministic negative: suppress for one TTL instead of hitting the
+        // Contact API on every bot turn for a roster row that can never mint.
+        // Token-gated: a code-0 unusable answer arriving from an evicted
+        // attempt must not override a newer attempt that already succeeded.
+        rememberOwnerNegative(negativeKey, attemptToken);
+        return undefined;
+      }
+      recordIdentity(larkAppId, {
+        openId,
+        name,
+        email,
+        contactResolvedAt: Date.now(),
+        type: 'user',
+        source: 'contact_api',
+      });
+      return { openId, unionId: returnedUnionId, type: 'user', name, email };
+    }
+    if (res?.code === LARK_CODE_APP_SCOPE_MISSING) {
+      tripOwnerScopeBreaker(larkAppId, negativeKey, attemptToken);
+      return undefined;
+    }
+    // Definitive per-owner codes arriving in a non-zero body get the same TTL
+    // suppression as a code-0 unusable payload (41050 not-visible / 41012 /
+    // 40001 / 99992361). Without this, an owner the app can never see costs a
+    // Contact API call on every bot turn.
+    if (classifyContactErrorCode(res?.code)) {
+      rememberOwnerNegative(negativeKey, attemptToken);
+      return undefined;
+    }
+    // Other API codes may be transient — do not negative-cache, let the next
+    // turn retry (fail closed in the meantime).
+    logger.debug(
+      `[identity] strict union contact lookup for ${unionId.substring(0, 12)} code=${res?.code} msg=${res?.msg ?? ''}`,
+    );
+    return undefined;
+  } catch (err: any) {
+    // This SDK is axios-based: non-2xx responses THROW and the business code
+    // lives in err.response.data.code. Classify the SAME two shapes here —
+    // otherwise neither the scope breaker nor the negative cache ever trips in
+    // deployments/gateways where these errors arrive as exceptions.
+    const code = getLarkErrorCode(err);
+    if (code === LARK_CODE_APP_SCOPE_MISSING) {
+      tripOwnerScopeBreaker(larkAppId, negativeKey, attemptToken);
+      return undefined;
+    }
+    if (classifyContactErrorCode(code)) {
+      rememberOwnerNegative(negativeKey, attemptToken);
+      return undefined;
+    }
+    logger.debug(
+      `[identity] strict contact lookup for ${unionId.substring(0, 12)} failed: ${err?.message ?? err}`,
     );
     return undefined;
   }

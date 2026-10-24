@@ -42,7 +42,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   // zellij is pid-AGNOSTIC on purpose (see adoptLiveKey doc / fix 57dcbebbb):
   // the key must stay stable across a render→confirm pid shift.
   adoptLiveKey: vi.fn((s: any) =>
-    'zellijPaneId' in s
+    'orcaTerminalHandle' in s
+      ? `live:orca:${s.orcaTerminalHandle}`
+      : 'zellijPaneId' in s
       ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}`
       : `live:tmux:${s.tmuxTarget}:${s.cliPid}`,
   ),
@@ -161,6 +163,12 @@ vi.mock('../src/core/session-manager.js', () => ({
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),
+}));
+
+// The /adopt picker's live-name enrichment shells out to herdr and reads
+// ~/.claude transcripts; keep it out of these tests (pass sessions through).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: vi.fn(async (sessions: unknown[]) => sessions),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({

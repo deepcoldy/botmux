@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -584,6 +584,40 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('prunes diagnostics older than the TTL when persisting, keeping the newest 50', async () => {
+    // 写侧接线：persistDiagnostics 落盘后顺手 prune 7 天前的旧快照、至少留 50。
+    const dir = join(home, '.botmux', 'data', 'mcp-gateway');
+    mkdirSync(dir, { recursive: true });
+    // 55 个超龄快照，seed-54 最新、seed-00 最旧；再加一个非 .json 文件，不能被碰。
+    for (let i = 0; i < 55; i += 1) {
+      const p = join(dir, `seed-${String(i).padStart(2, '0')}.json`);
+      writeFileSync(p, '{}\n');
+      const ageSeconds = 8 * 86400 - i; // seed-00 最旧
+      utimesSync(p, (Date.now() - ageSeconds * 1000) / 1000, (Date.now() - ageSeconds * 1000) / 1000);
+    }
+    writeFileSync(join(dir, 'notes.txt'), 'keep');
+
+    const sessionId = 'mcp-serve-prune-ttl';
+    const sessionFile = join(dir, `${sessionId}.json`);
+    const client = await connectMcpServe(sessionId);
+    try {
+      await vi.waitFor(() => expect(existsSync(sessionFile)).toBe(true));
+      // 56 个 .json（55 旧 + 当前会话）→ 删掉最旧 6 个，保留 50 个。
+      await vi.waitFor(() => {
+        const jsonCount = readdirSync(dir).filter(name => name.endsWith('.json')).length;
+        expect(jsonCount).toBe(50);
+      });
+      expect(existsSync(join(dir, 'seed-00.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-05.json'))).toBe(false);
+      expect(existsSync(join(dir, 'seed-06.json'))).toBe(true);
+      expect(existsSync(join(dir, 'seed-54.json'))).toBe(true);
+      expect(existsSync(sessionFile)).toBe(true);
+      expect(existsSync(join(dir, 'notes.txt'))).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
   it('treats an empty SESSION_DATA_DIR as missing instead of writing into cwd', async () => {
     const sessionId = 'mcp-serve-empty-data-dir';
     const diagnostics = join(home, '.botmux', 'data', 'mcp-gateway', `${sessionId}.json`);
@@ -738,60 +772,23 @@ describe('plugin MCP Gateway', () => {
     expect(readMcpGatewayLaunchRecord(dataDir, sessionId)).toBeNull();
   });
 
-  // ─── Worker reattach wiring (source lock) ──────────────────────────────────
-  //
-  // spawnCli is not exported (repo convention: source-lock tests, see
-  // resume-fresh-policy.test.ts). These pin the P0 fix: the pane-reattach-safe
-  // branch MUST re-serve the trusted Gateway host at the deterministic path so
-  // the surviving pane's relay can reconnect. Without it (the shipped bug) the
-  // reattach branch only logged, willReattachPersistent stayed true, and the
-  // sole host starter (prepareCliPluginGenerationAndGateway) was gated out by
-  // `if (!willReattachPersistent)` — the relay then reconnected forever to a
-  // socket nothing binds.
-  describe('reattach-safe branch re-serves the Gateway host (source lock)', () => {
+  // 源码结构护栏(K3)：#943 的 P0 修复——persistent pane 复用（reattach-safe）分支必须在同一确定性路径上
+  // 重新起 trusted Gateway host 并写回 launch record，否则 daemon 重启后 pane 里幸存的 relay 永远连不上
+  // socket，所有持久会话里的插件工具调用悬挂。spawnCli 是 worker.ts 闭包内未导出的流程，没有行为 seam；
+  // 重连机制本身由下一条行为用例覆盖。
+  it('re-serves the trusted Gateway host from the pane-reattach branch of the worker', () => {
     const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+    const starterAt = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
+    expect(starterAt).toBeGreaterThan(-1);
+    const starter = workerSource.slice(starterAt, workerSource.indexOf('\n}\n', starterAt));
+    expect(starter).toContain('startSessionMcpGatewayHost(');
+    expect(starter).toContain('writeMcpGatewayLaunchRecord(');
 
-    it('exposes a host-only starter that does NOT refresh the plugin generation', () => {
-      // The starter must be separate from prepareCliPluginGenerationAndGateway
-      // (which calls refreshCliPluginGeneration) so a warm reattach keeps the
-      // CLI's existing catalog untouched while still binding a fresh host.
-      const start = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
-      expect(start).toBeGreaterThan(-1);
-      const block = workerSource.slice(start, start + 800);
-      expect(block).toContain('startSessionMcpGatewayHost(');
-      expect(block).toContain('writeMcpGatewayLaunchRecord(');
-      // Host-only: must NOT re-run the catalog/plugin refresh on this path.
-      expect(block).not.toContain('refreshCliPluginGeneration(');
-      // Both host-start paths (fresh/resumed via prepare*, and the re-served
-      // reattach host) route through this helper, so it MUST keep #917's
-      // per-turn trusted-caller provider wired — otherwise a warm reattach (and
-      // every spawn) would silently stop injecting the host-signed identity.
-      // The worker-level wiring is not otherwise exercised by a runtime test.
-      expect(block).toContain('trustedTurnIdentity: currentGatewayTrustedTurnIdentity');
-    });
-
-    it('starts the replacement host inside the paneRelayReattachSafe branch', () => {
-      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
-      expect(start).toBeGreaterThan(-1);
-      // Scope strictly to the reattach-safe branch (ends at the legacy
-      // cold-resume `else if`), so a host start anywhere else can't satisfy this.
-      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
-      expect(branchEnd).toBeGreaterThan(start);
-      const branch = workerSource.slice(start, branchEnd);
-      expect(branch).toContain('startAndRecordSessionMcpGatewayHost(');
-      // Only when this fresh worker has no live host yet — never stomp a host an
-      // in-worker restart already brought up.
-      expect(branch).toContain('if (!sessionMcpGatewayHost)');
-    });
-
-    it('re-serving is awaited and guarded by the spawn-generation fence', () => {
-      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
-      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
-      const branch = workerSource.slice(start, branchEnd);
-      expect(branch).toContain('await startAndRecordSessionMcpGatewayHost(');
-      // A concurrent restart must not let a superseded generation keep running.
-      expect(branch).toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
-    });
+    const branchAt = workerSource.indexOf('if (paneRelayReattachSafe) {');
+    const branchEnd = workerSource.indexOf("} else if (paneProbe === 'exists') {", branchAt);
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(branchEnd).toBeGreaterThan(branchAt);
+    expect(workerSource.slice(branchAt, branchEnd)).toMatch(/await\s+startAndRecordSessionMcpGatewayHost\(/);
   });
 
   it('re-served reattach host binds the same deterministic path a stranded relay reconnects to', async () => {

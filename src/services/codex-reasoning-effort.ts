@@ -43,6 +43,8 @@ const SIX_LEVEL_MODELS = new Set([
 const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
 const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
+  ['gpt-6-astra', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-6.1-sol', CODEX_COMMON_REASONING_EFFORTS],
   ['seed-evolving', []],
   ['seed-2.1-pro', []],
   ['seed-2.1-turbo', []],
@@ -103,6 +105,10 @@ export function grokReasoningEffortsForModel(model: string | undefined): readonl
   const normalized = model?.trim().toLowerCase() ?? '';
   if (GROK_XHIGH_MODELS.has(normalized)) return GROK_REASONING_EFFORTS;
   return GROK_COMMON_REASONING_EFFORTS;
+}
+
+export function knownTraexReasoningEffortsForModel(model: string): readonly CodexReasoningEffort[] | undefined {
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(model.trim().toLowerCase());
 }
 
 export function traexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {

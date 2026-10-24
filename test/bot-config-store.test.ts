@@ -25,7 +25,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // Stub the Lark client so setBotAllowedUsers resolves emails/on_ → fake open_ids
 // without any network. Mirrors resolveAllowedUsersWithMap's contract: pass ou_
-// through, on_xxx → ou_xxx, email → ou_<localpart>, anything else is dropped.
+// through, on_xxx → ou_xxx, email → ou_<localpart> (except ghost@*, which models
+// a definitive miss: no such user / not visible), anything else is dropped.
 vi.mock('../src/im/lark/client.js', () => ({
   resolveAllowedUsersWithMap: async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
@@ -35,11 +36,12 @@ vi.mock('../src/im/lark/client.js', () => ({
       let id: string | undefined;
       if (v.startsWith('ou_')) id = v;
       else if (v.startsWith('on_')) id = 'ou_' + v.slice(3);
-      else if (v.includes('@')) id = 'ou_' + v.split('@')[0];
+      else if (v.includes('@') && !v.startsWith('ghost@')) id = 'ou_' + v.split('@')[0];
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = raw.filter(v => entryStatus.get(v) === 'definitive');
+    return { resolved, map, entryStatus, definitiveMisses };
   },
 }));
 
@@ -124,6 +126,76 @@ describe('bot-config store', () => {
     expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
     expect(effectiveReplyDelivery('app_default', 'codex')).toBe('send');
     expect(readConfig().replyDelivery).toBe('send');
+  });
+
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }, 'kimi'],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }, 'codex'],
+  ] as const)('/config cli switch %s -> %s drops the stranded structured runtime on disk and in memory', async (fromCli, runtime, toCli) => {
+    const { registry, store } = await loaded({
+      cliId: fromCli,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, toCli);
+    expect(changed).toMatchObject({ ok: true });
+    // Disk: descriptor and its equal downgrade shadow are both gone.
+    expect(readConfig()).toMatchObject({ cliId: toCli });
+    expect(readConfig().cliRuntime).toBeUndefined();
+    expect(readConfig().cliPathOverride).toBeUndefined();
+    // Memory config must match the persisted generation (new sessions read it).
+    const live = registry.getBot('app_default').config;
+    expect(live.cliRuntime).toBeUndefined();
+    expect(live.cliPathOverride).toBeUndefined();
+    // A fresh reload accepts the next generation instead of running one
+    // family's binary under the other family's interaction contract.
+    expect(() => registry.loadBotConfigs()).not.toThrow();
+  });
+
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }],
+  ] as const)('/config cli re-selecting the same %s family preserves its structured runtime', async (cliId, runtime) => {
+    const { store } = await loaded({
+      cliId,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, cliId);
+    expect(changed).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({
+      cliId,
+      cliRuntime: expect.objectContaining({ id: runtime.id }),
+      cliPathOverride: runtime.executable,
+    });
+  });
+
+  it('/config cli switch keeps an unrelated legacy cliPathOverride but clears a switch to an unsupported adapter', async () => {
+    // Legacy raw paths predate structured runtimes and are deliberately not
+    // scoped to an adapter family — same parity as setup edits.
+    {
+      const { store } = await loaded({ cliId: 'codex', cliPathOverride: '/opt/legacy-router' });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'kimi');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'kimi', cliPathOverride: '/opt/legacy-router' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+    }
+    // Structured runtime + switch to an adapter that has no runtime support:
+    // the descriptor is cleared, so the next generation reloads instead of
+    // failing the whole bots.json parse.
+    {
+      const { registry, store } = await loaded({
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' },
+        cliPathOverride: '/opt/bin/vendor-codex',
+      });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'claude-code');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'claude-code' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+      expect(readConfig().cliPathOverride).toBeUndefined();
+      expect(() => registry.loadBotConfigs()).not.toThrow();
+    }
   });
 
   it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
@@ -226,6 +298,97 @@ describe('bot-config store', () => {
     expect(keys).toContain('feedback');
     expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
+    expect(keys).toContain('herdr');
+  });
+
+  it('strictly normalizes the herdr JSON field and clears an empty block', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'next-session', clearable: true });
+    // 合法块：trim 文本、保留枚举与 chatTypes。
+    const ok = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: ' default ',
+      placement: 'split',
+      workspace: '  ',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    }));
+    expect(ok).toEqual({
+      ok: true,
+      value: { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] },
+    });
+    expect((await store.applyConfigField('app_default', spec, (ok as any).value)).ok).toBe(true);
+    expect(readConfig().herdr).toEqual({ sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] });
+    expect(registry.getBot('app_default').config.herdr).toEqual(readConfig().herdr);
+    // 非法 placement / 未知字段 / 错误类型显式拒绝（不静默剔除），且不动已落盘配置。
+    for (const bad of [
+      { placement: 'nope' },
+      { session: 'default' },
+      { sessionName: 3 },
+      { chatTypes: ['group', 'x'] },
+      [1, 2],
+    ]) {
+      const rejected = store.coerceConfigValue(spec, JSON.stringify(bad));
+      expect(rejected.ok, JSON.stringify(bad)).toBe(false);
+      expect((rejected as any).reason).toContain('invalid_herdr_config');
+    }
+    expect(readConfig().herdr).toBeDefined();
+    // chatTypes 重复值与 bots.json/env 门一致：去重接受，不报错。
+    const dup = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: 'default', chatTypes: ['group', 'group', 'p2p'],
+    }));
+    expect(dup).toEqual({ ok: true, value: { sessionName: 'default', chatTypes: ['group', 'p2p'] } });
+    // 空对象归一为 null：applyConfigField 删除整个 herdr 键。
+    const empty = store.coerceConfigValue(spec, '{}');
+    expect(empty).toEqual({ ok: true, value: null });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('herdr');
+    expect(registry.getBot('app_default').config.herdr).toBeUndefined();
+  });
+
+  it('rejects an inert herdr block through the shared /config coerce path too', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    // IM /config set 与 Dashboard 共用 coerceConfigValue：无 sessionName/placement
+    // 时只填子字段必须拒绝，不能存出「零效果」块。
+    for (const raw of [{ tab: '3' }, { workspace: 'w' }, { splitDirection: 'down' }, { chatTypes: ['group'] }]) {
+      const r = store.coerceConfigValue(spec, JSON.stringify(raw));
+      expect(r.ok, JSON.stringify(raw)).toBe(false);
+      expect((r as any).reason).toContain('invalid_herdr_config');
+    }
+    // env 已提供 placement 时，只覆盖 tab 的部分块合法（字段级叠加）。
+    const cfg = (await import('../src/config.js')).config.daemon as { herdr?: unknown };
+    const prev = cfg.herdr;
+    cfg.herdr = { placement: 'split' };
+    try {
+      expect(store.coerceConfigValue(spec, JSON.stringify({ tab: '3' }))).toEqual({ ok: true, value: { tab: '3' } });
+    } finally {
+      if (prev === undefined) delete cfg.herdr; else cfg.herdr = prev;
+    }
+  });
+
+  it('keeps the strict herdr field list in parity with the normalizer', async () => {
+    const { store } = await loaded();
+    const types = await import('../src/adapters/backend/types.js');
+    const spec = store.findConfigField('herdr')!;
+    const allFields = types.normalizeHerdrBackendConfig({
+      sessionName: 'default', placement: 'split', workspace: 'w', tab: 't',
+      splitDirection: 'right', chatTypes: ['group', 'p2p'],
+    });
+    // 严格门字段表必须与归一器实际接受的键完全一致：漏一个就会把新字段当
+    // 未知字段拒绝（或两边语义分叉）。
+    expect([...store.HERDR_FIELD_NAMES].sort()).toEqual(Object.keys(allFields).sort());
+    // 每个字段单独传入都能被严格门识别为已知字段（不报「不是可识别字段」）。
+    for (const key of store.HERDR_FIELD_NAMES) {
+      const value = key === 'placement' ? 'workspace'
+        : key === 'splitDirection' ? 'right'
+        : key === 'chatTypes' ? ['group']
+        : key === 'sessionName' ? 's' : 'x';
+      const r = store.coerceConfigValue(spec, JSON.stringify({ [key]: value }));
+      if (r.ok === false) expect(r.reason).not.toContain('不是可识别字段');
+    }
+    void spec;
   });
 
   it('strictly normalizes feedback JSON through the shared config field', async () => {
@@ -236,6 +399,20 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('hot-updates sender email hiding through botconfig and reloads it', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('senderTagHideEmail')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.senderTagHideEmail).toBe(true);
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('senderTagHideEmail');
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBeUndefined();
   });
 
   it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
@@ -1323,7 +1500,10 @@ describe('bot-config store', () => {
   });
 
   it('rejects replyDelivery=transcript for CLIs without transcript capture', async () => {
-    const { registry, store } = await loaded({ cliId: 'cursor' });
+    // antigravity has only zero-prompt transcript harvest and is still
+    // unsupported for ordinary transcript delivery; cursor used to be the
+    // exemplar here but gained the capability in #932.
+    const { registry, store } = await loaded({ cliId: 'antigravity' });
     const spec = store.findConfigField('replyDelivery')!;
     const before = store.getConfigSnapshot('app_default');
     expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
@@ -1338,6 +1518,64 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().replyDelivery).toBe('send');
     expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+  });
+
+  it('accepts replyDelivery=transcript for cursor (always-on structured fallback since #932)', async () => {
+    const { registry, store } = await loaded({ cliId: 'cursor' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+  });
+
+  it('rejects replyDelivery=transcript for cursor under scratch sandbox (host cannot read merged mirror; never a silent fallback)', async () => {
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('still accepts replyDelivery=transcript for an always-on non-cursor CLI (codex) under scratch — its bridge does not read a merged mirror', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('invariant backstop: switching cliId codex→cursor while scratch+transcript persist is rejected (the replyDelivery-only gate misses this edge)', async () => {
+    // 复现 pi 复审洞 1：replyDelivery 写入门禁只在 configKey==='replyDelivery' 时跑，
+    // 单查那条边会放行进 cursor 的切换，落盘永久无效组合（dashboard 显「已开启」、
+    // 运行时静默回落 send）。rmwBotEntry 的全局不变量必须在 cli 切换这条边拦下。
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'cursor');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('repair path: switching the invalid cursor+scratch+transcript entry to a supporting CLI (codex) succeeds', async () => {
+    // 不能把坏 entry 锁死：任何一个字段改到合法组合都必须能写，给运维修复出口。
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'codex');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    // 内存态可能由配置归一化填默认 false（盘上缺省才是契约）；关键是不能落成 scratch。
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
@@ -1452,6 +1690,67 @@ describe('bot-config store', () => {
     const r = await store.setBotAllowedUsers('app_default', ['garbage'], 'ou_owner');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('empty_resolved');
+  });
+
+  // 确定性解析失败（邮箱不存在 / 对本应用不可见）不拒绝写入：条目可能只是临时
+  // 不可见，且 self-lockout 防护已保证发起人仍生效。但结果必须把未生效条目带
+  // 回给 /botconfig 提示，而不是让它静默消失。
+  it('setBotAllowedUsers keeps writing but reports a definitively-missing email in unresolvedEmailsAndMobiles', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', 'ghost@corp.com'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.resolved).toEqual(['ou_alice']);
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
+    // 原始条目照常落盘，日后联系人可见时可随重新解析恢复。
+    expect(readConfig().allowedUsers).toEqual(['alice@corp.com', 'ghost@corp.com']);
+  });
+
+  it('setBotAllowedUsers reports a definitively-missing mobile alongside a resolved one', async () => {
+    const { store } = await loaded();
+    // 测试桩里非邮箱、非 ou_/on_ 的条目一律按 definitive miss（手机号同样走
+    // 真实 resolver 的 batch 缺口径）。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', '13900000000'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.unresolvedEmailsAndMobiles).toEqual(['13900000000']);
+  });
+
+  it('setBotAllowedUsers dedupes repeated definitively-missing entries in the warning list', async () => {
+    const { store } = await loaded();
+    // 同一条失效邮箱在命令里写两次：原始条目照常落盘（不去重用户输入），
+    // 但给 /botconfig 的未生效提示只列一次，与 union_id 告警口径一致。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', 'ghost@corp.com', 'ghost@corp.com'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
+  });
+
+  it('setBotAllowedUsers omits warning fields when every entry resolves', async () => {    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['alice@corp.com', 'ou_owner'], 'ou_alice');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.unresolvedEmailsAndMobiles).toBeUndefined();
+      expect(r.unresolvedUnionIds).toBeUndefined();
+    }
+  });
+
+  it('setBotAllowedUsers reports on_ misses only in unresolvedUnionIds, not as email/mobile warnings', async () => {
+    const { store } = await loaded();
+    // 正常 on_ 与邮箱确定性 miss 同时存在：两类告警互不串台（on_ miss 的分支
+    // 由 config-allow-owner-identity.test.ts 覆盖）。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['on_buddy', 'ghost@corp.com'], 'ou_buddy',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.unresolvedUnionIds).toBeUndefined();
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
   });
 
   it('setBotBlockedUsers with [] clears disk entry and in-memory resolved list', async () => {

@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-config.js';
 import {
-  DEFAULT_BUILTIN_SKILL_INJECTION,
   resolveSkillInjectionMode,
   globalBuiltinSkillInjectionDefault,
   resolveSkillInjectionModeForApp,
@@ -58,7 +57,6 @@ describe('skill injection-mode resolution', () => {
   });
 
   it('defaults to prompt when nothing is configured', () => {
-    expect(DEFAULT_BUILTIN_SKILL_INJECTION).toBe('prompt');
     expect(globalBuiltinSkillInjectionDefault()).toBe('prompt');
     expect(resolveSkillInjectionMode(undefined)).toBe('prompt');
   });

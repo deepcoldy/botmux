@@ -1,4 +1,5 @@
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -18,7 +19,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -30,6 +31,7 @@ import {
   builtinSkillEntries,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  chatManagerEnabledForApp,
 } from '../skills/injection-mode.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
@@ -78,9 +80,9 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './types.js';
-import type { DaemonSession } from './types.js';
+import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
-import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -103,6 +105,8 @@ import {
 } from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { initialLinkRefSources } from './link-ref-turn.js';
+import type { LinkRefMode, LinkRefSourceType } from '../services/link-ref-types.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
@@ -182,6 +186,26 @@ async function resumeRestoredPendingRepoSetup(
   // identity, not that the Lark message still exists. Persist the replacement
   // before best-effort withdrawal so exactly one card remains authoritative.
   const oldCardMessageId = setup.repoCardMessageId;
+  // The directory this opening would start in without a pick is missing: the
+  // picker in its missing-directory form, as on the first attempt (daemon's
+  // publishMissingStartDirPicker); the no-project start below would be refused.
+  const { missingStartDir, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+  const missingDir = missingStartDir(ds);
+  if (missingDir) {
+    const { sendMessage, replyMessage, deleteMessage } = await import('../im/lark/client.js');
+    const messageId = await publishWorkingDirRecovery(ds, missingDir, {
+      sessionReply: (_rootId, content, msgType = 'text') => ds.scope === 'thread'
+        ? replyMessage(ds.larkAppId, anchor, content, msgType, true)
+        : sendMessage(ds.larkAppId, ds.chatId, content, msgType),
+      lastRepoScan: new Map(),
+    });
+    if (oldCardMessageId && messageId && oldCardMessageId !== messageId) {
+      void deleteMessage(ds.larkAppId, oldCardMessageId).catch(() => {});
+    }
+    announcePendingRepoSession(ds);
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] Re-posted durable pending repo picker (start dir ${missingDir} is missing)`);
+    return;
+  }
   const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
   const projects = scanDirs.length > 0
     ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
@@ -777,17 +801,32 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
   ].join('\n');
 }
 
+function renderGroupJoinContextBlock(context?: GroupJoinContext): string {
+  if (!context) return '';
+  return [
+    `<botmux_group_join source="lark" trusted="true" event="${context.event}" gate_matched="${context.gateMatched}">`,
+    `  <lark_app_id>${xmlEscape(context.larkAppId)}</lark_app_id>`,
+    `  <chat_id>${xmlEscape(context.chatId)}</chat_id>`,
+    `  <turn_id>${xmlEscape(context.turnId)}</turn_id>`,
+    ...(context.operatorOpenId
+      ? [`  <operator_open_id>${xmlEscape(context.operatorOpenId)}</operator_open_id>`]
+      : []),
+    '</botmux_group_join>',
+  ].join('\n');
+}
+
 /**
  * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
  * (getBot throws for an unknown appId) or an absent key both mean "inject",
  * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
-function senderTagEnabled(larkAppId: string): boolean {
+function senderTagOptions(larkAppId: string): { enabled: boolean; hideEmail: boolean } {
   try {
-    return getBot(larkAppId).config.senderTag !== false;
+    const { senderTag, senderTagHideEmail } = getBot(larkAppId).config;
+    return { enabled: senderTag !== false, hideEmail: senderTagHideEmail === true };
   } catch {
-    return true;
+    return { enabled: true, hideEmail: false };
   }
 }
 
@@ -802,15 +841,17 @@ function senderTagEnabled(larkAppId: string): boolean {
  * at the call sites, so all five injection points (new topic, its codex-app
  * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
  * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
- * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
- * existing tests — keeps the historical always-inject behavior.
+ * judgment and cannot drift apart. `senderTagHideEmail: true` omits only the
+ * email attribute without mutating the resolved sender or daemon identity.
+ * Omitting `larkAppId` — synthetic callers and existing tests — keeps the historical always-inject behavior.
  */
 export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
-  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
+  const options = larkAppId ? senderTagOptions(larkAppId) : { enabled: true, hideEmail: false };
+  if (!options.enabled) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
-  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
+  if (sender.email && !options.hideEmail) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -994,6 +1035,21 @@ export function renderProjectGroupModeBlock(
   }
 }
 
+/**
+ * 管家群里唯一常驻的一行：只有「开了管家的 bot × 它的管家群」才有，别的 bot、别的群一律空。
+ * 规则正文不常驻，由 `botmux board guide` 按需输出。零注入的会话在更早处整体返回，不走到这里。
+ */
+export function renderStewardContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
+  if (!larkAppId || !chatId) return '';
+  try {
+    const steward = getBot(larkAppId).config.steward;
+    if (steward?.enabled !== true || steward.chatId !== chatId) return '';
+    return renderStewardHintBlock(chatId);
+  } catch {
+    return '';
+  }
+}
+
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
@@ -1002,6 +1058,7 @@ function renderApplicationRoleBlock(
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
     renderProjectGroupModeBlock(larkAppId, chatId),
+    renderStewardContextBlock(larkAppId, chatId),
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1227,10 +1284,27 @@ function credentialBoundaryForPrompt(
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
  *  core/reply-delivery.ts）。缺参 / bot 未加载 / 任何异常 → 'send'（fail-closed：
- *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。 */
-function replyDeliveryFor(larkAppId?: string, cliId?: string, promptInjection?: PromptInjection): ReplyDelivery {
+ *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。
+ *  sessionSandbox：已存活会话续轮传 spawn 时冻结的 session.sandbox——sandbox
+ *  改动 next-session-only，续轮信封必须按该会话 worker 的真实采集能力判，不能
+ *  被随后关掉 sandbox 再开 transcript 的 live 配置骗成改口不 send（静默轮）。 */
+function replyDeliveryFor(
+  larkAppId?: string,
+  cliId?: string,
+  promptInjection?: PromptInjection,
+  sessionSandbox?: Session['sandbox'],
+): ReplyDelivery {
   if (!larkAppId || !cliId) return 'send';
-  try { return effectiveReplyDelivery(larkAppId, cliId, promptInjection); } catch { return 'send'; }
+  try {
+    return effectiveReplyDelivery(larkAppId, cliId, promptInjection,
+      sessionSandbox !== undefined ? { sessionSandbox } : undefined);
+  } catch { return 'send'; }
+}
+
+/** 已存活会话续轮用的冻结沙箱（无 session 行 / store poisoned → undefined，
+ *  回退 live+env 解析口径；不能让 poisoned store 把续轮信封构造整个抛掉）。 */
+function frozenSessionSandbox(sessionId: string): Session['sandbox'] | undefined {
+  try { return sessionStore.getSession(sessionId)?.sandbox; } catch { return undefined; }
 }
 
 /** All public builders share the durable session policy, including callers
@@ -1277,7 +1351,12 @@ type NewTopicOpts = {
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
   chatContext?: ChatContext;
+  groupJoinContext?: GroupJoinContext;
   sharedGroupContext?: string;
+  /** Frozen LinkRef mode for this accepted turn. Missing preserves legacy input. */
+  linkRefMode?: LinkRefMode;
+  linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+  publicSystemDocUrls?: string[];
   turnId?: string;
   sessionBackendType?: BackendType;
   /** Exact worker launch decision for this opening input. This cannot be
@@ -1296,7 +1375,7 @@ type NewTopicOpts = {
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
-  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
+  | 'summaryMemory' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
 
@@ -1374,7 +1453,12 @@ function buildNewTopicBlocks(
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
       // the catalog as a compact trigger for complex delivery and safety rules.
-      const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
+      const entries = builtinSkillEntries({
+        asksViaHook: adapter.asksViaHook,
+        whiteboardEnabled: whiteboardEnabled(),
+        chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
+        excludeRoutingCovered: true,
+      });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale);
@@ -1411,6 +1495,7 @@ function buildNewTopicBlocks(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1475,6 +1560,7 @@ function buildNewTopicBlocks(
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
+  if (groupJoinContextBlock) blocks.push({ key: 'groupJoin', text: groupJoinContextBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
   if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
@@ -1554,7 +1640,11 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    groupJoinContext?: GroupJoinContext;
     sharedGroupContext?: string;
+    linkRefMode?: LinkRefMode;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+    publicSystemDocUrls?: string[];
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
     trustedCaller?: CliTurnPayload['trustedCaller'];
@@ -1607,7 +1697,7 @@ export function buildNewTopicCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText };
+      return withInitialLinkRefSources({ content: ptyText }, userMessage, { ...opts, attachments });
     }
     // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
   }
@@ -1618,7 +1708,11 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
-    return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+    return withInitialLinkRefSources(
+      { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+      userMessage,
+      { ...opts, attachments },
+    );
   }
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
@@ -1628,6 +1722,7 @@ export function buildNewTopicCliInput(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -1636,12 +1731,12 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
-  return {
+  return withInitialLinkRefSources({
     content,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, groupJoinContextBlock].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -1657,7 +1752,7 @@ export function buildNewTopicCliInput(
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
       attachments,
     }),
-  };
+  }, userMessage, { ...opts, attachments });
 }
 
 /**
@@ -1690,6 +1785,10 @@ type FollowUpOpts = {
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
   sharedGroupContext?: string;
+  /** Frozen LinkRef mode for this accepted turn. Missing preserves legacy input. */
+  linkRefMode?: LinkRefMode;
+  linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+  publicSystemDocUrls?: string[];
   /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
    *  Claude hook 进程，强制 inline 模式。 */
   sessionBackendType?: BackendType;
@@ -1720,8 +1819,11 @@ function buildFollowUpBlocks(
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
   // reminder_no_transport）。bare = transcript + solo → 信封去壳。
+  // 沙箱用本会话 spawn 时的冻结值：live config 可能已把 sandbox 关掉并开了
+  // transcript（next-session-only 改动），但这个 worker 仍在 scratch overlay 里、
+  // 采集关闭，按 live 改口不 send 会静默（见 replyDeliveryFor 注释）。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection) === 'transcript';
+  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection, frozenSessionSandbox(sessionId)) === 'transcript';
   const bare = transcript && opts?.solo === true;
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
@@ -1931,6 +2033,38 @@ function effectivePromptHookConfigPath(
   return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
+function withInitialLinkRefSources(
+  payload: CliTurnPayload,
+  userText: string,
+  opts: {
+    linkRefMode?: LinkRefMode;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
+    sharedGroupContext?: string;
+    publicSystemDocUrls?: string[];
+    attachments?: LarkAttachment[];
+  } | undefined,
+): CliTurnPayload {
+  // Builders only describe explicitly model-visible sources. They do not read
+  // mutable rollout configuration: the real fork/send boundary freezes that
+  // decision after every await/defer. Keep callers without a daemon app scope
+  // byte-compatible (pure formatter/tests and unsupported transports).
+  if (!opts?.linkRefMode && (!opts || !('larkAppId' in opts) || !opts.larkAppId)) return payload;
+  const mode = opts?.linkRefMode ?? 'disabled';
+  return {
+    ...payload,
+    linkRefs: {
+      mode,
+      sources: initialLinkRefSources({
+        userText,
+        userSourceType: opts?.linkRefSourceType,
+        groupContext: opts?.sharedGroupContext,
+        attachments: opts?.attachments,
+        publicSystemDocUrls: opts?.publicSystemDocUrls,
+      }),
+    },
+  };
+}
+
 /** Follow-up counterpart of buildNewTopicCliInput. */
 export function buildFollowUpCliInput(
   content: string,
@@ -1971,19 +2105,28 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+      return withInitialLinkRefSources(
+        { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+        content,
+        opts,
+      );
     }
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
-    return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
+    return withInitialLinkRefSources(
+      { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
+      content,
+      opts,
+    );
   }
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
-    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
+    // 续轮：按本会话冻结沙箱判（与 buildFollowUpBlocks 同一口径）。
+    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection, frozenSessionSandbox(sessionId)),
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);
@@ -1992,7 +2135,7 @@ export function buildFollowUpCliInput(
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
   const mentionBlock = renderMentionBlock(opts.mentions);
-  return {
+  return withInitialLinkRefSources({
     content: legacyContent,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -2009,7 +2152,7 @@ export function buildFollowUpCliInput(
       groupHistoryBlock: opts.sharedGroupContext,
       attachments: opts.attachments,
     }),
-  };
+  }, content, opts);
 }
 
 /**
@@ -2129,6 +2272,7 @@ export function buildReforkCliInput(
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
     turnId?: string;
+    linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
   },
 ): CliTurnPayload {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -2158,6 +2302,7 @@ export function buildReforkCliInput(
     sessionBackendType: ds.session.backendType,
     promptInjection: sessionPromptInjection(ds),
     turnId: opts?.turnId,
+    linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -3264,6 +3409,9 @@ export async function restoreActiveSessions(
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  // Rows whose backing session probed alive: their CLI is running already, so
+  // re-attaching is allowed even when the working directory is gone.
+  const liveBackendReattach = new Set<DaemonSession>();
   const restoreCandidates: Array<{
     ds: DaemonSession;
     backendType: PersistentBackendType;
@@ -3397,6 +3545,7 @@ export async function restoreActiveSessions(
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
     toReattach.push(ds);
+    liveBackendReattach.add(ds);
   }
 
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
@@ -3416,17 +3565,16 @@ export async function restoreActiveSessions(
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
-      forkWorker(
-        ds,
-        recoverExactNonCodex || '',
-        recoverExactNonCodex
-          ? {
-              resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-              turnId: ds.session.queuedActivationTurnId,
-              dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-            }
-          : true,
-      );
+      const prompt = recoverExactNonCodex || '';
+      const resume = recoverExactNonCodex
+        ? {
+            resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+            turnId: ds.session.queuedActivationTurnId,
+            dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          }
+        : true;
+      if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
+      else forkWorker(ds, prompt, resume);
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,
@@ -4024,10 +4172,6 @@ export async function resumeSession(
       const current = sessionStore.getOwnedSession(sessionId);
       if (!current || current.status !== 'active') return current?.status === 'closed';
       if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
-        logger.error(
-          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
-          + 'leaving the row active for explicit reconciliation',
-        );
         return false;
       }
       try {
@@ -4051,13 +4195,26 @@ export async function resumeSession(
       });
       return true;
     };
+    const reconcileStartedRemoteResumeExit = async (): Promise<boolean> => {
+      if (rollbackUnstartedRemoteResume()) return true;
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} provider exited after advancing lineage; `
+        + 'running an authoritative close before canonical activation',
+      );
+      const closed = await closeSessionForBackgroundCleanup(
+        sessionId,
+        'remote resume provider-exit rollback',
+      );
+      const current = sessionStore.getOwnedSession(sessionId);
+      return closed.ok && current?.status === 'closed';
+    };
     let started = false;
     try {
       started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
         onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
-        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+        onRemoteBackendStartupExit: reconcileStartedRemoteResumeExit,
       });
     } catch (error) {
       logger.warn(
@@ -4812,6 +4969,229 @@ export async function executeScheduledTask(
   });
 }
 
+// ─── 决策看板：owner 提交的一批决定 → 管家群会话的一个回合 ─────────────────────
+
+export interface OwnerBatchTurnInput {
+  larkAppId: string;
+  /** 管家所在群（bots.json steward.chatId）。 */
+  chatId: string;
+  /** 回合 id：`board:<appId>:<batchId>`，按批次稳定；同批次重投 / 补投沿用，worker 内存去重据此挡重复执行。 */
+  turnId: string;
+  prompt: string;
+  /** 管家群里的横幅（等同 owner 发了一条消息；也是话题群 / new-topic 模式下的落点）。 */
+  banner: string;
+  attachments: LarkAttachment[];
+  /** 提交人 = 管家 bot 的 owner（本 app 视角的 open_id）。拿不到就按无身份投递。 */
+  ownerOpenId?: string;
+  ownerName?: string;
+  sessionTitle: string;
+}
+
+/**
+ * 把看板批次作为一个回合送进管家群的 chat 级会话：会话在跑就续接（忙时走 worker 现有排队），
+ * 挂起就冷启续接，没有就新建。落点规则与定时任务的 chat 级顶层执行相同（话题群 /
+ * new-topic 模式下以横幅开新话题，shared 模式回复挂在横幅下）。
+ *
+ * 不复用 executeScheduledTask：它的尾段交织着定时任务专属状态（silent、task 位置的虚拟锚点
+ * 与提升、deferredScheduleRun），看板批次一个都不需要；这里只组合同一批底层原语。
+ *
+ * 身份按「owner 刚发的一条消息」处理（senderType=user）：批次就是 owner 刚点的提交，
+ * 不是定时触发；回合 id 的 `board:` 前缀足以在审计里区分来源。
+ */
+export async function deliverOwnerBatchTurn(
+  input: OwnerBatchTurnInput,
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion,
+  runtime?: {
+    prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  },
+): Promise<{ sessionId: string }> {
+  const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
+  if (!bot) throw new Error(`steward bot ${input.larkAppId} is not loaded`);
+  const { larkAppId, chatId, turnId } = input;
+  const { getChatMode, sendMessage } = await import('../im/lark/client.js');
+  const chatMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+  const chatType: 'p2p' | 'group' = chatMode === 'p2p' ? 'p2p' : 'group';
+  const regularGroupMode = chatType === 'p2p' ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  // 横幅的发送时机分两种：
+  //  - 话题群 / new-topic：横幅本身就是新话题锚点，全新 om_ id 下不可能有正在开场的会话，
+  //    锁外发（与定时任务 new-topic 落点同形）；
+  //  - shared / chat / p2p：锚点就是 chatId，横幅只是通知和 shared 模式的回复根。必须等锁内
+  //    开场保留 / 恢复归属检查通过后再发——否则管家会话还在选仓库时投递被拒，页面每重投一次
+  //    群里就多一条横幅。
+  const independentByMode = chatMode === 'topic' || regularGroupMode === 'new-topic';
+  let bannerId: string | undefined;
+  let bannerAttempted = false;
+  const postBanner = async (): Promise<string | undefined> => {
+    if (bannerAttempted) return bannerId;
+    bannerAttempted = true;
+    try {
+      bannerId = await sendMessage(larkAppId, chatId, input.banner);
+    } catch (err: any) {
+      logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+    }
+    return bannerId;
+  };
+  if (independentByMode) await postBanner();
+  // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
+  const opensIndependentTopic = independentByMode && !!bannerId;
+  const anchor = opensIndependentTopic ? bannerId! : chatId;
+  const sharedRootFor = (id: string | undefined): string | undefined =>
+    !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
+  const trustedCaller: CliTurnPayload['trustedCaller'] = input.ownerOpenId
+    ? { requestUserOpenId: input.ownerOpenId, requestLarkAppId: larkAppId, senderType: 'user' }
+    : undefined;
+  const sender: ResolvedSender | undefined = input.ownerOpenId
+    ? { openId: input.ownerOpenId, type: 'user', ...(input.ownerName ? { name: input.ownerName } : {}) }
+    : undefined;
+
+  refreshCliVersion(bot.config);
+  const key = sessionKey(anchor, larkAppId);
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    const existing = activeSessions.get(key);
+    if (existing) {
+      const reservedState = existing.pendingRepo
+        ? 'pending_repo'
+        : existing.pendingRepoCommitInFlight
+          ? 'pending_repo_commit'
+          : existing.initialStartPending
+            ? 'initial_start_pending'
+            : existing.worktreeCreating
+              ? 'worktree_creating'
+              : existing.session.queued
+                ? 'queued_backlog'
+                : undefined;
+      // 管家会话还在等开场（选仓库、建 worktree…）：不能抢在开场 prompt 前面，留给重投。
+      if (reservedState) throw new Error(`steward session ${existing.session.sessionId} is in ${reservedState}`);
+      if (hasProtectedSessionMutationOwnership(existing)) {
+        throw new Error(`steward session ${existing.session.sessionId} is being recovered`);
+      }
+      if (isRelayableRealSession(existing) || existing.session.suspendedColdResume) {
+        await runtime?.prepareTurnIdentity?.(existing, turnId);
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
+        }
+        // 开场检查过了才发横幅（shared 模式用它做这一回合的回复根）。
+        const sharedTopicRootId = sharedRootFor(await postBanner());
+        // 批次就是 owner 刚点的提交：按真人入站同口径刷新人活动钟，并清掉管家的决策举手
+        // （否则 Dashboard「需要你」常亮，且空闲自动关闭会一直跳过这个会话）。
+        markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
+        clearAgentAttention(existing);
+        ensureSessionWhiteboard(existing);
+        if (sharedTopicRootId) {
+          beginReplyTargetTurn(existing, sharedTopicRootId, turnId);
+          sessionStore.updateSession(existing.session);
+        }
+        const payload = buildFollowUpCliInput(input.prompt, existing.session.sessionId, {
+          isAdoptMode: false,
+          cliId: existing.session.cliLaunchSnapshot?.cliId ?? existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliLaunchSnapshot?.cliPathOverride ?? existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          locale: localeForBot(larkAppId),
+          larkAppId,
+          chatId,
+          whiteboardId: existing.session.whiteboardId,
+          sessionBackendType: existing.session.backendType,
+          promptInjection: sessionPromptInjection(existing),
+          attachments: input.attachments,
+          sender,
+          turnId,
+          trustedCaller,
+        });
+        rememberLastCliInput(existing, input.prompt, payload);
+        if (existing.worker && !existing.worker.killed) {
+          try {
+            if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
+              logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
+              return { sessionId: existing.session.sessionId };
+            }
+          } catch (err: any) {
+            logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
+          }
+        }
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
+        }
+        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
+        return { sessionId: existing.session.sessionId };
+      }
+      if (isDisposableCommandScratch(existing)) {
+        await closeSession(existing.session.sessionId);
+        if (activeSessions.get(key) === existing) activeSessions.delete(key);
+      }
+    }
+
+    const runtimeScope: 'thread' | 'chat' = anchor === chatId ? 'chat' : 'thread';
+    // 确定要新建会话了（chat/shared/p2p 路径的横幅拖到这里才发）。
+    const sharedTopicRootId = sharedRootFor(await postBanner());
+    const session = sessionStore.createSession(chatId, anchor, input.sessionTitle, chatType, undefined, { source: 'ordinary-feishu' });
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = runtimeScope;
+    if (input.ownerOpenId) {
+      session.ownerOpenId = input.ownerOpenId;
+      // 批次按 owner 本人的消息投递，新人活动钟与真人开话题同口径（follow-active 据此落点）。
+      stampHumanActivity(session, now);
+    }
+    session.lastMessageAt = new Date(now).toISOString();
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType,
+      scope: runtimeScope,
+      spawnedAt: sessionCreatedAtMs(session),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: effectiveDefaultWorkingDir(bot.config),
+      initialStartPending: true,
+      pendingPrompt: input.prompt,
+    };
+    if (sharedTopicRootId) {
+      beginReplyTargetTurn(ds, sharedTopicRootId, turnId);
+      sessionStore.updateSession(ds.session);
+    }
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
+      ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
+      input.attachments, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId },
+      localeForBot(larkAppId), sender, {
+        larkAppId,
+        chatId,
+        whiteboardId: ds.session.whiteboardId,
+        trustedCaller,
+        promptInjection: sessionPromptInjection(ds),
+        larkToolResume: false,
+        turnId,
+      });
+    try {
+      await runtime?.prepareTurnIdentity?.(ds, turnId);
+    } catch (err) {
+      sessionStore.closeSession(session.sessionId);
+      throw err;
+    }
+    if (!setActiveSessionIfActive(activeSessions, key, ds)) {
+      const winner = activeSessions.get(key);
+      await closeSession(session.sessionId);
+      throw new Error(`decision board batch lost active-session registration for ${anchor}`
+        + (winner ? ` to ${winner.session.sessionId}` : ''));
+    }
+    rememberLastCliInput(ds, input.prompt, prompt);
+    forkWorker(ds, prompt, turnId);
+    ds.initialStartPending = false;
+    ds.pendingPrompt = undefined;
+    logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
+    return { sessionId: session.sessionId };
+  });
+}
+
 // ─── Dashboard「创建会话」spawn / activate ───────────────────────────────────
 
 /** 解析 dashboard 创建会话的 pinned workingDir：本群 oncall 绑定优先（弹框填了工作目录会
@@ -4831,11 +5211,45 @@ function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): str
   return undefined;
 }
 
+/** forkOrShowRepoCard 的缺目录分支：首轮按选仓流程落盘，发缺目录形态的选仓卡（没有「直接开启
+ *  会话」，0 个项目也能手填），选好目录由 card-handler 的 pendingRepo 分支起 CLI。卡片发不出去
+ *  时 publishWorkingDirRecovery 改回文字，会话仍待选仓，`/repo <路径>` 可以提交。 */
+async function showMissingStartDirPicker(
+  ds: DaemonSession,
+  missingDir: string,
+  userContent: string,
+): Promise<'pending_repo'> {
+  ds.pendingRepo = true;
+  ds.pendingPrompt = userContent;
+  try {
+    stagePendingRepoSetup(ds, {
+      mode: 'picker',
+      turnId: ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId,
+    });
+  } catch (err) {
+    // Nothing was published, and a direct start would be refused as well.
+    ds.pendingRepo = false;
+    throw err;
+  }
+  ds.initialStartPending = false;
+  const { publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+  const { sendMessage } = await import('../im/lark/client.js');
+  await publishWorkingDirRecovery(ds, missingDir, {
+    sessionReply: (_rootId, content, msgType = 'text') => sendMessage(ds.larkAppId, ds.chatId, content, msgType),
+    lastRepoScan: new Map(),
+  });
+  announcePendingRepoSession(ds);
+  dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+  logger.info(`[createSession] start dir ${missingDir} is missing — repo picker posted for session ${ds.session.sessionId.substring(0, 8)}`);
+  return 'pending_repo';
+}
+
 /** 起会话或弹 /repo 选择卡片——复用普通新话题那套仓库选择逻辑：
  *  - ds.workingDir 已钉（oncall / bot 默认）→ 直接 forkWorker。
  *  - 没钉但扫到可选项目 → 设 pendingRepo + 把 userContent 暂存进 pendingPrompt + 在群里发
  *    buildRepoSelectCard（含 worktree）。用户点卡片由 card-handler 的 pendingRepo 分支起 CLI。
  *  - 没钉也没项目 → 回退用 bot 默认 cwd 直接起。
+ *  - 没钉且那个默认 cwd 不存在 → 不直接起（会被拒），发缺目录选仓卡（showMissingStartDirPicker）。
  *  userContent 是已按角色包装好的首轮内容（lead 前言等），不论哪条路都原样带过去。 */
 async function forkOrShowRepoCard(
   ds: DaemonSession,
@@ -4902,6 +5316,11 @@ async function forkOrShowRepoCard(
   );
 
   if (!ds.workingDir) {
+    // 不选仓库时会落到的目录（bot 默认工作目录）不存在：直接起会被拒，与普通新话题一样改发
+    // 缺目录选仓卡（daemon 的 publishMissingStartDirPicker），首轮挂在卡后。
+    const { missingStartDir } = await import('./working-dir-recovery.js');
+    const missingDir = missingStartDir(ds);
+    if (missingDir) return showMissingStartDirPicker(ds, missingDir, userContent);
     // 没钉目录 → 复用 /repo 选择卡片让用户在群里选仓库。
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
@@ -4974,6 +5393,8 @@ async function forkOrShowRepoCard(
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;
+    ds.pendingGroupJoinContext = undefined;
+    ds.pendingTrustedCaller = undefined;
     ds.pendingAttachments = undefined;
     ds.pendingMentions = undefined;
     ds.pendingSender = undefined;

@@ -21,7 +21,6 @@ import { buildTurnFailedCard, type TurnFailedCardOpts } from '../src/im/lark/car
 import {
   shouldNotifyTurnFailure,
   turnRetryOffer,
-  mayOfferTurnRetry,
   userAbortErrorCodes,
   userAbortErrorCodePrefixes,
   supersededByNewerInputErrorCodes,
@@ -238,18 +237,6 @@ describe('turnRetryOffer', () => {
     expect(turnRetryOffer({
       status: 'failed', errorCode: 'terminal_bridge_unavailable', retryable: false,
     })).toBe('none');
-  });
-
-  it('mayOfferTurnRetry agrees with turnRetryOffer', () => {
-    const cases = [
-      { status: 'failed' as const, errorCode: 'cli_exit' },
-      { status: 'ambiguous' as const, errorCode: 'write_input_threw' },
-      { status: 'completed' as const },
-      { status: 'ambiguous' as const, errorCode: 'pi_turn_aborted' },
-    ];
-    for (const c of cases) {
-      expect(mayOfferTurnRetry(c)).toBe(turnRetryOffer(c) !== 'none');
-    }
   });
 
   it('the policy whitelists do not overlap', () => {

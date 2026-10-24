@@ -5,9 +5,11 @@ import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
@@ -21,7 +23,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
-import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
@@ -132,9 +134,9 @@ export function contextCompactThreshold(): number {
 
 /** 布尔字段按配置页的逻辑分组（与 dashboard 的 Bot Profiles 区块对应）。 */
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
-  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
+  { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -369,6 +371,11 @@ export function getCliDisplayName(cliId: CliId): string {
  *  `<at id=…></at>` tag and spoof a mention in a `lark_md` body. */
 function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
+}
+
+/** Inline code is literal: markdown escaping would surface visible backslashes. */
+function inlineCode(s: string): string {
+  return `\`${s.replace(/[`\r\n]+/g, '')}\``;
 }
 
 /** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
@@ -821,11 +828,28 @@ const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
  *  只对 idle 生效，其它状态一律忽略。 */
 export type IdleCardLabel = 'silent' | 'completed' | 'failed';
 
+/** 主回合已结束、但它派出的后台子任务（后台 agent / 后台 Bash / Monitor）仍有
+ *  `backgroundTasks` 个在运行。working 与 idle 都可能带它（是否钉住 working 由
+ *  worker 既有规则决定），卡头一律显示「⏳ 主回合已结束 · 后台子任务运行中（N）」。 */
+export interface BackgroundWaitCardLabel {
+  backgroundTasks: number;
+}
+
+/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
-function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
   if (v === true) return 'silent';
   if (v === 'silent' || v === 'completed' || v === 'failed') return v;
   return undefined;
+}
+
+/** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
+function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
+  if (status !== 'working' && status !== 'idle') return undefined;
+  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  return label.backgroundTasks;
 }
 
 /** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
@@ -836,7 +860,9 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
+  const backgroundTasks = backgroundWaitCount(status, idleLabel);
+  if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -966,8 +992,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
-  silentIdle?: boolean | IdleCardLabel,
+  /** 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link StreamCardLabel}。 */
+  silentIdle?: boolean | StreamCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -991,6 +1017,7 @@ export function buildStreamingCard(
     ...(cardNonce ? { card_nonce: cardNonce } : {}),
   };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
+  const backgroundWait = backgroundWaitCount(status, silentIdle) !== undefined;
 
   const elements: any[] = [];
 
@@ -1071,9 +1098,10 @@ export function buildStreamingCard(
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
-  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
+  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败；
+  // 主回合已结束、只剩后台子任务在跑时也无 turn 可停（^C 停不了后台任务）。
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
     headerActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
   }
@@ -1102,9 +1130,11 @@ export function buildStreamingCard(
       })),
       value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
     }] });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
-      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
-    ) + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '') }] });
+    const effortScope = effortControl.pending && effortControl.nextTurn
+      ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
+      : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
+        + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: effortScope }] });
   }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
@@ -1183,7 +1213,7 @@ export function buildStreamingCard(
     extraConfig: { update_multi: true },
     header: cardHeader(
       `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
-      STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+      backgroundWait ? BACKGROUND_WAIT_TEMPLATE : STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     ),
     elements,
   });
@@ -1341,7 +1371,20 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
  *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
  *  many trailing projects to fit the card byte budget; the card then says so.
  *  Callers go through buildRepoSelectCard, which owns the budget. */
-function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
+/** Recovery form of the repo picker: the session's working directory is gone.
+ *  The top row names the missing path and, when git still knows where the
+ *  worktree came from, offers to rebuild it there; switching works as usual
+ *  but keeps the session. */
+export interface RepoSelectRecovery {
+  missingPath: string;
+  /** Branch the deleted worktree had; absent → no rebuild button. */
+  rebuildBranch?: string;
+  /** The session's first message has not started: choosing a directory starts
+   *  it there, so the card asks for a directory rather than a resend. */
+  opening?: boolean;
+}
+
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number, recovery?: RepoSelectRecovery): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1363,8 +1406,45 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
     }));
 
   const card = wideCard({
-    header: cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
+    header: recovery
+      ? cardHeaderTemplateFirst('orange', t(recovery.opening ? 'card.repo.recovery_title_opening' : 'card.repo.recovery_title', undefined, locale))
+      : cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
+      // Recovery: the missing directory + 「重建 worktree」take the top row. There
+      // is no 「直接开启会话」— the directory it would start in is the one gone.
+      ...(recovery ? [{
+        tag: 'column_set',
+        flex_mode: 'flow',
+        horizontal_spacing: 'default',
+        columns: [
+          {
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              larkMdDiv(t(
+                recovery.opening
+                  ? 'card.repo.recovery_missing_opening'
+                  : recovery.rebuildBranch ? 'card.repo.recovery_missing' : 'card.repo.recovery_missing_no_rebuild',
+                { path: escapeMd(recovery.missingPath) },
+                locale,
+              )),
+            ],
+          },
+          ...(recovery.rebuildBranch ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [
+              callbackButton(
+                t('card.btn.rebuild_worktree', { branch: recovery.rebuildBranch }, locale),
+                'primary',
+                { action: 'repo_rebuild_worktree', root_id: rootMessageId ?? '' },
+              ),
+            ],
+          }] : []),
+        ],
+      }] : [
       // Current working directory + 「直接开启会话」on the same row: the skip
       // button means "use this directory as-is, don't pick a repo", so it pairs
       // with the current-dir line rather than the switch dropdown below.
@@ -1399,11 +1479,13 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             ],
           },
         ],
-      },
+      }]),
       {
         tag: 'hr',
       },
-      {
+      // A recovery card is published with whatever the scan finds, possibly
+      // nothing; it then offers manual entry (below) instead of an empty select.
+      ...(options.length > 0 || !recovery ? [{
         tag: 'action',
         actions: [
           {
@@ -1413,7 +1495,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             value: { key: 'repo_switch', root_id: rootMessageId ?? '' },
           },
         ],
-      },
+      }] : []),
       // Worktree open. Two modes, persisted per-bot (worktreeMultiPicker):
       //   • single (default) — instant single-select dropdown + a short 「🔀 多仓库」
       //     button on the SAME action row (a select_static can't live in a
@@ -1540,7 +1622,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         elements: [
           {
             tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
+            content: t(
+              recovery ? (recovery.opening ? 'card.repo.recovery_note_opening' : 'card.repo.recovery_note') : 'card.repo.note',
+              undefined,
+              locale,
+            ),
           },
         ],
       },
@@ -1576,9 +1662,9 @@ export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
  *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
  *  thing before and after a truncation. The scanner sorts repos ahead of
  *  worktrees, so in practice the tail that goes is worktrees. */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, recovery?: RepoSelectRecovery): string {
   const render = (visible: number): string =>
-    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible, recovery);
   const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
 
   const full = render(projects.length);
@@ -2793,13 +2879,16 @@ export interface AdoptPickerEntry {
    *  Deterministic so a re-render (which re-discovers) reproduces the same key. */
   key: string;
   kind: AdoptEntryKind;
+  /** Live backend shown in the source field. Resume rows have no live backend. */
+  liveBackend?: 'tmux' | 'Zellij' | 'Herdr' | 'Orca';
   cliId?: CliId;
   cliDisplayName?: string;
   /** resume: the CLI's native title when the transcript has one, else the
-   *  first real user prompt (see ResumableSession.title); live: backend
-   *  display name (herdr pane label / Claude terminal title, see
-   *  AdoptableSession.title), else project (cwd basename). zellij always uses
-   *  project. */
+   *  first real user prompt (see ResumableSession.title); live: backend /
+   *  CLI display name (herdr pane label / Claude terminal title / TraeX native
+   *  title, see AdoptableSession.title and ZellijAdoptableSession.title; herdr
+   *  entries whose tab was found are named after it, see herdrTabTitle) or the
+   *  Orca terminal title, else project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2809,6 +2898,10 @@ export interface AdoptPickerEntry {
   sessionId?: string;
   /** live: tmux/zellij/herdr target label. */
   target?: string;
+  /** live herdr: workspace name shown ahead of `target` on the Location line. */
+  targetWorkspace?: string;
+  /** Search-only text, never rendered (live herdr: workspace and tab names). */
+  searchAliases?: string[];
   /** live: startedAt (uptime); resume: lastActivityAt. */
   timeMs?: number;
   /** One-based position among history candidates, for same-screen disambiguation. */
@@ -2828,9 +2921,35 @@ export interface AdoptPickerEntry {
  *  匹配"): (zellijSession, zellijPaneId) already uniquely identifies the pane.
  *  tmux/herdr keep adoptTargetKey (tmux includes pid, herdr does not) — tmux's
  *  confirm fast-path parses the trailing pid, and that path is unchanged. */
-export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
+function isOrcaAdoptCandidate(
+  s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession,
+): s is OrcaAdoptableSession {
+  return 'source' in s && s.source === 'orca';
+}
+
+export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession): string {
+  if (isOrcaAdoptCandidate(s)) return `live:orca:${s.orcaTerminalHandle}`;
   if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}`;
   return `live:${adoptTargetKey(s)}`;
+}
+
+/** Title of a live herdr entry named after its tab. Alone in the tab: pane
+ *  label > the tab's given name > native title (Claude: terminal title, else
+ *  first prompt) > the tab's default name. Sharing the tab with other entries
+ *  of this card: `<tab> · <pane label | native title | untitled>`. Undefined
+ *  unless the picker's enrichment found the tab; the caller then keeps the
+ *  discovery title exactly as before. */
+function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string): string | undefined {
+  if (s.source !== 'herdr' || !s.herdrTabLabel || s.herdrTabAutoNamed === undefined) return undefined;
+  const groupKey = herdrTabGroupKey(s);
+  const native = s.herdrNativeTitle ?? s.herdrFirstPrompt;
+  if ((groupKey ? tabGroups.get(groupKey) ?? 0 : 0) > 1) {
+    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? untitled);
+  }
+  return s.herdrPaneLabel
+    ?? (s.herdrTabAutoNamed ? undefined : s.herdrTabLabel)
+    ?? native
+    ?? s.herdrTabLabel;
 }
 
 /** Fold both adopt sources into one uniform entry list. Live entries come
@@ -2842,26 +2961,46 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): stri
  *  CLI, so the caller knows it), and the user wants to see "Codex" on each
  *  history row rather than a blank. */
 export function buildAdoptEntries(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
+  locale?: Locale,
 ): AdoptPickerEntry[] {
   const customName = runtimeDisplayName?.trim();
+  const tabGroups = countHerdrTabGroups(sessions);
+  const untitledLive = t('card.adopt.untitled_live', undefined, locale);
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
-    const target = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
+    const title = isOrcaAdoptCandidate(s)
+      ? s.orcaTerminalTitle || project
+      : s.title || project;
+    let target: string | undefined;
+    if (isOrcaAdoptCandidate(s)) target = undefined;
+    else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
+    else target = adoptTargetLabel(s);
+    // Only herdr / tmux entries carry herdr names; zellij and Orca never do.
+    const herdrLike = isOrcaAdoptCandidate(s) || zellij ? undefined : s;
+    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive) : undefined;
+    const workspace = herdrLike?.herdrWorkspaceLabel;
+    const tabName = herdrLike?.herdrTabAutoNamed !== undefined ? herdrLike.herdrTabLabel : undefined;
+    const aliases = [workspace, tabName].filter((a): a is string => !!a);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
+      liveBackend: isOrcaAdoptCandidate(s)
+        ? 'Orca'
+        : zellij ? 'Zellij' : s.source === 'herdr' ? 'Herdr' : 'tmux',
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: (!zellij && s.title) || project,
+      title: tabTitle ?? title,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
       target,
+      ...(workspace ? { targetWorkspace: workspace } : {}),
+      ...(aliases.length > 0 ? { searchAliases: aliases } : {}),
       timeMs: s.startedAt,
     };
   });
@@ -2892,14 +3031,15 @@ export interface AdoptPickerState {
 const ADOPT_PICKER_PAGE_SIZE = 5;
 const ADOPT_SEARCH_FIELD = 'adopt_search_q';
 
-/** Case-insensitive substring over title / project / cwd / cliId / sessionId.
- *  Empty query matches everything. Includes sessionId so a user who knows the
- *  id can type it and jump straight to the entry. */
+/** Case-insensitive substring over title / project / cwd / cliId / sessionId /
+ *  target and the search-only aliases (herdr workspace / tab names, which the
+ *  title may not show). Empty query matches everything. Includes sessionId so a
+ *  user who knows the id can type it and jump straight to the entry. */
 function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefined): AdoptPickerEntry[] {
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target]
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target, ...(e.searchAliases ?? [])]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -2917,7 +3057,7 @@ function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefine
  * knows to narrow via search instead of assuming they saw everything.
  */
 export function buildAdoptSelectCard(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
   resumable?: ResumableSession[],
@@ -2927,7 +3067,7 @@ export function buildAdoptSelectCard(
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName, locale);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;
@@ -3006,8 +3146,12 @@ export function buildAdoptSelectCard(
   // ─── Session cards (current page) ───────────────────────────────────
   visible.forEach((e) => {
     const isSelected = e.key === selectedKey;
+    // 既有后端（tmux/Zellij/Herdr）的「来源」行保持原样，避免改变老用户卡片形态；
+    // 仅 Orca 作为实验能力追加后端名与实验性标记（后端身份仍可从「位置」行看出）。
     const kindTag = e.kind === 'live'
-      ? t('card.adopt.kind_live', undefined, locale)
+      ? (e.liveBackend === 'Orca'
+        ? `${t('card.adopt.kind_live', undefined, locale)} · Orca${t('card.adopt.orca_experimental_suffix', undefined, locale)}`
+        : t('card.adopt.kind_live', undefined, locale))
       : t('card.adopt.kind_resume', undefined, locale);
     const cliName = e.cliDisplayName ?? (e.cliId ? getCliDisplayName(e.cliId) : '—');
     const timeLabel = e.kind === 'live'
@@ -3023,10 +3167,15 @@ export function buildAdoptSelectCard(
       titleLine,
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
-      `${labelDir}: \`${escapeMd(e.cwd)}\``,
+      `${labelDir}: ${inlineCode(e.cwd)}`,
     ];
     if (e.kind === 'resume' && e.candidateNumber) lines.push(`${labelCandidate}: #${e.candidateNumber}`);
-    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
+    if (e.kind === 'live' && e.target) {
+      const target = inlineCode(e.target);
+      lines.push(`${labelTarget}: ${e.targetWorkspace
+        ? t('card.adopt.location_with_workspace', { workspace: escapeMd(e.targetWorkspace), target }, locale)
+        : target}`);
+    }
     lines.push(`${timeLabel}: ${timeVal}`);
     elements.push({
       tag: 'interactive_container',

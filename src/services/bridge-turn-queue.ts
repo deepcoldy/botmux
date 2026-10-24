@@ -32,12 +32,15 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isMidTurnAbsorbedQueuedCommand,
   isScheduledTurnStartEvent,
   cronCreateToolUseIds,
   cronCreateAcks,
   isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
+  isClaudeTurnDurationEvent,
+  eventTimeMs,
   isTranscriptRateLimitEvent,
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
@@ -58,15 +61,29 @@ function assistantHasVisibleText(content: unknown): boolean {
 export interface BridgePendingTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   started: boolean;
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
    * never settle from screen-idle alone; worker terminal emission requires
    * this bit (or an explicit failure/exit path outside the queue). */
   terminalObserved?: boolean;
+  /** The latest terminal evidence is an assistant record's stop_reason that no
+   * `system/turn_duration` has confirmed yet. Claude Code stamps EVERY content
+   * block record with its message's stop reason, so the thinking block of a
+   * final message reads `end_turn` while the text block, an API error that cut
+   * the stream and the Stop hooks may all still follow. See drainEmittable. */
+  awaitingDurationMarker?: boolean;
+  /** Its `system/turn_duration` was read: the turn's last record. Anything the
+   *  assistant writes after it belongs to the next turn. */
+  closedByDurationMarker?: boolean;
   /** Structured execution result. This is independent from whether transcript
    * fallback text is visible or suppressed by a prior `botmux send`. */
   terminalOutcome?: Exclude<ClaudeTerminalOutcome, { status: 'rate_limited' }>;
+  /** Transcript timestamp of the record that set a non-completed
+   * terminalOutcome. Tells a failure the worker watched happen from one it is
+   * replaying out of an earlier generation's history. */
+  terminalOutcomeAtMs?: number;
   /** Structured 429 observed for this turn. It remains owned by the existing
    * limited/reset path and must not be converted into ordinary ambiguity when
    * the following turn_duration closes the transcript boundary. */
@@ -97,6 +114,9 @@ export interface BridgePendingTurn {
   /** A late text block after an empty terminal still belongs to the same
    * native local input; reuse its captured reply address. */
   replyContextTurnId?: string;
+  /** Local turns only: the Lark turn that most recently started before this
+   * one was synthesised — where a failure notice for it is anchored. */
+  precedingLarkTurnId?: string;
   /** A short substring of the Lark message that we expect to find inside
    *  the next matching `user` event's content. When set, only a user event
    *  whose stringified content contains this fingerprint is allowed to
@@ -130,6 +150,13 @@ export interface BridgePendingTurn {
   restoredFromJournal?: boolean;
   /** Observed at least one non-error assistant event (including tool calls). */
   hasAssistantActivity?: boolean;
+  /** Set on a Lark turn whose input Claude Code folded into the turn already
+   *  running (a mid-turn system reminder) instead of starting its own. It has
+   *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
+  absorbedIntoTurnId?: string;
+  /** Lark turns folded into this one. They leave the queue right behind it and
+   *  share its terminal, so each still gets the end signal its card waits for. */
+  absorbedTurns?: BridgePendingTurn[];
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -233,6 +260,51 @@ export class BridgeTurnQueue {
    *  `pruneExpired`'s return value, just accumulated because the drop happens
    *  deep inside ingest() rather than at an explicit call boundary. */
   private droppedNeedingJournalClear: BridgePendingTurn[] = [];
+  /** This transcript has shown it ends turns with `system/turn_duration`
+   *  (seen live, in absorbed history, or by the worker's baseline probe).
+   *  Survives clearPending: it describes the CLI, not one generation's turns. */
+  private durationMarkerSeen = false;
+  /** An idle-edge wait for a turn's duration marker ran out before this
+   *  transcript ever showed one: the CLI most likely never writes it (older
+   *  Claude JSONL), so later turns settle on the stop_reason again instead of
+   *  each waiting out the bound. A marker read afterwards outranks this.
+   *  Survives clearPending for the same reason as durationMarkerSeen. */
+  private durationMarkerWaitExpired = false;
+
+  /** Record that this transcript writes `system/turn_duration` markers. */
+  noteDurationMarkerObserved(): void {
+    this.durationMarkerSeen = true;
+  }
+
+  /** The worker's bounded idle-edge wait for the head turn's close ran out. */
+  noteDurationMarkerWaitExpired(): void {
+    if (!this.durationMarkerSeen) this.durationMarkerWaitExpired = true;
+  }
+
+  /** True while `turn` is held for its duration marker: its terminal so far is
+   *  a block-level stop_reason and no later turn has started collecting (a new
+   *  turn start is itself the boundary, and must never leave the head blocked
+   *  behind it). The hold does not need the marker to have been seen before:
+   *  the first turn of a session is cut by an API error as easily as any other.
+   *  Only a CLI shown not to write the marker (see durationMarkerWaitExpired)
+   *  settles on the stop_reason. */
+  isAwaitingDurationMarker(turn: BridgePendingTurn): boolean {
+    return (this.durationMarkerSeen || !this.durationMarkerWaitExpired)
+      && turn.awaitingDurationMarker === true
+      && turn === this.collecting;
+  }
+
+  /** True while the transcript is still writing `turn`: it started, it is the
+   *  turn collecting records, and nothing has closed it yet — no terminal
+   *  record was read, or it is held for its duration marker. Claude shows its
+   *  prompt (and its hooks report done) before the records that close a turn —
+   *  its final blocks, an API error that cut the stream, the marker — reach the
+   *  file, so the worker waits (bounded) on this at an idle edge before
+   *  settling from it. */
+  isTurnOpenAtIdle(turn: BridgePendingTurn): boolean {
+    if (!turn.started || turn !== this.collecting || turn.closedByDurationMarker) return false;
+    return !turn.terminalObserved || this.isAwaitingDurationMarker(turn);
+  }
 
   /** Hand over (and forget) the turns dropped head-of-line since the last
    *  call. The worker drains this after every ingest and clears each one's
@@ -248,6 +320,7 @@ export class BridgeTurnQueue {
   absorb(events: TranscriptEvent[]): void {
     for (const ev of events) {
       if (ev.uuid) this.seen.add(ev.uuid);
+      if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
     }
   }
 
@@ -265,11 +338,12 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean },
+    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
   ): string {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(opts?.linkRefMode ? { linkRefMode: opts.linkRefMode } : {}),
       started: false,
       assistantUuids: [],
       contentFingerprint,
@@ -406,10 +480,21 @@ export class BridgeTurnQueue {
         // would skip queued_command events and the type-ahead'd turn's
         // assistant text would either be dropped or attributed to a
         // sibling turn.
+        if (isMidTurnAbsorbedQueuedCommand(ev)) {
+          this.handleAbsorbedInput(ev, sourceJsonlPath);
+          continue;
+        }
         if (!isMeaningfulQueuedCommand(ev)) continue;
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // An assistant record after the collecting turn's duration marker opens
+        // the next turn, one that began without a meaningful user line (a
+        // `<task-notification>` wake-up). A live drain has emitted the closed
+        // turn by then; a batch spanning several turns — a rotation switch
+        // replaying what the bridge did not read — must not fold the next
+        // turn's reply into it.
+        if (this.collecting?.closedByDurationMarker) this.collecting = null;
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -463,6 +548,7 @@ export class BridgeTurnQueue {
               // on (`status !== 'failed' || retryable !== true` → no
               // continuation). Unconditional assignment, therefore.
               this.collecting.terminalOutcome = terminalOutcome;
+              this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
             } else {
               // The `<synthetic>` placeholder is the WEAKEST terminal signal
               // there is - no model call happened at all (no requestId, usage
@@ -471,7 +557,10 @@ export class BridgeTurnQueue {
               // then withhold the real answer text AND let the daemon post a
               // failure card for a turn that had in fact been answered. With no
               // earlier terminal outcome it still records the failure.
-              this.collecting.terminalOutcome ??= terminalOutcome;
+              if (this.collecting.terminalOutcome === undefined) {
+                this.collecting.terminalOutcome = terminalOutcome;
+                this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+              }
             }
             this.collecting.terminalObserved = true;
           }
@@ -494,6 +583,7 @@ export class BridgeTurnQueue {
             isLocal: true,
             userUuid: undefined,
             replyContextTurnId: this.lastLocalTurnId,
+            precedingLarkTurnId: this.lastLarkTurnId,
             assistantUuids: [],
             sourceJsonlPath,
             markTimeMs: Date.now(),
@@ -513,6 +603,10 @@ export class BridgeTurnQueue {
         }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
+          // Provisional: this may be any block of the final message, not its
+          // last one. Records that follow stay attributed here because the turn
+          // keeps `collecting`; drainEmittable holds it for the duration marker.
+          this.collecting.awaitingDurationMarker = true;
           if (terminalOutcome?.status !== 'rate_limited') {
             this.collecting.terminalOutcome ??= terminalOutcome;
           }
@@ -524,8 +618,11 @@ export class BridgeTurnQueue {
         // still authoritative proof that the turn completed. Keep a previously
         // classified API failure, but otherwise use the same completed default
         // as the next-turn-start compatibility boundary below.
+        if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
         if (this.collecting) {
           this.collecting.terminalObserved = true;
+          this.collecting.awaitingDurationMarker = false;
+          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }
@@ -598,6 +695,7 @@ export class BridgeTurnQueue {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.dropAbsorbedTurns(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
@@ -641,6 +739,50 @@ export class BridgeTurnQueue {
     this.collecting = scheduledTurn;
     this.lastLocalTurnId = scheduledTurn.turnId;
     this.onLocalTurnStarted?.(scheduledTurn);
+  }
+
+  /** A message typed while a turn ran, which Claude Code folded into that turn
+   *  as a system reminder instead of starting a new one. Not a turn boundary
+   *  (the running turn keeps collecting), but it is where the pending Lark
+   *  mark's input entered the conversation, and no `role:user` line follows.
+   *  Bind the mark here — under the same fingerprint / truncation proof as a
+   *  real turn start — and end it together with the turn that absorbed it;
+   *  otherwise the mark expires unmatched and its turn never gets a terminal.
+   *  A non-matching or unfingerprinted mark is left alone. */
+  private handleAbsorbedInput(ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    const next = this.queue.find(t => !t.started);
+    if (!next?.contentFingerprint) return;
+    const userText = normaliseForFingerprint(extractTurnStartText(ev));
+    if (!userText.includes(next.contentFingerprint) && !isTruncatedMatch(userText, next.contentNormalized)) return;
+    const fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
+    const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    next.started = true;
+    if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+    next.markTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    const host = this.collecting;
+    if (host && !host.terminalObserved) {
+      next.absorbedIntoTurnId = host.turnId;
+      (host.absorbedTurns ??= []).push(next);
+    } else {
+      // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
+      // running turn): what the model does from here on answers this input.
+      this.collecting = next;
+    }
+    this.lastLarkTurnId = next.turnId;
+    this.lastLocalTurnId = undefined;
+    this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+  }
+
+  /** A head-of-line dropped turn takes the input it absorbed with it: left
+   *  behind, a started turn that can never see a terminal would block the
+   *  queue head for good. */
+  private dropAbsorbedTurns(host: BridgePendingTurn): void {
+    for (const absorbed of host.absorbedTurns ?? []) {
+      const idx = this.queue.indexOf(absorbed);
+      if (idx < 0) continue;
+      this.queue.splice(idx, 1);
+      this.droppedNeedingJournalClear.push(absorbed);
+    }
   }
 
   /** Shared turn-start handler. Called for both `role:user` and
@@ -691,6 +833,7 @@ export class BridgeTurnQueue {
       // 「本轮执行失败」card. Local turns are skipped: they are synthesised by
       // this queue and never had a journal entry to begin with.
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.dropAbsorbedTurns(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
@@ -758,6 +901,7 @@ export class BridgeTurnQueue {
         turnId: `local-${uuid}`,
         started: true,
         isLocal: true,
+        precedingLarkTurnId: this.lastLarkTurnId,
         userUuid: uuid,
         assistantUuids: [],
         sourceJsonlPath,
@@ -791,6 +935,9 @@ export class BridgeTurnQueue {
     /** Screen idle may release ordinary fallback turns, but never a durable
      * receiver turn whose receipt depends on an exact terminal contract. */
     requireExplicitTerminalForDurable?: boolean;
+    /** The CLI generation is ending (exit, kill, teardown): a duration marker
+     *  still due will never be written, so a turn held for it is final now. */
+    releaseHeldTerminals?: boolean;
   } = {}): BridgePendingTurn[] {
     const out: BridgePendingTurn[] = [];
     while (this.queue.length > 0) {
@@ -800,10 +947,28 @@ export class BridgeTurnQueue {
       if (opts.requireExplicitTerminalForDurable
         && head.dispatchAttempt !== undefined
         && !head.terminalObserved) break;
+      // Neither the per-read drain nor the idle edge may settle a turn on a
+      // block-level stop_reason when its duration marker is due: the reader can
+      // stop between two records of one message (the idle edge, too, can beat
+      // the transcript flush). The rest of the turn would then arrive with
+      // nothing collecting, be synthesised as a local turn, and a stream that
+      // died there would fail that local turn instead of this one — answer
+      // text gone, failure unreported.
+      if (!opts.releaseHeldTerminals && this.isAwaitingDurationMarker(head)) break;
       if (!opts.terminalBoundary && !head.terminalObserved && head.assistantUuids.length === 0) break;
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
       out.push(head);
+      for (const absorbed of head.absorbedTurns ?? []) {
+        const idx = this.queue.indexOf(absorbed);
+        if (idx < 0) continue;
+        this.queue.splice(idx, 1);
+        if (this.collecting === absorbed) this.collecting = null;
+        absorbed.terminalObserved = head.terminalObserved;
+        if (head.terminalOutcome) absorbed.terminalOutcome ??= head.terminalOutcome;
+        if (head.rateLimited) absorbed.rateLimited = true;
+        out.push(absorbed);
+      }
     }
     return out;
   }

@@ -8,6 +8,7 @@ import {
   withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -47,7 +48,8 @@ export function signCliAuth(secretB64Url: string, bind?: string): HmacAttempt {
 
 /**
  * Verify a CLI rotation HMAC attempt.
- * - Source IP must be loopback (127.0.0.1 / ::1 / IPv4-mapped form).
+ * - Source IP must be loopback (127.0.0.1 / ::1 / IPv4-mapped form, plus any
+ *   BOTMUX_LOOPBACK_PEERS entries — see utils/loopback-peers.ts).
  * - Timestamp must be within ±TS_WINDOW_S seconds of now.
  * - Nonce must not have been seen in the last NONCE_TTL_MS.
  * - HMAC-SHA256(secret, `${ts}:${nonce}` [+ `:${bind}`]) must match `sig`
@@ -60,11 +62,7 @@ export function verifyHmac(
   remoteAddr: string,
   bind?: string,
 ): { ok: boolean; reason?: string } {
-  if (
-    remoteAddr !== '127.0.0.1' &&
-    remoteAddr !== '::1' &&
-    !remoteAddr.endsWith('::ffff:127.0.0.1')
-  ) {
+  if (!isLoopbackPeer(remoteAddr)) {
     return { ok: false, reason: 'remote_not_loopback' };
   }
   const tsNum = Number(attempt.ts);
@@ -333,7 +331,9 @@ export type WorkbenchH5Capability =
   | 'terminal.view'
   | 'terminal.operate'
   | 'preview.view'
-  | 'preview.operate';
+  | 'preview.operate'
+  | 'board.view'
+  | 'board.decide';
 
 export function workbenchH5Capability(method: string, pathname: string): WorkbenchH5Capability | null {
   const normalizedMethod = method.toUpperCase();
@@ -366,6 +366,16 @@ export function workbenchH5Capability(method: string, pathname: string): Workben
   if (terminal) {
     if (normalizedMethod === 'GET' && !terminal[1]) return 'terminal.view';
     if (normalizedMethod === 'POST' && terminal[1]) return 'terminal.operate';
+    return null;
+  }
+
+  // 决策看板：免登名单里的 owner 在飞书侧栏里看事项、写草稿、提交。只放这一组路径，
+  // 不放开看板之外的任何管理接口（bot 配置、会话、设置）。
+  if (pathname === '/api/decision-board/boards' && (normalizedMethod === 'GET' || normalizedMethod === 'HEAD')) return 'board.view';
+  const board = pathname.match(/^\/api\/decision-board\/[^/]+\/(items|guide|files|submit|batches)(\/.*)?$/);
+  if (board) {
+    if (normalizedMethod === 'GET' || normalizedMethod === 'HEAD') return board[1] === 'submit' ? null : 'board.view';
+    if ((normalizedMethod === 'POST' || normalizedMethod === 'PUT') && board[1] !== 'guide') return 'board.decide';
     return null;
   }
 

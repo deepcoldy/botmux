@@ -15,7 +15,7 @@
 
 用独立命令 `botmux voice` 交互式配置（特意不和 `botmux setup` 混在一起）。配置写入全局 `~/.botmux/config.json` 的 `voice` 块，`botmux restart` 后生效。
 
-支持三类引擎，**按你的身份 / 手上的服务三选一**：
+支持四类引擎，按你的凭证和服务选择：
 
 ### 字节租户：SAMI（语音合成大模型）
 
@@ -74,6 +74,48 @@ botmux restart        # 生效
 ```
 
 模型默认 `speech-2.8-hd`，音色默认 `female-shaonv`，二者都可在配置时或配置文件里覆盖。若默认音色在你的账号下不可用（不同区域 / 模型开放的音色可能不同），按 MiniMax 控制台列出的系统音色 id 填一个即可。
+
+### 火山引擎 / 豆包 V3
+
+运行 `botmux voice`，选择 `[4]`，再明确选择 `standard` 或 `agent-plan`，输入该模式的专用 API key。默认音色为 `zh_female_vv_uranus_bigtts`，语速为 `1`。有效的正数语速在请求时限制到 `0.5` 至 `2`。
+
+普通按量账户的全局配置示例：
+
+```json
+{
+  "voice": {
+    "engine": "volcengine",
+    "volcengine": {
+      "mode": "standard",
+      "apiKey": "<STANDARD_API_KEY>"
+    },
+    "speaker": "zh_female_vv_uranus_bigtts",
+    "rate": 1
+  }
+}
+```
+
+在 `bots.json` 的某个机器人条目中加入以下 `voice`，可改用 Agent Plan 专用账户：
+
+```json
+{
+  "voice": {
+    "engine": "volcengine",
+    "volcengine": {
+      "mode": "agent-plan",
+      "apiKey": "<AGENT_PLAN_API_KEY>"
+    }
+  }
+}
+```
+
+必须显式设置 `engine` 和 `mode`。`standard` 使用 `/api/v3/tts/unidirectional`，`agent-plan` 使用 `/api/v3/plan/tts/unidirectional`，两者固定使用 `openspeech.bytedance.com` 和资源 `seed-tts-2.0`。不要填写聊天服务的地址或旧版 app ID。占位 key 需替换为实际凭证，不会自动读取同名环境变量。
+
+切换 mode 时必须同时提供新 key，不能继承另一模式的全局 key。同一 mode 可继承 key，机器人也可只覆盖 `speaker` 或 `rate`。`"volcengine": null` 或显式空 key 禁用该账户的继承。缺失或非法 mode 会使配置不可用，不会改走普通付费端点。请求失败不重试、不跟随重定向，也不切换端点；套餐计费由供应商决定。
+
+`botmux voice status` 只显示新账户 key 是否设置。交互式保存任何 TTS 引擎都会保留原有 `voice.asr`。火山引擎返回 24 kHz、单声道、16 位 PCM，飞书语音仍需下述 Opus 编码器。
+
+合成会缓存整个响应，正常 HTTP 结束后才返回音频，不提供流式播放。默认 60 秒超时覆盖响应头和读体；收到完成记录后连接仍不结束也会超时。客户端限制为 16 MiB 响应、8 MiB PCM 和 10000 条 JSON 记录。截断、非法数据、完成帧携带非空音频或超限都会报错，不发送部分音频。
 
 ## 系统依赖
 

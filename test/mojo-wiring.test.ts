@@ -11,11 +11,15 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+
+import * as botRegistry from '../src/bot-registry.js';
+import * as workerPool from '../src/core/worker-pool.js';
+import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 
 import { createMojoAdapter } from '../src/adapters/cli/mojo.js';
 import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/registry.js';
@@ -189,21 +193,8 @@ describe('mojo backend bypasses local-only machinery', () => {
       .toBe(true);
   });
 
-  it('the proof exemption is the canonical name the child actually reads', () => {
-    // buildEnv() hands the resolved token to the CLI as X_JWT_TOKEN no matter what
-    // jwtEnv says, which is what makes exempting exactly that name (and nothing
-    // else) sound. If these two ever drift, the bypass comes back silently.
-    const backendSrc = readFileSync(resolve('src/adapters/backend/mojo-backend.ts'), 'utf8');
-    expect(backendSrc).not.toMatch(/env\.X_JWT_TOKEN\s*=/);
-    expect(backendSrc).toContain('env[MOJO_CANONICAL_JWT_ENV_KEY] =');
-
-    const typesSrc = readFileSync(resolve('src/adapters/backend/mojo-types.ts'), 'utf8');
-    const fn = typesSrc.slice(typesSrc.indexOf('export function mojoUnprovableEnvKeys'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    // The whole defect was reading jwtEnv here. Nothing may reintroduce it.
-    expect(body).not.toMatch(/cfg\??\.\s*jwtEnv/);
-  });
-
+  // 源码结构护栏(K1)：失败形态是类型里少了一个字段——TS 不对透传对象做多余属性检查，参数类型被收窄后
+  // env 会静默丢失、绕过重新出现，运行时调用观察不到「字段不存在」，只能看类型声明。
   it('the proof plumbing does not silently drop env on the way in', () => {
     // Narrowing any of these parameter types (as they originally were) drops `env`
     // WITHOUT a compile error — TS only rejects excess properties on fresh literals,
@@ -393,6 +384,8 @@ describe('mojo requires a local binary (unlike riff/mira)', () => {
   });
 });
 
+// 源码结构护栏(K4)：daemon 侧每个发出 raw_input / inject_command 的点都必须附带 mojo 凭据快照；
+// 发送点散落在 daemon.ts / worker-pool.ts 的闭包里，只能逐个扫出来核对（豁免表要求写明证据）。
 describe('every turn-starting IPC carries the mojo credential snapshot', () => {
   // Per-CHANGE-POINT guard, not per-defect. The original fix had two daemon-side
   // send points plus the worker-side apply, but only the worker side was pinned:
@@ -478,17 +471,38 @@ describe('every turn-starting IPC carries the mojo credential snapshot', () => {
     });
   }
 
-  it('inject_command is refused for remote backends instead of carrying a snapshot', () => {
-    // A slash injection is a TUI-only channel, but MojoBackend.write() would turn it
-    // into a REAL remote turn on the worker's stale token. Refused at the entry
-    // point rather than wired up — so the guard here is the refusal, not a snapshot.
-    const src = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
-    const idx = src.indexOf("type: 'inject_command',");
-    expect(idx).toBeGreaterThan(0);
-    // The refusal must sit BEFORE the send, not after it.
-    const gate = src.indexOf('remote_backend_inject_unsupported');
-    expect(gate).toBeGreaterThan(0);
-    expect(gate).toBeLessThan(idx);
-    expect(src.slice(gate - 400, gate)).toContain('isRemoteBackendType(');
+});
+
+describe('slash injection on remote backends', () => {
+  // A slash injection is a TUI-only channel, but MojoBackend.write() would turn it
+  // into a REAL remote turn on the worker's stale token (inject_command carries no
+  // credential snapshot). Refused at the IPC entry point rather than wired up.
+  const CAP = 'cafebabe'.repeat(8);
+  let handle: IpcServerHandle | null = null;
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['live mojo worker', { initConfig: { backendType: 'mojo' }, session: { sessionId: 's-remote', cliId: 'mojo' } }],
+    ['frozen riff session', { session: { sessionId: 's-remote', cliId: 'riff', backendType: 'riff' } }],
+  ])('refuses an allowlisted slash before any worker send (%s)', async (_label, shape) => {
+    const send = vi.fn();
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId: 'claude-code' } } as never);
+    vi.spyOn(botRegistry, 'getBotTuiSlashAllow').mockReturnValue(['/status']);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      ...shape, managedTurnOrigin: { capability: CAP }, larkAppId: 'app-1', worker: { send, killed: false },
+    } as never);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-remote/slash`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ command: '/status', originCapability: CAP }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'remote_backend_inject_unsupported' });
+    expect(send).not.toHaveBeenCalled();
   });
 });

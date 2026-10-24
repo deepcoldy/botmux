@@ -636,6 +636,29 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(logs).not.toContain('view_cap');
   });
 
+  it('skips the stale starting card when the explicit reply landed before worker ready', async () => {
+    // A fast startup turn can finish through `botmux send` before ready; a
+    // "Starting" card posted now would sit after the final reply forever.
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+
+    setupActiveWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready',
+      port: 9999,
+      token: 'tok_abc',
+      turnId: 'om_turn_ready',
+      replyAlreadySent: true,
+    });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardId).toBeUndefined();
+    // The terminal/runtime side of ready still applies.
+    expect(ds.workerPort).toBe(9999);
+  });
+
   it('ready POST keeps the dispatch-time topic when currentReplyTarget changes while awaiting Lark', async () => {
     let resolvePost!: (messageId: string) => void;
     sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {

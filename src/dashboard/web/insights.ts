@@ -18,6 +18,9 @@ import type {
   TurnTimelineTurn,
 } from '../../services/insight/types.js';
 import { botDisplayName, escapeHtml, relTime, t } from './ui.js';
+import { INSIGHT_TABS, INSIGHT_TAB_KEYS, type InsightTab } from './insight-tabs.js';
+
+export { INSIGHT_TABS, INSIGHT_TAB_KEYS, type InsightTab };
 
 export type InsightFilter = 'all' | 'review' | 'failed' | 'slow';
 
@@ -28,7 +31,6 @@ export type InsightRecord = {
 };
 
 export type ScopeOpts = { project?: string; sinceMs?: number; analyzableOnly?: boolean };
-export type InsightTab = 'overview' | 'sessions' | 'flow' | 'dist' | 'hot';
 export type SessSort = 'recent' | 'review' | 'spans' | 'fails' | 'slow' | 'agent';
 export type DetailTab = 'spans' | 'ledger' | 'convo';
 export type LedgerSender = 'all' | 'user' | 'a2a_agent' | 'system';
@@ -84,13 +86,6 @@ export type ConvoUnit =
 export const SEVERITY_RANK: Record<InsightSeverity, number> = { bad: 0, warn: 1, info: 2 };
 export const INSIGHT_PHASES: InsightPhase[] = ['research', 'edit', 'run', 'delegate', 'discuss'];
 export const FLOW_PHASES = ['research', 'edit', 'run', 'delegate', 'discuss'] as const;
-export const INSIGHT_TABS: Array<{ key: InsightTab; label: string }> = [
-  { key: 'overview', label: 'insights.tabOverview' },
-  { key: 'sessions', label: 'insights.tabSessions' },
-  { key: 'flow', label: 'insights.tabFlow' },
-  { key: 'dist', label: 'insights.tabDist' },
-  { key: 'hot', label: 'insights.tabHot' },
-];
 export const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> = [
   { key: 'all', label: 'insights.timeAll', days: 0 },
   { key: '1d', label: 'insights.time1d', days: 1 },
@@ -98,7 +93,6 @@ export const TIME_WINDOWS: Array<{ key: string; label: string; days: number }> =
   { key: '30d', label: 'insights.time30d', days: 30 },
 ];
 export const INSIGHT_FILTERS: InsightFilter[] = ['all', 'review', 'failed', 'slow'];
-export const INSIGHT_TAB_KEYS: InsightTab[] = ['overview', 'sessions', 'flow', 'dist', 'hot'];
 export const SESS_SORTS: Array<{ key: SessSort; label: string }> = [
   { key: 'recent', label: 'insights.sortRecent' },
   { key: 'review', label: 'insights.sortReview' },

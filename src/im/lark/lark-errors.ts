@@ -28,6 +28,8 @@ export const LARK_CODE_CONTACT_NO_SUCH_USER = 41012;
 /** Contact API：目标用户在本应用通讯录可见范围之外。 */
 export const LARK_CODE_CONTACT_NOT_VISIBLE = 41050;
 
+/** 消息 API 内部错误；合并转发请求 user_card_content 时可触发。 */
+export const LARK_CODE_MESSAGE_INTERNAL_ERROR = 2200;
 /** 目标消息已撤回。 */
 export const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
 /** 消息超出可编辑时限（仍存在，只是不能再 PATCH）。 */
@@ -40,6 +42,25 @@ export const LARK_CODE_CHAT_RATE_LIMITED = 230020;
 export const LARK_CODE_CARD_CONTENT_REJECTED = 230099;
 /** ephemeral/v1/send 的目标是话题群 / thread 会话（临时卡片只支持普通 group）。 */
 export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
+
+// ─── Contact API 确定性失败分类 ──────────────────────────────────────────────
+
+/** Contact API 单查端点「重试也不会变」的失败类别：
+ *  cross_app=99992361 标识属于其他应用；not_visible=41050 目标不在本应用通讯录
+ *  可见范围；invalid_id=41012 无此用户 / 40001 参数非法。其余非零码
+ *  （如 40003 internal error、99991400 频控）与网络异常不在此列，必须保持可重试。
+ *  该分类同时适用两种返回形状：HTTP 200 body 里的 `res.code`，以及 SDK（axios）
+ *  非 2xx 抛出异常时 `err.response.data.code`——catch 分支需先用
+ *  {@link structuredLarkCode} 取码再分类。 */
+export type DefinitiveContactErrorCode = 'cross_app' | 'not_visible' | 'invalid_id';
+
+/** Contact API 确定性失败码 → 类别；非确定性码 / undefined → undefined（可重试）。 */
+export function classifyContactErrorCode(code: number | undefined): DefinitiveContactErrorCode | undefined {
+  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
+  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
+  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
+  return undefined;
+}
 
 // ─── 带结构化 code 的错误类型 ────────────────────────────────────────────────
 

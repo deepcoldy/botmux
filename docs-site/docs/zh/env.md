@@ -4,6 +4,8 @@
 
 **适用**：dashboard / Web 终端打不开或要改绑定地址、要指定端口、要换 pty/tmux 后端、找配置 / 日志 / 凭证在哪。
 
+> 这里讲的是 botmux 自身进程的环境变量。会话（CLI）里拿到哪些变量，在 Dashboard「设置 → 会话环境变量」和「Bot 配置 → 高级 → 启动环境 → 会话环境变量」里查看和增删改，见 [会话环境变量](./bots-json.md#会话环境变量全局--bot-两层)。
+
 ## 环境变量（写在 `~/.botmux/.env`）
 
 | 变量 | 默认 | 说明 |
@@ -38,6 +40,7 @@
 | `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | 是否允许无 token 访问 Dashboard 白名单只读 API / SSE；一旦在 Dashboard 设置页保存过该开关，`~/.botmux/config.json` 中的值优先于本环境变量 |
 | `BOTMUX_COMPANION_SECRET_FILE` | _(未设置)_ | 封闭[本地 Companion API](/companion-api) 的专用 HMAC 密钥文件路径；通常由 `start/restart --companion-secret-file` 设置。严格校验 canonical 绝对路径、当前用户 owner、非软链、普通文件、`0600`、非空；不下发给会话 CLI，绝不回退或复用 `.dashboard-secret`。 |
 | `BOTMUX_COMPANION_BOT_APP_ID` | _(未设置)_ | Companion API 唯一绑定的隔离测试 Bot；通常由 `start/restart --companion-bot` 设置。不接受请求方选择 Bot。 |
+| `BOTMUX_LOOPBACK_PEERS` | _(空)_ | 内部端点额外认可的来源地址，逗号分隔的 IP/CIDR（如 `10.0.0.5,192.168.0.0/16,fd00::/64`），覆盖 7 处本机来源门禁：dashboard 鉴权、daemon 间调用、Workflow v3 IPC、会话迁移 IPC、dispatch launch IPC、原生子代理运行时 IPC、当前执行者归属解析。仅用于定制内核把同机 loopback 对端上报成 LAN IP 的机器；**默认空 = 只认 `127.0.0.1`/`::1`，行为与旧版一致**。非法或过宽条目（`/0`～`/7`，等于放开整个互联网）启动时忽略并告警；IPv6 双栈会把 IPv4 对端报成 `::ffff:a.b.c.d`，因此覆盖该映射块的 IPv6 条目按等效 IPv4 前缀判定（`::/80`、`::ffff:0:0/96` 等同 v4 `/0` 一并拒绝，`::ffff:10.0.0.0/104` 等同 `10.0.0.0/8` 放行）。**放宽的只是「来源必须是本机」这一层，HMAC 签名、时间戳、nonce 校验照旧**，来自放行地址但签名不对的请求仍被拒绝；最后一道归属解析还会校验对端 socket 属于本机进程。尽量配 `/32` 单地址或实际最小子网。IPv4 对端请直接配 IPv4 条目：`10.0.0.0/8` 同时覆盖原生 `10.x` 与双栈 mapped `::ffff:10.x` 两种上报形式；写成 `::ffff:10.0.0.0/104` 这类 IPv6 条目只匹配 mapped 形式的对端。 |
 
 ## 文件位置
 

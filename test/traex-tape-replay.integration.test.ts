@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -57,12 +58,7 @@ async function waitFor(
 }
 
 function readSubmissions(path: string): string[] {
-  try {
-    return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean)
-      .map(line => (JSON.parse(line) as { text: string }).text);
-  } catch {
-    return [];
-  }
+  return readJsonLines<{ text: string }>(path).map(row => row.text);
 }
 
 function startReplayWorker(terminalDelayMs: number) {

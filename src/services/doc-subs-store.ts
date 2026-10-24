@@ -124,18 +124,6 @@ export type DocWatchOutcome =
   | 'audit-rejected'
   | 'poll-failed';
 
-const DOC_WATCH_OUTCOMES: ReadonlySet<string> = new Set<DocWatchOutcome>([
-  'dispatched', 'no-comment', 'trigger-missing', 'empty-text',
-  'not-mentioned', 'self-authored', 'audit-rejected', 'poll-failed',
-]);
-
-/** 收窄未知字符串到 `DocWatchOutcome`。读旧文件/跨版本时用。 */
-export function asDocWatchOutcome(raw: unknown): DocWatchOutcome | undefined {
-  return typeof raw === 'string' && DOC_WATCH_OUTCOMES.has(raw)
-    ? raw as DocWatchOutcome
-    : undefined;
-}
-
 /** `lastError` 落盘上限，避免一条长报错把订阅表撑大。 */
 export const DOC_WATCH_LAST_ERROR_MAX = 300;
 

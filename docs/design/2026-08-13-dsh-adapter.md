@@ -92,7 +92,7 @@ worker 解码 final → 投递飞书
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
 
-**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-profile`（可选，默认 `botmux`）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout`（默认 600s）。
+**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-profile`（可选，默认 `botmux`）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout-ms`（可选；默认无回合超时，设置后按静默超时且最多持续 4 倍总时长）。
 
 **boot**：
 1. 解析 profile 名称：`--dsh-profile`（默认 `botmux`）。
@@ -111,10 +111,10 @@ worker 解码 final → 投递飞书
   - `tool/result` → `✓ ${name}`（isError 时 `✗`）
   - `assistant/message` → 把 content 中 `type:'text'` 块追加到本轮缓冲；记录 usage
   - `subagent.started/finished` → `↳ 子任务 ${status}`
-- `session.status`：`running` 置忙、`idle` 且有 in-flight → 发 `final` marker `{content: 缓冲文本, usage, startedAtMs, completedAtMs, replyTurnId}`，清空缓冲。缓冲为空则 content 给 `''`（worker 有 pure-silence 抑制逻辑）。
+- `session.status`：`running` 置忙、`idle` 且有 in-flight → 发 `final` marker `{content: 缓冲文本, usage, startedAtMs, completedAtMs, replyTurnId}`，清空缓冲。无文本且无错误时发明确的未知状态诊断回复，避免 worker 抑制空 final 后飞书无消息。
 - JSON-RPC error response → `final` 带错误文本。
 
-**看门狗**：turn 超过 `--turn-timeout` → 杀 dsh 子进程、发 lifecycle fatal、退出非零（worker 重拉 runner；会话上下文丢失，日志明示）。
+**看门狗**：默认不设置回合超时。显式设置 `--turn-timeout-ms` 时，当前 turn 的工具调用、工具结果或助手消息可刷新静默超时；无进度超过该时长，或总时长达到其 4 倍 → 杀 dsh 子进程、发 lifecycle fatal、退出非零（worker 重拉 runner；会话上下文丢失，日志明示）。其它会话或未确认接收的事件不得续时。
 
 **子进程崩溃**：exit 事件先于 final → lifecycle fatal 退出。
 
@@ -155,6 +155,7 @@ runner 在首轮用户消息前插入（后续轮不插）：
 <botmux_identity>
 你是飞书群机器人「<botName>」，通过 deepseek-harness 运行。
 - 你的最终回复文本会被自动捕获并发送到群里，**不要**执行 botmux send 或任何发消息命令。
+- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。
 - 工作目录：<cwd>。语言：<locale>。
 </botmux_identity>
 ```
@@ -177,9 +178,9 @@ runner 在首轮用户消息前插入（后续轮不插）：
 | dsh 二进制不存在 | resolveCommand 失败，setup/启动期报错（同其他 adapter） |
 | initialize 超时/失败 | lifecycle fatal，runner 退出非零，worker 展示失败 |
 | prompt JSON-RPC error | final 带错误文本，turn 正常收尾 |
-| turn 超时（默认 10min） | 杀 dsh + fatal 退出，worker 重拉（丢上下文，明示） |
+| turn 无进度超时或硬上限（仅显式配置时生效） | 杀 dsh + fatal 退出，worker 重拉（丢上下文，明示） |
 | dsh 中途崩溃 | lifecycle fatal 退出 |
-| 空回复（只调工具无文本） | final content='' → worker 抑制投递（已有逻辑） |
+| 空回复（只调工具无文本） | 发明确的未知状态诊断回复，不假报任务成功 |
 | 图片消息 | v1 转文本提示"暂不支持图片" |
 | stdout 纯净 | runner 的 display 行不含 ESC；OSC 帧由 RunnerControlWriter 统一转义 |
 

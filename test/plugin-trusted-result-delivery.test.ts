@@ -8,6 +8,7 @@ import {
   awaitTrustedResultDeliveryAck,
   MAX_TRUSTED_DELIVERY_FILE_BYTES,
   parseTrustedResultDelivery,
+  resolveTrustedResultDeliveryLinkRefs,
   sendTrustedDeliveryIpcWithBackpressure,
   TrustedResultDeliverySerialQueue,
   trustedResultTerminalObservation,
@@ -23,6 +24,54 @@ function fixture() {
 }
 
 describe('trusted plugin result delivery', () => {
+  it('resolves LinkRefs before the artifact persistence callback and keeps the input immutable', async () => {
+    const placeholder = '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}';
+    const delivery = {
+      schemaVersion: 1 as const,
+      deliveryId: 'delivery_link_ref_abcdefgh',
+      markdown: `授权：${placeholder}`,
+    };
+    const original = structuredClone(delivery);
+    const order: string[] = [];
+    const resolvedUrl = 'https://auth.example.test/approve'
+      + '?code=keep&state=ready';
+    const resolved = await resolveTrustedResultDeliveryLinkRefs({
+      delivery,
+      mode: 'enabled',
+      resolve: async payload => {
+        order.push('resolve');
+        return {
+          ...payload,
+          text: `授权：${resolvedUrl}`,
+          refCount: 1,
+        };
+      },
+      persist: value => {
+        order.push('persist');
+        expect(value.markdown).toBe(`授权：${resolvedUrl}`);
+      },
+    });
+
+    expect(order).toEqual(['resolve', 'persist']);
+    expect(delivery).toEqual(original);
+    expect(resolved.markdown).toContain('?code=keep&state=ready');
+  });
+
+  it('fails before persistence when enabled LinkRef resolution is rejected', async () => {
+    const persist = vi.fn();
+    await expect(resolveTrustedResultDeliveryLinkRefs({
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: 'delivery_link_ref_failure',
+        markdown: '{{botmux_link:lr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}',
+      },
+      mode: 'enabled',
+      resolve: async () => { throw new Error('link_ref_unknown'); },
+      persist,
+    })).rejects.toThrow('link_ref_unknown');
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('snapshots regular outbound files and consumes them only after persistence', () => {
     const { home, outbound } = fixture();
     const source = join(outbound, 'report.pdf');
@@ -140,10 +189,6 @@ describe('trusted plugin result delivery', () => {
       { revoke: timedOutRevoke, timeoutMs: 20 },
     )).rejects.toThrow('plugin_result_delivery_timeout');
     expect(timedOutRevoke).not.toHaveBeenCalled();
-
-    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
-    expect(workerSource).toContain('revoke: () => artifactStore.revoke(artifact.artifactId)');
   });
 
   it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {

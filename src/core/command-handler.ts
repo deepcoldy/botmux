@@ -10,7 +10,8 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
@@ -27,6 +28,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persist
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
+import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dismiss-card.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -44,7 +46,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -60,8 +62,11 @@ import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystem
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
+import { onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
-import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
+import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
+import { validateOrcaAdoptTarget } from './orca-adopt-discovery.js';
+import { adoptedFromForTarget, isOrcaAdoptTarget, isZellijAdoptTarget, type LiveAdoptTarget } from './adopt-target.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
@@ -139,7 +144,8 @@ import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
-import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
 
@@ -1161,6 +1167,9 @@ async function applyAllowedUsersSet(
     return;
   }
   let msg = t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc);
+  if (r.unresolvedEmailsAndMobiles?.length) {
+    msg += '\n' + t('cmd.config.allow_warn_contacts', { items: r.unresolvedEmailsAndMobiles.join(', ') }, loc);
+  }
   if (r.unresolvedUnionIds?.length) {
     msg += '\n' + t('cmd.config.allow_warn_union', { items: r.unresolvedUnionIds.join(', ') }, loc);
   }
@@ -1871,8 +1880,9 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
           break;
         }
-        const result = await updateCodexAppEffort(ds, effort);
-        const replyKey = result.status === 'future_only' && result.reason
+        const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
+        const result = await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
+        const replyKey = result.reason
           ? `cmd.effort.${result.reason}`
           : result.status === 'invalid' && !result.choices?.length
             ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
@@ -1943,48 +1953,15 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
           break;
         }
-        let job;
-        try {
-          job = getWorktreeCleanupJob(config.session.dataDir, cleanupId);
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ 无法读取 worktree 清理任务：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        if (!job || job.larkAppId !== appId) {
-          await sessionReply(rootId, '未找到该 worktree 清理任务。');
-          break;
-        }
-        try {
-          const containingRoot = await worktreeRootFor(job.worktreeDir);
-          const main = containingRoot ? await mainWorktreeFor(containingRoot) : undefined;
-          if (!containingRoot || resolve(containingRoot) !== resolve(job.worktreeDir)
-            || resolve(main ?? '') !== resolve(job.worktreeMain)
-            || !(await isLinkedWorktree(containingRoot))) {
-            await sessionReply(rootId, '⚠️ worktree 身份已变化，拒绝重试删除。');
-            break;
-          }
-          const refusal = await withWorktreeTargetLock(job.worktreeDir, async () => {
-            const active = sessionStore.findActiveSessionsByWorkingDirStrict(job.worktreeDir);
-            if (active.length > 0) {
-              return `⚠️ worktree 仍有 ${active.length} 个活动会话，暂不删除。`;
-            }
-            const safety = await worktreeSafetyStatus(job.worktreeDir);
-            if (safety.fingerprint !== job.safetyFingerprint) {
-              return '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。';
-            }
-            await removeRepoWorktree(job.worktreeMain, job.worktreeDir);
-            deleteWorktreeCleanupJob(config.session.dataDir, job.id);
-            return undefined;
-          });
-          if (refusal) {
-            await sessionReply(rootId, refusal);
-            break;
-          }
-        } catch (err) {
-          await sessionReply(rootId, `⚠️ worktree 清理重试失败，任务已保留：${err instanceof Error ? err.message : String(err)}`);
-          break;
-        }
-        await sessionReply(rootId, `🧹 已重试并移除 worktree：\`${job.worktreeDir}\``);
+        const run = await runWorktreeCleanupJob(appId, cleanupId);
+        const reply = run.status === 'unreadable' ? `⚠️ 无法读取 worktree 清理任务：${run.error}`
+          : run.status === 'not_found' ? '未找到该 worktree 清理任务。'
+          : run.status === 'identity_changed' ? '⚠️ worktree 身份已变化，拒绝重试删除。'
+          : run.status === 'busy' ? `⚠️ worktree 仍有 ${run.activeCount} 个活动会话，暂不删除。`
+          : run.status === 'changed' ? '⚠️ worktree 内容在上次确认后发生变化，拒绝重试删除。'
+          : run.status === 'failed' ? `⚠️ worktree 清理重试失败，任务已保留：${run.error}`
+          : `🧹 已重试并移除 worktree：\`${run.dir}\``;
+        await sessionReply(rootId, reply);
         break;
       }
 
@@ -2285,16 +2262,28 @@ export async function handleCommand(
         }
         const result = await dismissSessionGroup({
           larkAppId: appId, chatId, rootId, senderId: message.senderId,
-          confirmedState: parsed[1], activeSessions,
+          confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
-          // The deleted group cannot receive the receipt; notify privately.
-          try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
-          catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+          // The deleted group cannot receive the receipt; notify privately,
+          // offering one-click cleanup of the worktrees those sessions used.
+          try {
+            const offers = await offerWorktreeCleanup(appId, result.workingDirs);
+            await sendUserMessage(appId, message.senderId,
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+          } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+        } else if (result.status === 'confirm') {
+          await sessionReply(rootId, buildDismissConfirmCard({
+            chatId,
+            invokerOpenId: message.senderId,
+            confirmationState: result.state,
+            rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            loc,
+          }), 'interactive');
+        } else if (result.status === 'peer_offline') {
+          await sessionReply(rootId, t('cmd.dismiss.peer_offline', { bots: result.larkAppIds.map(botDisplayName).join('、') }, loc));
         } else {
-          const reply = result.status === 'confirm'
-            ? t('cmd.dismiss.confirm', { command: `/dismiss --confirm=${result.state}` }, loc)
-            : t(`cmd.dismiss.${result.status}`, undefined, loc);
+          const reply = t(`cmd.dismiss.${result.status}`, undefined, loc);
           await sessionReply(rootId, reply + ('detail' in result && result.detail ? `\n${result.detail}` : ''));
         }
         break;
@@ -2956,6 +2945,17 @@ export async function handleCommand(
           break;
         }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        // A first message whose start was refused because the directory it fell
+        // back to is missing still holds the session; `/repo <路径>` picks the
+        // directory for it, like the recovery card (the no-card reply says so).
+        if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
+        if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
+          await sessionReply(
+            rootId,
+            t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+          );
+          break;
+        }
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
           await sessionReply(
@@ -2995,7 +2995,8 @@ export async function handleCommand(
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
               || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
+              || current.pendingChatContext !== undefined
+              || current.pendingGroupJoinContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -3029,6 +3030,7 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  groupJoinContext: current.pendingGroupJoinContext,
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
@@ -3068,7 +3070,10 @@ export async function handleCommand(
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? {
+                turnId: pendingTurnId,
+                ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
+              } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -3087,6 +3092,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;
@@ -3101,6 +3108,7 @@ export async function handleCommand(
             const cardToWithdraw = current.repoCardMessageId;
             markRepoCardConsumed(current, cardToWithdraw);
             current.repoCardMessageId = undefined;
+            current.workingDirRecovery = undefined;
             return { current, cardToWithdraw };
           });
           if (!started) return false;
@@ -3499,6 +3507,15 @@ export async function handleCommand(
         const scanDirs = getProjectScanDirs(ds);
         const invalidDirs = invalidConfiguredWorkingDirs(ds, ds?.larkAppId ?? larkAppId);
         if (invalidDirs.length > 0) {
+          // The session's own directory is gone (typically a deleted worktree),
+          // not a bots.json problem: bring up the recovery card instead.
+          if (ds?.workingDir && !ds.pendingRepo) {
+            await publishWorkingDirRecovery(ds, getSessionWorkingDir(ds), {
+              sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
+              lastRepoScan,
+            }, { force: true });
+            break;
+          }
           await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
           break;
         }
@@ -3801,9 +3818,50 @@ export async function handleCommand(
           await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
           break;
         }
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
+        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
+        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
+        const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
+          ? platformCredentialsUrl() : null;
+        const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
+        if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
+          && (subCmd === '' || explicitGoverned)) {
+          await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
+          break;
+        }
+        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
+          const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
+            : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
+          const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
+            ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
+          const lines = [
+            t('cmd.login.platform_title', undefined, loc), '',
+            t('cmd.login.platform_step1', { provider }, loc),
+            platformCredsUrl, '',
+            t('cmd.login.platform_step2', undefined, loc), '',
+            t('cmd.login.platform_note', { tool: which }, loc),
+          ];
+          if (credSource === 'auto' && subCmd === '') {
+            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
+          if (platformCredsUrl) {
+            lines.push(t('cmd.login.platform_status', {
+              tool: [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / '),
+              url: platformCredsUrl,
+            }, loc));
+          }
           if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
@@ -4567,7 +4625,9 @@ export async function handleCommand(
           // ("session:paneId" / "session/paneId") against the merged list.
           const zellijNorm = directTarget.replace('/', ':');
           const target = sessions.find(s =>
-            'zellijPaneId' in s
+            'orcaTerminalHandle' in s
+              ? directTarget === `orca:${s.orcaTerminalHandle}` || directTarget === s.orcaTerminalHandle
+              : 'zellijPaneId' in s
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
@@ -6155,7 +6215,7 @@ export async function handleCommand(
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
-          ...((ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId) === 'codex-app'
+          ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')
             ? [t('cmd.effort.usage', undefined, loc)] : []),
           t('help.close', { cliName }, loc),
           t('help.dismiss', undefined, loc),
@@ -6203,6 +6263,7 @@ export async function handleCommand(
           t('help.heading_adopt', undefined, loc),
           t('help.adopt', undefined, loc),
           t('help.adopt_pane', undefined, loc),
+          t('help.adopt_orca', undefined, loc),
           t('help.resume', { cliName }, loc),
           t('help.detach', undefined, loc),
           '',
@@ -6325,11 +6386,6 @@ async function handleCodexAppAdoptCommand(
 }
 
 // ─── Adopt session helper ────────────────────────────────────────────────────
-
-/** Discriminate a zellij adopt candidate from tmux/herdr candidates. */
-function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is ZellijAdoptableSession {
-  return 'zellijPaneId' in t;
-}
 
 /**
  * Refuse a takeover (`/adopt`, Codex App thread, disk resume import) while the
@@ -6472,7 +6528,7 @@ export async function startCodexAppThreadSession(
 }
 
 export async function startAdoptSession(
-  target: AdoptableSession | ZellijAdoptableSession,
+  target: LiveAdoptTarget,
   ds: DaemonSession,
   deps: CommandHandlerDeps,
   larkAppId?: string,
@@ -6488,14 +6544,16 @@ export async function startAdoptSession(
 
   if (await blockRiffTakeover(ds, sessionReply)) return;
 
-  const zellij = isZellijTarget(target);
-  if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
+  const orca = isOrcaAdoptTarget(target);
+  const zellij = !orca && isZellijAdoptTarget(target);
+  const paneTarget = !orca && !zellij ? target as AdoptableSession : undefined;
+  if (paneTarget?.source === 'herdr' && paneTarget.herdrSessionName && paneTarget.herdrAgentName) {
     const occupied = [...deps.activeSessions.values()].some(active => {
       if (active.session.sessionId === ds.session.sessionId || active.session.status !== 'active' || active.adoptedFrom) return false;
       const owned = active.session.persistentBackendTarget;
       return owned?.backendType === 'herdr'
-        && owned.sessionName === target.herdrSessionName
-        && owned.agentName === target.herdrAgentName;
+        && owned.sessionName === paneTarget.herdrSessionName
+        && owned.agentName === paneTarget.herdrAgentName;
     });
     if (occupied) {
       await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
@@ -6524,8 +6582,9 @@ export async function startAdoptSession(
   // and offer a one-tap close so the user retires it and re-adopts cleanly.
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
-  const valid = zellij
-    ? validateZellijAdoptTarget(
+  const valid = orca
+    ? validateOrcaAdoptTarget(target) === 'alive'
+    : zellij ? validateZellijAdoptTarget(
       target.zellijSession,
       target.zellijPaneId,
       target.cliPid,
@@ -6539,7 +6598,9 @@ export async function startAdoptSession(
   }
 
   const project = target.cwd.split('/').pop() || target.cwd;
-  const pane = zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
+  const pane = orca
+    ? adoptTargetLabel(target)
+    : zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
   const targetSessionId = ds.session.sessionId;
   const adopted = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(
@@ -6554,23 +6615,7 @@ export async function startAdoptSession(
     current.session.workingDir = target.cwd;
     current.session.title = `Adopt: ${project}`;
     current.session.serviceTier = 'inherit';
-    current.adoptedFrom = {
-      source: zellij ? 'zellij' : target.source,
-      tmuxTarget: zellij ? undefined : target.tmuxTarget,
-      zellijSession: zellij ? target.zellijSession : undefined,
-      zellijPaneId: zellij ? target.zellijPaneId : undefined,
-      herdrSessionName: zellij ? undefined : target.herdrSessionName,
-      herdrTarget: zellij ? undefined : target.herdrTarget,
-      herdrPaneId: zellij ? undefined : target.herdrPaneId,
-      herdrAgentName: zellij ? undefined : target.herdrAgentName,
-      herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
-      originalCliPid: target.cliPid,
-      sessionId: target.sessionId,
-      cliId: target.cliId,
-      cwd: target.cwd,
-      paneCols: target.paneCols,
-      paneRows: target.paneRows,
-    };
+    current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
     sessionStore.updateSession(current.session);
     forkAdoptWorker(current);

@@ -20,6 +20,29 @@ export interface DeferredTopicSendSession {
   deferredScheduleRun?: DeferredScheduleRunData;
 }
 
+/** Where the per-run topic binding and its first-message claim live.
+ *
+ * The default is the host-visible sidecar under `dataDir`. A sandboxed /
+ * read-isolated CLI cannot create files there, so it uses a daemon-owned store
+ * instead (see deferred-topic-remote-store): the daemon serializes the claim
+ * with a lease and only records a root it has verified in the target chat. */
+export interface DeferredTopicBindingStore {
+  withLock<T>(fn: () => Promise<T>): Promise<T>;
+  read(): DeferredTopicBinding | undefined;
+  /** Throws when this caller may not publish a root (e.g. the daemon denied
+   * the claim). Called before the provider request, never after it. */
+  assertCanMaterialize?(): void;
+  write(binding: DeferredTopicBinding): void | Promise<void>;
+}
+
+export function localDeferredTopicBindingStore(dataDir: string, sessionId: string): DeferredTopicBindingStore {
+  return {
+    withLock: fn => withDeferredTopicBindingLock(dataDir, sessionId, fn),
+    read: () => readDeferredTopicBinding(dataDir, sessionId),
+    write: binding => writeDeferredTopicBinding(dataDir, binding),
+  };
+}
+
 export interface DeferredTopicSendResult {
   handled: boolean;
   messageId?: string;
@@ -61,6 +84,8 @@ export function reusableDeferredTopicRoot(input: {
  * makes retry-after-local-write-failure converge on the same Lark message. */
 export async function dispatchDeferredTopicSend(opts: {
   dataDir: string;
+  /** Resolved lazily, only for a deferred run. Defaults to the local sidecar. */
+  store?: () => DeferredTopicBindingStore | Promise<DeferredTopicBindingStore>;
   session: DeferredTopicSendSession;
   currentTurnId?: string;
   explicitTopLevel: boolean;
@@ -75,8 +100,11 @@ export async function dispatchDeferredTopicSend(opts: {
   const run = opts.session.deferredScheduleRun;
   if (!run) return { handled: false };
 
-  return withDeferredTopicBindingLock(opts.dataDir, opts.session.sessionId, async () => {
-    const existing = readDeferredTopicBinding(opts.dataDir, opts.session.sessionId);
+  const store = opts.store
+    ? await opts.store()
+    : localDeferredTopicBindingStore(opts.dataDir, opts.session.sessionId);
+  return store.withLock(async () => {
+    const existing = store.read();
     if (existing) {
       if (!deferredTopicBindingMatches(opts.session, existing)) {
         throw new Error('deferred topic binding identity mismatch');
@@ -97,6 +125,7 @@ export async function dispatchDeferredTopicSend(opts: {
       throw new Error('deferred topic is not materialized for this turn');
     }
 
+    store.assertCanMaterialize?.();
     const title = run.topicTitle?.trim();
     let rootMessageId: string;
     let messageId: string;
@@ -111,7 +140,7 @@ export async function dispatchDeferredTopicSend(opts: {
         rootMessageId,
         createdAt: new Date().toISOString(),
       };
-      writeDeferredTopicBinding(opts.dataDir, binding);
+      await store.write(binding);
       messageId = await opts.replyRoot(rootMessageId, opts.content, opts.msgType, opts.uuid);
     } else {
       rootMessageId = await opts.sendRoot(opts.content, opts.msgType, opts.session.sessionId);
@@ -124,7 +153,7 @@ export async function dispatchDeferredTopicSend(opts: {
         rootMessageId,
         createdAt: new Date().toISOString(),
       };
-      writeDeferredTopicBinding(opts.dataDir, binding);
+      await store.write(binding);
       messageId = rootMessageId;
     }
     return { handled: true, messageId, rootMessageId, materializedNow: true };

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from './helpers/node-ws.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import {
@@ -377,8 +378,10 @@ setInterval(() => {}, 1_000);
       text => text.includes(Buffer.from(controlledInput).toString('hex')),
     );
     expect(controlledWritten).toContain(Buffer.from(controlledInput).toString('hex'));
-    const auditText = await waitForFileText(controlAuditLog, text => text.includes('terminal.input'));
-    const auditRows = auditText.trim().split('\n').map(line => JSON.parse(line));
+    // The worker is still appending audit rows: wait for the whole input row.
+    await waitForFileText(controlAuditLog, () => readJsonLines(controlAuditLog).some(row => row.action === 'terminal.input'));
+    const auditText = readFileSync(controlAuditLog, 'utf8');
+    const auditRows = readJsonLines(controlAuditLog);
     expect(auditRows).toContainEqual(expect.objectContaining({
       timestamp: expect.any(String),
       user: 'ou_h5_owner',

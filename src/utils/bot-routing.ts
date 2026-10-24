@@ -35,19 +35,6 @@ export function loadOncallChatsByApp(botsJsonPath?: string): Map<string, Set<str
   return map;
 }
 
-export function pickBotEntryByName<T extends { larkAppId: string; botName: string | null }>(
-  botEntries: T[],
-  name: string,
-  targetChatId: string | undefined,
-  oncallChatsByApp: Map<string, Set<string>>,
-): T | undefined {
-  const lower = name.toLowerCase();
-  const candidates = botEntries.filter(e => e.botName?.toLowerCase() === lower);
-  if (candidates.length === 0) return undefined;
-  if (candidates.length === 1 || !targetChatId) return candidates[0];
-  return candidates.find(e => oncallChatsByApp.get(e.larkAppId)?.has(targetChatId)) ?? candidates[0];
-}
-
 export type BotMentionEntry = {
   larkAppId: string;
   botOpenId?: string | null;
@@ -60,6 +47,16 @@ export type OutgoingMention = {
   name?: string;
 };
 
+/** A bots-info.json row usable for @-name resolution; the file is merged by
+ *  every bot daemon, so a reader must not trust its shape. */
+export function isBotMentionEntry(entry: unknown): entry is BotMentionEntry {
+  if (!entry || typeof entry !== 'object') return false;
+  const { larkAppId, botName, cliId } = entry as Record<string, unknown>;
+  return typeof larkAppId === 'string'
+    && (botName === null || typeof botName === 'string')
+    && (cliId === undefined || cliId === null || typeof cliId === 'string');
+}
+
 export function loadBotMentionIdentityMap(
   dataDir: string,
   appId: string,
@@ -71,13 +68,7 @@ export function loadBotMentionIdentityMap(
     const parsedBotEntries = existsSync(botInfoPath)
       ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
       : [];
-    botEntries = Array.isArray(parsedBotEntries)
-      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
-          !!entry
-          && typeof entry === 'object'
-          && typeof entry.larkAppId === 'string'
-          && (entry.botName === null || typeof entry.botName === 'string'))
-      : [];
+    botEntries = Array.isArray(parsedBotEntries) ? parsedBotEntries.filter(isBotMentionEntry) : [];
     const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
     const parsedCrossRef = existsSync(crossRefPath)
       ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))

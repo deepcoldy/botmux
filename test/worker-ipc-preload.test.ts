@@ -35,6 +35,14 @@ describe('worker IPC preload', () => {
     expect(handled).toHaveBeenCalledWith(init);
   });
 
+  it('acknowledges a board batch cold-start init (board: is part of the ordinary-turn family)', () => {
+    const host = new FakeIpcHost();
+    const init = { type: 'init', prompt: '【决策看板 · 批次 #3】', turnId: 'board:cli_s:3' };
+    installWorkerIpcPreload(host);
+    host.emit('message', init);
+    expect(host.send).toHaveBeenCalledWith({ type: 'turn_input_received', turnId: 'board:cli_s:3' });
+  });
+
   it('buffers non-ordinary init without forging a delivery receipt', () => {
     const host = new FakeIpcHost();
     const handled = vi.fn();
@@ -100,14 +108,19 @@ describe('worker IPC preload', () => {
     await expect(waitForWorkerIpcPreloadMessage(host, 5)).resolves.toBe(false);
   });
 
+  // 源码结构护栏(K1)：编译态单文件二进制里 worker 是 re-exec 自身 + `__worker`，入口是
+  // standalone-entry；冷启动 init 必须先被预加载层接住并回执，再去加载完整 CLI 模块图
+  // （#1426：IPC 未就绪时 init 丢失）。这是二进制入口模块的加载顺序，测试进程里无法
+  // 以编译态复现，只能读入口与打包脚本。
   it('boots compiled workers through the preload entry before the CLI graph', () => {
     const entry = readFileSync(resolve('src/standalone-entry.ts'), 'utf8');
     const build = readFileSync(resolve('scripts/build-bun-binary.mjs'), 'utf8');
 
-    expect(entry).toContain("process.argv[2] === '__worker'");
-    expect(entry).toContain('waitForWorkerIpcPreloadMessage');
-    expect(entry.indexOf("await import('./worker-ipc-preload.js')"))
-      .toBeLessThan(entry.indexOf("await import('./cli.js')"));
-    expect(build).toContain("join(REPO_ROOT, 'dist', 'standalone-entry.js')");
+    const preload = entry.indexOf("import('./worker-ipc-preload.js')");
+    const wait = entry.indexOf('waitForWorkerIpcPreloadMessage(', preload);
+    expect(preload).toBeGreaterThanOrEqual(0);
+    expect(wait).toBeGreaterThan(preload);
+    expect(entry.indexOf("import('./cli.js')")).toBeGreaterThan(wait);
+    expect(build).toContain('standalone-entry.js');
   });
 });

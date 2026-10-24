@@ -4,14 +4,15 @@ import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
-import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { sessionChildEnvWithInject } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
 
 const { Terminal } = xtermHeadless;
 
-export type PersistentBackendType = Exclude<BackendType, 'pty'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
 export interface HerdrExternalTarget {
   sessionName: string;
@@ -29,6 +30,8 @@ interface HerdrBackendOptions {
   ownsSession?: boolean;
   /** Whether /close should close just the managed pane in a shared session. */
   ownsAgent?: boolean;
+  herdrConfig?: HerdrBackendConfig;
+  isCustomHost?: boolean;
 }
 
 // Slow output-streaming poll. We deliberately avoid the original 250ms tick:
@@ -68,6 +71,9 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
 const PANE_AGENT_START_TIMEOUT_MS = 30_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
+// A started launcher deletes itself. This fallback only reaps one Herdr never
+// ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
+const PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS = 60_000;
 // Watch the full useful lifecycle, not just settled statuses. Herdr's status
 // waits are level-triggered: when the pane is already in X they succeed
 // immediately. After one status wins we therefore exclude it
@@ -196,8 +202,26 @@ function herdrUsesManagedAgentFacade(): boolean {
   }
 }
 
-function paneAgentKindForExecutable(bin: string): string | undefined {
-  return PANE_AGENT_KIND_BY_EXECUTABLE[basename(bin)];
+function paneAgentKindForExecutable(bin: string, cliId?: string): string | undefined {
+  const base = basename(bin);
+  if (PANE_AGENT_KIND_BY_EXECUTABLE[base]) {
+    return PANE_AGENT_KIND_BY_EXECUTABLE[base];
+  }
+  // Support wrappers like claude-botmux, claude_wrapper, codex-v2
+  for (const [key, kind] of Object.entries(PANE_AGENT_KIND_BY_EXECUTABLE)) {
+    if (base.startsWith(`${key}-`)) return kind;
+    if (base.startsWith(`${key}_`)) return kind;
+  }
+  if (cliId) {
+    if (PANE_AGENT_KIND_BY_EXECUTABLE[cliId]) {
+      return PANE_AGENT_KIND_BY_EXECUTABLE[cliId];
+    }
+    for (const [key, kind] of Object.entries(PANE_AGENT_KIND_BY_EXECUTABLE)) {
+      if (cliId.startsWith(`${key}-`)) return kind;
+      if (cliId.startsWith(`${key}_`)) return kind;
+    }
+  }
+  return undefined;
 }
 
 function environmentForPaneAgent(bin: string, childEnv: Record<string, string> | undefined): Record<string, string> {
@@ -220,8 +244,9 @@ function shellSingleQuote(value: string): string {
  * Run this script by absolute path so interactive shell rc files cannot
  * shadow it by prepending real CLI directories to PATH. The mode-0700 script
  * restores the launch PATH and execs the full command, including wrappers and
- * multiline prompts. It removes itself before exec; the backend also cleans
- * up when automatic agent detection succeeds or any launch step fails.
+ * multiline prompts. It removes itself before exec; the backend removes it at
+ * once when a launch step fails, and only as a delayed fallback after the
+ * agent was detected (see startPaneAgent).
  */
 function createPaneAgentLauncher(
   canonicalExecutable: string,
@@ -235,7 +260,7 @@ function createPaneAgentLauncher(
   writeFileSync(path, [
     '#!/bin/sh',
     // Minimise the lifetime of the mode-0700 file containing the exact argv.
-    // The backend's finally block is the fallback if Herdr never executes it.
+    // The backend's cleanup is the fallback if Herdr never executes it.
     '/bin/rm -f -- "$0"',
     '/bin/rmdir -- "${0%/*}" 2>/dev/null || true',
     `PATH=${shellSingleQuote(originalPath)}`,
@@ -285,6 +310,35 @@ function herdrSessionArgs(sessionName: string, args: string[]): string[] {
   return ['--session', sessionName, ...args];
 }
 
+/** Linux MAX_ARG_STRLEN caps one argv element at 131072 bytes (32 pages).
+ *  Keep the `pane send-text` argument below it with headroom, since execve
+ *  rejects the whole call (E2BIG) once any single element reaches the cap. */
+const HERDR_SEND_TEXT_MAX_ARG_BYTES = 131072 - 8192;
+
+/** Split a string into pieces whose UTF-8 byte length is <= maxBytes, never
+ *  cutting through a multi-byte character. Returns one piece for short/empty
+ *  input so callers always issue at least one write. */
+export function chunkByUtf8Bytes(text: string, maxBytes: number): string[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4) {
+    throw new RangeError('maxBytes must be an integer >= 4');
+  }
+  const chunks: string[] = [];
+  let chunk = '';
+  let chunkBytes = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (chunk && chunkBytes + charBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += char;
+    chunkBytes += charBytes;
+  }
+  chunks.push(chunk);
+  return chunks;
+}
+
 function extractAgent(raw: any): any | undefined {
   return raw?.result?.agent;
 }
@@ -292,6 +346,28 @@ function extractAgent(raw: any): any | undefined {
 function extractAgents(raw: any): any[] {
   const agents = raw?.result?.agents;
   return Array.isArray(agents) ? agents : [];
+}
+
+/** A workspace/tab/pane list that placement decisions rest on. Unlike the
+ *  best-effort `jsonCommand`, a failed or malformed list throws: read as
+ *  "nothing there", it would make us create a workspace or tab in the user's
+ *  session. */
+function requiredHerdrList(operation: string, args: string[], key: 'workspaces' | 'tabs' | 'panes'): any[] {
+  const raw = requiredJsonCommand(operation, args);
+  const items = raw?.result?.[key] ?? raw?.[key];
+  if (!Array.isArray(items)) throw new Error(`${operation} failed: response has no ${key} list`);
+  return items;
+}
+
+/** The workspace/tab a configured name points to: exact id or label first,
+ *  then the label's first word (so "3" picks "3 其他", not "30 …"), then a
+ *  label prefix, then a substring. */
+function matchHerdrTarget(rows: any[], target: string, idKey: 'workspace_id' | 'tab_id'): any | undefined {
+  const label = (row: any): string => (typeof row?.label === 'string' ? row.label : '');
+  return rows.find(row => row?.[idKey] === target || label(row) === target)
+    ?? rows.find(row => label(row).split(/\s+/)[0] === target)
+    ?? rows.find(row => label(row).startsWith(target))
+    ?? rows.find(row => label(row).includes(target));
 }
 
 // Whether a matched `agent list` row represents an exited CLI. Verified against
@@ -421,6 +497,9 @@ export class HerdrBackend implements SessionBackend {
   private readonly webViewers = new Map<object, HerdrWebTerminalSize | null>();
 
   private childEnv: Record<string, string> | undefined;
+
+  private createdWorkspaceId?: string;
+  private createdTabId?: string;
 
   claudeJsonlPath?: string;
   cliPid?: number;
@@ -587,7 +666,7 @@ export class HerdrBackend implements SessionBackend {
     // Appended last so injected values win over same-named keys in opts.env.
     this.childEnv = this.opts.externalTarget
       ? undefined
-      : { ...opts.env, ...(opts.injectEnv ?? {}) };
+      : sessionChildEnvWithInject(opts);
     this.ensureServer();
 
     const external = this.opts.externalTarget;
@@ -666,10 +745,21 @@ export class HerdrBackend implements SessionBackend {
     this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    return runHerdr(
-      herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]),
-      { timeout: 5000 },
-    );
+    // Linux caps a SINGLE argv element at MAX_ARG_STRLEN (32 pages = 131072
+    // bytes), independent of ARG_MAX. A longer `pane send-text` payload dies
+    // with E2BIG before exec — the whole message is lost, and runHerdr reports
+    // false. Split oversized payloads into argv-safe pieces on UTF-8 boundaries
+    // and write them in order: the pane receives the identical byte sequence.
+    // A bracketed paste keeps one pair of markers because they are part of the
+    // stream; split points between the markers never leave paste mode.
+    const chunks = chunkByUtf8Bytes(data, HERDR_SEND_TEXT_MAX_ARG_BYTES);
+    for (const chunk of chunks) {
+      if (!runHerdr(
+        herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, chunk]),
+        { timeout: 5000 },
+      )) return false;
+    }
+    return true;
   }
 
   sendText(text: string): boolean {
@@ -685,6 +775,12 @@ export class HerdrBackend implements SessionBackend {
       herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]),
       { timeout: 5000 },
     );
+  }
+
+  /** One frame avoids per-line Enter/paste-burst ambiguity in Claude's composer.
+   * Send the paste boundaries through the raw terminal transport. */
+  sendBracketedPaste(text: string): boolean {
+    return this.write('\x1b[200~' + text + '\x1b[201~');
   }
 
   pasteText(text: string): boolean {
@@ -801,11 +897,15 @@ export class HerdrBackend implements SessionBackend {
 
   destroySession(): void {
     this.kill();
-    // Adopted targets are observation-only. A managed agent placed in a user's
-    // existing session owns its pane but never the surrounding herdr session.
-    if (this.opts.ownsSession ?? !this.opts.externalTarget) {
+    const isCustomSession = Boolean(
+      this.opts.isCustomHost
+      || (this.opts.herdrConfig?.sessionName && this.opts.herdrConfig.sessionName !== HerdrBackend.managedSessionName()),
+    );
+    // Adopted targets and custom user sessions are never killed at session-level.
+    // A managed agent placed in a user's session owns its pane but never the surrounding session.
+    if (!isCustomSession && (this.opts.ownsSession ?? !this.opts.externalTarget)) {
       HerdrBackend.killSession(this.sessionName);
-    } else if (this.opts.ownsAgent) {
+    } else if (this.opts.ownsAgent ?? isCustomSession) {
       if (this.paneId) {
         runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
       } else {
@@ -847,7 +947,7 @@ export class HerdrBackend implements SessionBackend {
   }
 
   getPaneSize(): { cols: number; rows: number } | null {
-    if (this.opts.externalTarget) {
+    if (this.opts.externalTarget || this.opts.herdrConfig?.placement === 'split') {
       return this.readExternalGrid() ?? { cols: this.cols, rows: this.rows };
     }
     return { cols: this.cols, rows: this.rows };
@@ -900,7 +1000,13 @@ export class HerdrBackend implements SessionBackend {
 
   private ensureServer(): void {
     if (HerdrBackend.hasSession(this.sessionName)) return;
-    if (this.opts.externalTarget) throw new Error(`herdr session ${this.sessionName} is not running`);
+    const isCustomSession = Boolean(
+      this.opts.isCustomHost
+      || (this.opts.herdrConfig?.sessionName && this.opts.herdrConfig.sessionName !== HerdrBackend.managedSessionName()),
+    );
+    if (this.opts.externalTarget || isCustomSession) {
+      throw new Error(`herdr session "${this.sessionName}" is not running`);
+    }
     // Botmux's machine-wide host is shared across bots, so its long-lived
     // server must be credential-neutral. Each agent receives childEnv
     // explicitly in startPaneAgent()/agent start. Legacy per-topic owned
@@ -925,6 +1031,55 @@ export class HerdrBackend implements SessionBackend {
     throw new Error(`failed to start herdr session ${this.sessionName}`);
   }
 
+  private resolveTargetWorkspaceId(target?: string): string {
+    const workspaces = requiredHerdrList(
+      `herdr workspace list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['workspace', 'list']),
+      'workspaces',
+    );
+    if (target?.trim()) {
+      const matched = matchHerdrTarget(workspaces, target.trim(), 'workspace_id');
+      if (matched?.workspace_id) return matched.workspace_id;
+    }
+    const focused = workspaces.find((w: any) => w?.focused === true);
+    if (focused?.workspace_id) return focused.workspace_id;
+    if (workspaces.length > 0 && workspaces[0]?.workspace_id) return workspaces[0].workspace_id;
+
+    const created = requiredJsonCommand(
+      `herdr workspace create for ${this.sessionName}`,
+      // Only reached when the session has no workspace at all. Name it after
+      // the configured target so the next lookup matches it.
+      herdrSessionArgs(this.sessionName, ['workspace', 'create', '--label', target?.trim() || 'botmux', '--no-focus']),
+      { timeout: 10_000, env: this.childEnv },
+    );
+    const wsId = created?.result?.workspace?.workspace_id;
+    if (typeof wsId !== 'string' || !wsId) {
+      throw new Error(`failed to resolve or create workspace in herdr session ${this.sessionName}`);
+    }
+    this.createdWorkspaceId = wsId;
+    return wsId;
+  }
+
+  private resolveTargetTab(workspaceId: string, target?: string): any | undefined {
+    const tabs = requiredHerdrList(
+      `herdr tab list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['tab', 'list']),
+      'tabs',
+    ).filter((t: any) => t?.workspace_id === workspaceId);
+    if (target?.trim()) return matchHerdrTarget(tabs, target.trim(), 'tab_id');
+    return tabs.find((t: any) => t?.focused === true) || tabs[0];
+  }
+
+  private resolvePaneInTab(tabId: string): string | undefined {
+    const panes = requiredHerdrList(
+      `herdr pane list in ${this.sessionName}`,
+      herdrSessionArgs(this.sessionName, ['pane', 'list']),
+      'panes',
+    ).filter((p: any) => p?.tab_id === tabId);
+    const focused = panes.find((p: any) => p?.focused === true);
+    return focused?.pane_id || panes[panes.length - 1]?.pane_id || panes[0]?.pane_id;
+  }
+
   /** Herdr >=0.7.5 managed-agent launch protocol.
    *
    * `agent start --kind` types a bare CLI name into the interactive shell. Its
@@ -937,7 +1092,7 @@ export class HerdrBackend implements SessionBackend {
     // Identify the managed kind by the original CLI; the launcher still
     // executes the complete wrapped command.
     const cliBin = opts.cliBin ?? bin;
-    const kind = paneAgentKindForExecutable(cliBin);
+    const kind = paneAgentKindForExecutable(cliBin, opts.cliId);
     if (!kind) {
       throw new Error(
         `Herdr >=0.7.5 cannot launch executable "${basename(cliBin)}" as a managed coding agent; ` +
@@ -946,27 +1101,90 @@ export class HerdrBackend implements SessionBackend {
     }
     const workspaceEnv = environmentForPaneAgent(cliBin, this.childEnv);
     const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
-    let workspaceId: string | undefined;
+    const placement: HerdrBackendPlacement = this.opts.herdrConfig?.placement ?? 'workspace';
+    let paneId: string | undefined;
     let launcher: ReturnType<typeof createPaneAgentLauncher> | undefined;
+    let launched = false;
     try {
-      const created = requiredJsonCommand(
-        `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
-        herdrSessionArgs(this.sessionName, [
-          'workspace', 'create',
-          '--cwd', opts.cwd,
-          '--label', this.agentName,
-          '--no-focus',
-          ...envCommandArgs(workspaceEnv),
-        ]),
-        { timeout: 10_000, env: this.childEnv },
-      );
-      const paneId = created?.result?.root_pane?.pane_id;
-      workspaceId = created?.result?.workspace?.workspace_id;
-      if (typeof paneId !== 'string' || !paneId) {
-        throw new Error(`herdr workspace create for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
+      if (placement === 'split') {
+        const targetWsId = this.resolveTargetWorkspaceId(this.opts.herdrConfig?.workspace);
+        const targetTab = this.resolveTargetTab(targetWsId, this.opts.herdrConfig?.tab);
+        if (targetTab?.tab_id) {
+          const splitTargetPaneId = this.resolvePaneInTab(targetTab.tab_id);
+          if (splitTargetPaneId) {
+            const splitDir = this.opts.herdrConfig?.splitDirection ?? 'right';
+            const split = requiredJsonCommand(
+              `herdr pane split for ${this.agentName} in ${this.sessionName}`,
+              herdrSessionArgs(this.sessionName, [
+                'pane', 'split',
+                '--pane', splitTargetPaneId,
+                '--direction', splitDir,
+                '--cwd', opts.cwd,
+                '--no-focus',
+                ...envCommandArgs(workspaceEnv),
+              ]),
+              { timeout: 10_000, env: this.childEnv },
+            );
+            paneId = split?.result?.pane?.pane_id;
+          }
+        }
+        if (!paneId) {
+          // Tab not found or empty: auto-create tab in target workspace so launch succeeds
+          const tabLabel = this.opts.herdrConfig?.tab?.trim() || this.agentName;
+          const createdTab = requiredJsonCommand(
+            `herdr tab create for ${this.agentName} in ${this.sessionName}`,
+            herdrSessionArgs(this.sessionName, [
+              'tab', 'create',
+              '--workspace', targetWsId,
+              '--label', tabLabel,
+              '--cwd', opts.cwd,
+              '--no-focus',
+              ...envCommandArgs(workspaceEnv),
+            ]),
+            { timeout: 10_000, env: this.childEnv },
+          );
+          paneId = createdTab?.result?.root_pane?.pane_id;
+          this.createdTabId = createdTab?.result?.tab?.tab_id;
+        }
+      } else if (placement === 'tab') {
+        const targetWsId = this.resolveTargetWorkspaceId(this.opts.herdrConfig?.workspace);
+        const tabLabel = this.opts.herdrConfig?.tab?.trim() || this.agentName;
+        const createdTab = requiredJsonCommand(
+          `herdr tab create for ${this.agentName} in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, [
+            'tab', 'create',
+            '--workspace', targetWsId,
+            '--label', tabLabel,
+            '--cwd', opts.cwd,
+            '--no-focus',
+            ...envCommandArgs(workspaceEnv),
+          ]),
+          { timeout: 10_000, env: this.childEnv },
+        );
+        paneId = createdTab?.result?.root_pane?.pane_id;
+        this.createdTabId = createdTab?.result?.tab?.tab_id;
+      } else {
+        const created = requiredJsonCommand(
+          `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, [
+            'workspace', 'create',
+            '--cwd', opts.cwd,
+            '--label', this.agentName,
+            '--no-focus',
+            ...envCommandArgs(workspaceEnv),
+          ]),
+          { timeout: 10_000, env: this.childEnv },
+        );
+        paneId = created?.result?.root_pane?.pane_id;
+        this.createdWorkspaceId = created?.result?.workspace?.workspace_id;
       }
 
-      launcher = createPaneAgentLauncher(basename(cliBin), bin, args, originalPath);
+      if (typeof paneId !== 'string' || !paneId) {
+        throw new Error(`herdr placement ${placement} for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
+      }
+      this.paneId = paneId;
+
+      launcher = createPaneAgentLauncher(kind, bin, args, originalPath);
       requiredJsonCommand(
         `herdr pane run ${paneId} in ${this.sessionName}`,
         // One quoted COMMAND argument reaches the shell verbatim, even while
@@ -1012,20 +1230,41 @@ export class HerdrBackend implements SessionBackend {
       }
       // Recognition can precede interactive readiness. The worker retains its
       // first-prompt gate until onAgentStatus/normal prompt detection releases it.
+      launched = true;
       return paneId;
     } catch (err) {
-      // Workspace creation succeeded but the CLI did not. Remove only the
-      // workspace created by this attempt so a shared user session is never
-      // left with an empty Botmux tab after a failed spawn.
-      if (typeof workspaceId === 'string' && workspaceId) {
+      if (typeof this.createdWorkspaceId === 'string' && this.createdWorkspaceId) {
         runHerdr(
-          herdrSessionArgs(this.sessionName, ['workspace', 'close', workspaceId]),
+          herdrSessionArgs(this.sessionName, ['workspace', 'close', this.createdWorkspaceId]),
+          { timeout: 5000 },
+        );
+      }
+      if (typeof this.createdTabId === 'string' && this.createdTabId) {
+        runHerdr(
+          herdrSessionArgs(this.sessionName, ['tab', 'close', this.createdTabId]),
+          { timeout: 5000 },
+        );
+      }
+      if (typeof paneId === 'string' && paneId) {
+        runHerdr(
+          herdrSessionArgs(this.sessionName, ['pane', 'close', paneId]),
           { timeout: 5000 },
         );
       }
       throw err;
     } finally {
-      if (launcher) rmSync(launcher.dir, { recursive: true, force: true });
+      if (launcher && launched) {
+        // Detection matches the launcher's argv, which can happen while macOS
+        // still holds its exec for a Gatekeeper assessment. Deleting the file
+        // then makes the XProtect scan fail and Gatekeeper SIGKILLs the CLI
+        // (`zsh: killed`), so a launched launcher is left to remove itself.
+        const dir = launcher.dir;
+        setTimeout(() => {
+          try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+        }, PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS).unref?.();
+      } else if (launcher) {
+        rmSync(launcher.dir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -1447,6 +1686,12 @@ export class HerdrBackend implements SessionBackend {
     this.stopStatusWatcher();
     for (const cb of this.exitCbs) {
       try { cb(code, signal); } catch { /* listener crash shouldn't kill teardown */ }
+    }
+    // The managed CLI is gone; its pane now holds only the shell it was
+    // launched from. The worker drops this exited backend before restarting,
+    // so nothing else would close the pane and every attempt would leave one.
+    if (this.opts.ownsAgent && !this.opts.externalTarget && this.paneId) {
+      runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
     }
   }
 }

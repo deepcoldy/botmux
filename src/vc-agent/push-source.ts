@@ -132,7 +132,16 @@ export function parseVcMeetingPushEvent(input: {
   kind: VcMeetingPushEventKind;
   eventType: VcMeetingPushEventType;
 }): VcMeetingPushContext {
+  const body = eventBody(input.data);
+  const inviterId = getPath(body, 'inviter.id');
+  // Envelope creation time cannot prove when the invitation happened (e.g. delayed delivery).
+  const invitedAt = parseTimeMs(getPath(body, 'invite_time'));
+  const inviter = input.kind === 'meeting_invited' && input.eventType === VC_BOT_MEETING_INVITED_EVENT
+    && getPath(body, 'inviter.user_type') === 1
+    && typeof inviterId === 'string' && /^ou_[A-Za-z0-9]+$/.test(inviterId)
+    ? { openId: inviterId, ...(invitedAt !== undefined ? { invitedAt } : {}) } : undefined;
   return {
+    ...(inviter ? { inviter } : {}),
     larkAppId: input.larkAppId,
     kind: input.kind,
     eventType: input.eventType,

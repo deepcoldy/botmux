@@ -28,10 +28,19 @@
 # 交互式会话列表，选择后直接 attach
 botmux list
 
-# 手动 attach（会话名 = bmx-<sessionId 前 8 位>）
-tmux attach -t bmx-<前8位>
+# 手动 attach（会话名 = bmx-<sessionId 前 8 位>，在独立的 botmux tmux server 上）
+tmux -L botmux attach -t bmx-<前8位>
+tmux -L botmux ls            # 列出所有托管会话
 # Ctrl+B, D 退出 attach，不影响 CLI 继续运行
 ```
+
+### 托管会话为什么不在默认 tmux server 上
+
+botmux 管理的会话跑在独立 socket（`tmux -L botmux`）上，不和你自己的 tmux 共用默认 server。这样在终端里（或 bot 在自己的 pane 里）误执行一次 `tmux kill-server`，只会影响默认 server 上你自己的会话，不会把所有 bot 会话一起带走。`TMUX_TMPDIR` 照常生效（socket 在 `$TMUX_TMPDIR/tmux-<uid>/botmux`）。
+
+- **升级前创建、还活着的会话**留在默认 server 上继续跑（`tmux attach -t bmx-…` 照旧可用），下次需要重新创建（CLI 重启、冷启动恢复）时才移到独立 socket。`botmux list`、Web 终端、Dashboard 终端页会按每个会话记录的位置自动找到它。
+- **`/adopt` 不受影响**：它接管的是你自己在默认 server 上开的 pane。
+- **想保持旧行为**：在 `~/.botmux/.env` 里设 `BOTMUX_TMUX_SOCKET=default`，之后新会话回到默认 server；也可以设成别的名字（只允许字母、数字、`_` `.` `-`）。
 
 attach 进去后你看到的就是和本地开发完全一致的终端——这也是 botmux 相比"只读输出"方案的关键区别。飞书话题、Web 终端、本地 tmux 三处看到的是同一个进程，见 [Web 终端](/web-terminal)。
 

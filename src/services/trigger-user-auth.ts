@@ -42,6 +42,26 @@ export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
+ * Where a person's credentials come from.
+ *
+ * - `auto` (default): ask the central platform first when this machine is
+ *   bound to one; otherwise, or when the platform knows nothing about the
+ *   person, fall back to the per-person HOME on this machine. A bound machine
+ *   never STARTS a local device login on its own — the person is pointed at
+ *   the platform, so one authorization serves every machine.
+ * - `platform`: platform only. An unbound machine, or an unreachable platform,
+ *   refuses the call. For deployments that require central audit.
+ * - `local`: today's behaviour — per-person HOME on this machine only, the
+ *   platform is never consulted. The open-source default when unbound.
+ *
+ * Deliberately a separate field from `credentialsSourceDir` (the per-bot Claude
+ * login directory): that one is the BOT's model account, this one is the
+ * trigger PERSON's tool credentials.
+ */
+export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
+export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+
+/**
  * Policy intent for a sender who has not authorized this tool.
  *
  * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
@@ -63,6 +83,10 @@ export interface TriggerUserAuthConfig {
   /** Tools this applies to. Empty means the policy is inert. */
   tools: TriggerUserAuthTool[];
   fallback: TriggerUserAuthFallback;
+  /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
+   *  it; it is optional on the type only so hand-built configs (tests, legacy
+   *  callers) keep compiling — read it through {@link credentialSourceOf}. */
+  credentialSource?: TriggerUserAuthCredentialSource;
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -79,19 +103,6 @@ export interface TriggerUserAuthConfig {
    */
   gitTokenExchangeUrl?: string;
 }
-
-/** Per-tool facts that decide what "unauthorized" can degrade to. */
-export const TRIGGER_USER_AUTH_TOOL_CAPABILITIES: Record<
-  TriggerUserAuthTool,
-  { supportsBotIdentity: boolean }
-> = {
-  // `lark-cli --as bot` works with app credentials alone.
-  'lark-cli': { supportsBotIdentity: true },
-  // `bytedcli auth` offers only SSO personal login — no bot/tenant identity to
-  // degrade to. (Per-person authorization itself IS supported; see
-  // services/bytedcli-auth.ts.)
-  bytedcli: { supportsBotIdentity: false },
-};
 
 /**
  * How well the on-disk token store is actually protected for this session.
@@ -192,6 +203,17 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     fallback = rec.fallback as TriggerUserAuthFallback;
   }
 
+  let credentialSource: TriggerUserAuthCredentialSource = 'auto';
+  if (rec.credentialSource !== undefined && rec.credentialSource !== null) {
+    if (!(TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(rec.credentialSource)) {
+      throw new TriggerUserAuthConfigError(
+        `triggerUserAuth.credentialSource must be one of ${TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ')}`
+        + ` (got ${JSON.stringify(rec.credentialSource)})`,
+      );
+    }
+    credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
+  }
+
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -202,6 +224,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     enabled,
     tools,
     fallback,
+    credentialSource,
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
@@ -238,32 +261,17 @@ function optionalHttpsUrl(value: unknown, field: string): string | undefined {
   return value;
 }
 
+/** The effective credential source; absent means `auto`. */
+export function credentialSourceOf(
+  config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
+): TriggerUserAuthCredentialSource {
+  return config?.credentialSource ?? 'auto';
+}
+
 /** Whether this policy governs `tool` right now. */
 export function triggerUserAuthApplies(
   config: TriggerUserAuthConfig | null | undefined,
   tool: TriggerUserAuthTool,
 ): boolean {
   return !!config?.enabled && config.tools.includes(tool);
-}
-
-/** How a specific tool behaves when the sender has not authorized it. */
-export type UnauthorizedOutcome = 'bot-identity' | 'fail';
-
-/**
- * Resolve the configured policy intent for `tool` when the current sender has
- * no credentials.
- *
- * Descriptive only: the turn publisher refuses unauthorized calls for BOTH
- * tools today (see turn-cli-identity), so nothing in production branches on
- * this result. It is kept because stored configs still carry the field and
- * tests pin what was configured. `bytedcli` reports `fail` even under
- * `fallback: 'bot-identity'` because it never had a non-human identity.
- */
-export function unauthorizedOutcomeFor(
-  config: TriggerUserAuthConfig | null | undefined,
-  tool: TriggerUserAuthTool,
-): UnauthorizedOutcome {
-  if (!triggerUserAuthApplies(config, tool)) return 'bot-identity';
-  if (config!.fallback === 'none') return 'fail';
-  return TRIGGER_USER_AUTH_TOOL_CAPABILITIES[tool].supportsBotIdentity ? 'bot-identity' : 'fail';
 }

@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import {
   normalizeStartupCommand,
   normalizeStartupCommandList,
   parseStartupCommandsInput,
   shouldRunStartupCommandsOnSpawn,
   shouldDeferInitialPromptForStartup,
+  judgeStartupCommandAck,
 } from '../src/core/startup-commands.js';
 
 describe('normalizeStartupCommand', () => {
@@ -85,41 +85,25 @@ describe('shouldDeferInitialPromptForStartup', () => {
   });
 });
 
-// Source-level guards: worker.ts has no exports, so pin the wiring that connects
-// the two predicates to the spawn path (the cross-path behaviour Codex flagged).
-describe('worker.ts startup-commands wiring', () => {
-  const src = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8');
+describe('judgeStartupCommandAck', () => {
+  const pty = { outputSinceSubmit: true, quietForMs: 2_000, promptVisible: true, quietMs: 500 };
 
-  it('re-arms the one-shot from the reattach prediction, not unconditionally', () => {
-    // The re-arm is gated on the reattach prediction (skip on live reattach)…
-    expect(src).toContain('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn({ willReattachPersistent })');
-    // …and it lives AFTER willReattachPersistent is computed (must read it).
-    expect(src.indexOf('hasRunStartupCommands = !shouldRunStartupCommandsOnSpawn'))
-      .toBeGreaterThan(src.indexOf('const willReattachPersistent ='));
+  it('trusts deterministic adapter evidence over PTY evidence, both ways', () => {
+    // A command folded into a paste burst echoes, goes quiet and keeps ❯ on
+    // screen — PTY evidence must not confirm what the transcript denies.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: false })).toBe(false);
+    expect(judgeStartupCommandAck({
+      executionRecorded: true, outputSinceSubmit: false, quietForMs: 0, promptVisible: false, quietMs: 500,
+    })).toBe(true);
   });
 
-  it('defers args-baked initial prompts for startup commands and adapter argv byte limits', () => {
-    // buildArgs gets undefined (not baked) and the init handler queues it instead;
-    // adapter-level preparation may also rewrite long prompts to safe argv tokens.
-    expect(src).toContain('cliAdapter.prepareInitialPromptArg?.({');
-    expect(src).toContain('promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;');
-    expect(src).toContain('resolveInitialPromptDelivery({');
-    expect(src).toContain('initialPrompt: preparedInitialPrompt,');
-    expect(src).toContain('shouldDeferInitialPromptForArgLimit({');
-    expect(src).toContain('maxInitialPromptArgBytes: cliAdapter.maxInitialPromptArgBytes,');
-    expect(src).toContain('lastSpawnDeferInitialPrompt = deferInitialPrompt;');
-    expect(src).toContain('const deferInitialPrompt = lastSpawnDeferInitialPrompt;');
-    expect(src).toContain('shouldQueueInitialPrompt({');
-    expect(src).toContain('passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,');
-    expect(src).toContain('deferInitialPrompt,');
-    expect(src).toContain('content: lastSpawnQueuedInitialPrompt ?? msg.prompt,');
-    expect(src).toContain('logicalContent: lastSpawnQueuedInitialPromptLogicalContent');
-    expect(src).toContain('args.unshift(...piInitialPromptAdditionalArgs);');
-    expect(src).toContain('Object.assign(childEnv, piInitialPromptEnv);');
-  });
-
-  it('does not route startupCommands into launch argv', () => {
-    expect(src).not.toContain('planStartupCommandsForCli');
-    expect(src).not.toContain('startupLaunchArgs');
+  it('without an adapter probe, requires output after the submit key, quiet, and the prompt', () => {
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined })).toBe(true);
+    // A CLI that is not reading input yet produces nothing after the Enter.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, outputSinceSubmit: false })).toBe(false);
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, quietForMs: 100 })).toBe(false);
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, promptVisible: false })).toBe(false);
+    // No readyPattern to check: output + quiet suffice.
+    expect(judgeStartupCommandAck({ ...pty, executionRecorded: undefined, promptVisible: undefined })).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -158,6 +158,56 @@ export function resolvePiModelForSpawn(
   }
 }
 
+/** Pi's busy status line, matched against ANSI-stripped PTY / viewport text.
+ *  Pi 1.x renders pi-tui's Loader as `<frame> <message>`: a braille spinner
+ *  frame, a space, then the default message `Working` with no ellipsis — on
+ *  1.3.0 it sits in the editor's top border as `── ⠴ Working ───`, repainted
+ *  every 80ms while the turn runs. Older builds printed `Working...`. The
+ *  spinner frame is required so prose like "Working through the fix" in a
+ *  reply cannot pass for the status line. */
+export const PI_BUSY_PATTERN = /[\u2800-\u28FF] Working\b|Working\.\.\./;
+
+/** Pi's own warning that the install it runs from was upgraded underneath it
+ *  (a global `npm i -g` while the session was open). Pi checks this after a
+ *  failed request, because code it loads on demand then fails with "Cannot
+ *  find module" until the process restarts, and renders it as its own line:
+ *  `Warning: pi was updated to <installed> while this session was running
+ *  (<running>). …`. Matched on ANSI-stripped PTY text, where a wrapped line
+ *  can lose the space at the wrap, hence the `\s*` between words; both
+ *  versions must look like versions, so source code or docs that merely quote
+ *  the sentence do not match. */
+const PI_INSTALL_UPDATED_PATTERN =
+  /Warning:\s*pi\s*was\s*updated\s*to\s*(\d[\w.+-]*?)\s*while\s*this\s*session\s*was\s*running\s*\((\d[\w.+-]*)\)/;
+
+export function parsePiInstallUpdatedNotice(text: string): { installedVersion: string; runningVersion: string } | undefined {
+  const match = PI_INSTALL_UPDATED_PATTERN.exec(text);
+  return match ? { installedVersion: match[1]!, runningVersion: match[2]! } : undefined;
+}
+
+/** Version of the Pi install `bin` runs from, read from that package's
+ *  package.json — the file Pi itself re-reads for the warning above. Undefined
+ *  when `bin` does not lead into a Pi package (a wrapper script, say). */
+export function readPiInstallVersion(bin: string): string | undefined {
+  let dir: string;
+  try {
+    dir = dirname(realpathSync(bin));
+  } catch {
+    return undefined;
+  }
+  for (let depth = 0; depth < 6; depth++) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+      if (typeof pkg?.name === 'string' && /(?:^|\/)pi-coding-agent$/.test(pkg.name)) {
+        return typeof pkg.version === 'string' ? pkg.version : undefined;
+      }
+    } catch { /* not the package root yet — keep walking up */ }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
 /** Adapter for Pi coding-agent's native TUI (`pi`).
  *
  *  ## Type-ahead (re-enabled 2026-08; first tried b2c2ba67, reverted next day
@@ -201,8 +251,8 @@ export function resolvePiModelForSpawn(
  *       has no on-disk end marker.
  *  Setting `reliableTurnTerminal` would (a) claim VC-meeting delivery eligibility
  *  Pi can't honor and (b) suppress the busy-marker idle probe Pi actually relies
- *  on, so it stays unset — keeping Pi on its proven quiescence + `Working...`
- *  busy-marker idle path. (Pi's screen `rate` verdict is NOT at risk here:
+ *  on, so it stays unset — keeping Pi on its proven quiescence + busy-line
+ *  ({@link PI_BUSY_PATTERN}) idle path. (Pi's screen `rate` verdict is NOT at risk here:
  *  `structuredRateLimitAuthoritative` gates on `claudeDataDir` /
  *  `emitsStructuredRateLimit`, neither of which Pi sets — Pi has no structured
  *  rate-limit emit, so it correctly keeps screen-scanning real 429s.)
@@ -212,13 +262,13 @@ export function resolvePiModelForSpawn(
  *  Without `reliableTurnTerminal` the worker keeps the post-submit busy-marker
  *  idle probe and the reattach probe (`scheduleReattachIdleProbe`, gated on
  *  `busyPattern`), so a turn — and a reattached persistent pane with no new PTY
- *  output — is marked ready via the `Working...` marker exactly as before this
+ *  output — is marked ready via the busy-line marker exactly as before this
  *  change. `assistant_final` events additionally fire idle when they land.
  *  Three guards keep quiescence honest (the raw heuristic alone mis-fires):
  *    1. Startup window: the TUI renders its input box seconds before the CLI
  *       begins consuming an argv-baked first prompt (extension/model loading).
  *       The worker holds the first ready until the turn has visibly started —
- *       `Working...` seen on PTY, or the transcript's first user record
+ *       the busy line seen on PTY, or the transcript's first user record
  *       (worker `spawnArgvTurnStartEvidenceSeen` gate).
  *    2. Mid-turn: pi is in STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS, so a
  *       transcript-started turn without a terminal suppresses screen idle
@@ -226,7 +276,7 @@ export function resolvePiModelForSpawn(
  *       hard error/aborted edges — see pi-transcript.ts for the accepted
  *       custom-tool `terminate:true` gap).
  *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
- *       working when `Working...` reappears. */
+ *       working when the busy line reappears. */
 /** Pi session JSONL. botmux passes `--session-id`, so the adapter session id is a valid
  *  first lookup key even before the native id is known. */
 export const piBridgeSpec: StructuredBridgeSpec = {
@@ -360,17 +410,17 @@ export function createPiAdapter(
     },
 
     completionPattern: undefined,
-    busyPattern: /Working\.\.\./,
+    busyPattern: PI_BUSY_PATTERN,
     // Self-heal for a falsely published ready (e.g. a startup-window quiescence
-    // idle slipping past the gates): if `Working...` renders AFTER an idle was
+    // idle slipping past the gates): if the busy line renders AFTER an idle was
     // reported, IdleDetector fires onBusy and the worker pulls isPromptReady
     // back to false + republishes working. Safe as an idle→busy edge marker:
-    // Pi's `Working...` is an ephemeral status line, never part of transcript
+    // Pi's busy line is an ephemeral status line, never part of transcript
     // history redraws, so a completed turn cannot revive a closed card.
-    idleToBusyPattern: /Working\.\.\./,
+    idleToBusyPattern: PI_BUSY_PATTERN,
     readyPattern: undefined,
     // Pi's native Message Queue parks/steers submit-while-busy input; the JSONL
-    // transcript bridge (drainPiTranscript) + the `Working...` busy marker are
+    // transcript bridge (drainPiTranscript) + the busy-line marker are
     // enough to attribute the reply per turn. No mergeQueuedInput: one card per
     // Lark turn. No reliableTurnTerminal: Pi holds no session fd and a
     // custom-terminate turn has no on-disk boundary — see the header for why
@@ -379,6 +429,10 @@ export function createPiAdapter(
     supportsProgramStatus: true,
     systemHints: [],
     altScreen: true,
+    // Pi >= 1.0 defaults to fullscreen mode, where Pi owns the transcript and
+    // xterm/tmux have no usable scrollback. Let read-only Web Terminal viewers
+    // use the worker's validated, rate-limited SGR wheel-only path.
+    readOnlyRemoteScroll: true,
     skillsDir: '~/.pi/agent/skills',
   };
 }

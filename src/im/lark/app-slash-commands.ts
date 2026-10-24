@@ -15,7 +15,7 @@
  * {@link classifyAppSlashCommandUnavailable} 把错误归为「不可用」，面板降级而不是报错。
  */
 import { formatLarkError, getBotClient } from '../../bot-registry.js';
-import { COMMANDS, type CommandSpec } from '../../core/command-schema.js';
+import { COMMANDS, commandCliIdMatches, type CommandSpec } from '../../core/command-schema.js';
 import { messages as enMessages } from '../../i18n/en.js';
 import { messages as zhMessages } from '../../i18n/zh.js';
 import type { Locale } from '../../i18n/types.js';
@@ -195,7 +195,9 @@ export function buildAppSlashCommandCatalog(
   const locale: Locale = options.locale ?? 'zh';
   const byName = new Map<string, AppSlashCommandSpec>();
   for (const spec of COMMANDS) {
-    if (spec.cliId && spec.cliId !== options.cliId) continue;
+    // CLI 限定项支持单个 cliId 或 cliId 数组（如 /effort 同时属于 codex-app 与 codex）：
+    // 与命令路由闸共用同一匹配口径，避免数组写法在面板目录里永远匹配不上。
+    if (spec.cliId && !commandCliIdMatches(spec.cliId, options.cliId)) continue;
     if (spec.claimWithoutSessionOnly) continue;
     const zh = describeSpec(spec, 'zh');
     const en = describeSpec(spec, 'en');

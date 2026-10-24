@@ -70,8 +70,12 @@ export function updateRuntimeTaskState(
   return !!mutateRuntimeTask(id, task => ({ ...task, ...updates }), appId);
 }
 
-export function rollbackUnpublishedRuntimeTask(id: string, appId: string): boolean {
+export function rollbackUnpublishedRuntimeTask(id: string, appId: string, expectedPreconditionRef?: string): boolean {
   assertScheduleAuthorityAvailable();
+  // Creation may commit authority even when its JSON projection fails. Match
+  // the staged binding against runtime authority, never against that projection.
+  if (expectedPreconditionRef !== undefined
+    && runtimeTask(id, appId)?.preconditionRef !== expectedPreconditionRef) return false;
   if (!authorityStore?.isInitialized(appId)) return scheduleStore.removeTask(id, appId);
   const removed = authorityStore.rollbackUnpublishedDirectCreate(appId, id);
   if (removed) scheduleStore.removeAuthoritativeTaskProjection(id, appId);
@@ -1047,12 +1051,10 @@ export function addTask(params: {
     followActive: params.followActive === true ? true : undefined,
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
-  });
-  if (task.larkAppId && authorityStore?.isInitialized(task.larkAppId)) {
-    authorityStore.createDirect(task);
-    project(task);
-  }
-  logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
+  }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
+    ? candidate => project(authorityStore!.createDirect(candidate))
+    : undefined);
+  logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
 }
 

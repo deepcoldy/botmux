@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const source = readFileSync(join(process.cwd(), 'src/dashboard/web/floating-scrollbars.ts'), 'utf8');
 const css = readFileSync(join(process.cwd(), 'src/dashboard/web/style.css'), 'utf8');
@@ -26,6 +26,7 @@ function extractIsVisible(): (target: unknown) => boolean {
 function scroller(ancestorAttrs: string[]) {
   return {
     isConnected: true,
+    parentElement: null,
     closest: (selector: string) => {
       const wanted = selector.split(',').map(s => s.trim().replace(/^\[|\]$/g, ''));
       return wanted.some(attr => ancestorAttrs.includes(attr)) ? {} : null;
@@ -45,9 +46,39 @@ describe('floating scrollbars behind an inert overlay', () => {
     expect(isVisible(scroller(['inert']))).toBe(false);
     expect(isVisible(scroller(['hidden']))).toBe(false);
   });
+  it('does not retain popup scrollbars after a details menu closes, even with a stale nonzero layout rect', () => {
+    const target = scroller([]) as any;
+    const details = { tagName: 'DETAILS', parentElement: null, hasAttribute: () => false,
+      querySelector: () => ({ contains: () => false }) };
+    target.parentElement = details;
+    expect(isVisible(target)).toBe(false);
+    details.hasAttribute = () => true;
+    expect(isVisible(target)).toBe(true);
+  });
 
-  it('rescans when an overlay toggles inert on the page', () => {
-    expect(source).toMatch(/attributeFilter:\s*\[[^\]]*'inert'/);
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('rescans when an overlay toggles inert on the page', async () => {
+    let observed: { callback: (records: unknown[]) => void; options: MutationObserverInit } | undefined;
+    vi.stubGlobal('MutationObserver', class {
+      constructor(private readonly callback: (records: unknown[]) => void) {}
+      observe(_target: unknown, options: MutationObserverInit) { observed = { callback: this.callback, options }; }
+    });
+    vi.stubGlobal('Element', class {});
+    vi.stubGlobal('document', { documentElement: { classList: { add: () => undefined } }, addEventListener: () => undefined });
+    const setTimeout = vi.fn(() => 1);
+    vi.stubGlobal('window', { addEventListener: () => undefined, requestAnimationFrame: () => 1, setTimeout });
+    const { initFloatingScrollbars } = await import('../src/dashboard/web/floating-scrollbars.js');
+    initFloatingScrollbars({} as HTMLElement);
+
+    // Browser semantics: attribute mutations are delivered only for names in attributeFilter.
+    const toggleAttribute = (attributeName: string) => {
+      if (observed?.options.attributeFilter?.includes(attributeName)) {
+        observed.callback([{ type: 'attributes', attributeName, target: {} }]);
+      }
+    };
+    toggleAttribute('inert');
+    expect(setTimeout).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -60,6 +91,9 @@ describe('Bot config example drawer stacking', () => {
     return Number(z[1]);
   }
 
+  // 源码结构护栏(K4)：示例侧栏与悬浮滚动条层是两条各自独立声明的 body 级规则，
+  // 叠放次序只能从 style.css 里两个 z-index 的相对大小看出，无法 import 比较；
+  // 只断言相对次序、不钉具体数值。对应 #1949（侧栏被背景页的悬浮滚动条盖住）。
   it('paints above the body-level floating scrollbar layer', () => {
     const layer = zIndexOf(/\.floating-scrollbar-layer\s*\{[^}]*\}/);
     const drawer = zIndexOf(/\.bot-defaults-page\.bd-example-layer\s*\{[^}]*\}/);

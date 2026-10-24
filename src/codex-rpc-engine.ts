@@ -28,6 +28,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
+import { MIN_POLL_REQUEST_BUDGET_MS } from './core/codex-poll-budget.js';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
   CODEX_CAPACITY_ERROR_CODE,
@@ -37,6 +38,7 @@ import {
 import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
 import { pidIsSignalable } from './utils/process-alive.js';
+import { PROCESS_TABLE_MAX_BUFFER } from './utils/exec-limits.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
@@ -170,15 +172,6 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
-/** Floor for a metadata-poll iteration's per-request budget. Below this, the
- *  poll deadline is effectively reached: issuing a thread/read with a
- *  sub-floor client timeout would reliably time out (and REJECT, not return)
- *  before even a fast response lands, and that rejection would escape the poll
- *  loop instead of degrading to "not found". Guards waitForThreadPreview /
- *  waitForThreadUpdatedAfter against a flaky end-of-window request. 50ms is
- *  comfortably above localhost RPC round-trip yet negligible vs the callers'
- *  200ms–10s budgets. */
-const MIN_POLL_REQUEST_BUDGET_MS = 50;
 
 export class CodexRpcEngine {
   private child?: ChildProcess;
@@ -622,7 +615,7 @@ export class CodexRpcEngine {
     let argv = '';
     try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
       catch { return false; }
     }
     if (!/\bapp-server\b/.test(argv)) return false;
