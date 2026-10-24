@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from '../adapters/cli/registry.js';
 import { JsonRpcStdioCore } from '../utils/jsonrpc-stdio.js';
+import { MIN_POLL_REQUEST_BUDGET_MS } from '../core/codex-poll-budget.js';
 
 type JsonObject = Record<string, any>;
 
@@ -75,6 +76,7 @@ function isThreadNotLoadedError(error: unknown, threadId: string): boolean {
     && error.code === -32600
     && error.serverMessage === `thread not loaded: ${threadId}`;
 }
+
 
 export interface CodexAppThreadSummary {
   threadId: string;
@@ -296,13 +298,18 @@ class CodexAppServerProbe {
     for (;;) {
       if (this.closed) throw new Error('Codex app-server is closed');
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return undefined;
       let preview: string | undefined;
       try {
         ({ preview } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000)));
       } catch (err) {
-        if (!isThreadNotLoadedError(err, threadId)) throw err;
+        // A client timeout fires at (or after) the deadline: the budget is
+        // exhausted, so degrade to "no preview" and let the caller write the
+        // fallback title instead of surfacing the timeout. Genuine transport
+        // errors with budget left, and not-loaded errors before the deadline,
+        // still propagate / keep polling.
         if (Date.now() >= deadline) return undefined;
+        if (!isThreadNotLoadedError(err, threadId)) throw err;
       }
       if (preview) return preview;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
@@ -311,8 +318,9 @@ class CodexAppServerProbe {
 
   async waitForThreadUpdatedAfter(threadId: string, baseline: number, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
-    while (!this.closed && Date.now() < deadline) {
+    while (!this.closed) {
       const remaining = deadline - Date.now();
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return;
       let updatedAt: number | undefined;
       try {
         ({ updatedAt } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000)));

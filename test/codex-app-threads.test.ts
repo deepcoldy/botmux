@@ -386,6 +386,106 @@ describe('setCodexAppThreadName', () => {
     expect(methods.slice(setIndex + 1)).toContain('thread/read');
   });
 
+  it('still writes the fallback title when a slow thread/read exhausts the preview wait budget', async () => {
+    // 繁忙机器上单次 thread/read 慢于整段等待预算时，withTimeout 在 deadline
+    // 处 reject。waitForThreadPreview 必须按「预览不可用」降级返回，让兜底
+    // 标题照常写入，而不是把超时错误抛给 setCodexAppThreadName（CI 上同一
+    // 缺陷以 "timed out after 1ms" 的尾窗竞态形状出现）。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-slow-preview-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-slow-preview',
+      name: '[BotMux·Lark] 慢响应兜底标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
+        FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
+      },
+      timeoutMs: 200,
+      initializeTimeoutMs: 2_000,
+      waitForExistingPreview: true,
+    });
+
+    const requests = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    const nameSet = requests.find(request => request.method === 'thread/name/set');
+    expect(nameSet).toEqual(expect.objectContaining({
+      params: { threadId: 'thread-slow-preview', name: '[BotMux·Lark] 慢响应兜底标题' },
+    }));
+  });
+
+  it('issues no thread/read when the preview wait budget is below the poll floor', async () => {
+    // MIN_POLL_REQUEST_BUDGET_MS=50：总预算低于下限时一次请求都不该发出——
+    // 任何 sub-floor 客户端超时的 thread/read 注定在响应落地前超时。用快速
+    // 假 app-server 即可区分：有 floor 时等待阶段零请求；删掉 floor 就会发出
+    // 1 次请求（请求被服务器接收即入账，与是否赶上超时无关）。40ms 低于
+    // 50ms floor，同时给随后即时返回的 thread/name/set 与校验 read 留出
+    // localhost IPC 余量。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-floor-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-floor-budget',
+      name: '[BotMux·Lark] 短预算兜底标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
+      },
+      timeoutMs: 40,
+      initializeTimeoutMs: 2_000,
+      waitForExistingPreview: true,
+    });
+
+    const methods = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).method);
+    const setIndex = methods.indexOf('thread/name/set');
+    expect(methods.slice(0, setIndex).filter(method => method === 'thread/read')).toHaveLength(0);
+    expect(methods).toContain('thread/name/set');
+  });
+
+  it('still writes the title when a slow thread/read exhausts the updatedAfter wait budget', async () => {
+    // waitForThreadUpdatedAfter 的 catch 与 preview 等待同形：deadline 处的
+    // 客户端超时必须按「等待结束」返回，让标题写入继续，而不是穿透抛出。
+    // 慢响应（300ms）> 整段预算（200ms），且 baseline 永不可达双保险。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-updatedafter-slow-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-slow-updated',
+      name: '[BotMux·Lark] 更新等待兜底标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_THREAD_READ_DELAY_MS: '300',
+      },
+      timeoutMs: 200,
+      initializeTimeoutMs: 2_000,
+      waitForUpdatedAfter: 999_999,
+    });
+
+    const methods = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).method);
+    expect(methods).toContain('thread/name/set');
+  });
+
   it('waits for the first resume append metadata update before restoring the managed title', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-resume-barrier-'));
     tempDirs.push(dir);
