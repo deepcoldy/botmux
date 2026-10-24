@@ -388,7 +388,13 @@ describe('final answer feedback card state machine', () => {
       .toBe('<strong>first</strong><em><strong>second</strong></em><em>third</em>');
   });
 
-  it('preserves text and per-character emphasis for every adjacent style transition', () => {
+  it.each([
+    ['a', 'b', 'c'],
+    ['A.', 'B', 'C'],
+    ['A', '.B', 'C'],
+    ['A', 'B.', 'C'],
+    ['A', '前😀', '重点'],
+  ])('preserves text and per-character emphasis for every adjacent style transition: %j', (...contents) => {
     const styles = [[], ['bold'], ['italic'], ['bold', 'italic']];
     const platformCard = structuredClone(baseCard);
     const cases = styles.flatMap(first => styles.flatMap(second => styles.map(third => [first, second, third])));
@@ -396,7 +402,7 @@ describe('final answer feedback card state machine', () => {
       tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
       rows: cases.map(attributes => ({ detail: { tag: 'markdown', property: {
         elements: attributes.map((style, index) => ({
-          tag: 'plain_text', property: { content: ['a', 'b', 'c'][index], textStyle: { attributes: style } },
+          tag: 'plain_text', property: { content: contents[index], textStyle: { attributes: style } },
         })),
       } } })),
     });
@@ -416,10 +422,103 @@ describe('final answer feedback card state machine', () => {
           for (const character of token.content) actual.push({ character, bold: bold > 0, italic: italic > 0 });
         }
       }
-      expect(actual).toEqual(cases[index].map((style: string[], position: number) => ({
-        character: ['a', 'b', 'c'][position], bold: style.includes('bold'), italic: style.includes('italic'),
-      })));
+      expect(actual).toEqual(cases[index].flatMap((style: string[], position: number) =>
+        Array.from(contents[position]).map(character => ({
+          character, bold: style.includes('bold'), italic: style.includes('italic'),
+        }))));
+      if (contents[0] === 'a' && !cases[index].some(style => style.includes('bold') && style.includes('italic'))) {
+        expect(row.detail).not.toMatch(/&#\d+;/);
+      }
     }
+  });
+
+  it.each([
+    { attributes: ['bold'], expected: '共 **19 处** 受影响' },
+    { attributes: ['italic'], expected: '共 *19 处* 受影响' },
+  ])('keeps ordinary styled text readable without numeric references: %j', ({ attributes, expected }) => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'lark_md' }],
+      rows: [{ detail: { tag: 'markdown', property: { elements: [
+        { tag: 'plain_text', property: { content: '共 ' } },
+        { tag: 'plain_text', property: { content: '19 处', textStyle: { attributes } } },
+        { tag: 'plain_text', property: { content: ' 受影响' } },
+      ] } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    expect(card.body.elements[0].rows[0].detail).toBe(expected);
+  });
+
+  it.each([
+    { content: 'A.', before: '', after: 'B' },
+    { content: '19)', before: '', after: '处' },
+    { content: '前😀', before: '', after: '重点' },
+    { content: '.B', before: 'A', after: '' },
+  ])('preserves emphasis across punctuation boundaries: %j', ({ content, before, after }) => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: [['bold'], ['italic']].map(attributes => ({ detail: {
+        tag: 'markdown', property: { elements: [
+          { tag: 'plain_text', property: { content: before } },
+          { tag: 'plain_text', property: { content, textStyle: { attributes } } },
+          { tag: 'plain_text', property: { content: after } },
+        ] },
+      } })),
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    for (const [index, row] of card.body.elements[0].rows.entries()) {
+      expect(new MarkdownIt().renderInline(row.detail))
+        .toBe(index === 0 ? `${before}<strong>${content}</strong>${after}` : `${before}<em>${content}</em>${after}`);
+    }
+  });
+
+  it.each(['ol', 'ul'])('retains block-level lists embedded in item elements: %s', (type) => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'lark_md' }],
+      rows: [{ detail: { tag: 'list', property: { items: [
+        { elements: [
+          { tag: 'plain_text', property: { content: 'parent' } },
+          { tag: 'list', property: { items: [
+            { elements: [{ tag: 'plain_text', property: { content: 'child' } }],
+              level: 0, order: 4, type },
+          ] } },
+        ], level: 0, order: 1, type: 'ol' },
+      ] } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const tokens = new MarkdownIt().parse(card.body.elements[0].rows[0].detail, {});
+    expect(tokens.filter(token => token.type === 'list_item_open').map(token => token.level))
+      .toEqual([1, 3]);
+    expect(tokens.filter(token => token.type === 'inline').map(token => token.content))
+      .toEqual(['parent', 'child']);
+    if (type === 'ol') {
+      expect(tokens.filter(token => token.type === 'ordered_list_open').map(token => token.attrGet('start')))
+        .toEqual([null, 4]);
+    }
+  });
+
+  it.each([
+    { levels: [0, 2], order: 1, itemLevels: [1, 3] },
+    { levels: [0, 2], order: 100, itemLevels: [1, 3] },
+    { levels: [0, 2, 3, 1], order: 1, itemLevels: [1, 3, 5, 3] },
+    { levels: [2, 4, 0], order: 1, itemLevels: [1, 3, 1] },
+  ])('derives skipped list levels from existing ancestors: %j', ({ levels, order, itemLevels }) => {
+    const platformCard = structuredClone(baseCard);
+    platformCard.body.elements.unshift({
+      tag: 'table', columns: [{ name: 'detail', data_type: 'markdown' }],
+      rows: [{ detail: { tag: 'list', property: { items: levels.map((level, index) => ({
+        elements: [{ tag: 'plain_text', property: { content: `item ${index}` } }],
+        level, order, type: level === 0 || index === 0 ? 'ol' : 'ul',
+      })) } } }],
+    });
+    const card = renderFeedbackCard(platformCard, policy, { result: 'conclusive_usable' }) as any;
+    const tokens = new MarkdownIt().parse(card.body.elements[0].rows[0].detail, {});
+    expect(tokens.filter(token => token.type === 'list_item_open').map(token => token.level))
+      .toEqual(itemLevels);
+    expect(tokens.filter(token => token.type === 'inline').map(token => token.content))
+      .toEqual(levels.map((_, index) => `item ${index}`));
   });
 
   it('retains nested-list hierarchy below a three-digit ordered parent', () => {

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
+import MarkdownIt from 'markdown-it';
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -126,7 +127,24 @@ describe('feedback callback state machine', () => {
               content: 'verify', textStyle: { attributes: ['bold'] },
             } }], level: 0, order: 2, type: 'ol' },
           ] } },
-        ], markdownElements: [], originTag: 'lark_md' } } }] },
+        ], markdownElements: [], originTag: 'lark_md' } } },
+        { detail: { tag: 'markdown', property: { elements: [
+          { tag: 'plain_text', property: { content: 'total ' } },
+          { tag: 'plain_text', property: { content: '19', textStyle: { attributes: ['bold'] } } },
+          { tag: 'plain_text', property: { content: ' affected' } },
+        ] } } },
+        { detail: { tag: 'list', property: { items: [
+          { elements: [
+            { tag: 'plain_text', property: { content: 'parent' } },
+            { tag: 'list', property: { items: [
+              { elements: [{ tag: 'plain_text', property: { content: 'child' } }], level: 0, type: 'ul' },
+            ] } },
+          ], level: 0, order: 1, type: 'ol' },
+        ] } } },
+        { detail: { tag: 'list', property: { items: [
+          { elements: [{ tag: 'plain_text', property: { content: 'parent' } }], level: 0, order: 1, type: 'ol' },
+          { elements: [{ tag: 'plain_text', property: { content: 'child' } }], level: 2, type: 'ul' },
+        ] } } }] },
       { tag: 'column_set', element_id: 'botmux_feedback' },
     ] } };
     const delivery = store.createDelivery({
@@ -148,8 +166,20 @@ describe('feedback callback state machine', () => {
         store, loadBaseCard: async () => platformCard,
       });
       for (const result of [first, changed, duplicate]) {
-        expect(result.card.data.body.elements.find((element: any) => element.tag === 'table').rows)
-          .toEqual([{ detail: '1. [PR 925](https://example.com/pr/925)\n2. **verify**' }]);
+        const rows = result.card.data.body.elements.find((element: any) => element.tag === 'table').rows;
+        expect(rows).toHaveLength(4);
+        expect(rows.slice(0, 2))
+          .toEqual([
+            { detail: '1. [PR 925](https://example.com/pr/925)\n2. **verify**' },
+            { detail: 'total **19** affected' },
+          ]);
+        for (const row of rows.slice(2)) {
+          const tokens = new MarkdownIt().parse(row.detail, {});
+          expect(tokens.filter(token => token.type === 'list_item_open').map(token => token.level))
+            .toEqual([1, 3]);
+          expect(tokens.filter(token => token.type === 'inline').map(token => token.content))
+            .toEqual(['parent', 'child']);
+        }
         expect(result.card.data.body.elements[0]).toEqual({ tag: 'markdown', content: 'answer from platform' });
       }
       expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(2);

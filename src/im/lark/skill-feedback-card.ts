@@ -67,7 +67,7 @@ function escapeRenderedMarkdown(content: string): string {
   return content.replace(/([\\`*_[\]<>!~&])/g, '\\$1');
 }
 
-function readbackCellText(value: unknown, markdown: boolean, protectStyleBoundary = false): string | undefined {
+function readbackCellText(value: unknown, markdown: boolean, protectStyleBoundary: boolean | { start: boolean; end: boolean } = false): string | undefined {
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
     const runs: unknown[] = [];
@@ -90,26 +90,78 @@ function readbackCellText(value: unknown, markdown: boolean, protectStyleBoundar
       const node = part as Record<string, any> | null;
       const attributes = node?.property?.textStyle?.attributes;
       return node?.tag === 'plain_text' && Array.isArray(attributes)
-        && (attributes.includes('bold') || attributes.includes('italic'));
+        && attributes.includes('bold') && attributes.includes('italic');
     });
     const parts = runs.map(part => readbackCellText(part, markdown, hasAdjacentStyles));
-    return parts.every(part => part !== undefined) ? parts.join('') : undefined;
+    if (parts.some(part => part === undefined)) return undefined;
+    if (markdown && !hasAdjacentStyles) {
+      const protectedRuns = new Map<number, { start: boolean; end: boolean }>();
+      const protectRun = (index: number, direction: number) => {
+        const protection = protectedRuns.get(index) ?? { start: false, end: false };
+        if (direction < 0) protection.start = true;
+        else protection.end = true;
+        protectedRuns.set(index, protection);
+      };
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const [index, part] of runs.entries()) {
+          const node = part as Record<string, any> | null;
+          const attributes = node?.property?.textStyle?.attributes;
+          if (node?.tag !== 'plain_text' || !Array.isArray(attributes)
+            || !attributes.some(attribute => attribute === 'bold' || attribute === 'italic')
+            || typeof node.property.content !== 'string') continue;
+          const content: string = node.property.content;
+          const characters = Array.from(content);
+          const protection = protectedRuns.get(index);
+          for (const direction of [-1, 1]) {
+            const protectedEdge = characters.length === 1
+              ? protection?.start || protection?.end : direction < 0 ? protection?.start : protection?.end;
+            const edge = direction < 0 ? characters[0] : characters[characters.length - 1];
+            if (!edge || (!protectedEdge && !/[\p{P}\p{S}]/u.test(edge))) continue;
+            let neighbor = index + direction;
+            while (neighbor >= 0 && neighbor < parts.length && !parts[neighbor]) neighbor += direction;
+            const adjacentNode = runs[neighbor] as Record<string, any> | null;
+            const adjacentContent: string = adjacentNode?.tag === 'plain_text'
+              ? adjacentNode.property?.content ?? '' : parts[neighbor] ?? '';
+            const adjacent = Array.from(adjacentContent);
+            const adjacentProtection = protectedRuns.get(neighbor);
+            const protectedOutside = adjacent.length === 1
+              ? adjacentProtection?.start || adjacentProtection?.end
+              : direction < 0 ? adjacentProtection?.end : adjacentProtection?.start;
+            const outside = direction < 0 ? adjacent[adjacent.length - 1] : adjacent[0];
+            if (protectedOutside || !outside || /[\s\p{P}\p{S}]/u.test(outside)) continue;
+            protectRun(index, direction);
+            protectRun(neighbor, -direction);
+            changed = true;
+          }
+        }
+      }
+      for (const [index, protection] of protectedRuns) parts[index] = readbackCellText(runs[index], markdown, protection);
+    }
+    return parts.reduce<string>((content, part, index) => {
+      const current = runs[index] as Record<string, any> | null;
+      const previous = runs[index - 1] as Record<string, any> | null;
+      const blockBoundary = current?.tag === 'list' || previous?.tag === 'list';
+      const separator = content && part && blockBoundary ? '\n\n' : '';
+      return content + separator + part;
+    }, '');
   }
   if (!value || typeof value !== 'object') return undefined;
   const node = value as Record<string, any>;
   if (node.tag === 'list' && Array.isArray(node.property?.items)) {
     const items: string[] = [];
-    const contentColumns: number[] = [];
+    const ancestors: Array<{ level: number; contentColumn: number }> = [];
     for (const item of node.property.items) {
       if (!item || typeof item !== 'object' || !Array.isArray(item.elements)) return undefined;
       const content = readbackCellText(item.elements, markdown);
       if (content === undefined || (item.type !== 'ol' && item.type !== 'ul')) return undefined;
       const level = Number.isInteger(item.level) && item.level >= 0 ? item.level : 0;
-      const indentWidth = level === 0 ? 0 : contentColumns[level - 1] ?? level * 4;
+      while (ancestors.length > 0 && ancestors[ancestors.length - 1].level >= level) ancestors.pop();
+      const indentWidth = ancestors[ancestors.length - 1]?.contentColumn ?? 0;
       const indent = ' '.repeat(indentWidth);
       const marker = item.type === 'ol' ? `${Number.isInteger(item.order) && item.order > 0 ? item.order : 1}. ` : '- ';
-      contentColumns.length = level;
-      contentColumns[level] = indentWidth + Math.max(4, marker.length);
+      ancestors.push({ level, contentColumn: indentWidth + Math.max(4, marker.length) });
       const continuation = indent + ' '.repeat(marker.length);
       items.push(`${indent}${marker}${content.replace(/\n/g, `\n${continuation}`)}`);
     }
@@ -157,9 +209,10 @@ function readbackCellText(value: unknown, markdown: boolean, protectStyleBoundar
     const characters = Array.from(rawParts[2]);
     const reference = (character: string) => `&#${character.codePointAt(0)!};`;
     const escaped = protectStyleBoundary && characters.length > 0
-      ? rawParts[1] + reference(characters[0])
-        + (characters.length > 1 ? escapeRenderedMarkdown(characters.slice(1, -1).join(''))
-          + reference(characters[characters.length - 1]) : '') + rawParts[3]
+      ? rawParts[1] + characters.map((character, index) =>
+        (index === 0 && (protectStyleBoundary === true || protectStyleBoundary.start))
+          || (index === characters.length - 1 && (protectStyleBoundary === true || protectStyleBoundary.end))
+          ? reference(character) : escapeRenderedMarkdown(character)).join('') + rawParts[3]
       : escapeRenderedMarkdown(content);
     const attributes = node.property?.textStyle?.attributes;
     if (!Array.isArray(attributes)) return escaped;
