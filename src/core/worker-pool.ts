@@ -761,7 +761,7 @@ import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
-import { buildTerminalUrl } from './terminal-url.js';
+import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -1343,7 +1343,11 @@ function doneReactionEmojiFor(ds: DaemonSession): string {
 
 /** Worker lifecycle readiness is independent from Web Terminal availability.
  * Legacy/test sessions predate workerReady, so retain the old port inference
- * only while the explicit flag is absent. */
+ * only while the explicit flag is absent. A session restored after a daemon
+ * restart has no explicit flag either, and its persisted port outlives the
+ * worker that served it, so this also passes with no worker at all. Callers
+ * only re-render cached card state on that path; anything that needs a live
+ * worker checks `ds.worker` itself. */
 export function workerHasInitialized(ds: DaemonSession): boolean {
   return ds.workerReady === true
     || (ds.workerReady === undefined
@@ -1358,11 +1362,19 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
   return backendType === undefined || backendSupportsWebTerminal(backendType);
 }
 
-/** Empty means this session intentionally has no Web Terminal surface. */
+/** Empty means this session has no Web Terminal entry to offer.
+ *  Through the terminal proxy the link names only the session: the proxy routes
+ *  to the live worker or wakes one, so a session that has served a terminal
+ *  keeps its entry after a restart. A direct link embeds the port itself, and a
+ *  persisted port belongs to the current generation only while a worker exists
+ *  to listen on it (it is that worker's preferred port) — once restored without
+ *  one, it is the previous daemon's and nothing listens there. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
-  return sessionSupportsWebTerminal(ds) && (ds.workerPort ?? ds.session.webPort)
-    ? buildTerminalUrl(ds)
-    : '';
+  if (!sessionSupportsWebTerminal(ds)) return '';
+  const port = getTerminalProxyPort()
+    ? ds.workerPort ?? ds.session.webPort
+    : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
+  return port ? buildTerminalUrl(ds) : '';
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
@@ -1872,6 +1884,17 @@ function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+/** 「会话启动失败」notice: the reason plus where to look. The session tag is
+ *  what this daemon's log lines are prefixed with, and the worker writes the
+ *  full failing command there (never into the chat). */
+function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string, loc: ReturnType<typeof botLocale>): string {
+  const botIndex = process.env.BOTMUX_BOT_INDEX;
+  const logPath = botIndex !== undefined && /^\d+$/.test(botIndex)
+    ? `~/.botmux/logs/daemon-${botIndex}-*.log`
+    : tr('worker.start_failed_log_fallback', {}, loc);
+  return tr('worker.start_failed', { cliName, reason, sessionId: tag(ds), logPath }, loc);
 }
 
 /** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
@@ -14578,8 +14601,7 @@ export function forkWorker(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
@@ -15435,8 +15457,7 @@ function setupWorkerHandlers(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, loc);
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
     try {
       await scopedReply(message, 'text', turnId);
     } catch (err: any) {
@@ -21467,10 +21488,7 @@ export function forkAdoptWorker(
     logger.error(`[${t}] Adopt worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    const message = tr('worker.start_failed', {
-      cliName: sessionCliDisplayName(ds, botCfg),
-      reason,
-    }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_fork_error',
       message: reason,

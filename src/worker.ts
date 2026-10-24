@@ -426,6 +426,8 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
 import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
+import { paneLaunchDir } from './adapters/backend/pane-launch.js';
+import { chatSafeFatalErrorMessage } from './core/startup-failure-reason.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
@@ -23068,6 +23070,9 @@ async function spawnCli(
       // them after the pane's rcfile / terminal-server env (session env overlay).
       unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
       launchShell: lastInitConfig?.launchShell,
+      // tmux reads the pane's launch argv from a private file here instead of
+      // its ~16 KB command line (pane-launch.ts).
+      paneLaunchDir: paneLaunchDir(config.session.dataDir, cfg.sessionId),
       strictEnv: cfg.envPolicy?.mode === 'strict',
       strictEnvReattach: willReattachPersistent,
       remoteResumeMode: cfg.remoteResumeMode,
@@ -27406,9 +27411,13 @@ async function sendFatalWorkerErrorAndExit(
     });
     activeRestartAttemptId = undefined;
   }
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const message = chatSafeFatalErrorMessage(err);
+  // The daemon posts `message` into the chat; the full text stays in this log.
+  if (message !== rawMessage) log(`Fatal worker error (full text, local log only): ${rawMessage}`);
   await sendAndFlush({
     type: 'error',
-    message: err instanceof Error ? err.message : String(err),
+    message,
     turnId,
     // Carry the durable attempt so the daemon can leave a meeting delivery
     // failure to the receipt/lease recovery path instead of replying out-of-band.

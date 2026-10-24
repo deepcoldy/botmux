@@ -117,6 +117,7 @@ import {
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
+import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import {
   clearCodexInstanceBots,
@@ -2674,6 +2675,22 @@ describe('closeSession()', () => {
     const reloaded = getSession(session.sessionId);
     expect(reloaded!.status).toBe('closed');
     expect(reloaded!.closedAt).toBeDefined();
+  });
+
+  it('removes an unread tmux launch file of the closed session only', () => {
+    // The pane normally deletes it on read; one left behind (pane never got
+    // that far, worker gone) still carries the bot's injected env values.
+    const closing = createSession('chat1', 'root1', 'Close With Launch File');
+    const other = createSession('chat1', 'root2', 'Stays Open');
+    const launch = { kind: 'sh' as const, script: 'exec "$@"', argv: ['PROVIDER_TOKEN=secret'] };
+    const unread = writePaneLaunchFile(paneLaunchDir(tempDir, closing.sessionId), launch);
+    const sibling = writePaneLaunchFile(paneLaunchDir(tempDir, other.sessionId), launch);
+
+    closeSession(closing.sessionId);
+
+    expect(existsSync(unread.path)).toBe(false);
+    expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
+    expect(existsSync(sibling.path)).toBe(true);
   });
 
   it('snapshots token usage in the same durable close write', () => {

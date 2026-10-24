@@ -44,6 +44,9 @@ const PROGRAM_STATUS_ZERO_WIDTH = /[\u200b-\u200d\ufeff]/g;
  *  such as Ink / Antigravity dots ⣾⣽⣻⢿⡿⣟⣯⣷), and OpenCode progress bar chars (■⬝). */
 const SPINNER_RE = /[·✢✳✶✻✽\u2800-\u28ff■⬝]/;
 
+/** Keep in sync with the rule-joined composer arm in the TraeX adapter. */
+const RULE_JOINED_CLEAR_CHAR = /[─━]/;
+
 /** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
 const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
@@ -258,6 +261,9 @@ export class IdleDetector {
     //  a submitted user message (`› text`) followed by a fresh queue line
     //  must NOT clear the latch (the queue is fresher), while a queue line
     //  followed by a real composer redraw must clear it.
+    //  Rule-joined composer matches are weaker: a cursor-addressed queue
+    //  repaint can retain the composer underneath the queue notice. Such
+    //  a match may clear only when this chunk has no queue evidence.
     // STALE-TAIL: after a clear, queue text lingering in the tail must not
     //  re-set the latch. Record the clear position in the tail; only queue
     //  evidence AFTER that position is fresh enough to set.
@@ -267,7 +273,9 @@ export class IdleDetector {
         : -1;
       const staticChunkIdx = lastMatchIndex(this.staticBusyPattern, stripped);
       const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
-      if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
+      const clearStartsOnRule = clearIdx >= 0 && RULE_JOINED_CLEAR_CHAR.test(stripped[clearIdx]!);
+      if (clearIdx >= 0 && clearIdx > staticChunkIdx
+        && (!clearStartsOnRule || staticChunkIdx < 0)) {
         this.staticBusyLatch = false;
         // Record where the clear landed in the tail so stale queue text
         // before it doesn't re-set the latch on the next chunk.
@@ -275,7 +283,10 @@ export class IdleDetector {
         this.staticBusyClearTailPos = chunkStart >= 0
           ? chunkStart + clearIdx
           : this.outputTail.length;
-      } else if (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos) {
+      } else if (staticChunkIdx >= 0
+        || (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos)) {
+        // A large repaint can evict its queue line from the rolling tail.
+        // Fresh evidence in the current chunk must still establish the hold.
         this.staticBusyLatch = true;
       }
     }

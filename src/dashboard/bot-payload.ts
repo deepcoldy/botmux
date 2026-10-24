@@ -279,6 +279,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
     // 页面刷新即显示 ∅，看起来像没存上（而空白再保存会真的清掉）。
+    envRevision: typeof j?.envRevision === 'string' ? j.envRevision : undefined,
     envKeys: Array.isArray(j?.envKeys) ? j.envKeys.filter((k: unknown): k is string => typeof k === 'string') : [],
     envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
