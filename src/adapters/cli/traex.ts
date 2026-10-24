@@ -568,7 +568,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // matches `\d+% left` (status bar), which the queue screen itself
     // carries — using it to clear the latch would re-open the ZMX false-idle
     // bug when queue and status bar arrive in separate chunks.
-    staticBusyClearPattern: /(?:^|[\n\r]|[─━]{3,})\s*[›❯](?!\s*\d+\.)/,
+    staticBusyClearPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)/,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
     // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
@@ -576,7 +576,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // into the advisory instead of TRAE's real composer.
     // v0.211.1 uses cursor movement between the rule and composer; stripping
     // ANSI joins them without a newline, so accept the preceding rule too.
-    readyPattern: /(?:^|[\n\r]|[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Anchor to the start of each rule run to avoid quadratic retries on
+    // long near-miss chunks. Keep its glyphs aligned with the clear guard
+    // in IdleDetector.
+    readyPattern: /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/,
     // Skeleton composer gate, same cells and regexes as Codex (fork). Real
     // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
     // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the
