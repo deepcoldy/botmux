@@ -86,6 +86,19 @@ A few boundaries:
 
 Codex capacity recovery is **off by default**. Administrators can enable it with `/botconfig set codexCapacityRecovery on` and disable it with `/botconfig set codexCapacityRecovery off`. When enabled, managed Codex Lark sessions automatically continue explicit model-capacity failures (`server_overloaded`) after 15 seconds and, if needed, another 45 seconds. Each continuation appends a recovery input to the native session (at most two per task); these inputs may remain in model context, and disabling recovery does not delete history. An opted-out pending recovery is saved as cancelled with one notice, so re-enabling recovery or restarting does not revive that old task. Detection is not specific to modelhub and does not guarantee a quick recovery. Continuations resume existing progress instead of replaying the original task. New input, `/stop`, or closing the session cancels the previous recovery. After a process restart, pending or unconfirmed recovery stops and requires manual continuation. Already running work can still deliver a successful result, but a late capacity failure will not trigger another automatic continuation, avoiding replay of a cancellation that could not be saved. After two unsuccessful continuations, the failure card offers a manual retry. Generic 503, stream, authentication and rate-limit errors retain their existing behavior, as do adopted, HTTP and meeting-receiver sessions.
 
+## Group manager (Agent tool)
+
+In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
+
+**Off by default, enabled per bot**: turn on "Group manager (default responder)" under Dashboard, bot configuration, session & mention policy (or `/botconfig set chatManagerEnabled on`). Only then does the bot expose the in-session tool and allow `set`. Turning it off stops un-@ answering and blocks `set`, but it never changes the group name or description; `clear` and `status` stay available and the saved manager record is kept (re-enabling restores it).
+
+Mutations require the current human sender to explicitly authorize the action and belong to the target bot's administrator allowlist. A session owner, bot, scheduled task or stale turn is not a substitute. Only the current regular group is supported, excluding automatically managed session groups.
+
+Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.
+
+Clear the old manager before setting the new one. Each manager-specific mention-free decision verifies the remote description marker with no stale fallback and requires local administrator opt-in. Description overflow is rejected without truncating human text.
+
+Lark has no cross-host conditional writes: concurrent claims are not strongly consistent. After network failures or `chat_update_unconfirmed`, inspect status before retrying. Local records are stored under `chat-managers/` in the data directory with mode 0600; include them in backups.
 ## 💬 Reply Mode (`/reply-mode`)
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.
@@ -157,11 +170,17 @@ step_model_switching = true
 
 With the feature disabled, commands sent during a task still save future-turn settings and explicitly report why the active turn was not updated. A completed or unavailable target turn produces a separate notice. Only an `applied` response confirms that the server accepted the active-turn update; requests already issued keep their original parameters, and the turn may have no further inference steps.
 
-For ordinary Codex CLI, Claude Code and other CLIs, `/effort` continues to follow the passthrough rules below.
+## Change reasoning effort in a Codex CLI session
+
+Send `/effort low|medium|high|xhigh|max|ultra` in an existing local Codex CLI session. Botmux drives the native `/model` menu, keeps the current model, and selects the level for **this session only**. After native confirmation, it saves the session launch preference. The receipt explicitly says **next turn only; the running turn keeps its original effort**, even when `step_model_switching` is enabled.
+
+This supports managed local PTY / tmux sessions with the native `s session` menu action and `thread_settings_applied` receipts (verified with Codex 0.162.1). RPC input, remote backends, wrappers, adopted sessions, sandbox and read isolation are excluded. Drafts, other menus, conflicting input and unrecognized screens are rejected without clearing the composer or restarting the task. You can still use `/model` manually.
+
+For Claude Code and other CLIs, `/effort` continues to follow the passthrough rules below.
 
 ## 🔀 Passthrough to the Underlying CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands (except Codex App `/effort`, described above).
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands (except Codex CLI / App `/effort`, described above).
 
 `/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
 
@@ -198,8 +217,9 @@ The panel needs the optional scopes `application:app_slash_command:read` / `appl
 
 | Command | Description |
 |------|------|
-| `/adopt` | Scan the local tmux and pop up a card to select a running session to adopt |
-| `/adopt <tmux_pane>` | Directly adopt the specified pane (e.g. `/adopt 0:2.0`) |
+| `/adopt` | Scan local tmux, Zellij, Herdr, and Orca sessions and open a picker; Orca support is experimental |
+| `/adopt <target>` | Directly adopt a specific tmux / Zellij / Herdr session (e.g. `/adopt 0:2.0`) |
+| `/adopt orca:<terminal>` | Directly adopt a specific Orca session (experimental) |
 | `/detach` | Disconnect this topic from the adopted session (the original CLI is untouched; `/disconnect` is an alias) |
 
 ## 🔐 User Authorization

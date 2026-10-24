@@ -15,6 +15,7 @@
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理进程已退出的僵尸会话 |
+| `botmux maintenance suspend-idle --dry-run\|--yes` | 按最后活动时间预览或批量休眠长期空闲会话（默认 7 天） |
 | `botmux dashboard [current\|rotate]` | 获取当前 Dashboard 登录 URL，尚无 token 时创建第一个；`rotate` 才显式替换已有 token |
 
 daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/close`
@@ -22,7 +23,18 @@ daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/c
 worker、后端与订阅。仅当所属 daemon 确认不在线时才使用本地收口；在线
 daemon 拒绝或 IPC 连接失败时命令返回失败，不会继续本地强杀。
 
-当 `BOTMUX_COORDINATION_MODE=primary` 时，PostgreSQL 中的 durable Session 才是 canonical truth。此模式下 `delete`、`resume`、非 dry-run 的 `suspend`，以及交互式 `list` 中的删除/唤醒都会明确拒绝；`list` 仍可只读展示，但会跳过本地自动清理。关闭或恢复请在原话题使用会话卡片，确保操作经过带 fencing 的 durable session-control 通道。
+当 `BOTMUX_COORDINATION_MODE=primary` 时，PostgreSQL 中的 durable Session 才是 canonical truth。此模式下 `delete`、`resume`、非 dry-run 的 `suspend`、`maintenance suspend-idle`，以及交互式 `list` 中的删除/唤醒都会明确拒绝；`list` 仍可只读展示，但会跳过本地自动清理。关闭或恢复请在原话题使用会话卡片，确保操作经过带 fencing 的 durable session-control 通道。
+
+## 空闲会话维护
+
+```bash
+botmux maintenance suspend-idle --older-than 7d --dry-run
+botmux maintenance suspend-idle --older-than 7d --yes
+```
+
+`--dry-run` 只读取在线 daemon 的权威运行态，不会修改会话或进程；输出包含会话、Bot、标题、最后活动时间、worker PID、持久后端目标与预计回收的进程类型。执行必须显式传 `--yes`，并通过 daemon 内部的同一 `suspendWorker` 路径完成：先精确销毁持久后端并 post-probe 确认 missing，才把逻辑会话持久化为 active + dormant；下一条消息从 transcript 冷恢复。销毁结果为 `exists` 或 `unknown` 时 fail closed，不会谎报休眠成功。
+
+候选会 fail closed：只选择 worker 已就绪、屏幕明确 idle、后端可恢复且最后活动时间已知的会话；adopt、锁定、待选仓库、排队输入、未结算 dispatch、需要用户处理和正在转移的会话都会跳过。`--bot <appId>` 可限定单个 Bot，`--json` 输出机器可读结果。Dashboard 的 per-bot「空闲自动休眠」配置仍负责周期策略；本命令提供人工预览和批量执行入口。
 
 ## 开机自启
 

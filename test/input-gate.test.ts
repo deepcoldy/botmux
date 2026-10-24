@@ -14,6 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  decideFirstWriteLiveness,
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
@@ -370,5 +371,38 @@ describe('decideHardTimeoutAction', () => {
     // to mark-ready so markPromptReady() sets isPromptReady and flushes the
     // held first message.
     expect(decideHardTimeoutAction(false)).toBe('mark-ready');
+  });
+});
+
+describe('decideFirstWriteLiveness', () => {
+  const claude = /❯/;
+  const composer = '\x1b[1m Claude Code\x1b[0m\n────────\n❯ \n────────';
+  const base = { readyPattern: claude, readySignal: false, hardCapReached: false };
+
+  it('holds the first write while a booting CLI has not drawn its prompt (2026-10-20 cold start)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '\n\n' }))
+      .toEqual({ write: false, reason: 'prompt-not-visible' });
+    expect(decideFirstWriteLiveness({ ...base, viewport: 'Loading…' }).write).toBe(false);
+  });
+
+  it('writes once the input prompt is on screen (ANSI-wrapped glyphs included)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: composer }))
+      .toEqual({ write: true, reason: 'prompt-visible' });
+    expect(decideFirstWriteLiveness({ ...base, viewport: '\x1b[36m❯\x1b[0m' }).write).toBe(true);
+  });
+
+  it("trusts the CLI's own ready signal even on a blank screen", () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '', readySignal: true }))
+      .toEqual({ write: true, reason: 'ready-signal' });
+  });
+
+  it('keeps the first-prompt hard cap a real deadline (stale readyPattern escape hatch)', () => {
+    expect(decideFirstWriteLiveness({ ...base, viewport: '', hardCapReached: true }))
+      .toEqual({ write: true, reason: 'hard-cap' });
+  });
+
+  it('keeps the legacy behavior when there is nothing to check', () => {
+    expect(decideFirstWriteLiveness({ ...base, readyPattern: undefined, viewport: '' }).write).toBe(true);
+    expect(decideFirstWriteLiveness({ ...base, viewport: undefined }).write).toBe(true);
   });
 });

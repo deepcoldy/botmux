@@ -5,6 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
 import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
+import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
@@ -74,8 +75,17 @@ function runWorkerWiring(late: boolean, options: {
   relayLaunched?: boolean;
   reattached?: boolean;
   cliRuntime?: { source: string; executable: string };
+  /** The pane pid is the owned-scope supervisor; resolve to this payload pid. */
+  scopePayloadPid?: number;
+  /** Which pid is the scope supervisor (default: the pane, 100). */
+  scopeSupervisorPid?: number;
+  /** This spawn wrapped the CLI in the scope (default: a payload is modelled). */
+  scopeLaunched?: boolean;
+  /** Payload becomes observable only after this many sessionScopePayloadPid reads. */
+  scopePayloadAfterProbe?: number;
 } = {}) {
   const scheduler = makeScheduler();
+  let scopeProbes = 0;
   const backend = { cliPid: 100, getChildPid: () => 100 };
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
@@ -95,6 +105,7 @@ function runWorkerWiring(late: boolean, options: {
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
@@ -102,6 +113,14 @@ function runWorkerWiring(late: boolean, options: {
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
+    sessionScopePayloadPid: vi.fn((pid: number) => {
+      scopeProbes++;
+      return options.scopePayloadPid !== undefined
+        && pid === (options.scopeSupervisorPid ?? 100)
+        && scopeProbes >= (options.scopePayloadAfterProbe ?? 1)
+        ? options.scopePayloadPid
+        : pid;
+    }),
     readCmdline: (() => {
       let reads = 0;
       return (pid: number) => {
@@ -120,6 +139,16 @@ function runWorkerWiring(late: boolean, options: {
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
+  // The REAL layer walk, probing the same synthetic process table.
+  Object.assign(context, {
+    unwrapBotmuxLaunchLayers: (pid: number, opts: { relay: boolean }) => unwrapBotmuxLaunchLayers(pid, {
+      ...opts,
+      probes: {
+        readCmdline: context.readCmdline, childrenOf: context.getChildPids,
+        commOf: context.readComm, scopePayloadOf: context.sessionScopePayloadPid,
+      },
+    }),
+  });
   runInNewContext(workerWiring, context);
   scheduler.runAll();
   expect(scheduler.pending()).toBe(0);
@@ -127,6 +156,70 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('binds and attests an owned-scope payload rather than its pane supervisor (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('follows a scope payload that appears after the initial PID wiring (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 2,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
+  it.each([false, true])('keeps resolving the wrapperCli native leaf underneath a scope payload (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', claudeDataDir: '/claude',
+      scopePayloadPid: 150,
+    });
+    // Scope unwraps to 150 first; the wrapper BFS then descends to native 200.
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it('keeps scope PID discovery alive while a slow launch shell is still starting', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 40,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
+  it.each([false, true])('roots Codex launcher ownership discovery at the scope payload, not the sh (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { scopePayloadPid: 150 });
+    // The pane sh (100) is never searched for the codex native leaf; BFS starts
+    // at the payload (150) and descends to 200.
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'codex');
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(200);
+  });
+
+  it('roots Codex ownership at the scope payload in the synchronous ownership block', () => {
+    // An adopt/reuse codex launch (no Claude data dir, no wrapper CLI) skips
+    // every async resolver, so only the immediate synchronous ownership block
+    // can unscope the root; with no resolve helpers it must bind the payload.
+    const result = runWorkerWiring(false, {
+      cliId: 'codex', wrapperCli: '', claudeDataDir: undefined, scopePayloadPid: 150,
+      launchedCliPid: null,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
   it.each([false, true])('attests the Codex child without a Claude data dir (late PID=%s)', late => {
     const result = runWorkerWiring(late);
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
@@ -158,6 +251,31 @@ describe('worker wrapper PID wiring', () => {
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code');
     expect(result.backend.cliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  // Every tmux Claude pane since the scope supervisor landed: relay (100) →
+  // scope sh (150) → Claude (175). Binding the sh leaves the bridge without
+  // Claude's pid-state record, so a /clear made before a daemon restart is
+  // never followed and the restored bridge reads the pre-clear transcript.
+  it.each([false, true])('re-attached relay → scope pane binds Claude, not the scope sh (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', paneCmdline: RELAY_ARGV,
+      reattached: true, scopeLaunched: false, scopeSupervisorPid: 150, scopePayloadPid: 175,
+    });
+    expect(result.backend.cliPid).toBe(175);
+    expect(result.bridgeCliPid).toBe(175);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(175);
+  });
+
+  it.each([false, true])('fresh relay → scope launch waits for both layers, then binds Claude (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', relayLaunched: true,
+      paneCmdline: ['/bin/sh', '-c', 'exec "$@"'], paneCmdlineAfterExec: RELAY_ARGV, execAfterReads: 2,
+      scopeSupervisorPid: 150, scopePayloadPid: 175, scopePayloadAfterProbe: 6,
+    });
+    expect(result.backend.cliPid).toBe(175);
+    expect(result.bridgeCliPid).toBe(175);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(175);
   });
 
   it.each([false, true])('waits for a fresh relay while the pane is still the launch shell (late PID=%s)', late => {

@@ -131,14 +131,18 @@ export function askKeyFor(
   return humanDecisionKeyFor(larkAppId, sessionId, originKind, requestId);
 }
 
-/** Feishu IM `uuid` dedupe token (≤50 chars) derived from the FULL scoped ask
- *  key — NOT the bare requestId (codex P1-1). Deriving from the scoped key means
- *  a re-send within the same invocation dedupes server-side (same key → same
- *  uuid → Feishu returns the original message_id), while a different session
- *  reusing the same requestId gets a DIFFERENT uuid and so cannot alias the
- *  first session's card. `ask-` + 40 hex = 44 chars, safely under the cap. */
-export function dispatchUuidForKey(askKey: string): string {
-  return humanDecisionDispatchUuidForKey(askKey, 'ask');
+/** Feishu IM `uuid` dedupe token (≤50 chars) for one ask's card, derived from
+ *  the FULL scoped ask key — NOT the bare requestId (codex P1-1) — plus the ask
+ *  instance's askId. The askId is persisted, so every re-send of THIS ask (a
+ *  bounded transient retry, or a re-send after restore) gets the same uuid and
+ *  Feishu returns the original message_id. A different session reusing the same
+ *  requestId gets a DIFFERENT uuid and so cannot alias the first session's card.
+ *  A NEW ask instance under the same key (e.g. a hook that re-registers after
+ *  its earlier ask was invalidated) also gets a different uuid: its buttons carry
+ *  a new askId + nonce, so being deduped onto the old card would leave the user
+ *  a card that can't be answered. `ask-` + 40 hex = 44 chars, under the cap. */
+export function dispatchUuidForAsk(askKey: string, askId: string): string {
+  return humanDecisionDispatchUuidForKey(`${askKey}|${askId}`, 'ask');
 }
 
 export interface AskPersistStore {

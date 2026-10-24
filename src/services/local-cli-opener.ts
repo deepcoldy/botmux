@@ -267,7 +267,12 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     return fail('missing_attach_target', 'This session has no persistent backend attach target.');
   }
   if (backendType === 'tmux') {
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
+    // A session created after the dedicated socket lives on `-L <socketName>`;
+    // older rows (no socketName) stay on the default server.
+    const socket = target.backendType === 'tmux' && target.socketName !== undefined
+      ? ` -L ${shellQuote(target.socketName)}`
+      : '';
+    return { ok: true, command: `tmux${socket} attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
     if (target.backendType === 'herdr' && target.agentName) {

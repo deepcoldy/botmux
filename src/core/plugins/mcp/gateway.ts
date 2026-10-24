@@ -41,6 +41,7 @@ import { resolveBotmuxDataDir } from '../../data-dir.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { pruneFilesByAge } from '../../../utils/prune-by-age.js';
 import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
@@ -64,6 +65,14 @@ import {
   type TrustedResultDelivery,
   type TrustedResultDeliveryReceipt,
 } from './trusted-result-delivery.js';
+import {
+  appendResourceLinkRefCompanion,
+  appendToolLinkRefCompanion,
+} from '../../../services/link-ref-presenter.js';
+import type {
+  LinkRefExtractionStats,
+  LinkRefMode,
+} from '../../../services/link-ref-types.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -111,6 +120,7 @@ export interface GatewayTrustedTurnIdentity {
   caller?: TrustedCaller;
   turnId?: string;
   dispatchAttempt?: number;
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
@@ -119,6 +129,13 @@ export type GatewayTrustedResultDeliveryHandler = (input: {
   identity: GatewayTrustedTurnIdentity;
   delivery: TrustedResultDelivery;
 }) => Promise<TrustedResultDeliveryReceipt>;
+export type GatewayLinkRefRegistrationHandler = (input: {
+  pluginId: string;
+  identity: GatewayTrustedTurnIdentity;
+  sourceType: 'mcp';
+  sourceId: string;
+  value: unknown;
+}) => Promise<{ companion?: string; stats: Partial<LinkRefExtractionStats> }>;
 const BOTMUX_META_RESERVED_PREFIX = 'botmux';
 const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
 const BOTMUX_TURN_HEADERS = [
@@ -248,6 +265,9 @@ function writeDiagnostics(file: McpGatewayDiagnosticsFile, dataDir: string): voi
   const path = diagnosticsPath(file.sessionId, dataDir);
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  // 诊断快照每会话一个、只写不删；dashboard 只读最新 50 个。写入时顺手回收
+  // 7 天前的旧快照（至少保留最新 50 个），避免随会话数无限累积。
+  pruneFilesByAge({ dir: dirname(path), suffix: '.json', maxAgeMs: 7 * 24 * 60 * 60_000, retainMin: 50 });
 }
 
 function resolveStdioCommand(descriptor: GatewayDescriptor): { command: string; args: string[] } {
@@ -314,6 +334,7 @@ export class PluginMcpGateway {
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  private readonly linkRefRegistration?: GatewayLinkRefRegistrationHandler;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -332,11 +353,13 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+      linkRefRegistration?: GatewayLinkRefRegistrationHandler;
     } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
+    this.linkRefRegistration = opts.linkRefRegistration;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -740,7 +763,17 @@ export class PluginMcpGateway {
       const deliveryValue = isRecord(result._meta)
         ? result._meta[BOTMUX_HOST_DELIVERY_META_KEY]
         : undefined;
-      if (deliveryValue === undefined) return result;
+      if (deliveryValue === undefined) {
+        const registration = await this.registerLinkRefs({
+          pluginId: route.connection.pluginId,
+          identity,
+          sourceId: `tool:${route.originalName}`,
+          value: result,
+        });
+        return identity?.linkRefMode === 'enabled' && registration?.companion
+          ? appendToolLinkRefCompanion(result, registration.companion)
+          : result;
+      }
       // Host delivery is deliberately restricted to installed local processes.
       // A remote MCP server must never turn its response into a privileged Lark
       // send, even when it happens to know the envelope shape.
@@ -809,17 +842,30 @@ export class PluginMcpGateway {
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
       const route = await this.resolveResourceRoute(request.params.uri);
       if (!route) throw methodUnsupported(`resources/read:${request.params.uri}`);
+      const currentIdentity = this.trustedTurnIdentity?.();
+      const identity = currentIdentity
+        ? { ...currentIdentity, ...(currentIdentity.caller ? { caller: { ...currentIdentity.caller } } : {}) }
+        : undefined;
       const result = await route.connection.client.readResource(
         { ...request.params, uri: route.originalUri },
         this.requestOptions(request, extra),
       );
-      return {
+      const remapped = {
         ...result,
         contents: result.contents.map(content => ({
           ...content,
           uri: route.exposedUri === route.originalUri ? content.uri : `${route.connection.uriPrefix}${content.uri}`,
         })),
       };
+      const registration = await this.registerLinkRefs({
+        pluginId: route.connection.pluginId,
+        identity,
+        sourceId: `resource:${route.originalUri}`,
+        value: remapped,
+      });
+      return identity?.linkRefMode === 'enabled' && registration?.companion
+        ? appendResourceLinkRefCompanion(remapped, registration.companion)
+        : remapped;
     });
     this.server.setRequestHandler(SubscribeRequestSchema, async (request, extra) => {
       const route = await this.resolveResourceRoute(request.params.uri);
@@ -868,6 +914,26 @@ export class PluginMcpGateway {
       await this.ensureInitialized();
       await Promise.allSettled(this.connections.map(connection => connection.client.sendRootsListChanged()));
     });
+  }
+
+  private async registerLinkRefs(input: {
+    pluginId: string;
+    identity: GatewayTrustedTurnIdentity | undefined;
+    sourceId: string;
+    value: unknown;
+  }): Promise<{ companion?: string; stats: Partial<LinkRefExtractionStats> } | undefined> {
+    if (!input.identity?.turnId || !input.identity.linkRefMode || !this.linkRefRegistration) return undefined;
+    try {
+      return await this.linkRefRegistration({
+        pluginId: input.pluginId,
+        identity: input.identity,
+        sourceType: 'mcp',
+        sourceId: input.sourceId,
+        value: input.value,
+      });
+    } catch {
+      return undefined;
+    }
   }
 }
 

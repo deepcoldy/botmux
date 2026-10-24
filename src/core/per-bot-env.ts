@@ -101,6 +101,65 @@ export function isReservedPerBotEnvKey(key: string): boolean {
   return RESERVED_ENV_PREFIXES.some((p) => key.startsWith(p));
 }
 
+/** The reserved list for display (Dashboard「botmux 保留」group). */
+export function reservedSessionEnvKeys(): { keys: string[]; prefixes: string[] } {
+  return { keys: [...RESERVED_ENV_KEYS].sort(), prefixes: [...RESERVED_ENV_PREFIXES] };
+}
+
+/**
+ * Login-shell shim the worker points the pane at when the lark tool binding or
+ * trigger-user identity wraps CLI tools (core/cli-identity.ts). With either
+ * feature on, the worker overwrites these per session, so a configured value
+ * can never take effect there; with both off they are ordinary user variables.
+ */
+const IDENTITY_SHELL_ENV_KEYS: ReadonlySet<string> = new Set(['ZDOTDIR', 'BASH_ENV']);
+/** Git attribution for the acting person (gitIdentityConfigEnv emits COUNT=3,
+ *  so the numbered keys are exactly 0..2). Injected only by trigger-user auth. */
+const IDENTITY_GIT_ENV_KEYS: ReadonlySet<string> = new Set([
+  'GIT_ASKPASS', 'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
+]);
+/** May be overridden but never removed: botmux resolves the CLI binary and
+ *  its own wrapper dir through them, so a session without them cannot start. */
+const UNSET_FORBIDDEN_ENV_KEYS: ReadonlySet<string> = new Set(['PATH', 'HOME']);
+
+/** Which identity wrappers are active for a bot (see {@link sessionEnvLock}). */
+export interface SessionEnvLockContext {
+  /** Lark tool binding or trigger-user auth: ZDOTDIR / BASH_ENV are botmux's. */
+  identityShell?: boolean;
+  /** Trigger-user auth: GIT_ASKPASS / GIT_CONFIG_* are botmux's. */
+  identityGit?: boolean;
+}
+
+/**
+ * - `reserved`  botmux-owned in every session: cannot be set or removed.
+ * - `identity`  owned by an identity wrapper that is ON for this bot: same.
+ * - `no-unset`  may be set, may not be removed.
+ */
+export type SessionEnvLock = 'reserved' | 'identity' | 'no-unset';
+
+/** Names an active identity wrapper owns for a bot with `ctx` (display). */
+export function identityWrapperEnvKeys(ctx: SessionEnvLockContext): string[] {
+  return [
+    ...(ctx.identityShell || ctx.identityGit ? [...IDENTITY_SHELL_ENV_KEYS] : []),
+    ...(ctx.identityGit ? [...IDENTITY_GIT_ENV_KEYS] : []),
+  ];
+}
+
+/**
+ * The single lock rule for the session environment (global + per-bot layers,
+ * the Dashboard editor and the spawn-time composition all ask this function).
+ */
+export function sessionEnvLock(key: string, ctx: SessionEnvLockContext = {}): SessionEnvLock | null {
+  if (isReservedPerBotEnvKey(key)) return 'reserved';
+  if (ctx.identityShell && IDENTITY_SHELL_ENV_KEYS.has(key)) return 'identity';
+  if (ctx.identityGit && (IDENTITY_SHELL_ENV_KEYS.has(key) || IDENTITY_GIT_ENV_KEYS.has(key))) return 'identity';
+  if (UNSET_FORBIDDEN_ENV_KEYS.has(key)) return 'no-unset';
+  return null;
+}
+
 /**
  * Sanitize a raw `env` value (from bots.json / dashboard / a config command)
  * into a clean `KEY -> string` map: drops anything that isn't a plain object,

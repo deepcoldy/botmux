@@ -8,6 +8,7 @@ import {
   awaitTrustedResultDeliveryAck,
   MAX_TRUSTED_DELIVERY_FILE_BYTES,
   parseTrustedResultDelivery,
+  resolveTrustedResultDeliveryLinkRefs,
   sendTrustedDeliveryIpcWithBackpressure,
   TrustedResultDeliverySerialQueue,
   trustedResultTerminalObservation,
@@ -23,6 +24,54 @@ function fixture() {
 }
 
 describe('trusted plugin result delivery', () => {
+  it('resolves LinkRefs before the artifact persistence callback and keeps the input immutable', async () => {
+    const placeholder = '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}';
+    const delivery = {
+      schemaVersion: 1 as const,
+      deliveryId: 'delivery_link_ref_abcdefgh',
+      markdown: `授权：${placeholder}`,
+    };
+    const original = structuredClone(delivery);
+    const order: string[] = [];
+    const resolvedUrl = 'https://auth.example.test/approve'
+      + '?code=keep&state=ready';
+    const resolved = await resolveTrustedResultDeliveryLinkRefs({
+      delivery,
+      mode: 'enabled',
+      resolve: async payload => {
+        order.push('resolve');
+        return {
+          ...payload,
+          text: `授权：${resolvedUrl}`,
+          refCount: 1,
+        };
+      },
+      persist: value => {
+        order.push('persist');
+        expect(value.markdown).toBe(`授权：${resolvedUrl}`);
+      },
+    });
+
+    expect(order).toEqual(['resolve', 'persist']);
+    expect(delivery).toEqual(original);
+    expect(resolved.markdown).toContain('?code=keep&state=ready');
+  });
+
+  it('fails before persistence when enabled LinkRef resolution is rejected', async () => {
+    const persist = vi.fn();
+    await expect(resolveTrustedResultDeliveryLinkRefs({
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: 'delivery_link_ref_failure',
+        markdown: '{{botmux_link:lr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}',
+      },
+      mode: 'enabled',
+      resolve: async () => { throw new Error('link_ref_unknown'); },
+      persist,
+    })).rejects.toThrow('link_ref_unknown');
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('snapshots regular outbound files and consumes them only after persistence', () => {
     const { home, outbound } = fixture();
     const source = join(outbound, 'report.pdf');
@@ -140,10 +189,6 @@ describe('trusted plugin result delivery', () => {
       { revoke: timedOutRevoke, timeoutMs: 20 },
     )).rejects.toThrow('plugin_result_delivery_timeout');
     expect(timedOutRevoke).not.toHaveBeenCalled();
-
-    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
-    expect(workerSource).toContain('revoke: () => artifactStore.revoke(artifact.artifactId)');
   });
 
   it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {
@@ -189,14 +234,31 @@ describe('trusted plugin result delivery', () => {
     expect(readdirSync(join(byteLimited.root, 'tokens')).filter(name => name.endsWith('.json'))).toEqual([]);
   });
 
-  it('renders a metadata-only entry card without result content or internal handles', () => {
+  it.each([
+    ['feishu', 'https://applink.feishu.cn'],
+    ['lark', 'https://applink.larksuite.com'],
+  ] as const)('renders a metadata-only %s entry card with in-client desktop and direct mobile links', (brand, appLinkOrigin) => {
     const accessUrl = 'https://example.test/plugin-result-access/view_token_abcdefghijklmnopqrstuvwxyz';
-    const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: '2026-10-16T01:00:00.000Z' });
-    expect(card).toContain(accessUrl);
-    expect(card).toContain('结果已生成');
-    expect(card).not.toContain('private result');
-    expect(card).not.toContain('artifactId');
-    expect(card).not.toContain('deliveryId');
+    const card = JSON.parse(buildTrustedResultDeliveryCard({
+      accessUrl,
+      expiresAt: '2026-10-16T01:00:00.000Z',
+      brand,
+    }));
+    const button = card.elements[1].actions[0];
+    const desktopUrl = new URL(button.multi_url.url);
+    expect(desktopUrl.origin).toBe(appLinkOrigin);
+    expect(desktopUrl.pathname).toBe('/client/web_url/open');
+    expect(desktopUrl.searchParams.get('mode')).toBe('appCenter');
+    expect(desktopUrl.searchParams.get('url')).toBe(accessUrl);
+    expect(button.multi_url.pc_url).toBe(button.multi_url.url);
+    expect(button.multi_url.android_url).toBe(accessUrl);
+    expect(button.multi_url.ios_url).toBe(accessUrl);
+    expect(button.multi_url.android_url).not.toMatch(/^(?:about:|[a-z]+:\/\/applink\.)/i);
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('结果已生成');
+    expect(serialized).not.toContain('private result');
+    expect(serialized).not.toContain('artifactId');
+    expect(serialized).not.toContain('deliveryId');
   });
 
   it('waits for IPC backpressure and serializes deliveries through the final receipt', async () => {

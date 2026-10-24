@@ -38,7 +38,6 @@ import {
   markSessionGroupTitled,
   markSessionGroupTitleFailed,
   removeSessionGroup,
-  listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
 import {
@@ -141,7 +140,6 @@ describe('session-groups-store', () => {
     registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
     removeSessionGroup('oc_a');
     expect(isSessionGroup('oc_a')).toBe(false);
-    expect(listSessionGroups()).toHaveLength(0);
   });
 
   it('never throws when not initialised', async () => {
@@ -150,7 +148,6 @@ describe('session-groups-store', () => {
     initSessionGroups('cli_testapp');
     expect(isSessionGroup('oc_x')).toBe(false);
     expect(getSessionGroup('oc_x')).toBeUndefined();
-    expect(listSessionGroups()).toEqual([]);
   });
 });
 
@@ -196,7 +193,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
     process.env.BOTMUX_SESSION_ID = 'sess-123';
     process.env.TMUX = '/tmp/tmux-socket';
     try {
-      const env = buildOneShotEnv(undefined);
+      const env = buildOneShotEnv();
       expect(env.LARK_APP_SECRET).toBeUndefined();
       expect(env.GITHUB_TOKEN).toBeUndefined();
       expect(env.BOTMUX_SESSION_ID).toBeUndefined();
@@ -210,7 +207,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   });
 
   it('layers the per-bot provider env on top (multi-provider correctness)', () => {
-    const env = buildOneShotEnv({ ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' });
+    const env = buildOneShotEnv({ env: { ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' } });
     expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.example');
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bot-token');
     // Inherited harmless vars still flow through (PATH etc.).
@@ -220,7 +217,7 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   it('per-bot env cannot smuggle reserved botmux keys past the sanitizer', () => {
     // PATH deliberately IS overridable per bot (same as the worker path);
     // reserved BOTMUX_* identity keys are not.
-    const env = buildOneShotEnv({ BOTMUX_SESSION_ID: 'evil' } as any);
+    const env = buildOneShotEnv({ env: { BOTMUX_SESSION_ID: 'evil' } });
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
   });
 });
@@ -260,6 +257,16 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
 
   it('falls back to the template verbatim', () => {
     expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
+  });
+
+  it('pins claude-code to dontAsk so a bypassPermissions profile cannot leak in', () => {
+    const argv = ONE_SHOT_ARGV['claude-code'];
+    expect(argv).toEqual(['claude', '-p', '--permission-mode', 'dontAsk']);
+    // Wrappers forward the pin to the underlying claude.
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, argv).argv)
+      .toEqual(['aiden', 'x', 'claude', '-p', '--permission-mode', 'dontAsk']);
+    expect(resolveOneShotCommand({ cliPathOverride: '/opt/claude' }, argv).argv)
+      .toEqual(['/opt/claude', '-p', '--permission-mode', 'dontAsk']);
   });
 
   it('supports antigravity in ONE_SHOT_ARGV with agy -p', () => {

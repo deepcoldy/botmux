@@ -115,9 +115,8 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
     //  (a) the pid-marker ancestry (verified manually; see NOTE below), and
     //  (b) an explicit `--session-id <virtual>` — the per-command target-aware
     //      gate loads THAT session record and refuses regardless of env.
-    // We assert (b) here because it is deterministic under vitest; (a) depends on
-    // process.ppid which the vitest worker pool controls, so it is covered by the
-    // `managedOriginHasNoTransport → resolveSessionContext` source-lock instead.
+    // We assert (b) here; (a) is covered by the env-stripped `src/cli.ts` spawn in
+    // api-only-mode-wiring.test.ts (marker at the spawning test's own pid).
     // NOTE (manual repro, matches codex's): with a marker at the CLI's real parent
     // pid, `env -u BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID node
     // dist/cli.js create-group --bot x` exits 2 via ancestry — confirmed by hand.

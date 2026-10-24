@@ -85,6 +85,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       protocol, version, type: 'ready', requestId: command.requestId, state,
       recoveredTurn: {
         turnId: 'om_turn_survived', generation: state.generation, startedAtMs: 1000,
+        dispatchAttempt: 8,
         trustedCaller: {
           requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_remote_takeover', senderType: 'user',
         },
@@ -145,7 +146,17 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     children.push(child);
     child.stdout?.on('data', chunk => logs.push(String(chunk)));
     child.stderr?.on('data', chunk => logs.push(String(chunk)));
-    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'link_ref_restore_mode') {
+        child.send({
+          type: 'link_ref_restore_mode_result',
+          requestId: message.requestId,
+          mode: 'enabled',
+        } satisfies DaemonToWorker);
+      }
+    });
 
     child.send({
       type: 'init',
@@ -174,6 +185,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       content: 'follow up during takeover',
       turnId: 'om_turn_followup',
       dispatchAttempt: 9,
+      durablePrimaryInbox: true,
       trustedCaller: {
         requestUserOpenId: 'ou_remote_user',
         requestLarkAppId: 'app_remote_takeover',
@@ -192,6 +204,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 16_000));
     expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
     expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed',
+      turnId: 'om_turn_survived',
+      dispatchAttempt: 8,
+      durablePrimaryInbox: true,
+    }));
 
     writeFileSync(releaseRecoveredFinalPath, 'release\n');
     await waitFor(
@@ -220,9 +238,16 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     ]);
     expect(messages).toEqual(expect.arrayContaining([
       expect.objectContaining({
+        type: 'turn_input_committed',
+        turnId: 'om_turn_followup',
+        dispatchAttempt: 9,
+        durablePrimaryInbox: true,
+      }),
+      expect.objectContaining({
         type: 'final_output',
         turnId: 'om_turn_survived',
         content: 'TAKEOVER_OK',
+        linkRefMode: 'enabled',
       }),
       expect.objectContaining({
         type: 'turn_terminal',
@@ -230,13 +255,19 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         status: 'completed',
       }),
     ]));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'link_ref_restore_mode',
+      sessionId: 'sid-remote-takeover',
+      turnId: 'om_turn_survived',
+    }));
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
-  it('passes persisted provider state to resume after a worker restart', async () => {
+  it('passes persisted provider state and defers a durable refork ACK until provider submission', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
     tempDirs.push(root);
     const commandsPath = join(root, 'commands.jsonl');
+    const releaseSubmitPath = join(root, 'release-submit');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -255,8 +286,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   } else if (command.type === 'resume') {
     emit({ type: 'ready', requestId: command.requestId, state: command.state });
   } else if (command.type === 'turn') {
-    emit({ type: 'status', requestId: command.requestId, status: 'busy' });
-    emit({ type: 'final', turnId: command.turnId, content: 'RESUMED_OK' });
+    const submitTimer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releaseSubmitPath)})) return;
+      clearInterval(submitTimer);
+      emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+      emit({ type: 'final', turnId: command.turnId, content: 'RESUMED_OK' });
+    }, 10);
   } else if (command.type === 'cancel') {
     emit({ type: 'status', requestId: command.requestId, status: 'closed' });
   }
@@ -314,14 +349,25 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       backendConfig: { expectedProvider: 'resume-provider' },
       remoteBackendState: persistedState,
       prompt: 'resume this turn',
-      turnId: 'turn-after-worker-restart',
+      turnId: 'om_turn_after_worker_restart',
+      dispatchAttempt: 7,
+      durablePrimaryInbox: true,
       larkAppId: 'app_remote_resume',
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
     await waitFor(
+      () => existsSync(commandsPath)
+        && readFileSync(commandsPath, 'utf8').includes('"type":"turn"'),
+      () => `remote runner did not receive the reforked turn\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'turn_input_committed'
+      && message.turnId === 'om_turn_after_worker_restart')).toBe(false);
+    writeFileSync(releaseSubmitPath, 'release\n');
+
+    await waitFor(
       () => messages.some(message => message.type === 'turn_terminal'
-        && message.turnId === 'turn-after-worker-restart'
+        && message.turnId === 'om_turn_after_worker_restart'
         && message.status === 'completed'),
       () => `remote runner resume turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
@@ -336,8 +382,14 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     });
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'final_output',
-      turnId: 'turn-after-worker-restart',
+      turnId: 'om_turn_after_worker_restart',
       content: 'RESUMED_OK',
+    }));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed',
+      turnId: 'om_turn_after_worker_restart',
+      dispatchAttempt: 7,
+      durablePrimaryInbox: true,
     }));
   });
 
@@ -431,6 +483,80 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'final_output'
       && message.turnId === 'turn-invisible-final')).toBe(false);
     expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
+  it('does not re-post a remote final that the same turn attempt already delivered via botmux send', async () => {
+    // Remote Runner has no transcript mark window, so only the exact
+    // (turnId, dispatchAttempt) identity of a delivered final marker can stop
+    // the fallback from double-posting the answer.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-sent-final-'));
+    tempDirs.push(root);
+    const dataDir = join(root, 'data');
+    const markerPath = join(dataDir, 'turn-sends', 'sid-sent-final.jsonl');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import readline from 'node:readline';
+const state = { version: 1, provider: 'sent-provider', generation: 1, remoteSessionId: 'remote-sent-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol: 'botmux.remote-runner', version: 1, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'sent-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    // The model already answered through botmux send for this exact attempt.
+    mkdirSync(dirname(${JSON.stringify(markerPath)}), { recursive: true });
+    appendFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ sentAtMs: Date.now(), responseKind: 'final', turnId: command.turnId, dispatchAttempt: 3 }) + '\\n');
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'ALREADY_SENT_ANSWER', state }), 20);
+  } else if (command.type === 'cancel' || command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: command.type === 'cancel' ? 'closed' : 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_sent_final', larkAppSecret: 'secret', cliId: 'remote-runner',
+      backendType: 'remote-runner', cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'sent-provider' },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-sent-final', LARK_APP_ID: 'app_sent_final', LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.send({
+      type: 'init', sessionId: 'sid-sent-final', chatId: 'oc_sent_final', rootMessageId: 'om_sent_final',
+      workingDir: root, cliId: 'remote-runner', cliPathOverride: provider, backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'sent-provider' }, prompt: 'answer via botmux send',
+      turnId: 'turn-sent-final', dispatchAttempt: 3,
+      trustedCaller: { requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_sent_final', senderType: 'user' },
+      larkAppId: 'app_sent_final', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-sent-final' && message.status === 'completed'),
+      () => `sent final did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(existsSync(markerPath)).toBe(true);
+    expect(messages.some(message => message.type === 'final_output')).toBe(false);
   });
 
   it('rejects a provider-selected schedule controller on a human-authored turn', async () => {

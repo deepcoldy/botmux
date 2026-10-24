@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { BOTMUX_APP_ICON_BASE64 } from '../src/setup/app-icon-data.js';
+import { validateAvatarPng } from '../src/services/open-platform-rename.js';
 import { computeViewportTop, matchesSelectItem, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
 import {
   createOpenPlatformAppWithClient,
@@ -227,6 +229,10 @@ describe('createOpenPlatformAppWithClient', () => {
     expect(upload.get('uploadType')).toBe('4');
     expect(upload.get('isIsv')).toBe('false');
     expect(upload.get('scale')).toBe(JSON.stringify({ width: 512, height: 512 }));
+    // 默认图标沿用会话群头像：渐变底色 + logo 现渲染成 512×512，而不是纯 favicon。
+    const icon = Buffer.from(await (upload.get('file') as Blob).arrayBuffer());
+    expect(validateAvatarPng(icon)).toEqual({ ok: true });
+    expect(icon.equals(Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64'))).toBe(false);
     expect(client.calls[1].body).toMatchObject({
       appManifestTemplateID: 'developer_console',
       createAppUserCustomField: {
@@ -249,6 +255,34 @@ describe('createOpenPlatformAppWithClient', () => {
     });
     expect(bodyOf('/app_version/create/')).not.toHaveProperty('applyReasonConfig');
     expect(bodyOf('/publish/commit/')).toEqual({ clientId: 'cli_new' });
+  });
+
+  it('falls back to the plain favicon when the gradient icon cannot be rendered', async () => {
+    vi.doMock('../src/services/bot-app-icon.js', () => ({
+      renderBotAppIconPng: () => { throw new Error('render exploded'); },
+    }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const client = stubClient([
+        { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+        { code: 0, data: { ClientID: 'cli_fallback_icon' } },
+        { code: 0 },
+        { code: 0 },
+        { code: 0, data: { privileges: [], scopeBiz: [] } },
+        { code: 0, data: { versionId: 'v-init' } },
+        { code: 0 },
+        { code: 0, data: { secret: 'new-secret' } },
+      ]);
+      await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-fb', creatorUserId: 'u_creator' }))
+        .resolves.toEqual({ appId: 'cli_fallback_icon', appSecret: 'new-secret' });
+      const upload = client.calls[0].body as FormData;
+      const icon = Buffer.from(await (upload.get('file') as Blob).arrayBuffer());
+      expect(icon.equals(Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64'))).toBe(true);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('render exploded'));
+    } finally {
+      warn.mockRestore();
+      vi.doUnmock('../src/services/bot-app-icon.js');
+    }
   });
 
   it('fails closed (with appId) when the enabling publish commit fails — no silent orphan', async () => {

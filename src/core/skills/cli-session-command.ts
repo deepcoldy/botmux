@@ -1,6 +1,7 @@
-import { readSessionSkillManifest } from './manifest-store.js';
+import { readSessionSkillManifest, SkillManifestReadError, SkillManifestParseError } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
 import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
+import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
 export interface SkillCommandResult {
@@ -65,7 +66,21 @@ export function runSkillSessionCommand(
   }
   const sessionId = sessionIdFromEnv(env);
   if (!sessionId) return { code: 2, stdout: '', stderr: 'missing BOTMUX_SESSION_ID\n' };
-  const manifest = readSessionSkillManifest(sessionId);
+  let manifest;
+  try {
+    manifest = readSessionSkillManifest(sessionId);
+  } catch (err) {
+    // Present-but-unreadable (sandbox/policy) or corrupt manifest — a real
+    // fault, NOT "not found". Distinct message + exit 1 so the sandbox misconfig
+    // is diagnosable instead of masquerading as an absent manifest (exit 2).
+    if (err instanceof SkillManifestReadError) {
+      return { code: 1, stdout: '', stderr: `skill manifest exists but is unreadable for session ${sessionId} (${(err.cause as any)?.code ?? 'read error'}) — check the file sandbox read-only policy: ${err.path}\n` };
+    }
+    if (err instanceof SkillManifestParseError) {
+      return { code: 1, stdout: '', stderr: `skill manifest is corrupt for session ${sessionId}: ${err.path}\n` };
+    }
+    throw err;
+  }
   if (!manifest) {
     // No user-skill manifest — still surface built-ins for discovery.
     if (sub === 'list') {
@@ -99,6 +114,30 @@ export function runSkillSessionCommand(
     }
     return { code: 2, stdout: '', stderr: `unknown skill command: ${sub}\n` };
   } catch (err: any) {
-    return { code: 1, stdout: '', stderr: `${err?.message ?? err}\n` };
+    const reason = unavailableSkillReason(manifest, args[1], err, env);
+    return { code: 1, stdout: '', stderr: `${reason ?? err?.message ?? err}\n` };
   }
+}
+
+/** A skill whose source this session cannot read: explain WHY instead of a raw
+ *  ENOENT/EPERM. Only botmux-managed skills (store / plugin bundles) are
+ *  snapshotted into the session (snapshot.ts); linked / external ones keep
+ *  their own path, which the file sandbox does not expose. */
+function unavailableSkillReason(
+  manifest: SessionSkillManifest,
+  name: string | undefined,
+  err: any,
+  env: Record<string, string | undefined>,
+): string | null {
+  const skill = name ? manifest.prioritySkills.find((candidate) => candidate.name === name) : undefined;
+  if (!skill || skill.snapshotOf || skill.source?.type === 'project') return null;
+  if (!['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'ELOOP'].includes(err?.code)) return null;
+  const sandboxed = env.BOTMUX_READ_ISOLATION === '1';
+  const where = sandboxed ? 'inside this sandboxed session' : 'from this session';
+  const failed = manifest.diagnostics.find((d) => d.skillName === skill.name && d.level === 'error'
+    && d.code.startsWith('skill_snapshot_'));
+  if (failed) return `skill ${skill.name} is not available ${where}: ${failed.message}`;
+  return `skill ${skill.name} is a linked/external skill (source ${skill.source?.type ?? 'unknown'}: ${skill.rootDir}) and is not available ${where} — `
+    + 'only skills installed into the botmux skill store are snapshotted into sandboxed sessions. '
+    + 'Install it in copy mode (`botmux skills install <path>` without --link) to use it here.';
 }

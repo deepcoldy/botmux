@@ -33,7 +33,7 @@ export const ASK_TOGGLE_ACTION = 'ask_toggle';
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
 /** Worst-case placeholder for ask dispatchUuid (ask- + 40 hex = 44 chars,
- * ask-persist-store.ts dispatchUuidForKey). Used when an ask lacks a real
+ * ask-persist-store.ts dispatchUuidForAsk). Used when an ask lacks a real
  * dispatchUuid so the byte budget still reflects the wire payload. */
 const ASK_DISPATCH_UUID_WORST_CASE = 'ask-'.padEnd(44, '0');
 
@@ -468,7 +468,7 @@ function renderAskCardWithCap(
     tag: 'div',
     fields: [
       { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
     ],
   };
 
@@ -594,7 +594,8 @@ function renderAskCardWithCap(
       tag: 'note',
       elements: [
         { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
+          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
   }
@@ -763,7 +764,12 @@ function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): stri
   if (result.kind === 'timedOut') {
     return `**${t('card.ask.timed_out', undefined, locale)}**`;
   }
-  return `**${t('card.ask.invalidated', undefined, locale)}**\n${escapeMd(result.reason)}`;
+  const detail = result.failureCode === 'claimant_gone'
+    ? t('card.ask.invalidated_claimant_gone', undefined, locale)
+    : result.failureCode === 'answer_undelivered'
+      ? t('card.ask.invalidated_answer_undelivered', undefined, locale)
+      : escapeMd(result.reason);
+  return `**${t('card.ask.invalidated', undefined, locale)}**\n${detail}`;
 }
 
 function templateForResult(result: AskResult): string {

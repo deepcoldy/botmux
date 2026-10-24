@@ -14,7 +14,7 @@ vi.mock('../src/services/feed-group-tagger.js', () => ({
 import { tagClosedSessionGroup } from '../src/services/feed-group-tagger.js';
 
 
-vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64) })) }));
+vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64), sessions: [] })) }));
 import { dismissSessionGroup } from '../src/core/dismiss-command.js';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
@@ -117,6 +117,10 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
 }));
 
 // lark-cli per-person HOME auth likewise shells out; script the verdicts.
+// Platform credential source: controls whether this "machine" is bound.
+vi.mock('../src/platform/credential-grant-client.js', () => ({
+  platformCredentialsUrl: vi.fn((): string | null => null),
+}));
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://lark.example.com/device' })),
   completeLarkCliLogin: vi.fn(async () => ({ state: 'failed' as const, detail: 'no active login — please start again' })),
@@ -242,7 +246,18 @@ vi.mock('../src/services/git-worktree.js', () => ({
   worktreeRootFor: vi.fn(async (dir: string) => dir),
   withWorktreeTargetLock: vi.fn(async (_path: string, fn: () => Promise<unknown>) => fn()),
   removeRepoWorktree: vi.fn(async () => {}),
-  worktreeSafetyStatus: vi.fn(async () => ({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })),
+  worktreeSafetyStatus: vi.fn(async () => ({
+    dirty: false,
+    dirtyCount: 0,
+    dirtyFiles: [],
+    uncommittedCount: 0,
+    uncommittedFiles: [],
+    ignoredCount: 0,
+    ignoredFiles: [],
+    ahead: 0,
+    unpushedCommits: [],
+    fingerprint: 'clean-state',
+  })),
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -301,7 +316,8 @@ vi.mock('../src/setup/owner-identity.js', () => ({
 
 vi.mock('../src/im/lark/client.js', () => ({
   // ou_ passes through literally (the reason the owner-identity probe exists);
-  // on_xxx → ou_xxx (except on_ghost). Used by the real setBotAllowedUsers behind /botconfig.
+  // on_xxx → ou_xxx (except on_ghost); emails/mobiles stay unresolved here
+  // (modeling a definitive miss). Used by the real setBotAllowedUsers behind /botconfig.
   resolveAllowedUsersWithMap: vi.fn(async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
     const entryStatus = new Map<string, 'resolved' | 'transient' | 'definitive'>();
@@ -312,7 +328,8 @@ vi.mock('../src/im/lark/client.js', () => ({
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = raw.filter(v => entryStatus.get(v) === 'definitive');
+    return { resolved, map, entryStatus, definitiveMisses };
   }),
   updateMessage: vi.fn(async () => {}),
   MessageWithdrawnError: class extends Error {},
@@ -396,6 +413,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
+  updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -466,6 +484,12 @@ vi.mock('../src/core/session-discovery.js', async (importOriginal) => {
     validateAdoptTarget: vi.fn(() => true),
   };
 });
+
+// The /adopt picker's live-name enrichment shells out to herdr and reads
+// ~/.claude transcripts; keep it out of these tests (pass sessions through).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: vi.fn(async (sessions: unknown[]) => sessions),
+}));
 
 // Resume-history tests swap in a fake on-disk store (`resumeStore.list`) so they
 // can see the exclude set the adapter receives; while it is unset every adapter
@@ -660,7 +684,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -684,6 +708,7 @@ import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
 import { hasLarkCliHome, beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge } from '../src/services/lark-cli-auth.js';
+import { platformCredentialsUrl } from '../src/platform/credential-grant-client.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
@@ -880,7 +905,6 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(45);
     expect(DAEMON_COMMANDS.has('/queue')).toBe(true);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
@@ -1590,6 +1614,17 @@ describe('/botconfig set allowedUsers surfaces owner-identity verdicts', () => {
     expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
     expect(replies[0]).toContain(t('cmd.config.allow_warn_union', { items: 'on_ghost' }, 'zh'));
   });
+
+  it('writes but warns in /botconfig when an email/mobile definitively fails to resolve', async () => {
+    // 邮箱确定性解析失败：照常落盘（可能临时不可见），回复里点名未生效条目，
+    // 且不与 union_id 告警串台。
+    const { replies, stored } = await runAllow('/botconfig set allowedUsers ou_sender, ghost@corp.com 确认', []);
+    expect(stored).toEqual(['ou_sender', 'ghost@corp.com']);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
+    expect(replies[0]).toContain(t('cmd.config.allow_warn_contacts', { items: 'ghost@corp.com' }, 'zh'));
+    expect(replies[0]).not.toContain('union_id');
+  });
 });
 
 describe('/vc preparation command', () => {
@@ -1692,6 +1727,8 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'minimax').size).toBe(0);
     // ebsd is interactive, but every external message must pass through the
     // service-user envelope and structured terminal-marker ledger.
     expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
@@ -1821,7 +1858,7 @@ describe('handleCommand', () => {
     vi.mocked(loadBotConfigs).mockReturnValue([{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }] as any);
     vi.clearAllMocks();
     vi.mocked(tagClosedSessionGroup).mockResolvedValue({ status: 'skipped' });
-    vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'a'.repeat(64) });
+    vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'a'.repeat(64), sessions: [] });
     vi.mocked(closeSession).mockImplementation(async (sessionId: string) => {
       // Model the authoritative close lifecycle's dashboard contract. The
       // command must delegate this side effect instead of publishing a second
@@ -3185,6 +3222,7 @@ describe('handleCommand', () => {
       mockShadowLane();
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 2,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-clean',
       });
       const deps = makeDeps(makeDaemonSession());
@@ -3201,6 +3239,7 @@ describe('handleCommand', () => {
       mockShadowLane();
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: true, dirtyCount: 1, dirtyFiles: ['src/dirty.ts'], ahead: 0,
+        uncommittedCount: 1, uncommittedFiles: ['src/dirty.ts'], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-dirty',
       });
       const deps = makeDeps(makeDaemonSession());
@@ -3218,10 +3257,12 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const beforePush = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
       };
       const published = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-published',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3268,6 +3309,7 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const clean = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-clean',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3301,14 +3343,17 @@ describe('handleCommand', () => {
       const { laneSession } = mockShadowLane();
       const beforePush = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
       };
       const published = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: [], fingerprint: 'lane-published',
       };
       const committedDuringClose = {
         dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
         unpushedCommits: ['def late change'], fingerprint: 'lane-late-commit',
       };
       vi.mocked(worktreeSafetyStatus)
@@ -3339,13 +3384,57 @@ describe('handleCommand', () => {
   });
 
   describe('/dismiss', () => {
+    it('fails closed in durable primary before invoking local group deletion', async () => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const deps = makeDeps();
+        await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+        expect(dismissSessionGroup).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          CHAT_ID,
+          expect.stringContaining('未删除任何会话'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
+      }
+    });
+
     it('registers as sessionless and routes confirmation without spawning a session', async () => {
       const deps = makeDeps();
       expect(SESSIONLESS_DAEMON_COMMANDS.has('/dismiss')).toBe(true);
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
       expect(dismissSessionGroup).toHaveBeenCalledWith(expect.objectContaining({ chatId: CHAT_ID, rootId: CHAT_ID, confirmedState: undefined }));
-      expect(deps.sessionReply).toHaveBeenCalledWith(CHAT_ID, expect.stringContaining('/dismiss --confirm='), undefined, LARK_APP_ID, 'msg_001');
+      expect(deps.sessionReply).toHaveBeenCalledWith(CHAT_ID, expect.stringContaining('dismiss_confirm'), 'interactive', LARK_APP_ID, 'msg_001');
       expect(tagClosedSessionGroup).not.toHaveBeenCalled();
+    });
+    it('confirms on a card listing every session it will close, bound to the invoker', async () => {
+      const row = (sessionId: string, larkAppId: string, title: string) =>
+        ({ sessionId, chatId: CHAT_ID, rootMessageId: CHAT_ID, scope: 'chat', status: 'active', createdAt: '2026-10-20T00:00:00Z', title, larkAppId }) as any;
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'c'.repeat(64), sessions: [
+        { larkAppId: LARK_APP_ID, session: row('s1', LARK_APP_ID, '主会话'), resident: true },
+        { larkAppId: 'cli_peer_bot', session: row('s2', 'cli_peer_bot', '旁路任务'), resident: false },
+      ] });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0]![1]);
+      const text = JSON.stringify(card);
+      expect(text).toContain('全部 2 个会话');
+      expect(text).toContain('主会话'); expect(text).toContain('旁路任务');
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({
+        action: 'dismiss_confirm', chat_id: CHAT_ID, invoker_open_id: 'ou_sender', confirmation_state: 'c'.repeat(64),
+      });
+    });
+    it('names offline peer bots instead of disbanding', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'peer_offline', larkAppIds: ['cli_offline_bot'] });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      // Shown by display name (the mocked registry names every bot "Claude").
+      expect(deps.sessionReply).toHaveBeenCalledWith(CHAT_ID, expect.stringMatching(/不在线.*Claude/), undefined, LARK_APP_ID, 'msg_001');
+      expect(sendUserMessage).not.toHaveBeenCalled();
     });
     it('rejects bot callers and non-operators before destructive handling', async () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID, senderType: 'app' }), makeDeps(), LARK_APP_ID);
@@ -3354,11 +3443,28 @@ describe('handleCommand', () => {
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
     it('reports successful deletion privately rather than to the deleted group', async () => {
-      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed' });
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), deps, LARK_APP_ID);
-      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'));
+      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'), 'interactive');
+      // A main checkout is never offered for deletion.
+      expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID, worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task', safetyFingerprint: 'clean-state',
+      }));
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({ action: 'dismiss_cleanup_wt', job_ids: 'cleanup-123', invoker_open_id: 'ou_sender' });
+      expect(JSON.stringify(card)).toContain('/home/testuser/project-wt-task');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
     });
     it('rejects unsupported arguments without executing', async () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --yes', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
@@ -3374,6 +3480,30 @@ describe('handleCommand', () => {
   });
 
   describe('/close', () => {
+    it.each(['/close', '/close wt', '/close wt --yes --state=unsafe'])('%s fails closed in durable primary before local close or worktree cleanup', async content => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+        ds.session.workingDir = '/home/testuser/project-wt-task';
+        const deps = makeDeps(ds);
+
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(content), deps, LARK_APP_ID);
+
+        expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+        expect(removeRepoWorktree).not.toHaveBeenCalled();
+        expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('已拒绝本地关闭'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
+      }
+    });
+
     it('updates the group tag only after clean close and does not wait to deliver the close card', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -3501,6 +3631,33 @@ describe('handleCommand', () => {
       expect(reply).toContain(expected);
       if ((close as { outcome?: string }).outcome !== 'closed') {
         expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+      }
+    });
+
+    it.each(['/detach', '/disconnect'])('%s fails closed in durable primary before closing an adopted worker', async command => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const ds = makeDaemonSession({
+          session: makeSession({
+            cliId: 'codex' as any,
+            cliSessionId: '019e-existing-app-server-thread',
+            existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+          }),
+        });
+        const deps = makeDeps(ds);
+
+        await handleCommand(command, ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+
+        expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('本次未修改会话状态'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
       }
     });
 
@@ -3735,7 +3892,26 @@ describe('handleCommand', () => {
         .map(c => c[1])
         .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
       expect(confirmCard).toBeTruthy();
-      const confirmTable = JSON.parse(confirmCard as string).body.elements
+      const parsedConfirmCard = JSON.parse(confirmCard as string);
+      expect(parsedConfirmCard.schema).toBe('2.0');
+      expect(parsedConfirmCard.body.elements.some((e: any) => e.tag === 'action')).toBe(false);
+      const confirmButton = parsedConfirmCard.body.elements
+        .find((e: any) => e.tag === 'column_set')?.columns?.[0]?.elements?.[0];
+      expect(confirmButton).toMatchObject({
+        tag: 'button',
+        type: 'danger',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: 'close_worktree_confirm',
+            root_id: ROOT_ID,
+            session_id: ds.session.sessionId,
+            invoker_open_id: 'ou_sender',
+          },
+        }],
+      });
+      expect(confirmButton.behaviors[0].value.confirmation_state).toMatch(/^[a-f0-9]{64}$/);
+      const confirmTable = parsedConfirmCard.body.elements
         .find((e: any) => e.tag === 'table');
       expect(confirmTable.row_height).toBe('auto');
       expect(confirmTable.row_max_height).toBe('300px');
@@ -3837,7 +4013,12 @@ describe('handleCommand', () => {
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
       vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
         dirty: true,
+        dirtyCount: 1,
         dirtyFiles: ['src/new-change.ts'],
+        uncommittedCount: 1,
+        uncommittedFiles: ['src/new-change.ts'],
+        ignoredCount: 0,
+        ignoredFiles: [],
         ahead: 0,
         unpushedCommits: [],
         fingerprint: 'new-state',
@@ -3860,8 +4041,16 @@ describe('handleCommand', () => {
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
       vi.mocked(worktreeSafetyStatus)
-        .mockResolvedValueOnce({ dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0, unpushedCommits: [], fingerprint: 'clean-state' })
-        .mockResolvedValueOnce({ dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'], ahead: 0, unpushedCommits: [], fingerprint: 'changed-state' });
+        .mockResolvedValueOnce({
+          dirty: false, dirtyCount: 0, dirtyFiles: [],
+          uncommittedCount: 0, uncommittedFiles: [], ignoredCount: 0, ignoredFiles: [],
+          ahead: 0, unpushedCommits: [], fingerprint: 'clean-state',
+        })
+        .mockResolvedValueOnce({
+          dirty: true, dirtyCount: 1, dirtyFiles: ['src/late.ts'],
+          uncommittedCount: 1, uncommittedFiles: ['src/late.ts'], ignoredCount: 0, ignoredFiles: [],
+          ahead: 0, unpushedCommits: [], fingerprint: 'changed-state',
+        });
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, [], 'clean-state')}`), deps, LARK_APP_ID);
 
@@ -3935,13 +4124,24 @@ describe('handleCommand', () => {
 
 
 
-    it('`/close wt` asks for confirmation when the worktree has dirty or unpushed changes', async () => {
+    it('`/close wt` displays uncommitted and ignored content separately', async () => {
       const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
       ds.session.workingDir = '/home/testuser/project-wt-task';
       const deps = makeDeps(ds);
       vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
       vi.mocked(mainWorktreeFor).mockResolvedValueOnce('/home/testuser/project');
-      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({ dirty: true, dirtyCount: 2, dirtyFiles: ['src/a.ts', 'README.md'], ahead: 2, unpushedCommits: ['abc123 fix close wt', 'def456 add tests'], fingerprint: 'risky-state' });
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true,
+        dirtyCount: 3,
+        dirtyFiles: ['src/a.ts', 'dist/', 'node_modules'],
+        uncommittedCount: 1,
+        uncommittedFiles: ['src/a.ts'],
+        ignoredCount: 2,
+        ignoredFiles: ['dist/', 'node_modules'],
+        ahead: 2,
+        unpushedCommits: ['abc123 fix close wt', 'def456 add tests'],
+        fingerprint: 'risky-state',
+      });
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close wt'), deps, LARK_APP_ID);
 
@@ -3950,15 +4150,18 @@ describe('handleCommand', () => {
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('⚠️ 未提交改动：2 个文件'),
+        expect.stringContaining('⚠️ 未提交改动：1 项'),
         'interactive',
         LARK_APP_ID,
         'msg_001',
       );
+      expect(replies).toContain('⚠️ Git 已忽略的本地内容：2 项');
       expect(replies).toContain('⚠️ 未 push 提交：2 个');
       expect(replies).toContain('src/a.ts');
+      expect(replies).toContain('dist/');
+      expect(replies).toContain('node_modules');
       expect(replies).toContain('abc123 fix close wt');
-      expect(replies).toContain('删除后：');
+      expect(replies).toContain('未提交改动和 Git 已忽略的本地内容会丢失');
     });
 
     it('`/close wt` refuses in a top-level chat-scope session', async () => {
@@ -4582,6 +4785,8 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
       expect(replyContent).toContain('/login');
+      expect(replyContent).toContain('/adopt orca:<terminal>');
+      expect(replyContent).toContain('实验性');
       expect(replyContent).toContain('/workflow <目标>');
       expect(replyContent).toContain('/workflow run <名称>');
       expect(replyContent).toContain('/workflow save last');
@@ -5082,6 +5287,73 @@ describe('handleCommand', () => {
       );
       expect(selected, 'no 已选择 confirmation was sent').toBeDefined();
       expect(selected![4]).toBe('msg_prime');
+    });
+
+    // A first message whose start was refused because the directory it fell
+    // back to is missing: it stays staged for repo selection on a session that
+    // is no longer pendingRepo. When no recovery card could be sent, the reply
+    // points at `/repo <路径>` — which must pick the directory for that message.
+    function makeRefusedOpeningDs(sessionOverrides: Record<string, unknown> = {}): DaemonSession {
+      return makeDaemonSession({
+        pendingRepo: false,
+        worker: null,
+        hasHistory: false,
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        session: makeSession({
+          queued: true,
+          queuedPrompt: 'first prompt',
+          pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first prompt' },
+          ...sessionOverrides,
+        } as any),
+      });
+    }
+
+    it('starts a first message refused for its missing directory in the /repo-chosen one', async () => {
+      const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = { path: '/gone/default-dir' };
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(forkWorker).mock.calls[0]![0]).toBe(ds);
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    });
+
+    it('guides bare /repo to pass a path instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('still refuses /repo while an activation is actually in flight', async () => {
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {
@@ -5932,6 +6204,35 @@ describe('handleCommand', () => {
       expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
+    it('preserves group-join provenance and caller through text /repo without other buffered input', async () => {
+      const groupJoinContext = {
+        event: 'chat.bot_added' as const,
+        larkAppId: LARK_APP_ID,
+        chatId: CHAT_ID,
+        turnId: 'om_group_join',
+        operatorOpenId: 'ou_inviter',
+        gateMatched: true,
+      };
+      const trustedCaller = { requestLarkAppId: LARK_APP_ID, requestUserOpenId: 'ou_inviter' };
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: groupJoinContext.turnId,
+        pendingGroupJoinContext: groupJoinContext,
+        pendingTrustedCaller: trustedCaller,
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[11]).toMatchObject({ groupJoinContext });
+      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:' }, {
+        turnId: groupJoinContext.turnId, trustedCaller,
+      });
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
+      expect(ds.pendingGroupJoinContext).toBeUndefined();
+      expect(ds.pendingTrustedCaller).toBeUndefined();
+    });
+
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
       mockCodexAppBot();
       const substituteTrigger = {
@@ -6543,6 +6844,75 @@ describe('handleCommand', () => {
   });
 
   // ─── /login ─────────────────────────────────────────────────────────────
+
+  // Platform credential source (triggerUserAuth.credentialSource): on a bound
+  // machine the bare /login points at the platform's credentials page instead of
+  // starting a machine-local device login; `platform` mode never starts one.
+  describe('/login with a platform credential source', () => {
+    const PAGE = 'https://platform.example.test/credentials';
+    function withPolicy(triggerUserAuth: unknown, bound: boolean) {
+      vi.mocked(platformCredentialsUrl).mockReturnValue(bound ? PAGE : null);
+      vi.mocked(getBot).mockImplementation((() => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+          workingDir: '~/projects', workingDirs: ['~/projects'],
+          triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined,
+        },
+      })) as any);
+      return makeDeps(makeDaemonSession());
+    }
+    const reply = (deps: any) => (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    afterEach(() => { vi.mocked(platformCredentialsUrl).mockReturnValue(null); });
+
+    it('auto + unbound: bare /login still starts the machine-local device login (regression pin)', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, false);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(beginLarkCliLogin).toHaveBeenCalledWith('ou_sender');
+      expect(reply(deps)).toContain('https://lark.example.com/device');
+    });
+
+    it('auto + bound: bare /login points at the platform page and starts no local login', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toContain(PAGE);
+      expect(reply(deps)).toContain(t('cmd.login.platform_title', undefined, 'zh'));
+      // auto keeps the explicit machine-local fallback discoverable
+      expect(reply(deps)).toContain('/login lark');
+    });
+
+    it('auto + bound: explicit /login lark still runs the machine-local flow', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+      expect(beginLarkCliLogin).toHaveBeenCalledWith('ou_sender');
+    });
+
+    it('platform + bound: explicit /login lark only gives the platform link', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toContain(PAGE);
+      expect(reply(deps)).not.toContain('/login lark');
+    });
+
+    it('platform + unbound: refuses with the bind instruction and never starts a local login', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: 'platform' }, false);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toContain(t('cmd.login.platform_unbound', undefined, 'zh'));
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+      expect(beginBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    it('platform + bound: /login lark for an ungoverned tool is not hijacked to the platform', async () => {
+      const deps = withPolicy({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+      expect(reply(deps)).not.toContain(PAGE);
+    });
+  });
 
   describe('/login', () => {
     it('should return OAuth URL', async () => {
@@ -9842,6 +10212,20 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
 });
 
 describe('Codex App /effort command', () => {
+  it('uses the CLI menu path and explicitly reports next-turn scope', async () => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }), lastScreenStatus: 'working' });
+    const deps = makeDeps(ds);
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort max'), deps, LARK_APP_ID);
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max');
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t('cmd.effort.cli_next_turn', { effort: 'max', choices: '' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);

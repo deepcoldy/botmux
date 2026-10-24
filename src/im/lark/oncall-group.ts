@@ -28,10 +28,16 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
   const feedback = elements.find((item: any) => item.element_id === 'botmux_feedback');
   if (feedback?.columns) { feedback.flex_mode = 'flow'; feedback.columns.push(column); }
   else {
-    const footer = elements.findIndex((item: any) => item.element_id === 'botmux_reply_footer');
-    elements.splice(footer < 0 ? elements.length : footer, 0, {
-      tag: 'column_set', element_id: 'botmux_oncall_group', flex_mode: 'none', columns: [column],
-    });
+    // Footer + voice/menu controls live in one chrome row; join that row so
+    // the on-call button stays beside them instead of landing at card bottom.
+    const chromeRow = elements.find((item: any) => item.element_id === 'botmux_reply_actions' && Array.isArray(item.columns));
+    if (chromeRow) { chromeRow.flex_mode = 'flow'; chromeRow.columns.push(column); }
+    else {
+      const footer = elements.findIndex((item: any) => item.element_id === 'botmux_reply_footer');
+      elements.splice(footer < 0 ? elements.length : footer, 0, {
+        tag: 'column_set', element_id: 'botmux_oncall_group', flex_mode: 'none', columns: [column],
+      });
+    }
   }
   return JSON.stringify(card);
 }

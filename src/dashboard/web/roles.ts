@@ -43,6 +43,7 @@ export interface RoleData {
 }
 
 export interface MessageListenerData {
+  autoCloseAfterCompletion?: boolean;
   enabled: boolean;
   name?: string;
   replyCardTitle?: string;
@@ -315,26 +316,6 @@ export async function saveDispatchCompletionEnabled(
 
 export async function deleteRole(larkAppId: string, chatId: string): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
-  return r.ok;
-}
-
-export async function loadMessageListener(larkAppId: string, chatId: string): Promise<MessageListenerData> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`);
-  const data = await readJson(r);
-  return data.listener ?? { enabled: false, prompt: '', messagePolicy: { scope: 'top_level' } };
-}
-
-export async function saveMessageListener(larkAppId: string, chatId: string, listener: MessageListenerData): Promise<boolean> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(listener),
-  });
-  return r.ok;
-}
-
-export async function deleteMessageListener(larkAppId: string, chatId: string): Promise<boolean> {
-  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
   return r.ok;
 }
 

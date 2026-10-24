@@ -942,6 +942,65 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
   });
 });
 
+describe('spawnDashboardSession — default working dir missing', () => {
+  // Starting without a pick would land in the bot's default working dir, which
+  // is gone: forkWorker refuses it. The session waits on the missing-directory
+  // picker instead (manual entry even with nothing to scan, no 「直接开启会话」).
+  const MISSING = `${process.env.TMPDIR ?? '/tmp'}/botmux-dash-missing-${process.pid}/gone/botmux`;
+
+  beforeEach(() => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: MISSING },
+      botName: 'TestBot', botOpenId: 'ou_bot',
+    } as any);
+    sendMessageMock.mockImplementation(async (...a: any[]) => (a[3] === 'interactive' ? 'om_missing_picker' : 'om_banner_123'));
+  });
+
+  function publishedCard(): string {
+    const call = sendMessageMock.mock.calls.find((c: any[]) => c[3] === 'interactive') as any[] | undefined;
+    return String(call?.[2] ?? '');
+  }
+
+  it('立即开跑：不 fork，发缺目录选仓卡，首轮挂在卡后', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'start where it can', column: 'in_progress', role: 'solo',
+    });
+
+    expect(result).toEqual({ ok: true, sessionId: 'sess-1' });
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.initialStartPending).toBe(false);
+    expect(publishedCard()).toContain(MISSING);
+    expect(publishedCard()).toContain('repo_manual_submit');
+    expect(publishedCard()).not.toContain('skip_repo');
+    expect(ds.repoCardMessageId).toBe('om_missing_picker');
+    expect(ds.session.pendingRepoSetup).toMatchObject({ mode: 'picker', repoCardMessageId: 'om_missing_picker' });
+    expect(ds.session.pendingRepoSetup?.prompt).toContain('start where it can');
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.spawned' }));
+  });
+
+  it('待办池「开始」：同样等选目录，排队的任务保留', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'queued for later', column: 'backlog', role: 'solo',
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+
+    const result = await activateQueuedSession(ds);
+
+    expect(result.ok).toBe(true);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.session.queued).toBe(true);
+    expect(ds.session.queuedPrompt).toContain('queued for later');
+    expect(publishedCard()).toContain('repo_manual_submit');
+    expect(publishedCard()).not.toContain('skip_repo');
+  });
+});
+
 describe('spawnDashboardSession — guards', () => {
   it('refuses to spawn over an existing real session at the same (chat, bot)', async () => {
     const active = new Map<string, DaemonSession>();

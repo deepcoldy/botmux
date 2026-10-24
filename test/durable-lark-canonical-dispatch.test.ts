@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type {
+  DurableInboxStore,
   DurableOutboxStore,
   DurableSessionRecord,
   InboxClaim,
@@ -54,7 +55,9 @@ function claim(): InboxClaim {
 
 function fakeStore() {
   const records = new Map<string, DurableSessionRecord>();
-  const store: DurableSessionFacadeStore & Pick<DurableOutboxStore, 'enqueueOutbox'> = {
+  const store: DurableSessionFacadeStore
+    & Pick<DurableOutboxStore, 'enqueueOutbox'>
+    & Pick<DurableInboxStore, 'enqueueInbox'> = {
     acquireSessionLease: vi.fn(async input => ({
       kind: 'acquired',
       lease: { sessionKey: input.sessionKey, ownerId: input.ownerId, epoch: 4, leaseUntil: 60_000 },
@@ -74,6 +77,7 @@ function fakeStore() {
       return { kind: 'written', record } as WriteSessionResult;
     }),
     enqueueOutbox: vi.fn(async () => ({ kind: 'inserted' as const })),
+    enqueueInbox: vi.fn(async () => ({ kind: 'inserted' as const })),
   };
   return { store, records };
 }
@@ -133,6 +137,46 @@ describe('durable Lark canonical dispatch', () => {
     await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
       .resolves.toEqual({ kind: 'ignored', reason: 'not addressed to this bot' });
     expect(store.writeSession).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
+  it('propagates explicit retry results without writing Session or Outbox state', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({ kind: 'retry', reason: 'session has an unfinished turn' }),
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toEqual({ kind: 'retry', reason: 'session has an unfinished turn' });
+    expect(store.writeSession).not.toHaveBeenCalled();
+    expect(store.enqueueOutbox).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
+  it('fails closed when a retry result queued a post-admission output', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async (_message, context) => {
+        context.queuePostAdmissionOutput({
+          target: { kind: 'send', chatId: 'oc_chat' },
+          content: 'must not escape a retry',
+          providerUuid: 'retry_output',
+        });
+        return { kind: 'retry', reason: 'session has an unfinished turn' };
+      },
+    });
+
+    await expect(dispatch(message(), {
+      claim: claim(), signal: new AbortController().signal,
+    })).rejects.toThrow(/retry result cannot publish/);
+    expect(store.writeSession).not.toHaveBeenCalled();
+    expect(store.enqueueOutbox).not.toHaveBeenCalled();
     await facade.stop();
   });
 
@@ -209,6 +253,35 @@ describe('durable Lark canonical dispatch', () => {
       content: 'late',
       providerUuid: 'late_output',
     })).toThrow(/after handler completion/);
+    await facade.stop();
+  });
+
+  it('persists queued controls only after the canonical Session admission', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const control = {
+      eventId: 'lark-command.session-control:cli_test:om_message',
+      lane: 'session-control',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      payload: { type: 'botmux.session.control' },
+      visibleAt: 1,
+      createdAt: 1,
+    } as const;
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async (_message, context) => {
+        context.queuePostAdmissionControl(control);
+        expect(store.enqueueInbox).not.toHaveBeenCalled();
+        return { kind: 'admitted', session: session() };
+      },
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toMatchObject({ kind: 'committed' });
+    expect(store.enqueueInbox).toHaveBeenCalledWith(control);
+    expect(vi.mocked(store.writeSession).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(store.enqueueInbox).mock.invocationCallOrder[0]!);
     await facade.stop();
   });
 

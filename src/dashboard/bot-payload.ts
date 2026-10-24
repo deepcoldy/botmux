@@ -1,5 +1,6 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
 import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
@@ -12,6 +13,9 @@ import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-ru
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
+import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
+import { readGlobalConfig } from '../global-config.js';
+import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 
 /** Shared parser so a malformed payload can't reach the selector half-shaped;
  *  anything invalid degrades to the registry default (`inherit`). */
@@ -34,11 +38,13 @@ export interface DashboardBotDescriptor {
   wrapperCli?: string;
   cliLaunchMode?: CliLaunchMode;
   model?: string;
+  traexAutoModel?: TraexAutoModelConfig;
+  codexRpcInput?: boolean;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
-  /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
+  /** dsh / MiniMax runner turn budget (ms). */
   turnTimeoutMs?: number;
   /** dsh runtime variant ('official' | 'tui'); dashboard exposes it for the dsh CLI only. */
   dshRuntime?: 'official' | 'tui' | null;
@@ -91,6 +97,12 @@ export function botSummaryPayload(bot: DashboardBotDescriptor) {
 }
 
 export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?: string) {
+  const rpcOverride = typeof j?.codexRpcInput === 'boolean' ? j.codexRpcInput
+    : j && Object.prototype.hasOwnProperty.call(j, 'codexRpcInput') ? undefined : bot.codexRpcInput;
+  const rpcDefault = typeof j?.codexRpcInputDefault === 'boolean'
+    ? j.codexRpcInputDefault : readGlobalConfig().dashboard?.codexRpcInput === true;
+  const auto = j && Object.prototype.hasOwnProperty.call(j, 'traexAutoModel') ? j.traexAutoModel : bot.traexAutoModel;
+  const rpcCliId = j?.cliId ?? bot.cliId;
   const base = {
     larkAppId: bot.larkAppId,
     botName: bot.botName,
@@ -101,6 +113,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.cliLaunchMode ? { cliLaunchMode: bot.cliLaunchMode } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.traexAutoModel ? { traexAutoModel: bot.traexAutoModel } : {}),
+    codexRpcInput: rpcOverride ?? null,
+    codexRpcInputDefault: rpcDefault,
+    codexRpcInputEffective: resolveBotCodexRpcInput({
+      cliId: rpcCliId, model: j?.model ?? bot.model, traexAutoModel: auto, codexRpcInput: rpcOverride,
+      wrapperCli: j && Object.prototype.hasOwnProperty.call(j, 'wrapperCli') ? j.wrapperCli : bot.wrapperCli,
+      cliLaunchMode: j && Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode') ? j.cliLaunchMode : bot.cliLaunchMode,
+    }, rpcDefault),
+    traexAutoModelBlockedReason: null,
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
     ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
@@ -136,6 +157,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     workingDir: typeof j?.workingDir === 'string' ? j.workingDir : null,
     defaultWorkingDirAutoWorktree: j?.defaultWorkingDirAutoWorktree === true,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
+    // 当前 oncall 绑定数。旧 daemon 不回这个字段 → null，页面只显示自动绑定过的数量。
+    oncallChatCount: typeof j?.oncallChatCount === 'number' ? j.oncallChatCount : null,
     brandLabel: j?.brandLabel ?? null,
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
@@ -166,6 +189,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
+    ...normalizeReplyFooter(j),
+    showReplyTiming: j?.showReplyTiming === true,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
@@ -178,8 +203,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
+    replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
+    senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
@@ -191,6 +218,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    chatManagerEnabled: j?.chatManagerEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
@@ -208,10 +236,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
+    promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
     grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
+    trustSameOwnerBots: j?.trustSameOwnerBots !== false,
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
       && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
       ? j.grantDefaultDurationMs
@@ -250,10 +280,39 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
     // 页面刷新即显示 ∅，看起来像没存上（而空白再保存会真的清掉）。
+    envRevision: typeof j?.envRevision === 'string' ? j.envRevision : undefined,
     envKeys: Array.isArray(j?.envKeys) ? j.envKeys.filter((k: unknown): k is string => typeof k === 'string') : [],
     envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
+    herdr: j?.herdr && typeof j.herdr === 'object' && !Array.isArray(j.herdr) ? j.herdr : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
+  };
+}
+
+/**
+ * Sparse `botDefaultsPayload` overrides lifted verbatim from a raw bots.json
+ * entry, used by the offline recovery rows (configuredBotDefaultsRecoveryRows
+ * in dashboard.ts): when the bot's daemon is down the dashboard cannot GET
+ * /api/bot-default-oncall, so fields whose saved value would otherwise be
+ * misread as their default have to come from disk here. Only fields that need
+ * that fidelity belong in this map; everything else keeps the payload layer's
+ * normalization. `larkToolBinding` in particular is default-on, so an explicit
+ * `false` dropped here renders a disabled binding back as enabled.
+ */
+export function sparseOverridesFromRawBotConfig(rawEntry: any): {
+  quotaFallbackBot: any;
+  autoInviteOwnerOnGroupAdd: any;
+  larkToolBinding: boolean | undefined;
+  askOptionLayout: any;
+  trustSameOwnerBots: boolean | undefined;
+} {
+  return {
+    quotaFallbackBot: rawEntry?.quotaFallbackBot,
+    autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+    larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    askOptionLayout: rawEntry?.askOptionLayout,
+    // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
+    trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,
   };
 }

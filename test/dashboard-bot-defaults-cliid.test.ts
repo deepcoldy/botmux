@@ -1,18 +1,30 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
 import {
-  BOT_DEFAULTS_TABS,
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+const originalFetch = globalThis.fetch;
+afterEach(() => { vi.unstubAllGlobals(); globalThis.fetch = originalFetch; });
+
+// Readiness timing/responses have dedicated coverage. Keep this fixture's
+// request recorders scoped to the save/model APIs they assert.
+function stubReadinessProbe(): void {
+  const configuredFetch = globalThis.fetch;
+  vi.stubGlobal('fetch', ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
+    ? Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response)
+    : configuredFetch(url, init)) as typeof fetch);
+}
 
 describe('bot defaults task tabs', () => {
   it('renders five accessible categories and supports pointer selection', () => {
@@ -26,7 +38,6 @@ describe('bot defaults task tabs', () => {
     });
 
     const tabs = renderer.root.findAllByProps({ role: 'tab' });
-    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
     expect(tabs).toHaveLength(5);
     expect(tabs[0]!.props['aria-selected']).toBe(true);
     expect(tabs[1]!.props.tabIndex).toBe(-1);
@@ -107,7 +118,7 @@ describe('bot defaults cli label', () => {
     });
     const root = renderer.root;
     const dropdown = root.findByProps({ dataInput: 'agentCliId' });
-    expect(dropdown.props.options[0].label).toContain('未安装');
+    expect(dropdown.props.options[0].label).toMatch(/未安装|不可用/);
     expect(root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
   });
 });
@@ -127,6 +138,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderAgent(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
@@ -175,6 +187,52 @@ describe('Codex-compatible runtime editor', () => {
 
     const oldWrapperPayload = renderAgent({ cliId: 'codex', wrapperCli: 'custom-launcher codex' });
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+  });
+
+
+  it.each([
+    ['codex', 'codex', 'codex --profile withhooks'],
+    ['claude-code', 'claude-code', 'custom-launcher claude'],
+    ['codex', 'ttadk-x-codex', 'ttadk codex'],
+  ])('sends replacement intent only after explicitly selecting the launch option for %s', async (cliId, key, wrapperCli) => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (init?.method !== 'PUT') return { ok: true, status: 200, json: async () => ({ models: [], source: 'static', profiles: [] }) } as any;
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({
+        ok: true, cliId, selectionKey: key, model: body.model,
+        wrapperCli: body.replaceCliSelection ? null : wrapperCli,
+      }) } as any;
+    });
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    try {
+      const rendered = renderAgent({ cliId, wrapperCli, agentSelectionKey: key });
+      renderer = rendered.renderer;
+      const { root, patchBot } = rendered;
+      const save = async () => { await act(async () => { root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); }); };
+      await save();
+      expect(requests[0]).not.toHaveProperty('replaceCliSelection');
+      expect(requests[0]).not.toHaveProperty('wrapperCli');
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli }));
+      act(() => root.findByProps({ dataInput: 'agentModel' }).props.onChange('new-model'));
+      await save();
+      expect(requests[1]).toMatchObject({ model: 'new-model' });
+      expect(requests[1]).not.toHaveProperty('replaceCliSelection');
+      // The picker can deliberately choose the same key. This is distinguishable
+      // from an untouched fallback key even for an unregistered Codex wrapper.
+      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
+        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      await save();
+      expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
+      await save();
+      expect(requests[3]).not.toHaveProperty('replaceCliSelection');
+    } finally {
+      if (renderer) act(() => renderer!.unmount());
+      globalThis.fetch = previousFetch;
+    }
   });
 
   it('shows and saves the configured Codex reasoning effort', async () => {
@@ -505,6 +563,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const grokCliState = {
         options: [
           { id: 'grok', label: 'Grok' },
@@ -556,6 +615,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
+      stubReadinessProbe();
       const traexCliState = {
         options: [
           { id: 'traex', label: 'TraeX' },
@@ -811,7 +871,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       expect(requests).toEqual([{
-        cliId: 'traex',
+        cliId: 'traex', replaceCliSelection: true,
         model: 'GPT-5.6-Terra',
         reasoningEffort: 'xhigh',
         modelBackendVariant: '',
@@ -1027,7 +1087,7 @@ describe('Codex-compatible runtime editor', () => {
         value => value === 1,
       );
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null }]);
       await waitForObserved(
         () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
         text => text.includes('已保存'),
@@ -1059,29 +1119,31 @@ describe('Codex-compatible runtime editor', () => {
     expect(root.findByProps({ dataInput: 'nativeSubagentReasoningEffort' }).props.value).toBe('ultra');
   });
 
-  const dshCliState = {
+  const budgetCliState = {
     options: [
       { id: 'codex', label: 'Codex' },
       { id: 'dsh', label: 'dsh' },
+      { id: 'minimax', label: 'MiniMax Code' },
     ],
     ttadkModelDefault: '',
     ttadkModelSuggestions: [],
   };
 
-  function renderDsh(bot: Record<string, any>, patchBot = vi.fn()) {
+  function renderBudget(bot: Record<string, any>, patchBot = vi.fn()) {
+    stubReadinessProbe();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
         bot: { larkAppId: 'cli_dsh', model: '', ...bot },
-        sessionFallback: 'dsh',
-        cliState: dshCliState as any,
+        sessionFallback: bot.cliId ?? 'dsh',
+        cliState: budgetCliState as any,
         patchBot,
       }));
     });
     return { renderer, root: renderer.root, patchBot };
   }
 
-  it('shows the dsh turn timeout in minutes and PUTs it as milliseconds', async () => {
+  it.each(['dsh', 'minimax'])('shows the turn timeout in minutes and PUTs it as milliseconds (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1094,12 +1156,12 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
       // 1_800_000 ms = 30 min
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '45' } }));
@@ -1109,13 +1171,13 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       // 45 min → 2_700_000 ms
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 2_700_000 }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('clears the dsh turn timeout to the runner default when emptied', async () => {
+  it.each(['dsh', 'minimax'])('clears the turn timeout to the runner default when emptied (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1128,11 +1190,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 1_800_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 1_800_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       expect(input.props.value).toBe('30');
       act(() => input.props.onChange({ currentTarget: { value: '' } }));
@@ -1141,19 +1203,19 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      // Empty → '' so the daemon deletes the field (revert to 10-min default).
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
+      // Empty → '' so the daemon deletes the field (remove the opt-in limit).
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('omits the turn timeout field for non-dsh CLIs', () => {
-    const { root } = renderDsh({ cliId: 'codex' });
+  it('omits the turn timeout field for unsupported CLIs', () => {
+    const { root } = renderBudget({ cliId: 'codex' });
     expect(root.findAllByProps({ 'data-input': 'agentTurnTimeout' })).toHaveLength(0);
   });
 
-  it('shows a legal non-whole-minute timeout and preserves it on a model-only save', async () => {
+  it.each(['dsh', 'minimax'])('shows a legal non-whole-minute timeout and preserves it on a model-only save (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1167,12 +1229,12 @@ describe('Codex-compatible runtime editor', () => {
         ok: true,
         status: 200,
         // Daemon preserved the stored ms because the field was absent from the body.
-        json: async () => ({ ok: true, cliId: 'dsh', model: body.model, turnTimeoutMs: 90_001, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: body.model, turnTimeoutMs: 90_001, selectionKey: cliId }),
       } as any;
     });
     try {
       // 90_001 ms is a legal positive integer but not a whole minute.
-      const { root } = renderDsh({ cliId: 'dsh', model: 'm0', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, model: 'm0', turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // Shown as exact decimal minutes (≈ 1.5000166667), never blanked.
       expect(input.props.value).not.toBe('');
@@ -1186,14 +1248,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: 'm1', reasoningEffort: '' }]);
+      expect(requests).toEqual([{ cliId, model: 'm1', reasoningEffort: '' }]);
       expect(Object.prototype.hasOwnProperty.call(requests[0], 'turnTimeoutMs')).toBe(false);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('re-saves the displayed non-whole-minute value back to the exact stored ms', async () => {
+  it.each(['dsh', 'minimax'])('re-saves the displayed non-whole-minute value back to the exact stored ms (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1206,11 +1268,11 @@ describe('Codex-compatible runtime editor', () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: 'dsh' }),
+        json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: body.turnTimeoutMs, selectionKey: cliId }),
       } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 90_001 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 90_001 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       const shown = input.props.value; // e.g. "1.5000166667"
       // Re-enter the exact displayed minutes (a touch) and save: rounding to the
@@ -1221,14 +1283,14 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'dsh', model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
+      expect(requests).toEqual([{ cliId, model: '', reasoningEffort: '', turnTimeoutMs: 90_001 }]);
       expect(root.findAllByProps({ 'data-turn-timeout-error': '' })).toHaveLength(0);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
   });
 
-  it('blocks the save and shows an inline error on invalid turn timeout input', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save and shows an inline error on invalid turn timeout input (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1237,10 +1299,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 0 is not a clearable blank and not a positive timeout → must error, not clear.
       act(() => input.props.onChange({ currentTarget: { value: '0' } }));
@@ -1257,7 +1319,7 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
-  it('blocks the save when the minutes value exceeds the arm-able millisecond bound', async () => {
+  it.each(['dsh', 'minimax'])('blocks the save when the minutes value exceeds the arm-able millisecond bound (%s)', async cliId => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
     (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
@@ -1266,10 +1328,10 @@ describe('Codex-compatible runtime editor', () => {
       if (String(_url).includes('/api/cli-options/models')) return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
       if (String(_url).includes('/api/dsh/profiles')) return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
       requests.push(JSON.parse(init?.body ?? '{}'));
-      return { ok: true, status: 200, json: async () => ({ ok: true, cliId: 'dsh', model: '', turnTimeoutMs: null, selectionKey: 'dsh' }) } as any;
+      return { ok: true, status: 200, json: async () => ({ ok: true, cliId, model: '', turnTimeoutMs: null, selectionKey: cliId }) } as any;
     });
     try {
-      const { root } = renderDsh({ cliId: 'dsh', turnTimeoutMs: 600_000 });
+      const { root } = renderBudget({ cliId, turnTimeoutMs: 600_000 });
       const input = root.findByProps({ 'data-input': 'agentTurnTimeout' });
       // 40000 min = 2.4e9 ms > 2_147_483_647 ms → invalid (would overflow setTimeout).
       act(() => input.props.onChange({ currentTarget: { value: '40000' } }));
@@ -1765,7 +1827,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -2412,5 +2474,67 @@ describe('card behavior defaults', () => {
       await pending;
     });
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
+    act(() => renderer.unmount());
   });
 });

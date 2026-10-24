@@ -16,26 +16,6 @@ import type { CliId } from '../src/adapters/cli/types.js';
  * to be exhaustive. Keep every "all CLIs" consumer on it.
  */
 describe('CLI id roster stays derived, not hand-typed', () => {
-  it('exposes every CLI in the type union, including the remote ones', () => {
-    const union = readFileSync(new URL('../src/adapters/cli/types.ts', import.meta.url), 'utf8')
-      .split('\n')
-      .find(line => line.startsWith('export type CliId ='));
-    expect(union).toBeTruthy();
-    const declared = [...union!.matchAll(/'([a-z0-9-]+)'/g)].map(m => m[1]).sort();
-
-    expect([...ALL_CLI_IDS].sort()).toEqual(declared);
-    // Sentinel: the two ids that the stale literal actually dropped.
-    expect(ALL_CLI_IDS).toContain('mojo');
-    expect(ALL_CLI_IDS).toContain('reasonix');
-  });
-
-  it('keeps the dashboard skill scan on the derived roster', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    expect(dashboard).toContain('for (const cliId of ALL_CLI_IDS) ids.add(cliId);');
-    // No re-typed union literal may come back: match a long inline CliId[] list.
-    expect(dashboard).not.toMatch(/const allCliIds: CliId\[\] = \[/);
-  });
-
   it('no test file re-types the roster as a stale literal', () => {
     // Both of these had drifted: cli-adapters dropped mojo/cursor/relay, and
     // slash-commands-doc-sync dropped mojo/reasonix while keeping a retired id —
@@ -90,6 +70,9 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
       'remote-runner': 'none',
+      // The initial TUI adapter leaves CodeM's own native skills untouched;
+      // no Botmux skill-directory delivery is advertised.
+      codem: 'none',
       // MiniMax Code loads native skills from its persistent data directory.
       minimax: 'global',
     };

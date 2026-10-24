@@ -84,13 +84,15 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('ask-option-layout', { kind: 'json', maxBytes: ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES }),
   // startup-commands：`{ startupCommands: string }`（逗号/换行分隔，'' = 清除）。
   putBotConfig('startup-commands'),
-  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/空格分隔，'' = 清除）。
+  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/换行或“空格+/”分隔，名字内空格归一为连字符，'' = 清除）。
   putBotConfig('custom-passthrough'),
   // cantalk-daemon-commands：`{ canTalkDaemonCommands: string }`（逗号/空格分隔，'' = 清除）。
   putBotConfig('cantalk-daemon-commands'),
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
+  // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
+  putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
   {
     method: 'PUT',
@@ -120,6 +122,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   },
   // riff：`{ riff: string }`（原始 JSON 文本，'' = 清除）。
   putBotConfig('riff'),
+  // herdr：`{ herdr: string }`（原始 JSON 文本，'' = 清除）。
+  putBotConfig('herdr'),
   // sandbox-network-policy：与其它 PUT 不同，空 body 不回落为 '{}'，原样转发空串。
   {
     ...putBotConfig('sandbox-network-policy', { kind: 'raw', emptyAs: '' }),
@@ -181,7 +185,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // skill-injection：`{ skillInjection: 'global'|'prompt'|'off'|'' }`（内置 skill 如何到达 global-skillsDir 的 CLI）。
   putBotConfig('skill-injection'),
   // grant-prefs：任意子集的 restrictGrantCommands / autoGrantRequestCards / p2pOpen /
-  // grantRequestToOwnerDm / messageQuotaDefaultLimit / grantDefaultDurationMs。
+  // grantRequestToOwnerDm / messageQuotaDefaultLimit / grantDefaultDurationMs / trustSameOwnerBots。
   putBotConfig('grant-prefs'),
   // rename：`{ name }`；daemon 先走开放平台自动化，失败回落为 botmux 侧显示名并带 `warning`。
   putBotConfig('rename'),
@@ -202,6 +206,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('max-live-workers'),
   // no-progress-notify：`{ noProgressNotify: { enabled?, timeoutMs? } | null }`（null = 默认开启 + 90s）。
   putBotConfig('no-progress-notify'),
+  // prompt-cache：`{ promptCache: { ttl?, keepalive? } | null }`（null = 删除本 bot 覆盖、回落全局）。
+  putBotConfig('prompt-cache'),
   // idle-suspend-minutes：`{ idleSuspendMinutes: number | null }`（null = 关闭空闲 TTL）。
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。

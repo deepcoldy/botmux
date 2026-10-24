@@ -673,10 +673,11 @@ jobs:
     #
     # darwin: node-pty SHIPS prebuilds (`prebuilds/darwin-{x64,arm64}/`), so one
     # macOS runner can emit both arches.
-    # linux: node-pty ships NO linux prebuild — its install script is
-    # `node-gyp rebuild`, which compiles `build/Release/pty.node` for the HOST arch
-    # only. So an x64 runner cannot produce a linux-arm64 binary: the build script
-    # fails closed ("node-pty native not found for linux-arm64") rather than
+    # linux: installs run with `npm_config_build_from_source=true` (so the glibc
+    # floor and musl gates inspect what we compiled, not node-pty's prebuilds), so
+    # node-pty's install script is `node-gyp rebuild`, which compiles
+    # `build/Release/pty.node` for the HOST arch only. So an x64 runner cannot
+    # produce a linux-arm64 binary: the build script fails closed ("node-pty native not found for linux-arm64") rather than
     # shipping a binary with the wrong native. Because the compile step loops with
     # `set -e`, that failure also discarded the successfully-built linux-x64 in the
     # same leg — and with the release order inverted, `binary-subpackages` and
@@ -715,8 +716,8 @@ jobs:
         if: matrix.glibc_baseline == ''
         with:
           bun-version: 1.4.3
-      # --frozen-lockfile + the platform's own install compiles node-pty's
-      # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
+      # Only the darwin leg installs here (linux installs inside the glibc-baseline
+      # container); node-pty's darwin prebuilds are what the embed plugin bundles.
       - if: matrix.glibc_baseline == ''
         run: bun install --frozen-lockfile
 
@@ -858,8 +859,9 @@ jobs:
     # job itself runs on the plain glibc runner.
     #
     # WHY A SEPARATE JOB: `pty.node` is embedded into the binary at build time, and
-    # node-pty ships NO linux prebuild — so the builder compiles it against whatever
-    # libc it runs on. Measured: on a glibc host the result is
+    # node-pty's linux prebuilds are glibc-only — so musl needs a from-source
+    # compile, which links against whatever libc the builder runs on. Measured: on a
+    # glibc host the result is
     # `NEEDED libc.so.6`; inside node:22-alpine it is `NEEDED libc.musl-x86_64.so.1`.
     # Cross-compiling a musl target from the glibc runner would therefore embed a
     # glibc native and fail at PTY spawn on Alpine — at RUNTIME, silently, not at
@@ -924,7 +926,10 @@ jobs:
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the whole point of this job.
-              bun install --frozen-lockfile
+              # build_from_source makes node-pty'"'"'s install script delete its
+              # (glibc) prebuilds and run node-gyp. It only takes effect when
+              # node-pty is actually (re)installed — a clean checkout here.
+              npm_config_build_from_source=true bun install --frozen-lockfile
 
               # Fail closed rather than shipping a glibc native inside a musl
               # binary: that mistake survives the build and only surfaces when the

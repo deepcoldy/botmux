@@ -49,6 +49,11 @@ import {
   type RunNode,
   type ValidateManifest,
 } from '../src/workflows/v3/contract.js';
+import {
+  freezeDagBotSnapshots,
+  parseFrozenBotSnapshots,
+  serializeFrozenBotSnapshots,
+} from '../src/workflows/v3/bot-resolve.js';
 
 const TWO_NODE = {
   runId: 'demo-001',
@@ -850,8 +855,7 @@ describe('human-gate 文件等待存储', () => {
 });
 
 describe('runtime CLI 白名单守卫', () => {
-  it('白名单包含五个已验证 /goal 的 CLI', () => {
-    expect(V3_SUPPORTED_CLIS).toEqual(['claude-code', 'codex', 'seed', 'traex', 'relay']);
+  it('白名单里的 CLI 都通过守卫，未验证 /goal 的 CLI 被拒', () => {
     for (const cliId of V3_SUPPORTED_CLIS) expect(isV3SupportedCli(cliId)).toBe(true);
     expect(isV3SupportedCli('gemini')).toBe(false);
   });
@@ -909,6 +913,46 @@ describe('runtime CLI 白名单守卫', () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  it('P2-1 契约：isV3SupportedCli 显式承认 minimax（不依赖允许列表派生）', () => {
+    expect(isV3SupportedCli('minimax')).toBe(true);
+  });
+
+  it('P2-1 行为：minimax bot 穿过 freezeDagBotSnapshots 真闸门并经 parseFrozenBotSnapshots 回读', () => {
+    const dag = validateDag({
+      runId: 'minimax-freeze',
+      nodes: [{ id: 'n', type: 'goal', goal: 'g', bot: 'cli_minimax', depends: [], inputs: [] }],
+    });
+    const bots = [{
+      larkAppId: 'cli_minimax',
+      larkAppSecret: 'secret',
+      cliId: 'minimax',
+      name: 'mmx',
+      workingDir: '/tmp',
+    }] as unknown as Parameters<typeof freezeDagBotSnapshots>[1];
+
+    // Goes through the real freeze gate (which throws on unsupported CLIs).
+    const snapshots = freezeDagBotSnapshots(dag, bots);
+    const frozen = snapshots.get('cli_minimax')!;
+    expect(frozen.cliId).toBe('minimax');
+
+    // And survives the real persisted-snapshot parse gate unchanged.
+    const restored = parseFrozenBotSnapshots(serializeFrozenBotSnapshots(snapshots)).get('cli_minimax')!;
+    expect(restored.cliId).toBe('minimax');
+    expect(restored.larkAppId).toBe('cli_minimax');
+  });
+
+  it('P2-1 守门：freezeDagBotSnapshots 对不在允许列表的 CLI 抛错（闸门真实生效）', () => {
+    const dag = validateDag({
+      runId: 'gemini-freeze',
+      nodes: [{ id: 'n', type: 'goal', goal: 'g', bot: 'cli_gemini', depends: [], inputs: [] }],
+    });
+    const bots = [{
+      larkAppId: 'cli_gemini', larkAppSecret: 'secret', cliId: 'gemini',
+      name: 'gem', workingDir: '/tmp',
+    }] as unknown as Parameters<typeof freezeDagBotSnapshots>[1];
+    expect(() => freezeDagBotSnapshots(dag, bots)).toThrow(/unsupported CLI/);
   });
 });
 

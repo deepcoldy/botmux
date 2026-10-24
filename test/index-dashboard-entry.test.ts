@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import {
   DASHBOARD_ENV_ALLOWLIST,
   isDashboardEnvKey,
@@ -48,73 +48,50 @@ import { DASHBOARD_H5_ENV_KEYS } from '../src/utils/child-env.js';
 const read = (rel: string) =>
   readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
 
+/** Relative paths (under src/) of every module reachable from `entry` through
+ *  STATIC value imports/re-exports, i.e. everything ESM evaluates before the
+ *  entry's own body runs. `import type` is erased and dynamic import() is lazy. */
+function staticImportClosure(entry: string): Set<string> {
+  const seen = new Set<string>();
+  const specifier = /(?:^|;)\s*(?:import|export)\s+(?!type\b)(?:[^'";]*?\sfrom\s+)?['"](\.{1,2}\/[^'"]+)['"]/gm;
+  const visit = (rel: string) => {
+    if (seen.has(rel)) return;
+    seen.add(rel);
+    for (const match of read(rel).matchAll(specifier)) {
+      const next = posix.normalize(posix.join(posix.dirname(rel), match[1].replace(/\.js$/, '.ts')));
+      if (existsSync(new URL(`../src/${next}`, import.meta.url))) visit(next);
+    }
+  };
+  visit(entry);
+  return seen;
+}
+
 describe('index-dashboard.ts — Dashboard PM2 entry', () => {
-  it('loads ~/.botmux/.env BEFORE dynamically importing dashboard.js', () => {
+  // 源码结构护栏(K1)：ESM 先求值整张静态 import 图再跑入口正文，所以「先 load ~/.botmux/.env、再动态
+  // import dashboard.js」只能靠模块结构保证——静态图里一旦出现 config.ts（模块级读 process.env）或
+  // dashboard.ts，H5 登录凭据就会在 load 之前被快照成未配置。真跑入口要起 HTTP 服务并依赖 dist/，见文件头注释。
+  it('evaluates the allowlisted .env load before anything that snapshots process.env', () => {
     const src = read('index-dashboard.ts');
     const loadAt = src.indexOf('loadDashboardEnvFile(');
-    const importAt = src.indexOf("await import('./dashboard.js')");
+    const importAt = src.search(/await import\(\s*['"]\.\/dashboard\.js['"]\s*\)/);
     expect(loadAt).toBeGreaterThan(-1);
     expect(importAt).toBeGreaterThan(loadAt);
-  });
 
-  it('never calls dotenv itself — the file goes through the allowlisted loader', () => {
-    // A bare `dotenvConfig({ path })` here would flood process.env with every
-    // credential in ~/.botmux/.env again, and this process forks debug shells /
-    // start-bot / npm-install children that inherit it.
-    const src = read('index-dashboard.ts');
-    expect(src).not.toMatch(/from\s+['"]dotenv['"]/);
-    expect(src).not.toMatch(/dotenvConfig\(/);
-  });
-
-  it('uses the same .env path fallback as index-daemon.ts', () => {
-    // One path contract for both managed cores: ~/.botmux/.env, falling back
-    // to a cwd .env — an entry that resolved the file differently would split
-    // daemon and dashboard onto different config sources.
-    for (const rel of ['index-dashboard.ts', 'index-daemon.ts']) {
-      const src = read(rel);
-      expect(src, rel).toContain("join(homedir(), '.botmux', '.env')");
-      expect(src, rel).toContain("existsSync(globalEnv) ? globalEnv : '.env'");
+    const closure = staticImportClosure('index-dashboard.ts');
+    expect(closure).toContain('utils/dashboard-env.ts');
+    for (const rel of closure) {
+      expect(rel, 'index-dashboard.ts statically reaches a module that evaluates config.ts / dashboard.ts early')
+        .not.toMatch(/^(config|dashboard)\.ts$|^dashboard\//);
     }
   });
 
-  it('contains no static import of ./dashboard.js (hoisting would defeat dotenv)', () => {
-    const src = read('index-dashboard.ts');
-    // Any static form is hoisted and evaluated before the entry body. Two
-    // complementary patterns: the single-line one catches the bare side-effect
-    // form (`import './dashboard.js'`), the `from` one catches default/named
-    // forms even when the specifier list spans lines.
-    expect(src).not.toMatch(/^\s*import\s+[^=\n]*['"]\.\/dashboard\.js['"]/m);
-    expect(src).not.toMatch(/from\s+['"]\.\/dashboard\.js['"]/);
-    expect(src).toContain("await import('./dashboard.js')");
-  });
-
-  it('statically imports nothing that would evaluate config.ts early', () => {
-    // The entry may only lean on side-effect-free utils before dotenv runs.
-    // A static './config.js' — or any './dashboard/...' module, whose imports
-    // reach config.ts — would capture pre-dotenv process.env.
-    const src = read('index-dashboard.ts');
-    expect(src).not.toMatch(/^\s*import\s+[^=\n]*['"]\.\/config\.js['"]/m);
-    expect(src).not.toMatch(/from\s+['"]\.\/config\.js['"]/);
-    expect(src).not.toMatch(/^\s*import\s+[^=\n]*['"]\.\/dashboard\//m);
-    expect(src).not.toMatch(/from\s+['"]\.\/dashboard\//);
-  });
-
-  it('dashboard.ts itself stays dotenv-free', () => {
-    // Guards against someone "saving a file" by moving the dotenv call into
-    // dashboard.ts: its own static imports (config.ts included) evaluate
-    // before its first statement, so that dotenv would land too late — while
-    // making the entry file LOOK redundant and safe to delete.
-    expect(read('dashboard.ts')).not.toMatch(/dotenv/);
-  });
-
-  it('the env loader itself stays out of config.ts’s import graph', () => {
-    // Same hoisting hazard as the entry: utils/dashboard-env.ts is imported
-    // STATICALLY by index-dashboard.ts, so anything it pulls in evaluates
-    // before the file is even read. config.ts reads process.env at module
-    // level — reaching it from here would snapshot the pre-load environment.
-    const src = read('utils/dashboard-env.ts');
-    expect(src).not.toMatch(/from\s+['"]\.\.\/config\.js['"]/);
-    expect(src).not.toMatch(/from\s+['"]\.\.\/dashboard\//);
+  // 源码结构护栏(K2)：~/.botmux/.env 常含与 dashboard 无关的凭据，而 dashboard 会 fork start-bot / 全局 install /
+  // 插件服务等子进程继承 process.env，所以只能经 allowlist 加载器（utils/dashboard-env.ts，下方行为测试覆盖）。
+  // 入口或 dashboard.ts 里出现整包 dotenv，就会把全部凭据灌进进程环境（P1-9「.env secret 扩散」）。
+  it('never loads .env wholesale in the entry or in dashboard.ts', () => {
+    for (const rel of ['index-dashboard.ts', 'dashboard.ts']) {
+      expect(read(rel), rel).not.toMatch(/from\s+['"]dotenv['"]|require\(\s*['"]dotenv['"]\s*\)/);
+    }
   });
 });
 
@@ -151,6 +128,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     'BOTMUX_PUBLIC_URL=https://botmux.example.com',
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH=/var/lib/botmux/audit.ndjson',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS=300000',
+    'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+    'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED=true',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID=cli_h5app',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET=h5-app-secret',
@@ -175,6 +154,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     expect(env.BOTMUX_PUBLIC_URL).toBe('https://botmux.example.com');
     expect(env.BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH).toBe('/var/lib/botmux/audit.ndjson');
     expect(env.BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS).toBe('300000');
+    expect(env.BOTMUX_GLOBAL_CONFIG_FILE).toBe('/mnt/shared/global-config.json');
+    expect(env.BOTMUX_GROUP_CONTEXT_SETTINGS_FILE).toBe('/mnt/shared/group-context-settings.json');
     // The dashboard IS the H5 family's only legitimate consumer — this entry
     // point exists to deliver it (resolveDashboardH5AuthConfig reads it).
     expect(env.BOTMUX_DASHBOARD_FEISHU_H5_ENABLED).toBe('true');

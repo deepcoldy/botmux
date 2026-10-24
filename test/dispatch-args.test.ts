@@ -18,6 +18,7 @@ describe('parseDispatchArgs', () => {
       '--model=gpt-6-astra',
       '--reasoning-effort', 'high',
       '--into', 'om_root',
+      '--result-delivery=publish-and-relay',
       '--session-id=sid',
       '--standby',
       '--steer',
@@ -34,6 +35,7 @@ describe('parseDispatchArgs', () => {
         model: 'gpt-6-astra',
         reasoningEffort: 'high',
         into: 'om_root',
+        resultDelivery: 'publish-and-relay',
         sessionId: 'sid',
         standby: true,
         steer: true,
@@ -44,6 +46,11 @@ describe('parseDispatchArgs', () => {
   it('keeps --brief text verbatim', () => {
     const result = parseDispatchArgs(['--title', 't', '--bot-app', 'cli_a', '--brief', '  keep me  ']);
     expect(result).toMatchObject({ ok: true, value: { brief: '  keep me  ' } });
+  });
+
+  it('parses an explicit result delivery mode for downstream validation', () => {
+    expect(parseDispatchArgs(['--result-delivery', 'publish']))
+      .toMatchObject({ ok: true, value: { resultDelivery: 'publish' } });
   });
 
   it('preserves explicit empty values for downstream legacy validation and fallback', () => {

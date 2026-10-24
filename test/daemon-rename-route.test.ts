@@ -244,12 +244,19 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
-import { sessionIdentityPath } from '../src/core/cli-identity.js';
-import { _resetForTest as resetAsks, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk } from '../src/core/ask-broker.js';
 import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
-import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
-import type { PendingAsk } from '../src/core/ask-types.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { setCardDispatcher, setCanTalkChecker, listPendingAsksByAnchor, submitAsk, submitCustomReply, invalidateAll } from '../src/core/ask-broker.js';
+import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { __testOnly_setScheduleAuthorityStore } from '../src/daemon.js';
+import type { PendingAsk } from '../src/core/ask-types.js';
+import { canOperate, evaluateAskAnswerTalk } from '../src/im/lark/event-dispatcher.js';
+import type { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+
+import { sessionIdentityPath } from '../src/core/cli-identity.js';
+import { _resetForTest as resetAsks, registerAsk } from '../src/core/ask-broker.js';
+import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -313,6 +320,59 @@ describe('document Ask production routing', () => {
       } finally { await server.close(); }
     },
   );
+
+  it.each(['button', 'dm-text'] as const)('keeps async document questions private and preserves their reply route after completion: %s', async answerMode => {
+    const ds = seedDocument();
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex-app',
+      allowedUsers: [OWNER], codexAppCleanInput: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    ds.session.cliId = 'codex-app';
+    ds.session.cliSessionId = 'native-document-thread';
+    ds.session.workerGeneration = 4;
+    ds.session.ownerOpenId = 'ou_unrelated_owner';
+    ds.workingDir = '/tmp';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    let card: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_async_document_card' }; } });
+    const secret = 'async-document-ask-secret';
+    setIpcAuthSecret(secret);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    try {
+      const response = fetchDaemonIpc(server.port, '/api/asks', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: APP, chatId: ds.chatId,
+          rootMessageId: null, questions, timeoutMs: 1000, originTurnId: 'turn-A',
+          originKind: 'native-user-input-async', requestId: 'call_document',
+          asyncUserInput: { threadId: 'native-document-thread', itemId: 'call_document' } }),
+      }, secret);
+      await vi.waitFor(() => expect(card).toBeDefined());
+      expect(card).toMatchObject({ answererOpenId: OWNER,
+        deliveryTarget: { kind: 'document-author', openId: OWNER, turnId: 'turn-A' } });
+      expect(card!.replyCardTarget).toBeUndefined();
+      // Completion may consume the original comment target before a human answers.
+      delete ds.session.docCommentTargets!['turn-A'];
+      ds.session.docCommentTargets!['turn-B'] = { fileToken: 'other-file', fileType: 'docx',
+        commentId: 'other-comment', turnId: 'turn-B', replyToOpenId: 'ou_other_author' };
+      if (answerMode === 'button') {
+        expect(submitAsk({ askId: card!.askId, nonce: card!.nonce, by: OWNER, selections: [['yes']] })).toBe('accepted');
+      } else {
+        const data = makeEventData('om_async_document_answer', 'Preserve labels');
+        data.message.parent_id = 'om_async_document_card';
+        data.message.chat_type = 'p2p';
+        await handleNewTopic(data, { ...makeCtx('om_async_document_card', 'om_async_document_answer'), chatType: 'p2p' });
+      }
+      expect((await response).status).toBe(200);
+      const answers = send.mock.calls.map(([message]) => message).filter(message => message.type === 'message');
+      expect(answers).toHaveLength(1);
+      expect(answers[0].codexAppInput.text).toContain('call_document');
+      expect(answers[0].trustedCaller.requestUserOpenId).toBe(OWNER);
+      expect(ds.session.docCommentTargets![answers[0].turnId]).toMatchObject({ fileToken: 'fixture', fileType: 'docx',
+        commentId: 'comment', replyToOpenId: OWNER, turnId: answers[0].turnId });
+      expect(ds.session.cliSessionId).toBe('native-document-thread');
+      expect(mocks.createSession).not.toHaveBeenCalled();
+    } finally { invalidateAll('fixture cleanup'); await server.close(); setIpcAuthSecret(null); }
+  });
 
   it.each(['new-topic', 'thread'])('DM %s reply answers the document without starting another CLI', async route => {
     let card!: PendingAsk;
@@ -711,6 +771,261 @@ describe('/rename production routing — must not pre-create a session (review P
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+  });
+
+  describe('async Ask production HTTP route and inbound answer wiring', () => {
+    async function setup(scope: 'chat' | 'thread' = 'thread') {
+      const root = scope === 'thread' ? 'om_async_review_root' : CHAT;
+      const ds = seedThreadSession(root, 'async review');
+      ds.scope = scope; ds.session.scope = scope;
+      ds.session.cliId = 'codex-app'; ds.session.cliSessionId = 'native-review-thread';
+      ds.session.workerGeneration = 7; ds.workingDir = '/tmp';
+      ds.session.ownerOpenId = OWNER;
+      const send = vi.fn(); ds.worker = { killed: false, send } as any;
+      const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
+        allowedUsers: [OWNER, 'ou_bystander'], codexAppCleanInput: true });
+      bot.resolvedAllowedUsers = [OWNER, 'ou_bystander'];
+      setActiveSessionsRegistry(activeSessions);
+      setCanTalkChecker((_app, _chat, by) => [OWNER, 'ou_bystander'].includes(by));
+      const cards: PendingAsk[] = [];
+      setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: `om_async_card_${cards.length}` }; } });
+      setIpcAuthSecret('async-review-fixture-secret');
+      const server = await startIpcServer({ host: '127.0.0.1', port: 0, authRequired: true });
+      function post(itemId: string, originTurnId = 'om_async_origin', text = false, timeoutMs = 60_000) {
+        return fetchDaemonIpc(server.port, '/api/asks', { method: 'POST',
+          body: JSON.stringify({ sessionId: ds.session.sessionId, chatId: CHAT, larkAppId: APP,
+            rootMessageId: scope === 'thread' ? root : null, originKind: 'native-user-input-async',
+            requestId: itemId, asyncUserInput: { threadId: 'native-review-thread', itemId },
+            originTurnId, timeoutMs,
+            questions: [{ prompt: 'Choose?', multiSelect: false, options: text ? [] : [{ key: 'o0', label: 'Only option' }],
+              ...(text ? { inputMode: 'text' } : {}) }],
+          }), headers: { 'content-type': 'application/json' },
+        }, 'async-review-fixture-secret');
+      }
+      async function close() {
+        invalidateAll('fixture cleanup'); await server.close();
+        setIpcAuthSecret(null); setActiveSessionsRegistry(undefined);
+      }
+      return { ds, root, send, cards, post, close, bot };
+    }
+
+    it.each(['codex-app', 'claude-code'] as const)('uses the frozen CLI snapshot for async card admission: %s', async cliId => {
+      const h = await setup();
+      try {
+        h.ds.session.cliId = cliId === 'codex-app' ? 'claude-code' : 'codex-app';
+        h.bot.config.cliId = h.ds.session.cliId;
+        h.ds.session.cliLaunchSnapshot = { cliId } as NonNullable<typeof h.ds.session.cliLaunchSnapshot>;
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: OWNER });
+        const response = h.post('call_snapshot', 'om_async_origin', false, 1000);
+        if (cliId === 'codex-app') {
+          await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+          expect(submitAsk({ askId: h.cards[0].askId, nonce: h.cards[0].nonce,
+            by: OWNER, selections: [['o0']] })).toBe('accepted');
+          expect((await response).status).toBe(200);
+          expect(h.send.mock.calls.some(([message]) => message.type === 'message')).toBe(true);
+        } else {
+          expect((await response).status).toBe(409);
+          expect(h.cards).toHaveLength(0);
+          expect(h.send).not.toHaveBeenCalled();
+        }
+      } finally { await h.close(); }
+    });
+
+    it.each(['thread', 'chat'] as const)('keeps talk-only human origin parity with blocking card clicks in %s scope', async scope => {
+      const h = await setup(scope);
+      const caller = 'ou_talk_only';
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        h.bot.config.allowedChatGroups = [CHAT];
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, caller)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, caller, 'group')).toBe(true);
+        beginReplyTargetTurn(h.ds, scope === 'thread' ? h.root : undefined, 'om_async_origin', NOW,
+          { senderOpenId: caller });
+        const response = h.post('call_talk_only');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+        const card = h.cards[0];
+        expect(card.answererOpenId).toBe(caller);
+        // canTalk admits the card; the frozen origin still controls who may answer.
+        expect(evaluateAskAnswerTalk(APP, CHAT, OWNER, 'group')).toBe(true);
+        expect(submitAsk({ askId: card.askId, nonce: card.nonce, by: OWNER,
+          selections: [['o0']] })).toBe('unauthorized');
+        expect(submitAsk({ askId: card.askId, nonce: card.nonce, by: caller,
+          selections: [['o0']] })).toBe('accepted');
+        expect((await response).status).toBe(200);
+        const answers = h.send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+        expect(answers).toHaveLength(1);
+        expect(answers[0].trustedCaller.requestUserOpenId).toBe(caller);
+        expect(answers[0].codexAppInput.text).toContain('call_talk_only');
+        expect(h.ds.session.cliSessionId).toBe('native-review-thread');
+      } finally { await h.close(); }
+    });
+
+    it.each(['ungranted', 'blocked'] as const)('refuses a frozen human origin without canTalk and shows a notice: %s', async mode => {
+      const h = await setup();
+      const caller = 'ou_ungranted';
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        if (mode === 'blocked') {
+          h.bot.config.allowedChatGroups = [CHAT];
+          h.bot.resolvedBlockedUsers = [caller];
+        }
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, caller)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, caller, 'group')).toBe(false);
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: caller });
+        // Keep denial regressions bounded: an incorrectly admitted card times out
+        // with HTTP 200, which must fail the explicit 409 assertion below.
+        const response = await h.post('call_no_talk', 'om_async_origin', false, 1000);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error).toBe('async_question_origin_unavailable');
+        expect(h.cards).toHaveLength(0);
+        expect(repliedText()).toContain('身份不可用');
+        expect(h.send).not.toHaveBeenCalled();
+      } finally { await h.close(); }
+    });
+
+    it('keeps canOperate authority for scheduled creators even when they have canTalk', async () => {
+      const h = await setup('chat');
+      const creator = 'ou_talk_only_creator';
+      const previous = __testOnly_setScheduleAuthorityStore({ getRecord: () => ({ task: {
+        id: 'abcd1234', larkAppId: APP, chatId: CHAT, ownerOpenId: creator,
+        enabled: false, disabledReason: 'once_completed',
+      } }) } as unknown as ScheduleAuthorityStore);
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        h.bot.config.allowedChatGroups = [CHAT];
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, creator)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, creator, 'group')).toBe(true);
+        const response = await h.post('call_schedule_talk_only',
+          'schedule:abcd1234:00000000-0000-0000-0000-000000000001', false, 1000);
+        expect(response.status).toBe(409);
+        expect(h.cards).toHaveLength(0);
+        expect(repliedText()).toContain('身份不可用');
+        expect(h.send).not.toHaveBeenCalled();
+      } finally { __testOnly_setScheduleAuthorityStore(previous); await h.close(); }
+    });
+
+    it.each(['interjection', 'eviction'] as const)('freezes A at registration and still delivers after %s', async mode => {
+      const h = await setup();
+      try {
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: OWNER });
+        const response = h.post('call_freeze');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+        const card = h.cards[0];
+        expect(card.answererOpenId).toBe(OWNER);
+        expect(submitCustomReply({ askId: card.askId, by: 'ou_bystander', text: 'no' })).toBe('unauthorized');
+        if (mode === 'interjection') {
+          const data = makeEventData('om_async_interjection', 'new ordinary task', h.root);
+          data.sender.sender_id.open_id = 'ou_bystander';
+          await handleThreadReply(data, makeCtx(h.root, 'om_async_interjection'));
+          expect(h.ds.session.lastCallerOpenId).toBe('ou_bystander');
+        } else {
+          for (let n = 0; n < 40; n++) beginReplyTargetTurn(h.ds, h.root, `om_new_${n}`,
+            new Date(Date.now() + n).toISOString(), { senderOpenId: 'ou_bystander' });
+          expect(pickTurnReplyTarget(h.ds.session, 'om_async_origin')).toBeUndefined();
+        }
+        expect(submitCustomReply({ askId: card.askId, by: OWNER, text: 'yes' })).toBe('accepted');
+        const res = await response; expect(res.status).toBe(200);
+        const turns = h.send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+        expect(turns.at(-1).codexAppInput.text).toContain('call_freeze');
+        expect(turns.at(-1).trustedCaller.requestUserOpenId).toBe(OWNER);
+        expect(h.ds.session.cliSessionId).toBe('native-review-thread');
+      } finally { await h.close(); }
+    });
+
+    it.each(['normal', 'legacy-owner', 'revoked', 'silent'] as const)('handles non-shared scheduled origins after the fire ended: %s', async mode => {
+      const h = await setup('chat');
+      const previous = __testOnly_setScheduleAuthorityStore({ getRecord: () => ({ task: {
+        id: 'abcd1234', larkAppId: APP, chatId: CHAT, ownerOpenId: mode === 'revoked' ? 'ou_removed' : mode === 'legacy-owner' ? undefined : OWNER,
+        silent: mode === 'silent', enabled: false, disabledReason: 'once_completed',
+      } }) } as unknown as ScheduleAuthorityStore);
+      try {
+        const response = h.post('call_schedule', 'schedule:abcd1234:00000000-0000-0000-0000-000000000001');
+        if (mode === 'normal' || mode === 'legacy-owner') {
+          await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+          expect(h.cards[0].answererOpenId).toBeUndefined();
+          expect(submitCustomReply({ askId: h.cards[0].askId, by: 'ou_bystander', text: 'on duty' })).toBe('accepted');
+          expect((await response).status).toBe(200);
+          const turn = h.send.mock.calls.map(([m]) => m).find(m => m.type === 'message');
+          expect(turn.trustedCaller.requestUserOpenId).toBe('ou_bystander');
+          expect(turn.codexAppInput.text).toContain('call_schedule');
+        } else {
+          const res = await response;
+          expect(res.status).toBe(mode === 'silent' ? 200 : 409);
+          expect(h.cards).toHaveLength(0);
+          if (mode === 'revoked') expect(repliedText()).toContain('身份不可用');
+          else expect(mocks.replyMessage).not.toHaveBeenCalled();
+        }
+      } finally { __testOnly_setScheduleAuthorityStore(previous); await h.close(); }
+    });
+
+    it('preserves bot attribution when a canTalk bot answers an autonomous card', async () => {
+      const h = await setup('chat');
+      try {
+        const response = h.post('call_bot_answer', 'trigger:autonomous');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+        expect(submitCustomReply({ askId: h.cards[0].askId, by: 'ou_bystander', text: 'reply',
+          actor: { botSender: true, senderType: 'bot' } })).toBe('accepted');
+        expect((await response).status).toBe(200);
+        const turn = h.send.mock.calls.map(([m]) => m).find(m => m.type === 'message');
+        expect(turn.trustedCaller.senderType).toBe('bot');
+      } finally { await h.close(); }
+    });
+
+    it.each(['missing-identity', 'expired', 'replaced'] as const)('shows a visible failure instead of losing the answer: %s', async mode => {
+      const h = await setup();
+      try {
+        if (mode !== 'missing-identity') beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: OWNER });
+        const response = h.post('call_failure', 'om_async_origin', false, mode === 'expired' ? 1000 : 60_000);
+        if (mode === 'replaced') {
+          await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+          h.ds.session.workerGeneration = 8;
+          expect(submitCustomReply({ askId: h.cards[0].askId, by: OWNER, text: 'yes' })).toBe('accepted');
+        }
+        const res = await response;
+        expect(res.status).toBe(mode === 'expired' ? 200 : 409);
+        expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
+        expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+      } finally { await h.close(); }
+    });
+
+    it.each(['thread', 'chat'] as const)('disambiguates concurrent text cards by exact parent message in %s scope', async scope => {
+      const h = await setup(scope);
+      try {
+        beginReplyTargetTurn(h.ds, scope === 'thread' ? h.root : undefined, 'om_async_origin', NOW,
+          { senderOpenId: OWNER });
+        const one = h.post('call_one', 'om_async_origin', true);
+        const two = h.post('call_two');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(2));
+        const ctx = (id: string) => ({ ...makeCtx(h.root, id), scope });
+        for (const parent of [undefined, 'om_unrelated']) {
+          const id = parent ? 'om_bad_quote' : 'om_unquoted';
+          const data = makeEventData(id, 'ordinary input', scope === 'thread' ? h.root : undefined);
+          if (parent) data.message.parent_id = parent;
+          await handleThreadReply(data, ctx(id));
+          expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: h.root })).toHaveLength(2);
+        }
+        expect(repliedText()).toContain('多张待答卡片');
+        const quoted = makeEventData('om_quote_card', 'my voice', scope === 'thread' ? h.root : undefined);
+        quoted.message.parent_id = h.cards[0].cardMessageId ?? 'om_async_card_1';
+        await handleThreadReply(quoted, ctx('om_quote_card'));
+        expect((await one).status).toBe(200);
+        const second = h.cards[1];
+        expect(submitAsk({ askId: second.askId, nonce: second.nonce, by: OWNER, selections: [['o0']] })).toBe('accepted');
+        expect((await two).status).toBe(200);
+        const answers = h.send.mock.calls.map(([m]) => m).filter(m => m.type === 'message'
+          && m.codexAppInput?.text.includes('send_user_message_question_reply'));
+        expect(answers).toHaveLength(2);
+        expect(answers[0].codexAppInput.text).toContain('call_one');
+        expect(answers[0].codexAppInput.text).not.toContain('call_two');
+        expect(answers[1].codexAppInput.text).toContain('call_two');
+      } finally { await h.close(); }
+    });
   });
 
   it.each([false, true])('/queue missing session creates nothing (reply=%s)', async reply => {
@@ -3623,6 +3938,29 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it('drops a doc-watch prewarm whose session was closed during the owner lookup', async () => {
+    const sub = { ...docSub(`doc-prewarm-stale-${Date.now()}`), ownerOpenId: OWNER };
+    const ds = seedThreadSession(sub.sessionAnchor, 'prewarm stale');
+    const priorLastMessageAt = ds.lastMessageAt;
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.forkWorker.mockClear();
+
+    const prewarm = prewarmDocCommentSession(ds, sub);
+    await vi.waitFor(() => expect(mocks.resolveSender).toHaveBeenCalled());
+    ds.session.status = 'closed';
+    gate.resolve();
+
+    await expect(prewarm).rejects.toThrow('routing generation changed');
+    expect(ds.lastMessageAt).toBe(priorLastMessageAt);
+    expect(ds.currentTurnTitle).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
   it('durably queues live doc-watch prewarm behind activation without worker IPC', async () => {
     const sub = docSub(`doc-prewarm-live-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'prewarm live');
@@ -3645,6 +3983,22 @@ describe('document comment canonical ownership and single-flight delivery', () =
       }),
     ]);
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it('hands concurrent replies on one new comment thread to a single auto-created session', async () => {
+    const fileToken = `doc-same-thread-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+
+    await expect(Promise.all([
+      handleDocComment({ ...docCtx(sub, 'first'), commentId: 'comment-shared' }),
+      handleDocComment({ ...docCtx(sub, 'second'), commentId: 'comment-shared' }),
+    ])).resolves.toEqual([true, true]);
+
+    const owner = activeSessions.get(sessionKey(`doc:${fileToken}:comment-shared`, APP))!;
+    expect(owner).toBeDefined();
+    expect([...activeSessions.values()].filter(ds => ds.chatId === `doc:${fileToken}:comment-shared`)).toEqual([owner]);
+    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-first', 'reply-second']);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
 
   it('isolates concurrent document comment threads and reuses one thread after restart', async () => {

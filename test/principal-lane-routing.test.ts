@@ -5,8 +5,6 @@ import {
   lanePrincipalFromInbound,
   lanePrincipalKey,
   parsePrincipalLaneBinding,
-  principalLaneDisplayTarget,
-  resolveCallerLaneId,
   sourceSessionDisplayTarget,
   validPrincipalLaneBinding,
 } from '../src/core/principal-lane-routing.js';
@@ -139,18 +137,6 @@ describe('principal lane route precedence', () => {
 });
 
 describe('principal identity and legacy source migration', () => {
-  it('maps the source principal to lane 0 even when no turn is active', () => {
-    expect(resolveCallerLaneId({
-      callerPrincipalKey: callerA,
-      sourcePrincipalKey: callerA,
-    })).toBe('source');
-    expect(resolveCallerLaneId({
-      callerPrincipalKey: callerB,
-      sourcePrincipalKey: callerA,
-      indexedLaneId: 'lane-b',
-    })).toBe('lane-b');
-  });
-
   it('prefers union id and app-scopes the open-id fallback', () => {
     expect(lanePrincipalFromInbound({
       senderType: 'user', larkAppId: 'cli_1', unionId: 'on_1', openId: 'ou_1',
@@ -225,9 +211,6 @@ describe('routing/display separation', () => {
       chatId: 'oc_group',
     } as any)).toBe('om_visible');
     expect(principalLaneRoutingAnchorId(session)).toBe('lane:source:b');
-    expect(principalLaneDisplayTarget(session, sourceDisplayTarget)).toEqual({
-      scope: 'thread', larkAppId: 'cli_app', chatId: 'oc_group', rootMessageId: 'om_visible',
-    });
     expect(validPrincipalLaneBinding(lane, { displayTarget: sourceDisplayTarget })).toBe(true);
   });
 
@@ -287,10 +270,6 @@ describe('routing/display separation', () => {
     };
     expect(parsePrincipalLaneBinding(crossApp, { displayTarget: sourceDisplayTarget }))
       .toEqual({ ok: false, error: 'display_app_mismatch' });
-    expect(principalLaneDisplayTarget({
-      scope: 'thread', larkAppId: 'cli_app', chatId: 'oc_group', rootMessageId: 'om_visible',
-      principalLane: crossApp,
-    }, sourceDisplayTarget)).toBeUndefined();
   });
 
   it('fails closed for the same app with another chat or thread root', () => {

@@ -8,6 +8,7 @@ import {
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
   refreshListenerCardTextFromResolved,
+  refreshListenerForwardTextFromParsed,
   renderMessageListenerInstruction,
   renderMessageListenerPrompt,
 } from '../src/services/message-listener.js';
@@ -266,6 +267,44 @@ describe('message listener evaluation', () => {
     expect(match).toMatchObject({
       messageText: 'CPU 告警来自 REST 历史',
       msgType: 'text',
+      senderOpenId: 'ou_allowed',
+      senderType: 'user',
+    });
+  });
+
+  it('admits configured merge-forward topic roots for daemon-side expansion', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_allowed'],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+        },
+      },
+    });
+
+    const match = evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage({
+        message_type: 'merge_forward',
+        content: '{}',
+        thread_id: 'omt_forwarded_topic',
+      }),
+      senderOpenId: 'ou_allowed',
+      senderTypeRaw: 'user',
+      explicitlyMentionedThisBot: false,
+    });
+
+    expect(match).toMatchObject({
+      prompt: '阅读转发内容并响应',
+      messageText: '',
+      msgType: 'merge_forward',
       senderOpenId: 'ou_allowed',
       senderType: 'user',
     });
@@ -1122,5 +1161,91 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
       }),
     };
     expect(extractListenerMessageText(messageWithoutMention)).toBe('线上报警请关注');
+  });
+});
+
+describe('listener completion policy', () => {
+  it.each([true, false, undefined])('propagates opt-in %s to a matched message', enabled => {
+    const match = evaluateMessageListener({
+      bot: bot({ globalMessageListener: { enabled: true, prompt: 'inspect', autoCloseAfterCompletion: enabled } }),
+      chatId: 'oc_chat', message: textMessage(), senderOpenId: 'ou_user',
+      senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    });
+    expect(match).not.toBeNull();
+    expect(match?.autoCloseAfterCompletion === true).toBe(enabled === true);
+  });
+});
+
+describe('refreshListenerForwardTextFromParsed', () => {
+  it('feeds expanded merge-forward XML into the rendered listener prompt', () => {
+    const match = {
+      prompt: '阅读转发内容并响应',
+      messageText: '',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+    const expanded = '<forwarded_messages>\n<msg from="A">保存失败</msg>\n</forwarded_messages>';
+
+    refreshListenerForwardTextFromParsed(match, expanded);
+    const prompt = renderMessageListenerPrompt(match);
+
+    expect(match.messageText).toBe(expanded);
+    expect(prompt).toContain('msg_type="merge_forward"');
+    expect(prompt).toContain('&lt;forwarded_messages&gt;');
+    expect(prompt).toContain('保存失败');
+  });
+
+  it('does not overwrite other listener message types', () => {
+    const match = {
+      prompt: 'p',
+      messageText: '原始正文',
+      msgType: 'text',
+      senderType: 'user' as const,
+    };
+
+    refreshListenerForwardTextFromParsed(match, '<forwarded_messages />');
+    expect(match.messageText).toBe('原始正文');
+  });
+
+  it('does not re-fill when rerouted with the already-rendered listener prompt (CAS-loser regression)', () => {
+    // A new-topic registration that loses to an existing session re-enters the
+    // thread route carrying the same parsed object — whose content was already
+    // replaced by the rendered listener prompt. Filling again would embed the
+    // whole prompt inside <observed_message> and double-escape the body.
+    const match = {
+      prompt: '整理转发内容',
+      messageText: '',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+    const expanded = '<forwarded_messages>\n<msg from="A">转发正文：登录失败</msg>\n</forwarded_messages>';
+
+    refreshListenerForwardTextFromParsed(match, expanded);
+    const firstPrompt = renderMessageListenerPrompt(match);
+
+    // Reroute: the caller now hands back the prompt that the first render produced.
+    refreshListenerForwardTextFromParsed(match, firstPrompt);
+    const secondPrompt = renderMessageListenerPrompt(match);
+
+    expect(match.messageText).toBe(expanded);
+    expect(secondPrompt).toBe(firstPrompt);
+    // The observed body is the forwarded XML exactly once (single-escape) —
+    // never a nested listener prompt.
+    expect(secondPrompt).not.toContain('&lt;message_listener&gt;');
+    expect(secondPrompt.match(/&lt;forwarded_messages&gt;/g)).toEqual(['&lt;forwarded_messages&gt;']);
+    expect(secondPrompt).toContain('转发正文：登录失败');
+    expect(secondPrompt).not.toContain('&amp;lt;forwarded_messages&amp;gt;');
+  });
+
+  it('ignores an empty expanded body without blanking a previously filled match', () => {
+    const match = {
+      prompt: 'p',
+      messageText: '<forwarded_messages>\n<msg from="A">x</msg>\n</forwarded_messages>',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+
+    refreshListenerForwardTextFromParsed(match, '   ');
+    expect(match.messageText).toBe('<forwarded_messages>\n<msg from="A">x</msg>\n</forwarded_messages>');
   });
 });

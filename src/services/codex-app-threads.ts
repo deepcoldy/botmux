@@ -172,6 +172,12 @@ class CodexAppServerProbe {
     });
     this.unregisterForceClose = registerForceClose?.(() => this.forceClose());
     this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
+    // An app-server that stops reading (crashed, closed stdin) makes the next
+    // write fail asynchronously with EPIPE. Unhandled, that stream 'error' is
+    // thrown at process level, and the daemon runs these probes with no
+    // uncaughtException trap. Fail what is pending with the cause; every caller
+    // closes the probe (and reaps the child) on the way out.
+    this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       this.lastStderr = (this.lastStderr + chunk.toString('utf8')).slice(-8000);
     });

@@ -675,10 +675,16 @@ describe('supportsTypeAhead flag', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
   });
 
-  it('pi: exposes Working... as the explicit busy marker', () => {
+  it('pi: exposes its busy line as the explicit busy marker', () => {
     const adapter = createPiAdapter('/bin/pi');
+    // Pre-1.0 builds.
     expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    // Pi 1.3.0: spinner frame + bare `Working` in the editor's top border.
+    expect(adapter.busyPattern?.test(`── ⠴ Working ${'─'.repeat(40)}`)).toBe(true);
+    expect(adapter.busyPattern?.test(' ⠏ Working')).toBe(true);
     expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+    expect(adapter.busyPattern?.test('Working through the implementation')).toBe(false);
+    expect(adapter.busyPattern?.test('── Working ──')).toBe(false);
   });
 
   it('pi: does not squash queued botmux turns (one card per Lark turn; steer merge reconciled by the bridge queue)', () => {

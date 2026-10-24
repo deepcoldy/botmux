@@ -225,6 +225,7 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['skip_repo', { pendingRepoOwnerException: true }],
   ['repo_manual_submit', { pendingRepoOwnerException: true }],
   ['repo_worktree_submit', { pendingRepoOwnerException: true }],
+  ['repo_rebuild_worktree', NO_META],
   ['worktree_toggle_mode', NO_META],
   ['retry_last_task', NO_META],
   ['retry_turn', NO_META],
@@ -248,6 +249,9 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['compact_session', NO_META],
   ['quote_confirm', NO_META],
   ['set_reasoning_effort', NO_META],
+  // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
+  ['reply_card_menu', NO_META],
+  ['reply_model_pick', NO_META],
 ]);
 
 /** 该 action 是否过 canOperate 门；非字符串 / 未登记一律 undefined。 */

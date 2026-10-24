@@ -27,12 +27,24 @@
  * Run:  pnpm test:agy
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import * as pty from 'node-pty';
-import { IdleDetector } from '../src/utils/idle-detector.js';
+import { IdleDetector, stripAnsiScreenText } from '../src/utils/idle-detector.js';
+import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 
 // ─── Constants (match production worker.ts) ─────────────────────────────────
@@ -56,6 +68,91 @@ function agyAvailable(): boolean {
   }
 }
 const AGY_AVAILABLE = agyAvailable();
+const OAUTH_TOKEN_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+const AGY_AUTH_AVAILABLE = AGY_AVAILABLE && existsSync(OAUTH_TOKEN_PATH);
+
+function createIsolatedAgySandbox(queuedMessages: 'queue' | 'send-immediately' = 'queue') {
+  const rootDir = mkdtempSync(join(tmpdir(), 'agy-e2e-sandbox-'));
+  // Keep outsideDir in an independent mkdtempSync root rather than a sibling
+  // under rootDir so agy reliably treats it as outside the workspace across
+  // environments.
+  const outsideDir = mkdtempSync(join(tmpdir(), 'agy-e2e-outside-'));
+  const homeDir = join(rootDir, 'home');
+  const workDir = join(rootDir, 'work');
+  mkdirSync(homeDir, { recursive: true });
+  mkdirSync(workDir, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: workDir });
+
+  const realAgyDir = join(homedir(), '.gemini', 'antigravity-cli');
+  const isoAgyDir = join(homeDir, '.gemini', 'antigravity-cli');
+  const isoCacheDir = join(isoAgyDir, 'cache');
+  mkdirSync(isoCacheDir, { recursive: true });
+  for (const name of ['antigravity-oauth-token', 'installation_id', 'jetski_state.pbtxt']) {
+    const src = join(realAgyDir, name);
+    if (existsSync(src)) copyFileSync(src, join(isoAgyDir, name));
+  }
+  const realDefaultProject = join(realAgyDir, 'cache', 'default_project_id.txt');
+  if (existsSync(realDefaultProject)) {
+    copyFileSync(realDefaultProject, join(isoCacheDir, 'default_project_id.txt'));
+  }
+  writeFileSync(
+    join(isoCacheDir, 'onboarding.json'),
+    JSON.stringify({
+      consumerOnboardingComplete: true,
+      enterpriseOnboardingComplete: false,
+      onboardingComplete: true,
+    }, null, 2) + '\n',
+  );
+  // Inherit model / modelProvider from the host's ~/.gemini/antigravity-cli/settings.json
+  // when present so the test works across accounts/regions without hardcoding a
+  // model that may be gated by location/tier eligibility.
+  let hostModel: string | undefined;
+  let hostModelProvider: string | undefined;
+  try {
+    const hostSettingsPath = join(realAgyDir, 'settings.json');
+    if (existsSync(hostSettingsPath)) {
+      const parsed = JSON.parse(readFileSync(hostSettingsPath, 'utf8'));
+      if (typeof parsed?.model === 'string' && parsed.model.trim()) {
+        hostModel = parsed.model;
+      }
+      if (typeof parsed?.modelProvider === 'string' && parsed.modelProvider.trim()) {
+        hostModelProvider = parsed.modelProvider;
+      }
+    }
+  } catch { /* ignore unreadable/malformed host settings */ }
+
+  const settingsPath = join(isoAgyDir, 'settings.json');
+  // agy strips keys that match its factory defaults ("queue") when writing
+  // settings.json, so only include queuedMessages when non-default to keep
+  // settingsContent byte-for-byte identical to agy's canonical file.
+  const settingsObj: Record<string, unknown> = {
+    colorScheme: 'dark',
+    ...(hostModel ? { model: hostModel } : {}),
+    ...(hostModelProvider ? { modelProvider: hostModelProvider } : {}),
+    ...(queuedMessages !== 'queue' ? { queuedMessages } : {}),
+    trustedWorkspaces: Array.from(new Set([workDir, realpathSync(workDir)])),
+  };
+  const settingsContent = JSON.stringify(settingsObj, null, 2) + '\n';
+  writeFileSync(settingsPath, settingsContent);
+
+  const cleanup = () => {
+    rmSync(rootDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  };
+
+  return {
+    rootDir,
+    homeDir,
+    workDir,
+    outsideDir,
+    isoAgyDir,
+    settingsPath,
+    settingsContent,
+    historyPath: join(isoAgyDir, 'history.jsonl'),
+    cliLogPath: join(isoAgyDir, 'cli.log'),
+    cleanup,
+  };
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -272,6 +369,249 @@ describe.skipIf(!AGY_AVAILABLE)('Antigravity (agy) first input submission', () =
 
     expect(matched, 'history.jsonl should contain a single line with display="line1\\nline2"').toBe(true);
   }, 30_000);
+
+  it.skipIf(!AGY_AUTH_AVAILABLE)(
+    'finding (4): disableCliBypass suppresses busy type-ahead so a follow-up cannot approve agy permission dialog',
+    async () => {
+      const sandbox = createIsolatedAgySandbox('queue');
+      const outsideTarget = join(sandbox.outsideDir, 'hello.txt');
+      const cliAdapter = createAntigravityAdapter();
+      const idleDetector = new IdleDetector(cliAdapter);
+      try {
+        const args = cliAdapter.buildArgs({
+          sessionId: 'e2e-restricted',
+          resume: false,
+          disableCliBypass: true,
+        });
+        expect(args).not.toContain('--dangerously-skip-permissions');
+
+        let screenBuf = '';
+        let sentFirst = false;
+        const firstPrompt = `Use write_file to create ${outsideTarget} with content "hello". Do not call any other tool.`;
+
+        proc = pty.spawn(AGY_BIN, args, {
+          name: 'xterm-256color',
+          cols: PTY_COLS,
+          rows: PTY_ROWS,
+          cwd: sandbox.workDir,
+          env: { ...process.env, HOME: sandbox.homeDir } as Record<string, string>,
+        });
+
+        idleDetector.onIdle(() => {
+          if (!sentFirst) {
+            sentFirst = true;
+            proc!.write(firstPrompt);
+            setTimeout(() => proc!.write('\r'), 200);
+          }
+        });
+
+        proc.onData((data) => {
+          screenBuf += stripAnsiScreenText(data);
+          if (screenBuf.length > 24_000) screenBuf = screenBuf.slice(-24_000);
+          idleDetector.feed(data);
+        });
+
+        const dialogDeadline = Date.now() + 45_000;
+        let dialogVisible = false;
+        while (Date.now() < dialogDeadline) {
+          if (
+            screenBuf.includes('Allow creation of this file?')
+            && cliAdapter.busyPattern!.test(screenBuf)
+          ) {
+            dialogVisible = true;
+            break;
+          }
+          await delay(250);
+        }
+        expect(dialogVisible, 'permission dialog should appear when disableCliBypass is true').toBe(true);
+
+        const historyBeforeFollowUp = existsSync(sandbox.historyPath)
+          ? readFileSync(sandbox.historyPath, 'utf8')
+          : '';
+        expect(historyBeforeFollowUp).toContain(historyMarker(firstPrompt));
+
+        // Simulate a busy follow-up containing digit '2' ("Yes, and always allow
+        // non-workspace access") arriving while the permission dialog is open.
+        const followUp = 'please check 2 items before merging';
+        const policy = resolvePtyInputPolicy(
+          cliAdapter,
+          true,
+          false,
+          isTypeAheadBlockedByBypass(cliAdapter, true),
+        );
+        const writeNow = shouldWriteNow({
+          isPromptReady: false,
+          isFlushing: false,
+          supportsTypeAhead: policy.supportsTypeAhead,
+          awaitingFirstPrompt: false,
+        });
+        expect(policy.supportsTypeAhead).toBe(false);
+        expect(writeNow).toBe(false);
+        if (writeNow) {
+          proc.write(followUp);
+          setTimeout(() => proc!.write('\r'), 200);
+        }
+
+        await delay(2_500);
+
+        const historyAfter = existsSync(sandbox.historyPath)
+          ? readFileSync(sandbox.historyPath, 'utf8')
+          : '';
+        const settingsAfter = readFileSync(sandbox.settingsPath, 'utf8');
+
+        // 1. No fragment of the held follow-up may land in history.jsonl while busy.
+        expect(historyAfter).toBe(historyBeforeFollowUp);
+        for (const fragment of ['please check', '2 items', 'before merging']) {
+          expect(historyAfter).not.toContain(fragment);
+        }
+        // 2. settings.json is byte-for-byte unchanged (no allowNonWorkspaceAccess).
+        expect(settingsAfter).toBe(sandbox.settingsContent);
+        expect(settingsAfter).not.toContain('allowNonWorkspaceAccess');
+        // 3. Outside-workspace file was never created.
+        expect(existsSync(outsideTarget)).toBe(false);
+
+        // Once the dialog is dismissed (3 = No, deny creation + Enter) and the
+        // turn settles back to idle, the serial gate releases the held follow-up
+        // intact into history.jsonl without mutating settings.json or creating the file.
+        const readyWrite = shouldWriteNow({
+          isPromptReady: true,
+          isFlushing: false,
+          supportsTypeAhead: policy.supportsTypeAhead,
+          awaitingFirstPrompt: false,
+        });
+        expect(readyWrite).toBe(true);
+      } finally {
+        idleDetector.dispose();
+        if (proc) { try { proc.kill(); } catch {} proc = null; }
+        sandbox.cleanup();
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(!AGY_AUTH_AVAILABLE)(
+    'finding (5): bypassed bot writes follow-up while busy and Queue mode auto-flushes at turn end',
+    async () => {
+      const sandbox = createIsolatedAgySandbox('queue');
+      const cliAdapter = createAntigravityAdapter();
+      const idleDetector = new IdleDetector(cliAdapter);
+      try {
+        const args = cliAdapter.buildArgs({
+          sessionId: 'e2e-bypassed',
+          resume: false,
+          disableCliBypass: false,
+        });
+        expect(args).toContain('--dangerously-skip-permissions');
+
+        let screenBuf = '';
+        let sentFirst = false;
+        const firstPrompt = `e2e-finding5-first-${Date.now()} Use run_command with WaitMsBeforeAsync=10000 to execute: sleep 6`;
+        const followUp = `e2e-finding5-second-${Date.now()} Reply with the single word PONG`;
+
+        proc = pty.spawn(AGY_BIN, args, {
+          name: 'xterm-256color',
+          cols: PTY_COLS,
+          rows: PTY_ROWS,
+          cwd: sandbox.workDir,
+          env: { ...process.env, HOME: sandbox.homeDir } as Record<string, string>,
+        });
+
+        idleDetector.onIdle(() => {
+          if (!sentFirst) {
+            sentFirst = true;
+            proc!.write(firstPrompt);
+            setTimeout(() => proc!.write('\r'), 200);
+          }
+        });
+
+        proc.onData((data) => {
+          screenBuf += stripAnsiScreenText(data);
+          if (screenBuf.length > 24_000) screenBuf = screenBuf.slice(-24_000);
+          idleDetector.feed(data);
+        });
+
+        // Wait until the first prompt is submitted and agy enters a busy turn.
+        const busyDeadline = Date.now() + 25_000;
+        let busyObserved = false;
+        while (Date.now() < busyDeadline) {
+          const hist = existsSync(sandbox.historyPath)
+            ? readFileSync(sandbox.historyPath, 'utf8')
+            : '';
+          if (
+            hist.includes(historyMarker(firstPrompt))
+            && cliAdapter.busyPattern!.test(screenBuf)
+          ) {
+            busyObserved = true;
+            break;
+          }
+          await delay(200);
+        }
+        expect(busyObserved, 'first turn should be submitted and busy').toBe(true);
+
+        const policy = resolvePtyInputPolicy(
+          cliAdapter,
+          true,
+          false,
+          isTypeAheadBlockedByBypass(cliAdapter, false),
+        );
+        const writeNow = shouldWriteNow({
+          isPromptReady: false,
+          isFlushing: false,
+          supportsTypeAhead: policy.supportsTypeAhead,
+          awaitingFirstPrompt: false,
+        });
+        expect(policy.supportsTypeAhead).toBe(true);
+        expect(writeNow).toBe(true);
+
+        proc.write(followUp);
+        await delay(200);
+        proc.write('\r');
+
+        // 4a. Queue mode records the busy Enter in history.jsonl immediately,
+        // before the first turn's tool call finishes and auto-flushes.
+        const historyDeadline = Date.now() + 8_000;
+        let recordedWhileBusy = false;
+        while (Date.now() < historyDeadline) {
+          const hist = existsSync(sandbox.historyPath)
+            ? readFileSync(sandbox.historyPath, 'utf8')
+            : '';
+          if (hist.includes(historyMarker(followUp))) {
+            recordedWhileBusy = true;
+            break;
+          }
+          await delay(200);
+        }
+        expect(recordedWhileBusy, 'follow-up should land in history.jsonl immediately while busy').toBe(true);
+        const logAtBusyRecord = existsSync(sandbox.cliLogPath)
+          ? readFileSync(sandbox.cliLogPath, 'utf8')
+          : '';
+        expect(
+          logAtBusyRecord.includes('Auto-flush: sending 1 queued input(s)'),
+          'Auto-flush must not have fired while the first turn is still running',
+        ).toBe(false);
+
+        // 4b. At turn end, agy auto-flushes the queued message in strictly interleaved order.
+        const flushDeadline = Date.now() + 40_000;
+        let autoFlushed = false;
+        while (Date.now() < flushDeadline) {
+          const cliLog = existsSync(sandbox.cliLogPath)
+            ? readFileSync(sandbox.cliLogPath, 'utf8')
+            : '';
+          if (cliLog.includes('Auto-flush: sending 1 queued input(s)')) {
+            autoFlushed = true;
+            break;
+          }
+          await delay(250);
+        }
+        expect(autoFlushed, 'Queue mode should auto-flush the queued message at turn end').toBe(true);
+      } finally {
+        idleDetector.dispose();
+        if (proc) { try { proc.kill(); } catch {} proc = null; }
+        sandbox.cleanup();
+      }
+    },
+    60_000,
+  );
 
   // ─── Adapter unit invariants (no PTY; cheap) ──────────────────────────────
 

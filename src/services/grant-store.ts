@@ -1,10 +1,14 @@
 /**
- * 群内授权持久化：全局 allowedUsers（含 email 形式条目）+ per-chat chatGrants。
- * 写路径走 config-store 的跨进程锁；撤销在单个 RMW 内同删 chat+global（原子）。
+ * 群内授权：全局 allowedUsers（含 email 形式条目，bots.json）+ per-user talk 授权
+ * （chatGrants / globalGrants 及其额度、有效期，持久层见 grant-state-store.ts）。
+ * 授权状态的每次读改写都是一个事务（mutateGrantState），内存缓存按提交的操作回放同步；
+ * /revoke 跨 allowedUsers 与授权两类数据，走 mutateBotEntryAndGrantState。
  */
 import { getBot, getOwnerOpenId } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { mutateBotEntryAndGrantState, mutateGrantState } from './grant-state-store.js';
+import { objectGrantTx, parseGrantKey, type GrantTx } from './grant-state.js';
 import { config } from '../config.js';
 import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { logger } from '../utils/logger.js';
@@ -17,58 +21,19 @@ type Fail = { ok: false; reason: string };
 export function chatQuotaKey(chatId: string, openId: string): string { return `chat:${chatId}:${openId}`; }
 export function globalQuotaKey(openId: string): string { return `global:${openId}`; }
 
-type QuotaRec = { limit: number; used: number };
-type QuotaMap = { [k: string]: QuotaRec };
-type ExpiryRec = { expiresAt: number };
-type ExpiryMap = { [k: string]: ExpiryRec };
-
-/** 取 quotaState（容错：非对象/数组 → undefined）。entry（磁盘原始）与 bot.config 同形，通用。 */
-function getQuotaMap(o: any): QuotaMap | undefined {
-  return (o.quotaState && typeof o.quotaState === 'object' && !Array.isArray(o.quotaState)) ? o.quotaState : undefined;
-}
-/** 写/删一条 quota 记录（rec=null 删）。返回是否实际改动。空 map 删键。 */
-function setQuotaRecord(o: any, qk: string, rec: QuotaRec | null): boolean {
-  const qs = getQuotaMap(o);
-  if (rec) { o.quotaState = { ...(qs ?? {}), [qk]: rec }; return true; }
-  if (qs && qk in qs) {
-    const next = { ...qs }; delete next[qk];
-    if (Object.keys(next).length > 0) o.quotaState = next; else delete o.quotaState;
-    return true;
-  }
-  return false;
-}
 /** 授权时套额度：quota>0 → 重置为 {limit,used:0}（续杯语义）；undefined → 删记录（转无限）。 */
-function applyGrantQuota(o: any, qk: string, quota: number | undefined): boolean {
+function applyGrantQuota(tx: GrantTx, qk: string, quota: number | undefined): boolean {
   return quota !== undefined && quota > 0
-    ? setQuotaRecord(o, qk, { limit: quota, used: 0 })
-    : setQuotaRecord(o, qk, null);
+    ? tx.quotaSet(qk, { limit: quota, used: 0 })
+    : tx.quotaSet(qk, null);
 }
 
-function getExpiryMap(o: any): ExpiryMap | undefined {
-  return (o.grantExpiryState && typeof o.grantExpiryState === 'object' && !Array.isArray(o.grantExpiryState))
-    ? o.grantExpiryState
-    : undefined;
-}
-
-/** 写/删一条授权有效期；无有效期代表永久授权。 */
-function setExpiryRecord(o: any, grantKey: string, expiresAt: number | null): boolean {
-  const state = getExpiryMap(o);
-  if (expiresAt !== null) {
-    o.grantExpiryState = { ...(state ?? {}), [grantKey]: { expiresAt } };
-    return true;
-  }
-  if (!state || !(grantKey in state)) return false;
-  const next = { ...state };
-  delete next[grantKey];
-  if (Object.keys(next).length > 0) o.grantExpiryState = next;
-  else delete o.grantExpiryState;
-  return true;
-}
-
-function applyGrantExpiry(o: any, grantKey: string, expiresAt: number | undefined): boolean {
-  return typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0
-    ? setExpiryRecord(o, grantKey, expiresAt)
-    : setExpiryRecord(o, grantKey, null);
+/** 授权时套有效期；无有效期代表永久授权（删记录）。 */
+function applyGrantExpiry(tx: GrantTx, grantKey: string, expiresAt: number | undefined): boolean {
+  return tx.expirySet(
+    grantKey,
+    typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null,
+  );
 }
 
 export function getGrantExpiresAt(larkAppId: string, grantKey: string): number | undefined {
@@ -94,27 +59,16 @@ function resolvedAfterRemoval(larkAppId: string, openId: string): string[] {
 export async function addChatGrant(
   larkAppId: string, chatId: string, openId: string, quota?: number, expiresAt?: number,
 ): Promise<{ ok: true; created: boolean } | Fail> {
-  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const qk = chatQuotaKey(chatId, openId);
-  const r = await rmwBotEntry<{ created: boolean }>(larkAppId, (entry) => {
-    const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
-    const cur: string[] = Array.isArray(map[chatId]) ? map[chatId] : [];
-    const created = !cur.includes(openId);
-    if (created) cur.push(openId);
-    map[chatId] = cur;
-    entry.chatGrants = map;
+  const r = await mutateGrantState<{ created: boolean }>(larkAppId, (tx) => {
+    const created = tx.chatAdd(chatId, openId);
     // 带额度即（重）设记录；无额度则删除已有记录（转无限）。重新授权 = 续杯/重置。
-    const qChanged = applyGrantQuota(entry, qk, quota);
-    const expiryChanged = applyGrantExpiry(entry, qk, expiresAt);
+    const qChanged = applyGrantQuota(tx, qk, quota);
+    const expiryChanged = applyGrantExpiry(tx, qk, expiresAt);
     return { write: created || qChanged || expiryChanged, result: { created } };
   });
   if (!r.ok) return r;
-  if (r.result.created) {
-    const map = (bot.config.chatGrants ??= {});
-    if (!map[chatId]?.includes(openId)) map[chatId] = [...(map[chatId] ?? []), openId];
-  }
-  applyGrantQuota(bot.config, qk, quota); // 同步内存
-  applyGrantExpiry(bot.config, qk, expiresAt);
   logger.info(`[grant:${larkAppId}] +chat ${chatId} ${openId}${quota ? ` quota=${quota}` : ''}${expiresAt ? ` expiresAt=${expiresAt}` : ''}`);
   return { ok: true, created: r.result.created };
 }
@@ -126,23 +80,15 @@ export async function addChatGrant(
 export async function addGlobalGrant(
   larkAppId: string, openId: string, quota?: number, expiresAt?: number,
 ): Promise<{ ok: true; created: boolean } | Fail> {
-  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const qk = globalQuotaKey(openId);
-  const r = await rmwBotEntry<{ created: boolean }>(larkAppId, (entry) => {
-    const cur: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
-    const created = !cur.includes(openId);
-    if (created) cur.push(openId);
-    entry.globalGrants = cur;
-    const qChanged = applyGrantQuota(entry, qk, quota);
-    const expiryChanged = applyGrantExpiry(entry, qk, expiresAt);
+  const r = await mutateGrantState<{ created: boolean }>(larkAppId, (tx) => {
+    const created = tx.globalAdd(openId);
+    const qChanged = applyGrantQuota(tx, qk, quota);
+    const expiryChanged = applyGrantExpiry(tx, qk, expiresAt);
     return { write: created || qChanged || expiryChanged, result: { created } };
   });
   if (!r.ok) return r;
-  if (r.result.created && !bot.config.globalGrants?.includes(openId)) {
-    bot.config.globalGrants = [...(bot.config.globalGrants ?? []), openId];
-  }
-  applyGrantQuota(bot.config, qk, quota); // 同步内存
-  applyGrantExpiry(bot.config, qk, expiresAt);
   logger.info(`[grant:${larkAppId}] +global ${openId}${quota ? ` quota=${quota}` : ''}${expiresAt ? ` expiresAt=${expiresAt}` : ''}`);
   return { ok: true, created: r.result.created };
 }
@@ -154,28 +100,15 @@ export async function addGlobalGrant(
 export async function removeChatGrant(
   larkAppId: string, chatId: string, openId: string,
 ): Promise<{ ok: true; removed: boolean } | Fail> {
-  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const qk = chatQuotaKey(chatId, openId);
-  const r = await rmwBotEntry<{ removed: boolean }>(larkAppId, (entry) => {
-    let removed = false;
-    const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
-    if (Array.isArray(map[chatId]) && map[chatId].includes(openId)) {
-      map[chatId] = map[chatId].filter((u: string) => u !== openId);
-      if (map[chatId].length === 0) delete map[chatId];
-      entry.chatGrants = map;
-      removed = true;
-    }
-    const qChanged = setQuotaRecord(entry, qk, null);
-    const expiryChanged = setExpiryRecord(entry, qk, null);
+  const r = await mutateGrantState<{ removed: boolean }>(larkAppId, (tx) => {
+    const removed = tx.chatRemove(chatId, openId);
+    const qChanged = tx.quotaSet(qk, null);
+    const expiryChanged = tx.expirySet(qk, null);
     return { write: removed || qChanged || expiryChanged, result: { removed } };
   });
   if (!r.ok) return r;
-  if (r.result.removed && bot.config.chatGrants?.[chatId]) {
-    bot.config.chatGrants[chatId] = bot.config.chatGrants[chatId].filter(u => u !== openId);
-    if (bot.config.chatGrants[chatId].length === 0) delete bot.config.chatGrants[chatId];
-  }
-  setQuotaRecord(bot.config, qk, null);
-  setExpiryRecord(bot.config, qk, null);
   logger.info(`[grant:${larkAppId}] -chat ${chatId} ${openId} (quota exhausted/heal)`);
   return { ok: true, removed: r.result.removed };
 }
@@ -187,33 +120,21 @@ export async function removeChatGrant(
 export async function removeGlobalGrant(
   larkAppId: string, openId: string,
 ): Promise<{ ok: true; removed: boolean } | Fail> {
-  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const qk = globalQuotaKey(openId);
-  const r = await rmwBotEntry<{ removed: boolean }>(larkAppId, (entry) => {
-    let removed = false;
-    const gg: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
-    if (gg.includes(openId)) {
-      const next = gg.filter((u: string) => u !== openId);
-      if (next.length > 0) entry.globalGrants = next; else delete entry.globalGrants;
-      removed = true;
-    }
-    const qChanged = setQuotaRecord(entry, qk, null);
-    const expiryChanged = setExpiryRecord(entry, qk, null);
+  const r = await mutateGrantState<{ removed: boolean }>(larkAppId, (tx) => {
+    const removed = tx.globalRemove(openId);
+    const qChanged = tx.quotaSet(qk, null);
+    const expiryChanged = tx.expirySet(qk, null);
     return { write: removed || qChanged || expiryChanged, result: { removed } };
   });
   if (!r.ok) return r;
-  if (r.result.removed) {
-    const next = (bot.config.globalGrants ?? []).filter(u => u !== openId);
-    if (next.length > 0) bot.config.globalGrants = next; else delete bot.config.globalGrants;
-  }
-  setQuotaRecord(bot.config, qk, null);
-  setExpiryRecord(bot.config, qk, null);
   logger.info(`[grant:${larkAppId}] -global ${openId} (quota exhausted/heal)`);
   return { ok: true, removed: r.result.removed };
 }
 
 /**
- * 仅当磁盘中的过期时间仍等于观察值且确已到期时回收，避免异步清理误删刚续期的授权。
+ * 仅当持久层中的过期时间仍等于观察值且确已到期时回收，避免异步清理误删刚续期的授权。
  */
 export async function removeExpiredGrant(
   larkAppId: string,
@@ -223,51 +144,48 @@ export async function removeExpiredGrant(
   observedExpiresAt: number,
   now: number = Date.now(),
 ): Promise<{ ok: true; removed: boolean } | Fail> {
-  let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const grantKey = scope === 'chat' ? chatQuotaKey(chatId!, openId) : globalQuotaKey(openId);
-  const r = await rmwBotEntry<{ removed: boolean }>(larkAppId, (entry) => {
-    const current = getExpiryMap(entry)?.[grantKey]?.expiresAt;
+  const r = await mutateGrantState<{ removed: boolean }>(larkAppId, (tx) => {
+    const current = tx.expiryGet(grantKey);
     if (current !== observedExpiresAt || current > now) {
       return { write: false, result: { removed: false } };
     }
-    let removed = false;
-    if (scope === 'chat') {
-      const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
-      if (Array.isArray(map[chatId!]) && map[chatId!].includes(openId)) {
-        map[chatId!] = map[chatId!].filter((id: string) => id !== openId);
-        if (map[chatId!].length === 0) delete map[chatId!];
-        entry.chatGrants = map;
-        removed = true;
-      }
-    } else {
-      const grants: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
-      if (grants.includes(openId)) {
-        const next = grants.filter(id => id !== openId);
-        if (next.length > 0) entry.globalGrants = next;
-        else delete entry.globalGrants;
-        removed = true;
-      }
-    }
-    const qChanged = setQuotaRecord(entry, grantKey, null);
-    const expiryChanged = setExpiryRecord(entry, grantKey, null);
+    const removed = scope === 'chat' ? tx.chatRemove(chatId!, openId) : tx.globalRemove(openId);
+    const qChanged = tx.quotaSet(grantKey, null);
+    const expiryChanged = tx.expirySet(grantKey, null);
     return { write: removed || qChanged || expiryChanged, result: { removed } };
   });
   if (!r.ok) return r;
-
-  if (r.result.removed && getExpiryMap(bot.config)?.[grantKey]?.expiresAt === observedExpiresAt) {
-    if (scope === 'chat' && bot.config.chatGrants?.[chatId!]) {
-      bot.config.chatGrants[chatId!] = bot.config.chatGrants[chatId!].filter(id => id !== openId);
-      if (bot.config.chatGrants[chatId!].length === 0) delete bot.config.chatGrants[chatId!];
-    } else if (scope === 'global') {
-      const next = (bot.config.globalGrants ?? []).filter(id => id !== openId);
-      if (next.length > 0) bot.config.globalGrants = next;
-      else delete bot.config.globalGrants;
-    }
-    setQuotaRecord(bot.config, grantKey, null);
-    setExpiryRecord(bot.config, grantKey, null);
-    logger.info(`[grant:${larkAppId}] expired ${grantKey}`);
-  }
+  if (r.result.removed) logger.info(`[grant:${larkAppId}] expired ${grantKey}`);
   return { ok: true, removed: r.result.removed };
+}
+
+/**
+ * 回收本 bot 所有已到期的授权（成员 + 额度 + 有效期记录）。授权**只在过期时**自动回收：
+ * 平时由 grantNotExpired 在对方下一条消息时顺手清，对方此后不再说话的过期授权会一直留着，
+ * 由 daemon 启动时和定期调用本函数清掉。逐条走 removeExpiredGrant 的条件式清理，
+ * 不会误删刚续期的授权。返回实际撤掉的授权数（只剩有效期记录、成员早已不在的也会清掉，但不计入）。
+ */
+export async function sweepExpiredGrants(larkAppId: string, now: number = Date.now()): Promise<number> {
+  let expiry: { [grantKey: string]: { expiresAt: number } } | undefined;
+  try { expiry = getBot(larkAppId).config.grantExpiryState; } catch { return 0; }
+  let revoked = 0;
+  for (const [grantKey, { expiresAt }] of Object.entries(expiry ?? {})) {
+    if (expiresAt > now) continue;
+    const parsed = parseGrantKey(grantKey);
+    if (!parsed) continue;
+    const r = await removeExpiredGrant(
+      larkAppId,
+      parsed.scope,
+      parsed.scope === 'chat' ? parsed.chatId : undefined,
+      parsed.openId,
+      expiresAt,
+      now,
+    );
+    if (r.ok && r.removed) revoked++;
+  }
+  return revoked;
 }
 
 /**
@@ -297,10 +215,10 @@ export async function consumeQuota(
   type Res = { tracked: boolean; allow: boolean; exhausted: boolean; used: number; limit: number };
   const initLimitRaw = typeof defaultLimit === 'number' && Number.isInteger(defaultLimit) && defaultLimit > 0 ? defaultLimit : 0;
   const now = expiredGrant?.now ?? Date.now();
-  // grantCleared: RMW 锁内是否真的清掉了整条 grant（CAS 命中）。内存同步据此，而非从 tracked 反推。
-  let grantCleared = false;
-  const r = await rmwBotEntry<Res>(larkAppId, (entry) => {
-    // 交集原子清理（收口在同一把锁，基于**当锁快照**而非陈旧 evaluate 观察值决策）：
+  const r = await mutateGrantState<Res>(larkAppId, (tx) => {
+    // grantCleared: 事务内是否真的清掉了整条 grant（CAS 命中）；清掉了就必须落盘。
+    let grantCleared = false;
+    // 交集原子清理（收口在同一个事务，基于**事务内快照**而非陈旧 evaluate 观察值决策）：
     //   本 key 的**当前** expiry 存在且 <= now → grant 确已过期 → 原子清「成员+quota+expiry」，
     //   本条按「无记录」走 oncall default。否则（无 expiry=永久 / expiry 在未来=已续期）→ grant
     //   仍 live → 不兜 default，按现有记录消费（无记录=显式不限→保持不限）。以当前 expiry 为准，
@@ -310,25 +228,16 @@ export async function consumeQuota(
     //       且非成员）→ 走「无 expiry」分支不清，按普通 oncall 回落 default。
     let initLimit = initLimitRaw;
     if (expiredGrant) {
-      const cur = getExpiryMap(entry)?.[quotaKey]?.expiresAt;
+      const cur = tx.expiryGet(quotaKey);
       if (cur !== undefined && cur <= now) {
         // 当前 expiry 确已过期 → 原子清整条 grant，回落 default
         if (expiredGrant.scope === 'chat' && expiredGrant.chatId) {
-          const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
-          if (Array.isArray(map[expiredGrant.chatId]) && map[expiredGrant.chatId].includes(expiredGrant.openId)) {
-            map[expiredGrant.chatId] = map[expiredGrant.chatId].filter((id: string) => id !== expiredGrant.openId);
-            if (map[expiredGrant.chatId].length === 0) delete map[expiredGrant.chatId];
-            entry.chatGrants = map;
-          }
+          tx.chatRemove(expiredGrant.chatId, expiredGrant.openId);
         } else if (expiredGrant.scope === 'global') {
-          const grants: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
-          if (grants.includes(expiredGrant.openId)) {
-            const next = grants.filter(id => id !== expiredGrant.openId);
-            if (next.length > 0) entry.globalGrants = next; else delete entry.globalGrants;
-          }
+          tx.globalRemove(expiredGrant.openId);
         }
-        setQuotaRecord(entry, quotaKey, null);
-        setExpiryRecord(entry, quotaKey, null);
+        tx.quotaSet(quotaKey, null);
+        tx.expirySet(quotaKey, null);
         grantCleared = true;
       } else {
         // 当前无 expiry（永久 / 已被整条清）或 expiry 在未来（已续期）→ grant 仍 live 或该用户已
@@ -336,108 +245,72 @@ export async function consumeQuota(
         //   • 仍是成员 → live grant（续期/改永久/永久不限）→ 不兜 default，按现有记录/不限消费；
         //   • 已非成员（被 revoke / 已被别处整条清）→ 普通 oncall 访客 → 回落 default（保留 initLimit）。
         const isMember = expiredGrant.scope === 'chat' && expiredGrant.chatId
-          ? !!(entry.chatGrants?.[expiredGrant.chatId]?.includes?.(expiredGrant.openId))
-          : Array.isArray(entry.globalGrants) && entry.globalGrants.includes(expiredGrant.openId);
+          ? tx.chatHas(expiredGrant.chatId, expiredGrant.openId)
+          : tx.globalHas(expiredGrant.openId);
         if (isMember) initLimit = 0; // 仍是成员且未过期 → live → 抑制 default
       }
     }
-    const qs = getQuotaMap(entry);
-    const rec = qs?.[quotaKey];
+    const rec = tx.quotaGet(quotaKey);
     if (!rec) {
       if (!initLimit) return { write: grantCleared, result: { tracked: false, allow: true, exhausted: false, used: 0, limit: 0 } };
       // 懒初始化：defaultLimit 生效，首次命中即 used=1
-      entry.quotaState = { ...(qs ?? {}), [quotaKey]: { limit: initLimit, used: 1 } };
+      tx.quotaSet(quotaKey, { limit: initLimit, used: 1 });
       return { write: true, result: { tracked: true, allow: true, exhausted: 1 >= initLimit, used: 1, limit: initLimit } };
     }
     if (rec.used >= rec.limit) {
       return { write: false, result: { tracked: true, allow: false, exhausted: true, used: rec.used, limit: rec.limit } };
     }
     const used = rec.used + 1;
-    entry.quotaState = { ...qs, [quotaKey]: { limit: rec.limit, used } };
+    tx.quotaSet(quotaKey, { limit: rec.limit, used });
     return { write: true, result: { tracked: true, allow: true, exhausted: used >= rec.limit, used, limit: rec.limit } };
   });
   if (!r.ok) throw new Error(`consumeQuota RMW failed: ${r.reason}`);
-  // 内存同步：① 若锁内清掉了整条 grant（CAS 命中）→ 先同步删内存的成员+quota+expiry；
-  //           ② 再按扣费结果同步 quota 记录（tracked 写快照 / 否则无记录）。两步独立，互不遮蔽。
-  if (grantCleared) {
-    setQuotaRecord(bot.config, quotaKey, null);
-    setExpiryRecord(bot.config, quotaKey, null);
-    if (expiredGrant!.scope === 'chat' && expiredGrant!.chatId && bot.config.chatGrants?.[expiredGrant!.chatId]) {
-      bot.config.chatGrants[expiredGrant!.chatId] = bot.config.chatGrants[expiredGrant!.chatId].filter(id => id !== expiredGrant!.openId);
-      if (bot.config.chatGrants[expiredGrant!.chatId].length === 0) delete bot.config.chatGrants[expiredGrant!.chatId];
-    } else if (expiredGrant!.scope === 'global') {
-      const next = (bot.config.globalGrants ?? []).filter(id => id !== expiredGrant!.openId);
-      if (next.length > 0) bot.config.globalGrants = next; else delete bot.config.globalGrants;
-    }
-  }
-  if (r.result.tracked) setQuotaRecord(bot.config, quotaKey, { limit: r.result.limit, used: r.result.used });
+  // 已提交的成员/额度改动已按操作回放进内存；未写盘的「已超额」也把内存额度对齐到持久层快照。
+  if (r.result.tracked) objectGrantTx(bot.config).quotaSet(quotaKey, { limit: r.result.limit, used: r.result.used });
   return r.result;
 }
 
 /**
  * Atomically charge one dispatch launch at most once. The durable receipt and
- * quota increment share the bots.json RMW lock, closing the crash window
+ * quota increment share one grant-state transaction, closing the crash window
  * between an irreversible charge and admission-store commit.
  */
 export async function consumeDispatchLaunchQuotaOnce(
   input: { larkAppId: string; quotaKey: string; receiptId: string; sourceOpenId: string; grantChatId?: string },
 ): Promise<{ allow: boolean }> {
   const { larkAppId, quotaKey, receiptId, sourceOpenId, grantChatId } = input;
-  const bot = getBot(larkAppId);
+  getBot(larkAppId); // throw → 调用方 fail-closed
   const chargedAt = new Date().toISOString();
-  const r = await rmwBotEntry<{ allow: boolean; receipts: Record<string, { allow: boolean; chargedAt: string }>; quota?: QuotaRec }>(
-    larkAppId,
-    (entry) => {
-      const receipts = entry.dispatchLaunchQuotaReceipts
-        && typeof entry.dispatchLaunchQuotaReceipts === 'object'
-        && !Array.isArray(entry.dispatchLaunchQuotaReceipts)
-        ? { ...entry.dispatchLaunchQuotaReceipts }
-        : {};
-      const existing = receipts[receiptId];
-      if (existing && typeof existing.allow === 'boolean') {
-        return { write: false, result: { allow: existing.allow, receipts } };
-      }
-      const rec = getQuotaMap(entry)?.[quotaKey];
-      const chatGrantMatches = grantChatId !== undefined
-        && quotaKey === chatQuotaKey(grantChatId, sourceOpenId)
-        && Array.isArray(entry.chatGrants?.[grantChatId])
-        && entry.chatGrants[grantChatId].includes(sourceOpenId);
-      const globalGrantMatches = grantChatId === undefined
-        && quotaKey === globalQuotaKey(sourceOpenId)
-        && Array.isArray(entry.globalGrants)
-        && entry.globalGrants.includes(sourceOpenId);
-      const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
-      let quota: QuotaRec | undefined;
-      if (allow && rec) {
-        quota = { limit: rec.limit, used: rec.used + 1 };
-        entry.quotaState = { ...(getQuotaMap(entry) ?? {}), [quotaKey]: quota };
-        if (quota.used >= quota.limit) {
-          if (quotaKey.startsWith('chat:') && grantChatId && Array.isArray(entry.chatGrants?.[grantChatId])) {
-            entry.chatGrants[grantChatId] = entry.chatGrants[grantChatId].filter((id: string) => id !== sourceOpenId);
-            if (entry.chatGrants[grantChatId].length === 0) delete entry.chatGrants[grantChatId];
-          } else if (quotaKey.startsWith('global:') && Array.isArray(entry.globalGrants)) {
-            entry.globalGrants = entry.globalGrants.filter((id: string) => id !== sourceOpenId);
-          }
-          setQuotaRecord(entry, quotaKey, null);
-          setExpiryRecord(entry, quotaKey, null);
-        }
-      }
-      receipts[receiptId] = { allow, chargedAt };
-      entry.dispatchLaunchQuotaReceipts = receipts;
-      return { write: true, result: { allow, receipts, ...(quota ? { quota } : {}) } };
-    },
-  );
-  if (!r.ok) throw new Error(`dispatch launch quota RMW failed: ${r.reason}`);
-  bot.config.dispatchLaunchQuotaReceipts = r.result.receipts;
-  if (r.result.quota && r.result.quota.used === r.result.quota.limit) {
-    setQuotaRecord(bot.config, quotaKey, null);
-    setExpiryRecord(bot.config, quotaKey, null);
-    if (quotaKey.startsWith('chat:') && grantChatId && bot.config.chatGrants?.[grantChatId]) {
-      bot.config.chatGrants[grantChatId] = bot.config.chatGrants[grantChatId].filter(id => id !== sourceOpenId);
-    } else if (quotaKey.startsWith('global:')) {
-      bot.config.globalGrants = bot.config.globalGrants?.filter(id => id !== sourceOpenId);
+  const r = await mutateGrantState<{ allow: boolean }>(larkAppId, (tx) => {
+    const existing = tx.receiptGet(receiptId);
+    if (existing && typeof existing.allow === 'boolean') {
+      return { write: false, result: { allow: existing.allow } };
     }
-  } else if (r.result.quota) setQuotaRecord(bot.config, quotaKey, r.result.quota);
+    const rec = tx.quotaGet(quotaKey);
+    const chatGrantMatches = grantChatId !== undefined
+      && quotaKey === chatQuotaKey(grantChatId, sourceOpenId)
+      && tx.chatHas(grantChatId, sourceOpenId);
+    const globalGrantMatches = grantChatId === undefined
+      && quotaKey === globalQuotaKey(sourceOpenId)
+      && tx.globalHas(sourceOpenId);
+    const allow = (chatGrantMatches || globalGrantMatches) && (!rec || rec.used < rec.limit);
+    if (allow && rec) {
+      const quota = { limit: rec.limit, used: rec.used + 1 };
+      tx.quotaSet(quotaKey, quota);
+      if (quota.used >= quota.limit) {
+        if (quotaKey.startsWith('chat:') && grantChatId) {
+          tx.chatRemove(grantChatId, sourceOpenId);
+        } else if (quotaKey.startsWith('global:')) {
+          tx.globalRemove(sourceOpenId);
+        }
+        tx.quotaSet(quotaKey, null);
+        tx.expirySet(quotaKey, null);
+      }
+    }
+    tx.receiptSet(receiptId, { allow, chargedAt });
+    return { write: true, result: { allow } };
+  });
+  if (!r.ok) throw new Error(`dispatch launch quota RMW failed: ${r.reason}`);
   return { allow: r.result.allow };
 }
 
@@ -488,8 +361,9 @@ export async function removeAllowedChatGroup(
 }
 
 /**
- * 原子彻底撤销：同一 RMW 内删 chatGrants[chatId]、全局 allowedUsers（email 反查）与
- * globalGrants（全局对话授权）。三重防开放守卫只约束 allowedUsers 这一支（operate/owner 安全），
+ * 彻底撤销：同一次读改写内删 chatGrants[chatId]、全局 allowedUsers（email 反查）与
+ * globalGrants（全局对话授权）。bots.json 后端下三支同一次落盘；SQLite 后端下授权事务嵌在
+ * bots.json 锁内先提交（见 mutateBotEntryAndGrantState）。三重防开放守卫只约束 allowedUsers 这一支（operate/owner 安全），
  * chatGrants / globalGrants 是 talk-only，删空不会让 bot 对所有人开放 operate，无需守卫：
  *   #2  禁止撤销当前 owner 本人（否则 owner 身份会漂移到别人）。
  *   R2#3 移除后运行时 resolvedAllowedUsers 不能变空（catch 未解析 email 导致 resolved 空）。
@@ -510,48 +384,37 @@ export async function revokeGrant(
   }
 
   type Res = { chat: boolean; global: boolean; globalTalk: boolean };
-  const r = await rmwBotEntry<Res | { guard: 'would_open_bot' }>(larkAppId, (entry) => {
+  const r = await mutateBotEntryAndGrantState<Res | { guard: 'would_open_bot' }>(larkAppId, (entry, tx) => {
     const rawList: string[] = Array.isArray(entry.allowedUsers) ? entry.allowedUsers : [];
     const willRemoveGlobal = !!rawEntry && rawList.includes(rawEntry);
     // R3#3：在锁内、对最新磁盘快照判定——移除全局会清空 allowlist 则拒绝（防并发删空）。
     if (willRemoveGlobal && rawList.filter(u => u !== rawEntry).length === 0) {
-      return { write: false, result: { guard: 'would_open_bot' as const } };
+      return { entryChanged: false, grantsChanged: false, result: { guard: 'would_open_bot' as const } };
     }
-    let chat = false, global = false, globalTalk = false;
-    const map = (entry.chatGrants && typeof entry.chatGrants === 'object') ? entry.chatGrants : {};
-    if (Array.isArray(map[chatId]) && map[chatId].includes(openId)) {
-      map[chatId] = map[chatId].filter((u: string) => u !== openId);
-      if (map[chatId].length === 0) delete map[chatId];
-      chat = true;
-    }
-    entry.chatGrants = map;
+    const chat = tx.chatRemove(chatId, openId);
+    let global = false;
     if (willRemoveGlobal) {
       entry.allowedUsers = rawList.filter((u: string) => u !== rawEntry);
       global = true;
     }
     // 全局对话授权（talk-only）：从 globalGrants 移除 open_id。与 allowedUsers 无关，
     // 因此不受 would_open_bot 守卫约束（清空它只是收回对话权，不会让 bot 对所有人开放 operate）。
-    const gg: string[] = Array.isArray(entry.globalGrants) ? entry.globalGrants : [];
-    if (gg.includes(openId)) {
-      const next = gg.filter((u: string) => u !== openId);
-      if (next.length > 0) entry.globalGrants = next; else delete entry.globalGrants;
-      globalTalk = true;
-    }
-    // 手动 /revoke 一并清两 scope 的额度记录（与三支授权同 RMW 原子）。
-    const qChat = setQuotaRecord(entry, chatQuotaKey(chatId, openId), null);
-    const qGlobal = setQuotaRecord(entry, globalQuotaKey(openId), null);
-    const eChat = setExpiryRecord(entry, chatQuotaKey(chatId, openId), null);
-    const eGlobal = setExpiryRecord(entry, globalQuotaKey(openId), null);
-    return { write: chat || global || globalTalk || qChat || qGlobal || eChat || eGlobal, result: { chat, global, globalTalk } };
+    const globalTalk = tx.globalRemove(openId);
+    // 手动 /revoke 一并清两 scope 的额度与有效期记录（与三支授权同一次读改写）。
+    const qChat = tx.quotaSet(chatQuotaKey(chatId, openId), null);
+    const qGlobal = tx.quotaSet(globalQuotaKey(openId), null);
+    const eChat = tx.expirySet(chatQuotaKey(chatId, openId), null);
+    const eGlobal = tx.expirySet(globalQuotaKey(openId), null);
+    return {
+      entryChanged: global,
+      grantsChanged: chat || globalTalk || qChat || qGlobal || eChat || eGlobal,
+      result: { chat, global, globalTalk },
+    };
   });
   if (!r.ok) return r;
   if ('guard' in r.result) return { ok: false, reason: r.result.guard };
 
-  // 同步内存
-  if (r.result.chat && bot.config.chatGrants?.[chatId]) {
-    bot.config.chatGrants[chatId] = bot.config.chatGrants[chatId].filter(u => u !== openId);
-    if (bot.config.chatGrants[chatId].length === 0) delete bot.config.chatGrants[chatId];
-  }
+  // 授权侧的内存缓存已按提交的操作回放；这里只同步 allowedUsers 这一支。
   if (r.result.global) {
     if (rawEntry) {
       bot.config.allowedUsers = (bot.config.allowedUsers ?? []).filter(u => u !== rawEntry);
@@ -575,15 +438,6 @@ export async function revokeGrant(
     }
     republishResolvedAllowedUsersDescriptor(larkAppId, bot.resolvedAllowedUsers);
   }
-  if (r.result.globalTalk) {
-    const next = (bot.config.globalGrants ?? []).filter(u => u !== openId);
-    if (next.length > 0) bot.config.globalGrants = next; else delete bot.config.globalGrants;
-  }
-  // 同步内存额度记录（两 scope）
-  setQuotaRecord(bot.config, chatQuotaKey(chatId, openId), null);
-  setQuotaRecord(bot.config, globalQuotaKey(openId), null);
-  setExpiryRecord(bot.config, chatQuotaKey(chatId, openId), null);
-  setExpiryRecord(bot.config, globalQuotaKey(openId), null);
   logger.info(`[grant:${larkAppId}] revoke chat=${chatId} ${openId} removed=${JSON.stringify(r.result)}`);
   return { ok: true, removed: r.result };
 }

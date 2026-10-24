@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
@@ -41,7 +41,7 @@ describe('dashboard bot payload helpers', () => {
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'codexBrowser', 'writableTerminalLinkInCard', 'privateCard',
-      'cotEnabled', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
+      'cotEnabled', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
       'autoStartOnNewTopic',
@@ -56,9 +56,25 @@ describe('dashboard bot payload helpers', () => {
       'nativeSubagentRuntime',
       'sessionOwnerReminder',
       'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env', 'envKeys', 'envPolicy',
-      'riff', 'skills',
+      'riff', 'skills', 'herdr',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
+  it('passes the live oncall binding count through next to the autobound count; an older daemon yields null', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052, oncallChatCount: 0 }))
+      .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: 0 });
+    // 旧 daemon 不回 oncallChatCount：不能补成 0（会被读成「已全部解绑」），也不能拿累计数顶上。
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052 }))
+      .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: null });
+  });
+
+  it('passes the herdr placement block through to the browser, degrading non-objects to null', () => {
+    const herdr = { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr })).toMatchObject({ herdr });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ herdr: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr: null })).toMatchObject({ herdr: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { herdr: ['split'] })).toMatchObject({ herdr: null });
   });
 
   it('keeps stored env names and env policy across a page refresh (values stay write-only)', () => {
@@ -590,5 +606,40 @@ describe('dashboard bot payload helpers', () => {
     const empty = brandMapByAppId(() => { throw new Error('bots.json not found'); });
     expect(empty.size).toBe(0);
     expect(empty.get('cli_anything')).toBeUndefined();
+  });
+
+  it('offline recovery rows keep a disabled larkToolBinding from raw bots.json', () => {
+    // daemon 离线行由 sparseOverridesFromRawBotConfig 从 bots.json 摘字段喂给
+    // botDefaultsPayload；该字段缺省即开，显式 false 丢掉就会在离线时回显成开。
+    expect(sparseOverridesFromRawBotConfig({ larkToolBinding: false }).larkToolBinding).toBe(false);
+    expect(sparseOverridesFromRawBotConfig({ larkToolBinding: true }).larkToolBinding).toBe(true);
+    // 未配置 / 非法手改值：undefined，交由 payload 层按缺省（开）归一化。
+    expect(sparseOverridesFromRawBotConfig({}).larkToolBinding).toBeUndefined();
+    expect(sparseOverridesFromRawBotConfig({ larkToolBinding: 'off' }).larkToolBinding).toBeUndefined();
+
+    const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+      { larkAppId: 'cli_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+    );
+    expect(offlineRow({ larkToolBinding: false }).larkToolBinding).toBe(false);
+    expect(offlineRow({ larkToolBinding: true }).larkToolBinding).toBe(true);
+    expect(offlineRow({}).larkToolBinding).toBe(true);
+
+    // 一起搬迁的既有字段保持逐字段透传，归一化仍由 payload 层负责。
+    expect(sparseOverridesFromRawBotConfig({ askOptionLayout: { layout: 'two-col' } }).askOptionLayout)
+      .toEqual({ layout: 'two-col' });
+    const fallback = { targetAppId: 'cli_other', strategy: 'round-robin' };
+    expect(sparseOverridesFromRawBotConfig({ quotaFallbackBot: fallback }).quotaFallbackBot).toBe(fallback);
+    expect(sparseOverridesFromRawBotConfig({ autoInviteOwnerOnGroupAdd: true }).autoInviteOwnerOnGroupAdd).toBe(true);
+  });
+
+  it('trustSameOwnerBots is on by default and an explicit off survives offline recovery rows', () => {
+    const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+      { larkAppId: 'cli_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+    );
+    expect(offlineRow({}).trustSameOwnerBots).toBe(true);
+    expect(offlineRow({ trustSameOwnerBots: false }).trustSameOwnerBots).toBe(false);
+    expect(offlineRow({ trustSameOwnerBots: 'off' }).trustSameOwnerBots).toBe(true);
   });
 });

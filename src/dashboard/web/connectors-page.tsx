@@ -129,18 +129,6 @@ const emptyForm: CreateForm = {
   storePayload: true,
 };
 
-export function buildConnectorInstructionUpdateBody(
-  connector: { name: string; promptEnvelope?: { sourceName?: string } },
-  instruction: string,
-): { promptEnvelope: { sourceName: string; instruction: string } } {
-  return {
-    promptEnvelope: {
-      sourceName: connector.promptEnvelope?.sourceName || connector.name,
-      instruction,
-    },
-  };
-}
-
 export function buildConnectorTopicMessageConfig(
   mode: CreateForm['topicMessageMode'],
   rawText: string,

@@ -147,6 +147,24 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的结构化 Session helper；持久调度写操作还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。自由字符串使用单一 opaque argv token 传递，daemon 对 Remote Runner 请求再次核对当前 Chat、Topic root 和工作目录。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
 
+Bot-authored turn 的 `trustedCaller` 可以携带独立的 `botOwner`。直接调用者仍由 `requestUserOpenId/requestUserUnionId + senderType=bot` 表示；`botOwner` 只在飞书已确认发送者是 Bot、两种 sender ID 同时精确命中目标 Bot 自己的 `botActorOwnerBindings`，且配置的 Owner union_id/email 能由目标 App 的 Contact API 重新解析时生成。该字段不会从消息正文、Session owner、最近真人或中心平台团队目录推断；缺失、重复冲突、邮箱不符和解析失败均保持缺失，由需要真人凭据的 provider 失败关闭。`botOwner` 是 host 只在出站 turn 命令里铸造的字段：provider 在 `ready.recoveredTurn` 里回传的同名字段只做形状校验（形状非法仍整包拒绝），不会写回恢复 turn 的 caller，下一条出站 turn 命令会携带重新铸造的值。
+
+该映射属于接收 Bot 的部署策略，写在同一条 canonical `bots.json` 配置中；open_id 必须是接收 App 实际观察到的 source Bot open_id，union_id 使用同租户稳定值，email 必须是小写 canonical 值。多 Pod 部署的每个 bot-sent turn 都从 daemon 启动时锁定的 `BOTS_CONFIG` 路径重新读取该策略，不把单个 Pod 的热更新内存或网络文件系统 watch 当成全局权威；文件不可读、目标 Bot 缺失/重复或策略格式错误时都保持 `botOwner` 缺失。未知字段、非法 ID、重复 source open_id/union_id 会让整个 Bot 配置拒绝启动，避免安全字段拼错后静默失效：
+
+```json
+{
+  "larkAppId": "cli_target",
+  "botActorOwnerBindings": [
+    {
+      "sourceBotOpenId": "ou_source",
+      "sourceBotUnionId": "on_source",
+      "ownerUnionId": "on_owner",
+      "ownerEmail": "owner@example.com"
+    }
+  ]
+}
+```
+
 Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，schedule 写事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员。`schedule.add` 按该真人 owner/control identity 落盘；`update|remove|pause|resume|run` 只允许管理当前 Chat 中由同一 controller 创建的 direct task，仍拒绝 delegated task、跨 controller、跨群或换代后的请求。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录或运行凭据。
 
 当前 allowlist：
@@ -209,7 +227,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
     "generation": 3,
     "snapshot": {
       "context": { "usedTokens": 7274, "windowTokens": 258400, "percentUsed": 3 },
-      "tokens": { "in": 7230, "out": 44 },
+      "tokens": { "in": 7230, "out": 44, "cacheReadTokens": 6100, "cacheCreateTokens": 1000 },
       "turnTokens": { "in": 7230, "out": 44 },
       "model": "example-model",
       "reasoningEffort": "high"
@@ -220,6 +238,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - `generation` 必须等于当前远端 compute generation；旧 generation 的快照会被拒绝。
 - `context` 和 `tokens` 必须显式为对象或 `null`。缺失指标保持缺失，不得由 provider 估算。
+- `tokens.cacheReadTokens` / `tokens.cacheCreateTokens` 可选，表示累计缓存读 / 写 token，都包含在 `in` 里（不得大于 `in`）。上报后卡片显示 `缓存命中 N%`（N = cacheReadTokens / in，向下取整）；不报则不显示。
 - BotMux 严格校验非负整数、上下文百分比和运行时标签，然后把快照交给普通卡片的同一套 usage renderer。
 - 这是 v1 的可选 additive 字段：旧 provider 不上报时行为不变，旧 BotMux 会忽略该字段，因此无需增加 capability 或升级协议版本。
 - 最近一次通过校验的快照会随 Session 持久化；远端 generation 前进时自动清除，避免恢复后显示旧计算资源的数据。

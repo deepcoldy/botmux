@@ -23,8 +23,14 @@
 //
 // 安全边界：这是一个**可写宿主 shell**。HTTP 路由挂在 dashboard auth gate 之后并额外要求
 // `legacyAuthed`（dashboard.ts）；WS upgrade 不经 HTTP 门禁，在本模块内显式校验「管理
-// cookie **且** legacy 管理身份」，平台隧道注入的角色（含平台 owner）一律拒，`Origin: null`
-// 拒死。可信 Origin 档位见 dashboard/control-csrf.ts 的 classifyManagementUpgrade。
+// cookie **且** legacy 管理身份」，带平台角色头（`X-Botmux-Role`，如 `t-` 终端分享子域）的
+// 请求一律拒（角色头只在本机已绑定平台、且值是 owner/teammate/guest 之一时生效，见
+// request-identity.ts），`Origin: null` 拒死。可信 Origin 档位见 dashboard/control-csrf.ts 的
+// classifyManagementUpgrade。
+//
+// 注意：中心平台的机器 Dashboard（`m-` 子域）反代**故意不注入角色头**（平台侧决定：协管者
+// 与机器主人等能力），所以从那里进来的机器主人和协管者在本机都解析成 legacy 管理身份，
+// 能用宿主终端——与原调试终端、write-link 等 legacy-only 的面同一口径。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -39,6 +45,7 @@ import { logger } from '../utils/logger.js';
 import { isExecutable, locateExecutable } from '../utils/executable.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { redactChildEnv } from '../utils/child-env.js';
+import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../adapters/backend/tmux-socket.js';
 import { parseCookie } from './auth.js';
 import {
   HOST_TERMINAL_API,
@@ -131,14 +138,20 @@ export interface HostTerminalDeps {
   /**
    * 本请求是否解析成 **legacy-dashboard 管理身份**——与 `/api/host-terminal` 的 HTTP 门禁
    * （dashboard.ts 的 `legacyAuthed`）同一口径。只比 cookie 不够：中心化平台隧道会剥掉
-   * 浏览器 Cookie、注入本机活跃 cookie，真实角色放在 `X-Botmux-Role`；cookie 对上只说明
-   * 走了平台隧道，不说明发起人是本机 owner。必填（不给默认值），漏接线在类型层报错。
+   * 浏览器 Cookie、注入本机活跃 cookie，带 `X-Botmux-Role` 的请求（终端分享子域等）cookie
+   * 也对得上，但身份是平台角色、不是本机管理身份。必填（不给默认值），漏接线在类型层报错。
    */
   isLegacyManagementRequest: (req: IncomingMessage) => boolean;
   /** `bmx-*` tmux session 对应的 bot / 话题名，列表里给托管会话起个人话名字。 */
   describeManagedTmuxSession?: (name: string) => string | undefined;
   /** 测试注入：tmux 的前置参数（如 `-L <socket>`），生产不传 = 用户默认 tmux server。 */
   tmuxArgs?: string[];
+  /**
+   * 测试注入：botmux 托管会话所在 server 的前置参数。生产不传 = 新会话用的独立
+   * socket（`-L botmux`，见 tmux-socket.ts）。独立 socket 之前创建的 `bmx-*` 仍在
+   * 默认 server 上，所以列表两边都查，attach 时 `bmx-*` 先找这里、再回落默认 server。
+   */
+  managedTmuxArgs?: string[];
   /** 测试注入：固定登录 shell，生产不传 = passwd 里登记的那个。 */
   loginShell?: string;
 }
@@ -252,6 +265,8 @@ function signalForegroundWinch(pid: number): void {
 export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalManager {
   const terminals = new Map<string, HostTerminal>();
   const tmuxPrefix = deps.tmuxArgs ?? [];
+  const managedTmuxPrefix = deps.managedTmuxArgs ?? tmuxSocketArgs(preferredManagedTmuxSocket());
+  const managedOnSeparateServer = managedTmuxPrefix.join('\0') !== tmuxPrefix.join('\0');
   const loginShell = async (): Promise<string> => deps.loginShell ?? await resolveLoginShell();
 
   const tmuxBin = (): string | null => locateExecutable('tmux');
@@ -265,15 +280,18 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
     return env;
   };
 
-  async function listTmux(): Promise<HostTerminalTargets['tmux']> {
-    const bin = tmuxBin();
-    if (!bin) return { available: false, sessions: [] };
+  /** 列出一个 server 上的 session；`managedOnly` 只保留 `bmx-*`（托管 socket 上的其它东西不归这里管）。 */
+  async function listTmuxServer(
+    bin: string,
+    prefix: string[],
+    managedOnly: boolean,
+  ): Promise<{ sessions: HostTmuxSessionEntry[]; error?: string }> {
     const fmt = '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_activity}\t#{pane_current_command}';
-    const r = await run(bin, [...tmuxPrefix, 'list-sessions', '-F', fmt], tmuxListEnv());
+    const r = await run(bin, [...prefix, 'list-sessions', '-F', fmt], tmuxListEnv());
     if (!r.ok) {
       // 没有 tmux server 在跑是常态，不算错误。
-      if (/no server running|error connecting|No such file or directory/i.test(r.stderr)) return { available: true, sessions: [] };
-      return { available: true, sessions: [], error: r.stderr.trim().slice(0, 200) || 'tmux_list_failed' };
+      if (/no server running|error connecting|No such file or directory/i.test(r.stderr)) return { sessions: [] };
+      return { sessions: [], error: r.stderr.trim().slice(0, 200) || 'tmux_list_failed' };
     }
     const sessions: HostTmuxSessionEntry[] = [];
     for (const line of r.stdout.split('\n')) {
@@ -281,6 +299,7 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
       const [name, windows, attached, activity, command] = line.split('\t');
       if (!name) continue;
       const managed = name.startsWith('bmx-');
+      if (managedOnly && !managed) continue;
       const entry: HostTmuxSessionEntry = {
         name,
         windows: Number(windows) || 0,
@@ -295,9 +314,25 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
       }
       sessions.push(entry);
     }
+    return { sessions };
+  }
+
+  async function listTmux(): Promise<HostTerminalTargets['tmux']> {
+    const bin = tmuxBin();
+    if (!bin) return { available: false, sessions: [] };
+    const [user, managed] = await Promise.all([
+      listTmuxServer(bin, tmuxPrefix, false),
+      managedOnSeparateServer
+        ? listTmuxServer(bin, managedTmuxPrefix, true)
+        : Promise.resolve<{ sessions: HostTmuxSessionEntry[]; error?: string }>({ sessions: [] }),
+    ]);
+    // 同名时托管 socket 上的那份胜出：attach 也按这个顺序找，默认 server 上的同名残留点不到。
+    const managedNames = new Set(managed.sessions.map(entry => entry.name));
+    const sessions = [...user.sessions.filter(entry => !managedNames.has(entry.name)), ...managed.sessions];
     // 用户自己的在前、托管的在后；各自按最近活动倒序。
     sessions.sort((a, b) => Number(a.managed) - Number(b.managed) || b.activity - a.activity);
-    return { available: true, sessions };
+    const error = user.error ?? managed.error;
+    return error ? { available: true, sessions, error } : { available: true, sessions };
   }
 
   async function listHerdr(): Promise<HostTerminalTargets['herdr']> {
@@ -337,8 +372,16 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
       const bin = tmuxBin();
       if (!bin) return { error: 'tmux_unavailable' };
       const exact = `=${target.session}`;
-      const probe = await run(bin, [...tmuxPrefix, 'has-session', '-t', exact], tmuxListEnv());
-      if (!probe.ok) return { error: 'tmux_session_not_found' };
+      // 托管名先找托管 socket，再回落默认 server（独立 socket 之前创建的会话）。
+      const prefixes = target.session.startsWith('bmx-') && managedOnSeparateServer
+        ? [managedTmuxPrefix, tmuxPrefix]
+        : [tmuxPrefix];
+      let prefix: string[] | null = null;
+      for (const candidate of prefixes) {
+        const probe = await run(bin, [...candidate, 'has-session', '-t', exact], tmuxListEnv());
+        if (probe.ok) { prefix = candidate; break; }
+      }
+      if (!prefix) return { error: 'tmux_session_not_found' };
       // 托管会话的窗口尺寸由 worker 管，这边 attach 不能把它撑大/缩小。
       const sizeFlags = target.session.startsWith('bmx-') ? ['-f', 'ignore-size'] : [];
       return {
@@ -346,7 +389,7 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
         // -E：不按 update-environment 用本客户端的环境改写会话环境。网页端给的是干净登录
         // 环境，没有 SSH_AUTH_SOCK / DISPLAY 等，不加的话连一次就会把这些从会话里删掉，
         // 会话之后新开的窗口就没了 SSH agent / 图形访问。
-        args: [...tmuxPrefix, '-u', 'attach-session', '-E', ...sizeFlags, '-t', exact],
+        args: [...prefix, '-u', 'attach-session', '-E', ...sizeFlags, '-t', exact],
         label: target.session,
         env,
       };

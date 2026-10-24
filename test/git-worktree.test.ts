@@ -8,11 +8,11 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, resolveDeletedWorktreeOrigin, restoreDeletedWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -337,6 +337,62 @@ describe('worktreeSafetyStatus', () => {
     expect(status.dirtyFiles).toContain('secret.env');
     expect(status.dirtyFiles).toContain('cache/');
     expect(status.dirtyFiles).not.toContain('cache/a.txt');
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.uncommittedFiles).toEqual([]);
+    expect(status.ignoredCount).toBe(2);
+    expect(status.ignoredFiles).toEqual(expect.arrayContaining(['secret.env', 'cache/']));
+  });
+
+  it('fingerprints ignored directories whose expanded status exceeds the child-process buffer', async () => {
+    const repo = makeUpstream('large-ignored-status');
+    writeFileSync(join(repo, '.gitignore'), 'cache/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore generated cache');
+    const component = 'd'.repeat(120);
+    const cache = join(repo, 'cache', component, component, component);
+    mkdirSync(cache, { recursive: true });
+    for (let i = 0; i < 2_500; i++) {
+      const name = `entry-${String(i).padStart(4, '0')}-${'x'.repeat(100)}`;
+      writeFileSync(join(cache, name), '');
+    }
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.ignoredCount).toBe(1);
+    expect(status.ignoredFiles).toEqual(['cache/']);
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('fingerprints an ignored directory symlink without following its target', async () => {
+    const repo = makeUpstream('ignored-symlink-safety');
+    writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore dependencies');
+    const firstTarget = join(tempRoot, 'dependencies-v1');
+    const secondTarget = join(tempRoot, 'dependencies-v2');
+    mkdirSync(firstTarget);
+    mkdirSync(secondTarget);
+    const firstTargetFile = join(firstTarget, 'package.json');
+    writeFileSync(firstTargetFile, '{"version":1}\n');
+    writeFileSync(join(secondTarget, 'package.json'), '{"version":2}\n');
+    const link = join(repo, 'node_modules');
+    symlinkSync(firstTarget, link, 'dir');
+
+    const first = await worktreeSafetyStatus(repo);
+    writeFileSync(firstTargetFile, '{"version":3}\n');
+    const targetContentChanged = await worktreeSafetyStatus(repo);
+    unlinkSync(link);
+    symlinkSync(secondTarget, link, 'dir');
+    const retargeted = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('node_modules');
+    expect(first.uncommittedFiles).toEqual([]);
+    expect(first.ignoredFiles).toContain('node_modules');
+    expect(first.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(targetContentChanged.fingerprint).toBe(first.fingerprint);
+    expect(retargeted.fingerprint).not.toBe(first.fingerprint);
   });
 
   it('detects untracked files even when git config hides them', async () => {
@@ -347,6 +403,8 @@ describe('worktreeSafetyStatus', () => {
     const status = await worktreeSafetyStatus(repo);
 
     expect(status.dirtyFiles).toContain('new.txt');
+    expect(status.uncommittedFiles).toContain('new.txt');
+    expect(status.ignoredFiles).toEqual([]);
   });
 
   it('reports the full dirty count while bounding file examples', async () => {
@@ -534,5 +592,76 @@ describe('worktree semantic slug helpers', () => {
     expect(slugFromWorktreeText('新建 worktree 和分支')).toBe('worktree');
     expect(slugFromWorktreeText('看下新开工作树的命名逻辑')).toBeUndefined();
     expect(localWorktreeSlugFromContext('修复卡片重复点击')).toBeUndefined();
+  });
+});
+
+describe('deleted worktree recovery', () => {
+  it('reads the branch off a registration that rm -rf left behind, then rebuilds it in place', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const created = await createRepoWorktree(repo, { branch: 'wt/review-pr-1809-cd' });
+    writeFileSync(join(created.path, 'note.txt'), 'kept');
+    git(created.path, 'add', 'note.txt');
+    git(created.path, 'commit', '-m', 'work');
+    rmSync(created.path, { recursive: true, force: true });
+
+    const origin = await resolveDeletedWorktreeOrigin(created.path);
+    expect(origin).toEqual({ repo, branch: 'wt/review-pr-1809-cd' });
+
+    const rebuilt = await restoreDeletedWorktree(origin!, created.path);
+    expect(rebuilt.path).toBe(created.path);
+    expect(rebuilt.branch).toBe('wt/review-pr-1809-cd');
+    expect(existsSync(join(created.path, 'note.txt'))).toBe(true);
+    expect(git(created.path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('wt/review-pr-1809-cd');
+  });
+
+  it('only clears the rebuilt path, leaving other stale registrations alone', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const a = await createRepoWorktree(repo, { branch: 'feat/a' });
+    const b = await createRepoWorktree(repo, { branch: 'feat/b' });
+    rmSync(a.path, { recursive: true, force: true });
+    rmSync(b.path, { recursive: true, force: true });
+
+    await restoreDeletedWorktree({ repo, branch: 'feat/a' }, a.path);
+    const listing = git(repo, 'worktree', 'list', '--porcelain');
+    expect(listing).toContain(`worktree ${b.path}`);
+  });
+
+  it('matches the branch by directory suffix once the registration was pruned', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    const created = await createRepoWorktree(repo, { branch: 'wt/botmux-claude-review-pr-1809-cd' });
+    rmSync(created.path, { recursive: true, force: true });
+    git(repo, 'worktree', 'prune');
+
+    expect(await resolveDeletedWorktreeOrigin(created.path)).toEqual({
+      repo,
+      branch: 'wt/botmux-claude-review-pr-1809-cd',
+    });
+  });
+
+  it('does not let a sibling linked worktree with a shorter name claim the path', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    // `proj-wt` is itself a linked worktree; `proj-wt-x` belongs to `proj`.
+    await createRepoWorktree(repo, { branch: 'side', worktreePath: join(tempRoot, 'proj-wt') });
+    const target = await createRepoWorktree(repo, { branch: 'wt/x' });
+    expect(target.path).toBe(join(tempRoot, 'proj-wt-x'));
+    rmSync(target.path, { recursive: true, force: true });
+
+    expect(await resolveDeletedWorktreeOrigin(target.path)).toEqual({ repo, branch: 'wt/x' });
+  });
+
+  it('returns null when no sibling main checkout owns the name', async () => {
+    expect(await resolveDeletedWorktreeOrigin(join(tempRoot, 'nothing-wt-here'))).toBeNull();
+  });
+
+  it('returns null when two branches flatten to the same directory suffix', async () => {
+    const upstream = makeUpstream('upstream');
+    const repo = makeClone(upstream, 'proj');
+    git(repo, 'branch', 'wt/a-b');
+    git(repo, 'branch', 'wt-a/b');
+    expect(await resolveDeletedWorktreeOrigin(join(tempRoot, 'proj-wt-a-b'))).toBeNull();
   });
 });

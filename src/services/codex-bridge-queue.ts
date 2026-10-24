@@ -68,6 +68,7 @@ export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
 export interface CodexPendingTurn {
   turnId: string;
   dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
   started: boolean;
   contentFingerprint?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
@@ -119,6 +120,7 @@ export interface CodexPendingTurn {
   sourceSessionId?: string;
   /** Native provider turn id learned from the transcript user event. */
   sourceTurnId?: string;
+  sourceMessageId?: string;
   /** True when the turn was delivered via Codex RPC (turn/start) and the
    *  app-server has acknowledged it. RPC turns have no local transcript to
    *  ingest, so they can never reach the started state; this flag keeps the
@@ -131,6 +133,7 @@ export interface CodexPendingTurn {
 
 export class CodexBridgeQueue {
   private seen = new Set<string>();
+  private seenNativeUserMessages = new Map<string, true>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
   /** Recently closed native turns. Providers can replay terminal/CoT records
@@ -145,6 +148,9 @@ export class CodexBridgeQueue {
    * any CoT on the successor. Let the UI close that exact abandoned timeline;
    * this notification is not evidence that the work completed. */
   private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
+  /** A Lark turn's own user record reached the transcript: the CLI has its
+   *  input. Never affects attribution; exceptions are swallowed. */
+  private turnStartObserver?: (turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
@@ -180,6 +186,20 @@ export class CodexBridgeQueue {
 
   private sourceSessionsCompatible(left: string | undefined, right: string | undefined): boolean {
     return !left || !right || left === right;
+  }
+
+  private nativeUserMessageKey(ev: CodexBridgeEvent): string | undefined {
+    if (!ev.sourceTurnId || !ev.sourceMessageId) return undefined;
+    return JSON.stringify([ev.sourceSessionId ?? '', ev.sourceTurnId, ev.sourceMessageId]);
+  }
+
+  private rememberNativeUserMessage(ev: CodexBridgeEvent): void {
+    const key = this.nativeUserMessageKey(ev);
+    if (!key) return;
+    this.seenNativeUserMessages.set(key, true);
+    if (this.seenNativeUserMessages.size > CodexBridgeQueue.CLOSED_NATIVE_TURNS_MAX) {
+      this.seenNativeUserMessages.delete(this.seenNativeUserMessages.keys().next().value!);
+    }
   }
 
   private isProvisionalTaskStart(turn: CodexPendingTurn | null | undefined): boolean {
@@ -269,10 +289,12 @@ export class CodexBridgeQueue {
     markTimeMs: number = this.now(),
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+    linkRefMode?: 'observe' | 'enabled',
   ): void {
     this.queue.push({
       turnId,
       dispatchAttempt,
+      ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
@@ -290,6 +312,7 @@ export class CodexBridgeQueue {
     turnId: string;
     fingerprint: string;
     markTimeMs: number;
+    linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
     offsetAtMark?: number;
   }[]): void {
@@ -299,6 +322,7 @@ export class CodexBridgeQueue {
       if (existing.has(entry.turnId)) continue;
       existing.add(entry.turnId);
       restored.push({ turnId: entry.turnId, started: false,
+        ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
@@ -403,6 +427,57 @@ export class CodexBridgeQueue {
       // next real turn, the started-turn guard above stops the loop.
     }
     return dropped;
+  }
+
+  /** Refresh the bounded pre-start leases of EVERY queued head while the CLI
+   *  is visibly busy. Cursor's transcript mirror may not flush a turn's user
+   *  line until the first assistant step (a tool-less reply flushes the whole
+   *  turn at once, at the end), which can exceed the 20s lease measured from
+   *  write time; the worker ticks this every second while the CLI works, so
+   *  the countdown effectively starts at idle. Both unconfirmed attribution
+   *  leases AND submit-confirmed leases are refreshed: cursor's argv-baked
+   *  first turn is confirmPendingTurn'd at init (the most common spawn path)
+   *  yet its user line flushes just as late, and a type-ahead successor must
+   *  not be pruned behind a still-unstarted confirmed predecessor (the
+   *  started-predecessor shield in pruneExpiredPreStartHeads does not cover
+   *  that case).
+   *
+   *  Bounds preserved:
+   *  - rpc-active and provisional-task heads keep their own leases;
+   *  - a head with submit verification in flight keeps its verification
+   *    grace (the check owns that window);
+   *  - `maxSinceMarkMs` is a HARD ceiling measured from the mark: a false
+   *    "busy" screen (swallowed Enter / modal redraw) can refresh only up to
+   *    it, after which the head prunes and the structured_start_timeout /
+   *    successor queue recover — no permanent wedge.
+   *  Returns the number of refreshed heads. */
+  refreshUnstartedHeadAttributionLease(
+    nowMs: number = this.now(),
+    maxSinceMarkMs?: number,
+  ): number {
+    let refreshed = 0;
+    for (const head of this.queue) {
+      if (head.started || head.finalText !== undefined) continue;
+      if (head.rpcActive) continue;
+      if (this.isProvisionalTaskStart(head)) continue;
+      if (head.submitVerificationStartedAtMs !== undefined
+        && nowMs - head.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS) {
+        continue;
+      }
+      if (maxSinceMarkMs !== undefined
+        && head.markTimeMs !== undefined
+        && nowMs - head.markTimeMs > maxSinceMarkMs) {
+        continue;
+      }
+      if (head.submitConfirmedAtMs !== undefined) {
+        head.submitConfirmedAtMs = nowMs;
+        refreshed++;
+      } else if (head.unconfirmedAttributionStartedAtMs !== undefined) {
+        head.unconfirmedAttributionStartedAtMs = nowMs;
+        refreshed++;
+      }
+    }
+    return refreshed;
   }
 
   /** Record positive submit evidence from an adapter/history check. The turn
@@ -551,6 +626,10 @@ export class CodexBridgeQueue {
     this.cotSupersededObserver = fn;
   }
 
+  setTurnStartObserver(fn: (turn: CodexPendingTurn) => void): void {
+    this.turnStartObserver = fn;
+  }
+
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
@@ -616,6 +695,8 @@ export class CodexBridgeQueue {
       if (target.sourceSessionId && ev.sourceSessionId
         && target.sourceSessionId !== ev.sourceSessionId) return;
       target.sourceTurnId = ev.sourceTurnId;
+      if (ev.sourceMessageId) target.sourceMessageId = ev.sourceMessageId;
+      this.rememberNativeUserMessage(ev);
       return;
     }
     if (ev.kind === 'turn_started') {
@@ -678,6 +759,8 @@ export class CodexBridgeQueue {
       return;
     }
     if (ev.kind === 'user') {
+      const messageKey = this.nativeUserMessageKey(ev);
+      if (messageKey && this.seenNativeUserMessages.has(messageKey)) return;
       // task_started can precede the response_item/user by well over the
       // pre-start lease. When that delayed record matches the already-started
       // collecting turn, treat it as corroborating metadata rather than a new
@@ -695,6 +778,8 @@ export class CodexBridgeQueue {
           || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
         if (!collectingTooOld && collectingFingerprintOk) {
           provisional.transcriptStartTimeMs = ev.timestampMs;
+          provisional.sourceMessageId = ev.sourceMessageId;
+          this.rememberNativeUserMessage(ev);
           provisional.provisionalTaskStartedAtMs = undefined;
           provisional.taskStartedRollbackAtMs = undefined;
           if (!provisional.sourceSessionId && ev.sourceSessionId) {
@@ -716,9 +801,11 @@ export class CodexBridgeQueue {
         }
       }
       // Some providers mirror one native user turn in more than one record.
-      // Once its stable id has started a pending turn, ignore any duplicate
-      // before considering HOL-drop or matching the next queued prompt.
-      if (ev.sourceTurnId && this.queue.some(turn => turn.started && turn.sourceTurnId === ev.sourceTurnId)) return;
+      // Without a native message id retain the historical turn-level mirror
+      // guard. A previously unseen message id is a genuine same-turn steer;
+      // its fingerprint/freshness checks below still decide whether it starts.
+      if (ev.sourceTurnId && !messageKey && this.queue.some(turn => turn.started
+        && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
       // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
@@ -772,6 +859,8 @@ export class CodexBridgeQueue {
         next!.taskStartedRollbackAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
         next!.sourceTurnId = ev.sourceTurnId;
+        next!.sourceMessageId = ev.sourceMessageId;
+        this.rememberNativeUserMessage(ev);
         next!.transcriptStartTimeMs = ev.timestampMs;
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
@@ -808,6 +897,7 @@ export class CodexBridgeQueue {
           next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
         }
         this.collecting = next!;
+        try { this.turnStartObserver?.(next!); } catch { /* observer only */ }
       } else if (willSynthLocal) {
         // Adopt mode local input: user typed in iTerm, no Lark
         // fingerprint match. Synthesise a local turn so the assistant
@@ -822,11 +912,13 @@ export class CodexBridgeQueue {
           transcriptStartTimeMs: ev.timestampMs,
           sourceSessionId: ev.sourceSessionId,
           sourceTurnId: ev.sourceTurnId,
+          sourceMessageId: ev.sourceMessageId,
         };
         const insertAt = this.queue.findIndex(t => !t.started);
         if (insertAt === -1) this.queue.push(localTurn);
         else this.queue.splice(insertAt, 0, localTurn);
         this.collecting = localTurn;
+        this.rememberNativeUserMessage(ev);
         this.onLocalTurnStarted?.(localTurn);
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
         // Cursor can write the Lark/user line to JSONL before the daemon IPC

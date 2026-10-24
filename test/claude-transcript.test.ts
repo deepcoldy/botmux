@@ -8,30 +8,34 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
-import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
+import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
   trailingAssistantText,
+  isClaudeMemoryToolUse,
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
+  extractAssistantTurns,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
   cronCreateToolUseIds,
   cronCreateAcks,
-  readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
   isTranscriptRateLimitEvent,
+  transcriptFilesSignature,
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  transcriptShowsTurnDurationMarker,
+  transcriptHoldsConversation,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -52,6 +56,15 @@ function appendLine(obj: unknown): void {
 }
 
 describe('drainTranscript', () => {
+  it('changes its transcript signature only when a history input changes', () => {
+    writeFileSync(path, 'first\n');
+    const first = transcriptFilesSignature([path, join(dir, 'missing.jsonl')]);
+    expect(transcriptFilesSignature([path, join(dir, 'missing.jsonl')])).toBe(first);
+
+    appendFileSync(path, 'second\n');
+    expect(transcriptFilesSignature([path, join(dir, 'missing.jsonl')])).not.toBe(first);
+  });
+
   it('returns empty result when file does not exist', () => {
     const r = drainTranscript('/no/such/file.jsonl', 0);
     expect(r.events).toEqual([]);
@@ -100,6 +113,26 @@ describe('drainTranscript', () => {
     appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'short' }] } });
     const r2 = drainTranscript(path, r1.newOffset);
     expect(r2.events.find(e => e.uuid === 'u2')).toBeDefined();
+  });
+});
+
+describe('transcriptShowsTurnDurationMarker', () => {
+  it('finds a main-thread turn_duration in the history behind the baseline', () => {
+    appendLine({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hi' } });
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'd1', durationMs: 1200 });
+    appendLine({ type: 'last-prompt', leafUuid: 'a1' });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(true);
+  });
+
+  it('is false for a transcript that never wrote one, a sidechain one, or only a half-written one', () => {
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'turn_duration is just a word here' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'side-d', isSidechain: true });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    // A record still being written sits past the baseline cursor.
+    appendFileSync(path, '{"type":"system","subtype":"turn_duration","uuid":"d-partial"', 'utf8');
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    expect(transcriptShowsTurnDurationMarker(join(dir, 'missing.jsonl'))).toBe(false);
   });
 });
 
@@ -1227,6 +1260,20 @@ describe('cronCreateToolUseIds / cronCreateAcks', () => {
 });
 
 describe('extractLastAssistantTurn', () => {
+  it('extracts every completed turn while omitting an unfinished tail', () => {
+    expect(extractAssistantTurns([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt'),
+      assistantEv('second reply'),
+      userEv('still running'),
+      assistantToolUseEv(),
+    ])).toEqual([
+      { userText: 'first prompt', assistantText: 'first reply' },
+      { userText: 'second prompt', assistantText: 'second reply' },
+    ]);
+  });
+
   it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
     const turn = extractLastAssistantTurn([
       userEv('first prompt'),
@@ -1363,51 +1410,6 @@ describe('findJsonlContainingFingerprint: acceptCandidate', () => {
     );
     const got = findJsonlContainingFingerprint(dir, 'test');
     expect(got).toBe(path);
-  });
-});
-
-// ─── readFirstEventTimestamp ───────────────────────────────────────────────
-describe('readFirstEventTimestamp', () => {
-  it('returns the first parseable timestamp from a top-level field', () => {
-    appendFileSync(
-      path,
-      JSON.stringify({
-        type: 'user',
-        timestamp: '2026-04-29T05:45:14.091Z',
-        message: { role: 'user', content: 'hello' },
-      }) + '\n',
-      'utf8',
-    );
-    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.091Z'));
-  });
-
-  it('falls through to snapshot.timestamp for file-history-snapshot leading event', () => {
-    // Mirrors Claude Code's actual emit order: file-history-snapshot at the
-    // top (no top-level timestamp; it lives under .snapshot.timestamp),
-    // then SessionStart with a top-level timestamp.
-    appendFileSync(
-      path,
-      JSON.stringify({
-        type: 'file-history-snapshot',
-        snapshot: { timestamp: '2026-04-29T05:45:14.092Z' },
-      }) + '\n' +
-      JSON.stringify({
-        type: 'user',
-        timestamp: '2026-04-29T05:45:14.200Z',
-        attachment: { hookName: 'SessionStart:clear' },
-      }) + '\n',
-      'utf8',
-    );
-    expect(readFirstEventTimestamp(path)).toBe(Date.parse('2026-04-29T05:45:14.092Z'));
-  });
-
-  it('returns undefined when the file is missing or unreadable', () => {
-    expect(readFirstEventTimestamp(join(dir, 'nope.jsonl'))).toBeUndefined();
-  });
-
-  it('returns undefined when the leading chunk has no parseable timestamp', () => {
-    appendFileSync(path, '{"type":"unknown","no":"timestamp"}\n', 'utf8');
-    expect(readFirstEventTimestamp(path)).toBeUndefined();
   });
 });
 
@@ -1766,5 +1768,132 @@ describe('trailingAssistantText', () => {
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
     // 新行为：尾段 900 < 749×2 → 抑制 ✓
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
+  });
+});
+
+// ─── transcript 投递：回答之后的 Claude Code memory 写入不得截掉回答 ──
+//
+// 2026-10-20 现场（零注入 bot，后台任务回调轮）：模型先写出 1278 字的分配结果，
+// 再 Write ×2 + Bash 维护自身 memory，最后补一句 240 字附言。尾段算法停在 memory
+// 写入处，只把附言发进了群，分配结果丢失。
+describe('trailingAssistantText across memory writes', () => {
+  const projects = '/root/.claude-api/projects/';
+  const transcriptPath = `${projects}-root-iserver-edenx/359e31a6.jsonl`;
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string, name: string, input: Record<string, unknown>): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name, input } as any] },
+  });
+  const toolResult = (uuid: string, toolUseUuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${toolUseUuid}` } as any] },
+  });
+  const opts = {
+    isHousekeepingToolUse: (block: { name?: unknown; input?: unknown }) => isClaudeMemoryToolUse(block, transcriptPath),
+    endsWithSentinel: hasTrailingBridgeSentinelLine,
+  };
+  const memWrite = (uuid: string) => aTool(uuid, 'Write', { file_path: `${projects}-root-iserver-edenx/memory/${uuid}.md` });
+  const answer = '已写进文档：末尾新增了「十、Reviewer 分配」一节。'.padEnd(400, '表');
+  const postscript = 'I also saved two notes in memory.';
+
+  const fieldTurn = (): TranscriptEvent[] => [
+    aTool('w0', 'Bash', { command: 'cat /tmp/out.log' }), toolResult('r0', 'w0'),
+    aText('ans', answer),
+    memWrite('m1'), toolResult('r1', 'm1'),
+    { type: 'attachment' } as TranscriptEvent,
+    memWrite('m2'), toolResult('r2', 'm2'),
+    aTool('m3', 'Bash', { command: `cd ${projects}-root-iserver-edenx/memory && printf '%s\\n' x >> MEMORY.md` }),
+    toolResult('r3', 'm3'),
+    aText('ps', postscript),
+  ];
+  const fieldUuids = ['w0', 'ans', 'm1', 'm2', 'm3', 'ps'];
+
+  it('field replay: answer before the memory writes is delivered together with the postscript', () => {
+    expect(trailingAssistantText(fieldTurn(), fieldUuids)).toBe(postscript);
+    expect(trailingAssistantText(fieldTurn(), fieldUuids, opts)).toBe(`${answer}\n\n${postscript}`);
+  });
+
+  it('a short "saving memory" note before the writes stays out when the answer follows them', () => {
+    const final = '结论：'.padEnd(300, '答');
+    const events = [aText('n', '先把这次结论记到 memory。'), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['n', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a substantive run is not prepended when the trailing run is longer', () => {
+    const before = '中间分析：'.padEnd(300, '析');
+    const final = '最终结论：'.padEnd(500, '答');
+    const events = [aText('a', before), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a trailing run ending with the sentinel is returned unchanged', () => {
+    for (const tail of ['BOTMUX_NOTHING_TO_SEND', 'CI 还在跑，继续等。\n\nBOTMUX_NOTHING_TO_SEND']) {
+      const events = [aText('a', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', tail)];
+      expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(tail);
+    }
+  });
+
+  it('any non-memory tool call between the runs keeps the trailing run alone', () => {
+    const events = [
+      aText('a', answer),
+      memWrite('m1'), toolResult('r1', 'm1'),
+      aTool('w', 'Write', { file_path: '/root/iserver/edenx/notes.md' }), toolResult('r2', 'w'),
+      aText('f', postscript),
+    ];
+    expect(trailingAssistantText(events, ['a', 'm1', 'w', 'f'], opts)).toBe(postscript);
+  });
+
+  it('text from another turn before the memory writes is never swept in', () => {
+    const events = [aText('prev', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', postscript)];
+    expect(trailingAssistantText(events, ['m1', 'f'], opts)).toBe(postscript);
+  });
+
+  it('isClaudeMemoryToolUse: only writes into the owning data dir\'s project memory', () => {
+    const home = homedir();
+    const homePath = `${home}/.claude-api/projects/-root-iserver-botmux-wt-3/s.jsonl`;
+    const mem = `${home}/.claude-api/projects/-root-iserver-botmux/memory`;
+    // 工作树会话的 memory 落在主仓库的 project 目录下，不要求 slug 一致。
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Edit', input: { file_path: `${mem}/MEMORY.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cd ${mem} && ls` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: 'cat ~/.claude-api/projects/-root-iserver-botmux/memory/MEMORY.md' } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: '/root/iserver/botmux/memory/a.md' } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${home}/.claude/projects/-root-iserver-botmux/memory/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cat ${mem}-backup/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Read', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, undefined)).toBe(false);
+  });
+});
+
+describe('transcriptHoldsConversation', () => {
+  // The records a Claude 2.1.308 transcript opens with before any conversation.
+  const preamble = [
+    { type: 'mode', mode: 'normal', sessionId: 's' },
+    { type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId: 's' },
+    { type: 'file-history-snapshot', messageId: 'm', snapshot: { messageId: 'm', trackedFileBackups: {}, timestamp: '2026-10-22T00:00:00.000Z' }, isSnapshotUpdate: false },
+  ];
+
+  it('is false while the file holds only the metadata a fork child starts with', () => {
+    for (const record of preamble) appendLine(record);
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('is true from the first user record — the /clear command Claude writes counts', () => {
+    for (const record of preamble) appendLine(record);
+    appendLine({ type: 'user', isMeta: true, message: { role: 'user', content: '<local-command-caveat>…</local-command-caveat>' } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+  });
+
+  it('is true for an assistant record, and false for a missing file or a half-written first line', () => {
+    appendLine({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+    expect(transcriptHoldsConversation(join(dir, 'missing.jsonl'))).toBe(false);
+    writeFileSync(path, JSON.stringify({ type: 'user', message: { role: 'user', content: 'still being written' } }));
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('does not take a nested "type":"user" for a conversation record', () => {
+    appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
+    expect(transcriptHoldsConversation(path)).toBe(false);
   });
 });

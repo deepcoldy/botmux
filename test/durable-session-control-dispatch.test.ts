@@ -11,6 +11,7 @@ import {
   parseDurableLarkSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
 import { createDurableSessionControlDispatch } from '../src/services/durable-session-control-dispatch.js';
+import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
 
 const tempDirs: string[] = [];
 
@@ -191,7 +192,15 @@ describe('durable session control dispatch', () => {
     });
     const input = controlInput();
 
-    await expect(dispatch(input.control, input.context)).rejects.toThrow(/occupied by other-owner/);
+    const error = await dispatch(input.control, input.context).then(
+      () => undefined,
+      reason => reason,
+    );
+    expect(error).toBeInstanceOf(DurableSessionControlOwnerHandoffError);
+    expect(error).toMatchObject({
+      name: 'DurableSessionControlOwnerHandoffError',
+      message: 'durable session control Session is occupied by other-owner',
+    });
     expect(execute).not.toHaveBeenCalled();
     await store.close();
   });

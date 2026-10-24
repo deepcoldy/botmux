@@ -34,10 +34,10 @@ jobs:
         with:
           node-version: 22
 
-      # Bun is the package manager (packageManager: bun@1.4.3). node-pty's native
-      # build runs only because it is in `trustedDependencies` — bun skips
+      # Bun is the package manager (packageManager: bun@1.4.3). node-pty's install
+      # script runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
-      # need a real build/Release/pty.node.
+      # need a loadable pty.node (here node-pty's own linux-x64 prebuild).
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
@@ -251,11 +251,12 @@ jobs:
   # The musl (Alpine) binary, gated on PRs — not only at release time.
   #
   # WHY THIS JOB EXISTS SEPARATELY FROM `bun-binary`: the musl binary is a shipped
-  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time and
-  # node-pty ships no linux prebuild, so it is compiled against whatever libc the
-  # builder runs on (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine →
-  # `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
-  # cleanly and fails only when the native is dlopen'd, on the user's machine.
+  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time, and
+  # node-pty's linux prebuilds are glibc-only, so the musl native must be compiled
+  # from source on musl (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine
+  # → `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
+  # cleanly, loads, and crashes (SIGSEGV) at the first PTY spawn on the user's
+  # machine.
   #
   # This job previously lived ONLY in release.yml, which runs on tag push. That
   # meant a PR could change the build script, the embed plugin, or node-pty's
@@ -291,15 +292,19 @@ jobs:
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             node:22-alpine sh -euc '
-              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty has no linux
-              # prebuild and must compile here. binutils supplies readelf.
+              # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty must compile
+              # here because its linux prebuilds are glibc-only. binutils supplies
+              # readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
               npm i -g bun@1.4.3 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
-              bun install --frozen-lockfile
+              # build_from_source makes node-pty'"'"'s install script delete its
+              # (glibc) prebuilds and run node-gyp. It only takes effect when
+              # node-pty is actually (re)installed — a clean checkout here.
+              npm_config_build_from_source=true bun install --frozen-lockfile
 
               # Fail closed rather than compiling a musl binary around a glibc
               # native: that mistake survives the build and surfaces only when the

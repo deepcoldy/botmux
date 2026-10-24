@@ -65,16 +65,22 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     // The pid-probed id must come from traex's own (segment-aware) parser.
     // A resumed-segment rollout (#1854): the codex parser cannot read it, so
     // persisting through it silently dropped the session id on pid-probe adopt.
+    // This assertion is the load-bearing guard for the intentionally strict,
+    // zero-production-caller codexSessionIdFromRolloutPath — see its doc block
+    // in src/services/codex-transcript.ts for why it must not be deleted or
+    // relaxed (the same shape is a Codex generation, read only via
+    // codexGenerationSessionIdFromRolloutPath on Codex-scoped paths).
     const sid = '00000000-0000-7000-8000-000000000001';
     const segmented = `/h/.trae/sessions/2026/10/14/rollout-2026-10-14T08-00-00-${sid}_00000000-0000-7000-8000-000000000099.jsonl`;
     expect(codexSessionIdFromRolloutPath(segmented)).toBeUndefined();
     expect(traexSessionIdFromRolloutPath(segmented)).toBe(sid);
     expect(bridgeSpecFor('traex')?.adopt?.pidProbedSessionId?.(segmented)).toBe(sid);
-    // antigravity: held final committed on ingest only, birth-aware baseline, zero-prompt only, no adopt.
-    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware', zeroPromptOnly: true } });
+    // antigravity: held final committed on ingest only, birth-aware baseline, no adopt.
+    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware' } });
     expect(bridgeSpecFor('antigravity')?.adopt).toBeUndefined();
-    // cursor: no per-event timestamps → byte-offset baseline on adopt; zero-prompt only on spawn.
-    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { zeroPromptOnly: true } });
+    // cursor: no per-event timestamps → byte-offset baseline on adopt; the
+    // spawn bridge is always-on (send-marker-gated) since #932.
+    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { baseline: 'resume-aware' } });
     // id-addressed isolated sessions (no pid discovery) fall back to the adapter session id.
     for (const id of ['oh-my-pi', 'ebsd'] as const) {
       expect(bridgeSpecFor(id)?.locate.byPid).toBeUndefined();

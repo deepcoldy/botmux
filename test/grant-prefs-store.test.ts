@@ -166,6 +166,7 @@ describe('grant-prefs store', () => {
       grantRequestToOwnerDm: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
+      trustSameOwnerBots: true,
     });
   });
 
@@ -267,6 +268,48 @@ describe('grant-prefs store', () => {
     expect(disk.autoGrantRequestCards).toBe(false);
     expect(disk.grantRequestToOwnerDm).toBe(true);
     expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBe(true);
+  });
+
+  it('defaults trustSameOwnerBots to true when unset (also for an unknown bot)', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(true);
+    expect(store.getBotGrantPrefs('app_unknown').trustSameOwnerBots).toBe(true);
+  });
+
+  it('parses an explicit trustSameOwnerBots=false from bots.json; true is the default and not kept', async () => {
+    writeConfig({ trustSameOwnerBots: false });
+    let { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(false);
+
+    writeConfig({ trustSameOwnerBots: true });
+    ({ registry, store } = await freshModules());
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBeUndefined();
+    expect(store.getBotGrantPrefs('app_default').trustSameOwnerBots).toBe(true);
+  });
+
+  it('persists trustSameOwnerBots=false, syncs in-memory config, and drops the key when turned back on', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const off = await store.updateBotGrantPrefs('app_default', { trustSameOwnerBots: false });
+    expect(off.ok && off.prefs.trustSameOwnerBots).toBe(false);
+    expect(readConfig().trustSameOwnerBots).toBe(false);
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBe(false);
+
+    // 其它字段的局部修改不能把显式关闭冲掉。
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+    expect(readConfig().trustSameOwnerBots).toBe(false);
+
+    const on = await store.updateBotGrantPrefs('app_default', { trustSameOwnerBots: true });
+    expect(on.ok && on.prefs.trustSameOwnerBots).toBe(true);
+    expect(readConfig().trustSameOwnerBots).toBeUndefined();
+    expect(registry.getBot('app_default').config.trustSameOwnerBots).toBeUndefined();
   });
 
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {

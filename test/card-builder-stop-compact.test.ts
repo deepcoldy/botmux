@@ -198,7 +198,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 
   it('is hidden for the runner CLIs specifically (mira/mir/dsh/ebsd — /compact would be dropped or sent as a user message)', () => {
-    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd']) {
+    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd', 'minimax']) {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }
@@ -391,6 +391,17 @@ describe('buildStreamingCard: signature stability', () => {
 
 
 describe('session reasoning selector', () => {
+  it('shows next-turn scope for a confirmed CLI menu preference while displaying actual current effort', () => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort: 'high',
+      reasoningControl: { choices: ['high', 'max'], selected: 'max', pending: true, nextTurn: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(JSON.stringify(card)).toContain('下一轮生效');
+    expect(JSON.stringify(card)).not.toContain('下次冷启动');
+  });
+
   it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
     const card = build({ cliId: 'codex', usage: {
       context: null, tokens: null, reasoningEffort,

@@ -21,7 +21,7 @@
  * latest-wins polling (by sessionId) and exact-match polling (by triggerId)
  * resolve after a restart.
  */
-import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -545,10 +545,4 @@ export function followSteerParkedChain(
     next = hit.result.steerParkedBy;
   }
   return undefined;
-}
-
-/** Delete a session's persisted async results (called on session close). */
-export function deleteResults(sessionId: string): void {
-  const fp = getFilePath(sessionId);
-  try { if (existsSync(fp)) unlinkSync(fp); } catch { /* ignore */ }
 }

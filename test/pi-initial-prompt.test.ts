@@ -9,6 +9,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import {
   PI_INITIAL_PROMPT_ARG_BYTE_LIMIT,
+  piInitialPromptNeedsFile,
   preparePiInitialPromptArg,
 } from '../src/adapters/cli/pi-initial-prompt.js';
 import {
@@ -53,6 +54,95 @@ describe('Pi initial prompt @file delivery', () => {
     expect(result.initialPromptArg).toBe('<user_message>hello Pi</user_message>');
     expect(result.filePath).toBeUndefined();
     expect(result.readonlyRoot).toBeUndefined();
+  });
+
+  it('writes a short first prompt that starts with @ to @file so Pi does not treat it as an at-file reference', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // Lark renders `@Bot do X` as leading text; Pi would parse that as
+      // `pi "{@}Bot do X"` and exit with `File not found` before any turn ran.
+      const prompt = '@Bot 前面这个消息也没出发';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-at',
+        sessionDataDir: dataDir,
+      });
+
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(result.initialPromptArg).not.toBe(prompt);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes a short first prompt that starts with - to @file so Pi does not treat it as an option', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // Pi parses a positional starting with `-` as an option: `pi "- do X"`
+      // exits with `Unknown option: - do X` before any turn ran.
+      const prompt = '- 帮我看看这个报错';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-dash',
+        sessionDataDir: dataDir,
+      });
+
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(result.initialPromptArg).not.toBe(prompt);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats leading whitespace before @ or - the same as the bare prefix, without widening to mid-text occurrences', () => {
+    expect(piInitialPromptNeedsFile('  @bot hi')).toBe(true);
+    expect(piInitialPromptNeedsFile('\n@bot hi')).toBe(true);
+    expect(piInitialPromptNeedsFile('你好 @bot hi')).toBe(false);
+    expect(piInitialPromptNeedsFile('- 帮我看看这个报错')).toBe(true);
+    expect(piInitialPromptNeedsFile('  - 帮我看看这个报错')).toBe(true);
+    expect(piInitialPromptNeedsFile('--- a/x')).toBe(true);
+    expect(piInitialPromptNeedsFile('你好 - 帮我看看这个报错')).toBe(false);
+    expect(piInitialPromptNeedsFile(undefined)).toBe(false);
+  });
+
+  it('routes a --help-leading first prompt through @file so Pi never parses it as its own help flag', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      // A user typing "--help" in a Lark topic is asking the agent, not asking
+      // pi(1) to print CLI help: a bare positional is consumed by pi's option
+      // parser and exits before any turn can run.
+      const prompt = '--help 这个命令怎么用';
+      expect(piInitialPromptNeedsFile(prompt)).toBe(true);
+
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-leading-help',
+        sessionDataDir: dataDir,
+      });
+      expect(result.filePath).toBeDefined();
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+
+      // The delivered argv keeps the prompt as a trailing @file positional:
+      // pi's own --help flag must not appear, so the help/version branch that
+      // a bare `pi --help …` would take is unreachable.
+      const args = createPiAdapter('pi').buildArgs({
+        sessionId: 'sess-leading-help',
+        initialPrompt: result.initialPromptArg,
+      });
+      expect(args).not.toContain('--help');
+      expect(args.at(-1)).toBe(result.initialPromptArg);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('writes short multiline prompts to @file so Herdr can forward control-free argv on resume', () => {

@@ -289,7 +289,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
       return path && existsSync(path) ? path : undefined;
     },
   },
-  spawn: { sessionId: 'cli', baseline: 'birth-aware', zeroPromptOnly: true },
+  spawn: { sessionId: 'cli', baseline: 'birth-aware' },
 };
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
@@ -454,6 +454,20 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: /\? for shortcuts/,
     busyPattern: /esc to cancel/,
+    // agy records Enter in history.jsonl immediately while a turn is running:
+    // Queue mode parks the message until turn end (Auto-flush), while
+    // Queued Messages = send-immediately forwards it into the active
+    // conversation without cancelling the in-flight tool. Without
+    // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
+    // a permission dialog where Enter approves and digit keys jump options, so
+    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
+    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
+    // commands (/effort, /compact, /model, /btw, /clear) bypass
+    // runtimePtyInputPolicy, and interactive selection menus that still appear
+    // with bypass enabled (`ask_question`, Plan artifact review) also capture
+    // digit keys + Enter; both belong in one unified screen-based hold
+    // alongside hookReviewInputHold.
+    supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;
       const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');

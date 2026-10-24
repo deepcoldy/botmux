@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -325,26 +325,5 @@ describe('CodexSubagentLimitTracker', () => {
     const events = tracker.poll();
     expect(events).toHaveLength(1);
     expect(events[0].uuid).toContain(CHILD_ID);
-  });
-});
-
-describe('worker wiring', () => {
-  const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-
-  it('registers live-side sub-agents during the adopt split-live attach', () => {
-    const attach = worker.slice(worker.indexOf('function codexBridgeAttach('), worker.indexOf("} else if (mode === 'baseline-existing-skip-tail'"));
-    expect(attach).toContain('codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff)');
-    expect(attach.indexOf('codexSubagentLimitTracker.observe(')).toBeLessThan(attach.indexOf('codexSubagentLimitTracker.poll()'));
-  });
-
-  it('registers live-side sub-agents during the baseline-existing journal recovery attach', () => {
-    const start = worker.indexOf("} else if (mode === 'baseline-existing-skip-tail'");
-    const recovered = worker.slice(start, worker.indexOf('Structured bridge baseline-existing recovered:', start));
-    expect(recovered).toContain('codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff)');
-    expect(recovered.indexOf('codexSubagentLimitTracker.observe(')).toBeLessThan(recovered.indexOf('codexSubagentLimitTracker.poll()'));
-  });
-
-  it('passes the structured limit kind to the owner notice / fallback state', () => {
-    expect(worker).toContain('structuredCodexLimitState(ev.terminalErrorSummary ?? \'429 Too Many Requests\', ev.terminalLimitKind)');
   });
 });

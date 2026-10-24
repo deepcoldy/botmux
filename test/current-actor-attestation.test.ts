@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,7 @@ import {
   resolveLoopbackPeerProcesses,
 } from '../src/core/current-actor-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { __resetLoopbackPeersCacheForTest } from '../src/utils/loopback-peers.js';
 
 function procStat(pid: number, ppid: number, start: string): string {
   const tail = ['S', String(ppid), '1', '1', '0', '-1', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', start];
@@ -85,6 +86,33 @@ describe('daemon current actor attestation', () => {
     expect(resolveLoopbackPeerProcesses({
       remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951,
     })).toEqual({ ok: false, reason: 'not_loopback' });
+  });
+
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-env-'));
+    mkdirSync(join(procRoot, 'net'), { recursive: true });
+    // No client-side tuple in this host's tables → a remote peer could never
+    // pass; an env-allowed LOCAL peer that reaches here gets peer_unresolved,
+    // proving the address ring (not the inode ring) was relaxed.
+    writeFileSync(join(procRoot, 'net', 'tcp'), 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n');
+    writeFileSync(join(procRoot, 'net', 'tcp6'), '');
+    const prev = process.env.BOTMUX_LOOPBACK_PEERS;
+    process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.1';
+    __resetLoopbackPeersCacheForTest();
+    try {
+      expect(resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'peer_unresolved' });
+      expect(resolveLoopbackPeerProcesses({
+        remoteAddress: '10.0.0.2', remotePort: 50_000, localPort: 7_951, procRoot,
+      })).toEqual({ ok: false, reason: 'not_loopback' });
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_LOOPBACK_PEERS;
+      else process.env.BOTMUX_LOOPBACK_PEERS = prev;
+      __resetLoopbackPeersCacheForTest();
+      unlinkSync(join(procRoot, 'net', 'tcp'));
+      unlinkSync(join(procRoot, 'net', 'tcp6'));
+    }
   });
 
   it('binds a live client descendant to the in-memory turn caller', async () => {
@@ -294,6 +322,29 @@ describe('daemon current actor attestation', () => {
       procRoot,
     })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
     expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a mid-ancestor stat between peer and trusted root is unreadable', async () => {
+    // Lineage: peer 101 -> 102 -> trusted CLI root 100. The walk must not skip
+    // an unreadable hop to "find" the root above it; the peer's own stat stays
+    // readable so this exercises the in-walk catch, not peer resolution.
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 102, 100, '1200');
+    writeProc(procRoot, 101, 102, '1100');
+    const input = {
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '1100' },
+      findSession: () => activeSession(),
+      procRoot,
+    };
+    // Positive control: the same chain is attested while the hop is readable.
+    expect(resolveDaemonCurrentExecution(input)).toMatchObject({
+      schema: 'botmux.current-execution.v1', status: 'verified', sessionId: 's1', turnId: 'om_turn',
+    });
+    rmSync(join(procRoot, '102', 'stat'), { force: true });
+    expect(resolveDaemonCurrentExecution(input)).toBeNull();
   });
 
   it('rejects a new descendant reached through an old-turn child', async () => {

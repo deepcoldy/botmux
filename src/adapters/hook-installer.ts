@@ -593,6 +593,9 @@ function askBotmux(payload) {
     child.stdout.on("data", (d) => { out += d.toString("utf-8"); });
     child.on("error", () => { clearTimeout(backstop); done(""); });
     child.on("close", (code) => { clearTimeout(backstop); done(code === 0 ? out : ""); });
+    // hook 没读 stdin 就退出（或被杀）时，下面的写入会异步报 EPIPE；没人接就作为
+    // 进程级异常抛出，直接带崩 OpenCode。结果仍由上面的 close 给出（非 0 = 放行）。
+    child.stdin.on("error", () => {});
     try { child.stdin.write(payload); child.stdin.end(); } catch { clearTimeout(backstop); done(""); }
   });
 }
@@ -758,6 +761,9 @@ function askBotmux(payload) {
     child.stdout.on("data", (d) => { out += d.toString("utf-8"); });
     child.on("error", () => { clearTimeout(backstop); done(""); });
     child.on("close", (code) => { clearTimeout(backstop); done(code === 0 ? out : ""); });
+    // hook 没读 stdin 就退出（或被杀）时，下面的写入会异步报 EPIPE；没人接就作为
+    // 进程级异常抛出，直接带崩 OpenCode。结果仍由上面的 close 给出（非 0 = 放行）。
+    child.stdin.on("error", () => {});
     try { child.stdin.write(payload); child.stdin.end(); } catch { clearTimeout(backstop); done(""); }
   });
 }

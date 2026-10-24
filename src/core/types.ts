@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -51,6 +52,31 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
   if (fc.displayMode === 'screenshot' || fc.displayMode === 'hidden') return fc.displayMode;
   return fc.expanded ? 'screenshot' : 'hidden';
 }
+
+export interface GroupJoinContext {
+  event: 'chat.bot_added';
+  larkAppId: string;
+  chatId: string;
+  turnId: string;
+  operatorOpenId?: string;
+  gateMatched: boolean;
+}
+
+export type TurnTerminalCarrierKind = 'standard_reply_card' | 'non_patchable';
+
+/** Last user-visible output carrier observed for each in-flight turn. The
+ *  worker reconstructs explicit-send entries from the durable turn-sends
+ *  journal before publishing turn_terminal; daemon-owned fallback output is
+ *  recorded directly after Lark accepts it. Retained in a bounded map so a
+ *  duplicate terminal can safely retry after an unconfirmed provider error. */
+export type TurnTerminalCarrier = {
+  messageId: string;
+  kind: TurnTerminalCarrierKind;
+  /** Explicit send classification. `progress` / `auxiliary` are visible
+   *  interim output and must never be promoted to a completed-turn carrier.
+   *  Undefined is retained for rolling compatibility with older workers. */
+  responseKind?: TurnSendKind;
+};
 
 /** Core session state — IM-agnostic.
  *  IM-specific rendering state (ImRenderState) is stored separately
@@ -270,6 +296,19 @@ export interface DaemonSession {
    * In-memory only; not persisted.
    */
   consumedRepoCardMessageIds?: string[];
+  /**
+   * The session's working directory was gone when a CLI start was attempted
+   * (forkWorker refuses instead of starting it elsewhere), and a recovery card
+   * was published for it. `cardMessageId` is unset while that card is still
+   * being built. `rebuild` is where the deleted worktree came from, when git
+   * still knows. In-memory only: after a restart the next refused start
+   * publishes a fresh card.
+   */
+  workingDirRecovery?: {
+    path: string;
+    cardMessageId?: string;
+    rebuild?: { repo: string; branch: string };
+  };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
   /** Exact Lark message id whose user input is waiting for the first worker
@@ -287,6 +326,13 @@ export interface DaemonSession {
   pendingCodexAppMessageContext?: string;
   /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
   pendingChatContext?: ChatContext;
+  /** Host-authored provenance for a real Lark bot-added lifecycle turn. Unlike
+   *  chat metadata this is trusted routing context and cannot be reconstructed
+   *  from group text. In-memory only; cleared with the opening buffers. */
+  pendingGroupJoinContext?: GroupJoinContext;
+  /** Exact host-signed caller paired with pendingGroupJoinContext while repo or
+   *  worktree setup delays the first fork. Never persisted or reconstructed. */
+  pendingTrustedCaller?: TrustedCaller;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
@@ -325,6 +371,8 @@ export interface DaemonSession {
    * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
    * bot-added / scheduler / system bootstrap) never infers it. */
   pendingCodexAppSteerable?: true;
+  /** LinkRef mode frozen when a pending-repository opening was admitted. */
+  pendingLinkRefMode?: import('../services/link-ref-types.js').LinkRefMode;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
@@ -412,6 +460,8 @@ export interface DaemonSession {
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
+  /** Native write observations, scoped to the worker generation and exact attempt. */
+  replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -427,6 +477,11 @@ export interface DaemonSession {
    * captured it). Trusted only while `imageKey === currentImageKey`; a cache
    * restored from disk has no provenance and is treated as legacy. */
   currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** Read-only preview shown while the card's own turn is waiting for the
+   * previous turn to finish. It is deliberately separate from currentImageKey:
+   * never persisted, never treated as this card turn's frame, and cleared as
+   * soon as the target turn activates or the worker generation changes. */
+  waitingTurnPreview?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
   /** The worker's actual screenshot capture identity, from capture_identity
    * events emitted at real CLI write points (never from input ACKs). Scoped to
    * one worker generation: once a generation announced it, that generation's
@@ -469,6 +524,11 @@ export interface DaemonSession {
   turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** `backgroundTasks` of the last working/idle screen_update: the main turn
+   *  ended while this many background tasks kept running. Card label (see
+   *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
+   *  with the CLI). In-memory only. */
+  backgroundTaskCount?: number;
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -477,6 +537,10 @@ export interface DaemonSession {
    * until its next real idle edge.
    */
   idleSinceAt?: number;
+  /** Prompt-cache keep-alive bookkeeping for the current idle stretch
+   *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
+   *  turn or busy edge that is not a keep-alive. */
+  promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -500,10 +564,7 @@ export interface DaemonSession {
    *  journal before publishing turn_terminal; daemon-owned fallback output is
    *  recorded directly after Lark accepts it. Retained in a bounded map so a
    *  duplicate terminal can safely retry after an unconfirmed provider error. */
-  turnTerminalCarriers?: Map<string, {
-    messageId: string;
-    kind: 'standard_reply_card' | 'non_patchable';
-  }>;
+  turnTerminalCarriers?: Map<string, TurnTerminalCarrier>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -512,6 +573,8 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Successful listener terminal evidence; idle alone never authorizes closing. */
+  messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
   /**
@@ -592,6 +655,10 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** A confirmed native-menu preference awaiting its first new turn. */
+  codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
+  /** Undefined means no observation; null means native/default context. */
+  activeModelBackendVariant?: 'standard' | 'max' | null;
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it
@@ -752,6 +819,8 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
+    /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
+    linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;
@@ -830,10 +899,10 @@ export interface DaemonSession {
    *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
-   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;       // e.g. "0:2.0" — user's original tmux pane
     zellijSession?: string;    // zellij session name (zellij backend)
     zellijPaneId?: string;     // e.g. "terminal_1" — observe/drive target
@@ -842,6 +911,17 @@ export interface DaemonSession {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    /** Display snapshot from adoption; the handle remains the stable identity. */
+    orcaTerminalTitle?: string;
+    /** Orca control route; absent = desktop relay for legacy rows. */
+    orcaInstance?: import('../services/orca-cli.js').OrcaInstance;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type

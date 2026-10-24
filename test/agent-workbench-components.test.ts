@@ -266,6 +266,32 @@ describe('Agent Workbench components', () => {
     act(() => renderer.unmount());
   });
 
+  it('opens the Dock chat through a real link, never scripted navigation', async () => {
+    // Feishu places the chat beside the Dock only for a genuine link activation;
+    // scripting the open (window.open / location.assign) navigated the Dock away.
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(AgentWorkbenchDockView, {
+        sessions: sessions(3),
+        online: true,
+        authenticated: true,
+        initialSessionId: 'session-0',
+        api,
+        sdk: null,
+        h5Context: { enabled: true, appId: 'cli_x', brand: 'feishu', entryPath: '/auth/feishu' },
+        targetOrigin: 'https://dash.example',
+        location: null,
+        onRouteChange: () => {},
+      }));
+    });
+    const chat = renderer.root.findAll(node => node.type === 'a' && textOf(node) === '打开聊天');
+    expect(chat).toHaveLength(1);
+    expect(chat[0].props.href).toContain('openChatId=');
+    expect(chat[0].props.target).toBe('_blank');
+    expect(chat[0].props.onClick).toBeUndefined();
+    act(() => renderer.unmount());
+  });
+
   it('renders the full Sessions list in the fixed mobile page stack', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {

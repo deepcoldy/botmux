@@ -11,6 +11,10 @@ describe('resolveRecoveryForkConfig', () => {
       BOTMUX_RECOVERY_FORK_BATCH: '12',
       BOTMUX_RECOVERY_FORK_DELAY_MS: '0',
     })).toEqual({ batchSize: 12, delayMs: 0 });
+
+    expect(resolveRecoveryForkConfig({
+      BOTMUX_RECOVERY_FORK_DELAY_MS: '2147483647',
+    })).toEqual({ batchSize: 5, delayMs: 2147483647 });
   });
 
   it.each([
@@ -31,5 +35,10 @@ describe('resolveRecoveryForkConfig', () => {
       BOTMUX_RECOVERY_FORK_BATCH: '1',
       BOTMUX_RECOVERY_FORK_DELAY_MS: '2147483648',
     })).toEqual({ batchSize: 1, delayMs: 250 });
+  });
+
+  it('rejects a zero batch size', () => {
+    expect(resolveRecoveryForkConfig({ BOTMUX_RECOVERY_FORK_BATCH: '0' }))
+      .toEqual({ batchSize: 5, delayMs: 250 });
   });
 });

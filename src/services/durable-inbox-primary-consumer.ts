@@ -15,7 +15,8 @@ import {
 
 export type DurableInboxPrimaryDispatchResult =
   | { kind: 'committed'; receipt: DurableLarkAdmissionReceipt }
-  | { kind: 'ignored'; reason: string };
+  | { kind: 'ignored'; reason: string }
+  | { kind: 'retry'; reason: string };
 
 export interface DurableInboxPrimaryDispatchContext {
   claim: InboxClaim;
@@ -183,8 +184,22 @@ export function startDurableInboxPrimaryConsumer(
       clearInterval(renewalTimer);
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
-      if (result.kind !== 'committed' && result.kind !== 'ignored') {
+      if (result.kind !== 'committed' && result.kind !== 'ignored' && result.kind !== 'retry') {
         throw new Error('durable inbox primary dispatch returned an invalid receipt');
+      }
+      if (result.kind === 'retry') {
+        const reason = result.reason.trim();
+        if (!reason || reason.length > 512) {
+          throw new Error('durable inbox primary retry result requires a bounded reason');
+        }
+        const retried = await options.store.retryInboxClaim({
+          claim,
+          visibleAt: now() + retryDelayMs,
+        });
+        if (retried.kind === 'stale') {
+          loseOwnership(new Error(`durable inbox primary retry lost claim ${claim.event.eventId}`));
+        }
+        return;
       }
       const validatedResult: DurableInboxPrimaryDispatchResult = result.kind === 'committed'
         ? { kind: 'committed', receipt: parseDurableLarkAdmissionReceipt(result.receipt, message) }

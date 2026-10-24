@@ -1,5 +1,5 @@
 /**
- * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost, formatNumber.
+ * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost.
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
@@ -125,7 +125,6 @@ import {
   getSessionCost,
   getSessionUsageSnapshot,
   getSessionTokenUsage,
-  formatNumber,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -1514,25 +1513,5 @@ describe('getSessionTokenUsage', () => {
       turns: 2,
       model: 'claude-sonnet-4-20250514',
     });
-  });
-});
-
-// ── formatNumber ────────────────────────────────────────────────────────
-
-describe('formatNumber', () => {
-  it('formats small numbers without commas', () => {
-    expect(formatNumber(42)).toBe('42');
-  });
-
-  it('formats thousands with commas', () => {
-    expect(formatNumber(1_234)).toBe('1,234');
-  });
-
-  it('formats millions with commas', () => {
-    expect(formatNumber(1_234_567)).toBe('1,234,567');
-  });
-
-  it('formats zero', () => {
-    expect(formatNumber(0)).toBe('0');
   });
 });

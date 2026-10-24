@@ -27,7 +27,7 @@ import {
   type AppSlashCommandSpec,
   type RemoteAppSlashCommand,
 } from '../src/im/lark/app-slash-commands.js';
-import { COMMANDS } from '../src/core/command-schema.js';
+import { COMMANDS, commandCliIdMatches } from '../src/core/command-schema.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../src/core/passthrough-commands.js';
 import { createCliAdapterSync, ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 
@@ -65,17 +65,28 @@ describe('native Lark slash-command catalog', () => {
     for (const cliId of ['claude-code', 'codex', 'codex-app', 'opencode'] as const) {
       const catalog = buildAppSlashCommandCatalog({ cliId });
       expect(catalog.every(command => command.source === 'botmux')).toBe(true);
-      // cliId-scoped daemon commands (codex-app /effort) are botmux-owned, the rest must not leak in.
-      const scoped = new Set(COMMANDS.filter(spec => spec.cliId === cliId).map(spec => spec.name.slice(1)));
+      // cliId-scoped daemon commands are botmux-owned, the rest must not leak in.
+      // Matches the router/catalog cliId matcher (string or array, e.g. /effort ∈ codex + codex-app).
+      const scoped = new Set(COMMANDS
+        .filter(spec => spec.cliId && commandCliIdMatches(spec.cliId, cliId))
+        .map(spec => spec.name.slice(1)));
       expect(catalog.map(command => command.command).filter(name => passthrough.has(name) && !scoped.has(name))).toEqual([]);
     }
   });
 
-  it('includes cliId-scoped schema commands only for the matching CLI', () => {
-    expect(buildAppSlashCommandCatalog({ cliId: 'codex' }).some(command => command.command === 'effort')).toBe(false);
-    const effort = buildAppSlashCommandCatalog({ cliId: 'codex-app' }).find(command => command.command === 'effort');
-    expect(effort?.source).toBe('botmux');
-    expect(effort?.description.i18n?.zh_cn).toContain('推理强度');
+  it('includes cliId-scoped schema commands only for matching CLIs (array cliId, e.g. /effort for both Codex flavors)', () => {
+    // /effort is daemon-owned for both Codex App and Codex CLI (schema cliId array).
+    for (const cliId of ['codex', 'codex-app'] as const) {
+      const effort = buildAppSlashCommandCatalog({ cliId }).find(command => command.command === 'effort');
+      expect(effort?.source, cliId).toBe('botmux');
+      expect(effort?.description.i18n?.zh_cn).toContain('推理强度');
+    }
+    // Other CLIs keep the passthrough behavior and must not see a botmux-owned /effort.
+    for (const cliId of ['claude-code', 'dsh'] as const) {
+      expect(buildAppSlashCommandCatalog({ cliId }).some(command => command.command === 'effort')).toBe(false);
+    }
+    // The global catalog (no cliId) never lists a CLI-scoped command.
+    expect(buildAppSlashCommandCatalog().some(command => command.command === 'effort')).toBe(false);
   });
 
   it('builds short bilingual descriptions from the /help i18n lines, marking aliases', () => {

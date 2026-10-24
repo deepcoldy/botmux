@@ -10,19 +10,18 @@
  *  /restart 重启才换新值」的承诺不符。
  *
  *  修复 — daemon 发 restart IPC 时捎带 daemon 侧最新 bots.json `env`
- *  （latestPerBotEnvForRestart，三分态：对象=最新 / null=已清空 / undefined=
+ *  （latestSessionEnvForRestart，三分态：对象=最新 / null=已清空 / undefined=
  *  取不到保持旧行为）；worker 在 respawn 前全量覆盖 lastInitConfig.env，
  *  spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy) 每次 spawn 都重跑即生效。
  *
  *  覆盖：
- *  1. latestPerBotEnvForRestart 纯函数三分态（最新 / 清空 / 取不到兜底）。
+ *  1. latestSessionEnvForRestart 纯函数三分态（最新 / 清空 / 取不到兜底）。
  *  2. daemon behavioral：requestSessionRestart live-worker 分支把 env 放进
  *     发给 worker 的 restart 消息体（含 attemptId）。
- *  3. 其余三个 restart IPC 生产者（dashboard 重启按钮 / dashboard cwd-move /
- *     崩溃 auto-restart）同样捎带 env——respawn 即该用最新 env，语义一致。
- *  4. worker wiring（source pin，worker.ts 是进程入口不可 import，同
- *     restart-worker-null-reattach.test.ts 的做法）：env merge 在合并守卫
- *     之前（被合并的重复 restart 也要带走 env 更新）且含 null→清除语义。
+ *  3. requestSessionRestart 是唯一的 restart IPC 发送方（dashboard 重启按钮 /
+ *     cwd-move / 崩溃 auto-restart 都经它走），单发送方约束见
+ *     restart-live-worker-lark-tool-binding.test.ts 的 restart IPC choke point。
+ *     worker 侧「合并守卫之前覆盖 lastInitConfig.env」在 worker.ts 闭包里，暂无单测 seam。
  *
  * Run:  pnpm vitest run test/restart-live-worker-env.test.ts
  */
@@ -38,18 +37,14 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
 }));
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  latestPerBotEnvForRestart,
+  latestSessionEnvForRestart,
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
-
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
 let sessionCounter = 0;
 
@@ -98,13 +93,13 @@ afterEach(() => {
   __testOnly_resetRestartCoordinator();
 });
 
-// ─── 1. latestPerBotEnvForRestart 纯函数三分态 ──────────────────────────────
+// ─── 1. latestSessionEnvForRestart 纯函数三分态 ──────────────────────────────
 
-describe('latestPerBotEnvForRestart (daemon-side env snapshot carrier)', () => {
+describe('latestSessionEnvForRestart (daemon-side env snapshot carrier)', () => {
   it('returns the LIVE bots.json env object when configured', () => {
     getBotMock.mockReturnValue({ config: { env: { ANTHROPIC_BASE_URL: 'https://glm' } } });
     const { ds } = makeDs();
-    expect(latestPerBotEnvForRestart(ds)).toEqual({ ANTHROPIC_BASE_URL: 'https://glm' });
+    expect(latestSessionEnvForRestart(ds)?.env).toEqual({ ANTHROPIC_BASE_URL: 'https://glm' });
     expect(getBotMock).toHaveBeenCalledWith('cli_app1');
   });
 
@@ -116,13 +111,13 @@ describe('latestPerBotEnvForRestart (daemon-side env snapshot carrier)', () => {
     // spawn snapshot and the live config clean while the child stays hooked.
     getBotMock.mockReturnValue({ config: { env: { LD_PRELOAD: '/tmp/hook.so' } } });
     const { ds } = makeDs(undefined, 'mojo');
-    latestPerBotEnvForRestart(ds);
+    latestSessionEnvForRestart(ds)?.env;
     expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
 
     // Clearing the config afterwards must NOT erase it: the restart carrying the
     // clean env can still fail or be coalesced, leaving the hooked child alive.
     getBotMock.mockReturnValue({ config: { env: {} } });
-    expect(latestPerBotEnvForRestart(ds)).toEqual({});
+    expect(latestSessionEnvForRestart(ds)?.env).toBeNull();
     expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
   });
 
@@ -132,35 +127,34 @@ describe('latestPerBotEnvForRestart (daemon-side env snapshot carrier)', () => {
     // permanently unprovable.
     getBotMock.mockReturnValue({ config: { env: { LD_PRELOAD: '/tmp/hook.so' } } });
     const { ds } = makeDs();   // pty
-    latestPerBotEnvForRestart(ds);
+    latestSessionEnvForRestart(ds)?.env;
     expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
   });
 
   it('leaves the ledger untouched for a harmless or credential-only env', () => {
     getBotMock.mockReturnValue({ config: { env: { X_JWT_TOKEN: 'a.b.c' } } });
     const { ds } = makeDs();
-    latestPerBotEnvForRestart(ds);
+    latestSessionEnvForRestart(ds)?.env;
     expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
   });
 
   it('returns null when the config has no env (worker must clear its snapshot)', () => {
     getBotMock.mockReturnValue({ config: {} });
     const { ds } = makeDs();
-    expect(latestPerBotEnvForRestart(ds)).toBeNull();
+    expect(latestSessionEnvForRestart(ds)?.env).toBeNull();
   });
 
   it('returns null for an EMPTY env object too (dashboard cleared every key)', () => {
     getBotMock.mockReturnValue({ config: { env: {} } });
     const { ds } = makeDs();
-    // {} ?? null → {} is truthy, so this is {} — worker 全量覆盖为空对象，
-    // 等价于清空（sanitizePerBotEnv({}) → 无 key 可注入）。
-    expect(latestPerBotEnvForRestart(ds)).toEqual({});
+    // 空 env 组合后没有任何要注入的键 → null，worker 清空快照。
+    expect(latestSessionEnvForRestart(ds)?.env).toBeNull();
   });
 
   it('falls back to undefined when the bot is gone (keep old-snapshot behavior)', () => {
     getBotMock.mockImplementation(() => { throw new Error('Bot not registered'); });
     const { ds } = makeDs();
-    expect(latestPerBotEnvForRestart(ds)).toBeUndefined();
+    expect(latestSessionEnvForRestart(ds)?.env).toBeUndefined();
   });
 });
 
@@ -179,6 +173,36 @@ describe('requestSessionRestart live-worker branch carries env (behavioral)', ()
     expect(typeof msg.attemptId).toBe('string');
     expect(msg.attemptId).toBe(r.attemptId);
     expect(msg.env).toEqual({ HTTPS_PROXY: 'http://p:7890' });
+  });
+
+  it('carries the session-env removals and the fingerprint the respawned CLI is stamped with', () => {
+    getBotMock.mockReturnValue({ config: { env: { HTTPS_PROXY: 'http://p' }, envUnset: ['BYTECLOUD_AUTH_AS'] } });
+    const { ds, send } = makeDs();
+    requestSessionRestart(ds, observer());
+    const msg = send.mock.calls[0][0];
+    expect(msg.envUnset).toEqual(['BYTECLOUD_AUTH_AS']);
+    expect(typeof msg.envFingerprint).toBe('string');
+    // a later config change produces a different stamp for the next restart
+    getBotMock.mockReturnValue({ config: { env: { HTTPS_PROXY: 'http://p' } } });
+    __testOnly_resetRestartCoordinator();
+    requestSessionRestart(ds, observer());
+    const next = send.mock.calls[1][0];
+    expect(next.envUnset).toBeNull();
+    expect(next.envFingerprint).not.toBe(msg.envFingerprint);
+  });
+
+  it('locks identity-wrapper names only for sessions the worker really wraps', () => {
+    // Lark tool binding is on by default, but not for an HTTP virtual chat or an
+    // external Codex App Server — there the worker leaves ZDOTDIR alone.
+    getBotMock.mockReturnValue({ config: { env: { ZDOTDIR: '/mine', OTHER: 'x' } } });
+    const { ds } = makeDs();
+    ds.chatId = 'oc_real_chat';
+    expect(latestSessionEnvForRestart(ds)?.env).toEqual({ OTHER: 'x' });
+    ds.chatId = 'http_async_probe';
+    expect(latestSessionEnvForRestart(ds)?.env).toEqual({ ZDOTDIR: '/mine', OTHER: 'x' });
+    ds.chatId = 'oc_real_chat';
+    ds.session.existingAppServerEndpoint = 'ws://127.0.0.1:1';
+    expect(latestSessionEnvForRestart(ds)?.env).toEqual({ ZDOTDIR: '/mine', OTHER: 'x' });
   });
 
   it('sends env:null when no per-bot env is configured (worker clears snapshot)', () => {
@@ -206,64 +230,5 @@ describe('requestSessionRestart live-worker branch carries env (behavioral)', ()
     expect(second.joined).toBe(true);
     expect(second.attemptId).toBe(first.attemptId);
     expect(send).toHaveBeenCalledTimes(1);
-  });
-});
-
-// ─── 3. 全部四个 restart IPC 生产者均捎带 env（wiring） ─────────────────────
-
-describe('every daemon-side restart IPC producer carries env (source wiring)', () => {
-  it('worker-pool.ts: every {type:restart} send includes env', () => {
-    const sends = workerPoolSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBeGreaterThanOrEqual(2); // requestSessionRestart + auto-restart
-    for (const s of sends) {
-      expect(s, `missing env in: ${s}`).toContain('env: latestPerBotEnvForRestart(ds)');
-    }
-  });
-
-  it('dashboard-ipc-server.ts: every {type:restart} send includes env', () => {
-    const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard restart 按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing env in: ${s}`).toContain('env: latestPerBotEnvForRestart(ds)');
-    }
-  });
-
-  it('the restart message type declares the three-state env field', () => {
-    const typesSource = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
-    const restartLine = typesSource.indexOf("| { type: 'restart';");
-    expect(restartLine).toBeGreaterThanOrEqual(0);
-    const line = typesSource.slice(restartLine, typesSource.indexOf('}', restartLine));
-    expect(line).toContain('env?: Record<string, string> | null');
-  });
-});
-
-// ─── 4. worker wiring：respawn 前 merge env（合并守卫之前 + null 清除语义） ──
-
-describe('worker restart case merges env into lastInitConfig (source pin)', () => {
-  function restartCaseBranch(): string {
-    const start = workerSource.indexOf("case 'restart': {");
-    const end = workerSource.indexOf("case 'expire_durable_turn':", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    return workerSource.slice(start, end);
-  }
-
-  it('full-replaces lastInitConfig.env with null→clear three-state semantics', () => {
-    const branch = restartCaseBranch();
-    expect(branch).toContain('if (msg.env !== undefined && lastInitConfig)');
-    expect(branch).toContain('lastInitConfig.env = msg.env === null ? undefined : msg.env;');
-  });
-
-  it('the env merge sits BEFORE the in-flight merge guard (coalesced restarts still take the update)', () => {
-    const branch = restartCaseBranch();
-    const envMerge = branch.indexOf('if (msg.env !== undefined && lastInitConfig)');
-    const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
-    expect(envMerge).toBeGreaterThanOrEqual(0);
-    expect(guard).toBeGreaterThan(envMerge);
-  });
-
-  it('spawnCli re-derives the inject set from cfg.env on every spawn (no cached copy)', () => {
-    const spawnCfg = workerSource.indexOf('const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);');
-    expect(spawnCfg).toBeGreaterThanOrEqual(0);
   });
 });

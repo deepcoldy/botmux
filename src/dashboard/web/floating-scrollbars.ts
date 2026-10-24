@@ -43,6 +43,9 @@ function overflowAllowsScroll(value: string): boolean {
 }
 
 function canScroll(target: HTMLElement, axis: Axis): boolean {
+  // The session table owns its local interactive horizontal overlay. All other
+  // axes/containers retain the original display-only floating scrollbar path.
+  if (axis === 'x' && target.hasAttribute('data-local-horizontal-scrollbar')) return false;
   const style = getComputedStyle(target);
   const overflow = axis === 'y' ? style.overflowY : style.overflowX;
   if (!overflowAllowsScroll(overflow)) return false;
@@ -54,6 +57,12 @@ function isVisible(target: HTMLElement): boolean {
   // An overlay that makes the page behind it `inert` (e.g. the Bot config example
   // drawer) leaves that page unscrollable; its bars must not float over the overlay.
   if (!target.isConnected || target.closest('[hidden], [inert]')) return false;
+  // Closed <details> hides its body without zeroing every descendant's cached
+  // layout rect. A previously hovered popup must not retain a body-level bar.
+  for (let parent: HTMLElement | null = target; parent; parent = parent.parentElement) {
+    if (parent.tagName === 'DETAILS' && !parent.hasAttribute('open')
+      && !parent.querySelector(':scope > summary')?.contains(target)) return false;
+  }
   const rect = target.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
 }
@@ -105,6 +114,11 @@ function showBar(bar: FloatingBar, sticky = false): void {
 
 function updateBar(bar: FloatingBar): void {
   const { target, axis, track, thumb } = bar;
+  if (!isVisible(target) || !canScroll(target, axis)) {
+    track.hidden = true;
+    track.classList.remove('is-visible', 'is-active');
+    return;
+  }
   const rect = target.getBoundingClientRect();
   if (axis === 'y') {
     const top = Math.max(0, rect.top + BAR_INSET);
@@ -251,7 +265,20 @@ export function initFloatingScrollbars(root: HTMLElement): void {
     // in the observed subtree) would re-trigger the observer → a self-sustaining rAF loop.
     for (const record of records) {
       const node = record.target;
-      if (node instanceof Element && node.closest('.floating-scrollbar-layer')) continue;
+      if (node instanceof Element && node.closest('.floating-scrollbar-layer, .session-horizontal-scrollbar')) continue;
+      if (record.type === 'attributes' && record.attributeName === 'open'
+        && node instanceof HTMLElement && node.tagName === 'DETAILS'
+        && !node.hasAttribute('open')) {
+        // Hide immediately at the close edge; the coalesced rescan may arrive
+        // later while a stale popup is still the remembered hover target.
+        for (const [target, entry] of bars) {
+          if (!node.contains(target)) continue;
+          if (entry.x) removeBar(entry.x);
+          if (entry.y) removeBar(entry.y);
+          bars.delete(target);
+          if (hoveredTarget === target) hoveredTarget = null;
+        }
+      }
       scheduleRescan();
       return;
     }

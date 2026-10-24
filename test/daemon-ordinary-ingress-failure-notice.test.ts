@@ -1,6 +1,7 @@
 import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
+  __testOnly_recordDurablePrimaryInputCommit,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
@@ -171,11 +172,10 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
-import * as messageQueue from '../src/services/message-queue.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_completedTurnHasCrossPrincipalFollower as completedTurnHasCrossPrincipalFollower,
@@ -190,6 +190,7 @@ import {
 } from '../src/daemon.js';
 import { getActiveSessionsRegistry, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
+import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
   findPendingAskByAnchor,
   setCardDispatcher,
@@ -396,6 +397,195 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.completedIdleTurnId).toBeUndefined();
   });
 
+  it('cold-resumes the same dormant session and native CLI lineage from its original Lark anchor', async () => {
+    const anchor = 'om_thread_dormant_cold_resume';
+    const turnId = 'om_dormant_follow_up';
+    const ds = seedThreadSession(anchor, 'dormant seeded') as any;
+    const sessionId = ds.session.sessionId;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.session.suspendedColdResume = true;
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = 'native-cli-lineage-42';
+    ds.lastCliInput = 'previous accepted turn';
+    ds.session.lastCliInput = 'previous accepted turn';
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, options: any) => {
+      expect(target).toBe(ds);
+      expect(options).toMatchObject({ resume: true, turnId });
+      expect(target.session.sessionId).toBe(sessionId);
+      expect(target.session.cliSessionId).toBe('native-cli-lineage-42');
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(turnId, 'continue from the dormant context', anchor),
+      makeCtx(anchor, turnId),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(ds);
+    expect(ds.session.sessionId).toBe(sessionId);
+    expect(ds.session.cliSessionId).toBe('native-cli-lineage-42');
+    expect(ds.lastCliInput).toContain('continue from the dormant context');
+    expect(ds.session.lastCliInput).toContain('continue from the dormant context');
+  });
+
+  it('reforks a dead durable-primary worker and waits for provider submission proof', async () => {
+    const anchor = 'om_thread_primary_dead_worker';
+    const turnId = 'om_primary_after_worker_exit';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 7,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, resume: any, options: any) => {
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId,
+        dispatchAttempt: 7,
+        durablePrimaryInbox: true,
+      });
+      target.workerGeneration = 5;
+      target.session.workerGeneration = 5;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 7,
+          durablePrimaryInbox: true,
+        }, 5);
+      });
+      return true;
+    });
+
+    await handleThreadReply(makeEventData(turnId, 'continue after worker exit', anchor), ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 7, workerGeneration: 5 }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('replays a queued activation journal after worker death before the durable follower', async () => {
+    const anchor = 'om_thread_primary_queued_recovery';
+    const openingTurnId = 'om_primary_queued_opening';
+    const followerTurnId = 'om_primary_queued_follower';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'activation-token';
+    ds.session.queuedActivationInput = { content: 'OPENING_N' };
+    ds.session.queuedActivationTurnId = openingTurnId;
+    ds.session.queuedActivationDispatchAttempt = 4;
+    ds.session.queuedActivationResume = true;
+    const ctx = makeCtx(anchor, followerTurnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 8,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, input: any, resume: any) => {
+      expect(input).toEqual({ content: 'OPENING_N' });
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId: openingTurnId,
+        dispatchAttempt: 4,
+      });
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(followerTurnId, 'FOLLOWER_N1', anchor),
+      ctx,
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: followerTurnId,
+        dispatchAttempt: 8,
+        cliInput: expect.objectContaining({ content: expect.stringContaining('FOLLOWER_N1') }),
+      }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('retries a dead durable-primary worker while another handler owns the start claim', async () => {
+    const anchor = 'om_thread_primary_live_start_claim';
+    const turnId = 'om_primary_during_live_start_claim';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = true;
+    ds.initialStartClaimToken = 'other-handler-claim';
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 2,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('retries a dead durable-primary worker while repository selection is pending', async () => {
+    const anchor = 'om_thread_primary_pending_repo';
+    const turnId = 'om_primary_during_pending_repo';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.pendingRepo = true;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 3,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait for repository', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
   it('clears the previous failed label before reforking for a document comment', async () => {
     const anchor = 'om_doc_refork_failure';
     const ds = seedThreadSession(anchor, 'seeded');
@@ -523,6 +713,39 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       content: 'Memory pressure is critical',
       providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
     }));
+  });
+
+  it('adds no generic notice when the refork was refused for a deleted working directory', async () => {
+    // forkWorker already published the recovery card (or the "still missing"
+    // line) before throwing; a second "请重发" message would contradict it.
+    const anchor = 'om_thread_missing_dir';
+    seedThreadSession(anchor, 'seeded');
+    const error = new MissingWorkingDirError('/gone/worktree');
+    mocks.forkWorker.mockImplementationOnce(() => { throw error; });
+
+    await expect(
+      handleThreadReply(makeEventData('om_missing_dir', 'resume please', anchor), makeCtx(anchor, 'om_missing_dir')),
+    ).rejects.toBe(error);
+
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('a refused refork does not strand the start gate: the next message reaches forkWorker again', async () => {
+    // After the user rebuilds the worktree (or switches directories) the next
+    // message must start the CLI; a start claim left behind by the refused
+    // attempt would buffer it forever instead.
+    const anchor = 'om_thread_missing_dir_retry';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.forkWorker.mockImplementationOnce(() => { throw new MissingWorkingDirError('/gone/worktree'); });
+    await expect(
+      handleThreadReply(makeEventData('om_missing_first', 'first try', anchor), makeCtx(anchor, 'om_missing_first')),
+    ).rejects.toBeInstanceOf(MissingWorkingDirError);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+
+    mocks.forkWorker.mockClear();
+    await handleThreadReply(makeEventData('om_missing_second', 'after rebuild', anchor), makeCtx(anchor, 'om_missing_second'));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
   it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
@@ -2471,7 +2694,7 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(repliedText()).not.toContain(resendNotice());
     expect(repliedText()).not.toContain(chooseRepoNotice());
-    expect(messageQueue.readUnread(anchor).length).toBe(1);
+    expect(readFileSync(`${mocks.dataDir}/queues/${anchor}.jsonl`, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1);
   });
 
   it('keeps the real new-topic handler pending until marginal admission reaches a terminal decision', async () => {
@@ -2627,5 +2850,86 @@ describe('durable admission then failing status reply → no resend advice (PR #
 
     expect(repliedText()).toContain(resendNotice());
     expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('queued-activation-pending refork clears suppressRecoveryCard (user inbound ends restart silence)', async () => {
+    const anchor = 'om_thread_queued_pending';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    // Restart restore: recovery silence set, a queued activation still pending
+    // from before the daemon died.
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-pending-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qp', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qp'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // This branch returns without rememberLastCliInput, so it must clear the
+    // recovery flag itself once the fork is ACCEPTED — otherwise every later
+    // async worker death stays muted and the session is permanently silent.
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('retained-queued-activation refork clears suppressRecoveryCard too', async () => {
+    const anchor = 'om_thread_queued_retained';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queued = true;
+    ds.session.queuedActivationInput = { content: 'retained opening task' };
+    ds.session.queuedActivationTurnId = 'turn-queued-retained-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qr', '继续任务', anchor),
+      makeCtx(anchor, 'om_msg_qr'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker returns false (rejection leg, same predicate as main refork)', async () => {
+    const anchor = 'om_thread_queued_rejected';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-rejected-1';
+    // false = quarantine / session no longer active non-throwing rejection;
+    // the fork was not accepted, so recovery silence must survive exactly as
+    // on the sync-throw path.
+    mocks.forkWorker.mockImplementationOnce(() => false);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qj', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qj'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBe(true);
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker throws synchronously (clear happens only after acceptance)', async () => {
+    const anchor = 'om_thread_queued_throw';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    mocks.forkWorker.mockImplementationOnce(() => {
+      throw new Error('fork threw: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_qt', '继续', anchor), makeCtx(anchor, 'om_msg_qt')),
+    ).rejects.toThrow('fork threw: EAGAIN');
+
+    // Timing contract: the flag is cleared only AFTER forkWorker returns. A
+    // sync throw keeps the silence and routes to the ingress-notice catch.
+    expect(ds.suppressRecoveryCard).toBe(true);
   });
 });

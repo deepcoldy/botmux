@@ -72,6 +72,19 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS',
   'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS',
   'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS',
+  // Extra source addresses accepted by the local-peer ring of the internal
+  // HMAC endpoints (utils/loopback-peers.ts): hosts whose kernel reports a
+  // same-machine loopback peer as a LAN IP. Consumed by both the daemons
+  // (daemon-internal-auth, workflow v3 IPC, migrate-to-chat IPC) and the
+  // dashboard process (dashboard.ts verifyHmac), so it rides the shared
+  // snapshot like BOTMUX_PUBLIC_URL. Non-secret; the HMAC layer is unaffected.
+  'BOTMUX_LOOPBACK_PEERS',
+  // Durable config mutations must resolve the same shared files in every
+  // daemon and in the dashboard. Without these paths in the fleet snapshot,
+  // a restart from a managed session could silently fall back to per-host
+  // defaults and make the scope-level CAS coordinate different files.
+  'BOTMUX_GLOBAL_CONFIG_FILE',
+  'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE',
   // Merlin Devbox auto-export switch (platform/devbox-dashboard-export.ts).
   // The dashboard resolves it (dashboard-url / control-csrf run there), so it
   // has to survive the allowlist copy — same reason BOTMUX_PUBLIC_URL is here.

@@ -1178,15 +1178,44 @@ describe('replyDelivery=transcript envelope', () => {
     expect(out).not.toContain('- @Bot');
   });
 
-  it('transcript + solo：cursor 的 <sender_note> 随 sender 一起消失', () => {
+  it('transcript + solo：cursor 与其它转写 CLI 一样去壳去 reminder（#932 起普通 spawn 也有转写采集）', () => {
     mockBotConfig.replyDelivery = 'transcript';
-    // cursor 没有转写采集 → effectiveReplyDelivery 回落 send，信封与 send 逐字相同。
-    const transcript = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    const out = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    expect(out).not.toContain('<botmux_reminder>');
+    expect(out).not.toContain('<user_message>');
+    expect(out).not.toContain('<sender');
+  });
+
+  it('transcript + antigravity：没有普通转写采集，回落 send，信封与 send 逐字相同', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    // antigravity 只有零注入转写 → effectiveReplyDelivery 回落 send。
+    const transcript = buildFollowUpContent('继续', 'sess-t3b', { ...base, cliId: 'antigravity', solo: true, selfMention });
     mockBotConfig.replyDelivery = 'send';
-    const send = buildFollowUpContent('继续', 'sess-t3', { ...base, cliId: 'cursor', solo: true, selfMention });
+    const send = buildFollowUpContent('继续', 'sess-t3b', { ...base, cliId: 'antigravity', solo: true, selfMention });
     expect(transcript).toBe(send);
     expect(transcript).toContain('<botmux_reminder>');
     expect(transcript).toContain('<sender ');
+  });
+
+  it('冻结 sandbox 边（pi 复审第三边）：live 已关 sandbox+开 transcript，但存活会话冻结为 scratch → 续轮保持 send 信封（reminder 仍在）', () => {
+    // 复现：会话 A 以 cursor+scratch 起（session.sandbox='scratch' 冻结）；运维
+    // dashboard 关 sandbox（entry 无 sandbox）再开 replyDelivery=transcript。
+    // live 解析放行 transcript，但该 worker 仍在 COW overlay 里采集关闭——改口
+    // 不 send 就是静默轮。续轮信封必须按冻结沙箱保持 send。
+    mockBotConfig.replyDelivery = 'transcript';
+    mockGetSession.mockReset();
+    mockGetSession.mockReturnValue({ sessionId: 'sess-frozen-scratch', sandbox: 'scratch' });
+    const out = buildFollowUpContent('继续', 'sess-frozen-scratch', { ...base, cliId: 'cursor', attachments, mentions });
+    expect(out).toContain('<botmux_reminder>');
+    expect(out).toContain('<user_message>');
+  });
+
+  it('冻结 sandbox=false 的同形会话：live transcript 正常改口（对照组，证明上面的拦截来自冻结 scratch 而非别的路径）', () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    mockGetSession.mockReset();
+    mockGetSession.mockReturnValue({ sessionId: 'sess-frozen-off', sandbox: false });
+    const out = buildFollowUpContent('继续', 'sess-frozen-off', { ...base, cliId: 'cursor', attachments, mentions });
+    expect(out).not.toContain('<botmux_reminder>');
   });
 
   it('noTransport 与 transcript 同时：reminder_no_transport 仍在，壳仍在', () => {
@@ -1409,4 +1438,54 @@ describe('async group message input contract', () => {
         expect(out.content).toContain('BOTMUX_NOTHING_TO_SEND');
       }
     });
+});
+
+describe('senderTagHideEmail', () => {
+  const sender = Object.freeze({ openId: 'ou_email_test', type: 'user' as const, name: 'Test User', email: 'sender@example.test' });
+  afterEach(() => {
+    delete mockBotConfig.senderTagHideEmail;
+    delete mockBotConfig.senderTag;
+  });
+
+  it('preserves default output and omits only email without mutating identity', () => {
+    const original = renderSenderTag(sender, 'app_test');
+    expect(original).toContain('email="sender@example.test"');
+    mockBotConfig.senderTagHideEmail = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe(original);
+    mockBotConfig.senderTagHideEmail = true;
+    expect(renderSenderTag(sender, 'app_test')).toBe(original.replace(' email="sender@example.test"', ''));
+    expect(sender.email).toBe('sender@example.test');
+    expect(renderSenderTag({ ...sender, email: undefined }, 'app_test')).toBe(original.replace(' email="sender@example.test"', ''));
+    mockBotConfig.senderTag = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe('');
+    mockBotConfig.senderTag = true;
+    expect(renderSenderTag(sender, 'app_test')).not.toContain('email=');
+  });
+
+  it.each(['claude-code', 'codex', 'codex-app', 'cursor'] as const)('covers opening, follow-up and sidecars for %s', cliId => {
+    const build = () => {
+      const opts = { larkAppId: 'app_test', chatId: 'oc_test', cliId, sender, locale: 'en' as const };
+      return [
+        buildNewTopicCliInput('hello', 'sid', cliId, undefined, undefined, undefined,
+          undefined, undefined, undefined, 'en', sender, opts),
+        buildFollowUpCliInput('hello', 'sid', opts),
+      ];
+    };
+    const original = build();
+    mockBotConfig.senderTagHideEmail = true;
+    const hidden = build();
+    for (let i = 0; i < hidden.length; i++) {
+      const before = JSON.stringify(original[i]);
+      const after = JSON.stringify(hidden[i]);
+      expect(before).toContain('sender@example.test');
+      expect(after).not.toContain('sender@example.test');
+      expect(after).toContain('ou_email_test');
+      expect(after).toContain('Test User');
+      expect(after).toBe(before.replaceAll(' email=\\"sender@example.test\\"', ''));
+    }
+    const buffered = renderBufferedSenderBlock(sender, cliId, 'en', 'app_test');
+    expect(buffered).not.toContain('email=');
+    expect(buffered).toContain('ou_email_test');
+    expect(buildFollowUpContent('body@example.test', 'sid', { cliId, sender, larkAppId: 'app_test' })).toContain('body@example.test');
+  });
 });

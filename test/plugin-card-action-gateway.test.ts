@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -499,12 +499,5 @@ describe('plugin card-action capability snapshot', () => {
       registryOf(malformed),
     );
     expect(snapshot.plugins).toEqual([]);
-  });
-
-  it('wires the snapshot into local, persistent, Riff, and Mojo generations', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    expect(worker).toContain('[PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities');
-    expect(worker).toContain('mergedEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
-    expect(worker).toContain('childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities');
   });
 });

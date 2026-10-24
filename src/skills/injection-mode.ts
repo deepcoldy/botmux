@@ -36,6 +36,7 @@ import {
   WORKFLOW_FEATURE_SKILLS,
   ASK_SKILL, ASK_SKILL_NAME,
   WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME,
+  CHAT_MANAGER_SKILL, CHAT_MANAGER_SKILL_NAME,
 } from './definitions.js';
 import {
   effectiveBuiltinSkills,
@@ -89,6 +90,14 @@ export function resolveSkillInjectionModeForApp(larkAppId?: string): SkillInject
     } catch { /* fall through to machine default */ }
   }
   return globalBuiltinSkillInjectionDefault();
+}
+
+/** Per-bot 群负责人开关（bots.json `chatManagerEnabled`，默认关）。 */
+export function chatManagerEnabledForApp(larkAppId?: string): boolean {
+  if (!larkAppId) return false;
+  try {
+    return loadBotConfigs().find((b) => b.larkAppId === larkAppId)?.chatManagerEnabled === true;
+  } catch { return false; }
 }
 
 function expandHome(p: string): string {
@@ -196,12 +205,15 @@ export function builtinSkillEntries(opts: {
   workflowEnabled?: boolean;
   /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
   multiTopicEnabled?: boolean;
+  /** Per-bot 群负责人开关（默认关）。开启时才在 prompt 目录里暴露该技能。 */
+  chatManagerEnabled?: boolean;
 }): BuiltinSkillEntry[] {
   const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
   const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
   let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
+  if (opts.chatManagerEnabled === true) defs.push({ name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL });
   if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
   // Apply user overrides last: replaces bodies + drops user-disabled skills.
   // Byte-identical to the pre-feature list when nothing is customized.
@@ -223,6 +235,7 @@ export function builtinSkillContent(
     ...baseBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
+    { name: CHAT_MANAGER_SKILL_NAME, content: CHAT_MANAGER_SKILL },
   ];
   const shipped = all.find((d) => d.name === name)?.content;
   if (shipped === undefined) return undefined;
@@ -327,6 +340,7 @@ export function builtinSkillBlockForInjectsSessionContext(
       builtinSkillEntries({
         asksViaHook: opts.asksViaHook === true,
         whiteboardEnabled: opts.whiteboardEnabled === true,
+        chatManagerEnabled: larkAppId ? chatManagerEnabledForApp(larkAppId) : false,
         // Only safe to drop the routing-covered skills when routing is present.
         excludeRoutingCovered: hasRoutingBlock,
       }),

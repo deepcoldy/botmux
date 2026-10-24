@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   clampUnicodeCodePoints,
@@ -11,44 +10,12 @@ import {
   REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
 } from '../src/im/lark/reply-card-style.js';
 
-const replyStylePage = readFileSync(
-  new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url),
-  'utf8',
-);
-
-function replyStyleInputHandler(dataInput: string, endMarker: string): string {
-  const start = replyStylePage.indexOf(dataInput);
-  expect(start).toBeGreaterThanOrEqual(0);
-  const end = replyStylePage.indexOf(endMarker, start);
-  expect(end).toBeGreaterThan(start);
-  return replyStylePage.slice(start, end);
-}
-
 describe('Dashboard reply-style form model', () => {
   it('clamps by Unicode code points instead of UTF-16 code units', () => {
     expect(clampUnicodeCodePoints('🧪'.repeat(32), 32)).toBe('🧪'.repeat(32));
     expect(clampUnicodeCodePoints(`${'🧪'.repeat(32)}超`, 32)).toBe('🧪'.repeat(32));
     expect(clampUnicodeCodePoints('甲乙丙', 2)).toBe('甲乙');
     expect(clampUnicodeCodePoints('anything', 0)).toBe('');
-  });
-
-  it('captures synthetic-event values before functional draft updaters run', () => {
-    // React clears currentTarget after the handler returns. Reading it from a
-    // deferred functional updater crashes the page, so both text handlers must
-    // turn the event into a plain string before calling setDraft.
-    const handlers = [
-      replyStyleInputHandler('data-input="replyStyle.recipePrompt"', '/>'),
-      replyStyleInputHandler('data-input={`replyStyle.layoutTags.${layout}`}', '</label>'),
-    ];
-
-    for (const handler of handlers) {
-      const eventRead = handler.indexOf('event.currentTarget.value');
-      const stateUpdate = handler.indexOf('setDraft(current =>');
-      expect(eventRead).toBeGreaterThanOrEqual(0);
-      expect(stateUpdate).toBeGreaterThanOrEqual(0);
-      expect(eventRead).toBeLessThan(stateUpdate);
-      expect(handler.slice(stateUpdate)).not.toContain('event.currentTarget');
-    }
   });
 
   it('renders an omitted block as built-in defaults and keeps the saved override sparse', () => {

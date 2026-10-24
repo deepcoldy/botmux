@@ -1,11 +1,12 @@
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
 import type { InstalledPluginRecord, PluginRegistryFile } from '../src/core/plugins/types.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 const fixturePath = resolve('test/fixtures/plugin-card-action-service.ts');
 const children = new Set<ChildProcess>();
@@ -95,10 +96,7 @@ const stopFixture = async (child: ChildProcess): Promise<void> => {
   children.delete(child);
 };
 
-const requestsFrom = (logPath: string): Array<Record<string, any>> => {
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-};
+const requestsFrom = (logPath: string): Array<Record<string, any>> => readJsonLines(logPath);
 
 /**
  * Wait until the fixture has logged `count` requests, then return them.

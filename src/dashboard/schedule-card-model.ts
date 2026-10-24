@@ -19,7 +19,6 @@ import type { ParsedSchedule } from '../types.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import type {
   ButtonState,
-  PaginationMeta,
   PaginationParams,
   StatusDot,
 } from './card-model-types.js';
@@ -139,19 +138,6 @@ export interface ScheduleDetailDto {
   repeat?: { times: number | null; completed: number };
   actions: ScheduleActionMatrix;
   raw: ScheduleCardTaskInput;
-}
-
-export interface KindCounts {
-  all: number;
-  once: number;
-  interval: number;
-  cron: number;
-}
-
-export interface ScheduleListPage {
-  rows: ScheduleRowDto[];
-  meta: PaginationMeta;
-  kindCounts: KindCounts;
 }
 
 function statusDotFor(task: ScheduleCardTaskInput): StatusDot {
@@ -397,17 +383,6 @@ export function computeNextNRuns(
   return [];
 }
 
-/** Tally kinds across the (unfiltered) task pool — used for the kind chip badges. */
-export function kindCounts(tasks: ReadonlyArray<ScheduleCardTaskInput>): KindCounts {
-  const counts: KindCounts = { all: tasks.length, once: 0, interval: 0, cron: 0 };
-  for (const t of tasks) {
-    if (t.parsed.kind === 'once') counts.once += 1;
-    else if (t.parsed.kind === 'interval') counts.interval += 1;
-    else if (t.parsed.kind === 'cron') counts.cron += 1;
-  }
-  return counts;
-}
-
 /**
  * Filter tasks by search/kind/enabledOnly. Returns a new array (no mutation).
  *  - `search`: case-insensitive substring across `name` and `prompt`.
@@ -460,26 +435,5 @@ export function paginateSchedules<T>(
     pageSize: size,
     total,
     totalPages,
-  };
-}
-
-/** End-to-end pipeline: filter → toRow → paginate → counts. Used by the dashboard endpoint. */
-export function filterAndPaginateSchedules(
-  tasks: ReadonlyArray<ScheduleCardTaskInput>,
-  query: ScheduleFilterQuery,
-  ctx: RowRenderContext,
-): ScheduleListPage {
-  const filtered = filterSchedules(tasks, query);
-  const counts = kindCounts(tasks);
-  const paged = paginateSchedules(filtered, query.page, query.pageSize);
-  return {
-    rows: paged.items.map(t => toScheduleRowDto(t, ctx)),
-    meta: {
-      page: paged.page,
-      pageSize: paged.pageSize,
-      total: paged.total,
-      totalPages: paged.totalPages,
-    },
-    kindCounts: counts,
   };
 }

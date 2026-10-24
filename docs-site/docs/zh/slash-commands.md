@@ -86,6 +86,19 @@ botmux 日常运维
 
 Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set codexCapacityRecovery on` 开启，`/botconfig set codexCapacityRecovery off` 关闭。开启后，Botmux 管理的 Codex 飞书会话遇到明确的模型容量错误（`server_overloaded`）时，会在 15 秒、45 秒后各自动续跑一次。每次续跑会向原生会话追加一条恢复提示（每个任务最多两条），可能保留在模型上下文中，关闭开关不会删除已有历史。关闭时若存在待执行的恢复，会保存取消状态并只提示一次；重新开启或重启不会自动恢复这条旧任务。这不是只针对 modelhub 的识别，也不保证错误会在短时间内恢复。续跑沿用当前会话进度，不重发原始任务；新消息、`/stop` 或关闭会话会停止旧轮恢复。进程重启后，尚未执行的恢复与交接结果未知的恢复均停止并提示人工继续；已在执行的任务仍可正常交付成功结果，但晚到的容量失败不会再自动续跑，避免重放未能保存的取消操作。两次仍未恢复时显示失败卡，可稍后点击重试继续。普通 503、断流、鉴权和限额错误不进入这条恢复链，外部 adopt、HTTP 和会议接收会话也不受影响。
 
+## 群负责人（Agent 工具）
+
+在普通群里 @ 目标机器人说“执行 botmux manager set”即可设置负责人；取消用“执行 botmux manager clear”，查询可让机器人运行 `botmux manager status`。这不是 daemon 的 `/manager` 斜杠命令，而是内置 `botmux-chat-manager` skill 调用会话 IPC。
+
+**默认关闭，按机器人单独开启**：在 Dashboard「机器人配置 → 会话与 @ 策略」里打开「群负责人（默认接待者）」（或 `/botconfig set chatManagerEnabled on`）后，该机器人才会在会话内提供这个工具、并允许 `set`。关闭后该机器人不再免 @ 接话、也不能 `set`；但不会自动改群名或群描述，`clear` 与 `status` 仍可用，已保存的负责人记录保留（重新打开即恢复）。
+
+设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
+
+负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
+
+切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
+
+飞书没有跨机器条件写入，不承诺并发抢占的强一致性。网络异常或 `chat_update_unconfirmed` 后先查 status。本地记录在数据目录 `chat-managers/` 下，权限 0600，应随数据目录备份。
 ## 💬 回复模式（`/reply-mode`）
 
 控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改需 `canOperate`，仅查看需 `canTalk`。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
@@ -157,11 +170,17 @@ step_model_switching = true
 
 未开启时，运行中发送命令仍可保存后续轮次设置，并明确提示当前轮因未开特性而未更新；目标轮次已经结束或不可用时会给出不同提示。只有原生接口返回 `applied` 才确认服务端接受当前轮更新；已经发出的模型请求保持原参数，当前轮也可能没有后续推理步骤。
 
-普通 Codex CLI、Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
+## Codex CLI 会话内调整推理强度
+
+在已有的本地 Codex CLI 会话中发送 `/effort low|medium|high|xhigh|max|ultra`，Botmux 会操作原生 `/model` 菜单，保留当前模型，并以 **session-only** 方式选择档位。成功后保存当前会话的启动设置，回执明确说明 **从下一轮生效，正在执行的这一轮保持原强度**；即使启用了 `step_model_switching`，菜单路径也不会更新当前轮。
+
+此功能支持受 Botmux 管理的本地 PTY / tmux 会话，要求原生菜单提供 `s session` 操作和 `thread_settings_applied` 设置确认记录（已在 Codex 0.162.1 验证）。RPC 输入、远程后端、wrapper、adopt、sandbox/read-isolation 不使用此路径。遇到未发送草稿、其它菜单、输入冲突或无法确认的界面时会拒绝操作；不会清空草稿或重启任务。用户仍可直接使用 `/model` 手动选择。
+
+Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex App 的 `/effort` 例外，见上文）。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 
@@ -198,8 +217,9 @@ Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可�
 
 | 命令 | 说明 |
 |------|------|
-| `/adopt` | 扫描本机 tmux，弹卡片选择要接入的已运行会话 |
-| `/adopt <tmux_pane>` | 直接接入指定 pane（如 `/adopt 0:2.0`） |
+| `/adopt` | 扫描本机 tmux、Zellij、Herdr 和 Orca，弹卡片选择已运行会话；Orca 支持为实验性能力 |
+| `/adopt <target>` | 直接接入指定 tmux / Zellij / Herdr 会话（如 `/adopt 0:2.0`） |
+| `/adopt orca:<terminal>` | 直接接入指定 Orca 会话（实验性） |
 | `/detach` | 断开本话题与 adopt 会话的桥接（原 CLI 不受影响，`/disconnect` 同义） |
 
 ## 🔐 用户授权

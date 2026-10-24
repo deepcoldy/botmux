@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { isLinuxZombie } from '../src/utils/process-identity.js';
+import { createServer, type ServerResponse } from 'node:http';
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
@@ -19,7 +22,7 @@ function fixture() {
   const options: MinimaxAcpOptions = { executable, cwd: root, env: { ...process.env, MINIMAX_DATA_DIR: join(root, 'data'),
     MCODE_TEST_LOG: log, BOTMUX_OWNER_OPEN_ID: 'ou_owner', __OWNER_OPEN_ID: 'ou_stale' },
     content: 'hello', permission: 'full', timeoutMs: 5000, onUserInput: async () => ({ action: 'accept', content: {} }) };
-  return { root, log, options, calls: () => readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l)) };
+  return { root, log, options, calls: () => readJsonLines(log) };
 }
 function durableFixture() {
   const f = fixture(); mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
@@ -369,10 +372,117 @@ it.each([false, true])('default ACP runner preserves queue attribution, native i
     send('hang', 'three'); await waitFor(() => existsSync(f.log) && f.calls().some(c => c.message?.params?.prompt?.[0]?.text === 'hang'));
     child.stdin.write('\x03');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 3);
+    expect(markers().filter(m => m.kind === 'final').at(-1)?.payload.errorCode).toBe('cancelled');
     send('healthy', 'four');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 4);
     expect(markers().filter(m => m.kind === 'final').at(-1)?.payload).toMatchObject({ turnId: 'four', content: 'answer:healthy' });
     expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 4 : 3);
     expect(markers().filter(m => m.kind === 'thread')).toEqual([{ kind: 'thread', payload: { threadId: 'session_fixture' } }]);
   } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it('reports native ACP failure with its cause and resumes the next turn', async () => {
+  const f = fixture();
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--data-dir', join(f.root, 'data')], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  const send = (content: string, replyTurnId: string) => child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId })).toString('base64')}\n`);
+  try {
+    send('crash', 'failed');
+    await waitFor(() => finals().length === 1);
+    expect(finals()[0]).toMatchObject({ turnId: 'failed', errorCode: 'execution_failed',
+      content: expect.stringContaining('mcode_acp_process_exited') });
+    send('healthy', 'next');
+    await waitFor(() => finals().length === 2);
+    expect(finals()[1]).toMatchObject({ turnId: 'next', content: 'answer:healthy' });
+    expect(finals()[1].errorCode).toBeUndefined();
+    expect(f.calls().filter(c => c.message?.method === 'session/resume').map(c => c.message.params.sessionId))
+      .toEqual(['session_fixture']);
+  } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it.each([false, true])('exhausts the cumulative budget despite progress and runs the queued turn (resume: %s)', async resume => {
+  const f = fixture();
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--data-dir', join(f.root, 'data'), '--turn-timeout-ms', '2000',
+    ...(resume ? ['--native-session-id', 'session_fixture'] : [])], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  const send = (content: string, replyTurnId: string) => child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId })).toString('base64')}\n`);
+  try {
+    await waitFor(() => stdout.includes('ready'));
+    send('progress-hang', 'budget');
+    // Queue only after native execution is observed; no stdout chunk assumptions.
+    await waitFor(() => stdout.includes('progress-2'));
+    send('healthy', 'queued');
+    await waitFor(() => finals().length === 2);
+    expect(finals()[0]).toMatchObject({ turnId: 'budget', errorCode: 'turn_budget_exhausted' });
+    expect(finals()[1]).toMatchObject({ turnId: 'queued', content: 'answer:healthy' });
+    expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 2 : 1);
+    await stopped(f.calls()[0].pid);
+    await waitFor(() => stdout.endsWith('›\n'));
+  } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it.each(['permission', 'permission-hang'])('pauses the runner budget for a human and resumes accounting after %s', async content => {
+  const f = fixture();
+  mkdirSync(join(f.root, '.botmux'), { mode: 0o700 });
+  writeFileSync(join(f.root, '.botmux/.dashboard-secret'), 'isolated-test-secret', { mode: 0o600 });
+  let pendingAsk: { res: ServerResponse; body: any } | undefined;
+  const server = createServer(async (req, res) => {
+    const body = await readRequestBodyJson<Record<string, any>>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    pendingAsk = { res, body };
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--turn-timeout-ms', '2000'], { env: { ...f.options.env, HOME: f.root,
+      BOTMUX_SESSION_ID: 'budget-session', BOTMUX_LARK_APP_ID: 'budget-app', BOTMUX_CHAT_ID: 'budget-chat',
+      BOTMUX_DAEMON_IPC_PORT: String(port) } }) as ChildProcessWithoutNullStreams;
+  let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  const closed = new Promise<void>(r => child.once('close', () => r()));
+  const finals = () => [...stdout.matchAll(/\x1b\]777;botmux:final:([A-Za-z0-9+/=]+)\x07/g)]
+    .map(m => JSON.parse(Buffer.from(m[1], 'base64').toString()));
+  try {
+    child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId: 'human' })).toString('base64')}\n`);
+    await waitFor(() => !!pendingAsk || finals().length > 0);
+    expect(finals()).toEqual([]);
+    expect(pendingAsk!.body).toMatchObject({ originTurnId: 'human', sessionId: 'budget-session' });
+    // Loopback probes must neither crash the fixture nor replace the real Ask.
+    const ask = pendingAsk;
+    for (const body of [undefined, 'not json']) {
+      const probe = await fetch(`http://127.0.0.1:${port}/`, {
+        method: body === undefined ? 'GET' : 'POST', body, signal: AbortSignal.timeout(5000),
+      });
+      expect(probe.status).toBe(400);
+      await probe.text();
+      expect(pendingAsk).toBe(ask);
+    }
+    // Deliberately cross the configured budget AFTER observing the blocked Ask.
+    // This is the timer boundary under test, not a sleep to guess readiness.
+    await new Promise(r => setTimeout(r, 2500));
+    expect(finals()).toEqual([]);
+    expect(pendingAsk!.res.destroyed).toBe(false);
+    const key = pendingAsk!.body.questions[0].options[1].key;
+    pendingAsk!.res.setHeader('content-type', 'application/json');
+    pendingAsk!.res.end(JSON.stringify({ kind: 'answered', answers: [[key]] }));
+    await waitFor(() => finals().length === 1);
+    expect(finals()[0].turnId).toBe('human');
+    if (content === 'permission-hang') {
+      expect(finals()[0].errorCode).toBe('turn_budget_exhausted');
+      expect(stdout).toContain('progress-2');
+    } else {
+      expect(finals()[0].errorCode).toBeUndefined();
+      expect(finals()[0].content).toContain('deny');
+    }
+  } finally {
+    child.kill('SIGTERM'); await closed;
+    await new Promise<void>(r => server.close(() => r()));
+  }
 });

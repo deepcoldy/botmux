@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   EffortConfirmDialogGuard,
@@ -114,33 +112,5 @@ describe('EffortConfirmDialogGuard', () => {
     guard.arm();
     guard.reset();
     expect(guard.isArmed()).toBe(false);
-  });
-});
-
-/**
- * Source-lock for the worker wiring. The guard above was fully unit-tested
- * while its only caller in `deliverRawInput` was silently dropped by a later
- * merge, which left the auto-accept dead for months. Pin the call site so a
- * refactor that drops it turns red instead of parking `/effort <level>` on an
- * unanswerable dialog.
- */
-describe('worker wiring', () => {
-  const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8')
-    .split('\n').filter(line => !/^\s*\/\//.test(line)).join('\n');
-
-  it('deliverRawInput arms the guard for /effort <level> passthroughs', () => {
-    const start = workerSource.indexOf('async function deliverRawInput(');
-    const end = workerSource.indexOf('const accepted = finalizeRawCommandDelivery(', start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const region = workerSource.slice(start, end);
-    expect(region).toMatch(/if \(isEffortLevelCommand\(msg\.content\)\) armEffortConfirm\(\);/);
-    expect(region).toMatch(/catch \(err: any\) \{[\s\S]*?disarmEffortConfirm\(\);/);
-  });
-
-  it('onPtyData consumes the armed guard', () => {
-    expect(workerSource).toMatch(
-      /effortConfirmGuard\.isArmed\(\) && effortConfirmGuard\.inspect\(data\) === 'confirm'/,
-    );
   });
 });

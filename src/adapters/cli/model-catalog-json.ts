@@ -25,6 +25,12 @@ export interface DebugModelCapabilities {
   reasoningEfforts?: string[];
   /** Parsed for future default-selection UX; deliberately not sent to Dashboard clients yet. */
   defaultReasoningEffort?: string;
+  contextWindow?: number;
+  contextVariants?: Array<{
+    id: 'standard' | 'max';
+    contextWindow: number;
+    reasoningEfforts?: string[];
+  }>;
 }
 
 export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapabilities[] {
@@ -46,6 +52,8 @@ export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapab
       service_tiers?: unknown;
       supported_reasoning_levels?: unknown;
       default_reasoning_level?: unknown;
+      context_window?: unknown;
+      business_metadata?: { variants?: Record<string, unknown> };
     };
     const slug = record.slug;
     const visibility = record.visibility;
@@ -65,9 +73,26 @@ export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapab
           : undefined))
         .filter(isCodexReasoningEffort)
       : [];
+    const contextWindow = Number.isSafeInteger(record.context_window) && (record.context_window as number) > 0
+      ? record.context_window as number : undefined;
+    const variants = record.business_metadata?.variants;
+    const contextVariants: NonNullable<DebugModelCapabilities['contextVariants']> = [];
+    for (const id of ['standard', 'max'] as const) {
+      const capacity = variants?.[`${id}_context_window`];
+      if (!Number.isSafeInteger(capacity) || (capacity as number) <= 0) continue;
+      const levels = variants?.[`${id}_supported_reasoning_levels`];
+      const efforts = Array.isArray(levels)
+        ? levels.flatMap(level => level && typeof level === 'object'
+          && isCodexReasoningEffort(level.effort) ? [level.effort] : [])
+        : undefined;
+      contextVariants.push({ id, contextWindow: capacity as number,
+        ...(efforts ? { reasoningEfforts: efforts } : {}) });
+    }
     capabilities.push({
       slug,
       serviceTiers,
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(contextVariants.length ? { contextVariants } : {}),
       ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
       ...(isCodexReasoningEffort(record.default_reasoning_level)
         ? { defaultReasoningEffort: record.default_reasoning_level }
@@ -116,6 +141,19 @@ export async function detectModelsViaExec(
   } catch {
     return null;
   }
+}
+
+export async function detectModelCapabilitiesViaExec(
+  bin: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<readonly DebugModelCapabilities[] | null> {
+  try {
+    const { stdout } = await promisify(execFile)(bin, ['debug', 'models'], {
+      env, timeout: 8_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true,
+    });
+    const catalog = parseDebugModelCapabilitiesJson(String(stdout));
+    return catalog.length ? catalog : null;
+  } catch { return null; }
 }
 
 /** 能力目录（`detectModelCapabilities` 的结果）→ `detectModels` 的 slug 列表；目录不可用时为 null。 */

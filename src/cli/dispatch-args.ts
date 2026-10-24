@@ -11,6 +11,7 @@ export interface DispatchArgs {
   model?: string;
   reasoningEffort?: string;
   into?: string;
+  resultDelivery?: string;
   standby: boolean;
   steer: boolean;
   delegates?: string[];
@@ -30,7 +31,7 @@ export type DispatchArgsResult =
   | { ok: false; errorCode: DispatchArgsErrorCode; error: string; option?: string };
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
-  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'model' | 'reasoningEffort'
+  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery' | 'model' | 'reasoningEffort'
 >>([
   ['--session-id', 'sessionId'],
   ['--title', 'title'],
@@ -39,6 +40,7 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--chat-id', 'chatId'],
   ['--repo', 'repo'],
   ['--into', 'into'],
+  ['--result-delivery', 'resultDelivery'],
   ['--model', 'model'],
   ['--reasoning-effort', 'reasoningEffort'],
 ]);

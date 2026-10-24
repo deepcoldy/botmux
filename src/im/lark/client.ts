@@ -32,6 +32,8 @@ import {
   LARK_CODE_USER_SCOPE_MISSING,
   larkApiError,
   structuredLarkCode,
+  classifyContactErrorCode,
+  type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
@@ -664,22 +666,11 @@ export async function resolveUnionIdFromOpenIdStrict(
 /** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
  *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
  *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时
- *  错误会把合法用户长期钉成「查不到」。 */
-type DefinitiveProfileMiss = 'cross_app' | 'not_visible' | 'invalid_id';
+ *  错误会把合法用户长期钉成「查不到」。分类器在零依赖的 lark-errors.ts，
+ *  body 与 throw 两种返回形状共用同一口径。 */
+type DefinitiveProfileMiss = DefinitiveContactErrorCode;
 const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | DefinitiveProfileMiss>();
 const USER_PROFILE_CACHE_MAX = 1000;
-
-/** Contact API 确定性失败码 → 类别（重试也不会变）：99992361 open_id 属其他
- *  应用；41050 无权限看该用户（不在通讯录可见范围）；41012 user id 无效 /
- *  40001 参数无效。其余非零码（如 40003 internal error）与网络异常视为瞬时。
- *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
- *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
-function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
-  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
-  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
-  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
-  return undefined;
-}
 
 export type UserProfileLookup =
   | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
@@ -1930,6 +1921,15 @@ export async function resolveAllowedUsersWithMap(
   errored?: boolean;
   entryStatus: Map<string, EntryResolveStatus>;
   hasPermanentBatchError?: boolean;
+  /**
+   * Raw entries (email / mobile / on_) this pass PROVED unresolvable: a
+   * code-0 batch omitted them, or a definitive contact code (41050 不可见 /
+   * 41012 / 40001 / code-0 无 user) ruled them out. These are NOT transient —
+   * no retry is scheduled and they must never be revived from cache. Literal
+   * `ou_` is always kept as-is and never appears here. Callers surface them as
+   * log warnings / user-facing hints instead of silently dropping them.
+   */
+  definitiveMisses: string[];
 }> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
@@ -2081,6 +2081,10 @@ export async function resolveAllowedUsersWithMap(
               // the returned user_list → definitive miss (no such user / not
               // visible), NOT a transient failure. Do not fall back to cache.
               entryStatus.set(rawEmail, 'definitive');
+              // 此前确定性 miss 完全静默（连 WARN 都没有），条目从运行时名单
+              // 消失却无任何线索。只打日志：不拒绝写入、不发 owner DM。
+              logger.warn(`allowedUsers email ${rawEmail} definitively unresolved for ${larkAppId} `
+                + `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -2157,6 +2161,9 @@ export async function resolveAllowedUsersWithMap(
               // code-0 but this mobile absent from user_list → definitive miss
               // (no such user / not visible), same as the email case.
               entryStatus.set(rawEntry, 'definitive');
+              // 与 email 分支同口径：确定性 miss 只打日志，不再静默丢弃。
+              logger.warn(`allowedUsers mobile ${rawEntry} definitively unresolved for ${larkAppId} `
+                + `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -2188,7 +2195,15 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored, entryStatus, hasPermanentBatchError };
+  // 一次性汇总本次确定性解析失败的原始条目（保持配置顺序），供调用方打日志 /
+  // 在 /botconfig 回复里提示。所有标 definitive 的位置（email 批量、mobile
+  // 批量、union_id 单查）都由这一张表覆盖；literal ou_ 恒为 resolved 不会出现，
+  // transient 条目排除在外（重试仍可能恢复）。
+  const definitiveMisses: string[] = [];
+  for (const v of raw) {
+    if (entryStatus.get(v) === 'definitive') definitiveMisses.push(v);
+  }
+  return { resolved, map, errored, entryStatus, hasPermanentBatchError, definitiveMisses };
 }
 
 /**
@@ -3099,4 +3114,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   }
 
   return configured;
+}
+
+/** Current application only. Throws on missing scope/unknown membership. */
+export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  const response: any = await larkGet(getBotClient(larkAppId),
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+  if (response.code !== 0 && response.code !== undefined) throw larkApiError('check bot chat membership', response);
+  if (typeof response.data?.is_in_chat !== 'boolean') throw new Error('chat_membership_unknown');
+  return response.data.is_in_chat;
 }

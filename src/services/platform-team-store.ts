@@ -94,7 +94,11 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      bots.push({ appId, unionId: unionId || undefined, name });
+      bots.push({
+        appId,
+        unionId: unionId || undefined,
+        name,
+      });
     }
   }
   const memberUnionIds = Array.isArray(t.memberUnionIds)

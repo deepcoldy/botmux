@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { drainPiTranscript, resetPiPendingTurnState, PI_TURN_BOUNDARY_TIMEOUT_MS, type PiBridgeEvent } from '../src/services/pi-transcript.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { shouldEmitEmptyCompletedBridgeFallback } from '../src/services/bridge-fallback-gate.js';
 
 const ROOT = join(tmpdir(), `botmux-pi-transcript-test-${process.pid}`);
 const SESSION_ID = 'eef935b5-4201-4e59-8bc7-06f03aa3388c';
@@ -99,6 +100,24 @@ describe('drainPiTranscript: turn terminal contract', () => {
     // fallback + historical behavior preserved).
     expect(final.terminalStatus).toBeUndefined();
     expect(final.terminalErrorCode).toBeUndefined();
+  });
+
+  it('keeps the empty-final fallback for a completed Pi turn with no successful send/report marker', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('finish without sending'),
+      assistantFinal('stop', ''),
+    ]);
+    const final = drainAll(path).find(event => event.kind === 'assistant_final');
+    expect(final?.text).toBe('');
+    expect(final?.terminalStatus).toBeUndefined();
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      turnId: 'turn-pi-no-send',
+      markTimeMs: Date.parse('2026-08-03T05:13:39.839Z'),
+      isLocal: false,
+      finalText: final?.text,
+      terminalStatus: final?.terminalStatus,
+    }, undefined, [], false)).toBe(true);
   });
 
   it('does NOT emit for a mid-turn toolUse assistant record (only the terminal record closes)', () => {
@@ -260,6 +279,76 @@ describe('drainPiTranscript: turn terminal contract', () => {
     // …and only once: the held state is cleared, not re-reported every drain.
     const after = drainPiTranscript(path, late.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
     expect(after.events).toHaveLength(0);
+  });
+
+  it('never reports an error the turn has already worked past, however long the turn then runs', () => {
+    // Live shape (PR review session, pi 1.3.0): `terminated` mid-turn, Pi
+    // retried, and the turn kept running tool steps for half an hour. Only
+    // stop/length used to drop the hold, so the backstop fired 300s later and
+    // the card flipped to 「执行失败」 while Pi was visibly still working.
+    const dir = join(ROOT, '--tmp-pi-probe--');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `2026-08-03T05-13-01-270Z_${SESSION_ID}.jsonl`);
+    writeFileSync(path, [
+      sessionHeader(),
+      turnSettled(null, '2026-08-03T05:13:30.000Z'),
+      userMsg('复审 PR'),
+      assistantToolUse('2026-08-03T05:13:42.000Z'),
+      toolResult('r1', '2026-08-03T05:13:43.000Z'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'terminated'),
+    ].map((o) => JSON.stringify(o)).join('\n') + '\n');
+    const t0 = 7_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    expect(first.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+
+    // The retry lands a couple of minutes later as an ordinary tool step.
+    appendFileSync(path, [
+      assistantToolUse('2026-08-03T05:17:06.000Z'),
+      toolResult('r2', '2026-08-03T05:17:07.000Z'),
+    ].map((o) => JSON.stringify(o)).join('\n') + '\n');
+    const second = drainPiTranscript(path, first.newOffset, t0 + 180_000);
+    expect(second.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+
+    // Long past the backstop with the turn still running: still no failure.
+    const late = drainPiTranscript(path, second.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
+    expect(late.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+  });
+
+  it('a turn that recovers once and then really fails reports only the later error', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      turnSettled(null, '2026-08-03T05:13:30.000Z'),
+      userMsg('复审 PR'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'terminated'),
+      assistantToolUse('2026-08-03T05:14:20.000Z'),
+      toolResult('r1', '2026-08-03T05:14:21.000Z'),
+      assistantFinal('error', '', '2026-08-03T05:20:00.000Z',
+        'API key auth failed for provider super-relay: Failed to resolve API key for provider "super-relay" from shell command: bytedcli auth get-bytecloud-jwt-token'),
+      turnSettled('error', '2026-08-03T05:20:00.010Z'),
+    ]);
+    const fails = drainAll(path).filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].timestampMs).toBe(Date.parse('2026-08-03T05:20:00.000Z'));
+    expect(fails[0].terminalErrorCode).toBe('pi_credential_unavailable');
+  });
+
+  it('classifies an unresolvable provider credential as pi_credential_unavailable, keeping the detail', () => {
+    // Pi re-runs a models.json `!command` key before every request under a
+    // 10s timeout; on a loaded box the token helper overruns, the request never
+    // leaves the machine, and Pi ends the turn without retrying. The shared
+    // classifier would call it a generic task failure.
+    const errorMessage = 'API key auth failed for provider super-relay: Failed to resolve API key for provider "super-relay" from shell command: bytedcli auth get-bytecloud-jwt-token';
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('复审 PR'),
+      assistantFinal('error', '', '2026-08-03T05:14:05.000Z', errorMessage),
+      turnSettled('error'),
+    ]);
+    const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].terminalStatus).toBe('failed');
+    expect(finals[0].terminalErrorCode).toBe('pi_credential_unavailable');
+    expect(finals[0].terminalErrorSummary).toContain('Failed to resolve API key');
   });
 
   it('drops a held error when the turn settles as anything other than error', () => {

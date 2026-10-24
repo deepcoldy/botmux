@@ -33,7 +33,6 @@ import {
     containmentHandles,
     containmentSessionIds,
     hasUnprovenContainment,
-    inheritContainmentHandles,
     proveContainmentQuiescent,
     readProcLiveness,
     readProcStartTime,
@@ -43,7 +42,6 @@ import {
     strongHandleFromPreparedBoundary,
     weakHandleRootStillOriginal,
     containmentQuiescence,
-    sessionContainmentQuiescence,
     type WeakContainmentHandle,
     type StrongContainmentHandle,
 } from '../src/core/mojo-containment.js';
@@ -598,40 +596,6 @@ describe('proving quiescence fails closed', () => {
     });
 });
 
-describe('generation replacement inherits the tree', () => {
-    it('a new generation inherits outstanding handles with identity preserved', () => {
-        const dataDir = freshDataDir();
-        recordContainmentHandle(weak({ generation: 1, rootPid: 4242, startTime: 999 }), dataDir);
-        const inherited = inheritContainmentHandles('sess-1', 7, dataDir);
-        expect(inherited).toHaveLength(1);
-        const h = inherited[0] as WeakContainmentHandle;
-        // Generation is refreshed for logs...
-        expect(h.generation).toBe(7);
-        // ...but the IDENTITY must be verbatim, or the handle proves nothing about
-        // the tree actually left behind.
-        expect(h.rootPid).toBe(4242);
-        expect(h.startTime).toBe(999);
-        expect(h.bootId).toBe(BOOT);
-        expect(h.nonce).toBe('nonce-abc');
-        // Still blocking: replacement proved nothing.
-        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
-    });
-
-    it('inheritance never drops a handle, so the blocker survives N replacements', () => {
-        const dataDir = freshDataDir();
-        recordContainmentHandle(weak({ rootPid: 1, startTime: 1 }), dataDir);
-        recordContainmentHandle(weak({ rootPid: 2, startTime: 2 }), dataDir);
-        for (let gen = 2; gen < 6; gen++) inheritContainmentHandles('sess-1', gen, dataDir);
-        expect(containmentHandles('sess-1', dataDir)).toHaveLength(2);
-    });
-
-    it('inheriting a session with nothing outstanding is a no-op', () => {
-        const dataDir = freshDataDir();
-        expect(inheritContainmentHandles('sess-nothing', 2, dataDir)).toEqual([]);
-        expect(containmentSessionIds(dataDir)).toEqual([]);
-    });
-});
-
 describe('pid reuse cannot masquerade as the original tree', () => {
     it('a recycled pid with a different starttime is NOT the original root', () => {
         const procRoot = fakeProc({ bootId: BOOT, pids: { 4242: 5000 } });
@@ -862,57 +826,6 @@ describe('a reboot is the ONLY source of boundaryProof: true (round-8 same-UID P
     });
 });
 
-describe('session-level quiescence takes the weakest outstanding tree', () => {
-    const dataDirs = (): string => mkdtempSync(join(tmpdir(), 'mojo-sess-q-'));
-    const cg = (id: string, path: string): StrongContainmentHandle => ({
-        kind: 'cgroup', sessionId: id, generation: 1, cgroupPath: path, nonce: 'n',
-    });
-
-    it('no outstanding handles is diagnostic-clean, NOT a boundary proof', () => {
-        // "nothing recorded" must not masquerade as kernel-level containment.
-        const q = sessionContainmentQuiescence('sess-empty', () => { throw new Error('unreachable'); }, dataDirs());
-        expect(q).toEqual({ kind: 'diagnostic-clean', boundaryProof: false });
-    });
-
-    it('all-strong and all-proven is diagnostic-clean now (cgroup emptiness is not a proof)', () => {
-        const d = dataDirs();
-        recordContainmentHandle(cg('s1', '/cg/a'), d);
-        recordContainmentHandle(cg('s1', '/cg/b'), d);
-        const q = sessionContainmentQuiescence('s1', h => ({ proven: true, handle: h }), d);
-        // Every member proven-empty, yet no boundary proof — the blocker survives
-        // (a same-UID process could have migrated out of any of these leaves).
-        expect(q.boundaryProof).toBe(false);
-        expect(q.kind).toBe('diagnostic-clean');
-    });
-
-    it('ONE weak handle downgrades the whole session to diagnostic-clean', () => {
-        const d = dataDirs();
-        recordContainmentHandle(cg('s2', '/cg/a'), d);
-        recordContainmentHandle({ ...weak(), sessionId: 's2' }, d);
-        const q = sessionContainmentQuiescence('s2', h => ({ proven: true, handle: h }), d);
-        expect(q.boundaryProof).toBe(false);
-    });
-
-    it('ONE unproven handle makes the whole session unproven', () => {
-        const d = dataDirs();
-        recordContainmentHandle(cg('s3', '/cg/a'), d);
-        recordContainmentHandle(cg('s3', '/cg/b'), d);
-        const q = sessionContainmentQuiescence('s3', h => (
-            h.kind === 'cgroup' && h.cgroupPath === '/cg/b'
-                ? { proven: false, handle: h, reason: 'busy', residualPids: [9] }
-                : { proven: true, handle: h }
-        ), d);
-        expect(q.boundaryProof).toBe(false);
-        expect(q.kind).toBe('alive');
-    });
-
-    it('an unreadable store THROWS rather than presenting a clean session', () => {
-        const d = dataDirs();
-        writeFileSync(join(d, 'mojo-containment-handles.json'), '{ nope');
-        expect(() => sessionContainmentQuiescence('s4', h => ({ proven: true, handle: h }), d)).toThrow();
-    });
-});
-
 describe('a host that can prove nothing still keeps its blocker', () => {
     /** A host with neither cgroup v2 nor a readable /proc — i.e. Darwin. */
     function barrenHost(): { procRoot: string; cgroupRoot: string } {
@@ -983,9 +896,6 @@ describe('a host that can prove nothing still keeps its blocker', () => {
         const back = containmentHandles('darwin-5', dataDir);
         expect(back).toHaveLength(1);
         expect(back[0].kind).toBe('unprovable');
-        // ...and inheritance carries it to the next generation unchanged.
-        const inherited = inheritContainmentHandles('darwin-5', 2, dataDir);
-        expect(inherited[0].kind).toBe('unprovable');
         expect(hasUnprovenContainment('darwin-5', dataDir)).toBe(true);
     });
 
@@ -998,24 +908,6 @@ describe('a host that can prove nothing still keeps its blocker', () => {
         expect(q.kind).toBe('unsupported-platform');
         expect(q.boundaryProof).toBe(false);
         if (q.kind === 'unsupported-platform') expect(q.platform).toBe('darwin');
-    });
-
-    it('one unprovable handle downgrades the whole session', () => {
-        const dataDir = mkdtempSync(join(tmpdir(), 'darwin-store4-'));
-        recordContainmentHandle(
-            { kind: 'cgroup', sessionId: 'mix', generation: 1, cgroupPath: '/cg/a', nonce: 'n' },
-            dataDir,
-        );
-        recordContainmentHandle(
-            acquireContainmentHandle({ sessionId: 'mix', generation: 1, rootPid: 1, nonce: 'n' },
-                { ...barrenHost(), platform: 'darwin' }),
-            dataDir,
-        );
-        const q = sessionContainmentQuiescence('mix', h => (
-            h.kind === 'cgroup' ? { proven: true, handle: h } : proveContainmentQuiescent(h, {})
-        ), dataDir);
-        // A strong proven sibling must not lift the session to contained-proven.
-        expect(q.boundaryProof).toBe(false);
     });
 });
 

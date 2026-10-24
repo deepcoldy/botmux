@@ -4,6 +4,7 @@ import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
 
 // Execute the actual worker handler with a controlled backend. Importing the
 // whole worker would start its IPC/runtime; a copy of the handler would miss
@@ -25,6 +26,8 @@ function harness(delivered = true) {
   const control = vi.fn(async () => delivered);
   const context = createContext({
     currentBotmuxTurnId: 'stop', backend: {}, lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'pty', isCodexAppCliId,
+    codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
+    traexAutoModelController: null,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
@@ -75,5 +78,15 @@ describe('worker exact interrupt acknowledgement and crash replay', () => {
     await h.interrupt();
     expect(h.replay()).toEqual(['next']);
     expect(h.pendingMessages.map(item => item.turnId)).toEqual(['next']);
+  });
+
+  it.each([true, false])('settles Auto model selection only when interruption is delivered (%s)', async delivered => {
+    const h = harness(delivered);
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'] });
+    controller.beginTurn('stop');
+    h.context.traexAutoModelController = controller;
+    await h.interrupt();
+    expect(controller.currentTurnId()).toBe(delivered ? undefined : 'stop');
+    expect(h.pendingMessages.map(item => item.turnId)).toEqual(delivered ? ['next'] : ['stop', 'next']);
   });
 });

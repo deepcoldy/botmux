@@ -11,7 +11,8 @@ import { buildFederatedRoster } from '../src/services/federation-roster.js';
  * excludes it from group membership — the roster is the source of truth the
  * member filter consults. Proves the 4-class matrix at the aggregation layer:
  *   remote normal (true) / remote apiOnly (false) / remote legacy (absent→normal).
- * (Local classes are covered by the createTeamGroup source-lock + config read.)
+ * (Hub-local apiOnly bots are filtered by dashboard createTeamGroup from its own
+ * config read; that path has no behavioural test here.)
  */
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-fed-cap-')); });

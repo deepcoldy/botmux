@@ -18,6 +18,7 @@
 import {
   DAEMON_COMMANDS,
   commandSpec,
+  commandCliIdMatches,
   MULTILINE_COMMANDS,
   ROUTE_SPECIAL_COMMANDS,
   SESSIONLESS_DAEMON_COMMANDS,
@@ -188,7 +189,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   if (special) return { kind: 'special', cmd, content, handler: special };
 
   const spec = commandSpec(cmd);
-  const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
+  const cliCommand = spec?.cliId !== undefined && commandCliIdMatches(spec.cliId, input.cliId);
   // 「仅无会话时认领」的命令（`/resume`）：无会话（或只有命令空壳，如关闭后发过 /help）
   // → 先于透传闸认领（没有 CLI 可透传）；
   // 有会话 → 落到下面的透传闸 / 未知命令转发，与改造前逐字一致（它不在 DAEMON_COMMANDS 里）。

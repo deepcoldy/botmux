@@ -89,6 +89,30 @@ export const GOAL_ENV = {
   V3_MARKER: 'BOTMUX_V3_GOAL',
 } as const;
 
+/** Native slash command a goal-mode worker is started with. */
+export const GOAL_COMMAND = '/goal';
+
+/** The objective botmux v3 hands every goal-mode worker (the text after
+ *  `/goal`): a short pointer at the file-backed instructions, see
+ *  `buildGoalCommand` / `renderGoalFile`. Single source shared with
+ *  {@link isBotmuxGoalObjective} so the two cannot drift apart. */
+export const GOAL_COMMAND_OBJECTIVE =
+  `Read $${GOAL_ENV.GOAL_PATH}. Write files in $${GOAL_ENV.OUTPUT_DIR} and manifest at `
+  + `$${GOAL_ENV.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+
+/** True when `text` is the goal botmux v3 sends — with or without the leading
+ *  `/goal`, whitespace-insensitive. Native stores keep it as the thread's first
+ *  input (TraeX 0.210 goal mode: `threads.preview` = the objective, empty
+ *  `first_user_message`), and none of the Lark-envelope checks match it, so
+ *  session discovery needs this to recognise a botmux workflow run. */
+export function isBotmuxGoalObjective(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const objective = normalized.startsWith(`${GOAL_COMMAND} `)
+    ? normalized.slice(GOAL_COMMAND.length + 1).trim()
+    : normalized;
+  return objective === GOAL_COMMAND_OBJECTIVE;
+}
+
 // ─── Runtime human-ask (goal worker → human, rides the blocked+retry rail) ──
 
 /**
@@ -118,14 +142,29 @@ export type { GoalAnswer, GoalAsk } from './event-contract.js';
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
 /**
- * v3 goal-mode is delivered via the native `/goal` command.  Keep this list
- * capability-based and explicit. Claude Code, Codex, Seed, and Traex have
- * direct `/goal` execution evidence (Traex 0.200.16+ also needs its automation
- * hook-trust flag). Relay is admitted from its exact Claude-family adapter and
- * slash-command compatibility with Seed; a Relay-binary smoke remains pending
- * on hosts where that binary is installed. The manifest watcher and goal env
- * contract are CLI-neutral after dispatch. The runtime rejects a run whose
- * nodes resolve to any other CLI at start time.
+ * v3 goal-mode delivery is CLI-specific at the INPUT edge and CLI-neutral
+ * after it.  Keep this list capability-based and explicit.
+ *
+ * Native `/goal` command (the pool injects `/goal <objective>`):
+ * Claude Code, Codex, Seed, and Traex have direct `/goal` execution evidence
+ * (Traex 0.200.16+ also needs its automation hook-trust flag). Relay is
+ * admitted from its exact Claude-family adapter and slash-command
+ * compatibility with Seed; a Relay-binary smoke remains pending on hosts where
+ * that binary is installed.
+ *
+ * Programmatic-session CLIs (the pool injects the bare `<objective>`, see
+ * buildGoalCommand in ephemeral-pool.ts): MiniMax Code (`minimax`) never sees
+ * a TUI composer in botmux — a long-lived runner drives native `mcode acp` session/prompt.
+ * That ACP prompt path intercepts only a fixed read-only command set
+ * (help/new/model/status/doctor/context/skills/mcp/usage/compact); a literal
+ * `/goal` would reach the model as plain text, not start a goal. mcode's
+ * autonomous Session Goal exists (TUI `/goal`, ACP mcode/session/goal/create),
+ * but v3 needs no native settlement loop: the bypass-permission objective turn
+ * is the same agentic shape as headless `mcode exec`, and the manifest watcher
+ * decides node completion exactly as for every other CLI.
+ *
+ * The runtime rejects a run whose nodes resolve to any other CLI at start
+ * time.
  */
 export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'claude-code',
@@ -133,10 +172,31 @@ export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'seed',
   'traex',
   'relay',
+  'minimax',
 ];
 
 export function isV3SupportedCli(cliId: CliId): boolean {
   return V3_SUPPORTED_CLIS.includes(cliId);
+}
+
+/**
+ * CLIs whose native interface understands the `/goal` slash command as the
+ * first turn of an autonomous goal-mode run. The pool prefixes the objective
+ * with `/goal` only for these. Every other admitted CLI is driven over a
+ * programmatic session (ACP / stream-json runner), where the objective text
+ * alone is sent — it already points at the file-backed instructions.
+ * `isBotmuxGoalObjective` recognises BOTH shapes for session discovery.
+ */
+export const V3_NATIVE_GOAL_COMMAND_CLIS: readonly CliId[] = [
+  'claude-code',
+  'codex',
+  'seed',
+  'traex',
+  'relay',
+];
+
+export function cliTakesNativeGoalCommand(cliId: CliId): boolean {
+  return V3_NATIVE_GOAL_COMMAND_CLIS.includes(cliId);
 }
 
 // ─── BotSnapshot (frozen at run start) ──────────────────────────────────────

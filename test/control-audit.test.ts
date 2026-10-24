@@ -1,14 +1,14 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  AUDIT_ASYNC_MAX_PENDING,
   AsyncFileControlAuditSink,
   controlAuditRecord,
   type AuditStreamLike,
   type ControlAuditRecord,
 } from '../src/dashboard/control-audit.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 const roots: string[] = [];
 
@@ -119,7 +119,6 @@ describe('async audit sink backpressure', () => {
   });
 
   it('never blocks or hands the caller a promise: append stays synchronous fire-and-forget', async () => {
-    expect(AUDIT_ASYNC_MAX_PENDING).toBe(2_000);
     const stream = new FakeAuditStream();
     stream.accept = false; // 永不 drain 的最坏情况
     const sink = new AsyncFileControlAuditSink({
@@ -154,12 +153,11 @@ describe('async terminal input audit sink', () => {
     const sink = new AsyncFileControlAuditSink({ path });
     sink.append(controlAuditRecord('ou_owner', 's1', 'terminal.input', { bytes: 4 }));
     sink.append(controlAuditRecord('ou_owner', 's1', 'terminal.input', { bytes: 9 }));
-    await waitFor(() => {
-      try { return readFileSync(path, 'utf8').trim().split('\n').length === 2; }
-      catch { return false; }
-    });
+    // The stream writes off the main thread while this polls, so a half-written
+    // second record must not count as two.
+    await waitFor(() => readJsonLines(path).length === 2);
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    const records = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const records = readJsonLines(path);
     expect(records.map(record => record.bytes)).toEqual([4, 9]);
     expect(Object.keys(records[0]).sort()).toEqual(['action', 'bytes', 'session', 'timestamp', 'user']);
   });

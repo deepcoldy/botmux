@@ -39,7 +39,7 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.3**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+发版编译用的 Bun 版本**钉在 1.4.3**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 
@@ -140,6 +140,16 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - **跨 CLI**：改某个 CLI 适配器时，确认没动到 `adapters/cli/` 的共用基类/工具（`shared-hints`、`runner-input`、`registry` 等）或 worker 侧共用逻辑，否则可能连带影响其它 20+ 个 CLI。共用改动要在至少一个「别的 CLI」上验证仍可用
 - **跨后端 / 跨会话类型**：改动涉及 `PtyBackend` vs `TmuxBackend`、话题会话 vs 群会话 vs adopt/restore、sandbox on vs off、v3 workflow vs 普通会话时，逐一核对受影响的组合
 - **改公共层**（`core/`、`config.ts`、`bot-registry.ts`、`im/lark/`）时影响面最大——PR 描述里写清评估结论：动了什么共用路径、哪些平台/CLI/会话类型受影响、各自怎么验证的
+
+## 测试原则（写/改测试必读）
+
+测试要证明**行为**，不是给实现拍照。下面几类已经集中治理过，不要再新增：
+
+- **不读 `src/` 源码文本做断言。** `readFileSync('src/worker.ts')` 后 `toContain` 某行代码、或比 `indexOf` 先后，钉的是实现文本：改名、重构就红，代码还在但已经走不到时照样绿。git 历史里这类文件几乎每次改 `worker.ts` / `daemon.ts` 都得跟着改字符串。被测逻辑埋在闭包里时，**把它抽成可导出的纯函数再测**，而不是 grep；治理时因为没有 seam 而删掉的绊线记在 `docs/plans/2026-10-20-test-seam-backlog.md`，动到对应代码时顺手补上。只有真正的结构约束才保留这种写法：K1 import 边界与编译态限制、K2 没有行为 seam 的安全护栏、K3 高危回归绊线（数据丢失、fleet 崩溃、消息丢失或重复）、K4 机器可校验的一致性。保留时在用例或外层 `describe` 上方写 `// 源码结构护栏(Kx)：<为什么只能读源码、守的是什么不变量>`；只是把 src 下的 HTML/CSS 当夹具或交给浏览器、并不断言其文本的，写 `// 非文本断言：<说明>`。`test/test-hygiene.test.ts` 会拒绝没有标注的读源码用例。从 `worker.ts` / `daemon.ts` 切出真实函数执行再断言结果（`test/helpers/worker-function-harness.ts`）是没有 seam 时的过渡写法，扫描器不拦，但它依赖函数名和自由变量名，能导出时就直接 import。
+- **不钉文案和文档措辞。** 断言 docs / README / 卡片文案里有某句话，或断言另一个测试文件里有某个用例标题，都证明不了行为。文档由代码生成时，用 `--check` 式的漂移检查；需要「文档覆盖全部枚举值」这类一致性时，两侧都从真实数据取，不要抄字符串。
+- **不钉内部常量。** `expect(TIMEOUT_MS).toBe(60_000)` 只是把字面量再抄一遍。外部协议值（飞书错误码、终端转义序列、跨进程退出码、HTTP 路由、wire format）可以钉；常量之间的关系（`A >= B + C`）写成关系断言。
+- **不为死代码写测试。** 一个导出如果只有测试在调用，要么接进生产路径，要么连同测试一起删掉。测试隔离用的 `reset*` / `clear*Cache` 钩子不在此列。
+- 落笔前自问两句：这条测试会在**真实的行为回归**时变红吗？会在**无害的重构、改文案、调参数**时变红吗？前一问答「会」、后一问答「不会」，才值得写。
 
 ## PR 规范
 

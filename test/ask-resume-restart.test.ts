@@ -7,14 +7,20 @@ import {
   registerAsk,
   registerHostAsk,
   restorePersistedAsks,
+  startHookAskReclaim,
   tryResolveAsk,
+  submitCustomReply,
   submitDocumentAskReply,
+  findPendingAskByAnchor,
+  listPendingAsksByAnchor,
   setCardDispatcher,
   setCanTalkChecker,
   setAskPersistStore,
+  _getPending,
   _resetForTest,
+  _setHookReclaimGraceForTest,
 } from '../src/core/ask-broker.js';
-import { createAskPersistStore, askKeyFor, dispatchUuidForKey, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
+import { createAskPersistStore, askKeyFor, dispatchUuidForAsk, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
 /**
@@ -367,13 +373,14 @@ describe('active same-requestId replay joins one ask (codex P1-1)', () => {
 });
 
 describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
-  it('resumable (hook) card send carries a stable dispatchUuid derived from the scoped key', async () => {
+  it('resumable (hook) card send carries a stable dispatchUuid derived from the scoped key + ask instance', async () => {
     let seenUuid: string | undefined = 'UNSET';
     const d = mockDispatcher((ask) => { seenUuid = ask.dispatchUuid; return Promise.resolve({ messageId: 'om_x' }); });
     setCardDispatcher(d);
     registerAsk(makeInput({ requestId: 'req-uuid-1' }));
     await new Promise((r) => setTimeout(r, 5));
-    expect(seenUuid).toBe(dispatchUuidForKey(askKeyFor('cli_app', 'sess-1', 'hook', 'req-uuid-1')));
+    const askId = d.sendCalls[0]!.askId;
+    expect(seenUuid).toBe(dispatchUuidForAsk(askKeyFor('cli_app', 'sess-1', 'hook', 'req-uuid-1'), askId));
   });
 
   it('explicit origin is NOT persisted but DOES carry a dispatchUuid (codex P1-1)', async () => {
@@ -388,5 +395,184 @@ describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
     // non-resumable card, so it needs server-side dedupe. uuid gates dispatch
     // idempotency (intra-process); resumable gates persistence (cross-restart).
     expect(seenUuid).toBeTruthy();
+  });
+});
+
+/**
+ * A dormant hook ask must be re-claimed by its hook, or the CLI that asked is no
+ * longer waiting. Live incident: the CLI was killed (its hook with it), the ask
+ * stayed dormant through a restart and later captured a plain chat message as
+ * its "answer" — never delivered, no notice.
+ */
+describe('dormant hook asks must be re-claimed by their hook', () => {
+  const GRACE = 40;
+  const anchor = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'om_root' };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /** Register, then restart and restore — the hook has not re-attached yet. */
+  async function restartWithPendingAsk(input = makeInput()) {
+    setCardDispatcher(mockDispatcher());
+    void registerAsk(input);
+    await sleep(5);
+    const orig = onlyPersisted();
+    _resetForTest(); bindStore();
+    const d2 = mockDispatcher();
+    setCardDispatcher(d2);
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    _setHookReclaimGraceForTest(GRACE);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    return { orig, d2 };
+  }
+
+  it('does not take free text while no hook is attached, and keeps the record intact', async () => {
+    const { orig, d2 } = await restartWithPendingAsk();
+    expect(findPendingAskByAnchor(anchor)).toBeUndefined();
+    // Not even as a quoted-card / ambiguity candidate (daemon reads this list first).
+    expect(listPendingAsksByAnchor(anchor)).toEqual([]);
+    expect(submitCustomReply({ askId: orig.askId, by: 'ou_owner', text: 'a plain chat message' })).toBe('stale');
+    expect(onlyPersisted().answeredResult).toBeUndefined();
+    expect(d2.settleCalls).toHaveLength(0);
+  });
+
+  it('a hook that re-attaches in time keeps the ask fully answerable (incl. free text)', async () => {
+    const { orig } = await restartWithPendingAsk();
+    expect(startHookAskReclaim()).toBe(1);
+    const reattached = registerAsk(makeInput());
+    await sleep(GRACE * 3);
+    expect(findPendingAskByAnchor(anchor)?.askId).toBe(orig.askId);
+    expect(listPendingAsksByAnchor(anchor).map((a) => a.askId)).toEqual([orig.askId]);
+    expect(submitCustomReply({ askId: orig.askId, by: 'ou_owner', text: '先灰度' })).toBe('accepted');
+    expect(await reattached).toMatchObject({ kind: 'answered', comment: '先灰度' });
+  });
+
+  it.each([false, true])('no hook within the grace → invalidated, record removed, card expired; a late hook gets a fresh card (daemon restarted in between: %s)', async (restartedBetween) => {
+    // Feishu dedupes a send by uuid (1h): the same uuid returns the ORIGINAL message.
+    const feishu = new Map<string, string>();
+    const dedupingSend = (ask: PendingAsk) => {
+      const uuid = ask.dispatchUuid!;
+      if (!feishu.has(uuid)) feishu.set(uuid, `om_card_${feishu.size + 1}`);
+      return Promise.resolve({ messageId: feishu.get(uuid) });
+    };
+    setCardDispatcher(mockDispatcher(dedupingSend));
+    void registerAsk(makeInput());
+    await sleep(5);
+    const orig = onlyPersisted();
+    _resetForTest(); bindStore();
+    const d2 = mockDispatcher(dedupingSend);
+    setCardDispatcher(d2);
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    _setHookReclaimGraceForTest(GRACE);
+    restorePersistedAsks(Date.now(), 'cli_app');
+
+    startHookAskReclaim();
+    await sleep(GRACE * 3);
+    expect(d2.settleCalls).toEqual([expect.objectContaining({ kind: 'invalidated', failureCode: 'claimant_gone' })]);
+    expect(persistedFiles()).toHaveLength(0);
+    expect(_getPending(orig.askId)).toBeUndefined();
+    expect(tryResolveAsk({ askId: orig.askId, nonce: orig.nonce, selected: 'yes', by: 'ou_owner' })).toBe('stale');
+
+    let lateDispatcher = d2;
+    if (restartedBetween) {
+      _resetForTest(); bindStore();
+      lateDispatcher = mockDispatcher(dedupingSend);
+      setCardDispatcher(lateDispatcher);
+      setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+      expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+    }
+
+    // The hook shows up after all (same requestId → same key). It must get a NEW
+    // card it can be answered on, not the expired one handed back by dedupe.
+    const late = registerAsk(makeInput());
+    await sleep(5);
+    expect(lateDispatcher.sendCalls).toHaveLength(1);
+    const fresh = lateDispatcher.sendCalls[0]!;
+    expect(fresh.dispatchUuid).not.toBe(dispatchUuidForAsk(orig.askKey, orig.askId));
+    expect(onlyPersisted()).toMatchObject({ cardMessageId: 'om_card_2' });
+    void late; // its connection dies with the next simulated restart
+
+    // A restart keeps the fresh card's own uuid (a re-send must dedupe onto IT).
+    _resetForTest(); bindStore();
+    setCardDispatcher(mockDispatcher(dedupingSend));
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    restorePersistedAsks(Date.now(), 'cli_app');
+    expect(_getPending(fresh.askId)?.dispatchUuid).toBe(fresh.dispatchUuid);
+    const reattached = registerAsk(makeInput());
+    expect(tryResolveAsk({ askId: fresh.askId, nonce: fresh.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    expect(await reattached).toMatchObject({ kind: 'answered', answers: [['yes']] });
+  });
+
+  it('a card click stashed while dormant is reported as undelivered when no hook claims it', async () => {
+    const { orig, d2 } = await restartWithPendingAsk();
+    expect(tryResolveAsk({ askId: orig.askId, nonce: orig.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    expect(onlyPersisted().answeredResult).toMatchObject({ kind: 'answered' });
+    startHookAskReclaim();
+    await sleep(GRACE * 3);
+    expect(d2.settleCalls.map((r) => r.kind)).toEqual(['answered', 'invalidated']);
+    expect(d2.settleCalls[1]).toMatchObject({ failureCode: 'answer_undelivered' });
+    expect(persistedFiles()).toHaveLength(0);
+  });
+
+  it('the restore clock waits for the daemon to serve; asks restored later arm at once', async () => {
+    const { d2 } = await restartWithPendingAsk();
+    await sleep(GRACE * 3);
+    expect(d2.settleCalls).toHaveLength(0); // boot time is not charged to the hook
+    expect(persistedFiles()).toHaveLength(1);
+
+    _resetForTest(); bindStore();
+    const d3 = mockDispatcher();
+    setCardDispatcher(d3);
+    _setHookReclaimGraceForTest(GRACE);
+    expect(startHookAskReclaim()).toBe(0);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    await sleep(GRACE * 3);
+    expect(d3.settleCalls).toEqual([expect.objectContaining({ failureCode: 'claimant_gone' })]);
+  });
+
+  it('a hook that drops while the daemon stays up and never returns is invalidated too', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    _setHookReclaimGraceForTest(GRACE);
+    const controller = new AbortController();
+    const first = registerAsk(makeInput(), controller.signal);
+    await sleep(5);
+    controller.abort(); // the CLI (and its hook) was killed
+    expect(await first).toMatchObject({ kind: 'invalidated' });
+    expect(findPendingAskByAnchor(anchor)).toBeUndefined();
+    await sleep(GRACE * 3);
+    expect(d.settleCalls).toEqual([expect.objectContaining({ failureCode: 'claimant_gone' })]);
+    expect(persistedFiles()).toHaveLength(0);
+  });
+
+  it('a click after the hook dropped keeps the reclaim deadline: no hook → reported undelivered', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    _setHookReclaimGraceForTest(GRACE);
+    const controller = new AbortController();
+    void registerAsk(makeInput(), controller.signal);
+    await sleep(5);
+    const rec = onlyPersisted();
+    controller.abort();
+    expect(tryResolveAsk({ askId: rec.askId, nonce: rec.nonce, selected: 'no', by: 'ou_owner' })).toBe('accepted');
+    await sleep(GRACE * 3);
+    expect(d.settleCalls.map((r) => r.kind)).toEqual(['answered', 'invalidated']);
+    expect(d.settleCalls[1]).toMatchObject({ failureCode: 'answer_undelivered' });
+    expect(persistedFiles()).toHaveLength(0);
+  });
+
+  it('host-owned asks are not reclaimed (the daemon is their claimant)', async () => {
+    const host = makeInput({ originKind: 'host_cross_principal_classification', requestId: 'host-1',
+      backendSurvivesRestart: undefined });
+    setCardDispatcher(mockDispatcher());
+    void registerHostAsk(host);
+    await sleep(5);
+    _resetForTest(); bindStore();
+    const d2 = mockDispatcher();
+    setCardDispatcher(d2);
+    _setHookReclaimGraceForTest(GRACE);
+    restorePersistedAsks(Date.now(), 'cli_app');
+    expect(startHookAskReclaim()).toBe(0);
+    await sleep(GRACE * 3);
+    expect(d2.settleCalls).toHaveLength(0);
+    expect(persistedFiles()).toHaveLength(1);
   });
 });

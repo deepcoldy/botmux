@@ -29,6 +29,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
+    reapOrphanTmuxServers: false,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -45,6 +46,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    promptCache: null,
     multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -123,6 +125,16 @@ describe('resolveCodexNotifierRecipientView', () => {
 });
 
 describe('applySettingsWrite happy paths', () => {
+  it('runs the complete settings write inside one injected config transaction', async () => {
+    const runConfigMutation = vi.fn(async <T>(mutation: () => Promise<T>) => mutation());
+    const deps = makeDeps({ runConfigMutation });
+    const result = await applySettingsWrite({ publicReadOnly: true, repoPickerMode: 'repos' }, deps);
+    expect(result.ok).toBe(true);
+    expect(runConfigMutation).toHaveBeenCalledOnce();
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ publicReadOnly: true });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ repoPickerMode: 'repos' });
+  });
+
   it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
@@ -193,6 +205,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
+  });
+
+  it.each([false, true])('writes reapOrphanTmuxServers=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ reapOrphanTmuxServers: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -559,6 +578,13 @@ describe('applySettingsWrite — validation errors', () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid reapOrphanTmuxServers=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_reapOrphanTmuxServers' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
@@ -1203,6 +1229,29 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite promptCache', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    });
+    const cleared = await applySettingsWrite({ promptCache: null }, deps);
+    expect(cleared.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ promptCache: null });
+  });
+
+  it('rejects typos instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ promptCache: { keepalive: { idleMinutes: 90 } } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_promptCache' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });
 
