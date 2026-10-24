@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, GIT_CONFIG_PAIR_ENV_KEY, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { sessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
@@ -24,8 +24,14 @@ const PANE_ENV_UNSET_KEYS = [...new Set([
   ...REDACTED_CHILD_ENV_KEYS,
   ...BOTMUX_INJECTED_ENV_KEYS,
 ])];
-const PANE_ENV_UNSET_CLAUSE = `unset ${PANE_ENV_UNSET_KEYS.join(' ')}`;
-const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}`;
+// Double quotes, not single: the whole wrapper is embedded by callers inside a
+// single-quoted shell word, so an embedded single quote would truncate it.
+const GIT_CONFIG_PAIR_ENV_NAMES = `/usr/bin/env | sed -nE "s/^(${GIT_CONFIG_PAIR_ENV_KEY.source.slice(1, -1)})=.*/\\1/p"`;
+// GIT_CONFIG_COUNT is cleared by the allowlist above, and botmux re-emits it with
+// its own pairs afterwards. Both halves are required: clearing the pairs while a
+// stale count (e.g. 14) survived makes git abort before reading any repository.
+const PANE_ENV_UNSET_CLAUSE = `unset ${PANE_ENV_UNSET_KEYS.join(' ')} $(${GIT_CONFIG_PAIR_ENV_NAMES})`;
+const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')} (${GIT_CONFIG_PAIR_ENV_NAMES})`;
 
 /** Guard so the fallback self-heal runs at most once in this worker process. */
 let serverGlobalEnvScrubbed = false;
@@ -633,7 +639,25 @@ export function buildBotmuxEnvAssignments(
   // every KEY=VAL operand, so any botmux assignment below still wins.
   out.push(...sessionEnvUnsetFlags(unsetEnv));
   if (env) {
+    // Numbered Git config pairs are re-emitted as a set whose COUNT is derived
+    // from the pairs actually present, never copied from the ambient value. An
+    // inherited COUNT (14 in the field) outlived the pairs that indexed it, and
+    // git aborts before reading any repository when the two disagree.
+    const gitPairs = Object.keys(env).filter(key => GIT_CONFIG_PAIR_ENV_KEY.test(key));
+    const indices = [...new Set(gitPairs.map(key => Number(key.slice(key.lastIndexOf('_') + 1))))].sort((a, b) => a - b);
+    const contiguous = indices.every((index, position) => index === position);
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
+      if (key === 'GIT_CONFIG_COUNT' && gitPairs.length) {
+        // Only publish a count when the surviving indices really are 0..n-1;
+        // a gapped set (0, 2) cannot be renumbered without rewriting values.
+        if (contiguous) out.push(`GIT_CONFIG_COUNT=${indices.length}`);
+        continue;
+      }
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    for (const key of gitPairs) {
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);

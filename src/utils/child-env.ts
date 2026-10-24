@@ -498,13 +498,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // per-host credential config are set on childEnv, which a tmux pane does not
   // inherit, so a push would carry the machine's identity instead.
   'GIT_ASKPASS',
-  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
-  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
-  // a prefix rule here would widen what any session can push into a pane.
   'GIT_CONFIG_COUNT',
-  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
-  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
-  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
@@ -636,7 +630,7 @@ export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   if (managed(env.GIT_ASKPASS)) {
     // These entries are emitted together by gitIdentityConfigEnv for the turn.
     for (const key of Object.keys(env)) {
-      if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete env[key];
+      if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
     }
   }
   for (const key of ['ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS']) {
@@ -716,8 +710,10 @@ const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([
  * botmux-owned routing/profile vars, we also strip daemon-side GitHub tokens so
  * a botmux-started tmux server never seeds them into its shared global env.
  */
+export const GIT_CONFIG_PAIR_ENV_KEY = /^GIT_CONFIG_(KEY|VALUE)_[0-9]+$/;
+
 export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
-  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key);
+  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key) || GIT_CONFIG_PAIR_ENV_KEY.test(key);
 }
 
 /**
@@ -727,7 +723,7 @@ export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
  * rewrite a shared tmux server's general-purpose env table.
  */
 export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
-  return key.startsWith('BOTMUX') || TMUX_SERVER_GLOBAL_SCRUB_KEYS.has(key);
+  return key.startsWith('BOTMUX') || TMUX_SERVER_GLOBAL_SCRUB_KEYS.has(key) || GIT_CONFIG_PAIR_ENV_KEY.test(key);
 }
 
 /**
