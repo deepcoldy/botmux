@@ -95,6 +95,9 @@ export interface TraexDrainOptions {
    *  different offset and must not disturb the production drainer's pending
    *  turn state. */
   probe?: boolean;
+  /** Restart scans need activity from a bounded tail that can start mid-turn.
+   *  Submit-confirmation probes keep their existing user/terminal-only output. */
+  includeHistoryCot?: boolean;
 }
 
 export interface TraexRuntimeSnapshot {
@@ -1014,10 +1017,10 @@ export function drainTraexRollout(
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
     // or results; preserve their item order in one cosmetic event.
-    if (!probe && obj.type === 'history_mutation') {
+    if ((!probe || opts?.includeHistoryCot === true) && obj.type === 'history_mutation') {
       const cotEntries = traexHistoryCotEntries(payload, sourceSessionId);
       if (cotEntries && cotEntries.length > 0) {
-        if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
+        if (!probe && sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
       }
       continue;
