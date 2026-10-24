@@ -63,7 +63,7 @@ function rows(path: string): any[] {
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
   freshStart = false, activityMode?: 'working' | 'queue-after-second', terminalDelayMs = 0,
-  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false) {
+  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -180,6 +180,9 @@ setInterval(() => {
   if (fs.existsSync(${JSON.stringify(crash)})) { fs.unlinkSync(${JSON.stringify(crash)}); process.exit(1); }
   if (submitted && !completed && fs.existsSync(release)) {
     completed = true;
+    // Keep the preferred successor open so its later crash exercises the
+    // ordinary interruption scan after a resumeCurrentTurn=false reset.
+    if (${JSON.stringify(holdPreferredSuccessor)} && model === 'last') fs.unlinkSync(release);
     const complete = () => line({ type: 'task_complete', turn_id: turnId, last_agent_message: 'done', duration_ms: 1000 });
     // terminalDelayMs paints the composer BEFORE the authoritative terminal:
     // the exact window where a capacity-held follow-up must not be type-ahead
@@ -459,7 +462,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     // Composer repaint precedes the authoritative terminal by 5.5s. A
     // follow-up stamped while capacity owns the pane must survive that gap
     // and still be submitted as its own turn after the preferred reset.
-    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500);
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500, 0, false, true);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 1, 'original submit');
     // Arrives during the queue: stays a distinct turn through both restarts.
@@ -495,6 +498,17 @@ describe('TraeX auto-model real Worker and PTY', () => {
     }, 'next ask relaunched on the preferred model after reset');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
+    expect(interruptionNotices(f.messages)).toHaveLength(0);
+    await new Promise(resolveWait => setTimeout(resolveWait, 1_500));
+    writeFileSync(f.crash, '1');
+    await f.wait(() => f.messages.some(message => message.type === 'claude_exit'), 'preferred successor crash');
+    f.child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+    await f.wait(() => interruptionNotices(f.messages).length === 1, 'ordinary interruption after idle model reset');
+    await f.wait(() => rows(f.submissions).length === 5, 'preferred successor restart continuation');
+    expect(interruptionNotices(f.messages)[0]).toMatchObject({ turnId: 'om_next' });
+    expect(rows(f.submissions)[4].text).toContain(interruptionNote());
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core', 'core']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(1);
   }, 100_000);
 
   it('keeps a follow-up arriving after exhaustion (but before the terminal) out of the degraded pane', async () => {
