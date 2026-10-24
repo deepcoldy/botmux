@@ -12008,11 +12008,15 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
  * edge. Only applies while the first prompt is still unadmitted on a backend
  * whose screen evidence is authoritative (the same scope as the startup
  * viewport poller; ZMX/non-authoritative screens keep the legacy stream-only
- * decision). An unreadable snapshot fails OPEN; the predicate itself rejects
- * loading-cell, draft/picker and native-login frames. */
+ * decision), and only when the stream's ready evidence is WEAK — a match that
+ * exists solely through #2247's cursor-addressed rule arm. Strong evidence
+ * (line-anchored prompt or a `\d+% left` status bar) keeps the legacy
+ * admission path. An unreadable snapshot fails OPEN; the predicate itself
+ * rejects loading-cell, draft/picker and native-login frames. */
 function traexFirstPromptViewportRejects(): boolean {
   if (lastInitConfig?.cliId !== 'traex' || !awaitingFirstPrompt
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (!idleDetector?.isReadyEvidenceWeak()) return false;
   const predicate = cliAdapter?.startupReadyFromHistory;
   if (!predicate) return false;
   let screen = '';
@@ -15909,11 +15913,12 @@ function markPromptReady(): void {
   if (idleDetector?.isStartupPending()) return;
   // TraeX 0.211 cursor-paints its composer: the byte-stream readyPattern
   // accepts a rule-joined prompt even while the model cell still reads
-  // "loading" or the surface owns an unsent draft. During the first prompt
-  // the stream match alone is therefore insufficient — require the adapter's
-  // rendered-viewport composer predicate. The traex first-prompt viewport
-  // poller (scheduleTraexFirstPromptReadiness) re-drives this edge once the
-  // initialized composer actually renders.
+  // "loading" or the surface owns an unsent draft. Such a match is tagged
+  // weak (it exists only through the rule arm); on a weak first-prompt edge
+  // require the adapter's rendered-viewport composer predicate. Strong
+  // evidence and all other CLIs keep the legacy stream admission path. The
+  // traex viewport poller (scheduleTraexFirstPromptReadiness) re-drives the
+  // edge once the initialized composer actually renders.
   if (traexFirstPromptViewportRejects()) {
     log('Holding traex first prompt: rendered viewport is not an initialized composer');
     idleDetector?.reset();

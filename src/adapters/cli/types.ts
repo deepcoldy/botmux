@@ -591,6 +591,17 @@ export interface CliAdapter {
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
 
+  /** Stricter sibling of `readyPattern` that recognizes ONLY evidence the CLI
+   *  already emitted before a weak rule-joined arm was added to readyPattern.
+   *  When a ready match fails this pattern too, the IdleDetector tags the
+   *  evidence as weak (`isReadyEvidenceWeak()`): a cursor-addressed repaint
+   *  whose prompt is joined to a horizontal rule in the stripped byte stream
+   *  can be a loading cell or an unsent draft rather than an initialized
+   *  composer. The worker consults the rendered viewport predicate before
+   *  acting on weak evidence during the first prompt. Undefined means the
+   *  adapter has no weak arm and all matches are strong. */
+  readonly readyPatternStrong?: RegExp;
+
   /** Optional first-start screen gate. Some CLIs draw their composer before
    * initialization finishes. A pending marker holds screen idle and queued
    * input until startupReadyPattern or an authoritative transcript idle.

@@ -27,6 +27,7 @@ function makeCli(opts: {
   staticBusyPattern?: RegExp;
   staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
+  readyPatternStrong?: RegExp;
   firstPromptQuiescenceMs?: number;
 } = {}): CliAdapter {
   return {
@@ -40,6 +41,7 @@ function makeCli(opts: {
     staticBusyPattern: opts.staticBusyPattern,
     staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
+    readyPatternStrong: opts.readyPatternStrong,
     firstPromptQuiescenceMs: opts.firstPromptQuiescenceMs,
     systemHints: [],
     altScreen: false,
@@ -67,6 +69,72 @@ describe('IdleDetector: constructor', () => {
     const cli = makeCli({ readyPattern: />\s*$/ });
     const detector = new IdleDetector(cli);
     expect(detector).toBeInstanceOf(IdleDetector);
+    detector.dispose();
+  });
+});
+
+// ─── Weak rule-joined ready evidence ──────────────────────────────────────
+
+describe('IdleDetector: isReadyEvidenceWeak()', () => {
+  const withRuleArm = /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/;
+  const withoutRuleArm = /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/;
+  const makeTraexish = () => new IdleDetector(makeCli({
+    readyPattern: withRuleArm,
+    readyPatternStrong: withoutRuleArm,
+  }));
+
+  it('tags a prompt joined to a horizontal rule (cursor-addressed redraw) as weak', () => {
+    const detector = makeTraexish();
+    detector.feed('──────────────────────────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.dispose();
+  });
+
+  it('treats a line-anchored prompt as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('banner line\n❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('treats a numeric Context status bar as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('GPT-6 xhigh · ~ · Context 99% left');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('upgrades to strong when a later chunk carries line-anchored evidence', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.feed('repaint\n❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('clears the weak tag on reset', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.reset();
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('treats viewport-verified seeding as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.seedReadyEvidence(true);
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('never tags evidence weak when the adapter declares no strong sibling', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: withRuleArm }));
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
     detector.dispose();
   });
 });
