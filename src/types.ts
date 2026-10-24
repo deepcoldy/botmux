@@ -1529,6 +1529,50 @@ export interface ParsedSchedule {
 
 export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 'task';
 
+/** Execution ledger kept on every scheduled task. Counters only ever grow;
+ *  absent means the task predates the ledger (all zero). See
+ *  docs/design/2026-10-24-schedule-until-done.md. */
+export interface ScheduleRunStats {
+  /** Runs whose model turn was dispatched — not proof the turn finished. */
+  dispatched: number;
+  /** Claimed runs skipped by a precondition or the work calendar. */
+  skipped: number;
+  /** Runs that failed before or while dispatching (incl. daemon restarts). */
+  failed: number;
+  /** Planned occurrences that were not executed on time. */
+  missed: number;
+  /** Failures since the last dispatched run. */
+  consecutiveFailures: number;
+  lastMissedAt?: string;
+  /** Set once the current failure streak has been notified; cleared on success. */
+  failingNotifiedAt?: string;
+}
+
+export type ScheduleUntilDoneStatus = 'open' | 'done' | 'expired';
+
+/** `--until-done` state: the task keeps running until it is explicitly marked
+ *  done (`botmux schedule done`) or its deadline's closing run is dispatched. */
+export interface ScheduleUntilDone {
+  status: ScheduleUntilDoneStatus;
+  /** ISO instant; reaching it triggers one final closing run. */
+  deadline?: string;
+  /** One-shot only: delay before the next attempt when a run did not finish. */
+  retryMinutes?: number;
+  /** Runs dispatched while open. */
+  attempts: number;
+  /** Run id of the in-flight deadline closing run. */
+  finalRunId?: string;
+  finalFailures?: number;
+  finalRetryAt?: string;
+  doneAt?: string;
+  doneNote?: string;
+  expiredAt?: string;
+}
+
+/** Opt-in owner notifications. `failing`: N consecutive failed runs (once per
+ *  streak). `expired`: an until-done task reached its deadline. */
+export type ScheduleNotifyEvent = 'failing' | 'expired';
+
 export interface ScheduledTask {
   id: string;
   /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
@@ -1617,6 +1661,12 @@ export interface ScheduledTask {
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
+  /** Execution ledger (see ScheduleRunStats). */
+  runStats?: ScheduleRunStats;
+  /** Present only for `--until-done` tasks. */
+  untilDone?: ScheduleUntilDone;
+  /** Opt-in owner notifications; absent means never notify. */
+  notify?: ScheduleNotifyEvent[];
   /** Delivery target:
    *  - 'origin' (default): reply into the original thread, or post to the chat
    *  - 'new-topic': compatibility input meaning a fresh topic per run;

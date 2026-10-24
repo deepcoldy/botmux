@@ -365,6 +365,15 @@ import {
 } from './core/dispatch-output-sink.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
+import {
+  buildUntilDoneRunPrompt,
+  isAutoCompletedSchedule,
+  isUntilDoneClosed,
+  scheduleNotificationTarget,
+  scheduleNotificationText,
+  UNTIL_DONE_NOTE_MAX_CHARS,
+} from './services/schedule-until-done.js';
+import { scheduleTimeZone } from './utils/timezone.js';
 import { scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
@@ -636,7 +645,7 @@ import {
   loadSessionOwnerReminderRecords,
   saveSessionOwnerReminderRecords,
 } from './services/session-owner-reminder-store.js';
-import { sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
+import { buildSessionOwnerMention, sendSessionOwnerThreadNotification } from './services/session-owner-notification.js';
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
@@ -4155,8 +4164,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   // Read the host authority, never the CLI-writable schedules.json projection
   // or the session's last sender. A completed one-shot may still have an
   // admitted turn to restore/continue; manual disables and revocations cannot.
-  const completedOnce = authority.state === 'completed'
-    && task.parsed?.kind === 'once' && task.disabledReason === 'once_completed';
+  const completedOnce = authority.state === 'completed' && isAutoCompletedSchedule(task);
   if (authority.state !== 'active' && !completedOnce) {
     throw new Error(`schedule authority state is ${authority.state}; refusing identity`);
   }
@@ -7663,9 +7671,24 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     || (task.calendar !== undefined && task.calendar !== null && typeof task.calendar !== 'string')
     || (task.calendarDayType !== undefined
       && task.calendarDayType !== 'workday' && task.calendarDayType !== 'restday')
+    || (task.untilDone !== undefined && (!task.untilDone || typeof task.untilDone !== 'object'
+      || Array.isArray(task.untilDone)
+      || (task.untilDone.deadline !== undefined && typeof task.untilDone.deadline !== 'string')
+      || (task.untilDone.retryMinutes !== undefined && typeof task.untilDone.retryMinutes !== 'number')))
+    || (task.notify !== undefined && (!Array.isArray(task.notify)
+      || task.notify.some((event: unknown) => typeof event !== 'string')))
     || task.larkAppId !== undefined && task.larkAppId !== (ds?.larkAppId ?? selfDaemonLarkAppId)) {
     return jsonRes(res, 400, { ok: false, error: 'schedule_delegation_scope_invalid' });
   }
+  // Until-done configuration reaches addTask only from a direct human turn or
+  // the host terminal; addTask re-validates it against the parsed schedule.
+  const untilDoneParams = {
+    ...(task.untilDone !== undefined ? { untilDone: {
+      ...(task.untilDone.deadline !== undefined ? { deadline: task.untilDone.deadline as string } : {}),
+      ...(task.untilDone.retryMinutes !== undefined ? { retryMinutes: task.untilDone.retryMinutes as number } : {}),
+    } } : {}),
+    ...(task.notify !== undefined ? { notify: task.notify as Array<'failing' | 'expired'> } : {}),
+  };
   // A host-terminal invocation authenticates with the daemon HMAC rather than
   // a conversation turn. It may create an ownerless local task, preserving the
   // historical admin CLI while still committing through the authority store.
@@ -7674,7 +7697,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       return jsonRes(res, 403, { ok: false, error: 'schedule_host_admin_required' });
     }
     try {
-      const created = scheduler.addTask(task);
+      const created = scheduler.addTask({ ...task, ...untilDoneParams });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -7740,7 +7763,10 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       }
       if (task.chatId !== ds.chatId
         || (task.executionPosition !== 'top-level' && task.executionPosition !== 'topic')
-        || task.deliver === 'local' || task.followActive === true || task.topicTitle !== undefined) {
+        || task.deliver === 'local' || task.followActive === true || task.topicTitle !== undefined
+        // A bot-authored grant covers the schedule shape it was issued for;
+        // until-done / notify are not part of that capability yet.
+        || task.untilDone !== undefined || task.notify !== undefined) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_scope_invalid' });
       }
       if (task.executionPosition === 'topic' && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
@@ -7821,7 +7847,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       ...(task.calendarDayType !== undefined ? { calendarDayType: task.calendarDayType } : {}),
     };
     if (direct) {
-      const created = scheduler.addTask({ ...baseParams, id: task.id,
+      const created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
         ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     }
@@ -7910,7 +7936,10 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (!verified.ok) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_origin_unproven' });
   }
-  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
+  if (!id || !['update', 'remove', 'pause', 'resume', 'run', 'done'].includes(action)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  if (action === 'done' && body.note !== undefined && typeof body.note !== 'string') {
     return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
   }
   if (!scheduleAuthorityStore) {
@@ -7951,8 +7980,10 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     }
     providerActorAdmin = true;
   }
+  // A scheduled turn may close its own task: pause/remove, or `done` for an
+  // until-done task reporting that the awaited work is finished.
   const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
-    && (action === 'pause' || action === 'remove');
+    && (action === 'pause' || action === 'remove' || action === 'done');
   if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
@@ -7994,6 +8025,20 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   let ok = false;
   let error: string | undefined;
+  if (action === 'resume' && isUntilDoneClosed(authority.task)) {
+    return jsonRes(res, 409, { ok: false, error: 'schedule_until_done_closed' });
+  }
+  if (action === 'done') {
+    const note = typeof body.note === 'string'
+      ? Array.from(body.note.trim()).slice(0, UNTIL_DONE_NOTE_MAX_CHARS).join('')
+      : undefined;
+    const result = scheduler.completeTask(id, note);
+    return jsonRes(res, result.ok ? 200 : 409, {
+      ok: result.ok,
+      ...(result.replay ? { replay: true } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    });
+  }
   if (action === 'update') {
     const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim();
     const hasCalendar = body.calendar !== undefined || body.calendarDayType !== undefined;
@@ -32095,6 +32140,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] progress-card cold-attach failed; continuing daemon startup: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  // Opt-in owner notifications (`schedule add --notify`); target and wording
+  // are decided in schedule-until-done.ts.
+  scheduler.setScheduleNotifier(async (task, event) => {
+    const target = scheduleNotificationTarget(task, cfg.larkAppId);
+    if (!larkTransportEnabled({ chatId: target.chatId, apiOnly: getBot(target.appId).config.apiOnly })) return;
+    const text = scheduleNotificationText(task, event);
+    const content = target.mentionOpenId ? buildSessionOwnerMention(target.mentionOpenId, text) : text;
+    if (target.rootMessageId) await replyMessage(target.appId, target.rootMessageId, content, 'text', true);
+    else await sendMessage(target.appId, target.chatId, content, 'text');
+  });
+
   // Start scheduler in every daemon.  Each daemon owns exactly one bot, so
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
@@ -32159,6 +32215,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         effectiveAppId,
         async (additionalPrompt) => {
           const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+          // Until-done runs carry their own run context (attempt, deadline, how
+          // to mark done) so the task prompt only states what to wait for.
+          const untilDonePrompt = buildUntilDoneRunPrompt(
+            task,
+            executionContext.runId,
+            iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
+          );
+          const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
           try {
             const results = await executeScheduledTaskForTargets(
               task,
@@ -32169,7 +32233,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   targetTask,
                   activeSessions,
                   refreshCliVersion,
-                  additionalPrompt,
+                  runPrompt,
                   {
                     prepareTurnIdentity: (session, turnId) =>
                       prepareTurnCliIdentity(session, turnId),

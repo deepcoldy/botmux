@@ -35,6 +35,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { effectiveScheduleChatIds } from '../services/schedule-store.js';
+import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
 
 /** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
@@ -163,8 +164,9 @@ export function authorizeScheduledTurn(input: {
   const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
   if (task.enabled === false) {
-    const autoCompletedStillLive = task.parsed?.kind === 'once'
-      && task.disabledReason === 'once_completed'
+    // A one-shot that ran, or an until-done task closed by its own run, keeps
+    // authority for that exact still-live turn.
+    const autoCompletedStillLive = isAutoCompletedSchedule(task)
       && input.isScheduledTurnLive?.(input.turnId) === true;
     if (!autoCompletedStillLive) return { error: 'task_disabled' };
   }

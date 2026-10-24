@@ -392,6 +392,8 @@ describe('target daemon consumes signed message authority', () => {
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
     const { trustedCallerForScheduledTask } = await import('../src/core/scheduled-turn-provenance.js');
+    const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
+    const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
@@ -430,6 +432,7 @@ describe('target daemon consumes signed message authority', () => {
         return match?.[1] ?? null;
       },
       trustedCallerForScheduledTask,
+      isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),

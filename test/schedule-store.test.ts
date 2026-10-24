@@ -268,6 +268,45 @@ describe('schedule-store', () => {
     });
   });
 
+  describe('until-done state and run ledger', () => {
+    const ONCE = { kind: 'once' as const, runAt: '2026-10-30T02:00:00.000Z', display: 'once' };
+
+    it('survives reloads and leaves pre-existing canonical hashes unchanged', async () => {
+      const store1 = await freshImport();
+      const plain = store1.createTask({ ...TASK_PARAMS });
+      const plainHash = store1.canonicalScheduleInput(plain);
+      const task = store1.createTask({ ...TASK_PARAMS, parsed: ONCE, schedule: ONCE.runAt,
+        untilDone: { status: 'open', attempts: 0, deadline: '2026-11-20T00:00:00.000Z', retryMinutes: 360 },
+        notify: ['failing'] });
+      const store2 = await freshImport();
+      expect(store2.getTask(task.id)).toMatchObject({
+        untilDone: { status: 'open', attempts: 0, deadline: '2026-11-20T00:00:00.000Z', retryMinutes: 360 },
+        notify: ['failing'],
+      });
+      expect(store2.canonicalScheduleInput(store2.getTask(plain.id)!)).toEqual(plainHash);
+      expect(store2.canonicalScheduleInput(store2.getTask(task.id)!))
+        .not.toEqual(store2.canonicalScheduleInput({ ...store2.getTask(task.id)!, untilDone: undefined }));
+    });
+
+    it('does not consume an until-done one-shot on the legacy settlement path', async () => {
+      const store1 = await freshImport();
+      const plain = store1.createTask({ ...TASK_PARAMS, parsed: ONCE, schedule: ONCE.runAt });
+      const task = store1.createTask({ ...TASK_PARAMS, parsed: ONCE, schedule: ONCE.runAt,
+        untilDone: { status: 'open', attempts: 0 } });
+      for (const id of [plain.id, task.id]) {
+        expect(store1.claimRun(id, { lastRunAt: new Date().toISOString(), nextRunAt: undefined, lastRunId: `run-${id}` }).ok)
+          .toBe(true);
+        store1.markRun(id, false, 'dispatch failed', undefined, `run-${id}`);
+      }
+      const store2 = await freshImport();
+      expect(store2.getTask(plain.id)).toMatchObject({ enabled: false, disabledReason: 'once_completed',
+        runStats: { failed: 1, consecutiveFailures: 1 } });
+      expect(store2.getTask(task.id)).toMatchObject({ enabled: true, lastStatus: 'error',
+        runStats: { failed: 1, consecutiveFailures: 1 }, untilDone: { status: 'open' } });
+      expect(Date.parse(store2.getTask(task.id)!.nextRunAt!)).toBeGreaterThan(Date.now());
+    });
+  });
+
   describe('getTask', () => {
     it('should retrieve a task by ID', async () => {
       const { createTask, getTask } = await freshImport();

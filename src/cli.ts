@@ -7480,6 +7480,11 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
+       --until-done                    直到完成：没做完按计划继续执行，出错/错过自动补上，直到 schedule done
+       --deadline <time>               配合 --until-done：到点做最后一次收尾执行后关闭（如 2026-11-20 / 7d / 明天18:00）
+       --retry-every <duration>        配合 --until-done 的一次性任务：没做完隔多久再执行（默认 1d）
+       --notify failing,expired        按需通知创建人：连续失败 3 次 / 截止收尾时
+  schedule done [id|self] [--note 结果] 标记「直到完成」任务已完成（任务自己的执行会话里可省略 id）
   schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
@@ -8351,13 +8356,16 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         console.log(`   calendar: ${t.calendar} ${JSON.stringify(previewTaskCalendar(t, t.larkAppId ?? scheduleStore.getScheduleScope() ?? undefined))}`);
       }
       console.log(`   next: ${next}   last: ${last}${t.lastStatus === 'error' ? ' ❌' : ''}`);
+      for (const line of describeScheduleState(t, iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }))) {
+        console.log(`   ${line}`);
+      }
       console.log('');
     }
     return;
   }
 
   if (sub === 'add') {
-    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active', '--until-done']);
     const structuredSchedule = argValue(rest, '--schedule');
     if (trustedRemoteRunnerRelay && (structuredSchedule === undefined || positionalSchedule !== undefined || promptParts.length > 0)) {
       console.error('botmux schedule refused: the Remote Runner relay requires structured schedule/prompt values');
@@ -8369,7 +8377,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL] [--until-done [--deadline TIME] [--retry-every DURATION]] [--notify failing,expired]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -8500,6 +8508,41 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // --until-done: the task keeps running until its own run marks it done
+    // (`botmux schedule done self`) or the deadline's closing run is dispatched.
+    const wantsUntilDone = rest.includes('--until-done');
+    const deadlineArg = argValue(rest, '--deadline');
+    const retryEveryArg = argValue(rest, '--retry-every');
+    const notifyArg = argValue(rest, '--notify');
+    for (const flag of ['--deadline', '--retry-every', '--notify']) {
+      if (rest.includes(flag) && !argValue(rest, flag)?.trim()) {
+        console.error(`${flag} 需要一个值。`);
+        process.exit(1);
+      }
+    }
+    if ((deadlineArg !== undefined || retryEveryArg !== undefined) && !wantsUntilDone) {
+      console.error('--deadline / --retry-every 只能与 --until-done 一起使用。');
+      process.exit(1);
+    }
+    const { parseScheduleNotify, resolveUntilDoneConfig } = await import('./services/schedule-until-done.js');
+    let untilDoneInput: import('./services/schedule-until-done.js').UntilDoneConfigInput | undefined;
+    let notify: Array<'failing' | 'expired'> | undefined;
+    try {
+      untilDoneInput = wantsUntilDone
+        ? scheduler.parseUntilDoneInput({ deadline: deadlineArg, retryEvery: retryEveryArg })
+        : undefined;
+      notify = notifyArg ? parseScheduleNotify(notifyArg) : undefined;
+      // Same validation the daemon applies at creation, surfaced before any IPC.
+      resolveUntilDoneConfig({ untilDone: untilDoneInput, notify, parsed, nowMs: Date.now() });
+    } catch (err) {
+      console.error(describeUntilDoneError(err));
+      process.exit(1);
+    }
+    const untilDoneFields = {
+      ...(untilDoneInput ? { untilDone: untilDoneInput } : {}),
+      ...(notify ? { notify } : {}),
+    };
+
     let task;
     try {
       // A bot-authored current turn cannot satisfy the direct-human creator
@@ -8535,6 +8578,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               calendarDayType: normalizedDayType,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
+              ...untilDoneFields,
               },
             },
           });
@@ -8567,6 +8611,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             calendarDayType: normalizedDayType,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
+            ...untilDoneFields,
           } },
         });
         const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
@@ -8599,6 +8644,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
+    if (task.untilDone) {
+      const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
+      const retry = task.untilDone.retryMinutes ?? (parsed.kind === 'once' ? 24 * 60 : undefined);
+      console.log(`   直到完成: 没做完就${retry ? `每隔 ${retry} 分钟` : '按计划'}再执行，出错和错过会自动补上；执行的会话做完后运行 botmux schedule done self 结束`);
+      if (task.untilDone.deadline) console.log(`   截止: ${fmt(task.untilDone.deadline)}（到点做最后一次收尾执行，之后关闭）`);
+    }
+    if (task.notify?.length) console.log(`   通知创建人: ${task.notify.join(', ')}`);
     if (model || reasoningEffort) {
       console.log(`   模型: ${[model ?? '（bot 默认）', reasoningEffort ? `思考强度 ${reasoningEffort}` : ''].filter(Boolean).join(' / ')}`);
       // Model and effort are CLI process launch arguments, so only a fire that
@@ -8611,7 +8663,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     return;
   }
 
-  const id = positionals(rest)[0];
+  // `done` closes an until-done task; inside the task's own scheduled turn the
+  // id defaults to `self`.
+  const id = positionals(rest)[0] ?? (sub === 'done' ? 'self' : undefined);
   if (!id) {
     console.error(`用法: botmux schedule ${sub} <id>`);
     process.exit(1);
@@ -8625,15 +8679,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const mutationSession = await detectCurrentSession();
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
-    && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
+    && ['remove', 'rm', 'delete', 'del', 'pause', 'disable', 'done'].includes(sub);
   if (!trustedRemoteRunnerRelay
       && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
     await detectAuthenticatedCurrentSession('operate');
   }
   const managedMutation = async (
-    action: 'update' | 'remove' | 'pause' | 'resume' | 'run',
+    action: 'update' | 'remove' | 'pause' | 'resume' | 'run' | 'done',
     extra: Record<string, unknown> = {},
-  ): Promise<void> => {
+  ): Promise<{ replay?: boolean }> => {
     let mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId
       ?? scheduleStore.getScheduleScope() ?? undefined;
     if (!mutationSession) {
@@ -8671,8 +8725,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     } catch (error) {
       throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
     }
-    const body = await response.json() as { ok?: boolean; error?: string };
+    const body = await response.json() as { ok?: boolean; error?: string; replay?: boolean };
     if (!response.ok || body.ok !== true) throw new Error(body.error ?? `HTTP ${response.status}`);
+    return { replay: body.replay === true };
   };
 
   switch (sub) {
@@ -8703,8 +8758,35 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
     case 'resume':
     case 'enable': {
-      await managedMutation('resume');
+      try {
+        await managedMutation('resume');
+      } catch (error) {
+        if (/schedule_until_done_closed/.test(String(error))) {
+          console.error(`任务 ${id} 已经完成或到期，不能恢复；需要继续跟进请新建任务。`);
+          process.exit(1);
+        }
+        throw error;
+      }
       console.log(`已恢复任务 ${id}`);
+      break;
+    }
+    case 'done': {
+      const note = argValue(rest, '--note');
+      if (rest.includes('--note') && !note?.trim()) {
+        console.error('--note 需要一句结果说明。');
+        process.exit(1);
+      }
+      let result: { replay?: boolean };
+      try {
+        result = await managedMutation('done', note ? { note } : {});
+      } catch (error) {
+        if (/schedule_not_until_done/.test(String(error))) {
+          console.error(`任务 ${id === 'self' ? '（当前定时任务）' : id} 不是「直到完成」任务；普通任务请用 pause / remove。`);
+          process.exit(1);
+        }
+        throw error;
+      }
+      console.log(result.replay ? `任务 ${id} 已经是完成状态。` : `✅ 已标记完成${id === 'self' ? '当前定时任务' : `任务 ${id}`}，之后不再执行。`);
       break;
     }
     case 'run':
@@ -9339,6 +9421,25 @@ import {
   matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
+import { describeScheduleState } from './services/schedule-until-done.js';
+
+/** Map until-done / notify validation codes to a one-line CLI message. */
+function describeUntilDoneError(error: unknown): string {
+  const code = error instanceof Error ? error.message : String(error);
+  const messages: Record<string, string> = {
+    until_done_deadline_invalid: '--deadline 无法解析：用一个时间点，如 2026-11-20、2026-11-20T18:00、7d、明天18:00。',
+    until_done_deadline_past: '--deadline 已经过去了。',
+    until_done_deadline_before_first_run: '--deadline 早于任务第一次执行的时间。',
+    until_done_retry_invalid: '--retry-every 无法解析：用一个时长，如 6h、1d、30m。',
+    until_done_retry_requires_once: '--retry-every 只用于一次性任务；循环任务按自身节奏重试。',
+    until_done_repeat_unsupported: '--until-done 不能与固定执行次数同时使用。',
+    notify_expired_requires_until_done: '--notify expired 需要配合 --until-done。',
+    notify_events_required: '--notify 需要至少一个事件：failing、expired。',
+  };
+  if (messages[code]) return messages[code];
+  if (code.startsWith('notify_event_invalid')) return `--notify 只接受 failing、expired，收到 ${code.split(':')[1] ?? '未知值'}。`;
+  return code;
+}
 
 /**
  * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot

@@ -252,6 +252,54 @@ function directHumanHarness() {
   return h;
 }
 
+describe('until-done schedule creation', () => {
+  const untilDone = { deadline: '2026-11-20T00:00:00.000Z' };
+
+  it('passes until-done and notify settings from a direct human turn to addTask', async () => {
+    const h = directHumanHarness();
+    h.body.task.untilDone = untilDone;
+    h.body.task.notify = ['failing', 'expired'];
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
+    }));
+  });
+
+  it('passes until-done settings from the host terminal to addTask', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.untilDone = { retryMinutes: 360 };
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone: { retryMinutes: 360 },
+    }));
+  });
+
+  it.each([
+    ['untilDone', untilDone],
+    ['notify', ['failing']],
+  ] as const)('keeps %s out of a bot-delegated grant', async (field, value) => {
+    const h = harness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['untilDone', 'tomorrow'],
+    ['untilDone', { deadline: 20261120 }],
+    ['untilDone', { retryMinutes: '6h' }],
+    ['notify', 'failing'],
+    ['notify', [1]],
+  ] as const)('rejects malformed %s %j before any commit', async (field, value) => {
+    const h = directHumanHarness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('direct schedule creation after the active-turn hint is cleared', () => {
   it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
     const h = directHumanHarness();

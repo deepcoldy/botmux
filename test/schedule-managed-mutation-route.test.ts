@@ -5,6 +5,7 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
+import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node)
@@ -31,6 +32,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const scheduler = {
     updateTask: vi.fn(() => ({ ok: true })), removeTask: vi.fn(() => true),
     disableTask: vi.fn(() => true), enableTask: vi.fn(() => true), runTaskNow: vi.fn(() => true),
+    completeTask: vi.fn((): { ok: boolean; replay?: boolean; error?: string } => ({ ok: true })),
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
     task: { id: 'a1b2c3d4', chatId: 'oc_chat' } };
@@ -43,6 +45,8 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,
+    isUntilDoneClosed,
+    UNTIL_DONE_NOTE_MAX_CHARS,
     authorizeScheduleSelfManage,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
     resolveUnionIdFromOpenId: async () => 'on_admin',
@@ -345,6 +349,56 @@ describe('managed schedule mutation route', () => {
     const runSelf = harness('run', turnId, 'self');
     runSelf.ds.activeInteractiveTurn.caller.senderType = 'bot';
     expect(await runSelf.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+  });
+
+  it('lets a scheduled turn mark only its own until-done task done, with a note', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('done', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: true,
+      untilDone: { status: 'open', attempts: 2 } };
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: turnId, action: 'done', id: 'self', note: '  PR merged, fleet switched  ' });
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledOnce();
+    expect(h.scheduler.completeTask).toHaveBeenCalledWith('a1b2c3d4', 'PR merged, fleet switched');
+
+    const other = harness('done', turnId, 'deadbeef');
+    other.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    expect(await other.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(other.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  it('reports a repeated done as a replay and a plain task as not until-done', async () => {
+    const replay = harness('done');
+    replay.record.kind = 'direct';
+    replay.scheduler.completeTask.mockReturnValue({ ok: true, replay: true });
+    expect(await replay.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+
+    const plain = harness('done');
+    plain.record.kind = 'direct';
+    plain.scheduler.completeTask.mockReturnValue({ ok: false, error: 'schedule_not_until_done' });
+    expect(await plain.run()).toMatchObject({ status: 409, value: { ok: false, error: 'schedule_not_until_done' } });
+  });
+
+  it('rejects a non-string done note before touching the task', async () => {
+    const h = harness('done');
+    h.record.kind = 'direct';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'done', id: 'a1b2c3d4', note: { text: 'x' } });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'invalid_schedule_mutation' } });
+    expect(h.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses to resume an until-done task that is already closed', async () => {
+    const h = harness('resume');
+    h.record.kind = 'direct';
+    h.record.state = 'completed';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_until_done_closed' } });
+    expect(h.scheduler.enableTask).not.toHaveBeenCalled();
   });
 
   it('refuses to force-run a paused task (must resume first)', async () => {
