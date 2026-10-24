@@ -49,6 +49,7 @@ import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewRepli
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { botDefaultsPayload } from '../src/dashboard/bot-payload.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from '../src/core/turn-result-runtime.js';
 import { TurnResultStore } from '../src/services/turn-result-store.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
@@ -3516,6 +3517,52 @@ describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('lark-cli binding setting survives dashboard refresh', () => {
+  it.each([undefined, true, false])('reads the saved setting after toggling (initial=%s)', async initial => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-lark-binding-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'cli_binding_refresh';
+    const previousConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'fixture-secret', cliId: 'codex',
+        ...(initial === undefined ? {} : { larkToolBinding: initial }),
+      }]));
+      loadBotConfigs().forEach((entry: any) => registerBot(entry));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const readDefaults = async () => {
+        const response = await fetch(`${base}/api/bot-default-oncall`);
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      expect(await readDefaults()).toHaveProperty('larkToolBinding', initial !== false);
+
+      for (const enabled of [false, true]) {
+        const saved = await fetch(`${base}/api/bot-lark-tool-binding`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, larkToolBinding: enabled });
+        expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].larkToolBinding !== false).toBe(enabled);
+        expect(getBot(appId).config.larkToolBinding !== false).toBe(enabled);
+        const refreshed = await readDefaults();
+        expect(refreshed).toHaveProperty('larkToolBinding', enabled);
+        expect(botDefaultsPayload({ larkAppId: appId }, refreshed).larkToolBinding).toBe(enabled);
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (previousConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previousConfig;
       rmSync(dir, { recursive: true, force: true });
     }
   });
