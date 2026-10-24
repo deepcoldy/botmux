@@ -73,6 +73,42 @@ describe('feedback callback state machine', () => {
     store.close();
   });
 
+  it.each(['conclusive_usable', 'effective_progress', 'incorrect'])(
+    'returns sendable readback table cells and records %s once across a duplicate callback',
+    async (verdict) => {
+      const { store, delivery } = await setup();
+      const platformCard = { schema: '2.0', body: { elements: [
+        { tag: 'markdown', content: 'answer from platform' },
+        { tag: 'table', columns: [{ name: 'qps', display_name: 'QPS', data_type: 'lark_md' }],
+          rows: [{ qps: { tag: 'markdown', property: {
+            elements: [{ tag: 'plain_text', property: { content: '348,265.76' } }],
+            markdownElements: [], originTag: 'lark_md',
+          } } }] },
+        { tag: 'column_set', element_id: 'botmux_feedback' },
+      ] } };
+      const input = event({ action: 'feedback_submit', result: verdict });
+      try {
+        const first = await handleSkillFeedbackCardAction(input, 'app', {
+          store, loadBaseCard: async () => platformCard,
+        });
+        const duplicate = await handleSkillFeedbackCardAction(input, 'app', {
+          store, loadBaseCard: async () => platformCard,
+        });
+        const card = (first.card ?? first.deferredCard).data;
+        expect(card.body.elements.find((element: any) => element.tag === 'table').rows)
+          .toEqual([{ qps: '348,265.76' }]);
+        expect(card.body.elements[0]).toEqual({ tag: 'markdown', content: 'answer from platform' });
+        expect((duplicate.card ?? duplicate.deferredCard).data).toEqual(card);
+        expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user'))
+          .toHaveLength(1);
+        expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user'))
+          .toMatchObject({ result: verdict, revision: 1 });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it('records a negative primary choice and defers the complex card update', async () => {
     const { store, delivery } = await setup();
     const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });

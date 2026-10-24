@@ -62,8 +62,84 @@ const FEEDBACK_ELEMENT_IDS = new Set([
   'botmux_feedback_comment_done',
 ]);
 
+function escapeRenderedMarkdown(content: string): string {
+  return content.replace(/([\\`*_[\]<>!~&])/g, '\\$1');
+}
+
+function readbackCellText(value: unknown, markdown: boolean): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const parts = value.map(part => readbackCellText(part, markdown));
+    return parts.every(part => part !== undefined) ? parts.join('') : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const node = value as Record<string, any>;
+  let content: string | undefined;
+  let direct = false;
+  for (const candidate of [node.content, node.text?.content, node.property?.content, node.text]) {
+    if (typeof candidate === 'string') {
+      content = candidate;
+      direct = true;
+      break;
+    }
+  }
+  if (content === undefined) {
+    for (const children of [node.property?.elements, node.elements, node.property?.markdownElements, node.markdownElements]) {
+      if (!Array.isArray(children) || children.length === 0) continue;
+      content = readbackCellText(children, markdown && node.tag !== 'a' && node.tag !== 'code_span');
+      if (content !== undefined) break;
+    }
+  }
+  if (content === undefined && node.tag === 'markdown' && Array.isArray(node.property?.elements)
+    && node.property.elements.length === 0) return '';
+  if (node.tag === 'br') return '\n';
+  if (content === undefined) return undefined;
+  if (!markdown) return content;
+  if (node.tag === 'code_span') {
+    const fence = '`'.repeat(Math.max(1, ...(content.match(/`+/g) ?? []).map(run => run.length + 1)));
+    const padding = /^[` ]|[` ]$/.test(content) ? ' ' : '';
+    return `${fence}${padding}${content}${padding}${fence}`;
+  }
+  if (node.tag === 'a') {
+    const href = node.href ?? node.property?.href ?? node.url ?? node.property?.url;
+    if (typeof href === 'string') {
+      const destination = href.replace(/[()<>\s\\]/g, character => encodeURIComponent(character)
+        .replace(/[()]/g, delimiter => `%${delimiter.charCodeAt(0).toString(16).toUpperCase()}`))
+        .replace(/&/g, '\\&');
+      return `[${escapeRenderedMarkdown(content)}](${destination})`;
+    }
+  }
+  return direct && node.tag === 'plain_text' ? escapeRenderedMarkdown(content) : content;
+}
+
+function normalizeReadbackTables(value: unknown): void {
+  if (Array.isArray(value)) {
+    value.forEach(normalizeReadbackTables);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const node = value as Record<string, any>;
+  if (node.tag === 'table' && Array.isArray(node.columns) && Array.isArray(node.rows)) {
+    const columns = node.columns.filter((column: any) =>
+      typeof column?.name === 'string' && ['text', 'lark_md', 'markdown'].includes(column.data_type ?? 'text'));
+    for (const row of node.rows) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+      for (const column of columns) {
+        const cell = row[column.name];
+        if (!cell || typeof cell !== 'object') continue;
+        const content = readbackCellText(cell, column.data_type === 'lark_md' || column.data_type === 'markdown');
+        if (content !== undefined) row[column.name] = content;
+      }
+    }
+  }
+  for (const key of ['body', 'elements', 'columns']) {
+    normalizeReadbackTables(node[key]);
+  }
+}
+
 export function renderFeedbackCard(baseCard: Record<string, any>, policy: FeedbackPolicy, state: FeedbackCardState = {}): Record<string, unknown> {
   const card = structuredClone(baseCard);
+  normalizeReadbackTables(card);
   const elements: Record<string, unknown>[] = card.body?.elements ?? [];
   const feedbackIndex = elements.findIndex((element: any) => element.element_id === 'botmux_feedback');
   if (feedbackIndex < 0) return card;
