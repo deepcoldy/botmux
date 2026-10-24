@@ -10,6 +10,17 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveCodexRpcInput } from '../src/services/codex-rpc-input-policy.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
+import { t } from '../src/i18n/index.js';
+import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
+import { restartInterruptionNote, restartInterruptionNotice } from '../src/services/restart-interruption.js';
+
+const interruptedTurn = { turnOpen: true, tasks: [] };
+const interruptionNote = () => restartInterruptionNote(interruptedTurn);
+const interruptionNotices = (messages: WorkerToDaemon[]) => messages.filter(message =>
+  message.type === 'user_notify' && [true, false].some(noteDelivered =>
+    message.message === restartInterruptionNotice(interruptedTurn, {
+      cliName: lookupCliDisplayName('traex') ?? 'CLI', noteDelivered,
+    })));
 
 const children: ChildProcess[] = [];
 const roots: string[] = [];
@@ -34,7 +45,8 @@ function rows(path: string): any[] {
 
 async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
   rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
-  freshStart = false, activityMode?: 'working' | 'queue-after-second', terminalDelayMs = 0) {
+  freshStart = false, activityMode?: 'working' | 'queue-after-second', terminalDelayMs = 0,
+  exitFirstReplacement = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -50,6 +62,9 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   const launches = join(root, 'launches.jsonl');
   const rpcRequests = join(root, 'catalog-requests.jsonl');
   const release = join(root, 'release');
+  const crash = join(root, 'crash');
+  const replacementExit = join(root, 'replacement-exit');
+  if (exitFirstReplacement) writeFileSync(replacementExit, '1');
   writeFileSync(rolloutPath, '');
   writeFileSync(historyPath, '');
   const fake = join(root, 'fake-traex');
@@ -85,6 +100,13 @@ if (!process.argv.includes('resume')) fs.writeSync(rolloutFd, JSON.stringify({
   type: 'session_meta', payload: { id: nativeId, cwd: process.cwd() },
 }) + '\\n');
 fs.appendFileSync(${JSON.stringify(launches)}, JSON.stringify({ model, args: process.argv.slice(2) }) + '\\n');
+const exitBeforePrompt = model !== 'core' && fs.existsSync(${JSON.stringify(replacementExit)});
+if (exitBeforePrompt) {
+  fs.unlinkSync(${JSON.stringify(replacementExit)});
+  // Let persistent backends establish their pane/pipe before the process
+  // exits, while still preceding the worker's first-prompt readiness edge.
+  setTimeout(() => process.exit(1), 1_000);
+}
 process.stdin.setRawMode?.(true);
 process.stdin.setEncoding('utf8');
 process.stdout.write('\\x1b[?2004h');
@@ -93,6 +115,10 @@ let turnId;
 const startedAt = Date.now();
 function line(payload) { fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
 function idle() {
+  if (exitBeforePrompt) {
+    process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n❯ Ask anything\\n');
+    return;
+  }
   if (${JSON.stringify(restoreWithoutBanner)} && model !== 'core') {
     if (Date.now() - startedAt < 400) {
       process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n│ directory: ${dataDir} │\\n❯ Explain this codebase\\n');
@@ -121,6 +147,12 @@ process.stdin.on('data', chunk => {
     fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
+    // Real interrupted work leaves model/tool history beyond the user receipt.
+    // This also exercises the restart scan after that receipt was already read.
+    fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'history_mutation',
+      payload: { version: 1, commit_id: turnId, turn_id: turnId, operation: 'append',
+        items: [{ type: 'function_call', name: 'read_file', call_id: turnId, arguments: '{"path":"src/a.ts"}' }] },
+    }) + '\\n');
     submissionCount++;
     if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working')} || submissionCount === 1)) {
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
@@ -128,6 +160,7 @@ process.stdin.on('data', chunk => {
   }
 });
 setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(crash)})) { fs.unlinkSync(${JSON.stringify(crash)}); process.exit(1); }
   if (submitted && !completed && fs.existsSync(release)) {
     completed = true;
     const complete = () => line({ type: 'task_complete', turn_id: turnId, last_agent_message: 'done', duration_ms: 1000 });
@@ -209,10 +242,56 @@ await import(${JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href)});
   child.send(init);
   if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
   else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements };
+  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('keeps planned model recovery silent and still reports a later genuine crash', async () => {
+    const f = await fixture(true, 'busy');
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 2, 'Auto continuation');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'last']);
+    expect(rows(f.launches).every(row => row.args.at(-1) === f.nativeId)).toBe(true);
+    expect(rows(f.submissions)[1].text).toBe(t('worker.traex_auto_model.continue_prompt'));
+    expect(interruptionNotices(f.messages)).toHaveLength(0);
+
+    // The replacement's submitted continuation now owns the still-open turn.
+    // Its real process death must arm the ordinary interruption scan again.
+    await new Promise(resolveWait => setTimeout(resolveWait, 1_500));
+    writeFileSync(f.crash, '1');
+    await f.wait(() => f.messages.some(message => message.type === 'claude_exit'), 'genuine replacement crash');
+    f.child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+    await f.wait(() => interruptionNotices(f.messages).length === 1, 'genuine interruption notice');
+    await f.wait(() => rows(f.submissions).length === 3, 'genuine restart continuation');
+    expect(interruptionNotices(f.messages)[0]).toMatchObject({ turnId: 'om_original' });
+    expect(rows(f.submissions)[2].text).toContain(interruptionNote());
+    expect(rows(f.submissions).filter(row => row.text.startsWith('original ask'))).toHaveLength(1);
+  }, 60_000);
+
+  it('reports a replacement that exits before its first prompt instead of inheriting the planned cause', async () => {
+    const f = await fixture(true, 'busy', false, undefined, false, undefined, false, undefined, 0, true);
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'claude_exit'), 'replacement exited before prompt');
+    expect(f.messages.filter(message => message.type === 'prompt_ready')).toHaveLength(1);
+    // Supply the daemon's normal crash-restart response; the fixture runs only
+    // the real worker, so no daemon exists to answer claude_exit on its behalf.
+    f.child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+    await f.wait(() => interruptionNotices(f.messages).length === 1, 'failed replacement interruption notice');
+    expect(interruptionNotices(f.messages)[0]).toMatchObject({ turnId: 'om_original' });
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'last', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('original ask'))).toHaveLength(1);
+  }, 60_000);
+
+  it('surfaces a failed Auto launch through the existing worker error path', async () => {
+    const f = await fixture(true, 'busy');
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original submit');
+    rmSync(f.fake);
+    await f.wait(() => f.messages.some(message => message.type === 'error'), 'failed Auto launch error');
+    expect(rows(f.launches)).toHaveLength(1);
+    expect(rows(f.submissions)).toHaveLength(1);
+  }, 45_000);
+
   it('submits healthy running follow-ups in order on the current model', async () => {
     const f = await fixture(true, false, false, undefined, false, undefined, false, 'working');
     f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
@@ -310,6 +389,8 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await f.wait(() => rows(f.submissions).length === 2, 'restored composer continuation', 30_000);
     expect(f.logs.join('')).toContain('restored composer observed on screen');
     expect(f.logs.join('')).not.toContain('WARN First prompt hard timeout');
+    expect(rows(f.submissions)[1].text).toBe(t('worker.traex_auto_model.continue_prompt'));
+    expect(interruptionNotices(f.messages)).toHaveLength(0);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original image ask'))).toHaveLength(1);
     expect(rows(f.submissions).filter(row => row.text.startsWith('follow-up image'))).toHaveLength(0);
     expect(rows(f.launches).every(row => row.args.at(-1) === f.nativeId)).toBe(true);
