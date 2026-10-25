@@ -32,41 +32,66 @@ describe('privateTmuxEnv', () => {
 });
 
 describe('tmux test isolation guard', () => {
-  // 其它隔离形态沿用文件级信号；privateTmuxEnv 必须是语法上的真实调用。
-  const ISOLATED = [
-    /delete\s+[\w.]+\.TMUX\b/,
-    /delete\s+[\w.]+\[['"]TMUX['"]\]/,
-    /\bTMUX:\s*(?:''|""|undefined)/,
-    /['"]-L['"]\s*,/,
-    /['"]-S['"]\s*,/,
-  ];
-  const callsPrivateTmuxEnv = (src: string): boolean => {
-    // Preserve comment/template boundaries but avoid parsing thousands of unrelated lines.
-    const relevant = src.split('\n').filter(line => /privateTmuxEnv|\/\*|\*\/|`/.test(line)).join('\n');
-    const sf = ts.createSourceFile('tmux-test.ts', relevant, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // 隔离信号只看语法树：注释、字符串、模板文本里的同名字样一律不算数。
+  const mentions = (node: ts.Node, text: string): boolean =>
+    (ts.isIdentifier(node) && node.text === text)
+    || (ts.isPropertyAccessExpression(node) && node.name.text === text);
+
+  const isIsolated = (src: string): boolean => {
+    const sf = ts.createSourceFile('tmux-test.ts', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     let found = false;
     const visit = (node: ts.Node): void => {
       if (found) return;
-      if (ts.isCallExpression(node)) {
-        const callee = node.expression;
-        found = ts.isIdentifier(callee) && callee.text === 'privateTmuxEnv'
-          || ts.isPropertyAccessExpression(callee) && callee.name.text === 'privateTmuxEnv';
+      if (ts.isCallExpression(node) && mentions(node.expression, 'privateTmuxEnv')) found = true;
+      if (ts.isDeleteExpression(node)) {
+        const target = node.expression;
+        if (ts.isPropertyAccessExpression(target) && target.name.text === 'TMUX') found = true;
+        if (ts.isElementAccessExpression(target)
+          && ts.isStringLiteralLike(target.argumentExpression)
+          && target.argumentExpression.text === 'TMUX') found = true;
       }
+      if (ts.isPropertyAssignment(node) && ts.isObjectLiteralExpression(node.parent)) {
+        const name = ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name) ? node.name.text : undefined;
+        const init = node.initializer;
+        if (name === 'TMUX'
+          && ((ts.isStringLiteralLike(init) && init.text === '')
+            || (ts.isIdentifier(init) && init.text === 'undefined'))) found = true;
+      }
+      if (ts.isStringLiteralLike(node) && (node.text === '-L' || node.text === '-S')) found = true;
       if (!found) ts.forEachChild(node, visit);
     };
     visit(sf);
     return found;
   };
-  const isIsolated = (src: string): boolean => ISOLATED.some(re => re.test(src)) || callsPrivateTmuxEnv(src);
 
-  it('does not accept privateTmuxEnv mentioned only in a comment', () => {
-    const unsafe = `
-      // privateTmuxEnv() keeps tests away from the host server (but is not actually called).
-      const env = { ...process.env, TMUX_TMPDIR: root };
-      spawnSync('tmux', ['kill-server'], { env });
-    `;
-    expect(isIsolated(unsafe)).toBe(false);
-    expect(callsPrivateTmuxEnv('const env = privateTmuxEnv(root);')).toBe(true);
+  it('ignores isolation signals that only appear in comments or strings', () => {
+    const spoofs = [
+      '// privateTmuxEnv(root)\nconst env = {};',
+      '// delete env.TMUX\nconst env = {};',
+      "// delete env['TMUX']\nconst env = {};",
+      "// TMUX: ''\nconst env = {};",
+      "// spawnSync('tmux', ['-L', sock, 'kill-server'])\nconst env = {};",
+      "// spawnSync('tmux', ['-S', sock, 'kill-server'])\nconst env = {};",
+      "/*\n  privateTmuxEnv(root)\n  delete env.TMUX\n  TMUX: ''\n*/\nconst env = {};",
+      'const s = "doc \\\n  privateTmuxEnv( nope";\nconst env = {};',
+      'const s = `\n  privateTmuxEnv( nope\n`;\nconst env = {};',
+    ];
+    for (const spoof of spoofs) expect(isIsolated(spoof), spoof).toBe(false);
+  });
+
+  it('still recognises real isolation code, including a call split across lines', () => {
+    const real = [
+      'const env = privateTmuxEnv(root);',
+      'const env = helpers.privateTmuxEnv(root);',
+      'const env = privateTmuxEnv\n  (root);',
+      'delete env.TMUX;',
+      "delete env['TMUX'];",
+      "const env = { TMUX: '' };",
+      'const env = { TMUX: undefined };',
+      "spawnSync('tmux', ['-L', sock, 'kill-server']);",
+      "spawnSync('tmux', ['-S', sock, 'kill-server']);",
+    ];
+    for (const code of real) expect(isIsolated(code), code).toBe(true);
   });
 
   it('every test that kills a TMUX_TMPDIR-isolated tmux server strips the inherited TMUX', () => {
