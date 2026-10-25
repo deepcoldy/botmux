@@ -69,7 +69,7 @@ describe('structured turn send attribution retirement', () => {
         sessionId: 'sid', cliPidMarker: marker, rpcEnginePidMarker: undefined,
         existsSync, readFileSync, basename, atomicWriteFileSync,
         readProcessStartIdentity: () => undefined, publishActiveTurn: vi.fn(),
-        markerIdentityTurnId: (value: unknown) => isValidMarkerIdentityTurnId(value) ? value : undefined,
+        markerIdentityTurnId: loadWorkerFunction('markerIdentityTurnId', { isValidMarkerIdentityTurnId }),
         activeTurnAuthority: { snapshot: () => undefined }, sandboxRelayCapability: null,
         withPidMarkerLock: (_path: string, fn: () => void) => fn(), log: vi.fn(),
         adoptInitialActiveTurn: vi.fn(), adoptDisplacedActiveTurn: vi.fn(),
