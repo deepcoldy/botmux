@@ -1,6 +1,10 @@
 // test/terminal-url.test.ts
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { config } from '../src/config.js';
+import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+import { deriveTerminalCardViewToken } from '../src/core/terminal-write-auth.js';
 
 vi.mock('../src/global-config.js', () => ({
   isRemoteAccessEnabled: vi.fn(() => false),
@@ -235,5 +239,63 @@ describe('buildTerminalUrl — proxy unavailable fallback', () => {
   it('uses the persisted session.webPort when the worker port is null', () => {
     const restored = { session: { sessionId: 's3', webPort: 7070 }, workerPort: null, workerToken: null };
     expect(buildTerminalUrl(restored)).toBe(`http://${config.web.externalHost}:7070`);
+  });
+});
+
+// #2279：恢复后没有 worker 的会话，卡片被重建时链接仍要带 card 读能力。worker
+// 的 ready token 只在 daemon 内存里，恢复后为 null；读链接改由 daemon 按落盘的
+// terminalCardEpoch 派生同一枚 token（worker 侧 refreshTerminalCardViewToken 同源，
+// worker-terminal-read-auth 集成用例验证被唤醒的 worker 认它）。
+describe('buildTerminalUrl — restored session without a worker (#2279)', () => {
+  const secret = 'restored-card-secret';
+  const restored = {
+    session: { sessionId: 'sess-restored', terminalCardEpoch: 'card-epoch-1' },
+    workerPort: null,
+    workerToken: null,
+    workerViewToken: null,
+    workerCardViewToken: null,
+  };
+  const bare = () => `http://${config.web.externalHost}:8801/s/sess-restored`;
+
+  beforeEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
+    setTerminalProxyPort(8801);
+    // homedir() 在单测里被 unit-setup 围到本文件的临时 HOME。
+    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+  });
+  afterEach(() => {
+    rmSync(dashboardSecretPath(), { force: true });
+    resetTerminalProxy();
+  });
+
+  it('carries the card capability derived from the persisted epoch', () => {
+    expect(buildTerminalUrl(restored)).toBe(`${bare()}?viewToken=${
+      encodeURIComponent(deriveTerminalCardViewToken(secret, 'sess-restored', 'card-epoch-1'))
+    }`);
+  });
+
+  it('keeps a live worker\'s reported card token ahead of the derived one', () => {
+    expect(buildTerminalUrl({ ...restored, workerCardViewToken: 'live-card' }))
+      .toBe(`${bare()}?viewToken=live-card`);
+  });
+
+  it('keeps the dashboard worker-generation scope on the live boot token only', () => {
+    expect(buildTerminalUrl(restored, { viewScope: 'worker' })).toBe(bare());
+  });
+
+  it('never puts the read capability on a write link', () => {
+    expect(buildTerminalUrl(restored, { write: true })).toBe(bare());
+  });
+
+  it('leaves the link bare when the secret is unavailable', () => {
+    rmSync(dashboardSecretPath(), { force: true });
+    expect(buildTerminalUrl(restored)).toBe(bare());
+  });
+
+  it('leaves the link bare for a session that never got a card epoch', () => {
+    expect(buildTerminalUrl({ ...restored, session: { sessionId: 'sess-restored' } })).toBe(bare());
   });
 });

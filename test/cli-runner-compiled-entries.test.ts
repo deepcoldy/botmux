@@ -104,7 +104,7 @@ describe('CLI-adapter runners — compiled binary form', () => {
     // fleet entries, whose launch path is resolveEntrySpawn, not this one.
     expect([...RUNNER_ENTRIES]).toEqual([
       'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner',
-      'minimax-runner', 'lark-tool-runner',
+      'minimax-runner', 'lark-tool-runner', 'cli-identity-runner',
     ]);
   });
 });

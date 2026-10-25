@@ -8,7 +8,8 @@
  *   1. createChat (creator + invited users), then synchronously announce chatId
  *   2. add peer bots / owners and fetch the share link, then the owners' local
  *      stewards (decision board; see steward-auto-join.ts — best-effort, silent)
- *   3. transferChatOwner + notify + bindings/bootstrap (best-effort where noted)
+ *   3. transferChatOwner + notify + bindings, then the optional bot-collaboration
+ *      hook, then role bootstrap / kickoff (best-effort where noted)
  *
  * The progress hook is the durable side-effect boundary: once it fires, the
  * chat exists and retrying would create a duplicate even if a later API call
@@ -77,15 +78,13 @@ export interface CreateGroupOpts {
    *  having to @ it. The kickoff bot must be present in `larkAppIds`. */
   kickoffBotLarkAppId?: string;
   kickoffPrompt?: string;
-  /** Authorization-grade preflight run after peer invitations settle and
-   * before any role/kickoff bot message. CLI cold-group creation uses this to
-   * establish the exact talk-only grant matrix; rejection aborts initialization
-   * while preserving the already-announced chatId for controlled recovery. */
-  ensureBotCollaboration?: (
-    chatId: string,
-    joinedBotAppIds: string[],
-    rejectedBotAppIds: string[],
-  ) => Promise<void>;
+  /** Best-effort collaboration setup for the bots that actually joined. CLI
+   * cold-group creation uses it to write the talk-only grant matrix between
+   * them. Runs after owner transfer, notify and oncall binding, and before any
+   * role/kickoff bot message. A throw is reported as `collaborationError`; it
+   * never skips the remaining steps — the chat already exists, and an aborted
+   * initialization would leave the owner without the group. */
+  ensureBotCollaboration?: (chatId: string, joinedBotAppIds: string[]) => Promise<void>;
   /** Synchronous progress hook fired immediately after chat.create returns a
    *  chatId, before bot invites, share-link lookup, owner transfer, oncall
    *  binding, or role bootstrap. CLI callers use this as the durable
@@ -117,6 +116,9 @@ export interface CreateGroupResult {
   roleProfileBootstrapError: string | null;
   kickoffMessageId: string | null;
   kickoffError: string | null;
+  /** Present only when `ensureBotCollaboration` was supplied: null when it
+   * completed, otherwise the error it threw. */
+  collaborationError?: string | null;
   customization?: { tagError?: string; avatarError?: string };
   /** Local stewards (decision board) this chat belongs to, and whether each was
    *  pulled in. Absent when no steward applied. Never part of invalidBotIds:
@@ -188,14 +190,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   const invalidBots = new Set(r.invalidBotIds);
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
     .filter(id => !invalidBots.has(id));
-  if (opts.ensureBotCollaboration) {
-    // Strict ordering boundary: invitations must have committed before the
-    // receiver-scoped live membership probes can succeed, while role/kickoff
-    // messages must not be emitted until the exact requested membership and
-    // grant matrix are ready. The callback also sees rejected invitees so a
-    // CLI caller cannot report a partially-created group as complete.
-    await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
-  }
 
   // Optional decoration must never delay inviting the requested teammates.
   // Avatar runs now (after invites, before owner transfer) so the chat already
@@ -378,6 +372,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Bot collaboration setup goes after everything the owner is waiting for
+  // (ownership, the @ notice) and before the first bot-to-bot message, so its
+  // grants are in place when role bootstrap / kickoff arrive. The receivers'
+  // live membership checks also need the invitations above to have settled.
+  let collaborationError: string | null = null;
+  if (opts.ensureBotCollaboration) {
+    try {
+      await opts.ensureBotCollaboration(r.chatId, joinedBotIds);
+    } catch (e: any) {
+      collaborationError = e?.message ?? String(e);
+    }
+  }
+
   let roleProfileBootstrapMessageId: string | null = null;
   let roleProfileBootstrapError: string | null = null;
   const roleProfileId = opts.roleProfileId?.trim();
@@ -485,6 +492,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     roleProfileBootstrapError,
     kickoffMessageId,
     kickoffError,
+    ...(opts.ensureBotCollaboration ? { collaborationError } : {}),
     ...(customization ? { customization } : {}),
     ...(stewardJoins.length ? { stewardJoins } : {}),
   };

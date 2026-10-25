@@ -244,6 +244,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
+import { recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
@@ -1101,10 +1102,16 @@ describe('/rename production routing — must not pre-create a session (review P
     bot.resolvedAllowedUsers = [OWNER];
     const ds = seedThreadSession(root, 'identity queue');
     ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp'; ds.lastScreenStatus = state;
+    // F3: the proven content store is only fed when the live worker reported
+    // the proven model; the fixture stands in for that worker.
+    ds.reportedIdentityModel = {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+      workerPid: process.pid, workerGeneration: ds.workerGeneration ?? 1, reportedAt: 1,
+    };
     mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
     const send = vi.fn((message: any) => {
       if (message.type === 'message') {
-        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli'), 'utf8');
+        const env = recallProvenIdentityContent(mocks.dataDir, ds.session.sessionId, 'om_queue_identity_reply', 'lark-cli');
         expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
         expect(env).toContain('fixture-lark-home');
       }

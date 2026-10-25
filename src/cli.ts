@@ -6073,6 +6073,7 @@ export async function resolveLinkRefsThroughSessionHost(
   input: import('./services/link-ref-resolver.js').OutboundLinkRefPayload,
   options: {
     mode?: 'observe' | 'enabled';
+    responseKind?: TurnSendKind;
     sessionId?: string;
     appId?: string;
     ipcPort?: number;
@@ -6085,7 +6086,7 @@ export async function resolveLinkRefsThroughSessionHost(
     expandOutboundLinkRefs,
     findOutboundExecutableLinkRefs,
   } = await import('./services/link-ref-resolver.js');
-  if (findOutboundExecutableLinkRefs(input).length === 0) {
+  if (findOutboundExecutableLinkRefs(input).length === 0 && options.responseKind !== 'final') {
     return expandOutboundLinkRefs(input, new Map());
   }
   const sessionId = options.sessionId ?? context?.sessionId;
@@ -6103,7 +6104,10 @@ export async function resolveLinkRefsThroughSessionHost(
     ipcPort,
     sessionId,
     'link-refs/resolve',
-    { payload: input },
+    {
+      payload: input,
+      ...(options.responseKind === undefined ? {} : { responseKind: options.responseKind }),
+    },
   );
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
@@ -11347,6 +11351,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       expectedLinks,
     }, {
       mode: linkRefMode,
+      responseKind: effectiveResponseKind,
       sessionId: originSessionId ?? sid,
       appId: originSession?.larkAppId ?? s.larkAppId,
     });
@@ -13938,14 +13943,6 @@ async function cmdAuth(rest: string[]): Promise<void> {
     // tuple. Absence of both env markers is the host case, never a missing turn.
     const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
       || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
-    let claim: ManagedOriginCapabilityClaim | undefined;
-    if (isolatedPane && !toolBinding) {
-      const read = readManagedOriginCapability(
-        resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
-      claim = read;
-    }
     const deadline = Date.now() + 300_000;
     while (true) {
       const remaining = deadline - Date.now();
@@ -13953,6 +13950,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
         console.log(JSON.stringify({ ok: false, status: 'pending', error: 'auth_request_timeout' }));
         process.exitCode = 1;
         return;
+      }
+      let claim: ManagedOriginCapabilityClaim | undefined;
+      if (isolatedPane && !toolBinding) {
+        const read = readManagedOriginCapability(
+          resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+        );
+        if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
+        claim = read;
       }
       const authBody = parsed.command === 'request'
         ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
@@ -15572,7 +15577,7 @@ botmux create-group — 用一组机器人新建飞书群
                  该 bot 必须已在 --bot 列表中（即已是群成员）。
   --kickoff-prompt "文本"  可选；与 --kickoff-bot 配合使用，@ bot 后发送的 prompt 文本。
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
-                   部分失败都保持历史兼容，只输出单行 chatId；部分失败仍以非零退出表示。
+                   部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
 
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
@@ -15597,7 +15602,8 @@ botmux create-group — 用一组机器人新建飞书群
 输出协议（skill 友好）:
   - chat.create 成功拿到 chatId 后立即向 stdout 写单行 chatId，不等待后续 bot 邀请、grant、
     群主转让或通知。默认任何已创建结果都只有这一行；--json-status 才追加 JSON。
-    collaboration 或显式 kickoff 未完成时 exit 非零。
+    显式 kickoff 未发出时 exit 非零。bot 邀请被拒、Bot 之间的本群对话授权没写全（如某个
+    bot 的 daemon 不在线）只在 stderr 告警，群主转让、@通知、kickoff 照常进行。
   - 只有缺 --bot / 解析失败 / chat.create 未成功时 stdout 才为空。只要 stdout 已有 chatId，
     即使超时或 exit 非零也必须先检查并复用该群，不得重建。
 `);
@@ -15763,10 +15769,10 @@ botmux create-group — 用一组机器人新建飞书群
       bindWorkingDir,
       kickoffBotLarkAppId: kickoff.targetLarkAppId,
       kickoffPrompt: kickoff.prompt,
-      ensureBotCollaboration: async (chatId, joinedBotAppIds, rejectedBotAppIds) => {
-        if (rejectedBotAppIds.length > 0) {
-          throw new Error(`bot_invites_incomplete:${rejectedBotAppIds.join(',')}`);
-        }
+      // Best-effort: rejected invitees are already reported as invalidBotIds,
+      // and a failed grant is reported as collaborationError — neither skips
+      // owner transfer, notify or kickoff.
+      ensureBotCollaboration: async (chatId, joinedBotAppIds) => {
         if (joinedBotAppIds.length >= 2) {
           await ensureLocalBotCollaboration(chatId, joinedBotAppIds);
         }
@@ -15800,16 +15806,15 @@ botmux create-group — 用一组机器人新建飞书群
 
   const invalidBots = new Set(result.invalidBotIds);
   const joinedBotAppIds = [...new Set(resolved.larkAppIds)].filter(appId => !invalidBots.has(appId));
-  // createGroupWithBots runs the exact grant preflight after invitations and
-  // before any role/kickoff message. Returning here therefore proves the cold
-  // group's collaboration boundary completed (or there was only one bot).
-  const collaborationReady = true;
+  const collaborationReady = !result.collaborationError;
   const kickoffRequested = !!kickoff.targetLarkAppId && !!kickoff.prompt;
 
   // Human-readable summary + warnings → stderr.
   const link = chatAppLink(result.chatId, botBrand(creatorCfg));
   console.error(`✅ 群已创建：${link}`);
-  if (collaborationReady) {
+  if (result.collaborationError) {
+    console.error(`⚠️  Bot 之间的本群对话授权没写全（不影响建群和后续步骤）: ${result.collaborationError}`);
+  } else if (joinedBotAppIds.length >= 2) {
     console.error(`✅ Bot 对话授权已就绪（talk-only，${joinedBotAppIds.length} 个 Bot）`);
   }
   if (result.invalidBotIds.length > 0) {
@@ -17914,6 +17919,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
   else if (__entrySubcommand === 'lark-tool-runner') {
     await import('./lark-tool-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
+  else if (__entrySubcommand === 'cli-identity-runner') {
+    await import('./cli-identity-runner.js');
     process.exit(process.exitCode ?? 0);
   }
   // The entry module now drives the process (top-level main() keeps the event

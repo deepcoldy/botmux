@@ -3,7 +3,7 @@ import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from './helpers/node-ws.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
@@ -13,6 +13,8 @@ import {
   deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
 } from '../src/core/terminal-write-auth.js';
+import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+import { buildTerminalUrl, resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 import {
   deriveWorkerViewGeneration,
   issueTerminalControlGrant,
@@ -657,6 +659,97 @@ setInterval(() => {}, 1_000);
     const thirdExit = new Promise<void>(resolvePromise => third.child.once('exit', () => resolvePromise()));
     third.child.send({ type: 'close' } satisfies DaemonToWorker);
     await thirdExit;
+  }, 45_000);
+
+  // #2279：daemon 重启后、下一次 fork 之前重建的卡片，worker 的 ready token 已不在
+  // daemon 内存里。链接改由 daemon 按落盘 epoch 派生 card 读能力——这里拿它去连一个
+  // 「被这条链接唤醒」的真实 worker，证明 worker 侧读权限判定认它；修复前同一张卡上
+  // 的裸链接会被同一个 worker 403。
+  it('#2279: a card rebuilt before the restored session re-forks still opens read-only on the woken worker', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-terminal-restored-card-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const secret = 'integration-restored-card-secret';
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
+    // daemon 侧（本进程）读同一把 host-only secret；单测进程的 HOME 被 unit-setup
+    // 围到另一个临时目录，所以在那边放同样的值。
+    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdin.setRawMode?.(true);
+process.stdin.resume();
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const sessionId = 'terminal-restored-card-session';
+    const epoch = 'restored-card-lifecycle';
+    // 恢复后的会话：没有 worker，ready 时上报的 token 全部为空，只剩落盘的 epoch。
+    setTerminalProxyPort(18_801);
+    let rebuiltLink: string;
+    try {
+      rebuiltLink = buildTerminalUrl({
+        session: { sessionId, terminalCardEpoch: epoch },
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        workerCardViewToken: null,
+      });
+    } finally {
+      resetTerminalProxy();
+      rmSync(dashboardSecretPath(), { force: true });
+    }
+    const viewToken = new URL(rebuiltLink).searchParams.get('viewToken');
+    expect(viewToken).toBeTruthy();
+
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_terminal_restored_card',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_terminal_restored_card',
+      rootMessageId: 'om_terminal_restored_card',
+      workingDir: dataDir,
+      cliId: 'claude-code',
+      cliPathOverride: fakeCli,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_terminal_restored_card',
+      larkAppSecret: 'secret',
+      terminalCardEpoch: epoch,
+    } satisfies DaemonToWorker);
+    const ready = await waitForReady(child, logs);
+    const base = `http://127.0.0.1:${ready.port}`;
+
+    const page = await fetch(`${base}/?viewToken=${encodeURIComponent(viewToken!)}`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('var hasToken=false');
+    const ws = await rawWsHandshake(ready.port, `/?viewToken=${encodeURIComponent(viewToken!)}`);
+    expect(ws).toMatch(/^HTTP\/1\.1 101 /);
+    // 修复前重建出的裸链接：同一个 worker、没有登录态 → 403。
+    expect((await fetch(`${base}/`)).status).toBe(403);
+
+    const exit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
+    child.send({ type: 'close' } satisfies DaemonToWorker);
+    await exit;
   }, 45_000);
 
   // ── P1-3：握手前放行 ≠ 登记那一刻仍然有效 ────────────────────────────────────

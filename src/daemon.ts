@@ -439,6 +439,10 @@ import {
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
+  identityStorageModelForDaemonSession,
+  identityDecisionConflict,
+  identityDecisionTurnIsLive,
+  collectSessionTurnGarbage,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
@@ -526,6 +530,8 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
+import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
@@ -4189,7 +4195,79 @@ function delegatedScheduleCliIdentity(
   };
 }
 
+/** F3 fail-closed: when the live worker's reported identity decision cannot
+ *  be honored (structurally impossible proven report), publish NOTHING on
+ *  either model rather than writing a snapshot the proven wrapper cannot read
+ *  or serving memory the single wrapper should never reach. */
+function identityPublicationConflicted(ds: DaemonSession): boolean {
+  const reason = identityDecisionConflict(ds);
+  if (reason) {
+    logger.error(`[trigger-user-auth] withholding turn identity for ${ds.session.sessionId}: ${reason}`);
+    return true;
+  }
+  return false;
+}
+
+/** Model an actual identity publication used. Records it on the session so the
+ *  worker-decision flip detector compares against what was really published
+ *  (after a daemon restart the accept publish lands single before any worker
+ *  report exists — that baseline must not be lost). */
+function identityModelForPublication(ds: DaemonSession): IdentityStorageModel {
+  const model = identityStorageModelForDaemonSession(ds);
+  ds.lastPublishedIdentityModel = model;
+  return model;
+}
+
+/** Replay the opening turn after a reported model flip.
+ *
+ *  At accept time the daemon publishes before the worker fork, so with no
+ *  report yet the material lands under the fail-closed single default. When
+ *  the worker's spawn decision differs, that material is unreadable: purge it
+ *  FIRST (plaintext must never coexist with a proven session), then republish
+ *  the turn once if it is still the live turn. A terminal turn is never
+ *  replayed, so the GC retention set cannot be pinned by a stale turn.
+ *
+ *  Replay suppression is the flip baseline itself: a successful replay
+ *  publishes under the new model (identityModelForPublication), so the next
+ *  identical report computes flipped=false and never gets here. A FAILED
+ *  attempt does NOT move the baseline and is recorded, which lets a following
+ *  decision for the OTHER model heal the material its purge removed. */
+async function handleIdentityDecisionFlip(
+  ds: DaemonSession,
+  context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
+): Promise<void> {
+  if (!context.turnId) return;
+  const turnId = context.turnId;
+  const prev = ds.lastIdentityDecisionRepublish;
+  const needsReplay = context.flipped
+    || (!!prev && !prev.ok && prev.turnId === turnId && prev.model !== context.model);
+  if (!needsReplay) return;
+  if (context.model === 'proven') {
+    clearSingleIdentityArtifacts(config.session.dataDir, ds.session.sessionId);
+  } else {
+    forgetProvenIdentityContent(config.session.dataDir, ds.session.sessionId);
+  }
+  // Re-check liveness AFTER the purge: an identity turn that terminated in the
+  // meantime must stay purged with no replay (and no success record, so a
+  // genuinely new spawn decision still gets evaluated).
+  if (!identityDecisionTurnIsLive(ds, turnId)) return;
+  try {
+    await refreshTurnCliIdentity(ds, turnId);
+    ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: true };
+  } catch (error) {
+    // Keep the failure visible and replayable: no success baseline, no
+    // unhandledRejection, and the ok:false record lets the other-model report
+    // heal the purge above.
+    ds.lastIdentityDecisionRepublish = { model: context.model, turnId, ok: false };
+    logger.error(
+      `[trigger-user-auth] identity model flip replay failed for ${ds.session.sessionId} `
+      + `turn=${turnId} model=${context.model}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (identityPublicationConflicted(ds)) return;
   if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) throw new Error('invalid scheduled turn');
@@ -4225,6 +4303,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     senderOpenId,
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityModelForPublication(ds),
   });
 }
 
@@ -4232,6 +4311,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   ds: DaemonSession,
   turnId: string,
 ): Promise<boolean> {
+  if (identityPublicationConflicted(ds)) return false;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) return false;
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
@@ -4250,6 +4330,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityModelForPublication(ds),
   });
   return true;
 }
@@ -4258,6 +4339,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
   if (!botConfig.triggerUserAuth?.enabled) return;
+  if (identityPublicationConflicted(ds)) return;
 
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
@@ -4293,6 +4375,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
+    storageModel: identityModelForPublication(ds),
   });
 
   // NO chat notice here.
@@ -30630,6 +30713,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
+    onIdentityDecision(ds, context) {
+      // Fire-and-forget (the IPC switch must not serialize behind possibly
+      // slow identity resolution), but every failure is captured inside the
+      // handler — no unhandledRejection, and failures stay replayable.
+      void handleIdentityDecisionFlip(ds, context).catch(error => {
+        logger.error(`[trigger-user-auth] identity decision handler failed for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    },
     onCliExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
       ds.activeInteractiveTurn = undefined;
@@ -32218,6 +32309,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       sweepOrphanSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
     sweepOrphanMacScratchSandboxes(config.session.dataDir, new Set([...activeSessions.values()].map(ds => ds.session.sessionId)));
+    // Periodic terminal GC for proven identity contents: covers rejection and
+    // worker-exit paths that do not emit a terminal, and any missed edge.
+    // Retention is computed from live state, so live/queued turns survive.
+    for (const ds of activeSessions.values()) {
+      try { collectSessionTurnGarbage(ds); }
+      catch (err: any) { logger.warn(`[trigger-user-auth] identity GC failed: ${err?.message ?? err}`); }
+    }
     } catch (err: any) {
       logger.warn(`[sandbox-reconcile] failed: ${err?.message ?? err}`);
     }

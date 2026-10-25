@@ -27,7 +27,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
-import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -73,6 +73,7 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
+import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
@@ -145,7 +146,7 @@ import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogS
 import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu } from './utils/codex-effort-menu.js';
-import { sandboxBoolValue } from './adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, resolveSpawnNetworkShape } from './adapters/cli/sandbox-mode.js';
 import {
   ClaudeBtwCaptureGuard,
   claudeBtwOverlayVisible,
@@ -1500,7 +1501,31 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const identityPolicy = boundLark && cfg.triggerUserAuth
       ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
       : cfg.triggerUserAuth;
-    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+    // RPC engines are host-side processes (codexRpcEligible forbids sandboxes),
+    // so the loopback proof channel is reachable whenever the binding applies.
+    // This decision is the single source the daemon publishes identity from;
+    // it is re-sent on every engagement.
+    const engineIdentityBinding = !!process.env.SESSION_DATA_DIR
+      && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    const engineIdentityModel = resolveIdentityStorageModel({
+      platform: process.platform, binding: engineIdentityBinding,
+      sandboxEngaged: false, loopbackShared: true,
+    });
+    if (process.env.SESSION_DATA_DIR) {
+      send({
+        type: 'session_identity_decision',
+        sessionId: cfg.sessionId,
+        model: engineIdentityModel,
+        sandboxEngaged: false,
+        loopbackShared: true,
+        ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+      });
+    }
+    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
+      engineIdentityModel,
+      engineIdentityModel === 'proven'
+        ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
+        : undefined);
     if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
       sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
     engine = new CodexRpcEngine({
@@ -1904,6 +1929,7 @@ const registerMcpLinkRefsThroughHost: GatewayLinkRefRegistrationHandler = async 
 async function resolveMcpLinkRefsThroughHost(input: {
   identity: NonNullable<ReturnType<typeof currentGatewayTrustedTurnIdentity>>;
   payload: import('./services/link-ref-resolver.js').OutboundLinkRefPayload;
+  responseKind: 'final' | 'auxiliary';
 }): Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs> {
   if (!input.identity.turnId || input.identity.linkRefMode !== 'enabled') {
     return { ...input.payload, refCount: 0 };
@@ -1922,6 +1948,7 @@ async function resolveMcpLinkRefsThroughHost(input: {
       ? { dispatchAttempt: input.identity.dispatchAttempt }
       : {}),
     linkRefMode: 'enabled',
+    responseKind: input.responseKind,
     payload: input.payload,
   });
   try {
@@ -1942,7 +1969,11 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
   const resolvedDelivery = await resolveTrustedResultDeliveryLinkRefs({
     delivery,
     mode: identity.linkRefMode ?? 'disabled',
-    resolve: payload => resolveMcpLinkRefsThroughHost({ identity, payload }),
+    resolve: (payload, responseKind) => resolveMcpLinkRefsThroughHost({
+      identity,
+      payload,
+      responseKind,
+    }),
     persist: value => {
       artifact = artifactStore.create({
         pluginId: input.pluginId,
@@ -4513,6 +4544,7 @@ let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
@@ -4823,6 +4855,7 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
+  identityTurnId?: string;
   queueAfterActiveTurn?: true;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
@@ -4831,6 +4864,7 @@ function turnAuthorityIdentity(input: {
   return {
     ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
     ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...(input.identityTurnId ? { identityTurnId: input.identityTurnId } : {}),
     ...(input.dispatchAttempt !== undefined
       ? { dispatchAttempt: input.dispatchAttempt }
       : {}),
@@ -4906,6 +4940,7 @@ function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boole
 function reserveActiveTurn(input: {
   queueAfterActiveTurn?: true;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
@@ -4926,6 +4961,7 @@ function reserveActiveTurn(input: {
 function markActiveTurnStarted(input: {
   queueAfterActiveTurn?: true;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
@@ -5060,6 +5096,10 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       sessionId,
       capability: capability.token,
       policyCapability,
+      ...(activeIdentity.turnId ? {
+        trustedCaller: activeIdentity.caller ?? null,
+        identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+      } : {}),
       ...(readIsolationOriginChannelId
         ? { originChannelId: readIsolationOriginChannelId }
         : {}),
@@ -5230,8 +5270,20 @@ function registerRpcEnginePidMarker(pid: number | undefined): string | null {
   }
 }
 
+/** Validate an identityTurnId read back from the CLI-writable PID marker, the
+ *  same shape the current-execution document enforces: non-empty, at most 256
+ *  chars, no controls/whitespace. A malformed marker value is dropped (the turn
+ *  then falls back to its own turnId) rather than published into the active
+ *  turn record. Depth defence — selection authority does not trust this file. */
+function markerIdentityTurnId(value: unknown): string | undefined {
+  // Shape guard lives in core/turn-id-shape.ts so it has fixed-point tests of
+  // its own (number / newline / overlong / whitespace each reject).
+  return isValidMarkerIdentityTurnId(value) ? value : undefined;
+}
+
 function adoptInitialActiveTurn(parsed: {
   turnId: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
@@ -5252,6 +5304,7 @@ function adoptInitialActiveTurn(parsed: {
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
     turnId: parsed.turnId,
+    identityTurnId: markerIdentityTurnId(parsed.identityTurnId),
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
@@ -5266,6 +5319,7 @@ function adoptInitialActiveTurn(parsed: {
 
 function adoptDisplacedActiveTurn(parsed: {
   turnId: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   trustedCaller?: TrustedCaller;
@@ -5277,6 +5331,8 @@ function adoptDisplacedActiveTurn(parsed: {
   const currentController = activeTurnAuthority.snapshot()?.controller;
   const displaced: QueuedTypeAheadTurnRecord = {
     turnId: currentBotmuxTurnId!,
+    ...(activeTurnAuthority.snapshot()?.identityTurnId
+      ? { identityTurnId: activeTurnAuthority.snapshot()!.identityTurnId } : {}),
     ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
     ...(currentCaller ? { trustedCaller: currentCaller } : {}),
@@ -5299,6 +5355,7 @@ function adoptDisplacedActiveTurn(parsed: {
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
     turnId: parsed.turnId,
+    identityTurnId: markerIdentityTurnId(parsed.identityTurnId),
     dispatchAttempt: currentBotmuxDispatchAttempt,
     caller: parsed.trustedCaller,
     controller: parsed.trustedController,
@@ -5325,26 +5382,12 @@ function withPidMarkerLock<T>(markerPath: string, fn: () => T): T {
 
 function writeCliPidMarker(): void {
   if (!sessionId) return;
-  // Publish the turn the CLI is actually executing, for the trigger-user
-  // identity wrapper. It rides this function because every point that changes
-  // `currentBotmuxTurnId` already calls it — including the ones that bypass the
-  // normal queue (adopt writes, passthrough, init). A separate call at each site
-  // would be one `git rebase` away from missing one, and a missed site means
-  // stale turn ⇒ refused commands.
-  //
-  // Distinct from the pid marker's own `turnId` field: that file is JSON (the
-  // wrapper is /bin/sh and must not spawn jq) and lives where the CLI could
-  // rewrite it. This one is a single line under the 0700 identity dir.
-  if (process.env.SESSION_DATA_DIR) {
-    publishActiveTurn(
-      process.env.SESSION_DATA_DIR,
-      sessionId,
-      currentBotmuxTurnId,
-      currentBotmuxDispatchAttempt,
-      currentBotmuxCallerOpenId,
-    );
-  }
-  // 读-采纳-改写在 per-marker 文件锁内（经 withPidMarkerLock，锁内回写 marker 不会自锁）。
+  // The active turn for the trigger-user identity wrapper is published at the
+  // END of this function: the read-adopt-rewrite below runs inside the
+  // per-marker file lock (via withPidMarkerLock; rewriting the marker inside
+  // the lock does not self-deadlock), and the publication must take the
+  // post-adopt authority snapshot. withFileLockSync is NOT re-entrant — do not
+  // acquire marker locks within this block.
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath) continue;
     try {
@@ -5392,6 +5435,7 @@ function writeCliPidMarker(): void {
                 if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
+                    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                     ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
                       ? { linkRefMode: qt.linkRefMode }
@@ -5413,6 +5457,7 @@ function writeCliPidMarker(): void {
           : undefined;
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
+          ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
           ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
           ...(t.trustedCaller ? { trustedCaller: t.trustedCaller } : {}),
@@ -5420,14 +5465,16 @@ function writeCliPidMarker(): void {
           ...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {}),
         }));
         const queuedTurnId = queuedTurns[0]?.turnId;
-        const effectiveCaller = activeTurnAuthority.snapshot()?.caller;
-        const effectiveController = activeTurnAuthority.snapshot()?.controller;
+        const authority = activeTurnAuthority.snapshot();
+        const effectiveCaller = authority?.caller;
+        const effectiveController = authority?.controller;
         atomicWriteFileSync(markerPath, JSON.stringify({
           sessionId,
           turnId: currentBotmuxTurnId ?? null,
           dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
           ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
-          ...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {}),
+          ...(effectiveCaller?.requestUserOpenId ? { callerOpenId: effectiveCaller.requestUserOpenId } : {}),
+          ...(authority?.identityTurnId ? { identityTurnId: authority.identityTurnId } : {}),
           ...(effectiveCaller ? { trustedCaller: effectiveCaller } : {}),
           ...(effectiveController ? { trustedController: effectiveController } : {}),
           ...(queuedTurnId ? { queuedTurnId } : {}),
@@ -5443,6 +5490,17 @@ function writeCliPidMarker(): void {
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }
+  }
+  if (process.env.SESSION_DATA_DIR) {
+    const authority = activeTurnAuthority.snapshot();
+    publishActiveTurn(
+      process.env.SESSION_DATA_DIR,
+      sessionId,
+      currentBotmuxTurnId,
+      currentBotmuxDispatchAttempt,
+      authority ? authority.caller?.requestUserOpenId : currentBotmuxCallerOpenId,
+      authority?.identityTurnId ?? authority?.turnId ?? currentBotmuxTurnId,
+    );
   }
 }
 
@@ -5464,6 +5522,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
+              ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
               ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
                 ? { linkRefMode: t.linkRefMode }
@@ -5537,6 +5596,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(qt.turnId) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
+                ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                 ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
                   ? { linkRefMode: qt.linkRefMode }
                   : {}),
@@ -5553,6 +5613,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       // ignore
     }
   }
+  if (anySynced) writeCliPidMarker();
   return anySynced;
 }
 
@@ -20057,6 +20118,16 @@ async function spawnCli(
   }
   const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
   if (effectiveNetworkError) throw new Error(effectiveNetworkError);
+  // Single-source network facts for THIS spawn. These same values feed the
+  // bwrap/Seatbelt constructors below (netEnabled) and the identity storage
+  // decision reported to the daemon (loopbackShared). Nothing else may derive
+  // loopback reachability from the frozen config — the effective mode above
+  // already includes the BOTMUX_SANDBOX override and the remote bypass.
+  const spawnNetworkShape = resolveSpawnNetworkShape({
+    mode: sandboxMode,
+    sandboxNetwork: cfg.sandboxNetwork,
+    sandboxNetworkPolicy: cfg.sandboxNetworkPolicy,
+  });
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
   // Retain the resolved mode for bridge activation decisions made later in
@@ -21699,7 +21770,35 @@ async function spawnCli(
   const identityPolicy = boundLark && cfg.triggerUserAuth
     ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
     : cfg.triggerUserAuth;
-  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+  // The identity model is the worker's spawn decision, from the resolved
+  // sandbox mode (BOTMUX_SANDBOX override and remote bypass included) and the
+  // actual spawn's loopback reachability (spawnNetworkShape feeds the bwrap
+  // argv). Report it to the daemon right after wrapper rendering setup so the
+  // daemon publishes identity material per this single source — the daemon
+  // never derives sandbox/network facts itself.
+  const childIdentityBinding = !!process.env.SESSION_DATA_DIR
+    && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const childIdentityModel = resolveIdentityStorageModel({
+    platform: process.platform,
+    binding: childIdentityBinding,
+    sandboxEngaged: spawnNetworkShape.sandboxEngaged,
+    loopbackShared: spawnNetworkShape.loopbackShared,
+  });
+  if (process.env.SESSION_DATA_DIR) {
+    send({
+      type: 'session_identity_decision',
+      sessionId: cfg.sessionId,
+      model: childIdentityModel,
+      sandboxEngaged: spawnNetworkShape.sandboxEngaged,
+      loopbackShared: spawnNetworkShape.loopbackShared,
+      ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+    });
+  }
+  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
+    childIdentityModel,
+    childIdentityModel === 'proven'
+      ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
+      : undefined);
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
@@ -22552,7 +22651,7 @@ async function spawnCli(
       hostOnlyDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
-      net: cfg.sandboxNetworkPolicy ? true : cfg.sandboxNetwork !== false,
+      net: spawnNetworkShape.netEnabled,
       // Claude Code saves ~/.claude.json atomically via a PID/random-suffixed
       // sibling — only relevant when the data dir is NOT redirected to BOT_HOME.
       writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
@@ -22814,7 +22913,7 @@ async function spawnCli(
         cliArgs: args,
         denyPaths: scratchDeny,
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
-        net: cfg.sandboxNetwork !== false,
+        net: spawnNetworkShape.netEnabled,
       });
       if (!sbx) {
         throw new Error('scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed; check same-volume and free space) — aborting, never bare-running');
@@ -22843,7 +22942,7 @@ async function spawnCli(
         dataDir: scratchDataDir,
         storage,
         tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
-        net: cfg.sandboxNetwork !== false,
+        net: spawnNetworkShape.netEnabled,
         chdir: cfg.workingDir,
         home: scratchHome,
         cliBin: cliAdapter.resolvedBin,

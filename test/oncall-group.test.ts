@@ -130,6 +130,11 @@ describe('Oncall and feedback card composition', () => {
     expect(JSON.stringify(first)).toContain('botmux_feedback_reasons');
     expect(JSON.stringify(first)).toContain('拉起 Oncall 群');
     const reason = renderFeedbackCard(first, policy, { ...negative, reasonKey: 'wrong', comment: 'details' });
+    for (const card of [first, second, reason] as any[]) {
+      for (const id of ['botmux_feedback', 'botmux_feedback_reasons']) {
+        expect(card.body.elements.find((element: any) => element.element_id === id).flex_mode).toBe('flow');
+      }
+    }
     expect(JSON.stringify(reason).match(/oncall_group_create/g)).toHaveLength(1);
     expect(JSON.stringify(reason)).toContain('已补充说明');
     expect(first.body.elements[0]).toEqual(base.body.elements[0]);

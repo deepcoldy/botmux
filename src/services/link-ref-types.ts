@@ -91,7 +91,9 @@ export type LinkRefLedgerErrorCode =
 
 export type OutboundLinkRefErrorCode =
   | LinkRefLedgerErrorCode
-  | 'expected_link_invalid_after_link_ref';
+  | 'expected_link_invalid_after_link_ref'
+  | 'link_ref_final_url_mismatch'
+  | 'link_ref_malformed_markdown';
 
 export interface LinkRefRegistrationResult {
   registered: RegisteredLinkRef[];

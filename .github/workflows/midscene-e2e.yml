@@ -16,6 +16,8 @@ on:
         required: false
         default: "4"
   pull_request:
+    # closed: see the concurrency group below.
+    types: [opened, synchronize, reopened, closed]
     paths:
       - ".github/workflows/midscene-e2e.yml"
       - "package.json"
@@ -37,7 +39,10 @@ permissions:
   contents: read
 
 # A newer push to the same pull request supersedes its older run. Manual runs
-# never cancel each other.
+# never cancel each other. Merging or closing the pull request starts a run in
+# the same group too, so its queued or running run is cancelled instead of
+# holding or waiting for the Feishu live slot (2026-10-24: a merged pull
+# request's run held it for about 3.5 hours). Every job skips that closing run.
 concurrency:
   group: midscene-e2e-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: true
@@ -55,7 +60,7 @@ concurrency:
 jobs:
   dashboard:
     name: Dashboard Midscene
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -131,7 +136,7 @@ jobs:
   feishu-queue:
     # The name is matched by scripts/feishu-live-queue.mjs.
     name: Wait for the Feishu live slot
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     # Waiting has its own budget, so it never eats into the Feishu job's.
     timeout-minutes: 300
@@ -154,7 +159,7 @@ jobs:
     # The name is matched by scripts/feishu-live-queue.mjs.
     name: Feishu live Midscene (parallel lanes)
     needs: feishu-queue
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || (github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     # The group-mode lane is serial (one shared group) and alone takes ~2h.
     timeout-minutes: 350
