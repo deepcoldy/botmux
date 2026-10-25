@@ -59,12 +59,10 @@ describe('cursor attach baseline is footer-aware', () => {
 describe('fresh TRAE RPC bridge attachment', () => {
   it('binds the app-server thread when no persisted CLI session id exists yet', () => {
     const spawn = topLevelFunction('spawnCli');
-    expect(spawn).toContain('cliSessionId: effectiveCliSessionId ?? opts.rpcThreadId');
+    expect(spawn).toContain('cliSessionId: effectiveCliSessionId ?? remoteThreadId');
   });
 
-  it('captures the RPC thread before spawn and drains after releasing a fast terminal', () => {
-    expect(source).toContain('const rpcThreadIdAtSpawn = rpcDecision.engaged ? remoteThreadId : undefined');
-    expect(source).toContain('rpcThreadId: rpcThreadIdAtSpawn');
+  it('drains after releasing a fast terminal', () => {
     const deferral = bracedBlockFrom('if (deferredFreshRpcTurn) {');
     const release = deferral.indexOf('releaseRpcTurnTerminalDeferral(');
     const drain = deferral.indexOf('codexBridgeDrainAndMaybeEmit({ signalIdle: false })');

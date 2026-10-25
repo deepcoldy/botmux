@@ -18841,11 +18841,7 @@ function resolveCliExtraArgs(): string[] {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: {
-    pluginGenerationPrepared?: boolean;
-    exactResumeSessionId?: string;
-    rpcThreadId?: string;
-  } = {},
+  opts: { pluginGenerationPrepared?: boolean; exactResumeSessionId?: string } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
@@ -23618,7 +23614,7 @@ async function spawnCli(
       // A fresh RPC turn executes on an app-server thread before the remote
       // viewer starts. Its first turn bypasses writeInput, so this is the only
       // attach boundary that can bind the rollout from byte zero.
-      cliSessionId: effectiveCliSessionId ?? opts.rpcThreadId,
+      cliSessionId: effectiveCliSessionId ?? remoteThreadId,
       adapterSessionId: effectiveAdapterSessionId,
     });
   } else if (cfg.cliId === 'coco') {
@@ -27714,11 +27710,7 @@ process.on('message', async (raw: unknown) => {
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
-        const rpcThreadIdAtSpawn = rpcDecision.engaged ? remoteThreadId : undefined;
-        await spawnCli(msg, {
-          pluginGenerationPrepared: rpcPluginGenerationPrepared,
-          rpcThreadId: rpcThreadIdAtSpawn,
-        });
+        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
