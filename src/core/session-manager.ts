@@ -974,18 +974,21 @@ function renderSubstituteTarget(trigger?: SubstituteTrigger): string {
   ].join('\n');
 }
 
-export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {
+export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale, cliId?: string): string {
   if (!attachments || attachments.length === 0) return '';
-  let imgN = 0, fileN = 0;
+  let imgN = 0, fileN = 0, videoN = 0;
   const items = attachments.map(a => {
-    const tag = a.type === 'image' ? 'image' : 'file';
-    const n = a.type === 'image' ? ++imgN : ++fileN;
+    const tag = a.type;
+    const n = a.type === 'image' ? ++imgN : a.type === 'video' ? ++videoN : ++fileN;
     const mime = a.mimeType ? ` mime_type="${xmlEscape(a.mimeType)}"` : '';
     const sequenceHint = imageSequenceHint(a);
     const hint = sequenceHint ? ` hint="${xmlEscape(sequenceHint)}"` : '';
     return `  <${tag} n="${n}" path="${xmlEscape(a.path)}"${mime}${hint} />`;
   });
-  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
+  const videoHint = attachments.some(a => a.type === 'video')
+    ? `\n  <video_hint>${xmlEscape(t(cliId === 'kimi' ? 'ai.attach.videoHintKimi' : 'ai.attach.videoHint', undefined, locale))}</video_hint>`
+    : '';
+  return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}${videoHint}\n</attachments>`;
 }
 
 function renderRoleContextBlock(
@@ -1576,7 +1579,7 @@ function buildNewTopicBlocks(
   const senderNote = bare ? '' : renderCursorSenderNote(cliId, !!senderBlock, locale);
   if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
-  const attachHint = bare ? '' : formatAttachmentsHint(attachments, locale);
+  const attachHint = bare ? '' : formatAttachmentsHint(attachments, locale, cliId);
   if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
@@ -1726,7 +1729,7 @@ export function buildNewTopicCliInput(
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
-  const attachmentBlock = formatAttachmentsHint(attachments, locale);
+  const attachmentBlock = formatAttachmentsHint(attachments, locale, cliId);
   const mentionBlock = renderMentionBlock(mentions);
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
@@ -1905,7 +1908,7 @@ function buildFollowUpBlocks(
   if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = !bare && opts?.attachments && opts.attachments.length > 0
-    ? formatAttachmentsHint(opts.attachments, opts.locale)
+    ? formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId)
     : '';
   if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
@@ -2133,7 +2136,7 @@ export function buildFollowUpCliInput(
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
-  const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
+  const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId);
   const mentionBlock = renderMentionBlock(opts.mentions);
   return withInitialLinkRefSources({
     content: legacyContent,

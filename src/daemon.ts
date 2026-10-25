@@ -27312,7 +27312,8 @@ async function handleThreadReplyAdmitted(
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
-    const attachmentHint = !zeroInjection && attachments.length > 0 ? formatAttachmentsHint(attachments) : '';
+    const attachmentHint = !zeroInjection && attachments.length > 0
+      ? formatAttachmentsHint(attachments, localeForBot(larkAppId), ds.session.cliId) : '';
     let enriched = zeroInjection ? buildZeroPromptInput(promptContent, attachments)
       : attachmentHint ? `${promptContent}${attachmentHint}` : promptContent;
     if (attachmentHint) codexAppFollowUpContextParts.push(attachmentHint);
