@@ -39,7 +39,10 @@ async function main(): Promise<void> {
       version: REMOTE_RUNNER_PROTOCOL_VERSION, ...event }) + '\n'),
   });
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  const shutdown = () => { input.close(); void runner.dispose(); };
+  const shutdown = () => {
+    input.close();
+    void runner.dispose().then(() => process.exit(0), exitWithError);
+  };
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
   try {
@@ -52,4 +55,10 @@ async function main(): Promise<void> {
   } finally { await runner.dispose(); }
 }
 
-main().catch(error => { process.stderr.write(String(error instanceof Error ? error.message : error) + '\n'); process.exitCode = 1; });
+function exitWithError(error: unknown): void {
+  process.stderr.write(String(error instanceof Error ? error.message : error) + '\n', () => process.exit(1));
+}
+
+// Bun's compiled CLI graph can retain handles after readline closes. This entry
+// owns only the bridge; disposal releases its lock without terminating the Orca Agent.
+main().then(() => process.exit(0), exitWithError);

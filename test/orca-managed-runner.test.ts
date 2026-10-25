@@ -105,6 +105,15 @@ function fixture(autoAck = true) {
 }
 
 describe('managed Orca conversations', () => {
+  it('releases ownership when disposed during startup without launching a conversation', async () => {
+    const f = fixture(); const runner = f.create();
+    const opening = f.start(runner);
+    await runner.dispose(); await opening;
+    expect(f.runtime.launches.size).toBe(0);
+    await f.start(f.create());
+    expect(f.events.at(-1)).toMatchObject({ type: 'ready' });
+  });
+
   it('creates a native session and returns its exact turn output', async () => {
     const f = fixture(); const runner = f.create();
     await f.start(runner);

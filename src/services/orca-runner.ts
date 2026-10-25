@@ -88,6 +88,7 @@ export class OrcaRunner {
     this.ownership = this.store.own(() => new Promise<void>(resolve => {
       this.unlock = resolve;
       acquired();
+      if (this.disposed) resolve();
     }));
     this.ownership.catch(failed);
     await ready;
@@ -96,6 +97,7 @@ export class OrcaRunner {
 
   private async open(command: StartCommand): Promise<void> {
     await this.acquire(command.sessionId);
+    if (this.disposed) return;
     const identity = { botmuxSessionId: command.sessionId, agent: this.options.agent,
       cwd: realpathSync(command.cwd), profile: realpathSync(this.options.profile) };
     if (command.type === 'resume' && command.state.provider !== 'orca') throw new Error('Cannot resume another provider');

@@ -53,6 +53,18 @@ function start(b, remoteResumeMode) {
   });
 }
 
+function stop(b, commit) {
+  return new Promise((resolveExit, reject) => {
+    const pid = b.getChildPid();
+    const timer = setTimeout(() => {
+      if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+      reject(new Error('Runner did not exit after releasing its session'));
+    }, 5000);
+    b.onExit(() => { clearTimeout(timer); resolveExit(); });
+    commit();
+  });
+}
+
 async function turn(b, marker) {
   let timer;
   const completed = new Promise((resolveFinal, reject) => {
@@ -73,22 +85,22 @@ try {
   const nativeSessionId = state.agentThreadId;
   const detached = await backend.prepareShutdownDetach();
   if (!detached.ok) throw new Error(JSON.stringify(detached));
-  backend.commitShutdownDetach();
+  await stop(backend, () => backend.commitShutdownDetach());
   backend = create(); await start(backend);
   await turn(backend, 'BOTMUX_ORCA_RESUMED');
   const closed = await backend.destroySession();
   if (!closed.ok) throw new Error(JSON.stringify(closed));
-  backend.commitDestroySession();
+  await stop(backend, () => backend.commitDestroySession());
   backend = create(); await start(backend, 'rebuild');
   await turn(backend, 'BOTMUX_ORCA_REOPENED');
   if (state.agentThreadId !== nativeSessionId || received.length !== 3) throw new Error('Conversation identity or delivery count changed');
+  const cleanup = await backend.destroySession();
+  if (!cleanup.ok) throw new Error(JSON.stringify(cleanup));
+  await stop(backend, () => backend.commitDestroySession());
+  successful = true;
   console.log(JSON.stringify({ agent, nativeSessionId, generation: state.generation,
     path: binary ? 'compiled-binary' : 'source', nativeConversationPreserved: true,
     turns: received.length, feishuDelivery: 'simulated-receipt', result: 'passed' }));
-  const cleanup = await backend.destroySession();
-  if (!cleanup.ok) throw new Error(JSON.stringify(cleanup));
-  backend.commitDestroySession();
-  successful = true;
 } finally {
   backend?.kill();
   if (successful) rmSync(data, { recursive: true, force: true });
