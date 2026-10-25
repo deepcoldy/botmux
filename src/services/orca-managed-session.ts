@@ -61,7 +61,7 @@ export class OrcaManagedSession {
       if (realpathSync(result.worktree.path) !== path) throw new Error('Orca resolved a different working directory');
       return result.worktree;
     } catch (error) {
-      if (!(error instanceof OrcaRpcError) || !['worktree_not_found', 'repo_not_found'].includes(error.code)) throw error;
+      if (!(error instanceof OrcaRpcError) || !['selector_not_found', 'worktree_not_found', 'repo_not_found'].includes(error.code)) throw error;
     }
     await this.runtime.call('repo.add', { path, kind: existsSync(join(path, '.git')) ? 'git' : 'folder' });
     const result = await this.runtime.call<{ worktree: { id: string; path: string } }>('worktree.show', { worktree: `path:${path}` });

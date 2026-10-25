@@ -27,6 +27,7 @@ class Runtime implements OrcaRuntime {
   lostSendReply = false;
   reset = false;
   workspaceExists = true;
+  missingWorkspaceCode = 'selector_not_found';
   queueState?: 'waiting' | 'paused' | 'removed';
   statusFails = false;
   refuseTabClose = false;
@@ -39,7 +40,7 @@ class Runtime implements OrcaRuntime {
       case 'status.get': if (this.statusFails) throw new Error('runtime unavailable'); result = { capabilities: ['agent.launch.replay-required.v1', 'agent.launch.surface.v1',
         'agent-session.structured.v1', 'agent-session.turn-item.v1'] }; break;
       case 'worktree.show':
-        if (!this.workspaceExists) throw new OrcaRpcError('worktree_not_found', 'not registered');
+        if (!this.workspaceExists) throw new OrcaRpcError(this.missingWorkspaceCode, 'not registered');
         result = { worktree: { id: 'workspace', path: this.cwd } }; break;
       case 'repo.add': this.workspaceExists = true; result = {}; break;
       case 'agent.launchReplay':
@@ -133,10 +134,19 @@ describe('managed Orca conversations', () => {
     expect(launch).not.toHaveProperty('prompt');
   });
 
-  it('registers a plain knowledge directory as a folder project', async () => {
-    const f = fixture(); f.runtime.workspaceExists = false;
+  it.each(['selector_not_found', 'worktree_not_found', 'repo_not_found'])(
+    'registers a plain knowledge directory after %s', async code => {
+    const f = fixture(); f.runtime.workspaceExists = false; f.runtime.missingWorkspaceCode = code;
     await f.start(f.create());
     expect(f.runtime.calls.find(c => c.method === 'repo.add')!.params).toEqual({ path: realpathSync(f.cwd), kind: 'folder' });
+  });
+
+  it('does not register another project when workspace lookup is denied', async () => {
+    const f = fixture(); f.runtime.workspaceExists = false; f.runtime.missingWorkspaceCode = 'permission_denied';
+    await f.start(f.create());
+    expect(f.events.at(-1)).toMatchObject({ type: 'failure' });
+    expect(f.runtime.calls.some(c => c.method === 'repo.add')).toBe(false);
+    expect(f.runtime.launches.size).toBe(0);
   });
 
   it('passes model and effort through Orca launch preferences', async () => {
