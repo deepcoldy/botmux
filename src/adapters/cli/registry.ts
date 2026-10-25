@@ -99,6 +99,8 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   'remote-runner': 'botmux-remote-runner',
   'orca-codex': undefined,
   'orca-claude': undefined,
+  'orca-codex-chat': undefined,
+  'orca-claude-chat': undefined,
   codem: 'codem',
 };
 
@@ -354,7 +356,8 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'mojo': return createMojoAdapter(pathOverride);
     case 'minimax': return createMinimaxAdapter(pathOverride);
     case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
-    case 'orca-codex': case 'orca-claude': return createOrcaAdapter(id, pathOverride);
+    case 'orca-codex': case 'orca-claude': case 'orca-codex-chat': case 'orca-claude-chat':
+      return createOrcaAdapter(id, pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

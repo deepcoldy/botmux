@@ -13,14 +13,15 @@ const args = process.argv.slice(2);
 function option(name) { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; }
 const cwd = option('--cwd');
 const agent = option('--agent') || 'codex';
-if (!cwd || !['codex', 'claude'].includes(agent)) {
-  throw new Error('Usage: node scripts/orca-managed-smoke.mjs --cwd /existing/project [--agent codex|claude] [--binary /path/to/botmux]');
+const surface = option('--surface') || 'terminal';
+if (!cwd || !['codex', 'claude'].includes(agent) || !['terminal', 'chat'].includes(surface)) {
+  throw new Error('Usage: node scripts/orca-managed-smoke.mjs --cwd /existing/project [--agent codex|claude] [--surface terminal|chat] [--binary /path/to/botmux]');
 }
 const directory = realpathSync(cwd);
 const binary = option('--binary');
 const data = mkdtempSync(join(tmpdir(), 'botmux-orca-smoke-'));
 const sessionId = randomUUID();
-const adapter = createOrcaAdapter(`orca-${agent}`);
+const adapter = createOrcaAdapter(`orca-${agent}${surface === 'chat' ? '-chat' : ''}`);
 let state;
 let delivered = '';
 let backend;
@@ -48,7 +49,7 @@ function start(b, remoteResumeMode) {
     b.onReady(() => { clearTimeout(timer); resolveReady(); });
     b.onExit(code => { clearTimeout(timer); reject(new Error(`Runner exited: ${code}`)); });
     b.spawn(binary ? resolve(binary) : adapter.resolvedBin,
-      binary ? ['__orca-runner', agent] : adapter.buildArgs({ sessionId }),
+      binary ? ['__orca-runner', agent, surface] : adapter.buildArgs({ sessionId }),
       { cwd: directory, cols: 120, rows: 40, remoteResumeMode,
         env: { ...process.env, SESSION_DATA_DIR: data } });
   });
@@ -58,7 +59,8 @@ async function assertNativeTab(visible) {
   const snapshot = await new OrcaRuntimeClient().call('session.tabs.list', {
     worktree: `id:${state.providerState.worktreeId}`,
   });
-  const present = snapshot.tabs.some(tab => tab.sessionId === state.agentThreadId);
+  const present = snapshot.tabs.some(tab => surface === 'chat'
+    ? tab.sessionId === state.agentThreadId : tab.terminal === state.providerState.terminalHandle);
   if (present !== visible) throw new Error(`Native Orca tab visibility differs: expected ${visible}`);
 }
 
@@ -112,7 +114,7 @@ try {
   await assertNativeTab(false);
   await stop(backend, () => backend.commitDestroySession());
   successful = true;
-  console.log(JSON.stringify({ agent, nativeSessionId, generation: state.generation,
+  console.log(JSON.stringify({ agent, surface, nativeSessionId, generation: state.generation,
     path: binary ? 'compiled-binary' : 'source', nativeConversationPreserved: true,
     turns: received.length, feishuDelivery: 'simulated-receipt', result: 'passed' }));
 } finally {

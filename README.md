@@ -67,7 +67,7 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 - **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
 - **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
 - **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
-- **[Orca 原生会话](docs/orca-managed-sessions.md)** — 选择 Orca · Codex / Claude Code 后，Bot 新会话自动进入 Orca 对应项目；在飞书与桌面继续同一段对话，无需逐个 `/adopt`。
+- **[Orca 原生会话](docs/orca-managed-sessions.md)** — 支持 Terminal CLI（默认）与 Chat；Bot 新会话自动进入 Orca 对应项目；在飞书与桌面继续同一段对话，无需逐个 `/adopt`。
 - **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — tmux / Zellij / Herdr / Orca（实验性）里跑到一半，手机 `/adopt` 接入；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
 - **[定时任务](https://deepcoldy.github.io/botmux/schedule) & [外部触发](https://deepcoldy.github.io/botmux/webhook)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](https://deepcoldy.github.io/botmux/webhook) 或 [API 任务触发](https://deepcoldy.github.io/botmux/api-task-trigger)。
 - **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。

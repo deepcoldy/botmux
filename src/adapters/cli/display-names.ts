@@ -40,6 +40,8 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'minimax': 'MiniMax Code',
   'orca-codex': 'Orca · Codex',
   'orca-claude': 'Orca · Claude Code',
+  'orca-codex-chat': 'Orca · Codex · Chat',
+  'orca-claude-chat': 'Orca · Claude Code · Chat',
   'remote-runner': 'Remote Runner',
   'codem': 'CodeM',
 };

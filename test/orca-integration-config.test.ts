@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { orcaLaunchSupportError } from '../src/core/orca-support.js';
+import { orcaLaunchSupportError, ORCA_SELECTIONS } from '../src/core/orca-support.js';
 import { botConfigInvariantError } from '../src/services/bot-config-invariants.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery } from '../src/core/reply-delivery.js';
 import { resolvePairedBackendId, isRemoteCliId } from '../src/core/remote-cli-ids.js';
@@ -8,7 +8,7 @@ import { createCliAdapter } from '../src/adapters/cli/registry.js';
 import { checkCliAvailability } from '../src/setup/cli-availability.js';
 
 describe('Orca native selection', () => {
-  it.each(['orca-codex', 'orca-claude'] as const)('pairs %s with the existing structured backend', async cliId => {
+  it.each(['orca-codex', 'orca-claude', 'orca-codex-chat', 'orca-claude-chat'] as const)('pairs %s with the existing structured backend', async cliId => {
     expect(resolveCliSelection(cliId)).toEqual({ cliId });
     expect(isRemoteCliId(cliId)).toBe(true);
     expect(resolvePairedBackendId(cliId, 'tmux', 'pty')).toBe('remote-runner');
@@ -16,6 +16,9 @@ describe('Orca native selection', () => {
     const adapter = await createCliAdapter(cliId);
     expect(adapter.injectsSessionContext).toBe(true);
     expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(adapter.buildArgs({ sessionId: 'test' }).slice(-2)).toEqual([
+      ORCA_SELECTIONS[cliId].agent, ORCA_SELECTIONS[cliId].surface,
+    ]);
     expect(defaultReplyDeliveryFor(cliId)).toBe('transcript');
     expect(effectiveReplyDelivery(undefined, cliId)).toBe('transcript');
     expect(botConfigInvariantError({ cliId, replyDelivery: 'send' })).toBe('orca_requires_transcript_delivery');
@@ -26,7 +29,7 @@ describe('Orca native selection', () => {
     expect(resolvePairedBackendId('codex', 'tmux', 'pty')).toBe('tmux');
     expect(resolvePairedBackendId('codex', 'remote-runner', 'pty')).toBe('pty');
     expect(defaultReplyDeliveryFor('codex')).toBe('send');
-    expect(CLI_SELECT_TREE.find(g => g.key === 'orca')?.children?.map(c => c.cliId)).toEqual(['orca-codex', 'orca-claude']);
+    expect(CLI_SELECT_TREE.find(g => g.key === 'orca')?.children?.map(c => c.cliId)).toEqual(Object.keys(ORCA_SELECTIONS));
   });
 
   it.each([

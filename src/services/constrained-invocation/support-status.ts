@@ -44,6 +44,8 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   minimax: { group: 'native-exec', status: 'verification_required', reason: 'mcode_model_only_isolation_unverified', detail: '已升级为 MiniMax Code mcode exec；原生 exec 保留 Agent 工具与插件，尚未验证完全零工具和独立认证的 model-only 契约，不回退 mmx。' },
   'orca-codex': { group: 'orca', status: 'interface_gap', reason: 'orca_owns_tools', detail: 'Orca owns the Agent tool and permission configuration.' },
   'orca-claude': { group: 'orca', status: 'interface_gap', reason: 'orca_owns_tools', detail: 'Orca owns the Agent tool and permission configuration.' },
+  'orca-codex-chat': { group: 'orca', status: 'interface_gap', reason: 'orca_owns_tools', detail: 'Orca owns the Agent tool and permission configuration.' },
+  'orca-claude-chat': { group: 'orca', status: 'interface_gap', reason: 'orca_owns_tools', detail: 'Orca owns the Agent tool and permission configuration.' },
   'remote-runner': { group: 'remote-agent', status: 'interface_gap', reason: 'provider_controls_agent_loop', detail: '执行由外置 provider 管理；是否支持纯模型、空工具和隔离凭据取决于 provider 声明与内部验收。' },
   codem: { group: 'native-print', status: 'verification_required', reason: 'native_model_only_isolation_unverified', detail: '本地适配器接入 CodeM TUI；原生 -p/--sse 仍运行 Agent 工具，尚未验证空工具及独立认证的 model-only 契约。' },
 };

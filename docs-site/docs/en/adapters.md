@@ -13,7 +13,8 @@ The table lists the current built-in adapters (the **authoritative source** for 
 |---------|-----|-----|:--:|
 | `claude-code` | Claude Code (default) | local process | ✅ |
 | `codex` | Codex CLI | local process | ✅ |
-| `orca-codex` / `orca-claude` | Orca · Codex / Claude Code | Native Orca Chat (same-host runtime, automatic workspace registration) | ✅ |
+| `orca-codex` / `orca-claude` | Orca · Codex / Claude Code | Orca Terminal CLI (default, automatic workspace registration) | ✅ |
+| `orca-codex-chat` / `orca-claude-chat` | Orca · Codex / Claude Code · Chat | Native Orca Chat (same-host runtime) | ✅ |
 | `codex-app` | Codex App | local process (app-server protocol) | |
 | `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |

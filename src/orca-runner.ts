@@ -29,11 +29,13 @@ const commandSchema = z.discriminatedUnion('type', [
 ]);
 
 async function main(): Promise<void> {
-  const agent = process.argv.at(-1);
+  const last = process.argv.at(-1);
+  const surface = last === 'chat' || last === 'terminal' ? last : 'terminal';
+  const agent = last === 'chat' || last === 'terminal' ? process.argv.at(-2) : last;
   if (agent !== 'codex' && agent !== 'claude') throw new Error('Orca runner requires codex or claude');
   if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is required');
   const profile = orcaUserDataPath();
-  const runner = new OrcaRunner({ agent, profile, dataDir: process.env.SESSION_DATA_DIR,
+  const runner = new OrcaRunner({ agent, surface, profile, dataDir: process.env.SESSION_DATA_DIR,
     runtime: new OrcaRuntimeClient(profile),
     emit: event => process.stdout.write(JSON.stringify({ protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION, ...event }) + '\n'),

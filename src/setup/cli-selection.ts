@@ -177,6 +177,13 @@ const EXTRA_GATEWAY_GROUPS: ReadonlyArray<CliSelectGroup> = [
   { key: 'ttadk', label: 'TTADK', children: TTADK_VARIANTS },
 ];
 
+const ORCA_VARIANTS: readonly CliSelectOption[] = [
+  { key: 'orca-codex', label: 'Orca · Codex（Terminal CLI，默认）', cliId: 'orca-codex' },
+  { key: 'orca-claude', label: 'Orca · Claude Code（Terminal CLI，默认）', cliId: 'orca-claude' },
+  { key: 'orca-codex-chat', label: 'Orca · Codex（Chat）', cliId: 'orca-codex-chat' },
+  { key: 'orca-claude-chat', label: 'Orca · Claude Code（Chat）', cliId: 'orca-claude-chat' },
+];
+
 // ─── 扁平 / 级联 视图（均派生自 bot-config-editor 的 CLI_OPTIONS，避免再抄一份）──
 
 /**
@@ -186,11 +193,8 @@ const EXTRA_GATEWAY_GROUPS: ReadonlyArray<CliSelectGroup> = [
 export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
   ...CLI_OPTIONS.flatMap((o): CliSelectGroup[] => {
     if (o.id === 'aiden') return [{ key: 'aiden', label: 'Aiden', children: AIDEN_VARIANTS }];
-    if (o.id === 'orca-codex') return [{ key: 'orca', label: 'Orca', children: [
-      { key: 'orca-codex', label: 'Codex（Orca Chat）', cliId: 'orca-codex' },
-      { key: 'orca-claude', label: 'Claude Code（Orca Chat）', cliId: 'orca-claude' },
-    ] }];
-    if (o.id === 'orca-claude') return [];
+    if (o.id === 'orca-codex') return [{ key: 'orca', label: 'Orca', children: ORCA_VARIANTS }];
+    if (o.id === 'orca-claude' || o.id === 'orca-codex-chat' || o.id === 'orca-claude-chat') return [];
     // mira + mir collapse into one「Mira」二级菜单 at mira's position.
     if (o.id === 'mira') return [{ key: 'mira', label: 'Mira', children: MIRA_VARIANTS }];
     if (o.id === 'mir') return []; // already a child of the Mira group above
@@ -226,6 +230,8 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
 export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
   ...CLI_OPTIONS.flatMap((o) => {
     if (o.id === 'aiden') return AIDEN_VARIANTS;
+    if (o.id === 'orca-codex') return ORCA_VARIANTS;
+    if (o.id === 'orca-claude' || o.id === 'orca-codex-chat' || o.id === 'orca-claude-chat') return [];
     if (o.id === 'mira') return MIRA_VARIANTS;   // expands to Mira App + Mir CLI
     if (o.id === 'mir') return [];               // already included via MIRA_VARIANTS
     if (o.id === 'codex') return CODEX_VARIANTS;  // expands to Codex + Codex App

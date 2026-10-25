@@ -97,6 +97,8 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   ],
   'orca-codex': undefined,
   'orca-claude': undefined,
+  'orca-codex-chat': undefined,
+  'orca-claude-chat': undefined,
   'remote-runner': undefined,
   'codem': undefined,
 };

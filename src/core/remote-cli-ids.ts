@@ -11,10 +11,11 @@
  *
  * Orca's two engine choices share the existing structured Remote Runner backend.
  */
+import { isOrcaCliId } from './orca-support.js';
+
 const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff', 'mojo', 'remote-runner']);
 const CLI_BACKENDS: Readonly<Record<string, string>> = {
   riff: 'riff', mojo: 'mojo', 'remote-runner': 'remote-runner',
-  'orca-codex': 'remote-runner', 'orca-claude': 'remote-runner',
 };
 
 /** True for a backend that runs the agent off-box (no local PTY to own). */
@@ -24,7 +25,7 @@ export function isRemoteBackendId(type: string): boolean {
 
 /** True for a CLI whose backend is remote. */
 export function isRemoteCliId(cliId: string | undefined): boolean {
-  return cliId !== undefined && Object.hasOwn(CLI_BACKENDS, cliId);
+  return isOrcaCliId(cliId) || (cliId !== undefined && Object.hasOwn(CLI_BACKENDS, cliId));
 }
 
 /**
@@ -36,6 +37,7 @@ export function isRemoteCliId(cliId: string | undefined): boolean {
  *     default, or to pty when that default is itself remote.
  */
 export function reconcilePairedBackendId(cliId: string, resolved: string, defaultType: string): string {
+  if (isOrcaCliId(cliId)) return 'remote-runner';
   if (isRemoteCliId(cliId)) return CLI_BACKENDS[cliId];
   if (isRemoteBackendId(resolved)) return !isRemoteBackendId(defaultType) ? defaultType : 'pty';
   return resolved;
@@ -52,6 +54,7 @@ export function resolvePairedBackendId(
   override: string | null | undefined,
   daemonDefault: string | null | undefined,
 ): string | undefined {
+  if (isOrcaCliId(cliId)) return 'remote-runner';
   if (cliId && isRemoteCliId(cliId)) return CLI_BACKENDS[cliId];
   const resolved = override || daemonDefault || undefined;
   if (!resolved) return undefined;

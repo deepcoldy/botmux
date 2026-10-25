@@ -4,15 +4,18 @@ import { MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES } from '../adapters/backend/re
 import { ORCA_RUNNER_CAPABILITIES } from './orca-runner-capabilities.js';
 import type { OrcaRuntime } from './orca-runtime-client.js';
 import { OrcaManagedSession } from './orca-managed-session.js';
-import { OrcaRunnerStore, type OrcaRunnerState, type OrcaAgent, type OrcaPendingTurn } from './orca-runner-store.js';
+import { OrcaRunnerStore, orcaTurnOperationId, type OrcaRunnerState, type OrcaAgent, type OrcaPendingTurn } from './orca-runner-store.js';
 import { orcaMessage, orcaMutation, requireOrcaMutation } from './orca-session-protocol.js';
 import { OrcaTurnReader } from './orca-turn-reader.js';
+import { OrcaTerminalSession } from './orca-terminal-session.js';
+import type { OrcaSurface } from '../core/orca-support.js';
 
 type EventPayload = RemoteRunnerEvent extends infer E ? E extends RemoteRunnerEvent ? Omit<E, 'protocol' | 'version'> : never : never;
 type StartCommand = Extract<RemoteRunnerCommand, { type: 'start' | 'resume' }>;
 
 export interface OrcaRunnerOptions {
   agent: OrcaAgent;
+  surface?: OrcaSurface;
   profile: string;
   dataDir: string;
   runtime: OrcaRuntime;
@@ -23,6 +26,7 @@ export interface OrcaRunnerOptions {
 export class OrcaRunner {
   private store?: OrcaRunnerStore;
   private session?: OrcaManagedSession;
+  private terminal?: OrcaTerminalSession;
   private state?: OrcaRunnerState;
   private polling?: Promise<void>;
   private detached = false;
@@ -66,9 +70,11 @@ export class OrcaRunner {
     const s = this.state!;
     return {
       version: 1, provider: 'orca', generation: s.generation,
-      remoteSessionId: `${s.sessionId}:${s.generation}`, agentThreadId: s.sessionId,
+      remoteSessionId: `${s.terminal?.handle ?? s.sessionId}:${s.generation}`,
+      ...(s.sessionId ? { agentThreadId: s.sessionId } : {}),
       providerState: { botmuxSessionId: s.botmuxSessionId, cwd: s.cwd, profile: s.profile,
-        agent: s.agent, worktreeId: s.worktreeId!, pendingTurnId: pendingTurnId ?? null,
+        agent: s.agent, surface: s.surface ?? 'chat', worktreeId: s.worktreeId!, pendingTurnId: pendingTurnId ?? null,
+        ...(s.terminal ? { terminalHandle: s.terminal.handle } : {}),
         settledTurnId: s.pending && this.settled(s.pending) ? s.pending.turnId : null },
     };
   }
@@ -76,7 +82,7 @@ export class OrcaRunner {
   private status(requestId: string, status: 'ready' | 'busy' | 'closed' | 'detached'): void {
     const pending = this.state?.pending;
     this.emit({ type: 'status', requestId, status,
-      ...(this.state?.sessionId ? { state: this.backendState(pending && !this.settled(pending) ? pending.turnId : undefined) } : {}) });
+      ...(this.state?.sessionId || this.state?.terminal ? { state: this.backendState(pending && !this.settled(pending) ? pending.turnId : undefined) } : {}) });
   }
 
   private async acquire(sessionId: string): Promise<void> {
@@ -99,10 +105,11 @@ export class OrcaRunner {
     await this.acquire(command.sessionId);
     if (this.disposed) return;
     const identity = { botmuxSessionId: command.sessionId, agent: this.options.agent,
-      cwd: realpathSync(command.cwd), profile: realpathSync(this.options.profile) };
+      cwd: realpathSync(command.cwd), profile: realpathSync(this.options.profile), surface: this.options.surface ?? 'terminal' };
     if (command.type === 'resume' && command.state.provider !== 'orca') throw new Error('Cannot resume another provider');
     const state = this.store!.initialize(identity);
     this.state = state;
+    if (state.surface === 'terminal') this.terminal = new OrcaTerminalSession(this.options.runtime, this.store!, this.options.pollMs);
     if (command.type === 'resume' && command.state.agentThreadId && command.state.agentThreadId !== state.sessionId) {
       throw new Error('Orca conversation identity differs from the Botmux record');
     }
@@ -115,7 +122,7 @@ export class OrcaRunner {
         && state.generation === command.state.generation + 1;
       if (!state.closed && !retry) throw new Error('Cannot rebuild an Orca session whose close was not confirmed');
     } else if (state.closed) throw new Error('Orca session is closed; reopen it explicitly');
-    await this.session!.open(state, command);
+    await (this.terminal ?? this.session!).open(state, command);
     if (rebuild && state.closed) {
       state.rebuiltFromGeneration = command.state.generation;
       state.generation = command.state.generation + 1;
@@ -138,19 +145,24 @@ export class OrcaRunner {
   }
 
   private async turn(command: Extract<RemoteRunnerCommand, { type: 'turn' }>): Promise<void> {
-    if (!this.state?.sessionId || this.state.closed || this.detached || this.polling) throw new Error('Orca session is not ready');
+    if ((!this.state?.sessionId && !this.state?.terminal) || this.state.closed || this.detached || this.polling) throw new Error('Orca session is not ready');
     if (this.state.pending && !this.settled(this.state.pending)) throw new Error('Resolve the previous Orca turn before sending another');
-    const page = await this.session!.history(this.state);
-    if (page.working) throw new Error('This Orca conversation is busy; wait for its current turn');
-    // The host serializes the final check with Send. If a desktop turn races our
-    // idle probe, queue rather than steer into it. Old hosts reject this strict field.
-    const request = orcaMutation('agentSession.send', this.state.sessionId, page.fence!, {
-      body: orcaMessage(command.content), delivery: 'queue-if-active',
-    });
-    const pending: OrcaPendingTurn = {
-      turnId: command.turnId, dispatchAttempt: command.dispatchAttempt,
-      startedAtMs: Date.now(), cursor: page.liveCursor || page.window.nextCursor, request,
-    };
+    let pending: OrcaPendingTurn;
+    const identity = { turnId: command.turnId, dispatchAttempt: command.dispatchAttempt, startedAtMs: Date.now() };
+    if (this.terminal) {
+      pending = { ...identity, ...await this.terminal.prepare(this.state, command.content) };
+    } else {
+      const page = await this.session!.history(this.state);
+      if (page.working) throw new Error('This Orca conversation is busy; wait for its current turn');
+      // The host serializes the final check with Send. If a desktop turn races our
+      // idle probe, queue rather than steer into it. Old hosts reject this strict field.
+      const request = orcaMutation('agentSession.send', this.state.sessionId!, page.fence!, {
+        body: orcaMessage(command.content), delivery: 'queue-if-active',
+      });
+      pending = {
+        ...identity, cursor: page.liveCursor || page.window.nextCursor, request,
+      };
+    }
     this.state.pending = pending;
     this.store!.save(this.state);
     this.status(command.requestId, 'busy');
@@ -167,6 +179,15 @@ export class OrcaRunner {
 
   private async runTurn(pending: OrcaPendingTurn): Promise<void> {
     if (pending.completed) { this.finish(pending); return; }
+    if (!('request' in pending)) {
+      if (!this.terminal) throw new Error('Orca terminal turn cannot run in Chat mode');
+      const completed = await this.terminal.run(this.state!, pending, {
+        stopped: () => this.disposed || this.closing || !!this.state!.closed,
+        progress: content => this.emit({ type: 'progress', turnId: pending.turnId, content }),
+      });
+      if (completed) { pending.completed = completed; this.store!.save(this.state!); this.finish(pending); }
+      return;
+    }
     // Replaying this exact operation also resolves a send whose response was lost; never mint a replacement ID.
     const sent = await this.options.runtime.call<{ ok: boolean; value?: { queued?: { messageId: string } }; refusal?: { code?: string; message?: string } }>('agentSession.send', pending.request);
     if (!sent.ok) {
@@ -217,7 +238,7 @@ export class OrcaRunner {
     } else {
       pending.delivery = 'prepared';
       this.store!.save(this.state!);
-      this.emit({ type: 'outbound_message', operationId: pending.request.envelope.clientOperationId,
+      this.emit({ type: 'outbound_message', operationId: orcaTurnOperationId(pending),
         turnId: pending.turnId, generation: this.state!.generation,
         content: orcaReplyContent(pending.completed!.content),
         responseKind: 'final', mention: 'requester' });
@@ -227,7 +248,7 @@ export class OrcaRunner {
   private deliveryResult(command: Extract<RemoteRunnerCommand, { type: 'outbound_message_result' }>): void {
     const pending = this.state?.pending;
     if (!pending || command.turnId !== pending.turnId || command.generation !== this.state!.generation
-        || command.operationId !== pending.request.envelope.clientOperationId || pending.delivery !== 'prepared') {
+        || command.operationId !== orcaTurnOperationId(pending) || pending.delivery !== 'prepared') {
       throw new Error('Orca delivery receipt does not match the pending reply');
     }
     pending.delivery = command.result.outcome;
@@ -239,22 +260,28 @@ export class OrcaRunner {
   }
 
   private async close(requestId: string): Promise<void> {
-    if (!this.state?.sessionId) throw new Error('Orca session has not been created');
+    if (!this.state?.sessionId && !this.state?.terminal) throw new Error('Orca session has not been created');
     this.closing = true;
     try {
       if (this.polling) await this.polling;
-      let page = await this.session!.history(this.state);
-      requireOrcaMutation(await this.options.runtime.call('agentSession.cancel',
-        orcaMutation('agentSession.cancel', this.state.sessionId, page.fence!, {})));
-      page = await this.session!.history(this.state);
-      const messageId = this.state.pending?.request.envelope.clientOperationId;
-      if (messageId && page.queuedMessages?.some(q => q.messageId === messageId)) {
-        requireOrcaMutation(await this.options.runtime.call('agentSession.queuedMessageDelete',
-          orcaMutation('agentSession.queuedMessageDelete', this.state.sessionId, page.fence!, { messageId })));
+      if (this.terminal) {
+        await this.terminal.close(this.state);
+      } else {
+        let page = await this.session!.history(this.state);
+        requireOrcaMutation(await this.options.runtime.call('agentSession.cancel',
+          orcaMutation('agentSession.cancel', this.state.sessionId!, page.fence!, {})));
+        page = await this.session!.history(this.state);
+        const messageId = this.state.pending ? orcaTurnOperationId(this.state.pending) : undefined;
+        if (messageId && page.queuedMessages?.some(q => q.messageId === messageId)) {
+          requireOrcaMutation(await this.options.runtime.call('agentSession.queuedMessageDelete',
+            orcaMutation('agentSession.queuedMessageDelete', this.state.sessionId!, page.fence!, { messageId })));
+        }
+        await this.session!.close(this.state);
       }
-      await this.session!.close(this.state);
       this.state.closed = true;
       delete this.state.pending;
+      delete this.state.reopenOperationId;
+      delete this.state.reopenArgs;
       this.store!.save(this.state);
       this.status(requestId, 'closed');
     } finally { this.closing = false; }

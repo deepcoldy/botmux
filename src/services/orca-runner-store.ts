@@ -3,21 +3,48 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { withFileLock } from '../utils/file-lock.js';
 import { orcaOperationId, type OrcaCursor, type OrcaMutation } from './orca-session-protocol.js';
+import type { OrcaSurface } from '../core/orca-support.js';
 
 export type OrcaAgent = 'codex' | 'claude';
-export interface OrcaPendingTurn {
+interface PendingTurn {
   turnId: string;
   dispatchAttempt?: number;
   startedAtMs: number;
-  cursor: OrcaCursor;
-  request: OrcaMutation;
   completed?: { content: string; failed?: string };
   delivery?: 'prepared' | 'delivered' | 'rejected' | 'unknown';
+}
+export interface OrcaChatTurn extends PendingTurn {
+  cursor: OrcaCursor;
+  request: OrcaMutation;
+}
+export interface OrcaTerminalTurn extends PendingTurn {
+  operationId: string;
+  content: string;
+  baselineMessageId?: string;
+  baselineTurnId?: string;
+  inputPhase?: 'paste-attempted' | 'paste-confirmed' | 'submit-attempted';
+}
+export type OrcaPendingTurn = OrcaChatTurn | OrcaTerminalTurn;
+export function orcaTurnOperationId(turn: OrcaPendingTurn): string {
+  return 'request' in turn ? turn.request.envelope.clientOperationId : turn.operationId;
+}
+
+export interface OrcaTerminalIdentity {
+  handle: string;
+  ptyId: string;
+  incarnationId: string;
+  tabId: string;
+  leafId: string;
+  launchOperationId: string;
+  transcriptPath?: string;
+  providerConfirmed?: boolean;
 }
 export interface OrcaRunnerState {
   version: 1;
   botmuxSessionId: string;
   agent: OrcaAgent;
+  /** Absent in the first Chat-only release; never reinterpret it as Terminal. */
+  surface?: OrcaSurface;
   cwd: string;
   profile: string;
   generation: number;
@@ -25,6 +52,9 @@ export interface OrcaRunnerState {
   launchOptions?: Record<string, string>;
   sessionId?: string;
   worktreeId?: string;
+  terminal?: OrcaTerminalIdentity;
+  reopenOperationId?: string;
+  reopenArgs?: string;
   pending?: OrcaPendingTurn;
   closed?: boolean;
   rebuiltFromGeneration?: number;
@@ -48,8 +78,12 @@ export class OrcaRunnerStore {
     const state = JSON.parse(text) as OrcaRunnerState;
     if (state.version !== 1 || !state.launchOperationId || !state.botmuxSessionId
         || !['codex', 'claude'].includes(state.agent) || !state.cwd || !state.profile
-        || !Number.isSafeInteger(state.generation) || state.generation < 1) {
+        || !Number.isSafeInteger(state.generation) || state.generation < 1
+        || (state.surface !== undefined && !['chat', 'terminal'].includes(state.surface))) {
       throw new Error('Invalid Orca runner state; refusing to create a replacement conversation');
+    }
+    if (state.pending && ((state.surface === 'terminal') === ('request' in state.pending))) {
+      throw new Error('Orca turn mode differs from its saved conversation');
     }
     return state;
   }
@@ -63,7 +97,7 @@ export class OrcaRunnerStore {
   /** Hold the existing process-aware lock through the runner lifetime; a second owner fails closed. */
   async own<T>(run: () => Promise<T>): Promise<T> { return withFileLock(this.path, run); }
 
-  initialize(identity: Pick<OrcaRunnerState, 'botmuxSessionId' | 'agent' | 'cwd' | 'profile'>): OrcaRunnerState {
+  initialize(identity: Pick<OrcaRunnerState, 'botmuxSessionId' | 'agent' | 'cwd' | 'profile' | 'surface'>): OrcaRunnerState {
     const saved = this.load();
     if (saved) {
       for (const key of ['botmuxSessionId', 'agent', 'cwd', 'profile'] as const) {
@@ -71,7 +105,8 @@ export class OrcaRunnerStore {
       }
       return saved;
     }
-    const state: OrcaRunnerState = { ...identity, version: 1, generation: 1, launchOperationId: orcaOperationId() };
+    const state: OrcaRunnerState = { ...identity, surface: identity.surface ?? 'terminal',
+      version: 1, generation: 1, launchOperationId: orcaOperationId() };
     this.save(state);
     return state;
   }

@@ -89,8 +89,8 @@ function fixture(autoAck = true) {
   const runtime = new Runtime(cwd);
   const events: any[] = [];
   const listeners = new Set<(event: any) => void>();
-  const create = (profile = root) => {
-    const runner = new OrcaRunner({ agent: 'codex', profile, dataDir: root, runtime, pollMs: 5,
+  const create = (profile = root, surface: 'chat' | 'terminal' | 'default' = 'chat') => {
+    const runner = new OrcaRunner({ agent: 'codex', ...(surface === 'default' ? {} : { surface }), profile, dataDir: root, runtime, pollMs: 5,
       emit: event => {
         events.push(event); for (const f of listeners) f(event);
         if (event.type === 'outbound_message' && autoAck) queueMicrotask(() => void runner.handle(remoteRunnerCommand('outbound_message_result', {
@@ -114,6 +114,18 @@ function fixture(autoAck = true) {
 }
 
 describe('managed Orca conversations', () => {
+  it('recovers a legacy Chat pending turn through the new default Terminal entry', async () => {
+    const f = fixture(); const first = f.create(); f.runtime.finished = false;
+    await f.start(first); await f.turn(first); await first.dispose();
+    const state = f.events.filter(e => e.type === 'lineage_changed').at(-1).state;
+    const store = new OrcaRunnerStore(f.root, 'bot-session'); const saved = store.load()!;
+    delete saved.surface; store.save(saved); f.runtime.finished = true;
+    const final = f.wait('final'); await f.resume(f.create(f.root, 'default'), state);
+    expect(await final).toMatchObject({ state: { agentThreadId: 'native-session', providerState: { surface: 'chat' } } });
+    expect(f.runtime.launches.size).toBe(1);
+    expect(f.runtime.sends.size).toBe(1);
+    expect(f.runtime.calls.some(c => c.method.startsWith('terminal.'))).toBe(false);
+  });
   it('releases ownership when disposed during startup without launching a conversation', async () => {
     const f = fixture(); const runner = f.create();
     const opening = f.start(runner);

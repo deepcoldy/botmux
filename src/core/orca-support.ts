@@ -1,5 +1,14 @@
-export function isOrcaCliId(id: string | undefined): id is 'orca-codex' | 'orca-claude' {
-  return id === 'orca-codex' || id === 'orca-claude';
+export const ORCA_SELECTIONS = {
+  'orca-codex': { agent: 'codex', surface: 'terminal' },
+  'orca-claude': { agent: 'claude', surface: 'terminal' },
+  'orca-codex-chat': { agent: 'codex', surface: 'chat' },
+  'orca-claude-chat': { agent: 'claude', surface: 'chat' },
+} as const;
+export type OrcaCliId = keyof typeof ORCA_SELECTIONS;
+export type OrcaSurface = 'terminal' | 'chat';
+
+export function isOrcaCliId(id: string | undefined): id is OrcaCliId {
+  return id !== undefined && Object.hasOwn(ORCA_SELECTIONS, id);
 }
 
 /** Orca owns its Agent's identity/environment. Never claim Botmux isolated a process it did not spawn. */
