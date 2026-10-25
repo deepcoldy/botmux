@@ -136,7 +136,7 @@ function runWorkerWiring(late: boolean, options: {
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
-    publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
+    publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
   // The REAL layer walk, probing the same synthetic process table.

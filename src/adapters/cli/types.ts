@@ -720,6 +720,30 @@ export interface CliAdapter {
    *  approves `agy`'s blocking permission dialog. */
   readonly supportsTypeAhead?: boolean;
 
+  /** Terminal key that interrupts the CLI's CURRENT turn without exiting it.
+   *  Defaults to `ctrlc`. Override only where Ctrl+C is an exit gesture:
+   *  ZCode quits the whole CLI on a single Ctrl+C even mid-turn (verified on
+   *  0.16.9), while Escape is its documented interrupt key — the busy footer
+   *  literally reads `esc to interrupt`. Without this, the card's Stop button
+   *  kills the session instead of cancelling the turn. */
+  readonly interruptKey?: 'ctrlc' | 'esc';
+
+  /** When true, a NEW user message arriving while this CLI is busy preempts the
+   *  running turn: the adapter's `interruptKey` is delivered first, the
+   *  superseded turn is settled as `cancelled`, and only then does the new
+   *  message run.
+   *
+   *  Opt in only for CLIs whose busy state has NO usable steer channel. ZCode
+   *  parks a mid-turn submit in its own queue panel and never drains it — the
+   *  user's instruction is silently dropped — so waiting for the turn to end is
+   *  not merely slow, it is a lost message. This flag is the opposite trade-off
+   *  from `supportsTypeAhead`: interrupt-and-replace instead of park-and-merge.
+   *
+   *  The worker only applies it to genuine user IM turns (never to internal
+   *  notifications, replays, or `queueAfterActiveTurn` inputs) and only when the
+   *  CLI is positively observed busy. */
+  readonly preemptsOnNewMessage?: boolean;
+
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible
    *  transcript). When true and the per-bot `envelopeInjection` setting is
@@ -1074,7 +1098,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。
@@ -1087,7 +1111,6 @@ export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex
 export function isCodexAppCliId(cliId: string | null | undefined): cliId is 'codex-app' {
   return cliId === 'codex-app';
 }
-
 /** Codex 家族（官方 codex TUI 与 Codex App runner 共用同一份 rollout / CODEX_HOME / service tier 语义）。 */
 export function isCodexFamilyCliId(cliId: string | null | undefined): cliId is 'codex' | 'codex-app' {
   return cliId === 'codex' || cliId === 'codex-app';

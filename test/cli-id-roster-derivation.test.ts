@@ -75,6 +75,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       codem: 'none',
       // MiniMax Code loads native skills from its persistent data directory.
       minimax: 'global',
+      zcode: 'global',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes

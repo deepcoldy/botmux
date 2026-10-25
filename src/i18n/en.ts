@@ -92,6 +92,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
+  'worker.zcode.progress_notice': '⏳ Still working — {minutes} minutes so far (long reasoning or tool runs are normal). Open the Web terminal from the card to watch live progress; this session will not be restarted or replayed automatically.',
   'worker.codex_app.no_progress': '⚠️ This Codex App turn has shown no observable progress for {seconds} seconds. It may still be running; check the web terminal and, if needed, restart only this session. Botmux will not restart or replay the task automatically.',
   'card.status.failed': 'Failed',
   'card.status.session_closed': '🛑 Session Closed',
@@ -803,6 +804,7 @@ export const messages: Record<string, string> = {
   'cmd.config.card_dmd': '⚙️ Config card sent to your DM (only you can see it) → open our 1:1 chat to view / edit.',
   'card.config.title': '⚙️ {name} · config',
   'card.config.summary': '🤖 CLI **{cli}**　·　🧠 model **{model}**　·　🌐 lang **{lang}**　·　👤 admins **{admins}**',
+  'card.config.effort': 'Reasoning',
   'card.config.default': 'default',
   'card.config.sec.runtime': '🧠 Runtime',
   'card.config.sec.card': '🎴 Card behavior',
@@ -1153,7 +1155,9 @@ export const messages: Record<string, string> = {
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
-  'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] placeholders in the body.',
+  'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] / [video N] placeholders in the body.',
+  'ai.attach.videoHint': 'The video is saved locally. Prefer Read or the current CLI media-reading tool to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
+  'ai.attach.videoHintKimi': 'The video is saved locally. Prefer ReadMediaFile to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
   'ai.identity.short_routing': 'Reminder: communicating or collaborating with another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
@@ -1173,6 +1177,7 @@ export const messages: Record<string, string> = {
   // task; when it completes Cursor injects a synthetic user prompt ("Briefly
   // inform the user about the task result…") and starts a new turn. That is not
   // a Lark message and botmux cannot intercept it (#1504) — prompt-level only.
+  'ai.zcode.progress_report': 'Long tasks need interim progress, not a single reply at the very end. Send a one-or-two-sentence `botmux send` update (what you are doing, what is next, whether you are blocked) whenever any of these is true: a visible phase just finished (code written / tests finished / files edited); about 3–5 minutes have passed since your last update; or you are about to run more than two long tool calls in a row. Do not paste large logs. The user is waiting and silence reads as a hang.',
   'ai.cursor.background_task_note': 'Cursor turns a shell command that outlives its wait limit into a background task; when it completes, Cursor injects a synthetic prompt like "Briefly inform the user about the task result and perform any follow-up actions" and starts a new turn — that is NOT a new message from the Lark user. When you receive it: if the result is already covered by an earlier reply or carries nothing new for the user, do not `botmux send` again — make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`; only send one progress message when the result is genuinely new information (e.g. the final verdict of a build/test). Prefer waiting for commands synchronously (raise the wait limit as needed) instead of letting them fall into the background.',
   'ai.cursor.background_task_note_transcript': 'Cursor turns a shell command that outlives its wait limit into a background task; when it completes, Cursor injects a synthetic prompt like "Briefly inform the user about the task result and perform any follow-up actions" and starts a new turn — that is NOT a new message from the Lark user. When you receive it: if the result is already covered by an earlier reply or carries nothing new for the user, make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`; only answer briefly when the result is genuinely new information (e.g. the final verdict of a build/test). Prefer waiting for commands synchronously (raise the wait limit as needed) instead of letting them fall into the background.',
   'ai.bridge.attachments_label': '[Attachments]',

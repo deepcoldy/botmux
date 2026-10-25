@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
@@ -51,6 +52,7 @@ import {
   cliModelSupportsReasoningEffort,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
+  reasoningEffortsForCliModel,
 } from './codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
@@ -1224,6 +1226,11 @@ export interface ConfigCardData {
   cliOptions: Array<{ id: string; label: string }>;
   model: string | null;
   modelChoices: string[];
+  /** Reasoning levels offered when this bot's CLI supports the control. */
+  reasoningEfforts?: string[];
+  /** Currently configured reasoning effort (null = CLI/model default). */
+  reasoningEffort?: string | null;
+  modelChoiceLabels?: Record<string, string>;
   lang: string | null;
   /** 私聊单聊模式 p2pMode（'chat' | 'thread' | 'group'）；null = 未设（默认 chat）。 */
   p2pMode: string | null;
@@ -1248,13 +1255,28 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   try { bot = getBot(larkAppId); } catch { return null; }
   const cfg = bot.config;
   const q = cfg.messageQuota?.defaultLimit;
+  let selectedModel = cfg.model ?? null;
+  const zcodeEnv = { ...process.env, ...cfg.env };
+  const modelChoiceLabels = cfg.cliId === 'zcode'
+    // Same model name behind two gateways must stay distinguishable in the card.
+    ? Object.fromEntries(modelChoices.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
+  if (cfg.cliId === 'zcode' && selectedModel) {
+    try { const ref = resolveZcodeModelReference(selectedModel, { ...process.env, ...cfg.env }); selectedModel = `${ref.providerId}/${ref.modelId}`; } catch { /* stale selections remain visible */ }
+  }
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
     cliId: selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode),
     cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
-    model: cfg.model ?? null,
+    model: selectedModel,
+    ...(modelChoiceLabels ? { modelChoiceLabels } : {}),
     modelChoices: [...modelChoices],
+    ...(isConfigurableReasoningCliId(cfg.cliId)
+      ? {
+        reasoningEfforts: [...reasoningEffortsForCliModel(cfg.cliId, cfg.model)],
+        reasoningEffort: isCodexReasoningEffort(cfg.reasoningEffort) ? cfg.reasoningEffort : null,
+      }
+      : {}),
     lang: cfg.lang ?? null,
     p2pMode: cfg.p2pMode ?? null,
     brandLabel: cfg.brandLabel ?? null,

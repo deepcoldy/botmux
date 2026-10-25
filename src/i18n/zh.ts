@@ -95,6 +95,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
+  'worker.zcode.progress_notice': '⏳ 已连续工作 {minutes} 分钟，仍在进行中（长时间推理或工具执行都属正常）。可在卡片上打开 Web 终端查看实时进度；本会话不会被自动重启或重放。',
   'worker.codex_app.no_progress': '⚠️ Codex App 此轮已连续 {seconds} 秒没有可观察进展。任务可能仍在运行；请检查 Web 终端，必要时仅重启当前会话。Botmux 不会自动重启或重放任务。',
   'card.status.failed': '提交失败',
   'card.status.session_closed': '🛑 会话已关闭',
@@ -800,6 +801,7 @@ export const messages: Record<string, string> = {
   'cmd.config.card_dmd': '⚙️ 配置卡片已私信给你（仅你可见）→ 去和我的私聊里查看 / 操作。',
   'card.config.title': '⚙️ {name} · 配置',
   'card.config.summary': '🤖 CLI **{cli}**　·　🧠 model **{model}**　·　🌐 lang **{lang}**　·　👤 管理员 **{admins}**',
+  'card.config.effort': '思考强度',
   'card.config.default': '默认',
   'card.config.sec.runtime': '🧠 运行',
   'card.config.sec.card': '🎴 卡片行为',
@@ -1150,7 +1152,9 @@ export const messages: Record<string, string> = {
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
-  'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应',
+  'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] / [视频 N] 占位符对应',
+  'ai.attach.videoHint': '视频已保存到本地。优先用 Read 或当前 CLI 的媒体读取工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
+  'ai.attach.videoHintKimi': '视频已保存到本地。优先用 ReadMediaFile 工具读取视频，让支持视频输入的模型理解完整时序；工具或模型不支持时，可按任务需要抽帧或转写，并说明所用方式。',
   'ai.identity.short_routing': '提醒：要跟别的 bot 沟通或协作必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。',
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
@@ -1167,6 +1171,7 @@ export const messages: Record<string, string> = {
   // Cursor 会把超过等待时限的 shell 命令转成后台任务，任务完成后由 Cursor 自动注入一条
   // 合成 user 提示（"Briefly inform the user about the task result…"）再开一轮——它不是
   // 飞书消息，botmux 拦不到（#1504）。只能在提示层告诉模型别把它当成新消息去 send。
+  'ai.zcode.progress_report': '长时间任务要中途汇报，不要等全部做完才回一次。满足任一条件就发一条一两句话的进展（正在做什么、下一步、是否卡住）：完成了一个明显阶段（代码写完/测试跑完/文件改完）；或距上次汇报已过约 3–5 分钟；或你要连续执行超过两次长工具调用。用 `botmux send` 发，不要贴大段日志。用户在等，沉默会被当成卡死。',
   'ai.cursor.background_task_note': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，不要再 botmux send，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才发一条 progress。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
   'ai.cursor.background_task_note_transcript': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才简短作答。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
   'ai.bridge.attachments_label': '[附件]',

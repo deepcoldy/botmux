@@ -22,6 +22,8 @@ import {
 } from '../services/claude-transcript.js';
 import { __resetCodexCompactionCountForTest, readCodexCompactionCount } from '../services/codex-compaction-count.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readZcodeUsage } from '../services/zcode-usage.js';
+import { readZcodeSessionMarker } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
@@ -1347,6 +1349,42 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
 }
 
 function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
+  if (q.cliId === 'zcode') {
+    // ZCode keeps no transcript botmux can parse; its own `model_usage` ledger
+    // is the source of truth. The native id is persisted on the session after
+    // the first turn, and read back from the hook marker until then.
+    const native = q.cliSessionId || readZcodeSessionMarker(q.sessionId)?.cliSessionId;
+    if (!native) return null;
+    const usage = readZcodeUsage(native);
+    if (!usage) return null;
+    const agg = newTokenUsageAggregate();
+    agg.inputTokens = usage.inputTokens;
+    agg.outputTokens = usage.outputTokens;
+    agg.cacheReadTokens = usage.cacheReadTokens;
+    agg.cacheCreateTokens = usage.cacheCreateTokens;
+    agg.turns = usage.turns;
+    agg.turnInputTokens = usage.turnInputTokens;
+    agg.turnOutputTokens = usage.turnOutputTokens;
+    if (usage.modelId) agg.model = usage.modelId;
+    if (usage.reasoningLevel) agg.reasoningEffort = usage.reasoningLevel;
+    // A request that failed is already excluded; the newest successful prompt
+    // size is the live context gauge. When the provider reported no token
+    // counts at all, omit context entirely — a `0/1M (0%)` reading would claim
+    // a measurement the CLI never made (the card then shows model/level only).
+    if (usage.hasTokenEvidence) {
+      const percentUsed = usage.contextWindow && usage.contextWindow > 0
+        ? Math.round(Math.max(0, Math.min(1, usage.contextUsed / usage.contextWindow)) * 100)
+        : undefined;
+      agg.latestContextUsage = {
+        usedTokens: usage.contextUsed,
+        ...(usage.contextWindow ? { windowTokens: usage.contextWindow } : {}),
+        ...(percentUsed !== undefined ? { percentUsed } : {}),
+      };
+    }
+    // `result` stays null: ZCode has no pricing entry and botmux does not write
+    // a cost ledger for it, so only context + this-turn deltas reach the card.
+    return { agg, result: null };
+  }
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
     const checkpointPath = cachedTranscriptPathLookup(
@@ -1503,8 +1541,8 @@ function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult 
     // Grok exposes a stable user-facing primaryModelId in signals.json.
     // Keep other CLIs unchanged: Relay-family transcript model strings may
     // be internal routing codes and intentionally never surface on cards.
-    ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
-    ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.model ? { model: agg.model } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }
