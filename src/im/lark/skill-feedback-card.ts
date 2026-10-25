@@ -19,7 +19,7 @@ function button(text: string, style: string, value: Record<string, unknown>, dis
 export function buildFeedbackElement(policy: FeedbackPolicy, state: FeedbackCardState = {}): Record<string, unknown> {
   const locked = !!state.result && !policy.allowReselect;
   return {
-    tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'none', horizontal_spacing: 'small',
+    tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'flow', horizontal_spacing: 'small',
     columns: policy.buttons.map(option => ({
       tag: 'column', width: 'auto', elements: [
         button(option.label, option.style, versionedValue(state, { action: 'feedback_submit', result: option.key }), locked),
@@ -38,7 +38,7 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
   }
   if (policy.negativeFollowup.reasons.length > 0) {
     elements.push({
-      tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'none', horizontal_spacing: 'small',
+      tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'flow', horizontal_spacing: 'small',
       columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', versionedValue(state, { action: 'feedback_reason', reason_key: reason.key }))] })),
     });
   }

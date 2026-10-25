@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildCanonicalFinalReplyCard, buildMarkdownCard } from '../src/im/lark/md-card.js';
+import { buildCanonicalFinalReplyCard, buildContextualReplyCard, buildMarkdownCard } from '../src/im/lark/md-card.js';
 import { renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import MarkdownIt from 'markdown-it';
@@ -13,6 +13,69 @@ const baseCard = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'final answ
 function visible(card: unknown): string { return JSON.stringify(card); }
 
 describe('final answer feedback card state machine', () => {
+  it.each(['canonical', 'contextual'])('uses content-sized flow columns for configured feedback labels in %s replies', kind => {
+    const customPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      buttons: policy.buttons.map(option => ({ ...option, label: `${option.label}，这是较长的自定义反馈文案` })),
+    });
+    const feedback = { policy: customPolicy };
+    const card = JSON.parse(kind === 'canonical'
+      ? buildCanonicalFinalReplyCard({ markdown: 'answer', feedback })
+      : buildContextualReplyCard({ title: 'reply', assistantText: 'answer', assistantLabel: 'assistant', feedback }));
+    const row = card.body.elements.find((element: any) => element.element_id === 'botmux_feedback');
+    expect(row).toMatchObject({ tag: 'column_set', flex_mode: 'flow' });
+    expect(row.columns).toHaveLength(customPolicy.buttons.length);
+    for (const [index, option] of customPolicy.buttons.entries()) {
+      expect(row.columns[index]).toMatchObject({
+        tag: 'column', width: 'auto',
+        elements: [{
+          tag: 'button', text: { content: option.label }, type: option.style, disabled: false,
+          behaviors: [{ type: 'callback', value: { action: 'feedback_submit', result: option.key } }],
+        }],
+      });
+    }
+  });
+
+  it.each([false, true])('retains flow layout through negative feedback updates with allowReselect=%s', allowReselect => {
+    const customPolicy = normalizeFeedbackPolicy({
+      enabled: true, allowReselect,
+      negativeFollowup: { reasons: [
+        { key: 'missing_context', label: '缺少必要的背景信息和上下文' },
+        { key: 'not_actionable', label: '建议暂时无法直接执行' },
+        { key: 'wrong_conclusion', label: '结论与实际情况不一致' },
+      ] },
+    });
+    const negative = customPolicy.buttons.find(option => option.semantic === 'negative')!;
+    const selectedReason = customPolicy.negativeFollowup.reasons[1];
+    const state = { feedbackId: 'fb_flow', result: negative.key, reasonKey: selectedReason.key };
+    const expanded = renderFeedbackCard(baseCard, customPolicy, state);
+    const updated: any = renderFeedbackCard(expanded, customPolicy, { ...state, comment: 'details' });
+    for (const card of [expanded, updated] as any[]) {
+      const row = card.body.elements.find((element: any) => element.element_id === 'botmux_feedback');
+      expect(row.flex_mode).toBe('flow');
+      for (const column of row.columns) {
+        expect(column.width).toBe('auto');
+        expect(column.elements[0].disabled).toBe(!allowReselect);
+      }
+      const reasons = card.body.elements.find((element: any) => element.element_id === 'botmux_feedback_reasons');
+      expect(reasons).toMatchObject({ tag: 'column_set', flex_mode: 'flow' });
+      expect(reasons.columns).toHaveLength(customPolicy.negativeFollowup.reasons.length);
+      for (const [index, reason] of customPolicy.negativeFollowup.reasons.entries()) {
+        const selected = reason.key === selectedReason.key;
+        expect(reasons.columns[index]).toMatchObject({
+          tag: 'column', width: 'auto',
+          elements: [{
+            text: { content: selected ? `✓ ${reason.label}` : reason.label },
+            type: selected ? 'primary' : 'default',
+            behaviors: [{ type: 'callback', value: {
+              action: 'feedback_reason', reason_key: reason.key, expected_feedback_id: state.feedbackId,
+            } }],
+          }],
+        });
+      }
+    }
+  });
+
   it('renders configured initial actions before the footer without internal levels', () => {
     expect(visible(baseCard)).toContain('结论可用');
     expect(visible(baseCard)).toContain('有效推进');
