@@ -17,6 +17,7 @@
  *   pendingRepo 阶段发起人放行）；门本身的判定流程仍在 card-handler.ts。
  */
 import { localeForBot, type Locale } from '../../i18n/index.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
 import type { CardActionData, CardHandlerDeps } from './card-handler.js';
 import {
   handleV3GateAction,
@@ -222,6 +223,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['restart', NO_META],
   ['close', NO_META],
   ['resume', NO_META],
+  // 会话关闭卡「清理 worktree」（#698）：删目录前还会在 handler 里按会话所在群复核一次。
+  [CLEANUP_SESSION_WORKTREE_ACTION, { denyToastKey: 'card.worktree_cleanup.no_permission' }],
   ['skip_repo', { pendingRepoOwnerException: true }],
   ['repo_manual_submit', { pendingRepoOwnerException: true }],
   ['repo_worktree_submit', { pendingRepoOwnerException: true }],

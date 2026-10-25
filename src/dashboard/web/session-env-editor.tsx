@@ -10,7 +10,7 @@ import { useT } from './react-hooks.js';
 
 /**
  * 「会话环境变量」编辑器（core/session-env.ts）：全局层放在「设置」，Bot 层放在
- * 「Bot 配置 → 运行环境」，同一个组件。表格里的值都是服务端打码后的；👁 单独请求
+ * 「Bot 配置 → 高级 → 启动环境」，同一个组件。表格里的值都是服务端打码后的；👁 单独请求
  * 一个变量的原文（只有本机 owner 有权限，canReveal）。
  */
 
@@ -307,7 +307,7 @@ function TmuxServers(props: { servers: TmuxServerView[]; sessions: SessionInfo[]
       {props.servers.map(server => {
         const running = props.sessions.filter(s => s.tmuxSocket !== undefined && (s.tmuxSocket ?? null) === server.socket).length;
         return (
-          <details key={server.socket ?? 'default'} className="se-tmux-server" open={server.managed}>
+          <details key={server.socket ?? 'default'} className="se-tmux-server">
             <summary>
               <code>{server.socket === null ? 'tmux' : `tmux -L ${server.socket}`}</code>
               {' '}{server.socket === null ? tr('sessionEnv.tmuxDefaultServer') : tr('sessionEnv.tmuxManagedSocket')}
@@ -356,7 +356,8 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
   const [status, setStatus] = useState<{ text: string; ok?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState('');
-  const [onlyChanged, setOnlyChanged] = useState(false);
+  // 默认只露出本层自己设置 / 去掉的条目；其余继承来的（宿主基线，Bot 页上还有全局层的改动）折成一行。
+  const [showInherited, setShowInherited] = useState(false);
   const [draft, setDraft] = useState<EditDraft | null>(null);
   const [pasting, setPasting] = useState(false);
   const [live, setLive] = useState<SessionInfo | null>(null);
@@ -369,7 +370,7 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
     } catch (e: any) { setLoadError(e?.message ?? String(e)); }
   }, [url, tr]);
 
-  useEffect(() => { setView(null); setStatus(null); setDraft(null); void load(); }, [load]);
+  useEffect(() => { setView(null); setStatus(null); setDraft(null); setShowInherited(false); void load(); }, [load]);
 
   async function apply(ops: EnvOp[]): Promise<boolean> {
     setBusy(true);
@@ -390,15 +391,78 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
   const layer = scope.kind;
   const canReveal = view?.canReveal === true;
   const revealUrl = (key: string) => `${url}/reveal?key=${encodeURIComponent(key)}`;
-  const rows = useMemo(() => {
-    const needle = filter.trim().toUpperCase();
-    return (view?.rows ?? []).filter(r => (!needle || r.key.toUpperCase().includes(needle)) && (!onlyChanged || r.state !== 'inherited'));
-  }, [view, filter, onlyChanged]);
+  const needle = filter.trim().toUpperCase();
+  const { ownRows, inheritedRows, lowerChanged } = useMemo(() => {
+    const matched = (view?.rows ?? []).filter(r => !needle || r.key.toUpperCase().includes(needle));
+    const inherited = matched.filter(r => !r.entry);
+    // 下层（Bot 页上的全局层）设置 / 去掉的排在折叠组前面，展开后先看到。
+    const lower = inherited.filter(r => r.state !== 'inherited');
+    return { ownRows: matched.filter(r => !!r.entry), inheritedRows: [...lower, ...inherited.filter(r => r.state === 'inherited')], lowerChanged: lower.length };
+  }, [view, needle]);
+  // 搜索时继承的变量照样参与匹配并直接列出，找变量不用先展开。
+  const inheritedOpen = showInherited || !!needle;
+  const foldLabel = inheritedOpen
+    ? (lowerChanged ? 'sessionEnv.inheritedHideGlobal' : 'sessionEnv.inheritedHide')
+    : (lowerChanged ? 'sessionEnv.inheritedShowGlobal' : 'sessionEnv.inheritedShow');
 
   if (loadError) return <p className="is-error" data-session-env-error="">{loadError}</p>;
   if (!view) return <p className="muted">{tr('sessionEnv.loading')}</p>;
 
   const shellWrapped = scope.kind === 'global' || SHELL_WRAPPED_BACKENDS.has(view.backendType ?? '');
+  const renderRow = (row: SessionEnvRow) => {
+    const ownEntry = row.entry;
+    const lowerText = row.lower ? `${sourceLabel(tr, row.lower)}${row.lower.value !== undefined ? `: ${row.lower.value}` : ''}` : '';
+    return (
+      <tr key={row.key} data-env-row={row.key} data-env-source={row.source} data-env-state={row.state}>
+        <td><code>{row.key}</code></td>
+        <td>
+          <EnvValue
+            value={row.value}
+            masked={row.masked}
+            canReveal={canReveal}
+            struck={row.state === 'unset'}
+            reveal={() => fetchReveal(revealUrl(row.key))}
+          />
+          {row.state === 'unset' && <span className="se-note">{tr('sessionEnv.removedNote')}</span>}
+          {lowerText && row.state === 'set' && <span className="se-note is-lower" title={lowerText}>{tr('sessionEnv.overrides', { lower: lowerText })}</span>}
+        </td>
+        <td><span className={`se-badge is-${row.source}${row.state === 'unset' ? ' is-unset' : ''}`}>{sourceLabel(tr, row)}</span></td>
+        <td className="se-actions"><div className="se-actions-inner">
+          {ownEntry === 'set' && (
+            <button type="button" className="se-link" data-action="edit-session-env" disabled={busy}
+              onClick={() => setDraft({ op: 'set', key: row.key, value: row.masked ? '' : row.value ?? '', keyEditable: false })}>
+              {tr('sessionEnv.edit')}
+            </button>
+          )}
+          {ownEntry && (
+            <button type="button" className="se-link" data-action="reset-session-env" disabled={busy}
+              onClick={() => void apply([{ op: 'reset', key: row.key }])}>
+              {tr('sessionEnv.restore')}
+            </button>
+          )}
+          {!ownEntry && row.state !== 'unset' && (
+            <button type="button" className="se-link" data-action="override-session-env" disabled={busy}
+              onClick={() => setDraft({ op: 'set', key: row.key, value: row.masked ? '' : row.value ?? '', keyEditable: false })}>
+              {tr('sessionEnv.override')}
+            </button>
+          )}
+          {!ownEntry && row.state === 'unset' && (
+            <button type="button" className="se-link" data-action="override-session-env" disabled={busy}
+              onClick={() => setDraft({ op: 'set', key: row.key, value: '', keyEditable: false })}>
+              {tr('sessionEnv.setHere')}
+            </button>
+          )}
+          {ownEntry !== 'unset' && row.state !== 'unset' && row.lock !== 'no-unset' && (
+            <button type="button" className="se-link is-danger" data-action="remove-session-env" disabled={busy}
+              onClick={() => void apply([{ op: 'unset', key: row.key }])}>
+              {tr('sessionEnv.remove')}
+            </button>
+          )}
+        </div></td>
+      </tr>
+    );
+  };
+
   return (
     <div className="se-editor" data-session-env={layer}>
       {scope.kind === 'bot' && view.inherit && (
@@ -424,10 +488,6 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
           value={filter}
           onChange={e => setFilter(e.currentTarget.value)}
         />
-        <label className="se-only-changed">
-          <input type="checkbox" checked={onlyChanged} onChange={e => setOnlyChanged(e.currentTarget.checked)} />
-          <span>{tr('sessionEnv.onlyChanged')}</span>
-        </label>
         <span className="se-toolbar-spacer" />
         <button type="button" data-action="add-session-env" disabled={busy} onClick={() => setDraft({ op: 'set', key: '', value: '', keyEditable: true })}>{tr('sessionEnv.add')}</button>
         <button type="button" data-action="unset-session-env" disabled={busy} onClick={() => setDraft({ op: 'unset', key: '', value: '', keyEditable: true })}>{tr('sessionEnv.removeByName')}</button>
@@ -445,63 +505,27 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
           </tr>
         </thead>
         <tbody>
-          {rows.map(row => {
-            const ownEntry = row.entry;
-            const lowerText = row.lower ? `${sourceLabel(tr, row.lower)}${row.lower.value !== undefined ? `: ${row.lower.value}` : ''}` : '';
-            return (
-              <tr key={row.key} data-env-row={row.key} data-env-source={row.source} data-env-state={row.state}>
-                <td><code>{row.key}</code></td>
-                <td>
-                  <EnvValue
-                    value={row.value}
-                    masked={row.masked}
-                    canReveal={canReveal}
-                    struck={row.state === 'unset'}
-                    reveal={() => fetchReveal(revealUrl(row.key))}
-                  />
-                  {row.state === 'unset' && <span className="se-note">{tr('sessionEnv.removedNote')}</span>}
-                  {lowerText && row.state === 'set' && <span className="se-note" title={lowerText}>{tr('sessionEnv.overrides', { lower: lowerText })}</span>}
-                </td>
-                <td><span className={`se-badge is-${row.source}${row.state === 'unset' ? ' is-unset' : ''}`}>{sourceLabel(tr, row)}</span></td>
-                <td className="se-actions"><div className="se-actions-inner">
-                  {ownEntry === 'set' && (
-                    <button type="button" className="se-link" data-action="edit-session-env" disabled={busy}
-                      onClick={() => setDraft({ op: 'set', key: row.key, value: row.masked ? '' : row.value ?? '', keyEditable: false })}>
-                      {tr('sessionEnv.edit')}
-                    </button>
-                  )}
-                  {ownEntry && (
-                    <button type="button" className="se-link" data-action="reset-session-env" disabled={busy}
-                      onClick={() => void apply([{ op: 'reset', key: row.key }])}>
-                      {tr('sessionEnv.restore')}
-                    </button>
-                  )}
-                  {!ownEntry && row.state !== 'unset' && (
-                    <button type="button" className="se-link" data-action="override-session-env" disabled={busy}
-                      onClick={() => setDraft({ op: 'set', key: row.key, value: row.masked ? '' : row.value ?? '', keyEditable: false })}>
-                      {tr('sessionEnv.override')}
-                    </button>
-                  )}
-                  {!ownEntry && row.state === 'unset' && (
-                    <button type="button" className="se-link" data-action="override-session-env" disabled={busy}
-                      onClick={() => setDraft({ op: 'set', key: row.key, value: '', keyEditable: false })}>
-                      {tr('sessionEnv.setHere')}
-                    </button>
-                  )}
-                  {ownEntry !== 'unset' && row.state !== 'unset' && row.lock !== 'no-unset' && (
-                    <button type="button" className="se-link is-danger" data-action="remove-session-env" disabled={busy}
-                      onClick={() => void apply([{ op: 'unset', key: row.key }])}>
-                      {tr('sessionEnv.remove')}
-                    </button>
-                  )}
-                </div></td>
-              </tr>
-            );
-          })}
-          {rows.length === 0 && <tr><td colSpan={4} className="muted">{tr('sessionEnv.noRows')}</td></tr>}
+          {ownRows.map(renderRow)}
+          {inheritedRows.length > 0 && (
+            <tr className="se-fold-row" data-session-env-inherited={inheritedOpen ? 'open' : 'closed'}>
+              <td colSpan={4}>
+                {needle ? (
+                  <span className="muted">{tr('sessionEnv.inheritedMatched', { count: inheritedRows.length })}</span>
+                ) : (
+                  <button type="button" className="se-link se-fold" data-action="toggle-inherited" aria-expanded={inheritedOpen}
+                    onClick={() => setShowInherited(open => !open)}>
+                    {inheritedOpen ? '▾' : '▸'} {tr(foldLabel, { count: inheritedRows.length, global: lowerChanged })}
+                  </button>
+                )}
+              </td>
+            </tr>
+          )}
+          {inheritedOpen && inheritedRows.map(renderRow)}
+          {ownRows.length === 0 && inheritedRows.length === 0 && <tr><td colSpan={4} className="muted">{tr('sessionEnv.noRows')}</td></tr>}
         </tbody>
       </table>
 
+      <div className="se-locked-row">
       <details className="se-locked" data-session-env-reserved="">
         <summary>🔒 {tr('sessionEnv.reservedTitle', { count: view.reserved.keys.length + view.reserved.prefixes.length + (view.identityLockedKeys?.length ?? 0) })}</summary>
         <p className="muted">{tr('sessionEnv.reservedHelp')}</p>
@@ -531,6 +555,7 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
           <ul className="bd-env-chips">{view.notInheritedKeys.map(k => <li key={k} className="bd-env-chip"><code>{k}</code></li>)}</ul>
         </details>
       )}
+      </div>
       {shellWrapped && <p className="muted se-intro">ⓘ {tr('sessionEnv.shellNote')}</p>}
       <p className="muted se-intro">ⓘ {tr('sessionEnv.cliConfigNote')}</p>
       {!canReveal && <p className="muted se-intro">{tr('sessionEnv.revealOwnerOnly')}</p>}

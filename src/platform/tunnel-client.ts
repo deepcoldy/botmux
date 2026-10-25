@@ -501,14 +501,24 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
   tcp.setNoDelay(true);
   let killed = false;
   let ending = false;
-  // 「已发出但未被 pong 确认的字节数」——反向背压水位，同时是 finish() 判断排空的依据。
-  // 声明在 kill/finish 之前：它们会读这个变量，别让顺序变成 TDZ 隐患。
-  let unacked = 0;
+  // 「已交给 WebSocket 的字节数」与「被 pong 确认的字节数」，两者之差是反向背压水位，同时是
+  // finish() 判断排空的依据。声明在 kill/finish 之前：它们会读这些变量，别让顺序变成 TDZ 隐患。
+  //
+  // ⚠️ pong 只证明对端读到了**那个 ping 之前**发出的字节。闸门暂停期间每 20ms 就补一个 ping，
+  // 平台慢时会同时挂着一串 ping；原先收到任何 pong 都把未确认量清零，排在后面的旧 pong 就把
+  // 之后才发出的字节也算成已确认：实测平台限速 8MB/s 时，闸门形同虚设（已交出 25.1MB、
+  // 对端才读到 4.6MB），本地 FIN 后 finish() 也在对端只读到 4.6MB 时就 close()（#2295）。
+  // 所以每个 ping 带上发出时的 `sent`，pong 原样回带（RFC 6455 要求 pong 与 ping 的应用数据
+  // 相同；Node ws、Bun 1.4.3/1.4.4、平台侧的 Node ws 服务端都实测原样回带），按回带的偏移确认。
+  let sent = 0;
+  let acked = 0;
   let probing = false;
+  const unacked = (): number => sent - acked;
+  const probe = (): void => { winner.ping(Buffer.from(String(sent))); };
   /**
    * 硬收尾：双向都会触发 close/error，去重避免重复 destroy。
    *
-   * 优雅关闭路径不需要在这里额外让路：finish() 已经等到 `unacked` 归零才 `close()`，
+   * 优雅关闭路径不需要在这里额外让路：finish() 已经等到 `unacked()` 归零才 `close()`，
    * 到 winner 'close' 回来时队列本就是空的，此时 terminate 无数据可丢。
    * （实测过一个「ending 时跳过 terminate」的额外分支：Bun 下 64MB × 4 次、以及平台永不
    *   回 close 的场景，加与不加逐字同结果 ⟹ 是没有牙的复杂度，删掉。）
@@ -525,9 +535,9 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
    * ⚠️ 这里实测会真丢数据，且踩了两层：
    * 1. `terminate()` 直接掐断 socket，Bun 内部队列里没发出去的帧全丢。64MB 响应 A/B
    *    （本地写满 64MB 后 FIN，平台侧统计实收）：`terminate()` → 只收到 50.2MB。
-   * 2. 光换成 `close()` 也不够：仍有 `unacked > 0`（帧已交给队列但对端未确认）时
+   * 2. 光换成 `close()` 也不够：仍有 `unacked() > 0`（帧已交给队列但对端未确认）时
    *    close 会抢在排空前生效，实测 4 次里 2 次丢 4~5MB。
-   * 所以先用 ping/pong 等到 `unacked` 归零（pong 证明对端真读到了我们的字节），再 close。
+   * 所以先用 ping/pong 等到 `unacked()` 归零（pong 证明对端真读到了我们的字节），再 close。
    * 实测该顺序 64MB × 5 次全部零丢失。原先 `pipe()` 的 `end:true` 免费提供了这个语义。
    *
    * ⚠️⚠️ 别把上面的字节数当成「凑够这个量就能测出来」：丢多少、乃至丢不丢，取决于 FIN 那一
@@ -541,8 +551,8 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
     const closeWhenDrained = (): void => {
       if (killed) return;
       if (winner.readyState !== winner.OPEN) { kill(); return; }
-      if (unacked <= 0) { try { winner.close(); } catch { kill(); } return; }
-      try { winner.ping(); } catch { kill(); return; }
+      if (unacked() <= 0) { try { winner.close(); } catch { kill(); } return; }
+      try { probe(); } catch { kill(); return; }
       setTimeout(closeWhenDrained, WS_BACKPRESSURE_PROBE_MS);
     };
     closeWhenDrained();
@@ -567,18 +577,20 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
   tcp.on('drain', () => { try { winner.resume(); } catch { /* ignore */ } });
 
   // ── 本地 → 平台 ──
-  // 水位变量见函数开头（unacked/probing）。不用 bufferedAmount：Bun 下恒为 0。
-  const onPong = (): void => {
-    unacked = 0;                       // 对端读到了我们此前写的字节
+  // 水位变量见函数开头（sent/acked/probing）。不用 bufferedAmount：Bun 下恒为 0。
+  const onPong = (data: RawData): void => {
+    // 回带的偏移之前的字节对端都读到了；读不出偏移的 pong（不是我们的 ping 换来的）不算确认。
+    const offset = Number(toBuffer(data).toString());
+    if (Number.isSafeInteger(offset) && offset > acked) acked = Math.min(offset, sent);
     if (killed) return;
-    tcp.resume();
+    if (unacked() <= WS_BACKPRESSURE_BYTES) tcp.resume();
   };
   winner.on('pong', onPong);
 
   const probeUntilDrained = (): void => {
     if (killed) return;
-    if (unacked <= WS_BACKPRESSURE_BYTES) { probing = false; tcp.resume(); return; }
-    try { winner.ping(); } catch { /* 连接已废，kill 会收尾 */ }
+    if (unacked() <= WS_BACKPRESSURE_BYTES) { probing = false; tcp.resume(); return; }
+    try { probe(); } catch { /* 连接已废，kill 会收尾 */ }
     setTimeout(probeUntilDrained, WS_BACKPRESSURE_PROBE_MS);
   };
 
@@ -588,11 +600,15 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
     // （不加也是 isBinary=true、字节逐字不变）。写出来是为了让「这是裸字节桥、
     // 不许按文本处理」这件事在代码里可见，避免日后有人换成 string 载荷。
     winner.send(chunk, { binary: true });
-    unacked += chunk.length;
-    if (unacked > WS_BACKPRESSURE_BYTES && !probing) {
-      probing = true;
+    sent += chunk.length;
+    if (unacked() > WS_BACKPRESSURE_BYTES) {
+      // 每次超水位都要停读：pong 可能在探测周期中途就把 tcp 恢复了，只在「首次超水位」时
+      // 暂停的话，这一轮探测剩下的时间里闸门一直敞着。
       tcp.pause();                     // 停读本地，直到 pong 证明平台已消费
-      setTimeout(probeUntilDrained, WS_BACKPRESSURE_PROBE_MS);
+      if (!probing) {
+        probing = true;
+        setTimeout(probeUntilDrained, WS_BACKPRESSURE_PROBE_MS);
+      }
     }
   });
 

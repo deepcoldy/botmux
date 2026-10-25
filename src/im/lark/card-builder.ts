@@ -28,6 +28,7 @@ import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -539,6 +540,19 @@ export function buildSessionCard(
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
  * Lark bridge so future replies route back into this topic.
  */
+/**
+ * The closed card's worktree section (#698), present only when the session's
+ * working dir is a worktree botmux created. Absent → the card is byte-for-byte
+ * the legacy one. Present → the card is shareable-updatable so the click result
+ * can replace it in place.
+ */
+export interface ClosedCardWorktreeCleanup {
+  /** Markdown under the body: the offer, "checking…", or the click result. */
+  note: string;
+  /** Show the button: the offer, or a refusal the user can fix and retry. */
+  button: boolean;
+}
+
 export function buildSessionClosedCard(
   sessionId: string,
   rootId: string,
@@ -549,6 +563,7 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
+  worktreeCleanup?: ClosedCardWorktreeCleanup,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
@@ -565,19 +580,37 @@ export function buildSessionClosedCard(
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const card = simpleCard({
-    title: t('card.status.session_closed', undefined, locale),
-    template: 'grey',
-    markdown: body,
-    buttons: [
-      callbackButton(
-        t('card.btn.resume_session', undefined, locale),
-        'primary',
-        { action: 'resume', ...actionBase },
-      ),
+  const resumeButton = callbackButton(
+    t('card.btn.resume_session', undefined, locale),
+    'primary',
+    { action: 'resume', ...actionBase },
+  );
+  if (!worktreeCleanup) {
+    return JSON.stringify(simpleCard({
+      title: t('card.status.session_closed', undefined, locale),
+      template: 'grey',
+      markdown: body,
+      buttons: [resumeButton],
+    }));
+  }
+  // The button carries only the session id: the directory is re-read from the
+  // session row and botmux's creation record on click, never from the card.
+  const buttons = worktreeCleanup.button
+    ? [resumeButton, callbackButton(
+        t('card.btn.cleanup_worktree', undefined, locale),
+        'default',
+        { action: CLEANUP_SESSION_WORKTREE_ACTION, root_id: rootId, session_id: sessionId },
+      )]
+    : [resumeButton];
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.status.session_closed', undefined, locale), 'grey'),
+    elements: [
+      { tag: 'markdown', content: body },
+      { tag: 'markdown', content: worktreeCleanup.note },
+      { tag: 'action', actions: buttons },
     ],
-  });
-  return JSON.stringify(card);
+    extraConfig: { update_multi: true },
+  }));
 }
 
 /** Parent-topic panel for `/fork <task>`. Links and live/closed state are

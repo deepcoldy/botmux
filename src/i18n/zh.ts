@@ -39,6 +39,26 @@ export const messages: Record<string, string> = {
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
   'card.btn.resume_session': '▶️ 恢复会话',
+  'card.btn.cleanup_worktree': '🧹 清理 worktree',
+  'card.worktree_cleanup.offer': '🧹 这个工作目录是 botmux 自动创建的 worktree。点「清理 worktree」只删除工作目录（含被 .gitignore 忽略的依赖、构建产物），分支保留；有未提交改动、未推送提交或仍有会话/进程在用时不会删除。',
+  'card.worktree_cleanup.running': '⏳ 正在检查并清理 worktree…',
+  'card.worktree_cleanup.removed': '✅ 已删除 worktree `{path}`，分支 `{branch}` 保留。',
+  'card.worktree_cleanup.blocked': '⚠️ 没有删除 worktree `{path}`：',
+  'card.worktree_cleanup.retry_hint': '处理后可以再点一次「清理 worktree」。',
+  'card.worktree_cleanup.reason_uncommitted': '有 {n} 个未提交的改动（含未跟踪文件）',
+  'card.worktree_cleanup.reason_unpushed': '有 {n} 个未推送的提交',
+  'card.worktree_cleanup.reason_sessions': '还有 {n} 个会话在用这个目录',
+  'card.worktree_cleanup.reason_processes': '还有 {n} 个进程的当前目录在里面',
+  'card.worktree_cleanup.reason_sessions_unknown': '读不全会话清单，无法确认没有会话在用：{error}',
+  'card.worktree_cleanup.reason_processes_unknown': '无法确认是否有进程在用：{error}',
+  'card.worktree_cleanup.reason_status_unknown': '无法读取 git 状态：{error}',
+  'card.worktree_cleanup.gone': 'ℹ️ worktree `{path}` 已经不在了，无需清理。',
+  'card.worktree_cleanup.not_botmux': '⚠️ 这个目录不是 botmux 自动创建的 worktree（或已被替换），不会删除。',
+  'card.worktree_cleanup.session_active': '⚠️ 会话已恢复，worktree 仍在使用，不会删除。',
+  'card.worktree_cleanup.session_missing': '找不到这个会话，无法清理 worktree',
+  'card.worktree_cleanup.failed': '❌ 删除 worktree `{path}` 失败：{error}',
+  'card.worktree_cleanup.no_permission': '你没有这个 Bot 的操作权限，不能清理 worktree',
+  'card.worktree_cleanup.expired': '卡片已失效，无法清理 worktree',
   'card.btn.show_output': '📖 显示输出',
   'card.btn.hide_output': '📕 隐藏输出',
   'card.btn.export_text': '📝 导出文字',
@@ -967,6 +987,7 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.sessions': '/sessions   - 列出当前机器人在本群的话题会话，并可返回或恢复话题',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
+  'help.dash': '/dash - 私信获取当前 Dashboard 管理首页完整链接（等价于 /dashboard link），不创建会话或 worktree；链接形式随远程访问/反代配置变化（本机直连或平台机子域）',
   'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
@@ -1392,6 +1413,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ {cliName} 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
   'worker.local_turn_failed': '⚠️ {cliName} 执行失败（{errorCode}）。失败的这一轮没有对应的飞书消息（例如在终端里直接输入的内容，或接续上一轮的输出），所以不会自动重试。请检查 Web 终端，需要时重新发送。',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} 因 API 错误中断了这一轮（{errorCode}），但 botmux 没能把这次中断对应到正在跟踪的回合，所以不会自动续跑，任务可能停在中途。请检查 Web 终端，需要时回复「继续」。',
 
   // ─── Turn-failure card (通用失败卡：@人 + 重试按钮) ────────────────────────
   'card.turn_failed.title': '⚠️ {cliName} 本轮执行失败',
@@ -1595,11 +1617,18 @@ export const messages: Record<string, string> = {
     '• `groups`     — 群组矩阵\n' +
     '• `schedules`  — 定时任务\n' +
     '• `settings`   — 全局设置（仅管理员）\n' +
+    '• `link`       — 管理首页链接（私信；等价裸 `/dash`；链接形式随远程访问/反代配置变化）\n' +
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
   'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给你。',
   'card.dashboard.dm_failed': '⚠️ 给你发送 Dashboard 私聊失败：{reason}',
+  'card.dashboard.link.title': '🔗 Dashboard 管理首页',
+  'card.dashboard.link.body': 'Dashboard 管理首页（完整管理权限）：\n{url}',
+  'card.dashboard.link.loopback_hint': '⚠️ Dashboard 当前仅监听本机回环地址，该链接只能在运行 BotMux 的机器本机打开。',
+  'card.dashboard.link.dm_sent': '📬 Dashboard 管理首页链接已私信给你。',
+  'card.dashboard.link.delivery_failed': '⚠️ Dashboard 链接的私密投递失败，未在群内展示链接。请检查与机器人的私聊权限后重试。',
+  'card.dashboard.link.unavailable': '⚠️ 当前无法读取 Dashboard 端口或管理员 token，请确认 Dashboard 已在运行。',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard 会话',
   'card.dashboard.sessions.count_summary': '活跃 {active} · 已关闭 {closed} · 第 {page}/{totalPages} 页',
@@ -1952,9 +1981,12 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
-  'card.waiting_duration': '等待 {seconds} 秒',
-  'card.execution_until_reply': '执行至回复 {seconds} 秒',
-  'card.execution_duration': '执行耗时 {seconds} 秒',
+  'card.waiting_duration': '等待 {duration}',
+  'card.execution_until_reply': '执行至回复 {duration}',
+  'card.execution_duration': '执行耗时 {duration}',
+  'card.duration_seconds': '{seconds} 秒',
+  'card.duration_minutes': '{minutes} 分',
+  'card.duration_hours': '{hours} 小时',
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
@@ -1975,6 +2007,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App 共享对话（已同步至飞书）',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 决策看板：收到 {count} 项决定（批次 #{id}），管家开始处理',
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
   'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
   'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
@@ -2002,6 +2035,17 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
+  'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',
+  'worker.startup_blocker_label.folder_trust': '目录信任确认',
+  'worker.startup_blocker_label.login': '登录',
+  'worker.startup_blocker_label.update': '升级确认',
+  'worker.startup_blocker_label.terms': '条款确认',
+  'worker.startup_blocked.folder_trust': '⚠️ {cliName} 卡在目录信任确认：{folder}{upgrade}。它在等人确认是否信任这个目录，这条消息还没开始处理。请打开 Web 终端选择信任，确认后会自动接着处理。',
+  'worker.startup_blocked.login': '⚠️ {cliName} 卡在登录{upgrade}：它在等人完成登录，这条消息还没开始处理。请打开 Web 终端（或在本机）按提示登录，登录后会接着处理。',
+  'worker.startup_blocked.update': '⚠️ {cliName} 卡在升级确认{upgrade}：它在等人选择是否升级，这条消息还没开始处理。请打开 Web 终端做出选择，之后会接着处理。',
+  'worker.startup_blocked.terms': '⚠️ {cliName} 卡在条款确认{upgrade}：它在等人接受新的使用条款，这条消息还没开始处理。请打开 Web 终端确认后继续。',
+  'worker.workspace_trust_explicitly_denied': '⚠️ 工作目录 {folder} 在 {cliName} 的信任记录里被显式设为不信任（{store} 里 trusted = false）。botmux 不会替你改这个决定，所以 {cliName} 启动时会停在目录信任确认、不处理消息。要在这个目录里用它，请在 Web 终端里选择信任，或把该条目改为 trusted = true（或删掉）后重发。',
   'worker.claude_bridge_turn_unread': '⚠️ {cliName} 刚跑完一轮，但 botmux 没在它的会话记录（transcript）里读到这一轮，这一轮的回复可能不会自动转发到群里。请打开 Web 终端查看；之后在群里再发消息时，botmux 会重新定位会话记录。',
 
   // Restart / maintenance report (bot-0 DM to owner)

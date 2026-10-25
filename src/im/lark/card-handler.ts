@@ -72,6 +72,9 @@ import {
 } from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
+import { cleanupSessionWorktree } from '../../core/session-worktree-cleanup.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } from './session-worktree-cleanup-card.js';
+import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
@@ -2765,9 +2768,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           ? getSessionByActionValue(activeSessions, rootId, larkAppId, value?.session_id, value?.action)
           : activeSessions.get(rootId))
       : undefined;
-    // Resume targets a closed session — fall back to the persistent store so
-    // we can still pin chatId/larkAppId for the canOperate gate.
-    const closedForCtx = !ds && value?.action === 'resume' && value?.session_id
+    // Resume / worktree cleanup target a closed session — fall back to the
+    // persistent store so we can still pin chatId/larkAppId for the canOperate gate.
+    const closedForCtx = !ds
+      && (value?.action === 'resume' || value?.action === CLEANUP_SESSION_WORKTREE_ACTION)
+      && value?.session_id
       ? sessionStore.getSession(value.session_id)
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
@@ -2828,6 +2833,26 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         content: 'v2 workflow 已下线；旧卡片不再可操作，请迁移定义后使用 /workflow。',
       },
     };
+  }
+
+  // Session-closed card「清理 worktree」(#698): the card carries only the session
+  // id; ownership, idleness and cleanliness are re-proven from the store and
+  // git after the ACK, and the result is patched into the same card.
+  if (value?.action === CLEANUP_SESSION_WORKTREE_ACTION) {
+    const loc = localeForBot(larkAppId);
+    return handleSessionWorktreeCleanupAction(
+      { larkAppId, operatorOpenId, sessionId: value.session_id, cardMessageId },
+      {
+        canOperate,
+        getSession: sessionId => sessionStore.getSession(sessionId),
+        buildCard: (session, state) => buildClosedSessionCard(session, loc, state),
+        cleanup: (sessionId, appId) => cleanupSessionWorktree(sessionId, appId),
+        updateCard: (messageId, card) => updateMessage(larkAppId!, messageId, card),
+        sendToOperator: (openId, card) => sendUserMessage(larkAppId!, openId, card, 'interactive'),
+        log: message => logger.warn(message),
+        locale: loc,
+      },
+    );
   }
 
   // Handle session card button actions (restart/close)
@@ -5269,6 +5294,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
             });
             created.push({ repo: repoPath, result });
           }
+          for (const c of created) await recordCreatedWorktree(targetDs.larkAppId, c.result);
           creation = selectedWorktreePaths.length > 1 && parentPath
             ? {
                 path: parentPath,

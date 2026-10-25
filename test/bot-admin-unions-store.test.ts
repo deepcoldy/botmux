@@ -59,6 +59,47 @@ describe('computeBotAdminUnions', () => {
   });
 });
 
+describe('owner union_id（管家拉群认 owner）', () => {
+  it('记下当前 owner 的 union_id：不一定是第一个管理员，owner 换不出来就不记', async () => {
+    const resolution = new Map([['a@example.com', 'ou_a'], ['b@example.com', 'ou_b']]);
+    const unions: Record<string, string> = { ou_a: 'on_a', ou_b: 'on_b' };
+    const owned = await computeBotAdminUnions(['a@example.com', 'b@example.com'], resolution, async ou => unions[ou], 1, 'ou_b');
+    expect(owned.snapshot.owner).toBe('on_b');
+    // on_ 条目本身就是 owner 的 union_id。
+    const direct = await computeBotAdminUnions(['on_direct'], new Map([['on_direct', 'ou_direct']]), async () => undefined, 1, 'ou_direct');
+    expect(direct.snapshot.owner).toBe('on_direct');
+    const missing = await computeBotAdminUnions(['a@example.com', 'b@example.com'], resolution, async ou => (ou === 'ou_a' ? 'on_a' : null), 1, 'ou_b');
+    expect(missing.snapshot.owner).toBeUndefined();
+    expect((await computeBotAdminUnions(['a@example.com'], resolution, async ou => unions[ou])).snapshot.owner).toBeUndefined();
+  });
+
+  it('读侧只认快照管理员里的 owner；allowedUsers 改过还没重新发布时没有 owner', async () => {
+    const { snapshot } = await computeBotAdminUnions(['on_me'], new Map([['on_me', 'ou_me']]), async () => undefined, 1, 'ou_me');
+    writeBotAdminUnions(dir, 'cli_s', snapshot);
+    expect(readBotAdminUnions(dir, 'cli_s', ['on_me'])?.owner).toBe('on_me');
+    expect(readBotAdminUnions(dir, 'cli_s', ['on_other'])).toBeUndefined();
+    writeBotAdminUnions(dir, 'cli_s', { ...snapshot, owner: 'on_intruder' });
+    expect(readBotAdminUnions(dir, 'cli_s', ['on_me'])?.owner).toBeUndefined();
+  });
+
+  it('发布器：owner 换了（allowedUsers 没变）也重新发布', async () => {
+    let ownerOpenId = 'ou_a';
+    const raw = ['a@example.com', 'b@example.com'];
+    const resolution = new Map([['a@example.com', 'ou_a'], ['b@example.com', 'ou_b']]);
+    const publisher = createBotAdminUnionsPublisher({
+      dataDir: dir,
+      larkAppId: 'cli_owner',
+      readState: () => ({ rawAllowedUsers: raw, resolution, ownerOpenId }),
+      lookupUnion: async ou => ({ ou_a: 'on_a', ou_b: 'on_b' } as Record<string, string>)[ou],
+    });
+    await publisher.publish();
+    expect(readBotAdminUnions(dir, 'cli_owner', raw)?.owner).toBe('on_a');
+    ownerOpenId = 'ou_b';
+    await publisher.publish();
+    expect(readBotAdminUnions(dir, 'cli_owner', raw)?.owner).toBe('on_b');
+  });
+});
+
 describe('readBotAdminUnions', () => {
   async function publish(appId: string, raw: string[], unions: Record<string, string>): Promise<void> {
     const { snapshot } = await computeBotAdminUnions(raw, new Map(raw.map(r => [r, `ou_${r}`])), async ou => unions[ou]);

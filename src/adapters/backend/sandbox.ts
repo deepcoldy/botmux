@@ -277,6 +277,19 @@ function credentialOnlyRelayHandle(
   };
 }
 
+/** Whether a CLI keeps running when its worker exits without ending it (daemon
+ * restart / IPC disconnect / parent watchdog / crash): a persistent backend
+ * (tmux / zellij / herdr / zmx) only DETACHES from its named session and the
+ * successor worker reattaches the same CLI; a PTY CLI is a child of the worker
+ * and dies with it. */
+export function cliSurvivesWorkerExit(input: {
+  backendType: string;
+  /** Present only when the CLI runs in a named persistent session. */
+  persistentSessionName: string | null | undefined;
+}): boolean {
+  return !!input.persistentSessionName && input.backendType !== 'pty';
+}
+
 /** Whether a session's per-session sandbox tree must OUTLIVE the worker that
  * owns it when that worker exits without ending the CLI (daemon restart / IPC
  * disconnect / parent watchdog / crash; a topic transfer always keeps it).
@@ -284,13 +297,13 @@ function credentialOnlyRelayHandle(
  * Every flavour shares the tree layout `<data>/sandboxes/<sid>`: the relay
  * outbox for oncall / scratch / credential-only, the oncall deny-mask
  * mountpoints, the scratch COW overlay + upper (Linux) or clone (macOS). A
- * persistent backend (tmux / zellij / herdr / zmx) only DETACHES on worker exit:
- * its CLI keeps running against that tree (Linux panes hold the outbox bind by
- * inode; a scratch CLI's whole root/cwd lives in it), and the successor worker
+ * CLI that survives its worker (see {@link cliSurvivesWorkerExit}) keeps
+ * running against that tree (Linux panes hold the outbox bind by inode; a
+ * scratch CLI's whole root/cwd lives in it), and the successor worker
  * reattaches the same CLI and re-serves the relay. Deleting it there silently
  * breaks every later `botmux send` (or wipes a live scratch CLI's files). A PTY
- * CLI is a child of the worker and dies with it, so its tree is cleaned up as
- * before; a real close removes the tree for every backend. */
+ * CLI dies with the worker, so its tree is cleaned up as before; a real close
+ * removes the tree for every backend. */
 export function sandboxTreeSurvivesWorkerExit(input: {
   /** This CLI generation established a per-session tree (holds its cleanup). */
   ownsTree: boolean;
@@ -298,7 +311,7 @@ export function sandboxTreeSurvivesWorkerExit(input: {
   /** Present only when the CLI runs in a named persistent session. */
   persistentSessionName: string | null | undefined;
 }): boolean {
-  return input.ownsTree && !!input.persistentSessionName && input.backendType !== 'pty';
+  return input.ownsTree && cliSurvivesWorkerExit(input);
 }
 
 /** The relay outbox a LIVE Linux pane bound into its bwrap namespace BY INODE

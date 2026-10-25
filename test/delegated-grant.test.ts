@@ -238,3 +238,72 @@ describe('applyDelegatedGrants', () => {
     expect(granted).toEqual(['ou_req']);
   });
 });
+
+/** 第二条委托来源：owner 显式列出的外部 bot 名单（grantDelegateBots）。 */
+describe('configured external delegate bots (grantDelegateBots)', () => {
+  const EXT = { senderIds: ['ou_ext_bot', 'cli_ext'] };
+
+  it('matches by open_id or app_id; unlisted bots and the empty default stay out', () => {
+    expect(resolveGrantDelegator(RECV, EXT)).toBeUndefined();
+
+    getBot(RECV).config.grantDelegateBots = ['ou_ext_bot'];
+    expect(resolveGrantDelegator(RECV, EXT)).toBe('configuredExternalBot');
+
+    getBot(RECV).config.grantDelegateBots = ['cli_ext'];
+    expect(resolveGrantDelegator(RECV, EXT)).toBe('configuredExternalBot');
+
+    getBot(RECV).config.grantDelegateBots = ['ou_someone_else'];
+    expect(resolveGrantDelegator(RECV, EXT)).toBeUndefined();
+  });
+
+  it('the two legs are independent: the list works with trustSameOwnerBots off, and does not admit siblings', () => {
+    getBot(RECV).config.trustSameOwnerBots = false;
+    getBot(RECV).config.grantDelegateBots = ['ou_ext_bot'];
+    expect(resolveGrantDelegator(RECV, EXT)).toBe('configuredExternalBot');
+    expect(resolveGrantDelegator(RECV, SIB)).toBeUndefined();
+  });
+
+  it('coexists with the sameOwnerBot leg: the sibling keeps its own kind while the list admits the external bot', () => {
+    getBot(RECV).config.grantDelegateBots = ['cli_ext'];
+    expect(resolveGrantDelegator(RECV, SIB)).toBe('sameOwnerBot');
+    expect(resolveGrantDelegator(RECV, EXT)).toBe('configuredExternalBot');
+  });
+
+  it('a listed external bot grants end to end: talk only, this chat only, result card replied', async () => {
+    getBot(RECV).config.grantDelegateBots = ['ou_ext_bot'];
+    expect(canTalk(RECV, 'oc_room', 'ou_req')).toBe(false);
+
+    const granted = await applyDelegatedGrants(RECV, kickoffCard(), { chatType: 'group', ...EXT });
+
+    expect(granted).toEqual(['ou_req']);
+    expect(canTalk(RECV, 'oc_room', 'ou_req')).toBe(true);
+    expect(canTalk(RECV, 'oc_other', 'ou_req')).toBe(false);
+    expect(canOperate(RECV, 'oc_room', 'ou_req')).toBe(false);
+    expect(replyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('without the list the same external bot grants nothing (zero behavior change by default)', async () => {
+    const granted = await applyDelegatedGrants(RECV, kickoffCard(), { chatType: 'group', ...EXT });
+    expect(granted).toEqual([]);
+    expect(canTalk(RECV, 'oc_room', 'ou_req')).toBe(false);
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+
+  it('a blocked listed bot cannot open the door for others (open_id and app_id forms both veto)', async () => {
+    getBot(RECV).config.grantDelegateBots = ['ou_ext_bot'];
+    getBot(RECV).resolvedBlockedUsers = ['cli_ext'];
+    const granted = await applyDelegatedGrants(RECV, kickoffCard(), { chatType: 'group', ...EXT });
+    expect(granted).toEqual([]);
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+
+  it('bots.json normalization: entries trimmed, blank entries dropped, empty list → undefined', () => {
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([
+      { larkAppId: 'norm1', larkAppSecret: 's', cliId: 'claude-code', grantDelegateBots: [' ou_ext_bot ', '', '   ', 'cli_ext', 'ou_ext_bot'] },
+      { larkAppId: 'norm2', larkAppSecret: 's', cliId: 'claude-code', grantDelegateBots: [] },
+    ], null, 2), 'utf-8');
+    const configs = loadBotConfigs();
+    expect(configs.find(c => c.larkAppId === 'norm1')!.grantDelegateBots).toEqual(['ou_ext_bot', 'cli_ext']);
+    expect(configs.find(c => c.larkAppId === 'norm2')!.grantDelegateBots).toBeUndefined();
+  });
+});

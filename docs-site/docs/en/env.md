@@ -4,7 +4,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 
 **Applies to**: the dashboard / web terminal won't open or you need to change the bind address, pin a port, switch the pty/tmux backend, or find where config / logs / credentials live.
 
-> This page covers botmux's own process environment. Which variables a session (CLI) receives is viewed and edited in the Dashboard under "Settings → Session environment" and "Bot settings → Runtime environment → Session environment"; see [Session environment](./bots-json.md#session-environment-global-and-per-bot-layers).
+> This page covers botmux's own process environment. Which variables a session (CLI) receives is viewed and edited in the Dashboard under "Settings → Session environment" and "Bot settings → Advanced → Startup environment → Session environment"; see [Session environment](./bots-json.md#session-environment-global-and-per-bot-layers).
 
 ## Environment variables (set in `~/.botmux/.env`)
 

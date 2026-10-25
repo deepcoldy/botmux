@@ -725,6 +725,24 @@ export function cardModelFallbackNotice(
   }, locale);
 }
 
+function formatReplyDuration(durationMs: number, locale?: Locale): string {
+  // Round before splitting units so seconds never overflow into 60.0.
+  const tenths = Math.round(durationMs / 100);
+  if (tenths < 600) {
+    return t('card.duration_seconds', { seconds: (tenths / 10).toFixed(1) }, locale);
+  }
+  const hours = Math.floor(tenths / 36000);
+  const minutes = Math.floor((tenths % 36000) / 600);
+  const seconds = (tenths % 600) / 10;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(t('card.duration_hours', { hours }, locale));
+  if (minutes > 0) parts.push(t('card.duration_minutes', { minutes }, locale));
+  if (seconds > 0) {
+    parts.push(t('card.duration_seconds', { seconds: seconds.toFixed(1) }, locale));
+  }
+  return parts.join(' ');
+}
+
 /** Build the one canonical footer shared by all Bot Session reply cards.
  * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
  * here so direct sends and daemon fallbacks cannot drift apart. */
@@ -754,10 +772,10 @@ export function buildReplyCardFooter(opts: {
   const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
   const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
   if (hasWaiting) {
-    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t('card.waiting_duration', { duration: formatReplyDuration(waitingMs, opts.locale) }, opts.locale));
   }
   if (hasDuration) {
-    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { duration: formatReplyDuration(durationMs, opts.locale) }, opts.locale));
   }
   const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;

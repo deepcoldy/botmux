@@ -81,6 +81,20 @@ botmux 的权限回答两个问题：**谁能跟 bot 说话**（canTalk，对话
 
 开关：Dashboard「Bot 配置 → 授权与额度 → 信任同一 owner 的同机 Bot」、`bots.json` 的 `trustSameOwnerBots: false`，或 `/botconfig set trustSameOwnerBots off`。关闭后所有同机 Bot 都只能对话（同机 Bot 用 `/repo` 选仓库不受这个开关影响）。
 
+## 委托授权 bot `grantDelegateBots`
+
+同机 Bot 之外的**第二条委托来源**：owner 显式列出的外部 bot 名单，与 `trustSameOwnerBots` 互相独立（各管各的来源，一个开关不影响另一个）。点名授权的效果与上一节完全相同，差别只在「谁算委托方」。
+
+外部平台常用自己的 bot 建群拉人，再发一张 @ 本 bot 的开场卡让它开工，卡里同时 @ 提需求的人。受限模式下这个人紧接着 @ 本 bot 会撞对话闸、要等 owner 手点授权。把平台 bot 列入名单后，这一轮审批可以省掉：
+
+- 名单条目是受信 bot 的 open_id（本 bot 视角的 `ou_` 标识）或 app_id（`cli_` 标识），解析时 trim、丢空白项。
+- 名单里的 bot 在群里发消息 **@ 了本 bot** 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**：与 owner 在授权卡上点「授权本群对话」完全同效——写 `chatGrants`，仅对话权、不授管理权，额度 / 有效期取 `/grant` 默认值（`messageQuota.defaultLimit` / `grantDefaultDurationMs`，未配置时 3 条 / 1 小时），`restrictGrantCommands` 照常生效。
+- 结果以一张授权结果卡回到那条消息下，@ 被授权的真人（被 @ 的其他 bot 只显示名字，不发 @ 通知，避免唤醒误触发）。
+- 跳过：已经能对话的人（owner、oncall 群、整群放开、已有授权、开放模式）、发送方自己、@所有人、黑名单用户；只在群聊生效，私聊不触发。委托 bot 自己被拉黑时整条跳过——拉黑它必须同时挡住它替别人开门。
+- **信任边界**：等于把「本群谁能和本 bot 对话」的一次性点名权交给名单里的 bot——它 @ 谁，谁就拿到有时限、有额度的对话权。只列入你完全信任的平台 bot；它不能授管理权、不能写 `allowedUsers` / `allowedChatGroups` / `globalGrants`，授权也只限它发消息的那个群。未配置时行为与旧版完全一致。
+
+配置入口：Dashboard「Bot 配置 → 授权与额度 → 委托授权的外部 Bot 名单」、`bots.json` 的 `grantDelegateBots`，或 `/botconfig set grantDelegateBots ou_xxx,cli_yyy`（`unset` 清空）。
+
 ## 常见疑问
 
 - **oncall 和裸 `/grant` 什么区别？** 都只给对话权、都不给操作权。区别：oncall 恒放行、恒不限额，同时把群绑定到一个工作目录（新话题跳过选仓）；`/grant` 只放开对话，不绑目录。

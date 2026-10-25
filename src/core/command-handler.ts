@@ -145,6 +145,7 @@ import { isTeamBot } from '../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
+import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
 import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
@@ -3377,6 +3378,7 @@ export async function handleCommand(
                 branch: branchArg,
                 slug,
               });
+              await recordCreatedWorktree(ds.larkAppId, creation);
             } catch (e) {
               await sessionReply(rootId, t('cmd.repo.worktree_failed', { error: e instanceof Error ? e.message : String(e) }, loc));
               break;
@@ -3687,6 +3689,13 @@ export async function handleCommand(
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleDashboardCommand(message, dashboardArgs, rootId, chatId, deps, larkAppId);
         logger.info(`[${logTag}] Dashboard command handled (sub=${dashboardArgs.trim().split(/\s+/)[0] || 'overview'})`);
+        break;
+      }
+
+      case '/dash': {
+        const chatId = ds?.chatId ?? message.chatId ?? '';
+        await handleDashboardCommand(message, 'link', rootId, chatId, deps, larkAppId);
+        logger.info(`[${logTag}] Dashboard link command handled`);
         break;
       }
 
@@ -6240,6 +6249,7 @@ export async function handleCommand(
           t('help.quote', undefined, loc),
           t('help.sessions', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.dash', undefined, loc),
           t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),

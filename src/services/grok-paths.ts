@@ -12,6 +12,10 @@
  *       line per submit. Submit-verify reads this file. Grok 1.0.x writes a
  *       type-ahead follow-up at dequeue, and may omit the line; updates.jsonl
  *       has the same timing, so neither can confirm a busy-turn submit.
+ *   $GROK_HOME/logs/unified.jsonl
+ *     — internal log shared by every Grok process under this home. Its
+ *       `prompt.enqueue` line ({pid, ctx.len}) is written when the composer
+ *       accepts a submit, idle or queued, so it is the busy-turn receipt.
  *   $GROK_HOME/sessions/session_search.sqlite
  *   $GROK_HOME/skills/
  *   $GROK_HOME/hooks/
@@ -155,6 +159,10 @@ export function grokUpdatesPath(sessionId: string, cwd: string): string {
  *  sessions in this cwd. Resolves hashed buckets via `.cwd` when needed. */
 export function grokPromptHistoryPath(cwd: string): string {
   return join(resolveGrokCwdBucketDir(cwd), 'prompt_history.jsonl');
+}
+
+export function grokUnifiedLogPath(): string {
+  return join(grokHome(), 'logs', 'unified.jsonl');
 }
 
 export function grokSummaryPath(sessionId: string, cwd: string): string {

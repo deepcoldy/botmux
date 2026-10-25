@@ -12,6 +12,11 @@ import {
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
+// Profile scanning has its own component/browser tests. Keep these agent-save
+// contract tests independent of that additional GET request.
+vi.mock('../src/dashboard/web/codex-profile-picker.js', () => ({
+  CodexProfilePicker: (props: any) => React.createElement('codex-profile-picker', props),
+}));
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const originalFetch = globalThis.fetch;
@@ -150,6 +155,58 @@ describe('Codex-compatible runtime editor', () => {
     });
     return { renderer, root: renderer.root, patchBot };
   }
+
+  it('sends the Codex profile only when edited, and resets touched state after authoritative clear', async () => {
+    const original = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, json: async () => ({ models: [] }) };
+      const body = JSON.parse(init?.body ?? '{}'); requests.push(body);
+      return { ok: true, json: async () => ({ ...body, ok: true, codexProfile: null }) };
+    });
+    try {
+      const { root, renderer } = renderAgent({ cliId: 'codex', codexProfile: 'saved' });
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[0]).not.toHaveProperty('codexProfile');
+      act(() => root.findByType('codex-profile-picker' as any).props.onChange(''));
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[1].codexProfile).toBeNull();
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[2]).not.toHaveProperty('codexProfile');
+      act(() => renderer.unmount());
+    } finally { globalThis.fetch = original; }
+  });
+
+  it('auto-clears the Codex profile when switching away; switching back before saving restores it', async () => {
+    const original = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, json: async () => ({ models: [] }) };
+      const body = JSON.parse(init?.body ?? '{}'); requests.push(body);
+      // The server preserves an omitted field: echo the draft's saved value when
+      // the request does not carry codexProfile.
+      return { ok: true, json: async () => ({ ...body, ok: true, codexProfile: 'codexProfile' in body ? body.codexProfile : 'saved' }) };
+    });
+    try {
+      const { root, renderer } = renderAgent({ cliId: 'codex', codexProfile: 'saved' });
+      // Round-trip BEFORE any save: leaving Codex marks a clear and explains it;
+      // coming back restores the saved value and withdraws the clear.
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('claude-code'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(1);
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('codex'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(0);
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[0].cliId).toBe('codex');
+      expect(requests[0]).not.toHaveProperty('codexProfile');
+      // Actually leaving Codex and saving sends an explicit null so the daemon
+      // clears the profile instead of rejecting cliId!=codex.
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('traex'));
+      expect(root.findAllByProps({ 'data-section': 'codex-profile-cleared' })).toHaveLength(1);
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[1]).toMatchObject({ cliId: 'traex', codexProfile: null });
+      act(() => renderer.unmount());
+    } finally { globalThis.fetch = original; }
+  });
 
   async function flushEffects(cycles = 1): Promise<void> {
     for (let i = 0; i < cycles; i += 1) {
@@ -2536,5 +2593,61 @@ describe('reply footer parent response synchronization', () => {
     expect(toggle('replyFooterBrand').props.checked).toBe(false);
     expect(backend).toEqual({ replyFooterBrand: false });
     act(() => renderer.unmount());
+  });
+});
+
+describe('Codex CLI runtime no-progress notice (3.2 dashboard switch)', () => {
+  it('shows the CLI opt-in (not App-only controls) and PUTs cliEnabled while preserving enabled', async () => {
+    const patchBot = vi.fn();
+    const fetches: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', ((url: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : undefined;
+      fetches.push({ url: String(url), body });
+      return Promise.resolve({ ok: true, json: async () => ({ ok: true, noProgressNotify: body.noProgressNotify }) } as Response);
+    }) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex', cliId: 'codex', noProgressNotify: { enabled: true } },
+        putCardPref: vi.fn(),
+        patchBot,
+      }));
+    });
+    const tree = () => JSON.stringify(renderer.toJSON());
+    expect(tree()).toContain('Codex CLI');
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-app-clean-input' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-browser' })).toHaveLength(0);
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0]!.url).toContain('/api/bots/cli_codex/no-progress-notify');
+    expect(fetches[0]!.body).toEqual({ noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(patchBot).toHaveBeenCalledWith('cli_codex', { noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(true);
+  });
+
+  it('rolls the CLI switch back when the PUT fails and keeps existing timeout/cliEnabled merge shape', async () => {
+    vi.stubGlobal('fetch', (() => Promise.resolve({
+      ok: false,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    })) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex2', cliId: 'codex', noProgressNotify: { enabled: true, cliEnabled: false, timeoutMs: 300000 } },
+        putCardPref: vi.fn(),
+        patchBot: vi.fn(),
+      }));
+    });
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(false);
   });
 });

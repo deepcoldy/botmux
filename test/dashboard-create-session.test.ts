@@ -7,6 +7,7 @@
  * wrapped queuedPrompt, clears queued). The CLI process is external — forkWorker
  * is stubbed so we exercise the routing/parking logic in isolation.
  */
+import { cardVisibleText } from './helpers/card-visible-text.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -946,7 +947,8 @@ describe('spawnDashboardSession — default working dir missing', () => {
   // Starting without a pick would land in the bot's default working dir, which
   // is gone: forkWorker refuses it. The session waits on the missing-directory
   // picker instead (manual entry even with nothing to scan, no 「直接开启会话」).
-  const MISSING = `${process.env.TMPDIR ?? '/tmp'}/botmux-dash-missing-${process.pid}/gone/botmux`;
+  // Keep `_`: markdown escaping must differ from the visible path we assert.
+  const MISSING = `${process.env.TMPDIR ?? '/tmp'}/botmux-dash-missing-${process.pid}/gone_dir/botmux`;
 
   beforeEach(() => {
     vi.mocked(getBot).mockReturnValue({
@@ -973,7 +975,7 @@ describe('spawnDashboardSession — default working dir missing', () => {
     const ds = active.get(sessionKey(CHAT, APP))!;
     expect(ds.pendingRepo).toBe(true);
     expect(ds.initialStartPending).toBe(false);
-    expect(publishedCard()).toContain(MISSING);
+    expect(cardVisibleText(publishedCard())).toContain(MISSING);
     expect(publishedCard()).toContain('repo_manual_submit');
     expect(publishedCard()).not.toContain('skip_repo');
     expect(ds.repoCardMessageId).toBe('om_missing_picker');

@@ -3,10 +3,12 @@
  * —— 与 owner 在授权卡上点「本群」同效（talk-only，额度/有效期取 /grant 的默认值），省掉
  * 「被点名的人 @ 本 bot → 弹申请卡 → 等 owner 手点」这一轮。
  *
- * 谁算委托方只在 {@link resolveGrantDelegator} 里判定，按来源逐条分支。目前只有一种来源：
+ * 谁算委托方只在 {@link resolveGrantDelegator} 里判定，按来源逐条分支。目前两种来源：
  * 与本 bot 同一个 owner 的同机 Bot（isTrustedSameOwnerSiblingBot，受 trustSameOwnerBots
- * 开关控制，默认开）——同一个人的 bot 视同 owner 本人在点名。落库、跳过规则、结果卡与
- * dispatcher 接线对所有来源共用，新增来源不用改它们。
+ * 开关控制，默认开）——同一个人的 bot 视同 owner 本人在点名；以及 owner 在
+ * grantDelegateBots 里显式列出的外部 bot（按发送方 open_id / app_id 命中，默认空名单）
+ * ——典型是外部平台用自己的 bot 建群、发开场卡点名要本 bot 服务的人。落库、跳过规则、
+ * 结果卡与 dispatcher 接线对所有来源共用，新增来源不用改它们。
  *
  * 信任锚是飞书盖章的 bot 发送方（调用方只在 sender_type=app|bot 分支调用）；绝不写
  * allowedUsers / allowedChatGroups / globalGrants，不授 canOperate。已经能和本 bot 对话的人
@@ -36,7 +38,9 @@ export interface DelegatedGrantSender {
 /** 委托来源。新增来源 = 这里加一个值 + {@link resolveGrantDelegator} 里加一条分支。 */
 export type GrantDelegatorKind =
   /** 与本 bot 同一个 owner 的同机 Bot（trustSameOwnerBots，默认开）。 */
-  | 'sameOwnerBot';
+  | 'sameOwnerBot'
+  /** owner 在 grantDelegateBots 里显式列出的外部 bot（按 open_id / app_id 命中，默认空）。 */
+  | 'configuredExternalBot';
 
 /**
  * 发送方能不能替本 bot 点名授权；能的话返回命中的委托来源（用于日志），否则 undefined。
@@ -49,6 +53,12 @@ export type GrantDelegatorKind =
 export function resolveGrantDelegator(larkAppId: string, sender: DelegatedGrantSender): GrantDelegatorKind | undefined {
   // 来源：与本 bot 同一个 owner 的同机 Bot。
   if (isTrustedSameOwnerSiblingBot(config.session.dataDir, larkAppId, sender.senderUnionId)) return 'sameOwnerBot';
+  // 来源：owner 显式列出的外部 bot（grantDelegateBots，默认空）。信任依据是 owner 亲手
+  // 写进名单的发送方身份——open_id（ou_，本 bot 视角）或 app_id（cli_）命中即算。
+  const configured = getBot(larkAppId).config.grantDelegateBots;
+  if (configured?.length && sender.senderIds.some(id => !!id && configured.includes(id))) {
+    return 'configuredExternalBot';
+  }
   return undefined;
 }
 

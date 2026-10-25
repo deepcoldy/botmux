@@ -838,6 +838,28 @@ export function stripLeadingMentions(content: string, mentions?: { name: string 
   return s;
 }
 
+/**
+ * Dispatcher 路由侧复刻 daemon **命令车道**对入站消息的渲染：即 daemon 在
+ * `handleNewTopicAdmitted` / `handleThreadReplyAdmitted` 里做斜杠判定前看到的
+ * `parsed.content`（post 标题拼成首行、段落以 `\n` 连接、`at`→`@user_name`
+ * 不带前导空格、`a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）。
+ *
+ * 热路径上的 {@link extractMessageTextForRouting}（在 dispatcher 里）只拼 text
+ * 节点、丢弃 title 与附件节点，是给 `/t` 等判定用的轻量窥视，**不能**拿它判内置
+ * 免 @ 命令：两套渲染在带标题富文本、text 与 at 紧贴等形态上会给出不同文本，
+ * 导致「群闸放行、daemon 却不认命令」地误建会话。需要与 daemon 结论对齐的判定
+ * 用本函数取车道文本，再走同一个 {@link stripLeadingMentions } +
+ * `parseSlashCommandInvocation`，两侧同一结论才放行。
+ *
+ * 纯解析：不做资源下载、合并转发展开或语音转写（那些发生在 daemon 更深处；本函数
+ * 的调用方只在轻量窥视已形似单行内置命令时才调用，附件/语音候选在 dispatcher
+ * 更早处已被路由）。
+ */
+export function daemonCommandLanePreview(data: RawEventData): { text: string; mentions: LarkMention[] } {
+  const { parsed } = parseEventMessage(data, createImgNumberer());
+  return { text: parsed.content, mentions: parsed.mentions ?? [] };
+}
+
 function matchesMentionId(m: any, id: string): boolean {
   if (!m || !id) return false;
   const openId = m.openId ?? mentionOpenId(m);

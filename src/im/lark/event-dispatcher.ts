@@ -18,11 +18,11 @@ import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
-import { commandSpec } from '../../core/command-schema.js';
+import { commandSpec, isBuiltinMentionlessInvocation } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -31,6 +31,7 @@ import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
+import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
 import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, recordDocWatchActivity, setDocTitle, settleDocCommentWsDelivery, type DocSubscription, type DocWatchOutcome } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, fetchDocTitle, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
@@ -3664,6 +3665,31 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
+ * 内置免 @ 控制命令的**车道确认**：dispatcher 的轻量路由窥视已把消息认成候选后，
+ * 用 daemon 命令车道的**同一套渲染**（{@link daemonCommandLanePreview}）重算一遍，
+ * 剥前导 @ 后再走同一个 `parseSlashCommandInvocation` +
+ * {@link isBuiltinMentionlessInvocation}；只有两侧解析出**同一条**内置命令才放行。
+ *
+ * 不能只比对路由文本：那个窥视对 post 只拼 text 节点、丢标题、丢附件节点，与 daemon
+ * 的 `parseEventMessage` 渲染（标题拼成首行、段落以 `\n` 连、`at`→`@name` 不带空格、
+ * `a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）在多种形态上不一致。
+ * 实测会被这里拦下的形态：带标题富文本（车道 `标题\n/dash`）、text 与 at 节点紧贴
+ *（车道 `/dash@张三`）、at 名含空格且无 mentions[]（车道 `@张 三 /dash`）、多段图片、
+ * 单段超链接/代码块。解析失败按不一致处理（fail-closed，不放行免 @）。
+ */
+function builtinMentionlessConfirmedByDaemonLane(data: any, routingCmd: string | undefined): boolean {
+  if (!routingCmd) return false;
+  try {
+    const { text, mentions } = daemonCommandLanePreview(data);
+    const lane = stripLeadingMentions(text.trim(), mentions).trim();
+    const laneCmd = parseSlashCommandInvocation(lane)?.cmd;
+    return laneCmd === routingCmd && isBuiltinMentionlessInvocation(laneCmd, lane);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 路由侧判「这是不是指令头」时的 @ 剥离，必须与 daemon 侧**逐字同源**。
  *
  * daemon 走两道：先按位置剥前导 @（谁的都剥），再按身份剥本 bot 的 @（任意位置）。
@@ -5734,6 +5760,28 @@ export function createLarkEventDispatcherRuntime(
           ? { ...commandTriggerEntry, args: commandTriggerArgs(strippedRoutingText) }
           : undefined;
         const commandTriggerRelax = !!commandTrigger;
+        // 内置保留控制命令（`/dash`、裸 `/dashboard link`）在**所有群形态**
+        // （普通群、话题群、话题回复）都免 @ 寻址本 bot。与用户配置的
+        // commandTriggers 正交：那条只放普通群且带 prompt 模板语义，这里不打
+        // commandTrigger 标记，原文进 daemon 后由 classifySlash 按 sessionless
+        // daemon 命令认领，不建会话、不起 CLI、不建 worktree。仍要求 isAllowed
+        // （canTalk 入口闸）；未授权者在 daemon 侧被 canOperate / 命令内管理员闸
+        // 拒绝。@ 别的成员的让路礼仪与 commandTriggers 同款（命令在前的 @参数
+        // 不算让路）。
+        //
+        // 关键：dispatcher 用来取首 token 的 routingText 是热路径轻量窥视——对
+        // post 只拼 text 节点（丢标题、img/file 节点丢弃、段落间无换行），与 daemon
+        // 命令车道的 parseEventMessage 渲染并不逐字相同。因此先用它做廉价候选过滤，
+        // 再用 daemon 车道同一套渲染（daemonCommandLanePreview）重算一次：标题成
+        // 首行、text 紧贴 at 变 `/dash@张三`、图片成 `[图片 N]` 多段等形态下，车道
+        // 解析不出同一条内置命令，群闸就不放行，杜绝「放行后 daemon 落建会话/
+        // auto-worktree」。
+        const builtinMentionlessCommand = isAllowed
+          && (!mentionsOther || commandLeadsMessage)
+          && isBuiltinMentionlessInvocation(triggeredCommand, strippedRoutingText)
+          && builtinMentionlessConfirmedByDaemonLane(data, triggeredCommand)
+          ? triggeredCommand
+          : undefined;
         // replyRootId means this turn has already been explicitly addressed
         // to the bot by shared-topic logic (possibly from inside an existing
         // Lark thread). Do not re-run the generic group @ gate, which would
@@ -5779,12 +5827,20 @@ export function createLarkEventDispatcherRuntime(
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
+          || !!builtinMentionlessCommand
           || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
             `${commandTrigger?.prompt ? '（模板）' : '（原文）'} chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+          );
+        }
+        if (builtinMentionlessCommand) {
+          logger.info(
+            `[builtin-command:${larkAppId}] ${builtinMentionlessCommand} 内置免@ 命中 ` +
+            `source=${routingSource} chat=${chatId.substring(0, 12)} msg=${messageId.substring(0, 12)} ` +
+            `sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
         }
         if (!relax) {
@@ -6233,6 +6289,12 @@ export function createLarkEventDispatcherRuntime(
         const chatId: string | undefined = data?.chat_id;
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
+        // 拉新群时静默带进来的管家（决策看板）：只是进群好之后用自己的身份发消息，
+        // 这次入群不跑入群钩子 / 入群命令 / 拉 owner / 自动开工，不发言也不开会话。
+        if (isStewardSilentJoin(config.session.dataDir, larkAppId, chatId)) {
+          logger.info(`[steward-join] joined chat=${chatId.substring(0, 12)} silently as a steward; skipping group-join actions`);
+          return;
+        }
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
         // chat.bot_added 观察钩子：拉群信号（应急群自动化的触发点之一）。
         // 放在 scheduleAckSafeEvent 的去重 claim 之后，重推不会重复发射。

@@ -42,6 +42,15 @@ describe('current execution proof', () => {
     expect(JSON.stringify(ds)).toBe(before);
   });
 
+  it('returns the execution identity reference when a follow-up keeps the original principal', async () => {
+    const { ds, input } = fixture();
+    ds.managedTurnOrigin.identityTurnId = 'original-turn';
+    const proof = resolveDaemonCurrentExecution(input);
+    expect(proof).toEqual({ ...document, identityTurnId: 'original-turn' });
+    expect(await resolveCurrentExecution({ ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a',
+      fetchImpl: async () => new Response(JSON.stringify(proof), { status: 200 }) })).toEqual(proof);
+  });
+
   it.each(['old-descendant', 'recycled-cli', 'recycled-peer', 'worker-generation', 'disconnected', 'revoked', 'wrong-session', 'invalid-attempt'])(
     'rejects %s', (reason) => {
       const { ds, input, proc } = fixture();
@@ -80,7 +89,8 @@ describe('current execution proof', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('http://127.0.0.1:12345/api/current-execution');
     expect(fetchImpl.mock.calls[0][1]).toMatchObject({ redirect: 'error', body: '{"sessionId":"session-a"}' });
     for (const change of [{ larkAppId: 'cli_b' }, { sessionId: 'session-b' }, { capability: 'secret' },
-      { workerGeneration: 0 }, { dispatchAttempt: -1 }, { status: 'blocked' }, { schema: 'botmux.current-actor.v2' }]) {
+      { workerGeneration: 0 }, { dispatchAttempt: -1 }, { identityTurnId: '' }, { identityTurnId: 'bad\nturn' },
+      { status: 'blocked' }, { schema: 'botmux.current-actor.v2' }]) {
       fetchImpl.mockResolvedValueOnce(new Response(JSON.stringify({ ...document, ...change }), { status: 200 }));
       await expect(resolveCurrentExecution(options)).rejects.toThrow('current_execution_unverified');
     }

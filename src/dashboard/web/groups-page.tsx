@@ -67,6 +67,7 @@ import {
   planAddBotsFollowup,
   roleKey,
   roleProfileBootstrapStatus,
+  stewardJoinNotes,
   summarizeAddBotsResult,
   suggestRoleProfileIdFromChat,
   type AddBotsSummary,
@@ -385,6 +386,7 @@ function CreateDialog(props: {
     const invalidBots = (success.invalidBotIds ?? []) as string[];
     const invalidUsers = (success.invalidUserIds ?? []) as string[];
     const binds = Array.isArray(success.oncallBindings) ? success.oncallBindings as any[] : [];
+    const stewardNotes = stewardJoinNotes(success.stewardJoins, props.bots);
     const bindOk = binds.filter(b => b?.ok).length;
     const bindFailed = binds.filter(b => !b?.ok);
     const profileStatus = roleProfileBootstrapStatus(
@@ -431,6 +433,7 @@ function CreateDialog(props: {
           )
         ) : null}
         {profileStatus ? <p className={profileStatus.kind === 'ok' ? 'hint-ok' : 'hint-warn'}>{profileStatus.text}</p> : null}
+        {stewardNotes.map(note => <p key={note.larkAppId} className={note.kind === 'ok' ? 'hint-ok' : 'hint-warn'}>{note.text}</p>)}
         {invalidBots.length || invalidUsers.length ? (
           <ul>
             {invalidBots.length ? <li>无效 bot id: <code>{invalidBots.join(', ')}</code></li> : null}

@@ -165,6 +165,16 @@ export function sessionScopeUnitName(sessionId: string): string {
   return `botmux-session-${safe || 'unknown'}.scope`;
 }
 
+const SESSION_SCOPE_UNIT_RE = /^botmux-session-[a-z0-9_.-]+\.scope$/;
+
+/** Whether a systemd unit is a per-session cleanup scope botmux itself created
+ *  (see {@link sessionScopeUnitName} / {@link wrapCommandInSessionScope}). The
+ *  fleet cgroup move may leave ONLY one of these: every other unit was chosen
+ *  by whoever launched the supervisor and must keep owning it. */
+export function isBotmuxSessionScopeUnit(unit: string): boolean {
+  return SESSION_SCOPE_UNIT_RE.test(unit);
+}
+
 export interface ScopedCommand {
   bin: string;
   args: string[];

@@ -12,6 +12,7 @@ import { join, delimiter } from 'node:path';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
+import { restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote } from '../src/services/restart-interruption.js';
 
 function harness(extra: Record<string, unknown> = {}) {
   const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: true });
@@ -59,6 +60,93 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
 }
 
 describe('auto-model Worker admission and original-input retirement', () => {
+  it('does not admit a follow-up on the stale composer after the first input was submitted', async () => {
+    const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+    h.scope.backend.captureViewportAsync = async () => '◆ Working… (2s • esc to interrupt)';
+    expect(await h.admit()).toBe(true);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
+  it.each([
+    { name: 'Herdr viewport', authoritative: true, capture: 'captureViewport' },
+    { name: 'Herdr current screen', authoritative: true, capture: 'captureCurrentScreen' },
+    { name: 'ZMX snapshot', authoritative: false, capture: 'captureViewport' },
+  ])('$name holds successors until activity or terminal, while permitting exact recovery', async ({ authoritative, capture }) => {
+    for (const waiting of ['submitted', 'switched']) {
+      const syncRead = vi.fn(() => '❯ Ask anything');
+      const h = admissionHarness({ backend: { [capture]: syncRead },
+        backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative });
+      const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+      controller.beginTurn('turn');
+      if (waiting === 'submitted') controller.markInputSubmitted('turn');
+      else expect(controller.commitSwitch(action)).toBe(true);
+      expect(controller.awaitingModelActivity()).toBe(true);
+      expect(await h.admit()).toBe(false);
+      expect(h.scope.pendingMessages).toEqual([h.item]);
+      h.scope.pendingMessages[0] = { content: 'continue', turnId: 'turn', traexAutoModelRecovery: true };
+      expect(await h.admit()).toBe(true);
+      h.scope.pendingMessages[0] = { content: 'unrelated recovery', turnId: 'other', traexAutoModelRecovery: true };
+      expect(await h.admit()).toBe(false);
+      h.scope.pendingMessages[0] = h.item;
+      controller.observeCapacityQueue({ turnId: 'turn', queued: false, progressing: true, nowMs: 1 });
+      expect(await h.admit()).toBe(true);
+      controller.markInputSubmitted('turn');
+      expect(await h.admit()).toBe(false);
+      controller.endTurn('turn');
+      expect(await h.admit()).toBe(true);
+      expect(syncRead).not.toHaveBeenCalled();
+    }
+  });
+
+  it('releases a parked legacy successor once model activity clears the awaiting latch', async () => {
+    const h = harness();
+    h.controller.commitSwitch(action);
+    const screen = '⠋ Any second now…\nQueued for next turn\nContext 65% left';
+    expect(traexModelProgressVisible(screen)).toBe(false);
+    expect(traexQueuedTypeAheadVisible(screen)).toBe(true);
+    Object.assign(h.scope, { isPromptReady: false, currentBotmuxTurnId: 'turn',
+      traexCapacityQueueVisible, traexCapacityQueuePosition: () => undefined,
+      traexModelProgressVisible, traexQueuedTypeAheadVisible, flushPending: vi.fn() });
+    const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
+    observe(screen);
+    expect(h.controller.awaitingModelActivity()).toBe(false);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    observe(screen);
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an async viewport result captured before a model switch', async () => {
+    let finish!: (screen: string) => void;
+    const h = admissionHarness({ backend: { captureViewportAsync: () => new Promise<string>(resolve => { finish = resolve; }) } });
+    const controller = h.scope.traexAutoModelController as TraexAutoModelController;
+    controller.beginTurn('turn');
+    const pending = h.admit();
+    expect(controller.commitSwitch(action)).toBe(true);
+    finish('◆ Working… (2s • esc to interrupt)');
+    expect(await pending).toBe(false);
+    expect(controller.currentModel()).toBe('backup');
+    expect(controller.awaitingModelActivity()).toBe(true);
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+  });
+
+  it('uses the authoritative terminal to release awaiting input when the ready observer is skipped', async () => {
+    const h = harness();
+    h.controller.markInputSubmitted('turn');
+    Object.assign(h.scope, { isPromptReady: true });
+    loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope)('◆ Working… (2s • esc to interrupt)');
+    expect(h.controller.awaitingModelActivity()).toBe(true);
+    const admission = admissionHarness({ traexAutoModelController: h.controller,
+      backend: { captureViewportAsync: async () => '❯ Ask anything' } });
+    expect(await admission.admit()).toBe(false);
+    h.controller.endTurn('turn');
+    expect(h.controller.awaitingModelActivity()).toBe(false);
+    expect(await admission.admit()).toBe(true);
+  });
+
   it('recovers the actual live model and its settings after a worker upgrade, and persists a same-model hold change', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000,
       modelSettings: { core: { reasoningEffort: 'high', modelBackendVariant: 'max' },
@@ -106,9 +194,68 @@ describe('auto-model Worker admission and original-input retirement', () => {
     expect(h.tracker.onCliExit()).toBe(0);
     expect(h.scope.restartCliProcess).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       exactResumeSessionId: 'native', skipRestartBudget: true, preservePending: true,
+      restartCause: 'traex-auto-model',
     }));
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(false);
     expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it('keeps interruption scanning enabled when rename timeout resets the model with an unfinished predecessor', async () => {
+    vi.useFakeTimers();
+    try {
+      const successor = { content: 'next ask', turnId: 'next' };
+      const h = harness({ pendingMessages: [successor] });
+      expect(h.controller.commitSwitch(action)).toBe(true);
+      h.scope.lastInitConfig.model = 'backup';
+      Object.assign(h.scope, {
+        isPromptReady: false, queuedTypeAheadTurns: [], traexAutoModelInputHold: () => true,
+        sessionRenamePhase: 'sent', sessionRenameIdleTimer: null, SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
+        executeTraexAutoModelSwitch: h.switchModel,
+      });
+      const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+      h.scope.flushPending = vi.fn(() => reset());
+      expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
+      loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
+      // advanceTimersToNextTimerAsync is available on both vitest and the
+      // bun:test shim (runOnlyPendingTimersAsync is not); here the rename
+      // timeout is the single pending timer, so they are equivalent.
+      await vi.advanceTimersToNextTimerAsync();
+
+      expect(h.scope.flushPending).toHaveBeenCalledOnce();
+      expect(h.controller.currentModel()).toBe('core');
+      expect(h.scope.pendingMessages).toEqual([successor]);
+      expect(h.scope.restartCliProcess).toHaveBeenCalledOnce();
+      const restartOptions = h.scope.restartCliProcess.mock.calls[0][1];
+      expect(restartOptions.exactResumeSessionId).toBe('native');
+      expect(restartOptions).not.toHaveProperty('restartCause');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still delivers unfinished work saved by an earlier crash when an Auto continuation is queued', () => {
+    const h = harness();
+    const work = { turnOpen: true, tasks: [{ taskId: 'previous-task', kind: 'shell' as const }] };
+    Object.assign(h.scope, {
+      pendingRestartInterruption: work, reportedInterruptedTaskIds: new Set(),
+      restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote,
+      cliName: () => 'TRAE',
+    });
+    expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
+    const recovery = h.scope.pendingMessages[0];
+    loadWorkerFunction<() => void>('deliverRestartInterruptionNote', h.scope)();
+    expect(h.scope.pendingMessages).toEqual([recovery]);
+    expect(recovery).toMatchObject({
+      turnId: 'turn', traexAutoModelRecovery: true, noReplay: true,
+      logicalContent: 'worker.traex_auto_model.continue_prompt',
+    });
+    expect(recovery.content).toBe(`${restartInterruptionNote(work)}\n\n${recovery.logicalContent}`);
+    expect(h.scope.send).toHaveBeenLastCalledWith({
+      type: 'user_notify', turnId: 'turn',
+      message: restartInterruptionNotice(work, { cliName: 'TRAE', noteDelivered: true }),
+    });
+    expect(h.scope.pendingRestartInterruption).toBeUndefined();
+    expect(h.scope.reportedInterruptedTaskIds.has('previous-task')).toBe(true);
   });
 
   it.each([
@@ -341,7 +488,7 @@ describe('Auto live follow-up input policy', () => {
     let frame = '❯ Ask anything';
     Object.assign(h.scope, { isPromptReady: false, backend: {}, commandLineWritesPending: 0,
       currentBotmuxTurnId: 'turn', captureBackendScreen: () => frame,
-      traexCapacityQueueVisible, traexModelProgressVisible, traexCapacityQueuePosition: () => undefined,
+      traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible, traexCapacityQueuePosition: () => undefined,
       flushPending: vi.fn(async () => {}), publishActiveRuntime: vi.fn() });
     const hold = loadWorkerFunction<() => boolean>('traexAutoModelInputHold', h.scope);
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', h.scope);
@@ -508,7 +655,7 @@ describe('Worker read-only capacity query', () => {
       cliAdapter: { resolvedBin: 'traex' }, buildSessionChildEnv, botInjectedEnv,
       process: { env: { HTTP_PROXY: 'host-proxy', API_TOKEN: 'host-token', KEEP: 'yes' } },
       traexCapacityQueueVisible: () => true, traexCapacityQueuePosition: () => undefined,
-      traexModelProgressVisible: () => false, readTraexModelLoads: read,
+      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false, readTraexModelLoads: read,
       executeTraexAutoModelSwitch: vi.fn(), publishActiveRuntime: vi.fn(), send: vi.fn(), log: vi.fn(),
     };
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
@@ -748,6 +895,19 @@ describe('live-only model effort on capacity switch', () => {
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
     expect(h.scope.lastInitConfig.reasoningEffort).toBe('xhigh');
   });
+});
+
+
+it('preserves handwritten shared effort when switching to a known model with a stale static table', () => {
+  const h = harness({ cliModelSupportsReasoningEffort: () => false });
+  const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'gpt-6-astra'], queueTimeoutMs: 5_000 },
+    undefined, { reasoningEffort: 'ultra' });
+  controller.beginTurn('turn');
+  h.scope.traexAutoModelController = controller;
+  h.scope.lastInitConfig.reasoningEffort = 'ultra';
+  expect(h.switchModel({ ...action, toModel: 'gpt-6-astra' }, { resumeCurrentTurn: true })).toBe(true);
+  expect(h.scope.lastInitConfig.reasoningEffort).toBe('ultra');
+  expect(h.scope.restartCliProcess).toHaveBeenCalledOnce();
 });
 
 describe('Auto legacy parked-input admission', () => {

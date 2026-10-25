@@ -7,6 +7,7 @@ import {
   writeManagedOriginAttestationProof,
 } from '../../src/core/managed-origin-attestation.js';
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
+import { enforceFinalLinkIntegrity } from '../../src/services/final-link-integrity.js';
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -120,18 +121,26 @@ if (process.env.BOTMUX_TEST_DURABLE_SEND === '1' || process.env.BOTMUX_TEST_LINK
       };
       try {
         const payload = body?.payload ?? {};
+        const expanded = {
+          ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
+          ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
+          ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
+          ...(payload.completionProposal === undefined
+            ? {}
+            : { completionProposal: walk(payload.completionProposal) }),
+          ...(payload.expectedLinks === undefined
+            ? {}
+            : { expectedLinks: payload.expectedLinks.map(expand) }),
+        };
+        enforceFinalLinkIntegrity({
+          payload: expanded,
+          responseKind: body?.responseKind,
+          registeredUrls: exactUrl ? [exactUrl] : [],
+        });
         return new Response(JSON.stringify({
           ok: true,
           payload: {
-            ...(payload.text === undefined ? {} : { text: expand(payload.text) }),
-            ...(payload.preparedText === undefined ? {} : { preparedText: expand(payload.preparedText) }),
-            ...(payload.card === undefined ? {} : { card: walk(payload.card) }),
-            ...(payload.completionProposal === undefined
-              ? {}
-              : { completionProposal: walk(payload.completionProposal) }),
-            ...(payload.expectedLinks === undefined
-              ? {}
-              : { expectedLinks: payload.expectedLinks.map(expand) }),
+            ...expanded,
             refCount: 1,
           },
         }), { status: 200, headers: { 'content-type': 'application/json' } });

@@ -13,11 +13,41 @@ import {
   restartInterruptionNotice,
   restartNoteInput,
   restartNoteMayPrefix,
+  shouldSuppressRestartInterruptionScan,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
 } from '../src/services/restart-interruption.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
+
+describe('shouldSuppressRestartInterruptionScan', () => {
+  // Full truth table: cause, CLI, requested-id presence and id equality.
+  // Both ids undefined satisfy equality but must still leave scanning enabled.
+  it.each([
+    [true, 'traex-auto-model', 'traex', 'native', 'native'],
+    [false, 'traex-auto-model', 'traex', 'native', 'other'],
+    [false, 'traex-auto-model', 'traex', undefined, undefined],
+    [false, 'traex-auto-model', 'traex', undefined, 'native'],
+    [false, 'traex-auto-model', 'codex', 'native', 'native'],
+    [false, 'traex-auto-model', 'codex', 'native', 'other'],
+    [false, 'traex-auto-model', 'codex', undefined, undefined],
+    [false, 'traex-auto-model', 'codex', undefined, 'native'],
+    [false, undefined, 'traex', 'native', 'native'],
+    [false, undefined, 'traex', 'native', 'other'],
+    [false, undefined, 'traex', undefined, undefined],
+    [false, undefined, 'traex', undefined, 'native'],
+    [false, undefined, 'codex', 'native', 'native'],
+    [false, undefined, 'codex', 'native', 'other'],
+    [false, undefined, 'codex', undefined, undefined],
+    [false, undefined, 'codex', undefined, 'native'],
+    [false, 'traex-auto-model', 'traex', 'native', undefined],
+  ] as const)('suppress=%s with cause=%s, CLI=%s, requested=%s, effective=%s',
+    (suppress, restartCause, cliId, exactResumeSessionId, effectiveCliSessionId) => {
+      expect(shouldSuppressRestartInterruptionScan({
+        restartCause, cliId, exactResumeSessionId, effectiveCliSessionId,
+      })).toBe(suppress);
+    });
+});
 
 // Record shapes follow Claude Code 2.1.305 transcripts from the 10-21 tmux
 // server loss (ids and texts are synthetic).

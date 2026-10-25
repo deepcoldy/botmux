@@ -34,6 +34,7 @@
 | `/quote <指令>` | 同上，但选完话题直接执行你的指令，省一个来回。话题内容仍然会被明确标注为「资料而不是指令」注入 |
 | `/sessions` | 列出当前机器人在本群的活跃话题会话，可直接回到原话题（旧会话安全降级为定位通知） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
+| `/dash` | 等价于 `/dashboard link`：私密返回当前 Dashboard 管理首页完整链接 `http://<主机>:<端口>/?t=<token>#/`（普通群仅你可见的临时卡，话题群/话题回复/单聊走私聊；仅 allowedUsers；不创建会话或 worktree；token 轮换后重发即得新链接） |
 | `@机器人 /project enable\|status\|roles\|disable` | 在当前普通群启用、查看、配置 Agent 角色或退出项目群模式（仅 owner/allowedUsers；不占用会话槽位） |
 | `@机器人 /context-sharing on\|off\|status` | 开启、关闭或查看当前群的后台上下文共享（默认关闭；仅 owner/allowedUsers；不创建会话或启动额外模型回合） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |

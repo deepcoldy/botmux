@@ -6,11 +6,13 @@ import { attestCurrentExecutionLoopbackPeer, type CurrentTurnPeerAttestationInpu
 export function resolveDaemonCurrentExecution(input: CurrentTurnPeerAttestationInput): CurrentExecutionDocument | null {
   const proof = attestCurrentExecutionLoopbackPeer(input);
   if (!proof || proof.ds.session.sessionId !== input.sessionId || proof.ds.worker?.connected === false) return null;
+  const identityTurnId = proof.ds.managedTurnOrigin?.identityTurnId;
   const document = {
     schema: CURRENT_EXECUTION_SCHEMA, status: 'verified' as const,
     larkAppId: proof.ds.larkAppId, sessionId: input.sessionId, chatId: proof.ds.chatId,
     turnId: proof.turnId, workerGeneration: proof.generation,
     ...(proof.dispatchAttempt !== undefined ? { dispatchAttempt: proof.dispatchAttempt } : {}),
+    ...(identityTurnId ? { identityTurnId } : {}),
   };
   return isCurrentExecutionDocument(document) ? document : null;
 }

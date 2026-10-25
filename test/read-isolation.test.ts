@@ -1114,7 +1114,7 @@ describe('CLI protected capability wiring', () => {
    * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
    * command line) constructs a frozen origin, and only its `/api/turn-idle` call
    * passes one. Wire a caller-supplied origin into `send` / reply / relay (or into
-   * the session-ready call, or into any new transport call) and one of these
+   * the session-ready or claude-stop-failure call, or into any new transport call) and one of these
    * assertions goes red — the mention/ carrier sets are computed from the source,
    * not from a substring's presence.
    */
@@ -1134,12 +1134,14 @@ describe('CLI protected capability wiring', () => {
     expect(producers).toHaveLength(1);
     const versionCheckAt = code.lastIndexOf('TURN_IDLE_PROTOCOL_VERSION', producers[0].index!);
     expect(enclosingFunctionName(code, versionCheckAt)).toBe('cmdTurnIdle');
-    // …and exactly two carriers. session-ready passes NO opts (so it must resolve
-    // the live origin itself); turn-idle passes the frozen one.
+    // …and exactly three carriers. session-ready and claude-stop-failure pass NO
+    // opts (so they must resolve the live origin themselves); turn-idle passes
+    // the frozen one.
     expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
       .map(m => enclosingFunctionName(code, m.index!)).sort())
-      .toEqual(['cmdSessionReady', 'cmdTurnIdle']);
+      .toEqual(['cmdClaudeStopFailure', 'cmdSessionReady', 'cmdTurnIdle']);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/session-ready', \{[^}]*\}\);/);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/claude-stop-failure', \{[^}]*\}\);/);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/turn-idle', \{[^}]*\}, \{\s*frozenOrigin\s*\}\);/);
   });
 });

@@ -1,6 +1,7 @@
 /**
  * 每个本机 bot 管理员（allowedUsers）的 union_id 快照——同机兄弟 bot 判断「对方的管理员是不是
- * 都是我的管理员」的依据（见 event-dispatcher 的 isTrustedSameOwnerSiblingBot）。
+ * 都是我的管理员」的依据（见 event-dispatcher 的 isTrustedSameOwnerSiblingBot）；拉新群时认
+ * 「新群属于哪个管家的 owner」也读这里的 owner（见 services/steward-auto-join.ts）。
  *
  * 为什么要单独存：allowedUsers 里同一个人可能写成邮箱、手机号、on_ 或 ou_，形态不同没法
  * 直接比；ou_ 还只对签发它的应用有效（见 setup/owner-identity.ts），跨应用只能比 union_id。
@@ -27,12 +28,15 @@ export interface BotAdminUnionsSnapshot {
    * 少了人：作为接收方只会少信任，作为发送方则无法证明「对方的管理员都在我这儿」，不授信。
    */
   exact: boolean;
+  /** 本 bot 当前 owner（getOwnerOpenId）的 union_id；没换出来就没有。管家拉群按它认 owner。 */
+  owner?: string;
   updatedAt: number;
 }
 
 export interface BotAdminUnions {
   admins: Set<string>;
   exact: boolean;
+  owner?: string;
 }
 
 function dirPath(dataDir: string): string {
@@ -60,6 +64,8 @@ export function adminListFingerprint(rawAllowedUsers: readonly string[]): string
  *   即使不在映射里也按自身处理（解析器对字面 ou_ 恒原样保留）。
  * @param lookupUnion  用本 app 凭证把 ou_ 换成 union_id：string = 拿到；null = 确定拿不到
  *   （不可见 / 缺权限，不必重试）；undefined = 这次没拿到（网络等，稍后重试）。
+ * @param ownerOpenId  本 bot 当前 owner 的 ou_（daemon 的 getOwnerOpenId，必然是某个有效管理员），
+ *   它换出的 union_id 记进 `owner`。
  * @returns `complete=false` 表示有条目这次没拿到 union_id，值得稍后重试；快照里的 `exact`
  *   另算：确定拿不到（null）也会让 exact 为 false。
  */
@@ -68,8 +74,10 @@ export async function computeBotAdminUnions(
   resolution: ReadonlyMap<string, string>,
   lookupUnion: (openId: string) => Promise<string | null | undefined>,
   now: number = Date.now(),
+  ownerOpenId?: string,
 ): Promise<{ snapshot: BotAdminUnionsSnapshot; complete: boolean }> {
   const admins: string[] = [];
+  let owner: string | undefined;
   let complete = true;
   let exact = true;
   const entries = rawAllowedUsers.map(e => (typeof e === 'string' ? e.trim() : '')).filter(Boolean);
@@ -82,10 +90,11 @@ export async function computeBotAdminUnions(
       if (union === undefined) complete = false;
       continue;
     }
+    if (!owner && ownerOpenId && openId === ownerOpenId) owner = union;
     if (!admins.includes(union)) admins.push(union);
   }
   return {
-    snapshot: { fingerprint: adminListFingerprint(entries), admins, exact, updatedAt: now },
+    snapshot: { fingerprint: adminListFingerprint(entries), admins, exact, ...(owner ? { owner } : {}), updatedAt: now },
     complete,
   };
 }
@@ -118,14 +127,16 @@ export function readBotAdminUnions(
     ? snap.admins.filter((u: unknown): u is string => typeof u === 'string' && u.startsWith('on_'))
     : [];
   const exact = snap.exact === true && Array.isArray(snap.admins) && admins.length === snap.admins.length;
-  return { admins: new Set(admins), exact };
+  // owner 必须是快照里的管理员之一：手改文件塞进一个别人的 union_id 不会被当成 owner。
+  const owner = typeof snap.owner === 'string' && admins.includes(snap.owner) ? snap.owner : undefined;
+  return { admins: new Set(admins), exact, ...(owner ? { owner } : {}) };
 }
 
 export interface BotAdminUnionsPublisherDeps {
   dataDir: string;
   larkAppId: string;
-  /** 本 bot 此刻的 allowedUsers 原文与解析结果；拿不到（bot 不在了）返回 undefined。 */
-  readState: () => { rawAllowedUsers: readonly string[]; resolution: ReadonlyMap<string, string> } | undefined;
+  /** 本 bot 此刻的 allowedUsers 原文、解析结果与当前 owner；拿不到（bot 不在了）返回 undefined。 */
+  readState: () => { rawAllowedUsers: readonly string[]; resolution: ReadonlyMap<string, string>; ownerOpenId?: string } | undefined;
   /** 同 {@link computeBotAdminUnions} 的 lookupUnion。 */
   lookupUnion: (openId: string) => Promise<string | null | undefined>;
   onError?: (err: unknown) => void;
@@ -133,7 +144,7 @@ export interface BotAdminUnionsPublisherDeps {
 
 /**
  * daemon 侧的发布器：`publish()` 可以反复调用（启动解析完成后一次、之后每个心跳一次），
- * 只有 allowedUsers 原文或解析结果变了才重算、写盘；上一轮有条目暂时没拿到 union_id 时
+ * 只有 allowedUsers 原文、解析结果或 owner 变了才重算、写盘；上一轮有条目暂时没拿到 union_id 时
  * 下次再试。同一时刻只跑一轮。ou_ → union_id 的结果按 ou_ 缓存在进程内。
  */
 export function createBotAdminUnionsPublisher(deps: BotAdminUnionsPublisherDeps): { publish: () => Promise<void> } {
@@ -154,9 +165,10 @@ export function createBotAdminUnionsPublisher(deps: BotAdminUnionsPublisherDeps)
         // 调用方都是 `void publish()`（启动一次 + 每个心跳），任何异常都必须在这里接住。
         const state = deps.readState();
         if (!state) return;
-        const key = JSON.stringify([state.rawAllowedUsers, [...state.resolution]]);
+        const key = JSON.stringify([state.rawAllowedUsers, [...state.resolution], state.ownerOpenId ?? null]);
         if (key === publishedKey) return;
-        const { snapshot, complete } = await computeBotAdminUnions(state.rawAllowedUsers, state.resolution, lookup);
+        const { snapshot, complete } = await computeBotAdminUnions(
+          state.rawAllowedUsers, state.resolution, lookup, Date.now(), state.ownerOpenId);
         writeBotAdminUnions(deps.dataDir, deps.larkAppId, snapshot);
         if (complete) publishedKey = key;
       } catch (err) {

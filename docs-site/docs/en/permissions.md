@@ -81,6 +81,20 @@ How it decides:
 
 Switch: Dashboard "Bot settings → Access & quota → Trust bots on this machine with the same owner", `trustSameOwnerBots: false` in `bots.json`, or `/botconfig set trustSameOwnerBots off`. When off, every bot on this machine can only talk (picking a repository with `/repo` is not affected by this switch).
 
+## Grant-delegate bots `grantDelegateBots`
+
+The **second delegation source** besides same-owner bots on this machine: an explicit list of external bots the owner trusts, independent of `trustSameOwnerBots` (each switch governs only its own source). The delegated grant itself works exactly as in the previous section — only "who counts as a delegate" differs.
+
+External platforms often create a group with their own bot and post a kickoff card that @mentions this bot, naming the person making the request in the same card. In restricted mode that person then hits the talk gate when they @mention this bot and must wait for the owner to click an approval card. Listing the platform bot removes that round-trip:
+
+- Entries are the trusted bot's open_id as seen by this bot (`ou_` form) or its app_id (`cli_` form); entries are trimmed and blank ones dropped.
+- When a listed bot posts a group message that **@mentions this bot**, everyone else it @mentions in the same message automatically gets a **chat-scoped talk grant**, identical to the owner clicking **Grant in this chat** on the grant card: written to `chatGrants`, talk-only (never management access), with the `/grant` default quota/duration (`messageQuota.defaultLimit` / `grantDefaultDurationMs`; 3 messages / 1 hour when unconfigured). `restrictGrantCommands` applies as usual.
+- A grant-result card is posted as a reply to that message, @mentioning the granted humans (other bots named in the message are shown as plain text without an @mention, so they are not woken by the notification).
+- Skipped for people who can already talk (owner, on-call chat, whole-group open, existing grant, open mode), the sender itself, @all, and blocked users. Group chats only — never in p2p. A delegate bot that is itself on the block list is ignored entirely (blocking it must also stop it from opening the door for others).
+- **Trust boundary**: this hands the listed bots one-shot authority over who can talk to this bot in a given group — whoever they @mention gets a time-bounded, quota-bounded talk grant. List only platform bots you fully trust. They cannot grant management access, cannot write `allowedUsers` / `allowedChatGroups` / `globalGrants`, and the grant is scoped to the group the message was posted in. When unset, behavior is unchanged.
+
+Configure it in the Dashboard ("Bot settings → Access & quota → External bots with delegated grants"), via `grantDelegateBots` in `bots.json`, or with `/botconfig set grantDelegateBots ou_xxx,cli_yyy` (`unset` clears the list).
+
 ## Common questions
 
 - **On-call vs bare `/grant`?** Both grant talk only, never operate. On-call is always allowed with no quota and also binds the group to a working directory (new topics skip repo picking); `/grant` only opens talk and binds no directory.

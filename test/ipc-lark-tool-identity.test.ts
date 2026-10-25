@@ -10,8 +10,11 @@ import * as tokens from '../src/utils/user-token.js';
 import { config } from '../src/config.js';
 import { prepareLarkToolEnv, larkToolBindingPath, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
+import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
+import { buildDocCommentTurnInput } from '../src/core/doc-comment-prompt.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
@@ -24,8 +27,11 @@ beforeEach(async () => {
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
-    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { killed: false },
-    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' },
+    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
+    localProcessAttestation: { backendType: 'pty', workerGeneration: 1,
+      cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
+    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender',
+      preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
@@ -135,7 +141,7 @@ describe('session application identity route', () => {
     await delegate({ targetOpenId: 'ou_later', turnId: 'om_queued' });
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
-    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
@@ -148,6 +154,51 @@ describe('session application identity route', () => {
     const user = await request('user');
     expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
+  });
+  it('uses each document turn author’s own grant without a normal message reply target', async () => {
+    session.session = {
+      sessionId: 'tool-session', status: 'active', ownerOpenId: 'ou_owner',
+      docCommentTargets: {
+        comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a', replyToOpenId: 'ou_author_a' },
+        comment_b: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_b', replyToOpenId: 'ou_author_b' },
+      },
+    };
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async (_app, person) => ({ openId: person, type: 'user' } as any));
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (_app, _secret, _brand, person) => `grant:${person}`);
+    for (const [turnId, author] of [['comment_a', 'ou_author_a'], ['comment_b', 'ou_author_b'], ['comment_a', 'ou_author_a']]) {
+      const { cliInput } = buildDocCommentTurnInput({ ds: session,
+        promptInput: { fileToken: 'file', fileType: 'docx', question: 'Read the author profile', author },
+        botCliId: 'codex', sender: { openId: author, type: 'user' }, mode: 'live', turnId });
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId, capability: 'cap',
+        identityTurnId: turnId, trustedCaller: cliInput.trustedCaller ?? null,
+        callerOpenId: cliInput.trustedCaller?.requestUserOpenId };
+      expect(currentGatewayCallerOpenId(session, turnId)).toBe(author);
+      const response = await request('user');
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ appId: 'cli_bound', credential: `grant:${author}` });
+      expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', author);
+    }
+  });
+  it('does not resolve a comment author’s grant when the identity is not a verified user', async () => {
+    session.session.replyTargets = undefined;
+    session.session.docCommentTargets = {
+      comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a', replyToOpenId: 'ou_bot' },
+    };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'comment_a', capability: 'cap', callerOpenId: currentGatewayCallerOpenId(session, 'comment_a') };
+    vi.spyOn(identities, 'getIdentity').mockReturnValue(undefined);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_bot', type: 'bot' } as any);
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('never substitutes the document session owner for an unknown comment author', async () => {
+    session.session.replyTargets = undefined;
+    session.session.ownerOpenId = 'ou_owner';
+    session.session.docCommentTargets = {
+      comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a' },
+    };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'comment_a', capability: 'cap', callerOpenId: currentGatewayCallerOpenId(session, 'comment_a') };
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
   it('rejects another session key and an application mismatch', async () => {
     expect((await request('bot', '00'.repeat(32))).status).toBe(403);
@@ -230,6 +281,57 @@ describe('session application identity route', () => {
     vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'wrong-turn-token'; });
     const response = await request('user');
     expect(response.status).toBe(409); expect(await response.text()).not.toContain('wrong-turn-token');
+  });
+  it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
+    await delegate();
+    delete session.managedTurnOrigin.callerOpenId;
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+  });
+  it.skipIf(process.platform !== 'linux').each(['generation', 'attempt', 'capability', 'identity'])(
+    'withholds a token when the execution changes during resolution (%s)', async change => {
+      vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+        if (change === 'generation') session.workerGeneration++;
+        if (change === 'attempt') session.managedTurnOrigin.dispatchAttempt = 2;
+        if (change === 'capability') session.managedTurnOrigin.capability = 'next-capability';
+        if (change === 'identity') session.managedTurnOrigin.identityTurnId = 'other-identity';
+        return 'late-token';
+      });
+      const response = await request('user');
+      expect(response.status).toBe(409);
+      expect(await response.text()).not.toContain('late-token');
+    },
+  );
+  it.skipIf(process.platform !== 'linux')('rejects a new tool child of an old shell after another user takes over', async () => {
+    const url = `http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`;
+    const source = `const response = await fetch(${JSON.stringify(url)}, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': ${JSON.stringify(binding.accessKey)} },
+      body: JSON.stringify({ mode: 'user' }) });
+      console.log(JSON.stringify({ status: response.status, body: await response.json() }));`;
+    const shell = spawnTsEvalWithRepoImports(`
+      import { spawnTsEval } from './test/helpers/ts-runner.js';
+      process.once('message', () => {
+        const tool = spawnTsEval(${JSON.stringify(source)}, { stdio: ['ignore', 'inherit', 'inherit'] });
+        tool.once('close', code => process.exit(code ?? 1));
+      });
+      process.send('ready');
+    `, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    let output = '';
+    shell.stdout!.on('data', data => { output += data; });
+    try {
+      await new Promise<void>((resolve, reject) => { shell.once('message', () => resolve()); shell.once('error', reject); });
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_new', callerOpenId: 'ou_new',
+        capability: 'new-capability', preexistingProcessIdentities: [
+          ...session.managedTurnOrigin.preexistingProcessIdentities,
+          `${shell.pid}:${readProcessStartIdentity(shell.pid!)}`,
+        ] };
+      const finished = new Promise<number | null>(resolve => shell.once('close', resolve));
+      shell.send('run');
+      expect(await finished).toBe(0);
+      expect(JSON.parse(output)).toEqual({ status: 403, body: { ok: false, error: 'current_execution_unverified' } });
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    } finally { shell.kill(); }
   });
   it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');

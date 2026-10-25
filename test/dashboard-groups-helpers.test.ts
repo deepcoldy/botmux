@@ -12,6 +12,7 @@ import {
   paginateGroupRows,
   planAddBotsFollowup,
   roleProfileBootstrapStatus,
+  stewardJoinNotes,
   summarizeAddBotsResult,
   suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
@@ -168,6 +169,25 @@ describe('paginateGroupRows — bounded dashboard DOM', () => {
     expect(paginateGroupRows([], 4)).toEqual({
       rows: [], page: 1, totalPages: 1, from: 0, to: 0, total: 0,
     });
+  });
+});
+
+describe('stewardJoinNotes — create-group steward feedback', () => {
+  it('one line per steward: joined is ok, a failed join says the group still exists and why', () => {
+    const bots = [{ larkAppId: 'cli_steward', botName: '管家' }] as any;
+    expect(stewardJoinNotes([
+      { larkAppId: 'cli_steward', ok: true },
+      { larkAppId: 'cli_unknown', ok: false, error: 'invalid_id' },
+    ], bots)).toEqual([
+      { larkAppId: 'cli_steward', kind: 'ok', text: expect.stringContaining('管家') },
+      // 不在 Bot 列表里的按 app_id 显示；失败原因原样带出。
+      { larkAppId: 'cli_unknown', kind: 'warn', text: expect.stringMatching(/cli_unknown.*invalid_id/) },
+    ]);
+  });
+
+  it('no stewards in the result (no steward on this machine) → nothing to show', () => {
+    expect(stewardJoinNotes(undefined, [])).toEqual([]);
+    expect(stewardJoinNotes([{ ok: true }], [])).toEqual([]);
   });
 });
 

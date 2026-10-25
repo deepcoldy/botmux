@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
@@ -641,5 +641,38 @@ describe('dashboard bot payload helpers', () => {
     expect(offlineRow({}).trustSameOwnerBots).toBe(true);
     expect(offlineRow({ trustSameOwnerBots: false }).trustSameOwnerBots).toBe(false);
     expect(offlineRow({ trustSameOwnerBots: 'off' }).trustSameOwnerBots).toBe(true);
+  });
+
+  it('grantDelegateBots is empty by default and a configured list survives offline recovery rows', () => {
+    const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+      { larkAppId: 'cli_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+    );
+    expect(offlineRow({}).grantDelegateBots).toEqual([]);
+    expect(offlineRow({ grantDelegateBots: ['ou_platform_bot', 'cli_platform'] }).grantDelegateBots)
+      .toEqual(['ou_platform_bot', 'cli_platform']);
+    // 非法手改值丢弃，payload 层按缺省（空名单）归一化。
+    expect(offlineRow({ grantDelegateBots: 'ou_platform_bot' }).grantDelegateBots).toEqual([]);
+    expect(botDefaultsPayload({ larkAppId: 'cli_live' }, { grantDelegateBots: ['ou_x', 42] }).grantDelegateBots)
+      .toEqual(['ou_x']);
+  });
+});
+
+describe('mergeBotOncallFields (#2037 codexProfile list round-trip)', () => {
+  it('uses the live codexProfile, including an explicit null that clears it', () => {
+    const d = { larkAppId: 'a', cliId: 'codex', codexProfile: 'saved' as string | undefined };
+    expect(mergeBotOncallFields(d, { codexProfile: 'picked' }).codexProfile).toBe('picked');
+    expect(mergeBotOncallFields(d, { codexProfile: null }).codexProfile).toBeUndefined();
+  });
+  it('falls back to the bots.json value when an old daemon omits the key', () => {
+    const d = { larkAppId: 'a', cliId: 'codex', codexProfile: 'saved' as string | undefined };
+    expect(mergeBotOncallFields(d, { cliId: 'codex' }).codexProfile).toBe('saved');
+  });
+  it('never revives other explicit-null fields and keeps non-profile fields intact', () => {
+    const d = { larkAppId: 'a', cliId: 'codex', cliRuntime: { id: 'x', executable: '/x' }, model: 'old', dshRuntime: null as any };
+    const merged = mergeBotOncallFields(d, { cliRuntime: null, model: 'new', turnTimeoutMs: 60000 });
+    expect(merged.cliRuntime).toBeUndefined();
+    expect(merged.model).toBe('new');
+    expect(merged.turnTimeoutMs).toBe(60000);
   });
 });

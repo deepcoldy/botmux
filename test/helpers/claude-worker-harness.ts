@@ -130,6 +130,35 @@ const runTurn = (prompt, reply) => {
     ev({ kind: 'turn', reply });
   }, cfg.turnMs);
 };
+// A turn that ends on an API error the way Claude 2.1.296 writes it ("API
+// Error: Connection lost mid-response."): a thinking block, then the error
+// record and turn_duration. quietMs first parks the turn on a quiet, non-busy screen
+// mid-work, which the worker reads as the turn ending.
+const failTurn = (prompt, quietMs) => {
+  busy = true;
+  record({ type: 'user', message: { role: 'user', content: prompt } });
+  render();
+  let spinner = setInterval(render, 300);
+  setTimeout(() => {
+    record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_fake', name: 'Bash', input: {} }], stop_reason: 'tool_use' } });
+    clearInterval(spinner);
+    busy = !quietMs;
+    render();
+    setTimeout(() => {
+      busy = true;
+      spinner = setInterval(render, 300);
+      setTimeout(() => {
+        clearInterval(spinner);
+        record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'thinking', thinking: 'next step' }], stop_reason: 'end_turn' } });
+        record({ type: 'assistant', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error: Connection lost mid-response. The response above may be incomplete.' }], stop_reason: 'stop_sequence' } });
+        record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
+        busy = false;
+        render();
+        ev({ kind: 'turn-failed', prompt });
+      }, cfg.turnMs);
+    }, quietMs || 0);
+  }, cfg.turnMs);
+};
 const command = (name, value) => {
   record({ type: 'user', message: { role: 'user', content: '<command-name>' + name + '</command-name>\\n<command-args>' + (value || '') + '</command-args>' } });
   record({ type: 'user', message: { role: 'user', content: '<local-command-stdout></local-command-stdout>' } });
@@ -146,6 +175,8 @@ const submit = () => {
     record({ type: 'system', subtype: 'compact_boundary', compactMetadata: { trigger: 'manual' } });
     record({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued from a previous conversation.' } });
   } else if (m) command('/' + m[1], m[2]);
+  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
+  else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
   else { runTurn(text, 'reply: ' + text); return; }
   ev({ kind: 'command', text });
   render();
@@ -192,6 +223,8 @@ export interface Harness {
   killCli: () => void;
   /** When the fake finished `kind` (a command, or the turn that replied `text`). */
   doneAt: (kind: 'command' | 'turn', text: string) => number | undefined;
+  /** When a turn started with a FAIL… prompt ended on its API error. */
+  failedAt: (prompt: string) => number | undefined;
   startWorker: (init?: Partial<Extract<DaemonToWorker, { type: 'init' }>>) => Generation;
 }
 
@@ -313,6 +346,7 @@ child.on('exit', code => process.exit(code ?? 1));
     commands: () => readEvents().filter(e => e.kind === 'command').map(e => e.text as string),
     launches: () => readEvents().filter(e => e.kind === 'start').map(e => ({ sid: e.sid as string, args: e.args as string[] })),
     doneAt: (kind, text) => readEvents().find(e => e.kind === kind && (kind === 'command' ? e.text === text : e.reply === text))?.t,
+    failedAt: prompt => readEvents().find(e => e.kind === 'turn-failed' && e.prompt === prompt)?.t,
     startWorker: (init = {}) => {
       const messages: WorkerToDaemon[] = [];
       const logs: string[] = [];

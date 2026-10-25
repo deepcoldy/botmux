@@ -818,7 +818,9 @@ export interface DaemonSession {
     /** Unguessable Seatbelt pane/profile authority channel. */
     originChannelId?: string;
     turnId?: string;
+    identityTurnId?: string;
     dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller | null;
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
@@ -829,6 +831,47 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Worker-reported identity storage decision for the CURRENT worker
+   *  generation. Only the worker knows the effective spawn shape (the
+   *  BOTMUX_SANDBOX override, remote-backend bypass, whether bwrap/Seatbelt
+   *  really engaged, and whether the daemon loopback is reachable inside the
+   *  spawn), so the daemon publishes identity material per this report instead
+   *  of deriving sandbox facts itself. Absent (nothing reported yet, or after a
+   *  daemon restart) is consumed fail-closed: publication uses the legacy
+   *  'single' shape and the proven content route refuses. `conflict` marks a
+   *  report the daemon's structural binding check cannot honor (e.g. binding
+   *  disabled after restart): identity publication is withheld on both models
+   *  until a live worker reports again. */
+  reportedIdentityModel?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    sandboxEngaged: boolean;
+    loopbackShared: boolean;
+    workerPid: number;
+    workerGeneration: number;
+    reportedAt: number;
+    conflict?: string;
+  };
+  /** Model used by the daemon's LAST actual identity publication for this
+   *  session (in-memory; absent before the first publish or after restart).
+   *  This — not the previous report value — is the flip baseline: after a
+   *  daemon restart the accept-time publication is written single before the
+   *  worker re-reports proven, and that must still count as a real flip even
+   *  though no prior report exists. */
+  lastPublishedIdentityModel?: import('./lark-tool-binding.js').IdentityStorageModel;
+  /** Last replay outcome of the identity-decision flip handler. A successful
+   *  replay moves the publication baseline (so identical reports stop
+   *  flipping); recording `ok:false` lets a later report of the OTHER model
+   *  heal the purge a failed attempt performed. */
+  lastIdentityDecisionRepublish?: {
+    model: import('./lark-tool-binding.js').IdentityStorageModel;
+    turnId: string;
+    ok: boolean;
+  };
+  /** Bounded set of turns the CURRENT worker generation has already sent
+   *  turn_terminal for. Refuses an identity-decision flip replay for a turn
+   *  that is over: a late spawn decision must not resurrect a terminal turn's
+   *  credentials or pin its proven material against GC. FIFO-trimmed. */
+  terminalIdentityTurnIds?: Set<string>;
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
