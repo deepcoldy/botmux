@@ -1195,9 +1195,8 @@ function BotDefaultsCard(props: {
             {herdrConfigVisible(bot) ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('herdr')}><HerdrConfigSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
-                选了别的 agent 就隐藏，避免无效开关。 */}
-            {bot.cliId === 'codex-app' ? (
+            {/* Codex App 历史显示只对 codex-app agent 有意义；CLI 停顿提醒区块对 codex 同样展示。 */}
+            {bot.cliId === 'codex-app' || bot.cliId === 'codex' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('codex-app-display')}><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
             {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
@@ -5375,11 +5374,13 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
+  const [cliNudge, setCliNudge] = useState(props.bot.noProgressNotify?.cliEnabled === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
   // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
   // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
   const noProgress = props.bot.noProgressNotify ?? null;
+  const isCodexApp = props.bot.cliId === 'codex-app';
   const nudgeOn = noProgress?.enabled !== false;
   const nudgeTimeoutSec = noProgress?.timeoutMs != null ? Math.round(noProgress.timeoutMs / 1000) : null;
   const nudgeLabel = useId();
@@ -5392,6 +5393,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
+  useEffect(() => setCliNudge(props.bot.noProgressNotify?.cliEnabled === true), [props.bot.noProgressNotify]);
 
   async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
@@ -5419,12 +5421,16 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
     });
   }
 
-  async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
+  async function saveNoProgress(
+    next: { enabled: boolean; cliEnabled?: boolean; timeoutMs?: number } | null,
+    rollback?: () => void,
+  ): Promise<void> {
     await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next === null ? null : { ...props.bot.noProgressNotify, ...next } }),
       setStatus,
       setBusy: on => setBusy(on ? 'no-progress' : null),
       saved: tr('botDefaults.cardPrefSaved'),
+      rollback,
       onSaved: body => {
         const saved = body.noProgressNotify ?? null;
         props.patchBot(props.bot.larkAppId, { noProgressNotify: saved });
@@ -5445,34 +5451,52 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   return (
     <section className="bd-section" data-codex-app-display>
-      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
-      <ToggleRow
-        checked={cleanInput}
-        disabled={busy !== null}
-        dataAction="toggle-codex-app-clean-input"
-        title={tr('botDefaults.codexAppCleanInput')}
-        help={tr('botDefaults.codexAppCleanInputHelp')}
-        onChange={checked => void saveCleanInput(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
-      <ToggleRow
-        checked={browserEnabled}
-        disabled={busy !== null}
-        dataAction="toggle-codex-browser"
-        title={tr('botDefaults.codexBrowser')}
-        description={tr('botDefaults.codexBrowserDescription')}
-        help={tr('botDefaults.codexBrowserHelp')}
-        onChange={checked => void saveBrowser(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
-      <ToggleRow
-        checked={nudgeOn}
-        disabled={busy !== null}
-        dataAction="toggle-codex-app-no-progress"
-        title={tr('botDefaults.noProgressNotify')}
-        help={tr('botDefaults.noProgressNotifyHelp')}
-        onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
-      />
+      <h3 className="bd-section-title">{tr(isCodexApp ? 'botDefaults.sectionCodexAppDisplay' : 'botDefaults.sectionCodexRuntime')}</h3>
+      {isCodexApp ? <>
+        <ToggleRow
+          checked={cleanInput}
+          disabled={busy !== null}
+          dataAction="toggle-codex-app-clean-input"
+          title={tr('botDefaults.codexAppCleanInput')}
+          help={tr('botDefaults.codexAppCleanInputHelp')}
+          onChange={checked => void saveCleanInput(checked)}
+        />
+        <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+        <ToggleRow
+          checked={browserEnabled}
+          disabled={busy !== null}
+          dataAction="toggle-codex-browser"
+          title={tr('botDefaults.codexBrowser')}
+          description={tr('botDefaults.codexBrowserDescription')}
+          help={tr('botDefaults.codexBrowserHelp')}
+          onChange={checked => void saveBrowser(checked)}
+        />
+        <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
+        <ToggleRow
+          checked={nudgeOn}
+          disabled={busy !== null}
+          dataAction="toggle-codex-app-no-progress"
+          title={tr('botDefaults.noProgressNotify')}
+          help={tr('botDefaults.noProgressNotifyHelp')}
+          onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
+        />
+      </> : <>
+        <ToggleRow
+          checked={cliNudge}
+          disabled={busy !== null}
+          dataAction="toggle-cli-no-progress"
+          title={tr('botDefaults.cliProgressNotify')}
+          help={tr('botDefaults.cliProgressNotifyHelp')}
+          onChange={checked => {
+            const previous = cliNudge;
+            setCliNudge(checked);
+            void saveNoProgress(
+              { enabled: nudgeOn, cliEnabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) },
+              () => setCliNudge(previous),
+            );
+          }}
+        />
+      </>}
       <div className="bd-row">
         <label htmlFor={nudgeLabel}>{tr('botDefaults.noProgressNotifyTimeoutLabel')}</label>
         <input
@@ -5482,19 +5506,19 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
           max={3600}
           step={1}
           data-input="no-progress-timeout-sec"
-          placeholder="90"
+          placeholder={isCodexApp ? '90' : '300'}
           value={nudgeInput}
-          disabled={busy !== null || !nudgeOn}
+          disabled={busy !== null || (isCodexApp ? !nudgeOn : !cliNudge)}
           onChange={event => setNudgeInput(event.currentTarget.value)}
         />
-        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || !nudgeOn} onClick={saveNudgeTimeout}>
+        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || (isCodexApp ? !nudgeOn : !cliNudge)} onClick={saveNudgeTimeout}>
           {tr('botDefaults.noProgressNotifyTimeoutSave')}
         </button>
         <button type="button" data-action="reset-no-progress" disabled={busy !== null || noProgress === null} onClick={() => void saveNoProgress(null)}>
           {tr('botDefaults.noProgressNotifyReset')}
         </button>
       </div>
-      <small className="bd-section-note">{tr('botDefaults.noProgressNotifyTimeoutHelp')}</small>
+      <small className="bd-section-note">{tr(isCodexApp ? 'botDefaults.noProgressNotifyTimeoutHelp' : 'botDefaults.cliProgressNotifyTimeoutHelp')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>

@@ -2595,3 +2595,59 @@ describe('reply footer parent response synchronization', () => {
     act(() => renderer.unmount());
   });
 });
+
+describe('Codex CLI runtime no-progress notice (3.2 dashboard switch)', () => {
+  it('shows the CLI opt-in (not App-only controls) and PUTs cliEnabled while preserving enabled', async () => {
+    const patchBot = vi.fn();
+    const fetches: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', ((url: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : undefined;
+      fetches.push({ url: String(url), body });
+      return Promise.resolve({ ok: true, json: async () => ({ ok: true, noProgressNotify: body.noProgressNotify }) } as Response);
+    }) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex', cliId: 'codex', noProgressNotify: { enabled: true } },
+        putCardPref: vi.fn(),
+        patchBot,
+      }));
+    });
+    const tree = () => JSON.stringify(renderer.toJSON());
+    expect(tree()).toContain('Codex CLI');
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-app-clean-input' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-codex-browser' })).toHaveLength(0);
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0]!.url).toContain('/api/bots/cli_codex/no-progress-notify');
+    expect(fetches[0]!.body).toEqual({ noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(patchBot).toHaveBeenCalledWith('cli_codex', { noProgressNotify: { enabled: true, cliEnabled: true } });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(true);
+  });
+
+  it('rolls the CLI switch back when the PUT fails and keeps existing timeout/cliEnabled merge shape', async () => {
+    vi.stubGlobal('fetch', (() => Promise.resolve({
+      ok: false,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    })) as typeof fetch);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex2', cliId: 'codex', noProgressNotify: { enabled: true, cliEnabled: false, timeoutMs: 300000 } },
+        putCardPref: vi.fn(),
+        patchBot: vi.fn(),
+      }));
+    });
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cli-no-progress' }).props.checked).toBe(false);
+  });
+});
