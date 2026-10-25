@@ -69,6 +69,24 @@ export class OrcaManagedSession {
     return result.worktree;
   }
 
+  async close(state: OrcaRunnerState): Promise<void> {
+    if (!state.sessionId || !state.worktreeId) throw new Error('Orca session has not been created');
+    const worktree = `id:${state.worktreeId}`;
+    const snapshot = await this.runtime.call<{ tabs: Array<{ id: string; type: string; sessionId?: string }> }>(
+      'session.tabs.list', { worktree });
+    if (!Array.isArray(snapshot.tabs)) throw new Error('Invalid Orca workspace tab snapshot');
+    for (const tab of snapshot.tabs) {
+      if (tab.type !== 'agent-session' || tab.sessionId !== state.sessionId) continue;
+      const result = await this.runtime.call<{ refused?: boolean; refusalReason?: string }>(
+        'session.tabs.close', { worktree, tabId: tab.id, reason: 'user' });
+      if (result.refused) throw new Error(`Orca refused to close this tab: ${result.refusalReason || 'unknown reason'}`);
+    }
+    // Closing the provider alone leaves renderer-owned desktop tabs visible.
+    // Also release a headless session when it has no published tab to close.
+    const result = await this.runtime.call<{ ok: boolean }>('agentSession.close', { sessionId: state.sessionId });
+    if (!result.ok) throw new Error('Orca did not confirm closing the conversation');
+  }
+
   async history(state: OrcaRunnerState, cursor?: OrcaCursor): Promise<OrcaPage> {
     if (!state.sessionId) throw new Error('Orca session has not been created');
     const result = await this.runtime.call<OrcaHistory>('agentSession.history', {

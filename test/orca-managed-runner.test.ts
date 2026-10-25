@@ -29,6 +29,8 @@ class Runtime implements OrcaRuntime {
   workspaceExists = true;
   queueState?: 'waiting' | 'paused' | 'removed';
   statusFails = false;
+  refuseTabClose = false;
+  tabs = [{ id: 'native-tab', type: 'agent-session', sessionId: 'native-session' }];
   constructor(readonly cwd: string) {}
   async call<T>(method: string, params: any = {}): Promise<T> {
     this.calls.push({ method, params });
@@ -50,8 +52,14 @@ class Runtime implements OrcaRuntime {
         result = { ok: true, value: this.queueState ? { queued: { messageId: params.envelope.clientOperationId } } : {} }; break;
       case 'agentSession.history': result = { ok: !this.reset, page: this.page(params.cursor !== undefined) }; break;
       case 'agentSession.cancel': this.finished = true; result = { ok: true, value: { cancelled: true } }; break;
-      case 'agentSession.close': result = {}; break;
-      case 'agentSession.reveal': result = { ok: true, sessionId: 'native-session', workspaceId: 'workspace' }; break;
+      case 'session.tabs.list': result = { tabs: this.tabs }; break;
+      case 'session.tabs.close':
+        if (this.refuseTabClose) { result = { refused: true, refusalReason: 'pinned' }; break; }
+        this.tabs = this.tabs.filter(t => t.id !== params.tabId); result = { tabs: this.tabs }; break;
+      case 'agentSession.close': result = { ok: true }; break;
+      case 'agentSession.reveal':
+        if (!this.tabs.some(t => t.sessionId === 'native-session')) this.tabs.push({ id: 'native-tab', type: 'agent-session', sessionId: 'native-session' });
+        result = { ok: true, sessionId: 'native-session', workspaceId: 'workspace' }; break;
       case 'agentSession.queuedMessageDelete': this.queueState = 'removed'; result = { ok: true, value: { deleted: true } }; break;
       default: throw new Error(`Unexpected method ${method}`);
     }
@@ -227,6 +235,25 @@ describe('managed Orca conversations', () => {
     const runner = f.create(); await f.start(runner); await f.turn(runner);
     await runner.handle(remoteRunnerCommand('cancel', { requestId: 'close' }));
     expect(f.events.at(-1)).toMatchObject({ type: 'status', status: 'closed' });
+  });
+
+  it('closes its native desktop tab while preserving unrelated conversations', async () => {
+    const f = fixture(); const runner = f.create(); await f.start(runner);
+    f.runtime.tabs.push({ id: 'other-tab', type: 'agent-session', sessionId: 'other-session' });
+    await runner.handle(remoteRunnerCommand('cancel', { requestId: 'close' }));
+    expect(f.runtime.tabs.map(t => t.id)).toEqual(['other-tab']);
+    expect(f.events.at(-1)).toMatchObject({ type: 'status', status: 'closed' });
+    expect(f.runtime.calls.find(c => c.method === 'session.tabs.close')!.params)
+      .toEqual({ worktree: 'id:workspace', tabId: 'native-tab', reason: 'user' });
+  });
+
+  it('does not report a pinned desktop tab as closed when Orca refuses', async () => {
+    const f = fixture(); const runner = f.create(); await f.start(runner);
+    f.runtime.refuseTabClose = true;
+    await runner.handle(remoteRunnerCommand('cancel', { requestId: 'close' }));
+    expect(f.events.at(-1)).toMatchObject({ type: 'failure', requestId: 'close' });
+    expect(f.runtime.tabs).toHaveLength(1);
+    expect(f.runtime.calls.some(c => c.method === 'agentSession.close')).toBe(false);
   });
 
   it('retries rebuild before ready and after the new generation was persisted', async () => {

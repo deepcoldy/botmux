@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { RemoteRunnerBackend } from '../dist/adapters/backend/remote-runner-backend.js';
 import { createOrcaAdapter } from '../dist/adapters/cli/orca.js';
+import { OrcaRuntimeClient } from '../dist/services/orca-runtime-client.js';
 import { ORCA_RUNNER_CAPABILITIES } from '../dist/services/orca-runner-capabilities.js';
 
 const args = process.argv.slice(2);
@@ -53,6 +54,14 @@ function start(b, remoteResumeMode) {
   });
 }
 
+async function assertNativeTab(visible) {
+  const snapshot = await new OrcaRuntimeClient().call('session.tabs.list', {
+    worktree: `id:${state.providerState.worktreeId}`,
+  });
+  const present = snapshot.tabs.some(tab => tab.sessionId === state.agentThreadId);
+  if (present !== visible) throw new Error(`Native Orca tab visibility differs: expected ${visible}`);
+}
+
 function stop(b, commit) {
   return new Promise((resolveExit, reject) => {
     const pid = b.getChildPid();
@@ -81,21 +90,26 @@ async function turn(b, marker) {
 
 try {
   backend = create(); await start(backend);
+  await assertNativeTab(true);
   await turn(backend, 'BOTMUX_ORCA_FIRST');
   const nativeSessionId = state.agentThreadId;
   const detached = await backend.prepareShutdownDetach();
   if (!detached.ok) throw new Error(JSON.stringify(detached));
   await stop(backend, () => backend.commitShutdownDetach());
   backend = create(); await start(backend);
+  await assertNativeTab(true);
   await turn(backend, 'BOTMUX_ORCA_RESUMED');
   const closed = await backend.destroySession();
   if (!closed.ok) throw new Error(JSON.stringify(closed));
+  await assertNativeTab(false);
   await stop(backend, () => backend.commitDestroySession());
   backend = create(); await start(backend, 'rebuild');
+  await assertNativeTab(true);
   await turn(backend, 'BOTMUX_ORCA_REOPENED');
   if (state.agentThreadId !== nativeSessionId || received.length !== 3) throw new Error('Conversation identity or delivery count changed');
   const cleanup = await backend.destroySession();
   if (!cleanup.ok) throw new Error(JSON.stringify(cleanup));
+  await assertNativeTab(false);
   await stop(backend, () => backend.commitDestroySession());
   successful = true;
   console.log(JSON.stringify({ agent, nativeSessionId, generation: state.generation,

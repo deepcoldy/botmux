@@ -252,7 +252,7 @@ export class OrcaRunner {
         requireOrcaMutation(await this.options.runtime.call('agentSession.queuedMessageDelete',
           orcaMutation('agentSession.queuedMessageDelete', this.state.sessionId, page.fence!, { messageId })));
       }
-      await this.options.runtime.call('agentSession.close', { sessionId: this.state.sessionId });
+      await this.session!.close(this.state);
       this.state.closed = true;
       delete this.state.pending;
       this.store!.save(this.state);

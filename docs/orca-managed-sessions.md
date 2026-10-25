@@ -99,4 +99,4 @@ node scripts/orca-managed-smoke.mjs --cwd /existing/test-project --agent codex
 node scripts/orca-managed-smoke.mjs --cwd /existing/test-project --agent claude
 ```
 
-脚本验证首轮、detach/restart 续接、显式关闭/rebuild 后继续同一原生会话；最终回复回执由测试宿主模拟。可用 `--binary /path/to/botmux` 验证单文件构建的内置 runner。
+脚本验证首轮、detach/restart 续接、显式关闭/rebuild 后继续同一原生会话；每次关闭还检查桌面标签消失和子进程退出。最终回复回执由测试宿主模拟。可用 `--binary /path/to/botmux` 验证单文件构建的内置 runner。
