@@ -38,6 +38,7 @@ export interface OrcaTerminalIdentity {
   launchOperationId: string;
   transcriptPath?: string;
   providerConfirmed?: boolean;
+  transcriptObserved?: boolean;
 }
 export interface OrcaRunnerState {
   version: 1;

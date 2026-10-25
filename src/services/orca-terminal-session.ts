@@ -151,10 +151,21 @@ export class OrcaTerminalSession {
       // transcript supplies a baseline, never a reply, until the new pane confirms it.
       if (state.terminal!.launchOperationId === state.launchOperationId) throw new Error('Missing provider conversation binding');
     }
-    const page = await this.runtime.call<OrcaTranscript>('nativeChat.readSession', {
+    const page = await this.runtime.call<OrcaTranscript & { notFound?: boolean }>('nativeChat.readSession', {
       agent: state.agent, sessionId: state.sessionId, transcriptPath: state.terminal!.transcriptPath, limit: 2000,
     });
+    if (page.notFound === true) {
+      // Provider hooks precede the first JSONL flush. A new terminal has no
+      // retained history to lose; an existing transcript must never become empty.
+      if (purpose === 'baseline' && !state.terminal!.transcriptObserved
+          && state.terminal!.launchOperationId === state.launchOperationId) return { messages: [], hasMore: false };
+      return undefined;
+    }
     if (!Array.isArray(page.messages)) throw new Error('Orca terminal transcript is unavailable');
+    if (!state.terminal!.transcriptObserved) {
+      state.terminal!.transcriptObserved = true;
+      this.store.save(state);
+    }
     return page;
   }
 
@@ -166,7 +177,8 @@ export class OrcaTerminalSession {
       terminal: state.terminal!.handle, screen: true, limit: 1,
     });
     if (terminal.source !== 'screen' || terminal.draft) throw new Error('Inspect or clear the Orca terminal composer before sending');
-    const page = (await this.history(state, 'baseline'))!;
+    const page = await this.history(state, 'baseline');
+    if (!page) throw new Error('Orca terminal transcript has not flushed; wait before sending another task');
     return { operationId: orcaOperationId(), content: normalized,
       baselineMessageId: page.messages.at(-1)?.id, baselineTurnId: page.lifecycle?.turnId };
   }
@@ -206,10 +218,15 @@ export class OrcaTerminalSession {
     await this.writeGuarded(state, { text: `\x1b[200~${pending.content}\x1b[201~` });
     pending.inputPhase = 'paste-confirmed';
     this.store.save(state);
-    // Give the TUI a render turn after the settled paste. Enter is sent once;
-    // only the subsequent provider transcript can prove it was consumed.
-    await new Promise(r => setTimeout(r, this.pollMs));
+    // Match Orca's minimum paste-ingest/settle window, then ask its native
+    // waiter for a sendable TUI. Enter is never retried to compensate for lag.
+    const ingestMs = Math.ceil(Buffer.byteLength(pending.content) / (process.platform === 'win32' ? 64 : 4096));
+    await new Promise(r => setTimeout(r, 500 + ingestMs));
     if (stopped()) return;
+    const { wait } = await this.runtime.call<{ wait: { satisfied: boolean; blockedReason?: string } }>('terminal.wait', {
+      terminal: state.terminal!.handle, for: 'tui-idle', timeoutMs: 5_000,
+    });
+    if (!wait?.satisfied || wait.blockedReason) throw new Error('Orca terminal input is not ready; inspect the staged paste in Orca');
     await this.tab(state);
     if (stopped()) return;
     pending.inputPhase = 'submit-attempted';

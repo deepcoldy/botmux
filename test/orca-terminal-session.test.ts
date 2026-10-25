@@ -21,6 +21,8 @@ class Runtime implements OrcaRuntime {
   lostClose = false;
   exitAfterPaste = false;
   stagedText = '';
+  transcriptMissing = 0;
+  waitSatisfied = true;
   lostLaunch = false;
   refused = false;
   tabs: any[] = [{ id: 'foreign', type: 'terminal', terminal: 'foreign' }];
@@ -51,9 +53,11 @@ class Runtime implements OrcaRuntime {
         writable: this.tabs.some(t => t.terminal === `handle${this.generation}`), agentIdentity: 'codex', executionHostId: 'local' } }; break;
       case 'terminal.agentStatus': result = { agentStatus: { isRunningAgent: true, status: this.status } }; break;
       case 'terminal.read': result = { terminal: { source: 'screen', draft: this.draft } }; break;
+      case 'terminal.wait': result = { wait: { satisfied: this.waitSatisfied } }; break;
       case 'session.tabs.list': result = { tabs: this.tabs.map(t => ({ ...t, agentStatus: this.provider && t.terminal !== 'foreign'
         ? { providerSession: { key: 'session_id', id: this.provider } } : {} })) }; break;
-      case 'nativeChat.readSession': result = { messages: this.messages, hasMore: false, lifecycle: this.lifecycle }; break;
+      case 'nativeChat.readSession': result = this.transcriptMissing-- > 0 ? { error: 'Transcript unavailable', notFound: true }
+        : { messages: this.messages, hasMore: false, lifecycle: this.lifecycle }; break;
       case 'terminal.send': {
         if (params.requireAgentStatus === 'sendable' && this.status !== 'idle') {
           result = { send: { accepted: false, refusedReason: 'no-agent' } }; break;
@@ -139,6 +143,13 @@ describe('managed Orca terminal', () => {
     expect(f.store.load()?.pending).toMatchObject({ inputPhase: 'paste-confirmed' });
     expect(f.runtime.calls.some(c => c.method === 'terminal.send' && c.params.enter)).toBe(false);
   });
+  it('leaves the staged paste unsent when Orca cannot confirm TUI readiness', async () => {
+    const f = fixture(); await f.session.open(f.state, {}); const pending = await f.pending();
+    f.state.pending = pending; f.runtime.waitSatisfied = false;
+    await expect(f.session.run(f.state, pending, f.observer)).rejects.toThrow('not ready');
+    expect(f.store.load()?.pending).toMatchObject({ inputPhase: 'paste-confirmed' });
+    expect(f.runtime.calls.some(c => c.method === 'terminal.send' && c.params.enter)).toBe(false);
+  });
   it('confirms a lost close response after control-channel restart and can then rebuild', async () => {
     const f = fixture(); await f.session.open(f.state, {}); const pending = await f.pending(); f.state.pending = pending;
     await f.session.run(f.state, pending, f.observer); f.runtime.lostClose = true;
@@ -173,6 +184,14 @@ describe('managed Orca terminal', () => {
     await expect(f.session.prepare(f.state, 'text\x1b[201~\ncommand')).rejects.toThrow('control characters');
     await f.session.close(f.state); f.state.closed = true;
     await expect(f.session.open(f.state, {})).rejects.toThrow('identity was not recorded');
+  });
+  it('waits for the first transcript flush without resending, but never empties known history', async () => {
+    const f = fixture(); await f.session.open(f.state, {}); const pending = await f.pending(); f.state.pending = pending;
+    f.runtime.transcriptMissing = 1;
+    expect(await f.session.run(f.state, pending, f.observer)).toEqual({ content: 'answer' });
+    expect(f.runtime.calls.filter(c => c.method === 'terminal.send' && c.params.enter)).toHaveLength(1);
+    f.runtime.transcriptMissing = 1;
+    await expect(f.pending()).rejects.toThrow('has not flushed');
   });
   it('preserves the Chat mode of state written before surface selection existed', () => {
     const f = fixture(); delete f.state.surface; f.store.save(f.state);
