@@ -913,6 +913,117 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('busy-tick lease refresh keeps a slow-flushing mirror turn alive, then resumes expiry at idle', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+
+    // Cursor mirror shape: writeInput returns undefined (attribution-only
+    // lease), and the transcript flushes the user line only when the first
+    // assistant step / whole turn completes — potentially far beyond the
+    // bare 20s lease. The worker refreshes the lease every tick while the
+    // CLI is visibly busy.
+    q.mark('slow-mirror', 'prompt whose jsonl line flushes late', now);
+    q.beginSubmitVerification('slow-mirror', now);
+    q.finishSubmitVerification('slow-mirror', now);
+
+    // 90s of busy ticks: without refresh this head would expire at 20s.
+    for (now = 1_000; now <= 90_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
+      expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    }
+
+    // Turn end: the mirror flushes user + final together; the head matches.
+    q.ingest([
+      userEv('prompt whose jsonl line flushes late', 'u-slow-mirror', 90_500),
+      asstEv('late-flushed answer', 'a-slow-mirror', 90_501),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'slow-mirror', finalText: 'late-flushed answer' }),
+    ]);
+
+    // A swallowed Enter still expires: once refreshes stop (CLI idle), the
+    // bounded lease resumes counting down from the last refresh.
+    q.mark('swallowed', 'enter never landed', now);
+    q.beginSubmitVerification('swallowed', now);
+    q.finishSubmitVerification('swallowed', now);
+    q.refreshUnstartedHeadAttributionLease();
+    const lastRefresh = now;
+    now = lastRefresh + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['swallowed']);
+  });
+
+  it('busy-tick refresh also covers the submit-confirmed argv-baked first turn', () => {
+    // The argv-baked first cursor turn is mark + confirmPendingTurn at init
+    // (never enters flushPending). Its user line flushes just as late, so the
+    // confirmed lease must be refreshed too — otherwise turn 1 ghosts at 20s.
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('argv-turn', 'baked opening prompt', now);
+    q.confirmPendingTurn('argv-turn', now);
+    for (now = 1_000; now <= 60_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
+      expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    }
+    q.ingest([
+      userEv('baked opening prompt', 'u-argv', 60_500),
+      asstEv('first answer', 'a-argv', 60_501),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'argv-turn', finalText: 'first answer' }),
+    ]);
+  });
+
+  it('busy-tick refresh keeps the whole type-ahead chain alive and honours the hard since-mark cap', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    // Confirmed argv head A + unconfirmed successor B queued behind it.
+    q.mark('a', 'first prompt', now);
+    q.confirmPendingTurn('a', now);
+    now = 1_000;
+    q.mark('b', 'queued follow-up', now);
+    q.beginSubmitVerification('b', now);
+    q.finishSubmitVerification('b', now);
+    // 90s of busy ticks refresh BOTH heads.
+    for (; now <= 90_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease()).toBe(2);
+    }
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    // The mirror flushes both turns together; both complete.
+    q.ingest([
+      userEv('first prompt', 'u-a', 90_500),
+      asstEv('answer a', 'a-a', 90_501),
+      userEv('queued follow-up', 'u-b', 90_600),
+      asstEv('answer b', 'a-b', 90_601),
+    ]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['a', 'b']);
+
+    // Hard cap: a perpetually "busy" screen (swallowed Enter / modal) cannot
+    // refresh a head beyond maxSinceMarkMs even though ticks keep arriving.
+    const q2 = new CodexBridgeQueue(() => 200_000);
+    q2.mark('stuck', 'never flushes', 0);
+    q2.confirmPendingTurn('stuck', 0);
+    expect(q2.refreshUnstartedHeadAttributionLease(60_000, 120_000)).toBe(1);
+    expect(q2.refreshUnstartedHeadAttributionLease(119_000, 120_000)).toBe(1);
+    expect(q2.refreshUnstartedHeadAttributionLease(120_001, 120_000)).toBe(0);
+  });
+
+  it('lease refresh leaves started and rpc-active turns alone', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(0);
+
+    q.mark('started', 'already running prompt', now);
+    q.ingest([userEv('already running prompt', 'u-refresh-started', 1)]);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(0);
+    q.ingest([asstEv('done', 'a-refresh-started', 2)]);
+    q.drainEmittable();
+
+    // Confirmed heads ARE refreshed now (argv first turn).
+    q.mark('confirmed', 'confirmed submit', now);
+    q.confirmPendingTurn('confirmed', now);
+    expect(q.refreshUnstartedHeadAttributionLease()).toBe(1);
+  });
+
   it('expires consecutive confirmed stale heads until a buffered live turn can start', () => {
     let now = 19_000;
     const q = new CodexBridgeQueue(() => now);

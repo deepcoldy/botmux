@@ -3,6 +3,7 @@
  *
  * Run: pnpm vitest run test/group-join-shared-routing.test.ts
  */
+import { cardVisibleText } from './helpers/card-visible-text.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -786,7 +787,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_missing_default';
     const chatId = 'oc_join_missing_default';
-    const missing = join(tempRoot, 'gone', 'botmux');
+    // Keep `_`: markdown escaping must differ from the visible path we assert.
+    const missing = join(tempRoot, 'gone_dir', 'botmux');
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -807,7 +809,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const cardCall = mocks.replyMessage.mock.calls.find(call => (call as unknown[])[3] === 'interactive') as unknown[] | undefined;
     // The card belongs under the shared join seed, like the ordinary picker.
     expect(cardCall?.[1]).toBe('om_join_seed');
-    expect(String(cardCall?.[2])).toContain(missing);
+    expect(cardVisibleText(String(cardCall?.[2]))).toContain(missing);
     expect(String(cardCall?.[2])).toContain('repo_manual_submit');
     expect(String(cardCall?.[2])).not.toContain('skip_repo');
   });

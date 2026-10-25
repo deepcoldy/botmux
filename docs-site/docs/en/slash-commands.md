@@ -34,6 +34,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/quote <instruction>` | Same, but runs your instruction as soon as you pick a topic, saving a round trip. The transcript is still injected explicitly labelled as material rather than instructions |
 | `/sessions` | List this bot's active topic sessions in the current group and jump directly back to a topic (legacy sessions use a safe locate fallback) |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
+| `/dash` | Alias of `/dashboard link`: privately returns the current dashboard admin home URL `http://<host>:<port>/?t=<token>#/` (requester-only ephemeral card in plain groups, DM in topic groups/topic replies/p2p; allowedUsers only; no session or worktree is created; re-run after a token rotation to get the fresh link) |
 | `@bot /project enable\|status\|roles\|disable` | Enable, inspect, configure agent roles, or leave project-group mode in the current ordinary group (owner/allowedUsers only; does not consume a session slot) |
 | `@bot /context-sharing on\|off\|status` | Enable, disable, or inspect passive context sharing for the current group (off by default; owner/allowedUsers only; creates no session or extra model turn) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |

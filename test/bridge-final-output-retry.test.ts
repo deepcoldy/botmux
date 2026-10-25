@@ -4918,6 +4918,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(closeSession).not.toHaveBeenCalled();
   });
 
+  it('treats an over-length final card (230025) as permanent: rejection notice, settled, no silent give-up', async () => {
+    // A long transcript final (e.g. an Antigravity reply read from its
+    // untruncated log) can exceed Feishu's message length cap. The same
+    // payload can never fit, so retrying only ended in a log-only give-up.
+    const tooLong = {
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230025, msg: 'The length of the message content reaches its limit.' } },
+    };
+    const sessionReply = vi.fn().mockRejectedValueOnce(tooLong).mockResolvedValueOnce('om_notice');
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const notice = sessionReply.mock.calls[1];
+    expect(notice[2]).toBe('text');
+    expect(String(notice[1])).toContain('230025');
+    expect(String(notice[1])).not.toContain('final answer');
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(ds.lastBridgeEmittedUuid).toBe('sid-final-out:uuid-1');
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'card content 230025' });
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('MessageWithdrawnError aborts retries, commits dedup, and closes session', async () => {
     const sessionReply = vi.fn().mockRejectedValue(new MessageWithdrawnError('om_root'));
     const closeSession = vi.fn();

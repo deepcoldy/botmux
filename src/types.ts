@@ -17,7 +17,9 @@ import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnap
 import type { CliId } from './adapters/cli/types.js';
 import type { CliRuntimeSnapshot } from './adapters/cli/runtime.js';
 import type { CliLaunchMode } from './core/cli-launch-mode.js';
+import type { TurnTerminalCarrierKind } from './core/types.js';
 import type { LinkRefTurnEnvelope } from './services/link-ref-types.js';
+import type { TurnSendKind } from './services/turn-send-ledger.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -37,6 +39,8 @@ export interface VcMeetingListenerDeliveryConfig {
  * persisted session so queued human turns cannot overwrite each other's
  * authority before the worker actually dequeues them. */
 export interface VcMeetingImTurnOrigin {
+  /** Frozen only from an exact, standalone human sharing command. Not inherited across turns. */
+  summaryShareTargetChatId?: string;
   listenerAppId: string;
   meetingId: string;
   memberId: string;
@@ -641,10 +645,10 @@ export interface Session {
    * narrow admission group. Quarantined rows are skipped while other sessions
    * restore normally. */
   xpiSharedCwdQuarantine?: XpiSharedCwdQuarantine;
-  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
-   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   /** Bounded notification receipts only; never authorizes execution/replay. */
   cliProgressNotices?: import('./services/cli-progress-notice.js').CliProgressNotice[];
+  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
+   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
   /**
    * Bounded, crash-recoverable proof that a durable-primary Inbox message
@@ -764,6 +768,10 @@ export interface Session {
    */
   restoreQuarantinedAt?: string;
   pid?: number;
+  /** Birth identity of the worker `pid` was recorded for (durable boot-id +
+   *  starttime, see core/session-worker-identity.ts). Written and cleared with
+   *  `pid`; a row without it is never signalled through `pid`. */
+  pidProcStart?: string;
   workingDir?: string;
   webPort?: number;
   /** Agent-registered local Web preview for this session. The daemon accepts
@@ -1072,6 +1080,8 @@ export interface Session {
   /** CLI config profile dir frozen with `cliId` (claude-code: CLAUDE_CONFIG_DIR).
    *  Frozen so a resume reads the transcript from the dir the CLI actually wrote,
    *  even after the bot's `cliConfigDir` changes. Absent = the CLI's default. */
+  codexProfile?: string | null;
+  codexProfileHome?: string;
   cliConfigDir?: string;
   /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
   wrapperCli?: string;
@@ -1875,7 +1885,7 @@ type DaemonToWorkerBase =
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
   | { type: 'link_ref_restore_mode_result'; requestId: string; mode?: 'enabled'; error?: string }
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; turnCallerOpenId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; codexProfile?: string; codexProfileHome?: string; cliUpgrade?: import('./core/cli-version-history.js').CliUpgrade; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; promptCacheTtl?: import('./services/prompt-cache-policy.js').PromptCacheTtl; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; turnCallerOpenId?: string }
     & { traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
@@ -1948,6 +1958,10 @@ type DaemonToWorkerBase =
   // 白名单 TUI 命令注入（/slash 路由）。cwd 移动不走注入——角色切换用
   // restart+updateWorkingDir 的 respawn，避免绕过 cd 路由的角色库硬校验。
   | { type: 'inject_command'; command: string }
+  // Claude Code prompt-cache keep-alive (core/prompt-cache-keepalive.ts): type
+  // this one-line prompt into the idle CLI with NO botmux turn identity, then
+  // ack with prompt_cache_keepalive_result.
+  | { type: 'prompt_cache_keepalive'; text: string }
   | {
       type: 'tui_text_input';
       keys: string[];
@@ -1984,7 +1998,19 @@ type DaemonToWorkerBase =
   // 必须把 claim 与本进程当前回合、当前 dispatch 代际逐字比对，不一致（含缺代际）
   // 一律丢弃：宁可让这一轮晚一轮由别的证据收口，也不能把一个正忙的 CLI 判成空闲
   // （会提前写消息、提前翻卡片）。seq / pid 只用于诊断。
-  | { type: 'turn_idle'; turnId?: string; dispatchAttempt?: number; seq?: number; pid?: number };
+  | { type: 'turn_idle'; turnId?: string; dispatchAttempt?: number; seq?: number; pid?: number }
+  // Claude StopFailure：回合因 API 错误结束（这条路径不跑 Stop hook）。CLI hook 经
+  // `botmux __claude-stop-failure-v1` 调到 daemon，daemon 校验后转给 worker。
+  // turnId / dispatchAttempt 是上报者读到的 active-turn marker（claim，不是凭据）。
+  // report 须来自本会话的 Claude 进程；宽限期后若 transcript 没把这次失败呈现出来，
+  // worker 为仍无终态、且与 claim 逐字相符的当前回合补发终态，没有可收口的回合时
+  // 改发一条提示。
+  | {
+    type: 'claude_stop_failure';
+    report: import('./services/claude-stop-failure.js').ClaudeStopFailureReport;
+    turnId?: string;
+    dispatchAttempt?: number;
+  };
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
@@ -2211,6 +2237,9 @@ export type WorkerToDaemon =
       eligible: boolean;
     }
   | { type: 'prompt_ready' }
+  /** Ack for prompt_cache_keepalive: queued into the CLI, or refused because
+   *  the session is no longer quietly idle (pending input, prompt not ready…). */
+  | { type: 'prompt_cache_keepalive_result'; injected: boolean; reason?: string }
   | { type: 'cli_runtime_version'; version: string }
   /** The CLI said its own install changed under the running process (Pi after
    *  a global upgrade: on-demand modules then fail with "Cannot find module").
@@ -2255,7 +2284,7 @@ export type WorkerToDaemon =
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even
    * though transcript fallback output is suppressed to avoid duplicates. */
-  | { type: 'explicit_reply_observed'; turnId: string; messageId?: string; responseKind?: 'progress' | 'final' | 'auxiliary'; terminalCarrier?: 'standard_reply_card' | 'non_patchable' }
+  | { type: 'explicit_reply_observed'; turnId: string; messageId?: string; responseKind?: TurnSendKind; terminalCarrier?: TurnTerminalCarrierKind }
   | { type: 'tui_prompt_resolved'; selectedText?: string; cardMessageId?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_submit_failed'; cardMessageId?: string; stuckNonce?: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }

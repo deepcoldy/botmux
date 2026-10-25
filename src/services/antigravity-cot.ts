@@ -2,7 +2,12 @@
  * Antigravity CoT (thinking process) transcript reader.
  *
  * Antigravity writes conversation logs incrementally to:
- *   ~/.gemini/antigravity-cli/brain/<cliSessionId>/.system_generated/logs/transcript.jsonl
+ *   ~/.gemini/antigravity-cli/brain/<cliSessionId>/.system_generated/logs/transcript_full.jsonl
+ * next to a compact transcript.jsonl that cuts long thinking / content to its
+ * head and tail (see antigravity-transcript.ts). The reader follows the full
+ * log, falls back to the compact one when no full log exists, and moves a
+ * compact read over to the full log (same record, mapped offset) once agy has
+ * created it.
  *
  * Each line is a self-contained JSON object:
  *   - type:"USER_INPUT" (user prompt start)
@@ -16,6 +21,11 @@ import { existsSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { scanJsonlFromOffset } from './jsonl-cursor.js';
+import {
+  antigravityFullSiblingPath,
+  mapAntigravityCompactOffsetToFull,
+  resolveAntigravityTranscriptPath,
+} from './antigravity-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 
 export const COT_TOOL_ARGS_MAX_CHARS = 600;
@@ -117,8 +127,16 @@ export function extractAntigravityCotEntriesFromRecord(
 
 interface ReaderState {
   cliSessionId: string;
-  transcriptPath: string;
+  /** Caller-pinned transcript (opts.transcriptPath): read as-is, never moved. */
+  pinned: boolean;
+  brainDir: string;
+  /** Log currently read; undefined until one exists on disk. */
+  transcriptPath?: string;
+  /** Byte offset in `transcriptPath`. */
   offset: number;
+  /** Last failed compact→full mapping (offset + full size), not retried until
+   *  one of them moves. */
+  upgradeAttemptKey?: string;
   timer: NodeJS.Timeout;
   watcher: FSWatcher | null;
   pendingTools: Array<{ id: string; name: string }>;
@@ -127,8 +145,60 @@ interface ReaderState {
 
 const readers = new Map<string, ReaderState>();
 
+function watchTranscript(state: ReaderState): void {
+  if (state.watcher) {
+    try { state.watcher.close(); } catch { /* ignore */ }
+    state.watcher = null;
+  }
+  if (!state.transcriptPath) return;
+  try {
+    const watcher = watch(state.transcriptPath, () => {
+      const current = readers.get(state.cliSessionId);
+      if (current) readNewTranscriptLines(current);
+    });
+    watcher.on('error', () => {
+      try { watcher.close(); } catch { /* ignore */ }
+      if (state.watcher === watcher) state.watcher = null;
+    });
+    state.watcher = watcher;
+  } catch {
+    state.watcher = null;
+  }
+}
+
+/** Bind the log to read (full first; a log created after the reader started is
+ *  read from byte 0), or move a compact read over to the full log at the
+ *  equivalent offset. Returns false while no log exists yet. */
+function bindTranscript(state: ReaderState): boolean {
+  if (state.pinned) return !!state.transcriptPath && existsSync(state.transcriptPath);
+  if (!state.transcriptPath) {
+    const path = resolveAntigravityTranscriptPath(state.cliSessionId, { brainDir: state.brainDir });
+    if (!path) return false;
+    state.transcriptPath = path;
+    watchTranscript(state);
+    return true;
+  }
+  const fullPath = antigravityFullSiblingPath(state.transcriptPath);
+  if (fullPath && existsSync(fullPath)) {
+    let fullSize = -1;
+    try { fullSize = statSync(fullPath).size; } catch { /* retried below */ }
+    const attemptKey = `${state.offset}:${fullSize}`;
+    if (fullSize >= 0 && attemptKey !== state.upgradeAttemptKey) {
+      state.upgradeAttemptKey = attemptKey;
+      const mapped = mapAntigravityCompactOffsetToFull(state.transcriptPath, state.offset, fullPath);
+      if (mapped !== undefined) {
+        state.transcriptPath = fullPath;
+        state.offset = mapped;
+        state.upgradeAttemptKey = undefined;
+        watchTranscript(state);
+      }
+    }
+  }
+  return existsSync(state.transcriptPath);
+}
+
 function readNewTranscriptLines(state: ReaderState): void {
-  if (!existsSync(state.transcriptPath)) return;
+  if (!bindTranscript(state) || !state.transcriptPath) return;
   try {
     const st = statSync(state.transcriptPath);
     if (st.size <= state.offset) return;
@@ -158,6 +228,8 @@ function readNewTranscriptLines(state: ReaderState): void {
 }
 
 export interface StartAntigravityCotOptions {
+  /** Read exactly this file (tests); otherwise the conversation's logs under
+   *  `brainDir` are resolved full-first. */
   transcriptPath?: string;
   brainDir?: string;
   mode?: 'baseline-existing' | 'fresh';
@@ -178,37 +250,17 @@ export function startAntigravityCot(
   if (!cliSessionId || !/^[a-zA-Z0-9._-]+$/.test(cliSessionId)) return false;
   if (readers.has(cliSessionId)) return true;
 
+  const brainDir = opts?.brainDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'brain');
   const transcriptPath = opts?.transcriptPath
-    ?? join(
-      opts?.brainDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'brain'),
-      cliSessionId,
-      '.system_generated',
-      'logs',
-      'transcript.jsonl',
-    );
+    ?? resolveAntigravityTranscriptPath(cliSessionId, { brainDir })
+    ?? undefined;
 
   let initialOffset = 0;
-  if (opts?.mode !== 'fresh' && existsSync(transcriptPath)) {
+  if (opts?.mode !== 'fresh' && transcriptPath && existsSync(transcriptPath)) {
     try {
       initialOffset = statSync(transcriptPath).size;
     } catch {
       initialOffset = 0;
-    }
-  }
-
-  let watcher: FSWatcher | null = null;
-  if (existsSync(transcriptPath)) {
-    try {
-      watcher = watch(transcriptPath, () => {
-        const current = readers.get(cliSessionId);
-        if (current) readNewTranscriptLines(current);
-      });
-      watcher.on('error', () => {
-        try { watcher?.close(); } catch { /* ignore */ }
-        watcher = null;
-      });
-    } catch {
-      watcher = null;
     }
   }
 
@@ -221,15 +273,18 @@ export function startAntigravityCot(
 
   const state: ReaderState = {
     cliSessionId,
-    transcriptPath,
+    pinned: opts?.transcriptPath !== undefined,
+    brainDir,
+    ...(transcriptPath ? { transcriptPath } : {}),
     offset: initialOffset,
     timer,
-    watcher,
+    watcher: null,
     pendingTools: [],
     onEntries,
   };
 
   readers.set(cliSessionId, state);
+  if (transcriptPath && existsSync(transcriptPath)) watchTranscript(state);
 
   // If starting in fresh mode, perform initial read immediately
   if (opts?.mode === 'fresh') {

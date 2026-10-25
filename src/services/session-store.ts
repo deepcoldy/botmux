@@ -1,3 +1,4 @@
+import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11,6 +12,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -2091,6 +2093,9 @@ function persistRow(session: Session): void {
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
     }
+    if (durable.codexProfile !== undefined) {
+      session = { ...session, codexProfile: durable.codexProfile, codexProfileHome: durable.codexProfileHome };
+    }
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
     }
@@ -2140,6 +2145,8 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    codexProfile: intent.inherit ? intent.inherit.codexProfile ?? null : source === 'external' ? null : bot?.codexProfile ?? null,
+    codexProfileHome: intent.inherit ? intent.inherit.codexProfileHome : source !== 'external' && bot?.codexProfile ? resolveCodexProfileHome(bot) : undefined,
     promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
@@ -2741,6 +2748,9 @@ export function closeSession(
     removePromptContextDir(sessionId);
     // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
     removeStatuslineDir(config.session.dataDir, sessionId);
+    // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
+    // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
+    removePaneLaunchDir(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);
@@ -2805,13 +2815,41 @@ export function reactivateClosedSession(
 }
 
 
-export function updateSessionPid(sessionId: string, pid: number | null): void {
+export function updateSessionPid(sessionId: string, pid: number | null, procStart?: string): void {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
+    session.pidProcStart = pid === null ? undefined : procStart;
     persistRow(session);
   }
+}
+
+/**
+ * Clear recorded worker pids in one transaction, each only if its row still
+ * records exactly that pid/identity pair — a worker forked for the session
+ * since the caller's snapshot keeps its fresh record. Only `pid` and
+ * `pidProcStart` change. Returns the number of rows cleared.
+ */
+export function clearSessionPidsIfUnchanged(
+  expected: ReadonlyArray<{ sessionId: string; pid: number; procStart: string | undefined }>,
+): number {
+  loadForWrite();
+  const targets = expected.flatMap(e => {
+    const session = sessions.get(e.sessionId);
+    return session && session.pid === e.pid && session.pidProcStart === e.procStart ? [session] : [];
+  });
+  if (targets.length === 0 || !ownStore) return 0;
+  ownStore.db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const session of targets) persistRow({ ...session, pid: undefined, pidProcStart: undefined });
+    ownStore.db.exec('COMMIT');
+  } catch (error) { ownStore.db.exec('ROLLBACK'); throw error; }
+  for (const session of targets) {
+    session.pid = undefined;
+    session.pidProcStart = undefined;
+  }
+  return targets.length;
 }
 
 export function updateSession(session: Session): void {
@@ -3778,7 +3816,7 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',

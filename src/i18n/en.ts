@@ -256,6 +256,8 @@ export const messages: Record<string, string> = {
   'card.adopt.field_time_live': 'Uptime',
   'card.adopt.field_time_resume': 'Last active',
   'card.adopt.field_target': 'Location',
+  'card.adopt.location_with_workspace': '{workspace} ({target})',
+  'card.adopt.untitled_live': 'New session',
   'card.adopt.selected_tag': 'selected',
   'card.adopt.hint_pick_first': 'Click any session above to select it, then click the button below to adopt.',
   'card.adopt.btn_confirm_live': 'Take over into this topic',
@@ -814,6 +816,7 @@ export const messages: Record<string, string> = {
   'config.label.restrictGrantCommands': 'Grantees chat-only',
   'config.label.p2pOpen': 'Open DMs',
   'config.label.grantRequestToOwnerDm': 'Forward requests to owner DM',
+  'config.label.trustSameOwnerBots': 'Trust same-owner local bots',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
   'card.config.text_title': '✏️ {name} · text fields',
@@ -967,6 +970,7 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.sessions': '/sessions   - List this bot\'s topic sessions in the current group and open or resume a topic',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
+  'help.dash': '/dash - Get the full current dashboard admin home link via private message (alias of /dashboard link); no session or worktree is created; the link form follows the remote-access/proxy configuration (local direct or platform subdomain)',
   'help.issue': '/issue      - Open the Issue Board and claim a platform task right from the card (auto-creates a group and starts work); inside the task group use `/issue status` to inspect, `/issue done` to accept, `/issue release` to hand it back',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
@@ -1336,10 +1340,11 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and your next message starts a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
   'worker.mojo_legacy_pinned': '⚠️ This mojo session predates the host-execution upgrade, so it is pinned to the legacy sandbox-fallback mode — tools and replies will mostly NOT work here. This is deliberate (an upgrade must never silently move a live session onto the host).\nPlease close this session (❌ button or /close) and send a new message to start a fresh session on the new behaviour.',
-  'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
+  'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nSession {sessionId}; full details in {logPath}.\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',
   'worker.input_rejected_before_admission': '⚠️ This message was rejected before it entered the Worker execution queue: it did not run and produced no side effects. The usual cause is that the turn currently running was started by a different principal (cross-principal interruption isolation); resend it once that turn has finished.\nturn: {turnId} | reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
+  'worker.start_failed_log_fallback': 'the daemon log',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'workerDiag.recentStderr': 'Recent worker output (may include the failure cause):',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
@@ -1389,6 +1394,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ This {cliName} turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
   'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
   'worker.local_turn_failed': '⚠️ {cliName} failed ({errorCode}). The failed turn has no matching Lark message (for example input typed in the terminal, or output continuing the previous turn), so it is not retried automatically. Check the Web Terminal and resend if needed.',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} stopped this turn on an API error ({errorCode}), but botmux could not match the interruption to the turn it was tracking, so it is not continued automatically and the task may have stopped midway. Check the Web Terminal and reply "continue" if needed.',
 
   // ─── Turn-failure card (generic failure card: @mention + retry button) ────
   'card.turn_failed.title': '⚠️ {cliName} turn failed',
@@ -1590,11 +1596,18 @@ export const messages: Record<string, string> = {
     '• `groups`     — group matrix\n' +
     '• `schedules`  — scheduled tasks\n' +
     '• `settings`   — global settings (admins only)\n' +
+    '• `link`       — admin home link via DM (alias: bare `/dash`; link form follows the remote-access/proxy configuration)\n' +
     '• `help`       — this help\n\n' +
     'Without a subcommand, defaults to `overview`. The entire group is restricted to bot admins (allowedUsers).',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',
   'card.dashboard.dm_sent': '📬 The dashboard reply was DMed to you.',
   'card.dashboard.dm_failed': '⚠️ Failed to DM you the dashboard reply: {reason}',
+  'card.dashboard.link.title': '🔗 Dashboard Admin Home',
+  'card.dashboard.link.body': 'Dashboard admin home (full management access):\n{url}',
+  'card.dashboard.link.loopback_hint': '⚠️ The dashboard is bound to loopback only; this link can only be opened on the machine running BotMux.',
+  'card.dashboard.link.dm_sent': '📬 The dashboard admin home link was DMed to you.',
+  'card.dashboard.link.delivery_failed': '⚠️ Private delivery of the dashboard link failed; the link was not posted in this group. Check your DM permissions with the bot and retry.',
+  'card.dashboard.link.unavailable': '⚠️ Cannot read the dashboard port or admin token right now; make sure the dashboard is running.',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard Sessions',
   'card.dashboard.sessions.count_summary': 'Active {active} · Closed {closed} · Page {page}/{totalPages}',
@@ -1947,9 +1960,12 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
-  'card.waiting_duration': 'Waiting {seconds}s',
-  'card.execution_until_reply': 'Execution until reply {seconds}s',
-  'card.execution_duration': 'Execution time {seconds}s',
+  'card.waiting_duration': 'Waiting {duration}',
+  'card.execution_until_reply': 'Execution until reply {duration}',
+  'card.execution_duration': 'Execution time {duration}',
+  'card.duration_seconds': '{seconds}s',
+  'card.duration_minutes': '{minutes}m',
+  'card.duration_hours': '{hours}h',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
@@ -1970,6 +1986,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App shared turn (synced to Lark)',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 Decision board: received {count} decision(s) (batch #{id}); the steward is on it',
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
   'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat\nOpen target chat: {link}',
   'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic\nOpen target topic: {link}',
@@ -1997,6 +2014,17 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
   'worker.structured_turn_not_collected': '⚠️ This message was sent to {cliName}, but the turn never showed up in its session transcript, so botmux cannot collect the reply and it will not be forwarded here automatically. If {cliName} answered in the terminal, open the Web terminal to read it; resend only if it was not processed.',
+  'worker.structured_turn_not_started_blocked': '⚠️ {cliName} is still waiting on a {blocker}, so this message never started and botmux has stopped waiting for its reply. Resolve it in the Web terminal, then resend.',
+  'worker.startup_upgrade_hint': ' ({cliName} was just upgraded to {to}, previously {from})',
+  'worker.startup_blocker_label.folder_trust': 'folder trust confirmation',
+  'worker.startup_blocker_label.login': 'sign-in',
+  'worker.startup_blocker_label.update': 'update confirmation',
+  'worker.startup_blocker_label.terms': 'terms confirmation',
+  'worker.startup_blocked.folder_trust': '⚠️ {cliName} is stuck on a folder trust confirmation for {folder}{upgrade}. It is waiting for someone to decide whether to trust this folder, so this message has not been processed yet. Open the Web terminal and choose to trust it; processing continues automatically afterwards.',
+  'worker.startup_blocked.login': '⚠️ {cliName} is stuck at sign-in{upgrade}: it is waiting for someone to finish logging in, so this message has not been processed yet. Open the Web terminal (or use this machine) and follow the sign-in prompt; processing continues afterwards.',
+  'worker.startup_blocked.update': '⚠️ {cliName} is stuck on an update prompt{upgrade}: it is waiting for someone to choose whether to update, so this message has not been processed yet. Make the choice in the Web terminal to continue.',
+  'worker.startup_blocked.terms': '⚠️ {cliName} is stuck on a terms confirmation{upgrade}: it is waiting for someone to accept updated terms, so this message has not been processed yet. Confirm it in the Web terminal to continue.',
+  'worker.workspace_trust_explicitly_denied': '⚠️ The working directory {folder} is explicitly marked untrusted for {cliName} ({store}: trusted = false). botmux will not override that decision, so {cliName} will stop at its folder trust confirmation and not process messages. To use it here, choose to trust the folder in the Web terminal, or set the entry to trusted = true (or delete it), then resend.',
   'worker.claude_bridge_turn_unread': '⚠️ {cliName} just finished a turn, but botmux found nothing of it in the session transcript it reads, so this turn\'s reply may not be forwarded here automatically. Open the Web terminal to read it; botmux will look for the transcript again on your next message here.',
 
   // Restart / maintenance report (bot-0 DM to owner)

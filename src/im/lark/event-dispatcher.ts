@@ -1,3 +1,4 @@
+import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
  * Lark event dispatcher — handles WSClient setup, bot identity probing,
  * and message routing (group access checks, @mention detection).
@@ -8,7 +9,7 @@ import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
-import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -17,11 +18,11 @@ import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
-import { commandSpec } from '../../core/command-schema.js';
+import { commandSpec, isBuiltinMentionlessInvocation } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -29,6 +30,8 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
+import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
+import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
 import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, recordDocWatchActivity, setDocTitle, settleDocCommentWsDelivery, type DocSubscription, type DocWatchOutcome } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, fetchDocTitle, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
@@ -46,6 +49,7 @@ import {
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
+import { applyDelegatedGrants } from './delegated-grant.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
@@ -1354,6 +1358,40 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
 }
 
 /**
+ * 同机兄弟 bot 的身份解析：飞书盖章的发送方 union_id 精确对上**此刻** bots.json 里
+ * 唯一一个兄弟应用（非本 bot、非 apiOnly）自己学到的 union_id，返回那个兄弟的配置。
+ *
+ * 与跨部署团队 peer（isTeamBot / isPlatformTeamBot）同一口径：只认租户稳定、发送方专属
+ * 的 union_id，不看名字、不看 cross-ref。兄弟的 union_id 只从「它自己被 @ / 自己消息回声」
+ * 里按自身 open_id 学到（bot-union-ids-store），真人的 union_id 不会进来。
+ * 没有 union / 没有命中 / 命中多个 / 读配置失败一律返回 undefined（fail closed）。
+ * 配置按 bots.json 原文缓存（loadBotConfigsCached）：Bot 发来的每条 daemon 命令都会走到这里。
+ *
+ * @param senderUnionId 必须是飞书盖章的 bot 发送方 union（与 canOperate 的团队腿同一契约）。
+ */
+export function resolveLocalSiblingBotByUnionId(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): BotConfig | undefined {
+  const unionId = (senderUnionId ?? '').trim();
+  if (!unionId) return undefined;
+  let match: BotConfig | undefined;
+  try {
+    for (const cfg of loadBotConfigsCached()) {
+      const appId = (cfg.larkAppId ?? '').trim();
+      if (!appId || appId === larkAppId || cfg.apiOnly === true) continue;
+      if (getBotUnionId(dataDir, appId) !== unionId) continue;
+      if (match) return undefined; // 两个兄弟学到同一个 union_id → 有歧义，不认
+      match = cfg;
+    }
+  } catch {
+    return undefined;
+  }
+  return match;
+}
+
+/**
  * Auth-grade local sibling check for the narrow `/repo` exception.
  *
  * Cross-ref proves only "this receiver has seen this sender open_id as some
@@ -1368,23 +1406,42 @@ export function isVerifiedLocalSiblingBot(
   senderUnionId: string | undefined,
 ): boolean {
   const openId = (senderOpenId ?? '').trim();
-  const unionId = (senderUnionId ?? '').trim();
-  if (!openId || !unionId) return false;
+  if (!openId || !isKnownPeerBot(dataDir, larkAppId, openId)) return false;
+  return resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId) !== undefined;
+}
 
-  if (!isKnownPeerBot(dataDir, larkAppId, openId)) return false;
-
-  let matchingConfiguredSiblings = 0;
-  try {
-    for (const cfg of loadBotConfigs()) {
-      const appId = (cfg.larkAppId ?? '').trim();
-      if (!appId || appId === larkAppId || cfg.apiOnly === true) continue;
-      if (getBotUnionId(dataDir, appId) === unionId) matchingConfiguredSiblings += 1;
-      if (matchingConfiguredSiblings > 1) return false;
-    }
-  } catch {
-    return false;
+/**
+ * 发送方是不是**与本 bot 同一个 owner** 的同机兄弟 bot——同机 bot 授信（canOperate 放行、
+ * 点名授权）的唯一判据。三条同时成立才算：
+ *
+ *  1. 本 bot 没关「信任同一 owner 的同机 Bot」（trustSameOwnerBots，默认开）；
+ *  2. 身份：{@link resolveLocalSiblingBotByUnionId} 精确对上 bots.json 里唯一的兄弟应用；
+ *  3. 同一 owner：对方的**每个**管理员都是本 bot 的管理员，按 union_id 比（每个 bot 用自己的
+ *     凭证解析后发布，见 services/bot-admin-unions-store.ts）。
+ *
+ * 第 3 条用「全部包含」而不是只比主 owner：能指挥对方 bot 的管理员，本来就都能管理本 bot，
+ * 信任它的 bot 不会让任何管理员多出权限；对方多一个本 bot 不认的管理员就不授信。一台机器托管
+ * 多人 bot 时，别人的 bot 因此仍只能对话。对方没有管理员（开放模式）、有管理员没换出
+ * union_id、任一快照缺失或过期（allowedUsers 改过还没重新发布）都不授信。
+ */
+export function isTrustedSameOwnerSiblingBot(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): boolean {
+  if (!senderUnionId) return false;
+  const bot = getBot(larkAppId);
+  if (bot.config.trustSameOwnerBots === false) return false;
+  const sibling = resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId);
+  if (!sibling) return false;
+  const theirs = readBotAdminUnions(dataDir, sibling.larkAppId, sibling.allowedUsers);
+  if (!theirs?.exact || theirs.admins.size === 0) return false;
+  const mine = readBotAdminUnions(dataDir, larkAppId, bot.config.allowedUsers);
+  if (!mine) return false;
+  for (const admin of theirs.admins) {
+    if (!mine.admins.has(admin)) return false;
   }
-  return matchingConfiguredSiblings === 1;
+  return true;
 }
 
 /**
@@ -1817,6 +1874,7 @@ export const TALK_REASONS = [
   'open',
   'chatGrant',
   'globalGrant',
+  'meetingInviter',
   'p2pOpen',
   'blocked',
   'none',
@@ -2054,6 +2112,11 @@ export function evaluateTalk(
   if (senderOpenId && bot.resolvedBlockedUsers.includes(senderOpenId)) {
     return { allowed: false, reason: 'blocked' };
   }
+  if (canInviterTalkToMeeting({ dataDir: config.session.dataDir, agentAppId: larkAppId,
+    chatId, openId: senderOpenId, unionId: memberUnionId,
+    isBlockedFor: (appId, openId) => getBot(appId).resolvedBlockedUsers.includes(openId),
+    policyFor: appId => { const cfg = getBot(appId).config; return cfg.apiOnly || cfg.vcMeetingAgent?.enabled === false ? undefined : cfg.vcMeetingAgent; },
+  })) return { allowed: true, reason: 'meetingInviter' };
   // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
   // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
   // 命中会话群时无论表不表态，都不再回落 oncall 腿。
@@ -2260,9 +2323,9 @@ export function canOperate(
   // blockedUsers 否决腿（P1c）：必须排在 isTeamBot / isPlatformTeamBot 两条
   // union 信任腿之前——被黑团队 bot 不能借团队背书复活 operate。
   if (senderOpenId && bot.resolvedBlockedUsers.includes(senderOpenId)) return false;
-  // 同部署 cross-ref / isKnownPeerBot 只证明「这是一个可路由的 bot 身份」，仅供
-  // evaluateTalk 的 peer 腿使用，绝不能隐式升级为管理权限。需要让编排者执行
-  // /repo /cd /restart 等命令时，必须命中下面显式支持 operate 的权限源。
+  // 同部署 cross-ref / isKnownPeerBot 只证明「这是一个可路由的 bot 身份」（按显示名学来，
+  // 可被同名真人污染），仅供 evaluateTalk 的 peer 腿使用，绝不能升级为管理权限。
+  // 让 bot 执行 /repo /cd /restart 等命令，必须命中下面按 union_id 锚定的 bot 信任源。
   //
   // 跨部署「团队 peer bot」互信 operate（覆盖编排者给
   // 队友派 /repo /cd 等）。**只认租户稳定的 union_id**（isTeamBot / 平台 roster），
@@ -2271,6 +2334,10 @@ export function canOperate(
   // 是发送方专属、且必须先被团队背书（团队群学习 / 平台 roster）才进表，人不会命中。
   if (isTeamBot(config.session.dataDir, senderUnionId)) return true;
   if (isPlatformTeamBot(config.session.dataDir, senderUnionId)) return true;
+  // 同机兄弟 bot 互信 operate（与团队 peer 同一口径：union_id 精确对上本机 bots.json 里
+  // 登记的兄弟应用），另加「同一个 owner」：对方的管理员都得是本 bot 的管理员，一台机器
+  // 托管多人 bot 时别人的 bot 仍只能对话。可在 Bot 配置关掉（trustSameOwnerBots）。
+  if (isTrustedSameOwnerSiblingBot(config.session.dataDir, larkAppId, senderUnionId)) return true;
   // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
@@ -2301,7 +2368,9 @@ export function canOperate(
  *
  * `/repo` 另有一个更窄的同部署 sibling bot 例外：仅当飞书事件把发送方盖章为 bot，
  * receiver cross-ref 命中 sender open_id，且 sender union_id 精确匹配当前仍配置的唯一
- * 本机 sibling app 已学习的自身 union_id 时放行；不把 sibling 提升为 canOperate，也不把其他 daemon 命令降权。
+ * 本机 sibling app 已学习的自身 union_id 时放行；不看 owner，也不把其他 daemon 命令降权。
+ * 同一 owner 的 sibling 已在 canOperate 里放行（isTrustedSameOwnerSiblingBot），这条例外
+ * 只对 owner 不同的 sibling（或关了 trustSameOwnerBots 的 bot）还有意义。
  */
 export function canRunDaemonCommand(
   larkAppId: string,
@@ -3593,6 +3662,31 @@ export function extractMessageTextForRouting(message: any): string | null {
     }
   } catch { /* malformed content — skip */ }
   return null;
+}
+
+/**
+ * 内置免 @ 控制命令的**车道确认**：dispatcher 的轻量路由窥视已把消息认成候选后，
+ * 用 daemon 命令车道的**同一套渲染**（{@link daemonCommandLanePreview}）重算一遍，
+ * 剥前导 @ 后再走同一个 `parseSlashCommandInvocation` +
+ * {@link isBuiltinMentionlessInvocation}；只有两侧解析出**同一条**内置命令才放行。
+ *
+ * 不能只比对路由文本：那个窥视对 post 只拼 text 节点、丢标题、丢附件节点，与 daemon
+ * 的 `parseEventMessage` 渲染（标题拼成首行、段落以 `\n` 连、`at`→`@name` 不带空格、
+ * `a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）在多种形态上不一致。
+ * 实测会被这里拦下的形态：带标题富文本（车道 `标题\n/dash`）、text 与 at 节点紧贴
+ *（车道 `/dash@张三`）、at 名含空格且无 mentions[]（车道 `@张 三 /dash`）、多段图片、
+ * 单段超链接/代码块。解析失败按不一致处理（fail-closed，不放行免 @）。
+ */
+function builtinMentionlessConfirmedByDaemonLane(data: any, routingCmd: string | undefined): boolean {
+  if (!routingCmd) return false;
+  try {
+    const { text, mentions } = daemonCommandLanePreview(data);
+    const lane = stripLeadingMentions(text.trim(), mentions).trim();
+    const laneCmd = parseSlashCommandInvocation(lane)?.cmd;
+    return laneCmd === routingCmd && isBuiltinMentionlessInvocation(laneCmd, lane);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -5054,6 +5148,19 @@ export function createLarkEventDispatcherRuntime(
         // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
         // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
         await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
+        // 委托授权：同一 owner 的同机 Bot @ 本 bot 时，把它同时点名的人写进本群 chatGrants
+        // （talk-only，见 delegated-grant.ts）。必须排在 bindDefaultOncallBeforeTalk **之后**：
+        // 它用 evaluateTalk 判「已能说话就跳过」，defaultOncall 群的 oncall 绑定要到上一行才
+        // 写入，顺序反了会给本就能说话的人白落一条授权 + 一张「已获授权」卡。排在发送方自己的
+        // talk 闸之前：授权对象是被点名者，与这条 bot 消息能否路由无关。durable primary 不做
+        // 授权类副作用（与授权申请卡同口径），跳过。
+        if (!primary) {
+          await applyDelegatedGrants(larkAppId, message, {
+            chatType,
+            senderIds: [sender.sender_id?.open_id, sender.sender_id?.app_id],
+            senderUnionId,
+          }).catch(err => logger.warn(`[grant:${larkAppId}] delegated grant failed: ${err}`));
+        }
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
@@ -5653,6 +5760,28 @@ export function createLarkEventDispatcherRuntime(
           ? { ...commandTriggerEntry, args: commandTriggerArgs(strippedRoutingText) }
           : undefined;
         const commandTriggerRelax = !!commandTrigger;
+        // 内置保留控制命令（`/dash`、裸 `/dashboard link`）在**所有群形态**
+        // （普通群、话题群、话题回复）都免 @ 寻址本 bot。与用户配置的
+        // commandTriggers 正交：那条只放普通群且带 prompt 模板语义，这里不打
+        // commandTrigger 标记，原文进 daemon 后由 classifySlash 按 sessionless
+        // daemon 命令认领，不建会话、不起 CLI、不建 worktree。仍要求 isAllowed
+        // （canTalk 入口闸）；未授权者在 daemon 侧被 canOperate / 命令内管理员闸
+        // 拒绝。@ 别的成员的让路礼仪与 commandTriggers 同款（命令在前的 @参数
+        // 不算让路）。
+        //
+        // 关键：dispatcher 用来取首 token 的 routingText 是热路径轻量窥视——对
+        // post 只拼 text 节点（丢标题、img/file 节点丢弃、段落间无换行），与 daemon
+        // 命令车道的 parseEventMessage 渲染并不逐字相同。因此先用它做廉价候选过滤，
+        // 再用 daemon 车道同一套渲染（daemonCommandLanePreview）重算一次：标题成
+        // 首行、text 紧贴 at 变 `/dash@张三`、图片成 `[图片 N]` 多段等形态下，车道
+        // 解析不出同一条内置命令，群闸就不放行，杜绝「放行后 daemon 落建会话/
+        // auto-worktree」。
+        const builtinMentionlessCommand = isAllowed
+          && (!mentionsOther || commandLeadsMessage)
+          && isBuiltinMentionlessInvocation(triggeredCommand, strippedRoutingText)
+          && builtinMentionlessConfirmedByDaemonLane(data, triggeredCommand)
+          ? triggeredCommand
+          : undefined;
         // replyRootId means this turn has already been explicitly addressed
         // to the bot by shared-topic logic (possibly from inside an existing
         // Lark thread). Do not re-run the generic group @ gate, which would
@@ -5698,12 +5827,20 @@ export function createLarkEventDispatcherRuntime(
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
+          || !!builtinMentionlessCommand
           || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
             `${commandTrigger?.prompt ? '（模板）' : '（原文）'} chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+          );
+        }
+        if (builtinMentionlessCommand) {
+          logger.info(
+            `[builtin-command:${larkAppId}] ${builtinMentionlessCommand} 内置免@ 命中 ` +
+            `source=${routingSource} chat=${chatId.substring(0, 12)} msg=${messageId.substring(0, 12)} ` +
+            `sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
         }
         if (!relax) {
@@ -6152,6 +6289,12 @@ export function createLarkEventDispatcherRuntime(
         const chatId: string | undefined = data?.chat_id;
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
+        // 拉新群时静默带进来的管家（决策看板）：只是进群好之后用自己的身份发消息，
+        // 这次入群不跑入群钩子 / 入群命令 / 拉 owner / 自动开工，不发言也不开会话。
+        if (isStewardSilentJoin(config.session.dataDir, larkAppId, chatId)) {
+          logger.info(`[steward-join] joined chat=${chatId.substring(0, 12)} silently as a steward; skipping group-join actions`);
+          return;
+        }
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
         // chat.bot_added 观察钩子：拉群信号（应急群自动化的触发点之一）。
         // 放在 scheduleAckSafeEvent 的去重 claim 之后，重推不会重复发射。

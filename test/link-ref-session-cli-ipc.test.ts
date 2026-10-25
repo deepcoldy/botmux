@@ -291,7 +291,7 @@ import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js
 describe('routeHasNarrowUntrustedAuth session-route set invariant', () => {
   const sessionRoutes = [
     'slash', 'cd', 'close', 'preview', 'chat-rename', 'chat-manager', 'rename',
-    'project', 'project-dispatch-policy', 'continuation', 'durable-send',
+    'project', 'decision-board', 'project-dispatch-policy', 'continuation', 'durable-send',
     'turn-delivery', 'deferred-topic', 'link-refs/register', 'link-refs/resolve',
     'auth-request', 'auth-status',
   ] as const;

@@ -61,7 +61,7 @@ import {
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
-import { isHttpVirtualSession } from './core/types.js';
+import { isHttpVirtualSession, type TurnTerminalCarrierKind } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
@@ -353,6 +353,11 @@ import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/la
 import { clearWorkerConfig, mergeDashboardConfig, mergeGlobalConfig, mergeWorkerConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
 import { evaluateWorkerAdmission, formatMemoryBytes, readHostMemoryPressure } from './core/worker-budget.js';
 import { sessionScopeCapabilities } from './core/session-scope.js';
+import {
+  inspectRecordedSessionWorker,
+  recordedSessionWorkerAlive,
+  signalRecordedSessionWorker,
+} from './core/session-worker-identity.js';
 import { DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   createWhiteboard,
@@ -3972,6 +3977,7 @@ interface SessionData {
   lastMessageAt?: string;
   closedAt?: string;
   pid?: number;
+  pidProcStart?: string;
   workingDir?: string;
   webPort?: number;
   larkAppId?: string;
@@ -4185,12 +4191,19 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
         }),
       };
     }
-    if (isProcessAlive(ownedWorkerPid)) {
-      const signalled = killProcess(ownedWorkerPid);
-      if ((!signalled && isProcessAlive(ownedWorkerPid))
-        || !(await waitForProcessExit(ownedWorkerPid))) {
+    // Only the exact worker this row recorded is ever signalled: a dormant
+    // row's pid may long since belong to an unrelated process (pid reuse, see
+    // core/session-worker-identity.ts). Anything not provably that worker is
+    // left alone; the row is still marked worker-less below.
+    const inspection = inspectRecordedSessionWorker({ ...current, pid: ownedWorkerPid });
+    if (inspection.status === 'exact') {
+      const signalled = signalRecordedSessionWorker(inspection, 'SIGTERM', { processGroup: false });
+      if ((!signalled && recordedSessionWorkerAlive(inspection))
+        || !(await waitForRecordedWorkerExit(inspection))) {
         return { ok: false, error: `worker_pid_kill_failed:${ownedWorkerPid}` };
       }
+    } else if (inspection.status !== 'gone' && inspection.status !== 'reused') {
+      console.error(`未向 pid ${ownedWorkerPid} 发信号：无法证明它是这个会话记录的 worker（${inspection.status}）`);
     }
 
     // Persist worker-less state without touching FIFO authority. If a new
@@ -4516,22 +4529,16 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function killProcess(pid: number): boolean {
-  try {
-    process.kill(pid, 'SIGTERM');
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+async function waitForRecordedWorkerExit(
+  target: { pid: number; processStart: string },
+  timeoutMs = 2_000,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
+    if (!recordedSessionWorkerAlive(target)) return true;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  return !isProcessAlive(pid);
+  return !recordedSessionWorkerAlive(target);
 }
 
 function formatDuration(ms: number): string {
@@ -5968,7 +5975,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6478,6 +6485,60 @@ ${SESSION_RENAME_USAGE}
     console.log('运行中的 CLI 原生会话名同步失败，原生会话名可能未更新；不影响标题更新。');
   }
   console.log('飞书话题（omt）标题平台无开放接口，不会改变，话题列表仍显示首条消息；`botmux chat rename` 改的是整个群名，与本命令不同。');
+}
+
+/** `botmux board …`：管家写决策看板。解析与输出在 cli/board-command.ts，这里只负责找会话和发 IPC。 */
+async function cmdBoard(argv: string[]): Promise<void> {
+  const { BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles } = await import('./cli/board-command.js');
+  const parsed = parseBoardArgs(argv);
+  if (!parsed.ok) {
+    console.error(`botmux board: ${parsed.error}`);
+    console.error('运行 `botmux board --help` 查看用法。');
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.help) {
+    console.log(BOARD_CLI_USAGE);
+    return;
+  }
+  const { action, json, request, attachPaths } = parsed.parsed;
+  if (attachPaths.length) {
+    const files = readBoardAttachFiles(attachPaths);
+    if (!files.ok) {
+      console.error(`botmux board: ${files.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    request.files = files.files;
+  }
+  const sid = parsed.parsed.sessionId ?? findAncestorSessionId();
+  if (!sid) {
+    console.error('无法推断 session-id；请在管家 bot 的会话里运行，或传 --session-id。');
+    process.exitCode = 1;
+    return;
+  }
+  const session = loadSessions().get(sid);
+  if (!session?.larkAppId) {
+    console.error(`未找到可用 session ${sid}`);
+    process.exitCode = 1;
+    return;
+  }
+  const daemon = findDaemon(session.larkAppId);
+  const ipcPort = resolveDaemonIpcPort(daemon?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('当前 Bot daemon 不在线。');
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(ipcPort, session.sessionId, 'decision-board', request);
+  const body = await response.json().catch(() => ({})) as Record<string, unknown> & { ok?: boolean; error?: string; message?: string };
+  if (!response.ok || !body.ok) {
+    console.error(`botmux board ${action} 失败: ${body.message ?? body.error ?? `HTTP ${response.status}`}`);
+    process.exitCode = 1;
+    return;
+  }
+  const { ok: _ok, ...result } = body;
+  console.log(json ? JSON.stringify(result, null, 2) : formatBoardResult(action, result));
 }
 
 async function cmdProject(argv: string[]): Promise<void> {
@@ -7542,6 +7603,8 @@ ${SEND_HELP_BODY}
   report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
   project init|status|update|close|resume [...]
                                        普通群项目控制面与置顶进度卡（详见 \`botmux project --help\`）
+  board guide|list|show|add|set|history|attach|pending [...]
+                                       决策看板（仅管家 bot 的会话；详见 \`botmux board --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
@@ -9085,10 +9148,10 @@ async function cmdQuoted(rest: string[]): Promise<void> {
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const { renderQuotedMessage } = await import('./cli/quoted-render.js');
+  const { getQuotedMessageDetail, renderQuotedMessage } = await import('./cli/quoted-render.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
-    const detail = await getMessageDetail(appId, messageId);
+    const detail = await getQuotedMessageDetail(appId, messageId, getMessageDetail);
     const msg = detail?.items?.[0];
     if (!msg) {
       console.error(`未找到消息 ${messageId}`);
@@ -9101,7 +9164,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
     // Interactive cards are re-resolved inside the render pipeline (both
     // im.message.get representations unioned, content + resources replaced
     // wholesale with fresh [图片 N] numbering — see renderQuotedMessage).
-    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent);
+    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent, detail);
     if (rawFlag) {
       if (rendered.mergedStructuredContent !== undefined) {
         // --raw: surface the full structured card JSON (v2 body/elements) so
@@ -12400,7 +12463,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     sentAtMs: number,
     messageId: string,
     sentContent: string,
-    terminalCarrier?: 'standard_reply_card' | 'non_patchable',
+    terminalCarrier?: TurnTerminalCarrierKind,
   ): void => {
     try {
       const markerSessionId = originSessionId ?? sid;
@@ -15770,6 +15833,11 @@ botmux create-group — 用一组机器人新建飞书群
   } else if (result.kickoffMessageId) {
     console.error(`✅ kickoff 消息已发送 (msg ${result.kickoffMessageId})`);
   }
+  for (const steward of result.stewardJoins ?? []) {
+    const label = botInfoEntries.find(b => b.larkAppId === steward.larkAppId)?.botName ?? steward.larkAppId;
+    if (steward.ok) console.error(`✅ 已带上管家 ${label}`);
+    else console.error(`⚠️  管家 ${label} 没加进群（不影响建群）: ${steward.error ?? 'unknown'}`);
+  }
   if (bindWorkingDir) {
     const ok = result.oncallBindings.filter(b => b.ok).length;
     const failed = result.oncallBindings.filter(b => !b.ok);
@@ -16553,10 +16621,10 @@ async function postSessionScopedSignal(
      *  dispatch by the time this child runs (see utils/turn-idle-report.ts). */
     frozenOrigin?: { turnId: string; dispatchAttempt?: number; capability?: string };
   },
-): Promise<void> {
+): Promise<boolean> {
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
-  if (!sessionId || !larkAppId) return;
+  if (!sessionId || !larkAppId) return false;
   try {
     let discoveredPort: number | undefined;
     try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
@@ -16564,7 +16632,7 @@ async function postSessionScopedSignal(
       discoveredPort,
       process.env.BOTMUX_DAEMON_IPC_PORT,
     );
-    if (!ipcPort) return;
+    if (!ipcPort) return false;
     const relayDir = process.env.BOTMUX_SEND_RELAY;
     const frozenOrigin = opts?.frozenOrigin;
     const originCapability = frozenOrigin?.capability
@@ -16599,12 +16667,47 @@ async function postSessionScopedSignal(
     if (!relayDir) {
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
     }
-    if (!hostSecret) {
-      await loopbackFetch(`http://127.0.0.1:${ipcPort}${route}`, init);
-    } else {
-      await fetchDaemonIpc(ipcPort, route, init, hostSecret);
-    }
+    const res = hostSecret
+      ? await fetchDaemonIpc(ipcPort, route, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${route}`, init);
+    return res.ok;
   } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+  return false;
+}
+
+// ─── botmux __claude-stop-failure-v1 ─────────────────────────────────────────────
+//
+// Claude Code `StopFailure` hook 客户端（见 services/claude-stop-failure.ts）：回合因
+// API 错误结束时 Claude 跑它而不跑 Stop。本命令只把错误类型与发起方身份
+// （session_id / transcript_path / CLAUDE_PID）搬给本会话 worker，兜底与否由 worker
+// 在 transcript 宽限期后决定。回合身份沿用 session-ready 的 origin 解析（worker 发布
+// 的 active-turn marker）；Claude 不等这个 hook，marker 可能已指向下一条排队输入，
+// worker 侧会据此只做提示、不收口回合。
+//
+// 沙箱 / 读隔离会话没有 host secret，只能凭本轮 capability 过 daemon 鉴权；而本兜底
+// 最常见的场景恰是这一轮已在 prompt_ready 收口、capability 已撤销，daemon 必然 403。
+// 这时退而把上报写进本会话的 relay outbox（只有本会话沙箱与它的 worker 能访问，随
+// worker 代际轮换）：worker 把 outbox 上报当作沙箱可控的字节，只据此发提示，绝不
+// 收口回合（见 services/claude-stop-failure.ts 的 outbox 一节）。
+// fail-open：env 缺失、载荷无法解析、daemon 不可达都静默 exit 0（StopFailure 的输出
+// 与退出码 Claude 本就忽略）。
+async function cmdClaudeStopFailure(): Promise<void> {
+  const payloadText = (await readStdinWithTimeout(2000)).toString('utf-8');
+  const { parseClaudeStopFailureHookInput, writeClaudeStopFailureOutboxReport } = await import('./services/claude-stop-failure.js');
+  const report = parseClaudeStopFailureHookInput(payloadText, process.env.CLAUDE_PID);
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  if (report && sessionId && process.env.BOTMUX_LARK_APP_ID) {
+    const delivered = await postSessionScopedSignal('/api/claude-stop-failure', { ...report });
+    const relayDir = process.env.BOTMUX_SEND_RELAY;
+    if (!delivered && relayDir) {
+      try {
+        writeClaudeStopFailureOutboxReport(relayDir, report, {
+          turnId: resolveSessionContext(resolveDataDir(), sessionId)?.turnId ?? process.env.BOTMUX_TURN_ID,
+        });
+      } catch { /* outbox 不可写 → 放弃，退回既有行为 */ }
+    }
+  }
+  process.exit(0);
 }
 
 // ─── botmux __turn-idle-v2 ──────────────────────────────────────────────────────
@@ -17967,6 +18070,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // branch's plugin lookup can never match it.
     '__turn-idle-v2',
     '__cursor-usage-v1', // local, session-scoped usage callback; no messaging
+    // Claude StopFailure hook client: forwards the failed turn's error type to
+    // this session's worker. Local and session-scoped like `session-ready`; the
+    // worker decides whether the turn still needs a terminal.
+    '__claude-stop-failure-v1',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -19236,6 +19343,11 @@ switch (command) {
     await cmdUserPromptHook();
     break;
   }
+  case '__claude-stop-failure-v1': {
+    // `botmux __claude-stop-failure-v1` — Claude StopFailure hook 客户端（API 错误结束的回合）。
+    await cmdClaudeStopFailure();
+    break;
+  }
   case '__cursor-usage-v1': {
     const { runCursorUsageHook } = await import('./services/cursor-usage-hook.js');
     await runCursorUsageHook();
@@ -19341,6 +19453,7 @@ switch (command) {
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
+  case 'board':    await cmdBoard(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

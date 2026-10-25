@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
  *
@@ -25,6 +26,7 @@ import { assertDurableConfigMutationAllowed } from './services/durable-config-mu
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -111,6 +113,8 @@ export interface VcMeetingSharedConsumerCatalog {
 }
 
 export interface VcMeetingAgentGlobalConfig {
+  /** Defaults for future meetings; each meeting freezes its effective policy. */
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
@@ -231,6 +235,11 @@ export interface GlobalConfig {
    *  聚合进程周期性调用与手动「清理空闲」按钮完全相同的判定/关闭逻辑
    *  （dashboard/session-cleanup.ts），无人值守地关掉空闲超过阈值的会话。 */
   sessionCleanup?: SessionCleanupGlobalConfig;
+  /** Claude Code prompt-cache defaults (TTL + idle keep-alive) for every bot.
+   *  Machine-level, default OFF, managed from the Dashboard; a bot's own
+   *  `promptCache` in bots.json overrides it field by field
+   *  (services/prompt-cache-policy.ts). */
+  promptCache?: PromptCacheConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -777,6 +786,15 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const out: VcMeetingAgentGlobalConfig = {};
+  try {
+    const listenerPolicy = normalizeVcMeetingListenerPolicy(v.listenerPolicy);
+    if (listenerPolicy) out.listenerPolicy = listenerPolicy;
+  } catch {
+    // A typo in this optional feature must not break unrelated global config
+    // reads or silently fall back to publishing raw meeting text.
+    console.warn('[botmux] Invalid vcMeetingAgent.listenerPolicy; disabling its publication/sharing flags.');
+    out.listenerPolicy = { rawMessages: false, finalSummary: false, allowSummarySharing: false };
+  }
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
@@ -877,6 +895,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const sessionCleanup = readSessionCleanup(raw.sessionCleanup);
   if (sessionCleanup) out.sessionCleanup = sessionCleanup;
+  const promptCache = readPromptCacheConfig(raw.promptCache);
+  if (promptCache) out.promptCache = promptCache;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
@@ -946,6 +966,7 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
     ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
+    ...(parsed?.listenerPolicy ? { listenerPolicy: parsed.listenerPolicy } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;

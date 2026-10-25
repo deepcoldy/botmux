@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -61,6 +62,8 @@ export interface GroupJoinContext {
   gateMatched: boolean;
 }
 
+export type TurnTerminalCarrierKind = 'standard_reply_card' | 'non_patchable';
+
 /** Last user-visible output carrier observed for each in-flight turn. The
  *  worker reconstructs explicit-send entries from the durable turn-sends
  *  journal before publishing turn_terminal; daemon-owned fallback output is
@@ -68,11 +71,11 @@ export interface GroupJoinContext {
  *  duplicate terminal can safely retry after an unconfirmed provider error. */
 export type TurnTerminalCarrier = {
   messageId: string;
-  kind: 'standard_reply_card' | 'non_patchable';
+  kind: TurnTerminalCarrierKind;
   /** Explicit send classification. `progress` / `auxiliary` are visible
    *  interim output and must never be promoted to a completed-turn carrier.
    *  Undefined is retained for rolling compatibility with older workers. */
-  responseKind?: 'progress' | 'final' | 'auxiliary';
+  responseKind?: TurnSendKind;
 };
 
 /** Core session state — IM-agnostic.
@@ -534,6 +537,10 @@ export interface DaemonSession {
    * until its next real idle edge.
    */
   idleSinceAt?: number;
+  /** Prompt-cache keep-alive bookkeeping for the current idle stretch
+   *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
+   *  turn or busy edge that is not a keep-alive. */
+  promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still

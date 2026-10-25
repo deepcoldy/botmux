@@ -3115,3 +3115,12 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
 
   return configured;
 }
+
+/** Current application only. Throws on missing scope/unknown membership. */
+export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  const response: any = await larkGet(getBotClient(larkAppId),
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+  if (response.code !== 0 && response.code !== undefined) throw larkApiError('check bot chat membership', response);
+  if (typeof response.data?.is_in_chat !== 'boolean') throw new Error('chat_membership_unknown');
+  return response.data.is_in_chat;
+}

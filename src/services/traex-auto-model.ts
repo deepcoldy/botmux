@@ -1,5 +1,3 @@
-import { knownTraexContextVariantsForModel, knownTraexReasoningEffortsForModel } from './codex-reasoning-effort.js';
-
 export const TRAEX_AUTO_MODEL_ID = 'auto';
 export const TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 export const TRAEX_AUTO_MODEL_MIN_QUEUE_TIMEOUT_MS = 5_000;
@@ -34,8 +32,10 @@ export type TraexAutoModelConfigResult = {
  * The list is an allowlist, not a suggestion list: runtime fallback may only
  * use these entries and preserves their order. Invalid enabled configs are
  * rejected as a whole so a typo cannot silently widen or reorder the pool.
+ * Capability tables can lag behind the CLI: validate setting syntax here,
+ * leaving model-specific support to the live catalog in Dashboard saves.
  */
-export function normalizeTraexAutoModelConfig(raw: unknown, options: { validateKnownSettings?: boolean } = {}): TraexAutoModelConfigResult {
+export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfigResult {
   if (raw === undefined || raw === null || raw === false) return {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { error: 'traexAutoModel must be an object' };
@@ -90,16 +90,8 @@ export function normalizeTraexAutoModelConfig(raw: unknown, options: { validateK
       if (effort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort as string)) {
         return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is invalid` };
       }
-      const knownEfforts = options.validateKnownSettings ? knownTraexReasoningEffortsForModel(model) : undefined;
-      if (effort !== undefined && knownEfforts && !knownEfforts.includes(effort as TraexAutoModelSettings['reasoningEffort'] & string)) {
-        return { error: `traexAutoModel.modelSettings.${id}.reasoningEffort is not supported by this model` };
-      }
       if (variant !== undefined && variant !== 'standard' && variant !== 'max') {
         return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is invalid` };
-      }
-      const knownVariants = options.validateKnownSettings ? knownTraexContextVariantsForModel(model) : undefined;
-      if (variant !== undefined && knownVariants && !knownVariants.includes(variant as string)) {
-        return { error: `traexAutoModel.modelSettings.${id}.modelBackendVariant is not supported by this model` };
       }
       // defineProperty safely preserves literal ids such as __proto__.
       Object.defineProperty(modelSettings, model, { enumerable: true, configurable: true, writable: true,
@@ -217,6 +209,8 @@ export class TraexAutoModelController {
   private currentIndex = 0;
   private turnId: string | undefined;
   private queueSinceMs: number | undefined;
+  /** Latest live "this pane is parked in a capacity queue" observation. */
+  private liveCapacityQueued = false;
   private exhausted = false;
   private lastSwitchAtMs: number | undefined;
   private queuePositions = new Map<number, { position: number; atMs: number }>();
@@ -253,6 +247,7 @@ export class TraexAutoModelController {
     this.exhausted = false;
     this.searchingBackups = false;
     this.queueSinceMs = undefined;
+    this.liveCapacityQueued = false;
   }
 
   currentModel(): string {
@@ -271,10 +266,33 @@ export class TraexAutoModelController {
     return this.queueSinceMs !== undefined || this.exhausted;
   }
 
+  /** Capacity still owns the live input surface: either a queue-confirmation
+   *  window is open, or the pool was declared exhausted while the pane is
+   *  STILL parked in the queue (the exhausted latch outlives queueSinceMs,
+   *  which both walk-off branches clear at the moment of exhaustion). */
+  capacityCurrentlyBlocking(): boolean {
+    return this.queueSinceMs !== undefined || (this.exhausted && this.liveCapacityQueued);
+  }
+
   /** A resumed continuation must show activity before queued corrections can
    * follow it; process startup alone does not finish a capacity transition. */
   awaitingModelActivity(): boolean {
     return this.awaitingActivity;
+  }
+
+  /** Submission can leave the previous composer visible until the first
+   * native activity frame. Keep follow-ups outside the CLI during that gap. */
+  markInputSubmitted(turnId: string): void {
+    if (turnId === this.turnId) this.awaitingActivity = true;
+  }
+
+  /** An unplanned process death can never paint the activity frame a
+   *  submitted input was waiting for: the crash-restarted process evaluates
+   *  the turn afresh, so its recovery input must not be held for a dead
+   *  process's frame. A PLANNED model switch keeps the latch — its
+   *  replacement owns the same waiting window and buffering contract. */
+  noteProcessExited(planned: boolean): void {
+    if (!planned) this.awaitingActivity = false;
   }
 
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
@@ -283,6 +301,7 @@ export class TraexAutoModelController {
     if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === 0) {
       this.turnId = turnId;
       this.queueSinceMs = undefined;
+      this.liveCapacityQueued = false;
       if (this.config.reselectPerTurn) this.exhausted = false;
       this.searchingBackups = false;
       this.progressSinceMs = undefined;
@@ -312,6 +331,7 @@ export class TraexAutoModelController {
     this.currentIndex = action.toIndex;
     this.turnId = action.turnId;
     this.queueSinceMs = undefined;
+    this.liveCapacityQueued = false;
     this.exhausted = action.reason === 'shortest_queue' || action.reason === 'lowest_load';
     this.searchingBackups = action.reason !== 'new_turn' && !this.exhausted;
     this.awaitingActivity = action.reason !== 'new_turn';
@@ -330,6 +350,9 @@ export class TraexAutoModelController {
     this.awaitingActivity = false;
     this.turnId = undefined;
     this.queueSinceMs = undefined;
+    // liveCapacityQueued describes the PANE, not the turn: a structured
+    // terminal does not repaint the queued pane, so keep that fact across
+    // endTurn until the next beginTurn/commitSwitch/observeRunningModel.
     this.searchingBackups = false;
     this.progressSinceMs = undefined;
     this.queuePositions.clear();
@@ -391,6 +414,10 @@ export class TraexAutoModelController {
     nowMs: number;
     queuePosition?: number;
   }): TraexAutoModelAction {
+    // Record the live viewport fact before any early return: the exhausted
+    // latch outlives queueSinceMs, so "still parked in the queue" is an
+    // observation of the current pane, independent of turn-id ownership.
+    this.liveCapacityQueued = input.queued;
     if (!input.turnId || input.turnId !== this.turnId) return { kind: 'none' };
     if (input.queued || input.progressing) this.awaitingActivity = false;
     if (!input.queued) {

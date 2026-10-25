@@ -485,6 +485,12 @@ vi.mock('../src/core/session-discovery.js', async (importOriginal) => {
   };
 });
 
+// The /adopt picker's live-name enrichment shells out to herdr and reads
+// ~/.claude transcripts; keep it out of these tests (pass sessions through).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: vi.fn(async (sessions: unknown[]) => sessions),
+}));
+
 // Resume-history tests swap in a fake on-disk store (`resumeStore.list`) so they
 // can see the exclude set the adapter receives; while it is unset every adapter
 // is the real one, so other tests are unaffected.
@@ -862,7 +868,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/dash', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -1721,6 +1727,8 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'minimax').size).toBe(0);
     // ebsd is interactive, but every external message must pass through the
     // service-user envelope and structured terminal-marker ledger.
     expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
@@ -5303,6 +5311,7 @@ describe('handleCommand', () => {
 
     it('starts a first message refused for its missing directory in the /repo-chosen one', async () => {
       const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = { path: '/gone/default-dir' };
       const deps = makeDeps(ds);
       deps.lastRepoScan.set(CHAT_ID, [
         { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
@@ -5317,6 +5326,20 @@ describe('handleCommand', () => {
       expect(sessionStore.createSession).not.toHaveBeenCalled();
       expect(ds.workingDir).toBe('/home/testuser/project-a');
       expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    });
+
+    it('guides bare /repo to pass a path instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
     });
 
     it('still refuses /repo while an activation is actually in flight', async () => {

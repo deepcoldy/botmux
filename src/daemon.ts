@@ -1,3 +1,13 @@
+import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
+import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { createBotAdminUnionsPublisher } from './services/bot-admin-unions-store.js';
+import { DecisionBoardService } from './core/decision-board/service.js';
+import { resolveDashboardOrigin } from './core/workbench-link.js';
+import { getAttachmentsDir } from './core/attachment-path.js';
+import { scheduleTimeZone } from './utils/timezone.js';
+import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-policy.js';
+import { globalVcMeetingAgentConfigLive } from './global-config.js';
+import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport } from './core/report-publication.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -17,6 +27,7 @@ import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
+import { activeVcMeetingInviters, createVcMeetingInviterGrant, type VcMeetingInviterGrant } from './services/vc-meeting-inviter-policy.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -83,6 +94,7 @@ import {
   getAllBots,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
+  getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
@@ -380,6 +392,7 @@ import {
   type WorkerForkAdmission,
   codexAppCleanInputAcceptedForSession,
   hasQueuedActivationAdmissionGate,
+  sendPromptCacheKeepalive,
   sendWorkerSessionInput,
   killWorker,
   retireWorkerProcessOnly,
@@ -427,6 +440,7 @@ import {
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
+import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -434,7 +448,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -476,6 +490,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
+import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
@@ -501,6 +516,7 @@ import {
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
+  deliverOwnerBatchTurn,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -774,6 +790,41 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
+
+/**
+ * 每个 bot 发布自己管理员的 union_id，供同机兄弟 bot 判断「是不是同一个 owner」（见
+ * services/bot-admin-unions-store.ts）。ou_ → union_id 必须用签发它的应用凭证，所以只发
+ * 本 bot 自己的。启动时 allowedUsers 解析完才登记；之后心跳里顺带 publish，解析结果
+ * （含 /botconfig、Dashboard 改 owner、解析重试）变了才重算，没变不打 API。
+ */
+const adminUnionsPublishers = new Map<string, { publish: () => Promise<void> }>();
+
+function startAdminUnionsPublisher(larkAppId: string): void {
+  const publisher = createBotAdminUnionsPublisher({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    readState: () => {
+      try {
+        const bot = getBot(larkAppId);
+        return {
+          rawAllowedUsers: bot.config.allowedUsers ?? [],
+          resolution: bot.rawAllowedUserResolution,
+          ownerOpenId: getOwnerOpenId(larkAppId),
+        };
+      } catch {
+        return undefined;
+      }
+    },
+    lookupUnion: async (openId) => {
+      const r = await resolveUnionIdFromOpenIdStrict(larkAppId, openId);
+      if (r.status === 'resolved') return r.unionId;
+      return r.status === 'unavailable' ? null : undefined;
+    },
+    onError: err => logger.warn(`[${larkAppId}] publish admin union_ids failed: ${err instanceof Error ? err.message : String(err)}`),
+  });
+  adminUnionsPublishers.set(larkAppId, publisher);
+  void publisher.publish();
+}
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
@@ -875,7 +926,7 @@ import {
   RealtimeVoiceSession,
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
-import { addBotToChat, isInChat } from './services/groups-store.js';
+import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle } from './services/session-group-title.js';
@@ -1010,6 +1061,7 @@ import {
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
+import { normalizeClaudeStopFailureReport } from './services/claude-stop-failure.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2234,6 +2286,9 @@ type VcMeetingDaemonSession = {
   ended: boolean;
   joined: boolean;
   monitoringStarted: boolean;
+  inviterManagers?: VcMeetingInviterGrant[];
+  listenerChatCreatedForMeeting?: boolean;
+  inviterMembershipPromise?: Promise<void>;
   /** True after this listener bot's own participant_left event. Generic
    * activity must not infer presence again; only an explicit own join or a
    * successful forced join clears the fence. */
@@ -2268,6 +2323,7 @@ type VcMeetingDaemonSession = {
   textOutputPolicy: VcMeetingOutputPolicy;
   voiceOutputPolicy: VcMeetingOutputPolicy;
   syncIntervalMs?: number;
+  listenerPolicy?: VcMeetingListenerPolicy;
   consumerSelectionExpiresAt?: number;
   consumerSelectionNonce?: string;
   consumerCardMessageId?: string;
@@ -3479,7 +3535,18 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
   }
   ctx.vcMeetingContextMayLag = caughtUp.meetingContextMayLag;
   ctx.vcMeetingContextLifecycle = caughtUp.candidate.lifecycle;
+  const projection = getVcMeetingMemberProjection(config.session.dataDir, {
+    listenerAppId: caughtUp.candidate.listenerAppId, meetingId: caughtUp.candidate.meetingId,
+    memberId: caughtUp.candidate.memberId, memberEpoch: caughtUp.candidate.memberEpoch,
+  });
+  const summaryShareTargetChatId = vcMeetingSummaryShareTarget({
+    enabled: projection?.listenerPolicy?.allowSummarySharing === true,
+    senderType: parsed.senderType, messageType: parsed.msgType,
+    meetingId: caughtUp.candidate.meetingId, meetingNo: caughtUp.candidate.meetingNo,
+    text: stripLeadingMentions(parsed.content, parsed.mentions), quoted: !!parsed.parentId,
+  });
   ctx.vcMeetingImTurnOrigin = {
+    ...(summaryShareTargetChatId ? { summaryShareTargetChatId } : {}),
     listenerAppId: caughtUp.candidate.listenerAppId,
     meetingId: caughtUp.candidate.meetingId,
     memberId: caughtUp.candidate.memberId,
@@ -5303,10 +5370,17 @@ function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
     const oldVersion = cached?.version;
     cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
     setCurrentCliVersion(newVersion, key);
+    // Persisted so an upgrade that happened while the daemon was down is still
+    // known as one (startup-stall notices quote it).
+    const record = noteObservedCliVersion(key, newVersion, { nowMs: now });
 
     if (oldVersion && oldVersion !== newVersion) {
       logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
       return true;
+    }
+    if (!oldVersion && record?.previousVersion && record.changedAtMs === now) {
+      logger.info(`CLI version changed since last seen: ${record.previousVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
+      return false;
     }
 
     logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
@@ -5746,6 +5820,8 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+  // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
+  resetPromptCacheKeepalive(ds);
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -8887,6 +8963,93 @@ ipcRoute('POST', '/api/turn-idle', async (req, res) => {
   return jsonRes(res, 200, { ok: true });
 });
 
+// ─── claude-stop-failure IPC route (internal: Claude 回合因 API 错误结束) ──────────
+//
+// NOT an agent-facing command. Claude Code 的 StopFailure hook 经
+// `botmux __claude-stop-failure-v1`（cli.ts cmdClaudeStopFailure）调到这里。这条
+// 路径上 Claude 不跑 Stop hook，transcript 跟丢了这一轮时就没有任何东西收口它：
+// 不续跑、不发失败卡，用户对着已经停下的任务干等。daemon 把错误类型、发起方
+// 身份与上报者读到的回合身份转给 worker；worker 先给 transcript 留宽限期，到期
+// 这次失败仍没呈现出来，才为仍开着的回合补发终态，或发一条提示（见
+// services/claude-stop-failure.ts）。
+//
+// 鉴权与 /api/turn-idle 同构，同样不放行 receiver 会话：转发可能让 worker 发出
+// 回合终态，属可观测副作用；声明的回合也必须正是该 capability 对应的 live
+// origin，绑定失败 403、不转发。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一次兜底只是退回既有行为。
+ipcRoute('POST', '/api/claude-stop-failure', async (req, res) => {
+  let raw: Record<string, unknown>;
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+  const report = normalizeClaudeStopFailureReport(raw);
+  if (!report) return jsonRes(res, 400, { ok: false, error: 'missing_error' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  const claimedTurnId = typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined;
+  const claimedDispatchAttempt = positiveInt(raw.originDispatchAttempt);
+  if (!isTrustedHostIpcRequest(req)) {
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+    // Same binding as /api/turn-idle: a live token proves only "current turn
+    // of this session", so the claimed tuple must be the one it was minted for.
+    const binding = decideTurnIdleReport({
+      reportedTurnId: claimedTurnId,
+      reportedDispatchAttempt: claimedDispatchAttempt,
+      activeTurnId: ds?.managedTurnOrigin?.turnId,
+      activeDispatchAttempt: ds?.managedTurnOrigin?.dispatchAttempt,
+      promptReady: false,
+    });
+    if (!binding.accept) {
+      logger.warn(`[${sessionId.slice(0, 8)}] claude-stop-failure claim refused (${binding.reason})`);
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'claude_stop_failure',
+        report,
+        turnId: claimedTurnId,
+        dispatchAttempt: claimedDispatchAttempt,
+      } as DaemonToWorker);
+      // WARN, not info: an API error ended this turn, which is exactly the event
+      // that has to be reconstructable afterwards.
+      logger.warn(`[${sessionId.slice(0, 8)}] Claude StopFailure (${report.error}) forwarded to worker (turn=${claimedTurnId?.slice(0, 12) ?? '?'})`);
+    } catch (err) {
+      logger.warn(`claude-stop-failure forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
 async function respondCodexNotifierIngress(
   res: import('node:http').ServerResponse,
   larkAppId: string,
@@ -9281,6 +9444,52 @@ ipcRoute('POST', '/api/vc-meetings/deliveries/:deliveryKey/abandon', async (req,
       errorCode: 'receiver_unavailable',
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+});
+
+// Separate human-authorized IM sink. No durable transcript-origin fallback and
+// no caller-supplied destination; ordinary send routing remains fenced.
+ipcRoute('POST', '/api/vc-meetings/share-summary', async (req, res) => {
+  try {
+    const body = await readJsonBody<Record<string, unknown>>(req, 128 * 1024);
+    const receiverSessionId = typeof body.receiverSessionId === 'string' ? body.receiverSessionId : '';
+    const ds = receiverSessionId ? findActiveBySessionId(receiverSessionId) : undefined;
+    if (!ds?.session.vcMeetingReceiver || ds.larkAppId !== selfDaemonLarkAppId || typeof body.content !== 'string') {
+      return jsonRes(res, 403, { ok: false, errorCode: 'human_share_authorization_required' });
+    }
+    const origin = resolveVcMeetingImTurnOrigin(ds.session, ds.managedTurnOrigin?.turnId);
+    const assertAuthority = () => {
+      const current = authorizeVcMeetingSummaryShare(config.session.dataDir, {
+        session: ds.session, agentAppId: ds.larkAppId, liveOrigin: ds.managedTurnOrigin,
+        claimedCapability: typeof body.originCapability === 'string' ? body.originCapability : undefined,
+      });
+      if (current !== origin) throw new Error('share_turn_changed');
+    };
+    assertAuthority();
+    const checkAccess = async (chatId: string) => {
+      if (!await isCurrentBotInChat(ds.larkAppId, chatId)) throw new Error('target_bot_not_in_chat');
+      // Do not add scopes, invite members, or borrow another application's identity.
+      for (const id of new Set([ds.chatId, chatId])) {
+        if (!(await listChatMemberOpenIds(ds.larkAppId, id)).includes(origin!.replyTargetSenderOpenId!)) {
+          throw new Error('requester_not_in_source_or_target');
+        }
+      }
+    };
+    const result = await shareVcMeetingSummary({
+      dataDir: config.session.dataDir, origin: origin!, content: body.content,
+      assertAuthority, checkAccess,
+      send: (chatId, content, uuid) => sendMessage(ds.larkAppId, chatId, content, 'text', uuid, undefined, {
+        beforeWrite: async () => {
+          assertAuthority();
+          await checkAccess(chatId);
+          assertAuthority();
+        },
+      }),
+    });
+    return jsonRes(res, result.ok ? 200 : 409, result);
+  } catch (error) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'summary_share_refused',
+      error: error instanceof Error ? error.message : String(error) });
   }
 });
 
@@ -9703,6 +9912,8 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
     },
     listenerChatId,
     attentionTargetOpenId: session.state.attentionTargetOpenId,
+    inviterManagers: session.inviterManagers,
+    listenerChatCreatedForMeeting: session.listenerChatCreatedForMeeting,
     ...(session.consumerMode ? { consumerMode: session.consumerMode } : {}),
     ...(vcMeetingSessionUsesProfileMembers(session, cfg)
       ? { selectedAgents: session.selectedAgents }
@@ -9720,6 +9931,7 @@ function persistVcMeetingRuntimeSession(session: VcMeetingDaemonSession, cfg: Vc
       : {}),
     textOutputPolicy: session.textOutputPolicy,
     voiceOutputPolicy: session.voiceOutputPolicy,
+    listenerPolicy: resolveVcMeetingListenerPolicy(session.listenerPolicy),
     ...(session.syncIntervalMs !== undefined ? { syncIntervalMs: session.syncIntervalMs } : {}),
     ...(session.consumerSelectionExpiresAt !== undefined ? { consumerSelectionExpiresAt: session.consumerSelectionExpiresAt } : {}),
     ...(session.consumerCardMessageId ? { consumerCardMessageId: session.consumerCardMessageId } : {}),
@@ -9800,6 +10012,8 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.listenerPresenceGeneration = record.listenerPresenceGeneration;
     session.listenerRejoinNonce = record.listenerRejoinNonce;
     session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
+    session.inviterManagers = record.inviterManagers;
+    session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
     session.listenerChatId = record.listenerChatId;
     session.state.notificationChatId = record.listenerChatId;
     if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
@@ -9812,6 +10026,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
     session.syncIntervalMs = record.syncIntervalMs;
+    session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
     session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
     session.consumerCardMessageId = record.consumerCardMessageId;
     session.temporaryInstructionOpenIds = Object.fromEntries(
@@ -9824,6 +10039,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.qaMode = record.qaMode ?? preparation?.qaMode;
     session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
     session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
+    void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
     const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
     const restoredProfileMemberships = session.consumerMode === 'agent'
       && session.selectedAgents.length > 0
@@ -10241,6 +10457,7 @@ function getOrCreateVcMeetingDaemonSession(
       joined: opts.joined === true,
       monitoringStarted: false,
       ...(listenerChatId ? { listenerChatId } : {}),
+      listenerPolicy: resolveVcMeetingListenerPolicy(globalVcMeetingAgentConfigLive().listenerPolicy, cfg.listenerPolicy),
       pendingItems: [],
       textOutputPolicy: defaultVcMeetingTextOutputPolicy(cfg),
       voiceOutputPolicy: defaultVcMeetingVoiceOutputPolicy(cfg),
@@ -10375,6 +10592,14 @@ function rememberVcMeetingActorIdentity(session: VcMeetingDaemonSession, actor: 
   if (unionId && name) session.actorNamesByUnionId[unionId] = name;
   if (openId && unionId) {
     session.actorUnionIdsByOpenId[openId] = unionId;
+    if (/^on_[A-Za-z0-9]+$/.test(unionId)) {
+      let changed = false;
+      for (const grant of session.inviterManagers ?? []) {
+        if (grant.openId === openId && grant.unionId !== unionId) { grant.unionId = unionId; changed = true; }
+      }
+      const cfg = changed ? effectiveVcMeetingAgentConfig(session.larkAppId) : undefined;
+      if (cfg) persistVcMeetingRuntimeSession(session, cfg);
+    }
     session.actorOpenIdsByUnionId[unionId] = openId;
   }
 }
@@ -10680,6 +10905,51 @@ function vcMeetingListenerChunkUuid(meetingId: string, chunk: string): string {
   return `vc_${meetingId.slice(-12)}_${hash}`;
 }
 
+async function synchronizeVcMeetingInviters(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Promise<void> {
+  if (session.inviterMembershipPromise) {
+    await session.inviterMembershipPromise;
+    // A second invitation can arrive while the first member write is in flight.
+    return synchronizeVcMeetingInviters(session, cfg);
+  }
+  const chatId = session.listenerChatId;
+  const currentPolicy = () => effectiveVcMeetingAgentConfig(session.larkAppId) ?? {};
+  if (!chatId || session.ended || currentPolicy().inviterManagementEnabled !== true) return;
+  const pending = (session.inviterManagers ?? []).filter(g => !g.memberReady
+    && g.policyEnabledAt === (currentPolicy().inviterManagementEnabledAt ?? 0));
+  if (!pending.length) return;
+  const work = (async () => {
+    for (const grant of pending) {
+      try {
+        if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
+          || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+        let members = await listChatMemberDisplays(session.larkAppId, chatId);
+        if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) {
+          // Never expand an owner-selected/shared/preparation group's visibility.
+          if (!session.listenerChatCreatedForMeeting) throw new Error('shared listener chat requires an existing membership');
+          if (session.ended || session.listenerChatId !== chatId || currentPolicy().inviterManagementEnabled !== true
+            || grant.policyEnabledAt !== (currentPolicy().inviterManagementEnabledAt ?? 0)) break;
+          const added = await addUsersToChatByOpenId(session.larkAppId, chatId, [grant.openId]);
+          if (added.invalidUserIds.length) throw new Error('inviter could not be added to listener chat');
+          members = await listChatMemberDisplays(session.larkAppId, chatId);
+          if (!members.some(m => m.openId === grant.openId && m.memberType !== 'bot')) throw new Error('listener membership not verified');
+        }
+        // A rejoin may redirect the session to a preparation chat during an API call.
+        if (session.listenerChatId !== chatId || session.ended) break;
+        // Saving after an off-toggle is harmless: every use checks the live policy/epoch.
+        grant.memberReady = true;
+        persistVcMeetingRuntimeSession(session, cfg);
+      } catch (err) {
+        logger.warn(`[vc-agent] inviter membership pending meeting=${session.state.meeting.id}: ${String(err)}`);
+        await sendMessage(session.larkAppId, chatId,
+          '本场邀请人尚未完成入群核验，未授予会议管理权。请确认应用可见范围和群成员权限；固定群需先由群管理员添加邀请人，再重新邀请助手重试。', 'text',
+          `vc_inviter_pending_${createHash('sha1').update(grant.eventId).digest('hex').slice(0, 16)}`).catch(() => undefined);
+      }
+    }
+  })();
+  session.inviterMembershipPromise = work;
+  try { await work; } finally { session.inviterMembershipPromise = undefined; }
+}
+
 async function ensureVcMeetingListenerChat(
   larkAppId: string,
   meeting: VcMeetingPushContext['meeting'],
@@ -10699,7 +10969,13 @@ async function ensureVcMeetingListenerChat(
     creatorLarkAppId: larkAppId,
     larkAppIds: [],
     name,
-    userOpenIds: [targetOpenId],
+    userOpenIds: [targetOpenId].filter(Boolean),
+    onChatCreated: chatId => {
+      session.listenerChatId = chatId;
+      session.state.notificationChatId = chatId;
+      session.listenerChatCreatedForMeeting = true;
+      persistVcMeetingRuntimeSession(session, cfg);
+    },
     transferOwnerTo: targetOpenId,
     notifyOwnerOpenId: targetOpenId,
   });
@@ -11074,6 +11350,9 @@ async function patchVcMeetingConsumerCard(
 
 function vcMeetingApproverOpenIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
   const ids = new Set<string>();
+  for (const grant of activeVcMeetingInviters(effectiveVcMeetingAgentConfig(session.larkAppId) ?? {}, session.inviterManagers, session.ended)) {
+    if (!getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) ids.add(grant.openId);
+  }
   if (session.state.attentionTargetOpenId) ids.add(session.state.attentionTargetOpenId);
   const target = vcMeetingTargetOpenId(session.larkAppId, cfg);
   if (target) ids.add(target);
@@ -11095,6 +11374,9 @@ function vcMeetingInstructionSourceOpenIds(session: VcMeetingDaemonSession, cfg:
 
 function vcMeetingApproverUnionIds(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): Set<string> {
   const ids = new Set<string>();
+  for (const grant of activeVcMeetingInviters(effectiveVcMeetingAgentConfig(session.larkAppId) ?? {}, session.inviterManagers, session.ended)) {
+    if (grant.unionId && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) ids.add(grant.unionId);
+  }
   for (const openId of vcMeetingApproverOpenIds(session, cfg)) {
     const unionId = session.actorUnionIdsByOpenId?.[openId]?.trim();
     if (unionId) ids.add(unionId);
@@ -13567,6 +13849,17 @@ async function postVcMeetingMemberProjection(
   agentAppId: string,
   request: VcMeetingMemberProjectionRequest,
 ): Promise<{ status: number; body: unknown }> {
+  const session = vcMeetingSessions.get(vcMeetingSessionKey(request.meeting.listenerAppId, request.meeting.meetingId));
+  const prior = getVcMeetingMemberProjection(config.session.dataDir, {
+    listenerAppId: request.meeting.listenerAppId, meetingId: request.meeting.meetingId,
+    memberId: request.member.memberId, memberEpoch: request.member.epoch,
+  });
+  // Pause/remove/reconciliation may run after the runtime record has expired.
+  // Never replace an existing epoch's policy with today's defaults in that path.
+  const frozen = prior ? prior.listenerPolicy : session?.listenerPolicy
+    ?? listVcMeetingRuntimeSessions(config.session.dataDir, request.meeting.listenerAppId)
+      .find(record => record.meeting.id === request.meeting.meetingId)?.listenerPolicy;
+  request = { ...request, outputRoute: { ...request.outputRoute, listenerPolicy: resolveVcMeetingListenerPolicy(frozen) } };
   if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
     const result = await registerVcMeetingMember(request, vcMeetingDeliveryReceiverDeps(agentAppId));
     return { status: result.status, body: result.body };
@@ -16979,6 +17272,10 @@ async function startVcMeetingMonitoring(input: {
 
       const preparation = resolveVcMeetingPreparation(input.larkAppId, meeting);
       if (preparation) {
+        if (session.listenerChatId !== preparation.prepChatId) {
+          session.listenerChatCreatedForMeeting = false;
+          for (const grant of session.inviterManagers ?? []) grant.memberReady = false;
+        }
         session.listenerChatId = preparation.prepChatId;
         session.state.notificationChatId = preparation.prepChatId;
         session.preparationMeetingNo = preparation.meetingNo;
@@ -17104,12 +17401,13 @@ async function flushVcMeetingListenerSession(
       ...pendingSnapshot,
       ...stableTranscripts,
     ];
-    const lines = buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, {
+    const rawMessages = resolveVcMeetingListenerPolicy(session.listenerPolicy).rawMessages;
+    const lines = rawMessages ? buildVcMeetingListenerLines(session.state.meeting, itemsToSend, cfg, {
       final: opts.final,
       actorNamesByOpenId: session.actorNamesByOpenId,
       actorNamesByUnionId: session.actorNamesByUnionId,
-    });
-    if (lines.length === 0) return { ok: true, sent: 0 };
+    }) : [];
+    if (rawMessages && lines.length === 0) return { ok: true, sent: 0 };
     const chunks = chunkVcMeetingListenerLines(lines);
     let sent = 0;
     for (const chunk of chunks) {
@@ -18514,6 +18812,27 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     }
     const session = getOrCreateVcMeetingDaemonSession(ctx.larkAppId, meeting, cfg, { joined: joinedByInvite });
     if (!session) return;
+    let inviterGrantUnavailable = cfg.inviterManagementEnabled === true;
+    let inviterBlocked = false;
+    if (ctx.inviter) {
+      const grant = createVcMeetingInviterGrant(cfg, { ...ctx.inviter, eventId: ctx.eventId });
+      if (grant && !getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId)) {
+        inviterGrantUnavailable = false;
+        const grants = session.inviterManagers ??= [];
+        const current = grants.find(g => g.openId === grant.openId && g.policyEnabledAt === grant.policyEnabledAt);
+        if (!current) {
+          // Drop revoked generations rather than accumulating historic authority forever.
+          session.inviterManagers = grants.filter(g => g.policyEnabledAt === grant.policyEnabledAt);
+          session.inviterManagers.push(grant);
+          persistVcMeetingRuntimeSession(session, cfg);
+        }
+      } else if (cfg.inviterManagementEnabled === true) {
+        inviterBlocked = !!grant && getBot(session.larkAppId).resolvedBlockedUsers.includes(grant.openId);
+        logger.warn(inviterBlocked
+          ? '[vc-agent] inviter management skipped: inviter is blocked'
+          : '[vc-agent] inviter management skipped: invitation identity/time is not verifiable');
+      }
+    }
     const result = await startVcMeetingMonitoring({
       larkAppId: ctx.larkAppId,
       key,
@@ -18526,6 +18845,15 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
       logger.warn(`[vc-agent] manual invite start failed meeting=${meeting.id}: ${result.error}`);
       notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, session, meeting, result.error);
     } else {
+      await synchronizeVcMeetingInviters(session, cfg);
+      if (inviterGrantUnavailable) {
+        const eventHash = createHash('sha1').update(ctx.eventId ?? 'unknown').digest('hex').slice(0, 16);
+        await sendMessage(ctx.larkAppId, result.listenerChatId,
+          inviterBlocked
+            ? '本次邀请人命中机器人黑名单，未自动授予本场管理权；原授权人权限保持不变。'
+            : '本次邀请未取得可核验且有效的邀请人身份，未自动授予本场管理权；原授权人权限保持不变。',
+          'text', `vc_inviter_unverified_${eventHash}`).catch(() => undefined);
+      }
       deleteVcMeetingPendingInvite(key);
       if (result.key !== key) deleteVcMeetingPendingInvite(result.key);
     }
@@ -19183,7 +19511,9 @@ async function resolveSoloSessionForTurn(
   let solo = false;
   try {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    if (effectiveReplyDelivery(ds.larkAppId, cliId, sessionPromptInjection(ds)) === 'transcript') {
+    // 续轮 solo 去壳只在「这个存活会话真的走 transcript 采集」时成立：传冻结
+    // session.sandbox，防止 live 关掉 sandbox 再开 transcript 把续轮信封误去壳。
+    if (effectiveReplyDelivery(ds.larkAppId, cliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) === 'transcript') {
       let chatMode: 'group' | 'topic' | undefined;
       let stats: { userCount: number; botCount: number } | undefined;
       if (chatType === 'group') {
@@ -23076,6 +23406,10 @@ function vcMeetingApplicationContext(ctx: RoutingContext): string {
   return (ctx.vcMeetingImTurnOrigin
     ? VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT
     : '')
+    + (ctx.vcMeetingImTurnOrigin?.summaryShareTargetChatId
+      ? '[会议纪要分享] 当前真人已授权将本场会议纪要发到 ' + ctx.vcMeetingImTurnOrigin.summaryShareTargetChatId
+        + '。请整理纪要和待办，然后用 `botmux vc-agent share-summary --content "纪要正文"` 提交。目标由宿主固定，不要使用 botmux send --chat-id 或会中输出。只有成功回执才可报告已发送。\n'
+      : '')
     + (ctx.vcMeetingContextLifecycle === 'sealed'
     ? '[会议上下文状态] 本轮正在复用一场已结束会议的专属会话；这是会后追问。可以基于既有会议上下文回答，但不得声称会议仍在进行，也不要尝试会中文本或语音动作。\n'
     : '')
@@ -30122,6 +30456,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then(() => undefined);
     },
     onQueuedActivationSubmitted,
+    // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
+    // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
+    onBoardTurnDeliveryFailed(ds, context) {
+      if (ds.larkAppId !== cfg.larkAppId) return;
+      try {
+        decisionBoard.noteDeliveryFailure(context.turnId, context.reason);
+      } catch (err) {
+        logger.warn(`[decision-board] noteDeliveryFailure failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
     async onOrdinaryImInputRejected(ds, context) {
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
@@ -30696,6 +31040,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     claimOccupancy();
+    for (const publisher of adminUnionsPublishers.values()) void publisher.publish();
   }, 30_000);
   if (typeof descriptorHeartbeat.unref === 'function') descriptorHeartbeat.unref();
 
@@ -30923,6 +31268,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     }
+    if (!cfg.apiOnly) startAdminUnionsPublisher(cfg.larkAppId);
 
     // Resolve blockedUsers 黑名单（P1c）。复用 allowedUsers 同一套解析器与同一
     // sidecar（retainKeys 取两侧并集，见 resolveCacheRetainKeys）。与 allowed 块的
@@ -31806,6 +32152,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
     void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
+    // Claude Code prompt-cache keep-alive: off unless config.json / bots.json
+    // `promptCache.keepalive.enabled`; read live so Dashboard edits apply here.
+    try {
+      runPromptCacheKeepaliveSweep(activeSessions.values(), {
+        bot: getBot(cfg.larkAppId).config,
+        dataDir: config.session.dataDir,
+        send: sendPromptCacheKeepalive,
+        log: message => logger.info(message),
+      });
+    } catch (error) {
+      logger.warn(`[prompt-cache] keep-alive sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
@@ -31992,6 +32350,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
+
+  // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。
+  const decisionBoard = new DecisionBoardService({
+    dataDir: config.session.dataDir,
+    larkAppId: () => cfg.larkAppId,
+    steward: () => getBot(cfg.larkAppId).config.steward,
+    locale: () => localeForBot(cfg.larkAppId),
+    brand: () => getBotBrand(cfg.larkAppId),
+    dashboardOrigin: () => resolveDashboardOrigin(),
+    ownerOpenId: () => getOwnerOpenId(cfg.larkAppId),
+    ownerName: async () => {
+      const owner = getOwnerOpenId(cfg.larkAppId);
+      return owner ? (await resolveSender(cfg.larkAppId, owner, 'user'))?.name : undefined;
+    },
+    timeZone: () => scheduleTimeZone(),
+    batchAttachmentsDir: batchId => getAttachmentsDir(cfg.larkAppId, `board-${batchId}`),
+    banner: ({ batchId, count, locale }) => tr('decisionBoard.batch_banner', { id: batchId, count }, locale),
+    deliver: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      banner: input.banner,
+      attachments: input.attachments,
+      ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+      ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+      sessionTitle: input.sessionTitle,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    })),
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  });
+  setDecisionBoardService(decisionBoard);
+  // 补投重启前没送达的批次。等会话恢复与 worker 就绪的初始阶段过去再投，避免和恢复抢同一个会话。
+  setTimeout(() => {
+    void decisionBoard.redeliverUndelivered().catch(err => logger.warn(`[decision-board] redelivery failed: ${err?.message ?? err}`));
+  }, 30_000).unref?.();
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity

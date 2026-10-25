@@ -81,11 +81,13 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 ## Supported CLIs & Agents
 
+Kimi-compatible TUI distributions can retain `cliId: "kimi"` and declare their own `cliRuntime` identity. For example, a CodeM wrapper can use `{ "id": "codem", "displayName": "CodeM", "executable": "codem-wrapper", "update": { "provider": "none" } }`. Cards and session views use that distribution name while the Kimi adapter owns input handling. Existing sessions retain their frozen runtime identity; verify configuration changes in a new topic.
+
 The optional [OpenViking shared-memory example](examples/openviking-memory/README.md) lets every shell-capable coding agent share per-user and per-project memory, searching, reading and saving key conclusions on demand. **Off by default**; opt in by binding a local agent or a single-user Bot through the shared Skill/CLI, with Codex automatic session capture as a separate optional adapter. (The example ships only in the source repository's `examples/`; the npm package does not include `examples/`, so this link does not resolve on the npm page.)
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) · `remote-runner` ([generic remote runner protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code / mcode](docs/minimax-code.md), with file/shell tools, native skills and exact session resume; sign in via `mcode login` / `mcode login --region global`, isolate accounts with `MINIMAX_DATA_DIR`) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) · `remote-runner` ([generic remote runner protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code / mcode](docs/minimax-code.md), with file/shell tools, native skills and exact session resume; sign in via `mcode login` / `mcode login --region global`, isolate accounts with `MINIMAX_DATA_DIR`) …
 
 The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
 

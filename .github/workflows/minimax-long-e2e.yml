@@ -1,0 +1,60 @@
+name: MiniMax native long task
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minimax-long-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-exec:
+    # Forks may run manually, but do not inherit a daily background workload.
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'deepcoldy/botmux'
+    name: native-exec (${{ matrix.runtime }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - name: Install isolated, pinned native CLI
+        run: npm install --prefix "$RUNNER_TEMP/minimax-code" --no-package-lock --no-audit --no-fund '@minimax-ai/code@0.6.5'
+      - name: Cross the former ten-minute boundary (fresh and resumed)
+        timeout-minutes: 15
+        env:
+          BOTMUX_MCODE_LONG_E2E: '1'
+          PROBE_RUNTIME: ${{ matrix.runtime }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export BOTMUX_MCODE_E2E_BIN="$RUNNER_TEMP/minimax-code/node_modules/.bin/mcode"
+          "$BOTMUX_MCODE_E2E_BIN" --version
+          # The test creates its own HOME, native data directory and local
+          # synthetic Provider. No real account/model credential is needed.
+          if [ "$PROBE_RUNTIME" = node ]; then
+            node node_modules/vitest/vitest.mjs run --project e2e test/minimax-exec-long.e2e.ts 2>&1 | tee minimax-long.log
+          else
+            bun test ./test/minimax-exec-long.e2e.ts --timeout=750000 2>&1 | tee minimax-long.log
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minimax-long-${{ matrix.runtime }}
+          path: minimax-long.log
+          if-no-files-found: warn
+          retention-days: 14

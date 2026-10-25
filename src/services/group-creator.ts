@@ -6,7 +6,8 @@
  * This service only orchestrates the Lark API sequence:
  *
  *   1. createChat (creator + invited users), then synchronously announce chatId
- *   2. add peer bots / owners and fetch the share link
+ *   2. add peer bots / owners and fetch the share link, then the owners' local
+ *      stewards (decision board; see steward-auto-join.ts — best-effort, silent)
  *   3. transferChatOwner + notify + bindings/bootstrap (best-effort where noted)
  *
  * The progress hook is the durable side-effect boundary: once it fires, the
@@ -21,8 +22,16 @@
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
 import type { ChatMode } from './groups-store.js';
 import type { GroupAvatarMode } from './group-creation-options.js';
-import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
+import { listChatBotMembers, resolveAllowedUsersWithMap, resolveUnionIdFromOpenIdStrict, sendMessage } from '../im/lark/client.js';
+import { loadBotConfigsCached } from '../bot-registry.js';
 import { bindOncall } from './oncall-store.js';
+import { readBotAdminUnions } from './bot-admin-unions-store.js';
+import {
+  clearStewardSilentJoin,
+  joinStewardsToNewChat,
+  markStewardSilentJoin,
+  type StewardJoinResult,
+} from './steward-auto-join.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
 import { logger } from '../utils/logger.js';
@@ -109,6 +118,10 @@ export interface CreateGroupResult {
   kickoffMessageId: string | null;
   kickoffError: string | null;
   customization?: { tagError?: string; avatarError?: string };
+  /** Local stewards (decision board) this chat belongs to, and whether each was
+   *  pulled in. Absent when no steward applied. Never part of invalidBotIds:
+   *  a steward that could not join does not make the group incomplete. */
+  stewardJoins?: StewardJoinResult[];
 }
 
 export interface TransferGroupOwnerOpts {
@@ -223,6 +236,40 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     const ar = await addUsersToChatByUnionId(opts.creatorLarkAppId, r.chatId, opts.ownerUnionIds);
     invalidOwnerUnionIds = ar.invalidUserIds;
   }
+
+  // Stewards join after the requested bots and owners are in, and while the
+  // creator still owns the chat. They stay out of joinedBotIds on purpose: no
+  // collaboration grant, oncall binding, role bootstrap or kickoff for them.
+  // A chat that ends up with one person and one bot keeps that bot answering
+  // without an @ (solo-group bypass); a steward would make it two bots, so such
+  // chats only get stewards that opted in. Counted from who actually joined;
+  // open_id and union_id may be the same person, so the larger count is used.
+  const dataDir = config.session.dataDir;
+  const creatorLarkAppId = opts.creatorLarkAppId;
+  const memberOpenIds = (opts.userOpenIds ?? []).filter(id => !r.invalidUserIds.includes(id));
+  const memberUnionIds = (opts.ownerUnionIds ?? []).filter(id => !invalidOwnerUnionIds.includes(id));
+  const soloGroup = joinedBotIds.length <= 1 && Math.max(new Set(memberOpenIds).size, new Set(memberUnionIds).size) <= 1;
+  const stewardJoins = await joinStewardsToNewChat({
+    creatorLarkAppId,
+    requestedBotAppIds: opts.larkAppIds,
+    soloGroup,
+    memberOpenIds,
+    memberUnionIds,
+    initiatorOpenIds: [opts.transferOwnerTo, opts.notifyOwnerOpenId]
+      .filter((id): id is string => !!id && !r.invalidUserIds.includes(id)),
+    initiatorUnionIds: [opts.transferOwnerUnionId].filter((id): id is string => !!id && !invalidOwnerUnionIds.includes(id)),
+  }, {
+    loadConfigs: loadBotConfigsCached,
+    readAdminUnions: (appId, allowedUsers) => readBotAdminUnions(dataDir, appId, allowedUsers),
+    lookupUnion: async openId => {
+      const found = await resolveUnionIdFromOpenIdStrict(creatorLarkAppId, openId);
+      return found.status === 'resolved' ? found.unionId : undefined;
+    },
+    markSilentJoin: appId => markStewardSilentJoin(dataDir, appId, r.chatId),
+    clearSilentJoin: appId => clearStewardSilentJoin(dataDir, appId, r.chatId),
+    addBot: async appId => (await addBotToChat(creatorLarkAppId, r.chatId, [appId]))[0] ?? { ok: false, error: 'no_result' },
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  });
 
   let transferOwnerTo = opts.transferOwnerTo?.trim() || null;
   const transferOwnerUnionId = opts.transferOwnerUnionId?.trim() || null;
@@ -439,5 +486,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     kickoffMessageId,
     kickoffError,
     ...(customization ? { customization } : {}),
+    ...(stewardJoins.length ? { stewardJoins } : {}),
   };
 }

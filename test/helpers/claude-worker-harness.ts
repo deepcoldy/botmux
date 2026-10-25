@@ -15,7 +15,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { claudeJsonlPathForSession } from '../../src/adapters/cli/claude-code.js';
@@ -23,6 +23,8 @@ import { preferredManagedTmuxSocket } from '../../src/adapters/backend/tmux-sock
 import { probeTmuxFunctional } from '../../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { privateTmuxEnv } from './private-tmux-env.js';
+import { readJsonLines } from './read-json-lines.js';
+import { killProcessTree } from './process-tree.js';
 import { spawnNodeTsScript } from './ts-runner.js';
 
 export const claudeHarnessRunnable = process.platform === 'linux' && probeTmuxFunctional().ok;
@@ -71,8 +73,10 @@ const record = o => {
     uuid: randomUUID(), timestamp: new Date().toISOString(), sessionId: sid, cwd: cfg.workingDir, ...o,
   }) + '\\n');
 };
-// Claude's own pid-state record. Withheld until the gate file exists when the
-// scenario wants a transcript nobody can locate.
+// Claude's own pid-state record, rewritten in place the way Claude does (never
+// through a rename): the worker has to read through a torn record. Withheld
+// until the gate file exists when the scenario wants a transcript nobody can
+// locate.
 const pidState = () => {
   if (cfg.pidStateGate && !fs.existsSync(cfg.pidStateGate)) return;
   fs.mkdirSync(path.join(cfg.claudeDir, 'sessions'), { recursive: true });
@@ -105,7 +109,14 @@ const render = () => {
     + '\\r\\n❯ ' + composer + '\\r\\n' + rule + '\\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)'
     + (busy ? ' · esc to interrupt' : '') + '\\r\\n');
 };
+// A status clock ticking until the first turn: the screen never goes quiet, so
+// the worker never sees the prompt settle and falls back to its first-prompt
+// timeout, which reads the prompt off the screen instead.
+let startupTicker = cfg.startupTicker
+  ? setInterval(() => process.stdout.write('\x1b7\x1b[1;40H' + new Date().toISOString().slice(11, 19) + '\x1b8'), 500)
+  : undefined;
 const runTurn = (prompt, reply) => {
+  if (startupTicker) { clearInterval(startupTicker); startupTicker = undefined; }
   busy = true;
   record({ type: 'user', message: { role: 'user', content: prompt } });
   render();
@@ -117,6 +128,35 @@ const runTurn = (prompt, reply) => {
     busy = false;
     render();
     ev({ kind: 'turn', reply });
+  }, cfg.turnMs);
+};
+// A turn that ends on an API error the way Claude 2.1.296 writes it ("API
+// Error: Connection lost mid-response."): a thinking block, then the error
+// record and turn_duration. quietMs first parks the turn on a quiet, non-busy screen
+// mid-work, which the worker reads as the turn ending.
+const failTurn = (prompt, quietMs) => {
+  busy = true;
+  record({ type: 'user', message: { role: 'user', content: prompt } });
+  render();
+  let spinner = setInterval(render, 300);
+  setTimeout(() => {
+    record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_fake', name: 'Bash', input: {} }], stop_reason: 'tool_use' } });
+    clearInterval(spinner);
+    busy = !quietMs;
+    render();
+    setTimeout(() => {
+      busy = true;
+      spinner = setInterval(render, 300);
+      setTimeout(() => {
+        clearInterval(spinner);
+        record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'thinking', thinking: 'next step' }], stop_reason: 'end_turn' } });
+        record({ type: 'assistant', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error: Connection lost mid-response. The response above may be incomplete.' }], stop_reason: 'stop_sequence' } });
+        record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
+        busy = false;
+        render();
+        ev({ kind: 'turn-failed', prompt });
+      }, cfg.turnMs);
+    }, quietMs || 0);
   }, cfg.turnMs);
 };
 const command = (name, value) => {
@@ -135,6 +175,8 @@ const submit = () => {
     record({ type: 'system', subtype: 'compact_boundary', compactMetadata: { trigger: 'manual' } });
     record({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued from a previous conversation.' } });
   } else if (m) command('/' + m[1], m[2]);
+  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
+  else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
   else { runTurn(text, 'reply: ' + text); return; }
   ev({ kind: 'command', text });
   render();
@@ -181,6 +223,8 @@ export interface Harness {
   killCli: () => void;
   /** When the fake finished `kind` (a command, or the turn that replied `text`). */
   doneAt: (kind: 'command' | 'turn', text: string) => number | undefined;
+  /** When a turn started with a FAIL… prompt ended on its API error. */
+  failedAt: (prompt: string) => number | undefined;
   startWorker: (init?: Partial<Extract<DaemonToWorker, { type: 'init' }>>) => Generation;
 }
 
@@ -196,12 +240,13 @@ export interface Generation {
   kill: () => Promise<void>;
 }
 
-const cleanups: Array<() => void> = [];
+const cleanups: Array<() => void | Promise<void>> = [];
 /** Register with `afterEach`: kills every worker, fake CLI and tmux server the
- *  test started, and removes its files. */
-export function cleanUpClaudeHarnesses(): void {
+ *  test started, and removes its files. Workers go first, each with the tmux
+ *  calls it still has in flight, so none of them outlives its TMUX_TMPDIR. */
+export async function cleanUpClaudeHarnesses(): Promise<void> {
   while (cleanups.length) {
-    try { cleanups.pop()!(); } catch { /* best effort */ }
+    try { await cleanups.pop()!(); } catch { /* best effort */ }
   }
 }
 
@@ -218,6 +263,9 @@ export function setupFakeClaude(opts: {
   /** The pid-state record keeps the spawn-time sessionId (2.1.123), and the
    *  fake holds its active session's tasks dir open. */
   stalePidState?: boolean;
+  /** Keep the screen busy with a status clock until the first turn, so the
+   *  worker only finds the prompt through its first-prompt timeout. */
+  startupTicker?: boolean;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -249,6 +297,7 @@ export function setupFakeClaude(opts: {
     ...(opts.pidStateGated ? { pidStateGate } : {}),
     ...(opts.stalePidState ? { stalePidState: true, holdTasksDir: true } : {}),
     ...(opts.unknownLayer === 'cli-named-launcher' ? { commAsClaude: true } : {}),
+    ...(opts.startupTicker ? { startupTicker: true } : {}),
   }));
   // An extensionless script follows the nearest package.json; never inherit a
   // stray `"type": "module"` from a parent directory.
@@ -264,7 +313,8 @@ const child = spawn(process.execPath, [${JSON.stringify(fakeCli)}, ...process.ar
 child.on('exit', code => process.exit(code ?? 1));
 `);
   chmodSync(launcher, 0o755);
-  const readEvents = () => (existsSync(events) ? readFileSync(events, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []);
+  // The fake appends one line per event while tests poll this file.
+  const readEvents = () => readJsonLines(events);
   const killCli = () => {
     for (const pid of new Set(readEvents().map(e => e.pid as number))) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
@@ -285,10 +335,18 @@ child.on('exit', code => process.exit(code ?? 1));
   let notified = 0;
   const harness: Harness = {
     root, sessionId, workingDir, claudeDir, transcript, clearSid, forkSid, pidStateGate, killCli,
-    notify: reply => writeFileSync(join(notifyDir, String(++notified).padStart(4, '0')), reply),
+    // Staged outside notifyDir and renamed in: the fake polls notifyDir every
+    // 100ms, and a file it reads between creation and write is an empty reply.
+    notify: reply => {
+      const name = String(++notified).padStart(4, '0');
+      const staged = join(root, `notify-${name}.tmp`);
+      writeFileSync(staged, reply);
+      renameSync(staged, join(notifyDir, name));
+    },
     commands: () => readEvents().filter(e => e.kind === 'command').map(e => e.text as string),
     launches: () => readEvents().filter(e => e.kind === 'start').map(e => ({ sid: e.sid as string, args: e.args as string[] })),
     doneAt: (kind, text) => readEvents().find(e => e.kind === kind && (kind === 'command' ? e.text === text : e.reply === text))?.t,
+    failedAt: prompt => readEvents().find(e => e.kind === 'turn-failed' && e.prompt === prompt)?.t,
     startWorker: (init = {}) => {
       const messages: WorkerToDaemon[] = [];
       const logs: string[] = [];
@@ -310,13 +368,8 @@ child.on('exit', code => process.exit(code ?? 1));
       });
       child.stdout?.on('data', b => logs.push(b.toString()));
       child.stderr?.on('data', b => logs.push(b.toString()));
-      const kill = async () => {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        const exited = new Promise<void>(done => child.once('exit', () => done()));
-        child.kill('SIGKILL');
-        await Promise.race([exited, new Promise(done => setTimeout(done, 3_000))]);
-      };
-      cleanups.push(() => { child.kill('SIGKILL'); });
+      const kill = () => killProcessTree(child, 3_000);
+      cleanups.push(kill);
       child.send({
         type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir,
         cliId: 'claude-code', cliPathOverride: opts.unknownLayer ? launcher : fakeCli, cliConfigDir: claudeDir, backendType: 'tmux',

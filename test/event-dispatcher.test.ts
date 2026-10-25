@@ -88,6 +88,13 @@ vi.mock('../src/services/oncall-store.js', async (importOriginal) => ({
   ensureDefaultOncallBound: (...args: any[]) => mockEnsureDefaultOncallBound(...(args as [string, string, string])),
 }));
 
+// 委托授权的语义由 test/delegated-grant.test.ts 用真实模块覆盖；这里只盯接线：bot 发送方
+// 分支要在 defaultOncall 懒绑定之后，带着飞书盖章的发送方身份调用它。
+const mockApplyDelegatedGrants = vi.fn(async (..._args: any[]) => [] as string[]);
+vi.mock('../src/im/lark/delegated-grant.js', () => ({
+  applyDelegatedGrants: (...args: any[]) => mockApplyDelegatedGrants(...args),
+}));
+
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
@@ -147,7 +154,10 @@ vi.mock('../src/services/groups-store.js', async (importOriginal) => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  // isDebug 也要补：内置免@ 命令的车道确认复用 message-parser 的 parseEventMessage，
+  // 它在非 text 消息上会调 logger.isDebug()；缺了这个方法解析直接抛错被 fail-closed
+  // 吞掉，车道确认会恒为 false（见 /dash 套件里的 post 用例）。
+  logger: { info: vi.fn(), debug: vi.fn(), isDebug: vi.fn(() => false), warn: vi.fn(), error: vi.fn() },
 }));
 
 const mockRecordObservedBots = vi.fn();
@@ -4707,10 +4717,40 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockGetCachedChatMode.mockReset();
     mockGetCachedChatMode.mockReturnValue(undefined);
     mockRecordObservedBots.mockClear();
+    mockApplyDelegatedGrants.mockClear();
     setupBotState();
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('delegated grant: a bot @ hands its Lark-stamped identity to applyDelegatedGrants after the defaultOncall bind', async () => {
+    // 删掉 dispatcher 里那次调用、丢掉 union_id，或把它挪到 ensureDefaultOncallBound 之前
+    // （会给 oncall 群里本就能说话的人白落授权），本用例都要变红。
+    const order: string[] = [];
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => { order.push('bind'); return undefined; });
+    mockApplyDelegatedGrants.mockImplementationOnce(async () => { order.push('delegate'); return []; });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderAppId: 'cli_sibling_app',
+      content: JSON.stringify({ text: '@_user_1 @_user_2 开工吧' }),
+      mentions: [
+        { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_2', name: '提需求的人', id: { open_id: 'ou_req_person' } },
+      ],
+    });
+    (event.sender.sender_id as any).union_id = 'on_sibling_bot';
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockApplyDelegatedGrants).toHaveBeenCalledTimes(1);
+    expect(mockApplyDelegatedGrants).toHaveBeenCalledWith(MY_APP_ID, event.message, {
+      chatType: 'group',
+      senderIds: [OTHER_BOT_OPEN_ID, 'cli_sibling_app'],
+      senderUnionId: 'on_sibling_bot',
+    });
+    expect(order).toEqual(['bind', 'delegate']);
   });
 
   it('blocks /introduce for restricted chat-granted users before recording bots', async () => {
@@ -13452,6 +13492,33 @@ describe('chat.bot_added observer hook', () => {
     expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
   });
 
+  it('a steward pulled into a new chat by botmux joins silently: no hook, join command, owner invite or auto-start', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+    const handleBotAdded = vi.fn(async () => {});
+    Object.assign(handlers, { handleBotAdded });
+    // group-creator 加管家之前写的「静默加入」标记（内容是写入时间）；其它群没有标记。
+    const markedAt = String(Date.now());
+    mockReadFileSync.mockImplementation((path: any) =>
+      String(path).endsWith(`steward-silent-joins/${MY_APP_ID}/oc_silent`) ? markedAt : '[]');
+    try {
+      capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'oc_silent', operator_id: { open_id: USER_OPEN_ID } });
+      await flushEventWork();
+      expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(0);
+      expect(runGroupJoinCommandMock).not.toHaveBeenCalled();
+      expect(handleBotAdded).not.toHaveBeenCalled();
+
+      capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'oc_normal', operator_id: { open_id: USER_OPEN_ID } });
+      await flushEventWork();
+      expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
+      expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+      expect(handleBotAdded).toHaveBeenCalledWith('oc_normal', USER_OPEN_ID, MY_APP_ID);
+    } finally {
+      mockReadFileSync.mockImplementation(() => '[]');
+    }
+  });
+
   it('does not run the group-join command when disabled or blank', async () => {
     runGroupJoinCommandMock.mockClear();
     const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
@@ -13713,5 +13780,288 @@ describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒�
     expect(typeof capturedHandlers['im.message.recalled_v1']).toBe('function');
     capturedHandlers['im.message.recalled_v1']({ message_id: 'msg-gc-recall', chat_id: GC_CHAT, recall_time: '1700000009000' });
     expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-recall')).toMatchObject({ deleted: true, text: '发错了', deletedAt: 1700000009000 });
+  });
+});
+
+describe('im.message.receive_v1 — /dash 内置免@ 控制命令', () => {
+  function setup(chatMode: 'group' | 'topic') {
+    capturedHandlers = {};
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    mockGetChatMode.mockResolvedValue(chatMode);
+    return handlers;
+  }
+
+  async function fire(event: ReturnType<typeof makeUserMessageEvent>) {
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+  }
+
+  it.each([
+    { name: 'regular', chatMode: 'group' as const, rootId: undefined },
+    { name: 'topic', chatMode: 'topic' as const, rootId: undefined },
+    { name: 'topicreply', chatMode: 'topic' as const, rootId: 'om-topic-root' },
+  ])('$name：/dash 免 @ 寻址本 bot 且不携带 commandTrigger', async ({ name, chatMode, rootId }) => {
+    const handlers = setup(chatMode);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '  /dash  ' }),
+      messageId: `msg-dash-bare-${name}`,
+      chatId: `chat-dash-bare-${name}`,
+      chatType: 'group',
+      rootId,
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    const ctx = handlers.handleNewTopic.mock.calls[0][1];
+    expect(ctx.commandTrigger).toBeUndefined();
+  });
+
+  it.each([
+    { name: 'regular', chatMode: 'group' as const },
+    { name: 'topic', chatMode: 'topic' as const },
+  ])('$name：裸 /dashboard link 也免 @ 寻址（link 是唯一免@ 的 /dashboard 子命令）', async ({ chatMode }) => {
+    const handlers = setup(chatMode);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/dashboard link' }),
+      messageId: `msg-dashlink-bare-${chatMode}`,
+      chatId: `chat-dashlink-bare-${chatMode}`,
+      chatType: 'group',
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic.mock.calls[0][1].commandTrigger).toBeUndefined();
+  });
+
+  it('多段富文本 post（/dash 段 + 图片段）不放行内置免@：dispatcher 与 daemon 解析必须同构', async () => {
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash' }], [{ tag: 'img', image_key: 'img_1' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-img',
+      chatId: 'chat-dash-post-img',
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    // 第二行 [图片 1] 会让 daemon 把它判成普通正文 —— 那正是要避免的建会话路径，
+    // 所以群闸必须不把它当内置命令寻址（默认 @ 策略下被忽略）。
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'code_block', node: { tag: 'code_block', language: 'ts', text: 'const x = 1\n' } },
+    { name: 'link', node: { tag: 'a', text: 'docs', href: 'http://x' } },
+  ])('单段 post（/dash + $name 节点）也不放行：daemon 车道渲染与路由窥视不同构', async ({ node }) => {
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash' }, node]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: `msg-dash-post-${node.tag}`,
+      chatId: `chat-dash-post-${node.tag}`,
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('单段 post（/dash 文本节点紧贴 at 节点、无空格）不放行：daemon 车道是 /dash@张三', async () => {
+    // 取代旧的「单段 + img」用例：图片节点在资源处理路径就被提前丢弃，那条用例
+    // 删不删守卫都绿、钉不住守卫；at 节点能走到群闸，而 daemon 把 at 渲染成不带
+    // 前导空格的 @name，车道变 /dash@张三，必须由车道确认腿拦下。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash' }, { tag: 'at', user_id: 'ou_other_zhang', user_name: '张三' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-nospace',
+      chatId: 'chat-dash-post-at-nospace',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_other_zhang' } }],
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('带标题的单段 post（title + /dash）不放行：daemon 车道是 标题\\n/dash', async () => {
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { title: '求链接', content: [[{ tag: 'text', text: '/dash' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-title',
+      chatId: 'chat-dash-post-title',
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('前导 at 名字含空格、at 无可解析 user_id 且无结构化 mentions[] 时不放行：daemon 只能剥掉 @张，车道剩 三 /dash', async () => {
+    // 合成/开放 API 富文本：at 节点只有名字、没有可解析 user_id，飞书也没给结构化
+    // mentions[]。它既不触发显式 @ 本 bot 腿（messageMentionsBot 认不出），也不触发
+    // 让路礼仪（mentionsAnotherMember 跳过无 user_id 的 at），于是廉价窥视把它当成
+    // 裸 /dash 候选；daemon 渲染却是「@张 三 /dash」，剥前导 @ 的正则只剥得掉空格
+    // 前的 @张 —— 两侧不同结论，车道确认腿必须拦下。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'at', user_name: '张 三' }, { tag: 'text', text: ' /dash' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-space-name',
+      chatId: 'chat-dash-post-at-space-name',
+      chatType: 'group',
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('单段 post（仅文本 + at 节点）的 /dash 仍正常免 @ 寻址', async () => {
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }, { tag: 'text', text: ' /dash' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-single',
+      chatId: 'chat-dash-post-single',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('单段 post（/dash 带尾空格再接 at 节点）仍免 @ 寻址：daemon 车道 /dash @张三 仍是 /dash', async () => {
+    // 车道确认不能误杀合法形态：at 与命令之间有空格时，daemon 车道 /dash @张三 的
+    // 首 token 仍是 /dash（命令在前 @ 别人当参数，让路礼仪同款放行）。
+    const handlers = setup('topic');
+    const postContent = JSON.stringify({
+      zh_cn: { content: [[{ tag: 'text', text: '/dash ' }, { tag: 'at', user_id: 'ou_other_zhang', user_name: '张三' }]] },
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: postContent,
+      messageId: 'msg-dash-post-at-trailing-space',
+      chatId: 'chat-dash-post-at-trailing-space',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: '张三', id: { open_id: 'ou_other_zhang' } }],
+    });
+    (event.message as any).message_type = 'post';
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('裸 /dashboard sessions 不享受 link 的免 @ 通道', async () => {
+    const handlers = setup('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/dashboard sessions' }),
+      messageId: 'msg-dashsessions-bare',
+      chatId: 'chat-dashsessions-bare',
+      chatType: 'group',
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('@Bot /dash（@ 在前）同样寻址本 bot', async () => {
+    const handlers = setup('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA /dash' }),
+      messageId: 'msg-dash-mention',
+      chatId: 'chat-dash-mention',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic.mock.calls[0][1].commandTrigger).toBeUndefined();
+  });
+
+  it('未授权用户裸 /dash 在群闸被忽略：既不进新话题也不进话题回复', async () => {
+    const handlers = setup('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: 'ou_stranger',
+      content: JSON.stringify({ text: '/dash' }),
+      messageId: 'msg-dash-stranger',
+      chatId: 'chat-dash-stranger',
+      chatType: 'group',
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('裸 /dash 不会因 autoStartOnNewTopic 变成 AI 会话种子', async () => {
+    capturedHandlers = {};
+    setupBotState({ allowedUsers: [USER_OPEN_ID], autoStartOnNewTopic: true });
+    const handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '/dash' }),
+      messageId: 'msg-dash-autostart',
+      chatId: 'chat-dash-autostart',
+      chatType: 'group',
+    });
+
+    await fire(event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    const ctx = handlers.handleNewTopic.mock.calls[0][1];
+    expect(ctx.commandTrigger).toBeUndefined();
   });
 });

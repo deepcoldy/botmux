@@ -276,6 +276,12 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('writes promptCacheTtl into --settings only when configured', () => {
+    const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false })).promptCacheTtl).toBeUndefined();
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false, promptCacheTtl: '1h' })).promptCacheTtl).toBe('1h');
+  });
+
   it('passes inline --settings that skips the dangerous-mode prompt', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     const idx = args.indexOf('--settings');
@@ -299,6 +305,13 @@ describe('claude-code buildArgs', () => {
     expect(parsed.statusLine.type).toBe('command');
     expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
+  });
+
+  it('installs the StopFailure hook globally, next to the other botmux Claude hooks', () => {
+    // Claude ends API-error turns without running Stop hooks; this is the only
+    // structured signal botmux gets for them (see services/claude-stop-failure.ts).
+    expect(adapter.hookInstall?.format).toBe('claude-settings');
+    expect(adapter.hookInstall?.stopFailureCommand?.endsWith(' __claude-stop-failure-v1')).toBe(true);
   });
 
   it('ignores initialPrompt (not passed via args)', () => {

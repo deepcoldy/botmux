@@ -365,6 +365,8 @@ describe('worker Codex session automatic upgrade', () => {
     await settleMicrotasks();
     expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
     expect(h.state.replacementSpawnInProgress).toBe(true);
+    // restoreCfg('thread') strips both model and reasoningEffort so the same
+    // configuration upgrade resumes the native thread's own model / effort.
     expect(h.state.spawnCli).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'botmux-session', workingDir: '/project', cliId: 'codex',
       resume: true, cliSessionId: threadId, prompt: '', forkSession: false,

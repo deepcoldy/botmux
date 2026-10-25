@@ -423,16 +423,13 @@ describe('controller switch source consistency', () => {
 
 
 describe('hand-written Auto settings and recovery defaults', () => {
-  it('rejects a known model with an unsupported effort without guessing unknown live models', () => {
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'],
-      modelSettings: { 'seed-code': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
-      .toMatch(/not supported/);
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['future-live-model'],
-      modelSettings: { 'future-live-model': { reasoningEffort: 'ultra' } } }, { validateKnownSettings: true }).error)
+  it.each(['seed-code', 'gpt-6-astra', 'future-live-model'])('leaves capability decisions to the live catalog for %s', model => {
+    const pool = { enabled: true, models: [model, 'gpt-5.6-sol'],
+      modelSettings: { [model]: { reasoningEffort: 'ultra', modelBackendVariant: 'max' },
+        'gpt-5.6-sol': { reasoningEffort: 'xhigh' } } };
+    expect(normalizeTraexAutoModelConfig(pool).config).toMatchObject(pool);
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: [model], modelSettings: { [model]: {} } }).error)
       .toBeUndefined();
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': { modelBackendVariant: 'max' } } }, { validateKnownSettings: true }).error).toMatch(/not supported/);
-    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['seed-code'], modelSettings: { 'seed-code': {} } },
-      { validateKnownSettings: true }).error).toBeUndefined();
   });
   it('persists an independent copy of shared settings through native recovery', () => {
     const config = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 5_000 };
@@ -449,6 +446,51 @@ describe('hand-written Auto settings and recovery defaults', () => {
 
 
 describe('current footer capacity evidence', () => {
+  it.each([16, 80])('finds live capacity above a native pending panel with %i lines', count => {
+    const queue = "◇ Queued for capacity (3h 34m 43s • esc to interrupt)\n  └ Too many requests right now. You're in the queue at position 41.";
+    const panel = ['Send after tool call · esc to interrupt and send · ↑ to edit',
+      ...Array.from({ length: count }, (_, index) => `› pending ${index}`), '────────',
+      '❯ Summarize recent commits', 'GPT-6-Astra (MAX) xhigh · ~ · Context —',
+      'Full Access · ? for shortcuts'].join('\n');
+    expect(traexCapacityQueueVisible(`${queue}\n${panel}`)).toBe(true);
+    expect(traexCapacityQueuePosition(`${queue}\n${panel}`)).toBe(41);
+    expect(traexModelProgressVisible(`${queue}\n${panel}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n◆ Working… (2s • esc to interrupt)\n${panel}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n${panel.replace('Send after', '  Send after')}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n${panel.replace('GPT-6-Astra (MAX) xhigh · ~ · Context —', 'unrecognized footer')}`)).toBe(false);
+  });
+
+  it('holds after a fresh submission until matching activity or terminal evidence', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('first');
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('first');
+    controller.observeCapacityQueue({ turnId: 'first', queued: false, nowMs: 0 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    controller.observeCapacityQueue({ turnId: 'stale', queued: false, progressing: true, nowMs: 1 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    controller.observeCapacityQueue({ turnId: 'first', queued: false, progressing: true, nowMs: 2 });
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('stale');
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('first');
+    controller.endTurn('first');
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
+
+  it('disarms the activity latch on a crash exit but keeps it for a planned switch', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    controller.observeCapacityQueue({ turnId: 'turn', queued: false, nowMs: 0 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A planned model switch's replacement owns the same waiting window.
+    controller.noteProcessExited(true);
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A genuine crash can never paint the frame the dead process owed.
+    controller.noteProcessExited(false);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
   it('does not switch during a long ordinary reasoning interval', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
     controller.beginTurn('turn');
@@ -472,5 +514,92 @@ describe('Auto policy setting presence', () => {
   it('distinguishes inherited settings from an explicit native-default entry', () => {
     const base = { enabled: true as const, models: ['core', 'backup'], queueTimeoutMs: 30_000 };
     expect(traexAutoModelPolicyKey(base)).not.toBe(traexAutoModelPolicyKey({ ...base, modelSettings: { backup: {} } }));
+  });
+});
+
+describe('capacityCurrentlyBlocking contract (pane ownership across a terminal)', () => {
+  // The worker tags an incoming message with queueAfterActiveTurn from this
+  // predicate. A structured terminal does NOT repaint the pane, so the queued
+  // pane fact must survive endTurn — otherwise a follow-up landing between
+  // turn_terminal and the next prompt_ready is written into the degraded pane.
+  const base = { enabled: true as const, models: ['core', 'backup-1', 'backup-2'],
+    queueTimeoutMs: 10_000, switchCooldownMs: 1_000 };
+  let now = 0;
+  const tick = (controller: TraexAutoModelController, ms: number) => {
+    now += ms;
+    return controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now });
+  };
+  /** Walk the pool to its last model, then exhaust there — the state where a
+   *  follow-up must wait for both the terminal and the preferred-model reset. */
+  function exhaustOnLastModel(controller: TraexAutoModelController): void {
+    now = 1_000;
+    controller.beginTurn('turn-1');
+    for (const expected of ['backup-1', 'backup-2']) {
+      tick(controller, 0);                          // opens the queue window
+      // The observation that elapses the window is the one that asks for loads.
+      expect(tick(controller, 10_000).kind).toBe('load_check');
+      controller.resolveModelLoads('turn-1', null);
+      now += 100;
+      const switched = controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now });
+      expect(switched).toMatchObject({ kind: 'switch', toModel: expected });
+      if (switched.kind === 'switch') expect(controller.commitSwitch(switched, now)).toBe(true);
+      now += 5_000;
+    }
+    tick(controller, 0);                          // opens the queue window
+    expect(tick(controller, 1_000).kind).toBe('load_check');
+    controller.resolveModelLoads('turn-1', null);
+    now += 100;
+    expect(controller.observeCapacityQueue({ turnId: 'turn-1', queued: true, nowMs: now }).kind).toBe('exhausted');
+    expect(controller.currentModel()).toBe('backup-2');
+  }
+
+  it('keeps blocking across the terminal while the exhausted pane is still queued', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    // Both walk-off branches cleared queueSinceMs at the moment of exhaustion;
+    // only the exhausted latch plus the live pane observation can block here.
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    controller.endTurn('turn-1');
+    // A terminal does not repaint the queued pane, so the fact must survive.
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+  });
+
+  it('releases as soon as the live pane stops showing the queue', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    controller.observeCapacityQueue({ turnId: 'turn-1', queued: false, nowMs: now + 500 });
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('never leaks a stale queue fact into a later unrelated turn', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    // reselectPerTurn is off by default, so the exhausted latch itself persists;
+    // only the pane observation may keep blocking, and beginTurn clears it.
+    controller.beginTurn('turn-2');
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('holds blocking across the proposed preferred-model reset', () => {
+    const controller = new TraexAutoModelController({ ...base, reselectPerTurn: true });
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    // beginTurn only PROPOSES the reset; the pane still shows the fallback.
+    const reset = controller.beginTurn('turn-2');
+    expect(reset).toMatchObject({ kind: 'switch', reason: 'new_turn', toModel: 'core' });
+    expect(controller.capacityCurrentlyBlocking()).toBe(true);
+    if (reset.kind === 'switch') expect(controller.commitSwitch(reset, now + 1_000)).toBe(true);
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+  });
+
+  it('releases on the successor turn when per-turn reselection is off', () => {
+    const controller = new TraexAutoModelController(base);
+    exhaustOnLastModel(controller);
+    controller.endTurn('turn-1');
+    controller.beginTurn('turn-2');
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
   });
 });

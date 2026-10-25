@@ -261,25 +261,49 @@ export class BridgeTurnQueue {
    *  deep inside ingest() rather than at an explicit call boundary. */
   private droppedNeedingJournalClear: BridgePendingTurn[] = [];
   /** This transcript has shown it ends turns with `system/turn_duration`
-   *  (seen live, in absorbed history, or by the worker's baseline probe). Only
-   *  then is a stop_reason terminal held for that marker — a CLI that never
-   *  writes it keeps settling on the stop_reason alone. Survives clearPending:
-   *  it describes the CLI, not one generation's turns. */
+   *  (seen live, in absorbed history, or by the worker's baseline probe).
+   *  Survives clearPending: it describes the CLI, not one generation's turns. */
   private durationMarkerSeen = false;
+  /** An idle-edge wait for a turn's duration marker ran out before this
+   *  transcript ever showed one: the CLI most likely never writes it (older
+   *  Claude JSONL), so later turns settle on the stop_reason again instead of
+   *  each waiting out the bound. A marker read afterwards outranks this.
+   *  Survives clearPending for the same reason as durationMarkerSeen. */
+  private durationMarkerWaitExpired = false;
 
   /** Record that this transcript writes `system/turn_duration` markers. */
   noteDurationMarkerObserved(): void {
     this.durationMarkerSeen = true;
   }
 
+  /** The worker's bounded idle-edge wait for the head turn's close ran out. */
+  noteDurationMarkerWaitExpired(): void {
+    if (!this.durationMarkerSeen) this.durationMarkerWaitExpired = true;
+  }
+
   /** True while `turn` is held for its duration marker: its terminal so far is
-   *  a block-level stop_reason, the transcript is known to write the marker,
-   *  and no later turn has started collecting (a new turn start is itself the
-   *  boundary, and must never leave the head blocked behind it). */
+   *  a block-level stop_reason and no later turn has started collecting (a new
+   *  turn start is itself the boundary, and must never leave the head blocked
+   *  behind it). The hold does not need the marker to have been seen before:
+   *  the first turn of a session is cut by an API error as easily as any other.
+   *  Only a CLI shown not to write the marker (see durationMarkerWaitExpired)
+   *  settles on the stop_reason. */
   isAwaitingDurationMarker(turn: BridgePendingTurn): boolean {
-    return this.durationMarkerSeen
+    return (this.durationMarkerSeen || !this.durationMarkerWaitExpired)
       && turn.awaitingDurationMarker === true
       && turn === this.collecting;
+  }
+
+  /** True while the transcript is still writing `turn`: it started, it is the
+   *  turn collecting records, and nothing has closed it yet — no terminal
+   *  record was read, or it is held for its duration marker. Claude shows its
+   *  prompt (and its hooks report done) before the records that close a turn —
+   *  its final blocks, an API error that cut the stream, the marker — reach the
+   *  file, so the worker waits (bounded) on this at an idle edge before
+   *  settling from it. */
+  isTurnOpenAtIdle(turn: BridgePendingTurn): boolean {
+    if (!turn.started || turn !== this.collecting || turn.closedByDurationMarker) return false;
+    return !turn.terminalObserved || this.isAwaitingDurationMarker(turn);
   }
 
   /** Hand over (and forget) the turns dropped head-of-line since the last

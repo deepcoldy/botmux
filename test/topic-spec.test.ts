@@ -151,6 +151,26 @@ describe('resolveTopicSpec —— /effort 的拒绝分支', () => {
       ok: true, reasoningEffort: 'ultra',
     });
   });
+
+  it.each([
+    { model: 'auto', effort: 'ultra' },
+    { model: 'deepseek-v4-pro', effort: 'xhigh' },
+    { model: 'future-traex-model', effort: 'ultra' },
+  ])('TraeX 的 $model 接受语法合法的 $effort，不受静态模型表限制', async ({ model, effort }) => {
+    expect(await resolve(`/t /effort ${effort} 干活`, { cliId: 'traex', model })).toEqual({
+      ok: true, reasoningEffort: effort,
+    });
+    expect(await resolve(`/t /model ${model} /effort ${effort} 干活`, { cliId: 'traex', model: 'gpt-5.2' })).toEqual({
+      ok: true, model, reasoningEffort: effort,
+    });
+  });
+
+  it('TraeX 仍拒绝非法档位，Codex 仍拒绝不兼容的模型档位组合', async () => {
+    expect(errorKinds(await resolve('/t /model deepseek-v4-pro /effort turbo 干活', { cliId: 'traex' })))
+      .toEqual(['effort_invalid']);
+    expect(errorKinds(await resolve('/t /model gpt-5.2 /effort ultra 干活', { cliId: 'codex' })))
+      .toEqual(['effort_unsupported_model']);
+  });
 });
 
 describe('resolveTopicSpec —— 一次收齐所有错误', () => {

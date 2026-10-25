@@ -1,5 +1,6 @@
 import {
   findVcMeetingDeliveryByKey,
+  getVcMeetingMemberProjection,
   listVcMeetingActiveProjectionsForReceiverSession,
 } from './vc-meeting-delivery-store.js';
 import type {
@@ -298,4 +299,27 @@ export function evaluateVcMeetingManagedSend(
       memberEpoch: lookup.memberKey.memberEpoch,
     },
   };
+}
+
+/** Revalidate at every external-write boundary. Automatic deliveries, stale
+ * capabilities and ordinary follow-ups never inherit a previous share grant. */
+export function authorizeVcMeetingSummaryShare(dataDir: string, input: {
+  session: Pick<Session, 'sessionId' | 'vcMeetingImTurnOrigins'>;
+  agentAppId: string;
+  liveOrigin?: VcMeetingLiveManagedOrigin;
+  claimedCapability?: string;
+}): VcMeetingImTurnOrigin {
+  const origin = resolveVcMeetingImTurnOrigin(input.session, input.liveOrigin?.turnId);
+  const verified = verifyVcMeetingManagedOriginClaim({
+    receiverSessionId: input.session.sessionId, currentImTurnOrigin: origin,
+    liveOrigin: input.liveOrigin, claimedCapability: input.claimedCapability,
+  });
+  if (!verified.ok || input.liveOrigin?.dispatchAttempt !== undefined || !origin
+    || !origin.summaryShareTargetChatId || !origin.replyTargetSenderOpenId
+    || origin.agentAppId !== input.agentAppId
+    || !isCurrentVcMeetingImTurnOrigin(dataDir, origin)
+    || getVcMeetingMemberProjection(dataDir, origin)?.listenerPolicy?.allowSummarySharing !== true) {
+    throw new Error('human_share_authorization_required');
+  }
+  return origin;
 }

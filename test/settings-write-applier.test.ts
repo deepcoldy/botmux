@@ -46,6 +46,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    promptCache: null,
     multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -1228,6 +1229,29 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite promptCache', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    });
+    const cleared = await applySettingsWrite({ promptCache: null }, deps);
+    expect(cleared.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ promptCache: null });
+  });
+
+  it('rejects typos instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ promptCache: { keepalive: { idleMinutes: 90 } } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_promptCache' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });
 

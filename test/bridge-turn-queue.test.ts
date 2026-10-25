@@ -681,6 +681,10 @@ describe('BridgeTurnQueue', () => {
         message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
       } as TranscriptEvent;
     }
+    /** Claude Code's last record of a turn: a reply's `end_turn` alone is held for it. */
+    function turnDurationMarker(uuid: string): TranscriptEvent {
+      return { type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent;
+    }
     function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
       return {
         type: 'assistant', uuid, isApiErrorMessage: false,
@@ -705,7 +709,7 @@ describe('BridgeTurnQueue', () => {
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['s1']);
@@ -744,7 +748,7 @@ describe('BridgeTurnQueue', () => {
     it('does not downgrade a turn that already completed with a real reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -760,7 +764,7 @@ describe('BridgeTurnQueue', () => {
     it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);

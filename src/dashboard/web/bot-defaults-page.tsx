@@ -1,3 +1,4 @@
+import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -5,6 +6,8 @@ import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js'
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import type { PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
@@ -17,6 +20,7 @@ import {
   fetchBotDefaults,
   fetchCliOptions,
   fetchCardBrandLabelEnabled,
+  fetchGlobalPromptCache,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -67,6 +71,7 @@ import {
 import { store } from './store.js';
 import { toast } from './toast.js';
 import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
+import { cliAvailabilityStatus, cliAvailabilityRevision, useCliAvailability } from './cli-availability.js';
 import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
 import { sessionMutationBlockedText } from './session-mutation-blocked.js';
 import type { RoleInjectMode } from './roles.js';
@@ -104,6 +109,17 @@ import {
 } from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
+import { fetchStewardGuide } from './decision-board-api.js';
+import {
+  DECISION_BOARD_CHANGED_EVENT,
+  boardSummaryHash,
+  stewardErrorText,
+  stewardFormFrom,
+  stewardGuideProblem,
+  stewardPayload,
+  type StewardForm,
+  type StewardGuideMode,
+} from './decision-board-model.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
   type StreamingCardButtonId,
@@ -850,6 +866,7 @@ export function BotDefaultsPage() {
         bots={bots}
         cliState={cliState}
         patchBot={patchBot}
+        refreshBot={() => { void refresh(); }}
         brandEnabled={brandEnabled}
         activeTab={activeTab}
         onTabChange={setActiveTab}
@@ -1003,6 +1020,7 @@ function BotDefaultsCard(props: {
   bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
+  refreshBot?(): void;
   brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
@@ -1103,12 +1121,17 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-cap')}><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
@@ -1191,7 +1214,7 @@ function BotDefaultsCard(props: {
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
-            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -1522,7 +1545,7 @@ function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow
   );
 }
 
-function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; refreshBot?(): void }) {
   const tr = useT();
   return (
     <section className="bd-section bd-runtime-env">
@@ -1534,7 +1557,8 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
           scope={{
             kind: 'bot',
             larkAppId: props.bot.larkAppId,
-            onPolicySaved: envPolicy => props.patchBot(props.bot.larkAppId, { envPolicy }),
+            onPolicySaved: envPolicy => { props.patchBot(props.bot.larkAppId, { envPolicy }); props.refreshBot?.(); },
+            onEnvSaved: props.refreshBot,
           }}
         />
       </div>
@@ -2396,13 +2420,22 @@ export function BotAgentSection(props: {
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   const [serviceTier, setServiceTier] = useState<'' | 'default' | 'priority' | 'ultrafast'>(bot.serviceTier ?? '');
   const [serviceTierTouched, setServiceTierTouched] = useState(false);
+  const currentAgentAppId = useRef(bot.larkAppId);
+  currentAgentAppId.current = bot.larkAppId;
+  const [codexProfile, setCodexProfile] = useState(bot.codexProfile ?? '');
+  const [codexProfileTouched, setCodexProfileTouched] = useState(false);
+  // Set when an incompatible CLI switch auto-clears a selected profile, so the
+  // save sends an explicit null (the server rejects cliId!=codex with a kept
+  // profile) and the UI explains why the value is gone. Switching back to
+  // Codex before saving restores the saved value and withdraws the clear.
+  const [codexProfileAutoCleared, setCodexProfileAutoCleared] = useState(false);
   const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
   const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
   const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
   const [nativeEffort, setNativeEffort] = useState<'' | NativeEffort>(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
   const [nativePolicyTouched, setNativePolicyTouched] = useState(false);
   const [nativePolicyErrors, setNativePolicyErrors] = useState<NativePolicyErrors>({ model: null, effort: null });
-  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty means
+  // dsh timeout / MiniMax turn budget, edited in minutes (bots.json stores ms). Empty means
   // no runner watchdog. `touched` gates whether a save sends the field
   // at all: an untouched field is omitted so the daemon preserves the exact
   // stored ms (including legal non-whole-minute values) instead of clearing it.
@@ -2445,6 +2478,9 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setCodexProfile(bot.codexProfile ?? '');
+    setCodexProfileTouched(false);
+    setCodexProfileAutoCleared(false);
     setServiceTier(bot.serviceTier ?? '');
     setServiceTierTouched(false);
     setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
@@ -2475,6 +2511,7 @@ export function BotAgentSection(props: {
     bot.codexRpcInputDefault,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.codexProfile,
     bot.serviceTier,
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
@@ -2488,6 +2525,7 @@ export function BotAgentSection(props: {
   ]);
 
   const option = selectedCliOption(cliState.options, cliKey);
+  const availabilityStatus = useCliAvailability(cliKey, option, bot.larkAppId, cliAvailabilityRevision(bot));
   const suggestions = modelSuggestionsForOption(option, cliState);
   const modelDisabledByCli = option?.gateway === 'ttadk' && option.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
@@ -2548,6 +2586,18 @@ export function BotAgentSection(props: {
     const previousKey = cliKey;
     setCliKey(nextKey);
     setCliSelectionTouched(true);
+    // A saved profile applies only to native Codex. Leaving Codex with a
+    // profile still selected must explicitly clear it on save (the daemon
+    // rejects the combination); coming back before saving restores it.
+    if (codexProfile && selectedAgentCliId(nextKey) !== 'codex') {
+      setCodexProfile('');
+      setCodexProfileTouched(true);
+      setCodexProfileAutoCleared(true);
+    } else if (codexProfileAutoCleared && selectedAgentCliId(nextKey) === 'codex') {
+      setCodexProfile(bot.codexProfile ?? '');
+      setCodexProfileTouched(false);
+      setCodexProfileAutoCleared(false);
+    }
     if (nextKey !== previousKey && (nextKey !== 'codex' || previousKey !== 'codex')) {
       setRuntimeDraft(runtimeDraftFromBot({ cliRuntime: null, cliPathOverride: null }));
       // If the user leaves Codex and comes back before saving, the visible
@@ -2621,12 +2671,12 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
-    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // Runner turn budget: validate the (touched) minutes input before saving
     // so an illegal value surfaces an inline error instead of silently clearing
     // the config. Untouched → omitted below so the daemon preserves the stored
     // ms exactly (including legal non-whole-minute values).
     let turnTimeoutField: number | '' | undefined;
-    if (cliKey === 'dsh' && turnTimeoutTouched) {
+    if (supportsTurnTimeout && turnTimeoutTouched) {
       const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
       if (parsed === 'invalid') {
         const text = tr('botDefaults.agentTurnTimeoutInvalid');
@@ -2680,6 +2730,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(codexProfileTouched ? { codexProfile: codexProfile || null } : {}),
         ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(saveCliId === 'traex' && (autoModelTouched || autoModelEnabled)
@@ -2689,10 +2740,9 @@ export function BotAgentSection(props: {
         ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
           ? { serviceTier }
           : {}),
-        // dsh-only: only send when the user actually edited the field. Omitting
-        // it makes the daemon preserve the current value; non-dsh selections
-        // never send it (the daemon drops any stored value for non-dsh CLIs).
-        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
+        // Only send a supported budget when edited. For supported runners, the
+        // server preserves omitted values; for unsupported CLIs, it deletes them.
+        ...(supportsTurnTimeout && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         // dsh-only runtime variant: only send when touched, same semantics as
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
@@ -2703,6 +2753,7 @@ export function BotAgentSection(props: {
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      if (currentAgentAppId.current !== bot.larkAppId) return;
       const syncSavedBot = () => patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime === undefined
@@ -2721,6 +2772,7 @@ export function BotAgentSection(props: {
           traexAutoModelBlockedReason: null,
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          codexProfile: res.body.codexProfile ?? null,
           serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
@@ -2791,6 +2843,9 @@ export function BotAgentSection(props: {
         setTurnTimeoutMin(turnTimeoutMinFromMs(
           typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
         ));
+        setCodexProfile(res.body.codexProfile ?? '');
+        setCodexProfileTouched(false);
+        setCodexProfileAutoCleared(false);
         setTurnTimeoutTouched(false);
         setModelBackendVariant(res.body.modelBackendVariant ?? '');
         setModelBackendVariantTouched(false);
@@ -2938,8 +2993,8 @@ export function BotAgentSection(props: {
   const isTraex = isBackendVariantCliId(selectedCliId);
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
-  // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = selectedCliId === 'dsh';
+  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax';
   const reasoningEffortOptions = useMemo(
     () => {
       const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
@@ -3007,7 +3062,7 @@ export function BotAgentSection(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
-      label: option.available === false && !(option.id === 'codex' && usesAlternativeCodexExecutable)
+      label: (option.id === cliKey ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable' && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
     }));
@@ -3045,9 +3100,9 @@ export function BotAgentSection(props: {
             onChange={updateCli}
             notifyOnReselect
           />
-          {option?.available === false && !usesAlternativeCodexExecutable ? (
+          {availabilityStatus === 'unavailable' && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
-              {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
+              {tr('botDefaults.agentMissingHint', { command: option?.command ?? cliKey })}
             </small>
           ) : null}
         </div>
@@ -3310,6 +3365,17 @@ export function BotAgentSection(props: {
           </div>
         </div>
       )}
+      {(selectedCliId === 'codex' || codexProfile) && <CodexProfilePicker
+        appId={bot.larkAppId} contextKey={bot}
+        value={codexProfile} disabled={!!props.lock || agentBusy}
+        launchChanged={cliSelectionTouched || runtimeTouched}
+        onChange={value => { setCodexProfile(value); setCodexProfileTouched(true); setCodexProfileAutoCleared(false); }} />}
+      {codexProfileAutoCleared && selectedCliId !== 'codex' && (
+        <div className="bd-row" data-section="codex-profile-cleared">
+          <span />
+          <p className="bd-aux-note bd-aux-err" role="status">{tr('botDefaults.codexProfileClearedOnCliSwitch')}</p>
+        </div>
+      )}
       {isDsh && (
         <div className="bd-row">
           <label>
@@ -3361,10 +3427,14 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isDsh && (
+      {supportsTurnTimeout && (
         <div className="bd-row">
           <label>
-            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            {isDsh ? (
+              <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            ) : (
+              <FieldTitle help={tr('botDefaults.minimaxTurnBudgetHelp')}>{tr('botDefaults.minimaxTurnBudget')}</FieldTitle>
+            )}
             <input
               type="number"
               min={0}
@@ -6105,6 +6175,230 @@ function SessionModeSection(props: {
   );
 }
 
+/**
+ * 管家（决策看板）：开关、管家所在群、提示词（预置 + 追加 / 替换）。三样存在 bots.json 的
+ * `steward` 一个字段里，所以每次保存都发完整对象：开关和选群立刻保存（带上已保存的提示词，
+ * 不顺手把没点保存的文本框内容写进去）；提示词点「保存提示词」才写。
+ */
+export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
+  const tr = useT();
+  const appId = props.bot.larkAppId;
+  const savedForm = useMemo(() => stewardFormFrom(props.bot.steward), [props.bot.steward]);
+  const [enabled, setEnabled] = useState(savedForm.enabled);
+  const [chatId, setChatId] = useState(savedForm.chatId);
+  const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
+  const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
+  const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
+  const [guideText, setGuideText] = useState(savedForm.guideText);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [guideStatus, setGuideStatus] = useState<StatusMessage>(null);
+  const [chats, setChats] = useState<GroupChat[] | null>(null);
+  const [guide, setGuide] = useState<{ preset: string; effective: string } | 'offline' | null>(null);
+  // 群列表要完整矩阵（memberBots），很大：只在「会话」分类打开、且开了管家时每 bot 拉一次。
+  const chatsGateRef = useRef(createOncePerKeyGate());
+  const guideGateRef = useRef(createOncePerKeyGate());
+  const pickerId = useId();
+  const guideTextId = useId();
+
+  // 各自只在自己那部分的已保存值变化时同步：保存开关后不能把没保存的提示词冲掉。
+  useEffect(() => { setEnabled(savedForm.enabled); }, [appId, savedForm.enabled]);
+  useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
+  useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
+  useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
+  useEffect(() => {
+    setGuideMode(savedForm.guideMode);
+    setGuideText(savedForm.guideText);
+  }, [appId, savedForm.guideMode, savedForm.guideText]);
+  useEffect(() => { setStatus(null); setGuideStatus(null); }, [appId]);
+
+  useEffect(() => {
+    if (!props.active || !enabled) return;
+    if (!chatsGateRef.current.claim(appId)) return;
+    setChats(null);
+    void fetchGroupsSnapshot().then(snapshot => {
+      if (!chatsGateRef.current.claimed(appId)) return;
+      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === appId && member.inChat)));
+    }).catch(() => {
+      setChats([]);
+      chatsGateRef.current.release(appId);
+    });
+  }, [appId, props.active, enabled]);
+
+  const loadGuide = useCallback(() => {
+    void fetchStewardGuide(appId).then(next => {
+      if (guideGateRef.current.claimed(appId)) setGuide(next);
+    }).catch(() => {
+      if (guideGateRef.current.claimed(appId)) setGuide('offline');
+    });
+  }, [appId]);
+
+  useEffect(() => {
+    if (!props.active || !enabled) return;
+    if (!guideGateRef.current.claim(appId)) return;
+    setGuide(null);
+    loadGuide();
+  }, [appId, props.active, enabled, loadGuide]);
+
+  async function save(next: StewardForm, setSlot: (status: StatusMessage) => void, rollback?: () => void): Promise<boolean> {
+    return saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(appId)}/steward`, { steward: stewardPayload(next) }),
+      setStatus: setSlot,
+      setBusy,
+      saved: tr('botDefaults.stewardSaved'),
+      errorText: res => stewardErrorText(res.body?.error ?? res.status, tr),
+      onSaved: body => {
+        props.patchBot(appId, { steward: body.steward ?? null });
+        // 侧边栏的「决策看板」按有没有管家决定显示与否。
+        window.dispatchEvent(new Event(DECISION_BOARD_CHANGED_EVENT));
+        if (guideGateRef.current.claimed(appId)) loadGuide();
+      },
+      rollback,
+    });
+  }
+
+  function toggleEnabled(on: boolean): void {
+    const previous = enabled;
+    setEnabled(on);
+    void save({ ...savedForm, enabled: on }, setStatus, () => setEnabled(previous));
+  }
+
+  function toggleAutoJoin(on: boolean): void {
+    const previous = autoJoin;
+    setAutoJoin(on);
+    void save({ ...savedForm, autoJoinNewGroups: on }, setStatus, () => setAutoJoin(previous));
+  }
+
+  function toggleAutoJoinSolo(on: boolean): void {
+    const previous = autoJoinSolo;
+    setAutoJoinSolo(on);
+    void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
+  }
+
+  function changeChat(next: string): void {
+    const previous = chatId;
+    setChatId(next);
+    void save({ ...savedForm, chatId: next }, setStatus, () => setChatId(previous));
+  }
+
+  function saveGuide(): void {
+    const form: StewardForm = { ...savedForm, guideMode, guideText };
+    if (stewardGuideProblem(form) === 'replace_empty') {
+      setGuideStatus({ text: `✗ ${tr('botDefaults.stewardGuideReplaceEmpty')}` });
+      return;
+    }
+    void save(form, setGuideStatus);
+  }
+
+  const guideDirty = guideMode !== savedForm.guideMode || guideText.trim() !== savedForm.guideText.trim();
+  const chatOptions = chats
+    ? [...chats, ...(chatId && !chats.some(chat => chat.chatId === chatId) ? [{ chatId }] : [])]
+    : (chatId ? [{ chatId }] : []);
+  const selectedChat = chats?.find(chat => chat.chatId === chatId);
+  const missingChat: StatusMessage = enabled && !chatId ? { text: tr('botDefaults.stewardChatMissing') } : null;
+
+  return (
+    <section className="bd-section bd-steward-section" aria-busy={busy} data-steward-section>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSteward')}</h3>
+      <p className="bd-section-note">{tr('botDefaults.stewardIntro')}</p>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-steward"
+        title={tr('botDefaults.stewardEnabled')}
+        help={tr('botDefaults.stewardEnabledHelp')}
+        onChange={toggleEnabled}
+      />
+      <div className="bd-mode-group-side"><StatusSpan status={status ?? missingChat} attr={{ 'data-steward-status': '' }} /></div>
+      {enabled ? (
+        <>
+          <div className="bd-row bd-steward-chat">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.stewardChatHelp')}>{tr('botDefaults.stewardChat')}</FieldTitle>
+              <SearchableGroupPicker
+                id={pickerId}
+                label={tr('botDefaults.stewardChat')}
+                groups={chatOptions}
+                value={chatId}
+                disabled={busy || chats === null}
+                placeholder={chats === null ? tr('botDefaults.stewardChatLoading') : tr('botDefaults.stewardChatPlaceholder')}
+                searchPlaceholder={tr('botDefaults.stewardChatSearch')}
+                emptyLabel={tr('botDefaults.stewardChatEmpty')}
+                selectedCountLabel={count => String(count)}
+                onChange={value => changeChat(String(value))}
+              />
+              {selectedChat?.chatMode === 'topic' ? <p className="bd-section-note">{tr('botDefaults.stewardChatTopic')}</p> : null}
+            </div>
+          </div>
+          <ToggleRow
+            checked={autoJoin}
+            disabled={busy}
+            dataAction="toggle-steward-auto-join"
+            title={tr('botDefaults.stewardAutoJoin')}
+            help={tr('botDefaults.stewardAutoJoinHelp')}
+            onChange={toggleAutoJoin}
+          />
+          {/* 受上一项约束：拉新群不带管家时，单人群自然也不带，置灰。 */}
+          <ToggleRow
+            checked={autoJoinSolo}
+            disabled={busy || !autoJoin}
+            dataAction="toggle-steward-auto-join-solo"
+            title={tr('botDefaults.stewardAutoJoinSolo')}
+            help={tr('botDefaults.stewardAutoJoinSoloHelp')}
+            onChange={toggleAutoJoinSolo}
+          />
+          <div className="bd-row bd-steward-guide">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.stewardGuideHelp')}>{tr('botDefaults.stewardGuide')}</FieldTitle>
+              <details className="bd-steward-preset">
+                <summary>{tr('botDefaults.stewardPreset')}</summary>
+                {guide === null
+                  ? <p className="bd-section-note">{tr('botDefaults.stewardPresetLoading')}</p>
+                  : guide === 'offline'
+                    ? <p className="bd-section-note">{tr('botDefaults.stewardPresetOffline')}</p>
+                    : <pre className="bd-steward-guide-text">{guide.preset}</pre>}
+              </details>
+              <div className="bd-steward-mode" role="radiogroup" aria-label={tr('botDefaults.stewardModeLabel')}>
+                <label>
+                  <input type="radio" name={`steward-mode-${appId}`} checked={guideMode === 'append'} disabled={busy} onChange={() => setGuideMode('append')} />
+                  <span>{tr('botDefaults.stewardModeAppend')}</span>
+                </label>
+                <label>
+                  <input type="radio" name={`steward-mode-${appId}`} checked={guideMode === 'replace'} disabled={busy} onChange={() => setGuideMode('replace')} />
+                  <span>{tr('botDefaults.stewardModeReplace')}</span>
+                </label>
+              </div>
+              {guideMode === 'replace' ? <p className="bd-section-note">{tr('botDefaults.stewardModeReplaceHint')}</p> : null}
+              <textarea
+                id={guideTextId}
+                className="bd-steward-guide-input"
+                aria-label={tr('botDefaults.stewardGuide')}
+                value={guideText}
+                rows={5}
+                maxLength={20_000}
+                disabled={busy}
+                placeholder={tr('botDefaults.stewardGuidePlaceholder')}
+                onChange={event => setGuideText(event.currentTarget.value)}
+              />
+              <div className="actions bd-steward-guide-actions">
+                <button type="button" className="primary" disabled={busy || !guideDirty} onClick={saveGuide}>{tr('botDefaults.stewardGuideSave')}</button>
+                <StatusSpan status={guideStatus} attr={{ 'data-steward-guide-status': '' }} />
+              </div>
+              {guide && guide !== 'offline' && savedForm.guideText ? (
+                <details className="bd-steward-preset">
+                  <summary>{tr('botDefaults.stewardEffective')}</summary>
+                  <pre className="bd-steward-guide-text">{guide.effective}</pre>
+                </details>
+              ) : null}
+            </div>
+          </div>
+          <a className="bd-steward-open" href={boardSummaryHash({ appId })}>{tr('botDefaults.stewardOpenBoard')} →</a>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 type CommandTriggerCheck = {
   input: string;
   valid: boolean;
@@ -7575,6 +7869,47 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
+function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [globalValue, setGlobalValue] = useState<PromptCacheConfig | null>(null);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchGlobalPromptCache().then(value => { if (alive) setGlobalValue(value); });
+    return () => { alive = false; };
+  }, []);
+
+  async function save(value: PromptCacheConfig | null): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/prompt-cache`, { promptCache: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.promptCache && typeof body.promptCache === 'object' ? body.promptCache as PromptCacheConfig : null;
+        props.patchBot(props.bot.larkAppId, { promptCache: next });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionPromptCache')}</h3>
+      <small className="bd-section-note">{tr('botDefaults.promptCacheNote')}</small>
+      <PromptCacheEditor
+        scope="bot"
+        value={props.bot.promptCache ?? null}
+        globalValue={globalValue}
+        disabled={busy}
+        onSave={save}
+      />
+      <StatusSpan status={status} attr={{ 'data-prompt-cache-status': '' }} />
+    </section>
+  );
+}
+
 function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const [value, setValue] = useState(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : '');
@@ -8503,6 +8838,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [ownerDm, setOwnerDm] = useState(props.bot.grantRequestToOwnerDm === true);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
+  const [trustSameOwner, setTrustSameOwner] = useState(props.bot.trustSameOwnerBots !== false);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
   const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
@@ -8530,6 +8866,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.p2pOpen]);
 
   useEffect(() => {
+    setTrustSameOwner(props.bot.trustSameOwnerBots !== false);
+  }, [props.bot.trustSameOwnerBots]);
+
+  useEffect(() => {
     const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
     setDuration(nextDuration);
     setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -8547,6 +8887,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       grantRequestToOwnerDm?: boolean;
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
+      trustSameOwnerBots?: boolean;
       grantDefaultDurationMs?: number | null;
       messageQuotaDefaultLimit?: number | null;
     },
@@ -8568,6 +8909,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         setOwnerDm(body.grantRequestToOwnerDm === true);
         setRestrict(body.restrictGrantCommands === true);
         setP2pOpen(body.p2pOpen === true);
+        setTrustSameOwner(body.trustSameOwnerBots !== false);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -8579,6 +8921,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           grantRequestToOwnerDm: body.grantRequestToOwnerDm === true,
           restrictGrantCommands: body.restrictGrantCommands === true,
           p2pOpen: body.p2pOpen === true,
+          trustSameOwnerBots: body.trustSameOwnerBots !== false,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
@@ -8712,6 +9055,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = p2pOpen;
             setP2pOpen(checked);
             void savePatch({ p2pOpen: checked }, 'p2pOpen', () => setP2pOpen(previous));
+          }}
+        />
+        <ToggleRow
+          checked={trustSameOwner}
+          disabled={busy !== null}
+          dataAction="toggle-trust-same-owner-bots"
+          title={tr('botDefaults.trustSameOwnerBots')}
+          help={tr('botDefaults.trustSameOwnerBotsHelp')}
+          onChange={checked => {
+            const previous = trustSameOwner;
+            setTrustSameOwner(checked);
+            void savePatch({ trustSameOwnerBots: checked }, 'trustSameOwner', () => setTrustSameOwner(previous));
           }}
         />
       </div>

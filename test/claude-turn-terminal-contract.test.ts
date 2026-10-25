@@ -265,6 +265,8 @@ describe('Claude durable turn terminal contract', () => {
     const finalFirst = new ContractHarness();
     finalFirst.mark('final-race', 'quick task', 7);
     finalFirst.ingest([user('u-final', 'quick task'), assistant('a-final', 'done', 'end_turn')]);
+    // The worker drains before every cli_exit (drainReliableTerminalBeforeInterrupt).
+    finalFirst.preExitDrain();
     finalFirst.exit('final-race', 7);
     expect(finalFirst.emitted).toEqual([
       { turnId: 'final-race', dispatchAttempt: 7, status: 'completed' },
@@ -395,13 +397,43 @@ describe('Claude durable turn terminal contract', () => {
       expect(h.emitted.map(e => [e.turnId, e.status])).toEqual([['review', 'failed']]);
     });
 
-    it('still settles on the stop_reason for a transcript that has never written the marker', () => {
-      // Older Claude JSONL without turn_duration: holding would leave every
-      // turn open until the next message.
+    it('fails the first turn of a session too, before any marker was ever seen', () => {
+      const h = new ContractHarness(0);
+      h.mark('review', 'please re-review', 1);
+      h.ingest([user('u1', 'please re-review'), thinking('a-think', 'msg-1')]);
+      h.idle();
+      expect(h.emitted).toEqual([]);
+      h.ingest([connectionLost('err'), turnDuration('d1')]);
+      expect(h.emitted.map(e => [e.turnId, e.status, e.errorCode])).toEqual([['review', 'failed', 'provider_server_error']]);
+    });
+
+    it('settles on the stop_reason again once a wait for the marker ran out on a transcript that never wrote one', () => {
+      // Older Claude JSONL without turn_duration: holding on would leave every
+      // turn waiting out the idle edge's bound.
       const h = new ContractHarness(0);
       h.mark('old-shape', 'old prompt', 1);
       h.ingest([user('u1', 'old prompt'), text('a1', 'msg-1', 'answer')]);
+      expect(h.emitted).toEqual([]);
+      h.queue.noteDurationMarkerWaitExpired();
+      h.idle();
       expect(h.emitted).toEqual([{ turnId: 'old-shape', dispatchAttempt: 1, status: 'completed' }]);
+
+      h.mark('old-shape-2', 'next prompt', 1);
+      h.ingest([user('u2', 'next prompt'), text('a2', 'msg-2', 'next answer')]);
+      expect(h.emitted.at(-1)).toEqual({ turnId: 'old-shape-2', dispatchAttempt: 1, status: 'completed' });
+    });
+
+    it('holds again once the transcript writes a marker after all', () => {
+      const h = new ContractHarness(0);
+      h.queue.noteDurationMarkerWaitExpired();
+      h.mark('slow', 'slow prompt', 1);
+      h.ingest([user('u1', 'slow prompt'), text('a1', 'msg-1', 'answer'), turnDuration('d1')]);
+      h.emitted.length = 0;
+      h.mark('review', 'please re-review', 1);
+      h.ingest([user('u2', 'please re-review'), thinking('a-think', 'msg-2')]);
+      h.queue.noteDurationMarkerWaitExpired();
+      h.idle();
+      expect(h.emitted).toEqual([]);
     });
 
     it('releases a held turn to the pre-exit drain, so cli_exit cannot mark it ambiguous', () => {
@@ -561,6 +593,7 @@ describe('Claude durable turn terminal contract', () => {
       h.ingest([
         user('local-u', 'typed in the pane'),
         assistant('local-a', 'done', 'end_turn'),
+        turnDuration('local-d'),
       ]);
       expect(h.emitted).toHaveLength(1);
       expect(h.emitted[0].status).toBe('completed');

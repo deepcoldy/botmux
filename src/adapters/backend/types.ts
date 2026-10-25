@@ -218,6 +218,12 @@ export interface SpawnOpts {
    * global env have been applied, so those sources cannot re-add them.
    */
   unsetEnv?: string[];
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */
@@ -328,6 +334,9 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /** Fresh, bounded viewport read without blocking the Worker event loop.
+   * Returns plain text; rejects or returns empty when the viewport is unknown. */
+  captureViewportAsync?(): Promise<string>;
   /**
    * Plain current viewport plus the real terminal cursor. Adopt-mode input
    * guards use this to detect an unsubmitted local composer draft before a

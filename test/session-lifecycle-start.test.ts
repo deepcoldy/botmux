@@ -245,12 +245,14 @@ import {
 import type { DaemonSession } from '../src/core/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8600,5 +8602,61 @@ describe('/btw side answer relay', () => {
     worker.emit('message', { type: 'btw_answer', turnId: 'om_btw', question: 'q', answer: 'a', source: 'clipboard' });
     await new Promise(resolveTick => setTimeout(resolveTick, 20));
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('worker pid record', () => {
+  // A real idle child stands in for the forked worker so its birth identity is
+  // readable; updateSessionPid is mocked and only the cleanup signals it.
+  async function withIdleChild(run: (pid: number) => void): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-fork-pid-identity-'));
+    const script = join(dir, 'worker.js');
+    writeFileSync(script, 'setTimeout(() => {}, 600_000);\n');
+    const child = spawnTsScript(script, [], { stdio: 'ignore' });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      run(child.pid!);
+    } finally {
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('persists a forked worker pid together with its birth identity', async () => {
+    await withIdleChild(pid => {
+      const worker = makeFakeWorker();
+      worker.pid = pid;
+      forkMock.mockImplementationOnce(() => worker);
+
+      forkWorker(makeDs(), 'hello', { turnId: 'om_pid_identity' });
+
+      const identity = readWorkerProcessStart(pid);
+      expect(identity).toBeTruthy();
+      expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, identity);
+    });
+  });
+
+  it('persists an adopt worker pid together with its birth identity', async () => {
+    await withIdleChild(pid => {
+      const worker = makeFakeWorker();
+      worker.pid = pid;
+      forkMock.mockImplementationOnce(() => worker);
+      const ds = makeDs({
+        adoptedFrom: {
+          source: 'tmux',
+          tmuxTarget: 'work:0.0',
+          originalCliPid: 4242,
+          sessionId: 'sess-adopt-pid',
+          cliId: 'claude-code',
+          cwd: REPO,
+          paneCols: 200,
+          paneRows: 50,
+        },
+      });
+
+      forkAdoptWorker(ds, { prompt: 'hi', turnId: 'om_adopt_pid_identity' });
+
+      expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, readWorkerProcessStart(pid));
+    });
   });
 });

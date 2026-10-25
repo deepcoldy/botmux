@@ -32,11 +32,11 @@ import {
   type PaletteItem,
 } from '../src/dashboard/web/command-palette-model.js';
 import {
-  SETTINGS_SEARCH_INDEX,
   buildSessionItems,
   buildSettingItems,
   orderSessionsForPalette,
 } from '../src/dashboard/web/command-palette-sources.js';
+import { SETTINGS_SECTIONS } from '../src/dashboard/web/settings-sections.js';
 import {
   CommandPalette,
   __testOnly_resetPaletteRemoteCache,
@@ -343,7 +343,7 @@ describe('command palette sources', () => {
   it('every indexed settings key is translated in both locales', () => {
     const zh = createDashboardTranslator('zh');
     const en = createDashboardTranslator('en');
-    for (const entry of SETTINGS_SEARCH_INDEX) {
+    for (const entry of SETTINGS_SECTIONS) {
       for (const key of [entry.module, entry.section, ...entry.fields]) {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
@@ -358,7 +358,7 @@ describe('command palette sources', () => {
   // 深链才滚得过去；区块 JSX 是页面组件内部结构、import 不出来，只能读文本比对。
   it('every indexed settings section is a real block id on the settings page', () => {
     const source = readFileSync(new URL('../src/dashboard/web/settings-page.tsx', import.meta.url), 'utf8');
-    for (const entry of SETTINGS_SEARCH_INDEX) {
+    for (const entry of SETTINGS_SECTIONS) {
       expect(source, entry.id).toContain(`id="${entry.id}"`);
     }
   });

@@ -258,6 +258,8 @@ export const messages: Record<string, string> = {
   'card.adopt.field_time_live': '已运行',
   'card.adopt.field_time_resume': '最近活动',
   'card.adopt.field_target': '位置',
+  'card.adopt.location_with_workspace': '{workspace}（{target}）',
+  'card.adopt.untitled_live': '新会话',
   'card.adopt.selected_tag': '已选中',
   'card.adopt.hint_pick_first': '点击上方任意会话以选中，再点下方按钮确认接入。',
   'card.adopt.btn_confirm_live': '确认接管到本话题',
@@ -811,6 +813,7 @@ export const messages: Record<string, string> = {
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'config.label.p2pOpen': '私聊全开',
   'config.label.grantRequestToOwnerDm': '申请卡转投私聊',
+  'config.label.trustSameOwnerBots': '信任同 owner 的同机 Bot',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',
   'card.config.text_title': '✏️ {name} · 文本设置',
@@ -964,6 +967,7 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.sessions': '/sessions   - 列出当前机器人在本群的话题会话，并可返回或恢复话题',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
+  'help.dash': '/dash - 私信获取当前 Dashboard 管理首页完整链接（等价于 /dashboard link），不创建会话或 worktree；链接形式随远程访问/反代配置变化（本机直连或平台机子域）',
   'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
@@ -1335,10 +1339,11 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': '最近终端输出：',
   'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
   'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
-  'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
+  'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n会话 {sessionId}，详细日志见本机 {logPath}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Botmux 无法确认这条消息是否已进入 Worker 的执行队列。已停止继续投递以避免重复执行。请先查看会话状态，不要直接重发。\nturn: {turnId}',
   'worker.input_rejected_before_admission': '⚠️ 这条消息在进入 Worker 执行队列之前就被拒收：它没有被执行，也没有产生任何副作用。常见原因是会话里正在执行的那一轮由另一个身份发起（跨身份打断隔离）；等那一轮结束后重新发送即可。\nturn: {turnId}｜reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ 会话在处理这条消息期间被主动休眠或更换，Botmux 未能确认它是否已进入执行队列。请先查看会话记录确认结果；若未执行，再重新发送这条消息。\nturn: {turnId}',
+  'worker.start_failed_log_fallback': 'daemon 日志',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'workerDiag.recentStderr': '最近的 worker 输出（可能含死因）：',
   'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
@@ -1388,6 +1393,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_non_retryable': '⚠️ {cliName} 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
   'worker.local_turn_failed': '⚠️ {cliName} 执行失败（{errorCode}）。失败的这一轮没有对应的飞书消息（例如在终端里直接输入的内容，或接续上一轮的输出），所以不会自动重试。请检查 Web 终端，需要时重新发送。',
+  'worker.claude_stop_failure_unsettled': '⚠️ {cliName} 因 API 错误中断了这一轮（{errorCode}），但 botmux 没能把这次中断对应到正在跟踪的回合，所以不会自动续跑，任务可能停在中途。请检查 Web 终端，需要时回复「继续」。',
 
   // ─── Turn-failure card (通用失败卡：@人 + 重试按钮) ────────────────────────
   'card.turn_failed.title': '⚠️ {cliName} 本轮执行失败',
@@ -1591,11 +1597,18 @@ export const messages: Record<string, string> = {
     '• `groups`     — 群组矩阵\n' +
     '• `schedules`  — 定时任务\n' +
     '• `settings`   — 全局设置（仅管理员）\n' +
+    '• `link`       — 管理首页链接（私信；等价裸 `/dash`；链接形式随远程访问/反代配置变化）\n' +
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',
   'card.dashboard.dm_sent': '📬 Dashboard 响应已私信给你。',
   'card.dashboard.dm_failed': '⚠️ 给你发送 Dashboard 私聊失败：{reason}',
+  'card.dashboard.link.title': '🔗 Dashboard 管理首页',
+  'card.dashboard.link.body': 'Dashboard 管理首页（完整管理权限）：\n{url}',
+  'card.dashboard.link.loopback_hint': '⚠️ Dashboard 当前仅监听本机回环地址，该链接只能在运行 BotMux 的机器本机打开。',
+  'card.dashboard.link.dm_sent': '📬 Dashboard 管理首页链接已私信给你。',
+  'card.dashboard.link.delivery_failed': '⚠️ Dashboard 链接的私密投递失败，未在群内展示链接。请检查与机器人的私聊权限后重试。',
+  'card.dashboard.link.unavailable': '⚠️ 当前无法读取 Dashboard 端口或管理员 token，请确认 Dashboard 已在运行。',
   // sessions card (PR3 slice 1)
   'card.dashboard.sessions.title': '🖥️ Dashboard 会话',
   'card.dashboard.sessions.count_summary': '活跃 {active} · 已关闭 {closed} · 第 {page}/{totalPages} 页',
@@ -1948,9 +1961,12 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
-  'card.waiting_duration': '等待 {seconds} 秒',
-  'card.execution_until_reply': '执行至回复 {seconds} 秒',
-  'card.execution_duration': '执行耗时 {seconds} 秒',
+  'card.waiting_duration': '等待 {duration}',
+  'card.execution_until_reply': '执行至回复 {duration}',
+  'card.execution_duration': '执行耗时 {duration}',
+  'card.duration_seconds': '{seconds} 秒',
+  'card.duration_minutes': '{minutes} 分',
+  'card.duration_hours': '{hours} 小时',
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。
@@ -1971,6 +1987,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App 共享对话（已同步至飞书）',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 决策看板：收到 {count} 项决定（批次 #{id}），管家开始处理',
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
   'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
   'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
@@ -1998,6 +2015,17 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
+  'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',
+  'worker.startup_blocker_label.folder_trust': '目录信任确认',
+  'worker.startup_blocker_label.login': '登录',
+  'worker.startup_blocker_label.update': '升级确认',
+  'worker.startup_blocker_label.terms': '条款确认',
+  'worker.startup_blocked.folder_trust': '⚠️ {cliName} 卡在目录信任确认：{folder}{upgrade}。它在等人确认是否信任这个目录，这条消息还没开始处理。请打开 Web 终端选择信任，确认后会自动接着处理。',
+  'worker.startup_blocked.login': '⚠️ {cliName} 卡在登录{upgrade}：它在等人完成登录，这条消息还没开始处理。请打开 Web 终端（或在本机）按提示登录，登录后会接着处理。',
+  'worker.startup_blocked.update': '⚠️ {cliName} 卡在升级确认{upgrade}：它在等人选择是否升级，这条消息还没开始处理。请打开 Web 终端做出选择，之后会接着处理。',
+  'worker.startup_blocked.terms': '⚠️ {cliName} 卡在条款确认{upgrade}：它在等人接受新的使用条款，这条消息还没开始处理。请打开 Web 终端确认后继续。',
+  'worker.workspace_trust_explicitly_denied': '⚠️ 工作目录 {folder} 在 {cliName} 的信任记录里被显式设为不信任（{store} 里 trusted = false）。botmux 不会替你改这个决定，所以 {cliName} 启动时会停在目录信任确认、不处理消息。要在这个目录里用它，请在 Web 终端里选择信任，或把该条目改为 trusted = true（或删掉）后重发。',
   'worker.claude_bridge_turn_unread': '⚠️ {cliName} 刚跑完一轮，但 botmux 没在它的会话记录（transcript）里读到这一轮，这一轮的回复可能不会自动转发到群里。请打开 Web 终端查看；之后在群里再发消息时，botmux 会重新定位会话记录。',
 
   // Restart / maintenance report (bot-0 DM to owner)
