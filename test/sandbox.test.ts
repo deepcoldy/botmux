@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, cliSurvivesWorkerExit, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -363,14 +363,6 @@ describe('sandbox tree across a detach-style worker exit', () => {
     expect(sandboxTreeSurvivesWorkerExit({ ownsTree: true, backendType: 'tmux', persistentSessionName: undefined })).toBe(false);
     // Unsandboxed: nothing to keep.
     expect(sandboxTreeSurvivesWorkerExit({ ownsTree: false, backendType: 'tmux', persistentSessionName: 'bmx-1' })).toBe(false);
-  });
-
-  it('keeps a persistent pane CLI running past the worker, sandboxed or not; a PTY CLI dies with it', () => {
-    for (const backendType of ['tmux', 'zellij', 'herdr', 'zmx']) {
-      expect(cliSurvivesWorkerExit({ backendType, persistentSessionName: 'bmx-1' })).toBe(true);
-    }
-    expect(cliSurvivesWorkerExit({ backendType: 'pty', persistentSessionName: 'bmx-1' })).toBe(false);
-    expect(cliSurvivesWorkerExit({ backendType: 'tmux', persistentSessionName: undefined })).toBe(false);
   });
 
   it('re-serves the outbox a live pane bound and never recreates a lost one', () => {

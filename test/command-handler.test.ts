@@ -682,6 +682,7 @@ import {
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
+import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
@@ -5354,6 +5355,88 @@ describe('handleCommand', () => {
       expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('未结算');
       expect(forkWorker).not.toHaveBeenCalled();
       expect(ds.pendingRepo).toBe(false);
+    });
+
+    // #2224: `/cd` and `/restart` in that state answered 「Codex App 仍有未结算
+    // 消息」 — there is no turn to wait for; the message waits for a directory.
+    it('guides /cd to /repo instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeRefusedOpeningDs();
+      const workingDirBefore = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(ds.workingDir).toBe(workingDirBefore);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('guides /cd to /repo when the refused opening lands while /cd waits for the mutation gate', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeDaemonSession({ worker: null, hasHistory: false });
+      const workingDirBefore = ds.workingDir;
+      const deps = makeDeps(ds);
+      // Another mutation holds the bot's gate while the opening is refused.
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>(resolve => { releaseGate = resolve; });
+      let gateEntered!: () => void;
+      const entered = new Promise<void>(resolve => { gateEntered = resolve; });
+      const peer = withBotTurnMutation(LARK_APP_ID, async () => { gateEntered(); await gateHeld; });
+      await entered;
+
+      const cd = handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+      // Past the preflight: the target was validated, the mutation is queued.
+      await vi.waitFor(() => expect(existsSync).toHaveBeenCalledWith('/home/testuser/project-a'));
+      // Meanwhile the session's first message is refused for a missing directory.
+      ds.initialStartPending = true;
+      ds.pendingPrompt = 'first prompt';
+      Object.assign(ds.session, {
+        queued: true,
+        queuedPrompt: 'first prompt',
+        pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first prompt' },
+      });
+      releaseGate();
+      await peer;
+      await cd;
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('未结算');
+      expect(ds.workingDir).toBe(workingDirBefore);
+      expect(killWorker).not.toHaveBeenCalled();
+    });
+
+    it('guides /restart to /repo instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+    });
+
+    it('still refuses /cd and /restart while an activation is actually in flight', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => String(c[1]));
+      expect(said).toHaveLength(2);
+      for (const reply of said) expect(reply).toContain('未结算');
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {

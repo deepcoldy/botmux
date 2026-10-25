@@ -8,7 +8,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DashboardSessionStore } from '../src/dashboard/h5-auth.js';
 import {
   issueTerminalControlGrant,
+  signTerminalWakeProof,
+  TERMINAL_WAKE_HEADER,
   verifyTerminalControlGrant,
+  verifyTerminalWakeProof,
 } from '../src/core/terminal-control-grant.js';
 import {
   TerminalControlManager,
@@ -454,6 +457,60 @@ describe('central terminal front proxy boundary', () => {
           expect(observed[0].role, cell).toBeUndefined();
           if (identity.expectHint) expect(observed[0].hint, cell).toBe('1');
           else expect(observed[0].hint, cell).toBeUndefined();
+        }
+      } finally {
+        await close(front);
+      }
+    }
+    await close(upstream);
+  });
+
+  it('#2004 wake proof: every signed-in identity carries one on every path, anonymous and unknown visitors never do', async () => {
+    const observed: Array<{ wake?: string | string[] }> = [];
+    const upstream = createServer((req, res) => {
+      observed.push({ wake: req.headers[TERMINAL_WAKE_HEADER] });
+      res.end('ok');
+    });
+    const upstreamPort = await listen(upstream);
+    const identities: Array<{ name: string; actor: TerminalDashboardActor | null; expectProof: boolean }> = [
+      { name: 'platform-sso-guest', actor: { userId: 'p:on_a:guest', authSessionId: 's:on_a:guest', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'readonly' }, expectProof: true },
+      { name: 'platform-anonymous-guest', actor: { userId: 'p:guest', authSessionId: 's:guest', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'readonly', anonymous: true }, expectProof: false },
+      { name: 'platform-owner', actor: { userId: 'p:owner', authSessionId: 's:owner', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'owner' }, expectProof: true },
+      { name: 'legacy', actor: { userId: 'legacy-owner', authSessionId: 'legacy-auth', expiresAt: Number.MAX_SAFE_INTEGER, terminalCapability: 'controlled' }, expectProof: true },
+      { name: 'h5', actor: { userId: 'ou_h5', authSessionId: 'h5-auth', expiresAt: Date.now() + 30 * 60_000, terminalCapability: 'controlled' }, expectProof: true },
+      { name: 'no-identity', actor: null, expectProof: false },
+    ];
+    for (const identity of identities) {
+      const proxy = createTerminalFrontProxy({
+        resolvePort: () => upstreamPort,
+        resolveActor: () => identity.actor,
+        control: new TerminalControlManager({ secret: SECRET, audit: { append() {} } }),
+        isAuthSessionLive: () => true,
+        wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
+      });
+      const front = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (!proxy.handleHttp(req, res, url)) res.writeHead(404).end();
+      });
+      const frontPort = await listen(front);
+      try {
+        // 卡片读链接、写链接、无 token（剥凭证 / 注入 grant / 原样透传三条路）都要覆盖。
+        for (const query of ['?viewToken=card-view', '?token=write-link', '']) {
+          observed.length = 0;
+          await fetch(`http://127.0.0.1:${frontPort}/s/s1/${query}`, {
+            // 浏览器伪造的唤醒证明在每条路上都必须被丢弃。用别的密钥签：上游收到的
+            // 值能用本机 SECRET 校验通过，就只可能是前门自己签的，不是透传上来的。
+            headers: { [TERMINAL_WAKE_HEADER]: signTerminalWakeProof('browser-forged-secret', 's1')! },
+          });
+          const cell = `${identity.name} × ${query || 'no-token'}`;
+          expect(observed, cell).toHaveLength(1);
+          const wake = observed[0].wake;
+          if (identity.expectProof) {
+            expect(typeof wake, cell).toBe('string');
+            expect(verifyTerminalWakeProof(SECRET, 's1', wake), cell).toBe(true);
+          } else {
+            expect(wake, cell).toBeUndefined();
+          }
         }
       } finally {
         await close(front);

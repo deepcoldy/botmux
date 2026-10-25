@@ -5,7 +5,8 @@ export type TerminalStatusKind =
   | 'closed'
   | 'not-found'
   | 'forbidden'
-  | 'unavailable';
+  | 'unavailable'
+  | 'suspended';
 
 interface TerminalStatusCopy {
   code: string;
@@ -38,6 +39,11 @@ const STATUS_COPY: Record<TerminalStatusKind, TerminalStatusCopy> = {
     code: 'UNAVAILABLE',
     titleKey: 'terminal.status.unavailable.title',
     detailKey: 'terminal.status.unavailable.detail',
+  },
+  suspended: {
+    code: 'SUSPENDED',
+    titleKey: 'terminal.status.suspended.title',
+    detailKey: 'terminal.status.suspended.detail',
   },
 };
 

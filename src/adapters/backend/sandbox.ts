@@ -36,6 +36,7 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
 import { isValidPluginId } from '../../core/plugins/ids.js';
+import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -275,19 +276,6 @@ function credentialOnlyRelayHandle(
     // the session tree is the whole teardown.
     cleanup: () => { removeSandboxTree(paths.sessionRoot); },
   };
-}
-
-/** Whether a CLI keeps running when its worker exits without ending it (daemon
- * restart / IPC disconnect / parent watchdog / crash): a persistent backend
- * (tmux / zellij / herdr / zmx) only DETACHES from its named session and the
- * successor worker reattaches the same CLI; a PTY CLI is a child of the worker
- * and dies with it. */
-export function cliSurvivesWorkerExit(input: {
-  backendType: string;
-  /** Present only when the CLI runs in a named persistent session. */
-  persistentSessionName: string | null | undefined;
-}): boolean {
-  return !!input.persistentSessionName && input.backendType !== 'pty';
 }
 
 /** Whether a session's per-session sandbox tree must OUTLIVE the worker that

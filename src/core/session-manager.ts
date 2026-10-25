@@ -4353,6 +4353,24 @@ async function buildScheduledTargetNotice(params: {
   );
 }
 
+/**
+ * forkWorker refused a system-started session (a scheduled fire, a decision
+ * board batch) because the directory it would start in is gone
+ * ({@link MissingWorkingDirError}; the chat already has the recovery card).
+ * Unlike a human first message (#2168) nobody waits for this prompt to start
+ * later: the run fails and the next fire or redelivery brings its own. So the
+ * start gate must go — kept, it made the recovery card and `/cd` answer
+ * 「仍有待提交消息」 and every later fire bail out on `initial_start_pending`
+ * (#2172). Released, the session stays registered under its recovery card;
+ * moving it (or rebuilding the worktree) lets the next fire resume it there.
+ */
+async function releaseStartRefusedForMissingDir(ds: DaemonSession, err: unknown): Promise<void> {
+  const { MissingWorkingDirError } = await import('./working-dir-recovery.js');
+  if (!(err instanceof MissingWorkingDirError)) return;
+  ds.initialStartPending = false;
+  ds.pendingPrompt = undefined;
+}
+
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
@@ -4961,6 +4979,7 @@ export async function executeScheduledTask(
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      await releaseStartRefusedForMissingDir(ds, err);
       throw err;
     }
     ds.initialStartPending = false;
@@ -5185,7 +5204,12 @@ export async function deliverOwnerBatchTurn(
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
     rememberLastCliInput(ds, input.prompt, prompt);
-    forkWorker(ds, prompt, turnId);
+    try {
+      forkWorker(ds, prompt, turnId);
+    } catch (err) {
+      await releaseStartRefusedForMissingDir(ds, err);
+      throw err;
+    }
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);

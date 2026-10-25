@@ -75,6 +75,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
@@ -497,7 +498,6 @@ import {
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
-  cliSurvivesWorkerExit,
   sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
   sandboxEnabled,
@@ -29829,6 +29829,10 @@ process.on('message', async (raw: unknown) => {
       // rather than destroySession(): persistent mux/ZMX sessions and Riff
       // tasks survive for reattach, while PTY keeps its existing cold-resume
       // behavior because its kill() owns the child process.
+      // The CLI PID marker is NOT handed on (unlike a daemon restart): the
+      // daemon's transferSession refuses a busy worker (worker_busy) before
+      // asking for this detach, so no in-flight turn is cut here. Relaxing that
+      // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
       cleanup();
       await flushTransferDetachAck(msg.requestId);
@@ -30174,13 +30178,14 @@ function shutdownWorkerForParentExit(reason: string): void {
   // The surviving CLI may be mid-turn, and its PID marker is the record of the
   // turn it is executing: leave it for the successor worker, which takes the
   // turn back when it reattaches the pane (bindCliPidMarker). Deleting it would
-  // send the rest of that turn's `botmux send`s to the chat top level. Adopted
-  // panes, Codex App (its own exact dispatch recovery) and an RPC engine (its
-  // turns end with the engine this exit stops) still delete it.
-  const preserveCliPidMarker = cliOutlivesWorker && backend !== null
-    && !lastInitConfig?.adoptMode
-    && !isCodexAppCliId(lastInitConfig?.cliId)
-    && !codexRpcEngine;
+  // send the rest of that turn's `botmux send`s to the chat top level.
+  const preserveCliPidMarker = handsCliPidMarkerToSuccessor({
+    cliSurvivesExit: cliOutlivesWorker,
+    cliRunning: backend !== null,
+    adoptMode: !!lastInitConfig?.adoptMode,
+    codexApp: isCodexAppCliId(lastInitConfig?.cliId),
+    rpcEngineEngaged: !!codexRpcEngine,
+  });
   if (preserveCliPidMarker && currentBotmuxTurnId) {
     log(`Leaving executing turn ${currentBotmuxTurnId.slice(0, 12)} in the CLI PID marker for the successor worker (${reason})`);
   }

@@ -159,6 +159,7 @@ import {
 } from './dashboard/workbench-ticket.js';
 import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
+import { signTerminalWakeProof } from './core/terminal-control-grant.js';
 import {
   centralViewLinkPath,
   mintTerminalViewCapability,
@@ -887,6 +888,8 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // therefore through the liveness check above — so a raw view URL aimed at the
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+  // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
+  wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {

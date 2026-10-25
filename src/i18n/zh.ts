@@ -26,6 +26,8 @@ export const messages: Record<string, string> = {
   'terminal.status.forbidden.detail': '请返回飞书，从该会话的最新卡片重新打开 Web 终端。',
   'terminal.status.unavailable.title': '终端暂不可用',
   'terminal.status.unavailable.detail': '会话仍然存在，但终端服务当前无法恢复。',
+  'terminal.status.suspended.title': '会话已挂起',
+  'terminal.status.suspended.detail': '该会话当前已挂起，只读链接不会唤醒它。在飞书话题里发一条消息，或登录后重新打开 Web 终端，即可恢复会话。',
 
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',

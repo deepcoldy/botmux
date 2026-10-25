@@ -23,6 +23,8 @@ export const messages: Record<string, string> = {
   'terminal.status.forbidden.detail': 'Return to Lark and reopen the Web Terminal from this session\'s latest card.',
   'terminal.status.unavailable.title': 'Terminal unavailable',
   'terminal.status.unavailable.detail': 'The session still exists, but its terminal service cannot be restored right now.',
+  'terminal.status.suspended.title': 'Session suspended',
+  'terminal.status.suspended.detail': 'This session is suspended, and a read-only link does not wake it. Send a message in its Lark topic, or sign in and reopen the Web Terminal, to resume it.',
 
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',

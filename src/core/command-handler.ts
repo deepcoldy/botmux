@@ -2770,6 +2770,16 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.restart.remote_unsupported', undefined, loc));
             break;
           }
+          // Only a first message refused for its missing directory holds the
+          // session — no CLI to restart, no turn to wait for. Say how to pick
+          // its directory, as bare `/repo` does.
+          if (onlyUnstartedOpeningHolds(ds)) {
+            await sessionReply(
+              rootId,
+              t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+            );
+            break;
+          }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
           // route. requestSessionRestart does not itself gate on dispatch
           // ownership, so reject here before the coordinator tears the worker
@@ -2847,6 +2857,17 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.cd.remote_unsupported', undefined, loc));
           break;
         }
+        // Only a first message refused for its missing directory holds the
+        // session: no turn to wait for, the message waits for a directory.
+        // Point at `/repo <路径>`, which starts it there (as bare `/repo` does).
+        const replyOpeningNeedsRepo = () => sessionReply(
+          rootId,
+          t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc),
+        );
+        if (onlyUnstartedOpeningHolds(ds)) {
+          await replyOpeningNeedsRepo();
+          break;
+        }
         // Cheap preflight avoids creating a requested directory when the
         // current FIFO already makes the switch impossible.  The mutation
         // below repeats this check after draining peer admissions.
@@ -2871,7 +2892,7 @@ export async function handleCommand(
           );
           if (!current) return 'gone' as const;
           if (hasProtectedSessionMutationOwnership(current)) {
-            return 'pending' as const;
+            return onlyUnstartedOpeningHolds(current) ? 'opening_needs_repo' as const : 'pending' as const;
           }
           const suspended = !current.adoptedFrom
             && suspendWorker(current, 'working_dir_changed');
@@ -2883,6 +2904,10 @@ export async function handleCommand(
           sessionStore.updateSession(current.session);
           return 'switched' as const;
         });
+        if (switched === 'opening_needs_repo') {
+          await replyOpeningNeedsRepo();
+          break;
+        }
         if (switched === 'pending') {
           await sessionReply(
             rootId,
