@@ -591,7 +591,7 @@ import {
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
-import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure } from './services/submit-failure-diagnosis.js';
+import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -16783,6 +16783,11 @@ const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
  *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
  *  机制自然终止链，这是保险上限。 */
 const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
+/** 正面忙碌证据（适配器 busyPattern 命中）比"PTY 刚有活动"强得多：它证明 CLI 正在
+ *  执行某一轮。确认回执在多个 CLI 上要等回合出队才落盘（ZCode 实测 291s，Grok 忙碌
+ *  追加约 104s），20s 链必然在回合中途就误报。这里给 12 次（约 +240s）上限；回合
+ *  结束、忙碌页脚消失后，下一次重查立刻回到正常告警路径。 */
+const SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA = 12;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -16916,6 +16921,7 @@ function scheduleSubmitFailureNotify(
   };
   let deferredRecheckAttempts = 0;
   let activeSilenceExtra = 0;
+  let busySilenceExtra = 0;
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
@@ -17001,20 +17007,6 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
-    if (sessionStartGated) {
-      const gated = decideSessionStartGatedSubmitWarning({
-        sessionStartAtMs: sessionStartSignalAtMs,
-        waitingSinceMs: activityBaselineMs,
-        nowMs: Date.now(),
-      });
-      if (!gated.warn) {
-        log(`Deferred recheck: no ${transcriptLabel} record yet (${gated.reason}) — waiting for the record or SessionStart before warning. preview="${preview}"`);
-        armDeferredRecheck();
-        return;
-      }
-      log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
-    }
-
     // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
     // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
     let submitDiagnosisScreen = '';
@@ -17031,6 +17023,47 @@ function scheduleSubmitFailureNotify(
       cliId: lastInitConfig?.cliId,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
+    // 正面忙碌证据：CLI 此刻正在跑一轮（适配器 busyPattern，如 ZCode 的
+    // "esc to interrupt"）。输入框里卡着的草稿显示的是空闲页脚，所以忙碌页脚
+    // 只可能来自"某个输入已被接受并正在执行"。确认回执在多个 CLI 上要等这一轮
+    // 出队才落盘（ZCode 实测 291s，Grok 约 104s），固定 20s 链必然在回合中途误报。
+    // 只要还在忙就继续等；回合结束、页脚消失后立刻回到下面正常的告警判定。
+    // 必须放在 SessionStart 门控之前：门控只认 transcript，而 transcript 恰好
+    // 就是迟到的那个。
+    const busyNow = (() => {
+      if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
+      try {
+        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
+      } catch { return false; }
+    })();
+    if (
+      shouldWaitThroughBusyTurn({
+        busy: busyNow,
+        diagnosisReason: submitDiagnosis.reason,
+        waitsSoFar: busySilenceExtra,
+        maxWaits: SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA,
+      })
+      && chainIsCurrent()
+    ) {
+      busySilenceExtra += 1;
+      log(`Deferred recheck sees the CLI positively mid-turn (busy footer) — input was accepted, waiting for the receipt. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+
+    if (sessionStartGated) {
+      const gated = decideSessionStartGatedSubmitWarning({
+        sessionStartAtMs: sessionStartSignalAtMs,
+        waitingSinceMs: activityBaselineMs,
+        nowMs: Date.now(),
+      });
+      if (!gated.warn) {
+        log(`Deferred recheck: no ${transcriptLabel} record yet (${gated.reason}) — waiting for the record or SessionStart before warning. preview="${preview}"`);
+        armDeferredRecheck();
+        return;
+      }
+      log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
+    }
     if (
       submitDiagnosis.reason === 'still_active'
       && !sessionStartGated
