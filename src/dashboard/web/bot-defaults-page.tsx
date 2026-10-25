@@ -5451,7 +5451,9 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   return (
     <section className="bd-section" data-codex-app-display>
-      <h3 className="bd-section-title">{tr(isCodexApp ? 'botDefaults.sectionCodexAppDisplay' : 'botDefaults.sectionCodexRuntime')}</h3>
+      {isCodexApp
+        ? <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
+        : <h3 className="bd-section-title">{tr('botDefaults.sectionCodexRuntime')}</h3>}
       {isCodexApp ? <>
         <ToggleRow
           checked={cleanInput}

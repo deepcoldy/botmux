@@ -172,6 +172,13 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionCodexAppDisplay',
     fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify'],
   },
+  {
+    id: 'codex-runtime',
+    tab: 'advanced',
+    titleKey: 'botDefaults.sectionCodexRuntime',
+    tile: 'codex-app-display',
+    fieldKeys: ['botDefaults.cliProgressNotify'],
+  },
   { id: 'envelope-injection', tab: 'advanced', titleKey: 'botDefaults.envelopeInjection', fieldKeys: ['botDefaults.envelopeInjectionAuto'] },
   { id: 'prompt-injection', tab: 'advanced', titleKey: 'botDefaults.promptInjection', fieldKeys: ['botDefaults.promptInjectionToggle'] },
   { id: 'reply-delivery', tab: 'advanced', titleKey: 'botDefaults.replyDelivery', tile: 'prompt-injection', fieldKeys: ['botDefaults.replyDeliveryTranscript'] },
