@@ -186,6 +186,11 @@ const EXTRA_GATEWAY_GROUPS: ReadonlyArray<CliSelectGroup> = [
 export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
   ...CLI_OPTIONS.flatMap((o): CliSelectGroup[] => {
     if (o.id === 'aiden') return [{ key: 'aiden', label: 'Aiden', children: AIDEN_VARIANTS }];
+    if (o.id === 'orca-codex') return [{ key: 'orca', label: 'Orca', children: [
+      { key: 'orca-codex', label: 'Codex（Orca Chat）', cliId: 'orca-codex' },
+      { key: 'orca-claude', label: 'Claude Code（Orca Chat）', cliId: 'orca-claude' },
+    ] }];
+    if (o.id === 'orca-claude') return [];
     // mira + mir collapse into one「Mira」二级菜单 at mira's position.
     if (o.id === 'mira') return [{ key: 'mira', label: 'Mira', children: MIRA_VARIANTS }];
     if (o.id === 'mir') return []; // already a child of the Mira group above

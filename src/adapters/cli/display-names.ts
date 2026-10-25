@@ -38,6 +38,8 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
   'minimax': 'MiniMax Code',
+  'orca-codex': 'Orca · Codex',
+  'orca-claude': 'Orca · Claude Code',
   'remote-runner': 'Remote Runner',
   'codem': 'CodeM',
 };

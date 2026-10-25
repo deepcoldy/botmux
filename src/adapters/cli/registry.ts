@@ -40,6 +40,7 @@ import { createDshTuiAdapter } from './dsh-tui.js';
 import { createMojoAdapter } from './mojo.js';
 import { createMinimaxAdapter } from './minimax.js';
 import { createRemoteRunnerAdapter } from './remote-runner.js';
+import { createOrcaAdapter } from './orca.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -96,6 +97,8 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // MiniMax Code — native exec stream-json, wrapped by minimax-runner.
   minimax: 'mcode',
   'remote-runner': 'botmux-remote-runner',
+  'orca-codex': undefined,
+  'orca-claude': undefined,
   codem: 'codem',
 };
 
@@ -351,6 +354,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'mojo': return createMojoAdapter(pathOverride);
     case 'minimax': return createMinimaxAdapter(pathOverride);
     case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
+    case 'orca-codex': case 'orca-claude': return createOrcaAdapter(id, pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

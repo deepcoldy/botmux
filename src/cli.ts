@@ -17917,6 +17917,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
+  else if (__entrySubcommand === 'orca-runner') await import('./orca-runner.js');
   else if (__entrySubcommand === 'lark-tool-runner') {
     await import('./lark-tool-runner.js');
     process.exit(process.exitCode ?? 0);

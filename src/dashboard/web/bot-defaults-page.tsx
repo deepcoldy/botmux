@@ -1,3 +1,4 @@
+import { isOrcaCliId } from '../../core/orca-support.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
@@ -5698,6 +5699,7 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
   const supported = props.bot.replyDeliverySupported === true;
+  const orcaManaged = isOrcaCliId(props.bot.cliId);
   const defaultMode = props.bot.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send';
 
   useEffect(() => setTranscript(props.bot.replyDelivery === 'transcript'), [props.bot.replyDelivery]);
@@ -5725,14 +5727,15 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
       <TopicUnavailablePolicySection {...props} />
       <ToggleRow
         checked={transcript}
-        disabled={busy || !supported || props.bot.promptInjection === 'none'}
+        disabled={busy || !supported || orcaManaged || props.bot.promptInjection === 'none'}
         dataAction="toggle-reply-delivery"
         title={tr('botDefaults.replyDeliveryTranscript')}
         help={tr('botDefaults.replyDeliveryHelp')}
         onChange={checked => void save(checked)}
       />
       <small className="bd-section-note">
-        {props.bot.promptInjection === 'none' ? tr('botDefaults.replyDeliveryZeroPrompt')
+        {orcaManaged ? tr('botDefaults.replyDeliveryOrca')
+          : props.bot.promptInjection === 'none' ? tr('botDefaults.replyDeliveryZeroPrompt')
           : supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
       </small>
       <div className="actions">

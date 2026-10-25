@@ -19,6 +19,7 @@ import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-c
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { isScratchSandbox, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
+import { isOrcaCliId } from './orca-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
@@ -39,8 +40,8 @@ export { supportsTranscriptReplyDelivery };
  * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，将来若要为某个
  * CLI 单独换缺省，只改这一个函数即可，不必回头翻所有调用点。
  */
-export function defaultReplyDeliveryFor(_cliId: string | undefined): ReplyDelivery {
-  return 'send';
+export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  return isOrcaCliId(cliId) ? 'transcript' : 'send';
 }
 
 /** Per-bot options that can make transcript delivery unusable even when the
@@ -89,6 +90,7 @@ export function effectiveReplyDelivery(
   promptInjection?: PromptInjection,
   opts?: { sessionSandbox?: ZeroPromptSandboxValue },
 ): ReplyDelivery {
+  if (isOrcaCliId(cliId)) return 'transcript';
   if (!larkAppId) return 'send';
   if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
   let configured: ReplyDelivery | undefined;

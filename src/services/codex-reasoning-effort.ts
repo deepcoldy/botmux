@@ -1,3 +1,4 @@
+import { isOrcaCliId } from '../core/orca-support.js';
 export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
@@ -81,7 +82,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi';
+    || cliId === 'claude-code' || cliId === 'kimi' || isOrcaCliId(cliId);
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -123,7 +124,7 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
-  if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
+  if (cliId === 'remote-runner' || isOrcaCliId(cliId)) return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);

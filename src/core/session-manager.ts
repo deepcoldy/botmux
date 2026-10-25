@@ -1436,7 +1436,8 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  const remoteRunnerSkillCatalog = (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
+  const remoteRunnerSkillCatalog = !adapter.injectsSessionContext
+    && (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
   if (remoteRunnerSkillCatalog) {
     // A Remote Runner executes in an ephemeral environment and has no host
     // skillsDir/pluginDir to discover. Force only the durable-schedule entry

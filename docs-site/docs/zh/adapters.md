@@ -13,6 +13,7 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 |---------|-----|-----|:--:|
 | `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
 | `codex` | Codex CLI | 本地进程 | ✅ |
+| `orca-codex` / `orca-claude` | Orca · Codex / Claude Code | Orca 原生 Chat（同机运行时，自动归入工作区） | ✅ |
 | `codex-app` | Codex App | 本地进程（app-server 协议） | |
 | `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |

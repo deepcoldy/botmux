@@ -1,5 +1,7 @@
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { listPendingAsks } from './ask-broker.js';
+import { isOrcaCliId } from './orca-support.js';
+import { ORCA_RUNNER_CAPABILITIES } from '../services/orca-runner-capabilities.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -15049,8 +15051,10 @@ export function forkWorker(
     // messages would silently move a live session from cloud to host execution,
     // or resume it against a different tenant/workspace than the one holding its
     // remote session.
-    backendConfig: botCfg.backendType === 'remote-runner' || agentCfg.cliId === 'remote-runner'
-      ? botCfg.remoteRunner
+    backendConfig: resolvedBackendType === 'remote-runner'
+      ? isOrcaCliId(agentCfg.cliId)
+        ? { ...botCfg.remoteRunner, expectedProvider: 'orca', requiredCapabilities: [...ORCA_RUNNER_CAPABILITIES] }
+        : botCfg.remoteRunner
       : botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
         ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
         // Decide herdr from the resolved backend: it can come from the session

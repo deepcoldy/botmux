@@ -95,6 +95,8 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'minimax/MiniMax-M2.7',
     'minimax/MiniMax-M2.7-highspeed',
   ],
+  'orca-codex': undefined,
+  'orca-claude': undefined,
   'remote-runner': undefined,
   'codem': undefined,
 };

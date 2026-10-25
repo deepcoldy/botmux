@@ -21,6 +21,7 @@
  * follow-up; this file only collapses the OR-list tax.
  */
 import type { CliId } from '../adapters/cli/types.js';
+import { isOrcaCliId } from '../core/orca-support.js';
 
 /** Always-on structured-bridge CLIs (including SQLite-backed hermes/mtr). */
 export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
@@ -154,7 +155,7 @@ export function supportsZeroPromptStructuredBridge(cliId: string | undefined): b
  *  `replyDelivery: transcript` mode — the ALWAYS CLIs' send-marker-gated
  *  fallback harvest (including cursor) runs regardless of this setting. */
 export function supportsTranscriptReplyDelivery(cliId: string | undefined): boolean {
-  return cliId === 'claude-code' || (!!cliId && ALWAYS_SET.has(cliId));
+  return isOrcaCliId(cliId) || cliId === 'claude-code' || (!!cliId && ALWAYS_SET.has(cliId));
 }
 
 /** Daemon adopt path — forward transcript bind fields. */
