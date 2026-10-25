@@ -46,6 +46,7 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
     cliSpawnGeneration: 3,
     cliRestartInProgress: false,
     emitTurnTerminal: vi.fn(),
+    retireStructuredTurnAttribution: vi.fn(),
     restartCliProcess: vi.fn(),
     redriveRejectedStructuredReady: vi.fn(),
     log: vi.fn(),
@@ -95,6 +96,9 @@ describe('worker: expired structured heads', () => {
     expect(scope.emitTurnTerminal.mock.calls).toEqual([
       ['om_durable', 'ambiguous', 'structured_start_timeout', 1],
     ]);
+    expect(scope.retireStructuredTurnAttribution).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ turnId: 'om_ordinary' }),
+    ]));
     // A consumed write-failure entry does not suppress a later, fresh mark.
     expect(scope.structuredTurnsWithSubmitNotice.has('om_write_failed')).toBe(false);
   });

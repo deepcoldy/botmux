@@ -121,6 +121,9 @@ export interface CodexPendingTurn {
   /** Native provider turn id learned from the transcript user event. */
   sourceTurnId?: string;
   sourceMessageId?: string;
+  /** Inputs folded into this native execution by a confirmed same-turn steer.
+   * Their send attribution must retire with the single native terminal. */
+  supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
   /** True when the turn was delivered via Codex RPC (turn/start) and the
    *  app-server has acknowledged it. RPC turns have no local transcript to
    *  ingest, so they can never reach the started state; this flag keeps the
@@ -843,6 +846,11 @@ export class CodexBridgeQueue {
         && !isDistinctNativeTurn
         && ev.preserveCollecting !== true) {
         const superseded = this.collecting;
+        if (willStartNext && ev.sourceTurnId && ev.sourceTurnId === superseded.sourceTurnId
+          && this.sourceSessionsCompatible(superseded.sourceSessionId, ev.sourceSessionId)) {
+          next!.supersededTurns = [...(superseded.supersededTurns ?? []),
+            { turnId: superseded.turnId, dispatchAttempt: superseded.dispatchAttempt }];
+        }
         const idx = this.queue.indexOf(superseded);
         if (idx >= 0) this.queue.splice(idx, 1);
         this.collecting = null;

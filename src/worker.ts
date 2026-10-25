@@ -11522,6 +11522,50 @@ function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): v
   }
 }
 
+let pendingStructuredCaptureRetirement: Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'> | undefined;
+
+/** Retired structured inputs must also leave the process-tree send queue.
+ * Otherwise a later `botmux send` can promote an already-ended steer and
+ * measure its old execution window, including idle time between turns. */
+function retireStructuredTurnAttribution(turns: readonly Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>[]): void {
+  if (turns.length === 0) return;
+  const retired = (turnId: string | undefined, dispatchAttempt?: number) => turns.some(turn =>
+    turn.turnId === turnId && turn.dispatchAttempt === dispatchAttempt);
+  for (const turn of turns) {
+    turnExecutionClock.forget(turn.turnId, turn.dispatchAttempt);
+    releaseActiveTurnAuthority('structured_turn_retired', turn);
+    // A retry under the same id is a different live execution attempt.
+    if ((currentBotmuxTurnId !== turn.turnId || currentBotmuxDispatchAttempt === turn.dispatchAttempt)
+      && !queuedTypeAheadTurns.some(queued => queued.turnId === turn.turnId
+        && queued.dispatchAttempt !== turn.dispatchAttempt)) markTurnRetired(turn.turnId);
+  }
+  queuedTypeAheadTurns = queuedTypeAheadTurns.filter(turn => !retired(turn.turnId, turn.dispatchAttempt));
+  if (retired(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) {
+    pendingStructuredCaptureRetirement = {
+      turnId: currentBotmuxTurnId!, dispatchAttempt: currentBotmuxDispatchAttempt,
+    };
+  }
+  const captureRetired = pendingStructuredCaptureRetirement
+    && pendingStructuredCaptureRetirement.turnId === currentBotmuxTurnId
+    && pendingStructuredCaptureRetirement.dispatchAttempt === currentBotmuxDispatchAttempt;
+  if (!captureRetired) pendingStructuredCaptureRetirement = undefined;
+  // A transcript drain can close predecessors while an already-started native
+  // successor is still running. Keep its type-ahead/model-admission context
+  // until that successor ends; clearing it now misclassifies a correction as
+  // a fresh model turn and can strand the next input behind a readiness gate.
+  const successorRunning = codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined);
+  if (captureRetired && !successorRunning) {
+    setCaptureIdentity(undefined, undefined, undefined);
+    currentBotmuxLinkRefMode = undefined;
+    currentVcMeetingImTurnOrigin = undefined;
+    currentTurnSteerPromoted = false;
+    pendingStructuredCaptureRetirement = undefined;
+  }
+  // Tombstones precede the read/merge/write so stale disk entries cannot
+  // resurrect retired inputs during this write.
+  writeCliPidMarker();
+}
+
 /** Expire confirmed or attribution-only unstarted queue heads at an explicit worker
  *  lifecycle boundary. Pruning can replay a buffered successor user+final and
  *  thereby produce an immediately emittable completion, so query/projection
@@ -11589,6 +11633,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
           );
         }
       }
+      retireStructuredTurnAttribution(turns);
     },
   );
   if (dropped.length === 0) return false;
@@ -11846,9 +11891,11 @@ function emitReadyCodexTurns(): void {
       nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
     );
   }
+  retireStructuredTurnAttribution(ready.flatMap(turn => [...(turn.supersededTurns ?? []), turn]));
 }
 
 function stopCodexBridge(): void {
+  pendingStructuredCaptureRetirement = undefined;
   if (codexBridgeWatcher) {
     try { codexBridgeWatcher.close(); } catch { /* ignore */ }
     codexBridgeWatcher = null;
@@ -25336,6 +25383,9 @@ async function restartCliProcess(
         preservePending: opts.preservePending,
         preservePolicyCapability: true,
       });
+      // A normal restart cannot observe activity from the retired process.
+      // Only capacity-model rotation carries that waiting latch forward.
+      traexAutoModelController?.noteProcessExited(opts.restartCause === 'traex-auto-model');
       awaitingFirstPrompt = true;
       setTimeout(async () => {
         let spawnedWorkingDir: string | undefined;
