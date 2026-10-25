@@ -84,10 +84,10 @@ async function turn(b, marker) {
     b.onTurnFailure(error => { clearTimeout(timer); reject(new Error(JSON.stringify(error))); });
   });
   const submission = await b.submitTurn({ turnId: randomUUID(),
-    content: `Reply exactly ${marker}. Do not run tools or change files.` });
+    content: `Reply with only this marker, without punctuation:\n${marker}\nDo not run tools or change files.` });
   if (!submission.submitted) { clearTimeout(timer); throw new Error(JSON.stringify(submission)); }
   const text = await completed;
-  if (text.trim() !== marker) throw new Error(`Unexpected answer: ${text}`);
+  if (text.trim().replace(/[.。]$/, '') !== marker) throw new Error(`Unexpected answer: ${text}`);
 }
 
 try {
