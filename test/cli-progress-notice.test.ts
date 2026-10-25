@@ -6,10 +6,10 @@ import { normalizeNoProgressNotifyPolicy } from '../src/services/no-progress-not
 function harness(records: CliProgressNotice[] = []) {
   let now = 0, allowed = true, waiting = false;
   const deps: CliProgressNoticeDeps = {
-    records, now: () => now, persist: vi.fn(), allowed: () => allowed, waiting: () => waiting,
+    records: () => records, now: () => now, persist: vi.fn(), allowed: () => allowed, waiting: () => waiting,
     timeout: () => 300_000,
     send: vi.fn(async (_r, level, guard) => { guard(); return `notice-${level}`; }),
-    update: vi.fn(async (_r, _id, guard) => { guard(); }), error: vi.fn(),
+    update: vi.fn(async (_r, _id, guard) => { guard(); }), error: vi.fn(), warn: vi.fn(),
   };
   const n = new CliProgressNotifier(deps);
   return { n, deps, records, time: (v: number) => { now = v; },
@@ -90,8 +90,8 @@ describe('daemon-owned CLI silence notices', () => {
   it('serializes polls and patches a progress event that raced the send ACK', async () => {
     const h = harness(); h.begin(); let resolve!: (id: string) => void;
     h.deps.send = vi.fn(async (_r, _level, guard) => { guard(); return new Promise<string>(r => { resolve = r; }); });
-    h.time(300_000); const poll = h.n.poll(); await h.n.poll();
-    h.n.progress('om_turn', undefined, 1, 'model_output'); resolve('id'); await poll; await h.n.poll();
+    h.time(300_000); const poll = h.n.poll(); const concurrentPoll = h.n.poll();
+    h.n.progress('om_turn', undefined, 1, 'model_output'); resolve('id'); await poll; await concurrentPoll; await h.n.poll();
     expect(h.deps.send).toHaveBeenCalledTimes(1); expect(h.deps.update).toHaveBeenCalledTimes(1);
   });
   it('periodically persists continuous same-stage progress (not only stage transitions)', () => {
@@ -106,6 +106,7 @@ describe('daemon-owned CLI silence notices', () => {
     const text = card.body.elements[0].content;
     expect(text).toContain('<at id="ou_original">');
     expect(card.schema).toBe('2.0');
+    expect(card.config.update_multi).toBe(true);
     expect(card.body.elements.map((e: { tag: string }) => e.tag)).toEqual(['markdown']);
   });
   it('retries a failed terminal PATCH to the same message without another POST', async () => {
@@ -165,15 +166,125 @@ describe('daemon-owned CLI silence notices', () => {
     vi.mocked(h.deps.update).mockResolvedValue(undefined); await h.n.poll();
     expect(h.deps.update).toHaveBeenCalledTimes(2); expect(h.records[0].dirty).toBe(false);
   });
-  it('claimed fences escalation when an ACK cleared pending but saving the receipt failed', async () => {
+  it('retires after receipt persistence failure and retains the durable pending claim across restore', async () => {
     const h = harness(); h.begin(); let failed = false;
     h.deps.persist = vi.fn(() => {
       if (!failed && h.records[0].messages.length) { failed = true; throw new Error('receipt save failed'); }
     });
-    h.time(300_000); await h.n.poll(); expect(h.records[0].deliveryPending).toBe(false);
-    const restored = harness(JSON.parse(JSON.stringify(h.records))); restored.time(900_000); restored.begin();
+    h.time(300_000); await expect(h.n.poll()).rejects.toThrow('receipt save failed'); expect(h.records[0].deliveryPending).toBe(false);
+    const durable = JSON.parse(JSON.stringify(h.records)); durable[0].deliveryPending = true; durable[0].messages = [];
+    const restored = harness(durable); restored.time(900_000); restored.begin();
     await restored.n.poll(); expect(restored.deps.send).not.toHaveBeenCalled();
     h.time(900_000); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledTimes(1);
+  });
+  it.each(['progress', 'waiting'])('rolls back a pre-transport %s race without losing future notices', async race => {
+    const h = harness(); h.begin(); const transport = vi.fn();
+    h.deps.send = vi.fn(async (_r, level, guard) => {
+      if (vi.mocked(h.deps.send).mock.calls.length === 1) {
+        if (race === 'progress') h.n.progress('om_turn', undefined, 1, 'tool_returned');
+        else h.wait(true);
+      }
+      guard(); transport(); return `notice-${level}`;
+    });
+    h.time(300_000); await h.n.poll();
+    expect(transport).not.toHaveBeenCalled();
+    expect(h.records[0]).toMatchObject({ claimed: 0, deliveryPending: false, stalled: false });
+    if (race === 'waiting') {
+      h.time(1_500_000); await h.n.poll(); expect(transport).not.toHaveBeenCalled();
+      h.wait(false); await h.n.poll();
+    }
+    const resumed = h.records[0].progressAt;
+    h.time(resumed + 299_999); await h.n.poll(); expect(transport).not.toHaveBeenCalled();
+    h.time(resumed + 300_000); await h.n.poll(); expect(transport).toHaveBeenCalledTimes(1);
+    h.time(resumed + 900_000); await h.n.poll(); expect(transport).toHaveBeenCalledTimes(2);
+  });
+  it('does not roll back a retry guard rejection after an earlier transport attempt', async () => {
+    const h = harness(); h.begin();
+    h.deps.send = vi.fn(async (_r, _level, guard) => {
+      guard(); // First API attempt may have been accepted but lost its ACK.
+      h.n.progress('om_turn', undefined, 1, 'tool_returned');
+      guard(); // The retry is definitely cancelled, but not the first attempt.
+      return 'unreachable';
+    });
+    h.time(300_000); await h.n.poll();
+    expect(h.records[0]).toMatchObject({ claimed: 2, deliveryPending: true });
+    h.time(1_500_000); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledOnce();
+    const restored = harness(JSON.parse(JSON.stringify(h.records)));
+    restored.time(1_500_000); await restored.n.poll(); expect(restored.deps.send).not.toHaveBeenCalled();
+  });
+  it('a cancelled escalation preserves the first receipt and can later escalate once', async () => {
+    const h = harness(); h.begin(); h.time(300_000); await h.n.poll();
+    vi.mocked(h.deps.send).mockImplementationOnce(async (_r, _level, guard) => {
+      h.n.progress('om_turn', undefined, 1, 'model_output'); guard(); return 'unreachable';
+    });
+    h.time(900_000); await h.n.poll();
+    expect(h.records[0]).toMatchObject({ claimed: 1, messages: ['notice-1'], deliveryPending: false });
+    h.time(1_800_000); await h.n.poll();
+    expect(h.records[0].messages).toEqual(['notice-1', 'notice-2']);
+    h.time(9_000_000); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledTimes(3);
+  });
+  it('reclaims stale generations before settled slots, but never current in-flight receipts', () => {
+    const h = harness();
+    for (let i = 0; i < 64; i++) h.n.begin(`om_${i}`, undefined, 'ou_original', 1);
+    h.n.finish('om_1');
+    h.n.begin('om_new', undefined, 'ou_original', 2);
+    expect(h.records).toHaveLength(64);
+    expect(h.records.some(r => r.turnId === 'om_0')).toBe(false);
+    expect(h.records.some(r => r.turnId === 'om_1')).toBe(true);
+    expect(h.deps.warn).toHaveBeenCalled();
+    const current = harness();
+    for (let i = 0; i < 65; i++) current.n.begin(`om_${i}`, undefined, 'ou_original', 1);
+    expect(current.records).toHaveLength(64);
+    expect(current.records.some(r => r.turnId === 'om_64')).toBe(false);
+    expect(current.deps.warn).toHaveBeenCalledOnce();
+  });
+  it('repeated input starts a fresh window without resetting receipts or attribution', async () => {
+    const h = harness(); h.begin(); h.time(299_999);
+    h.n.begin('om_turn', undefined, 'ou_other', 1);
+    h.time(300_000); await h.n.poll(); expect(h.deps.send).not.toHaveBeenCalled();
+    h.time(599_999); await h.n.poll(); expect(h.deps.send).toHaveBeenCalledOnce();
+    expect(h.records[0].caller).toBe('ou_original');
+    h.time(600_000); h.begin();
+    expect(h.records[0].claimed).toBe(1); expect(h.records[0].messages).toEqual(['notice-1']);
+  });
+  it('retires on persistence rollback instead of writing to detached records on later events', async () => {
+    const h = harness(); h.begin();
+    let durable = JSON.parse(JSON.stringify(h.records));
+    h.deps.records = () => durable;
+    const detached = durable;
+    h.deps.persist = vi.fn(() => {
+      durable = JSON.parse(JSON.stringify(h.records)); throw new Error('row rollback');
+    });
+    h.time(300_000); await expect(h.n.poll()).rejects.toThrow('row rollback');
+    const snapshot = JSON.stringify(detached);
+    h.n.progress('om_turn', undefined, 1, 'model_output'); h.n.finish('om_turn');
+    h.n.begin('om_new', undefined, 'ou_original', 1); await h.n.poll();
+    expect(JSON.stringify(detached)).toBe(snapshot);
+    expect(durable).toEqual(h.records); expect(h.deps.persist).toHaveBeenCalledOnce();
+    expect(h.deps.send).not.toHaveBeenCalled();
+  });
+  it('close waits for an in-flight ACK, then patches once and never posts again', async () => {
+    const h = harness(); h.begin(); let ack!: (id: string) => void;
+    h.deps.send = vi.fn(async (_r, _level, guard) => { guard(); return new Promise(r => { ack = r; }); });
+    h.time(300_000); const pending = h.n.poll(); const closing = h.n.close();
+    ack('notice-1'); await pending; await closing;
+    expect(h.deps.update).toHaveBeenCalledOnce(); expect(h.records[0].settled).toBe(true);
+    h.n.begin('om_other', undefined, 'ou_original', 1); h.time(9_000_000); await h.n.poll();
+    expect(h.deps.send).toHaveBeenCalledOnce(); expect(h.records).toHaveLength(1);
+  });
+  it('close is bounded and rejects a transport write delayed past its deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness(); h.begin(); h.time(300_000); await h.n.poll();
+      let guard!: () => void; let ack!: () => void;
+      h.deps.update = vi.fn(async (_r, _id, beforeWrite) => {
+        guard = beforeWrite; return new Promise<void>(resolve => { ack = resolve; });
+      });
+      const closing = h.n.close(2_000); await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000); await closing;
+      expect(() => guard()).toThrow(); ack(); await Promise.resolve();
+      expect(h.records[0].dirty).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
   it('CLI is opt-in and does not change the existing App policy defaults', () => {
     expect(normalizeNoProgressNotifyPolicy({})).toEqual({ enabled: true });

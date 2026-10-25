@@ -103,10 +103,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 
 import { __testOnly_setupWorkerHandlers, initWorkerPool } from '../src/core/worker-pool.js';
+import { updateSession } from '../src/services/session-store.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 
-function setup(chatType = 'p2p', cliId = 'codex', explicit = false, human: boolean | undefined = false) {
+function setup(chatType = 'p2p', cliId = 'codex', explicit = false, human: boolean | undefined = false, extra: Partial<DaemonSession> = {}) {
   const worker = Object.assign(new EventEmitter(), {
     killed: false, send: vi.fn(), kill: vi.fn(), pid: 4242,
     stdout: new EventEmitter(), stderr: new EventEmitter(),
@@ -121,6 +122,7 @@ function setup(chatType = 'p2p', cliId = 'codex', explicit = false, human: boole
     displayMode: 'hidden', lastScreenContent: '', lastScreenStatus: 'working',
     turnExplicitMentions: new Set(explicit ? ['om_turn'] : []),
   } as unknown as DaemonSession;
+  Object.assign(ds, extra);
   const reply = vi.fn(async (_root, _content, _type, _app, _turn, opts) => { opts?.beforeWrite?.(); return 'om_notice'; });
   initWorkerPool({ sessionReply: reply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
   __testOnly_setupWorkerHandlers(ds, worker as any);
@@ -229,6 +231,95 @@ describe('CLI progress timer at actual worker IPC seam', () => {
     expect(h.ds.session.cliProgressNotices![0].patchAttempts).toBe(0);
     policy.enabled = true; await vi.advanceTimersByTimeAsync(15_000);
     expect(updateMessage).toHaveBeenCalledTimes(1); expect(h.reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('turn_terminal stops future alerts even without a final IM reply', async () => {
+    const h = setup(); h.start();
+    h.worker.emit('message', { type: 'turn_terminal', sessionId: 'sid-notice', turnId: 'om_turn', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(915_000);
+    expect(h.ds.session.cliProgressNotices![0].settled).toBe(true);
+    expect(h.reply).not.toHaveBeenCalled();
+  });
+  it('exit drains a terminal card without waiting for the next 15 second tick', async () => {
+    const h = setup(); h.start(); await vi.advanceTimersByTimeAsync(300_000);
+    h.worker.emit('message', { type: 'turn_terminal', sessionId: 'sid-notice', turnId: 'om_turn', status: 'completed' });
+    vi.mocked(updateMessage).mockImplementationOnce(async (_app, _id, _card, opts) => { opts!.beforeWrite!(); });
+    h.worker.killed = true; h.worker.emit('exit', 0, null);
+    expect(h.ds.worker).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updateMessage).toHaveBeenCalledOnce();
+    const call = vi.mocked(updateMessage).mock.calls[0];
+    expect(call[1]).toBe('om_notice'); expect(JSON.parse(call[2]).header.template).toBe('grey');
+    expect(call[3]?.beforeWrite).toBeTypeOf('function');
+    expect(h.ds.session.cliProgressNotices![0].dirty).toBe(false);
+    await vi.advanceTimersByTimeAsync(915_000); expect(h.reply).toHaveBeenCalledOnce();
+  });
+  it('exit cleanup is fenced if a replacement takes over before PATCH enters transport', async () => {
+    const h = setup(); h.start(); await vi.advanceTimersByTimeAsync(300_000);
+    let guard!: () => void; let ack!: () => void;
+    vi.mocked(updateMessage).mockImplementationOnce(async (_app, _id, _card, opts) => {
+      guard = opts!.beforeWrite!; return new Promise<void>(resolve => { ack = resolve; });
+    });
+    h.worker.killed = true; h.worker.emit('exit', 0, null); await Promise.resolve();
+    const next = Object.assign(new EventEmitter(), { killed: false, send: vi.fn(), pid: 4243,
+      stdout: new EventEmitter(), stderr: new EventEmitter() });
+    h.ds.worker = next as any; __testOnly_setupWorkerHandlers(h.ds, next as any);
+    expect(() => guard()).toThrow(); ack(); await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.reply).toHaveBeenCalledOnce();
+  });
+  it.each(['progress', 'waiting'])('scopedReply receives the pre-transport guard for a %s race', async race => {
+    const h = setup(); h.start(); const transport = vi.fn();
+    h.reply.mockImplementationOnce(async (_root, _content, _type, _app, _turn, opts) => {
+      if (race === 'progress') h.worker.emit('message', { type: 'turn_progress', turnId: 'om_turn', stage: 'tool_returned' });
+      else h.ds.tuiPromptCardId = 'om_prompt';
+      opts?.beforeWrite?.(); transport(); return 'om_bad';
+    });
+    await vi.advanceTimersByTimeAsync(300_000); expect(transport).not.toHaveBeenCalled();
+    expect(h.ds.session.cliProgressNotices![0].deliveryPending).toBe(false);
+    h.ds.tuiPromptCardId = undefined;
+    await vi.advanceTimersByTimeAsync(315_000); expect(h.reply).toHaveBeenCalledTimes(2);
+    expect(h.ds.session.cliProgressNotices![0].messages).toEqual(['om_notice']);
+  });
+  it.each(['cliEnabled', 'enabled'] as const)('hot %s gate prevents both admission and delivery', async key => {
+    const h = setup(); h.start(); policy[key] = false;
+    h.ds.session.turnReplyContexts!.om_new = h.ds.session.turnReplyContexts!.om_turn;
+    h.start('om_new');
+    expect(h.ds.session.cliProgressNotices!.map(r => r.turnId)).toEqual(['om_turn']);
+    await vi.advanceTimersByTimeAsync(915_000); expect(h.reply).not.toHaveBeenCalled();
+    policy[key] = true; await vi.advanceTimersByTimeAsync(15_000); expect(h.reply).toHaveBeenCalledOnce();
+  });
+  it.each(['adopted', 'session-adopted', 'meeting', 'doc-native', 'trigger-final'])('rejects %s with otherwise valid human admission', async kind => {
+    const h = setup('p2p', 'codex', false, false, kind === 'doc-native' ? { scope: 'chat', chatId: 'doc:test' } : {});
+    if (kind === 'adopted') h.ds.adoptedFrom = 'external' as any;
+    if (kind === 'session-adopted') h.ds.session.adoptedFrom = 'external' as any;
+    if (kind === 'meeting') h.ds.session.vcMeetingReceiver = {} as any;
+    if (kind === 'trigger-final') h.ds.suppressedTriggerFinalTurns = new Map([['om_turn', Date.now()]]);
+    h.start(); expect(h.ds.session.cliProgressNotices).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(915_000); expect(h.reply).not.toHaveBeenCalled();
+  });
+  it.each(['codex-app', 'claude-code', 'disabled'])('does not allocate notice records for %s', async kind => {
+    if (kind === 'disabled') policy.cliEnabled = false;
+    const h = setup('p2p', kind === 'disabled' ? 'codex' : kind); h.start();
+    h.worker.emit('message', { type: 'turn_progress', turnId: 'om_turn', stage: 'model_output' });
+    h.worker.emit('message', { type: 'turn_terminal', sessionId: 'sid-notice', turnId: 'om_turn', status: 'completed' });
+    await vi.advanceTimersByTimeAsync(915_000);
+    expect(h.ds.session.cliProgressNotices).toBeUndefined();
+  });
+  it('a session-store rollback retires the notifier and never persists its detached array again', async () => {
+    const h = setup(); h.start(); const durable = JSON.parse(JSON.stringify(h.ds.session));
+    const detached = h.ds.session.cliProgressNotices;
+    vi.mocked(updateSession).mockImplementationOnce(session => {
+      for (const key of Object.keys(session)) delete (session as any)[key];
+      Object.assign(session, JSON.parse(JSON.stringify(durable)));
+      throw new Error('rollback');
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(h.ds.session.cliProgressNotices).not.toBe(detached);
+    const writes = vi.mocked(updateSession).mock.calls.length;
+    h.worker.emit('message', { type: 'turn_progress', turnId: 'om_turn', stage: 'tool_returned' });
+    h.start(); await vi.advanceTimersByTimeAsync(915_000);
+    expect(h.reply).not.toHaveBeenCalled(); expect(updateSession).toHaveBeenCalledTimes(writes);
+    expect(h.ds.session.cliProgressNotices).toEqual(durable.cliProgressNotices);
   });
 
 });
