@@ -13435,7 +13435,17 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
   return false;
 }
 
-async function handleTermAction(key: TermActionKey): Promise<void> {
+async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
+  // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
+  // 单个 Ctrl+C 会退出整个进程（0.16.9 实测）——用户点「停止这一轮」却丢掉会话
+  // 与上下文。适配器声明 interruptKey 时，中断类键一律走它，一处覆盖所有入口。
+  const key: TermActionKey = (
+    cliAdapter?.interruptKey === 'esc'
+    && (requestedKey === 'ctrlc' || requestedKey === 'esc')
+  ) ? 'esc' : requestedKey;
+  if (key !== requestedKey) {
+    log(`term_action '${requestedKey}' normalized to '${key}' (${cliAdapter?.id} interruptKey)`);
+  }
   // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
   // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
   if (isRemoteBackendType(effectiveBackendType)) {

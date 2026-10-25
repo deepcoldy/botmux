@@ -76,3 +76,42 @@ describe.skipIf(!canUseNativeCodec)('ZCode native codec model preparation', () =
     expect(JSON.parse(readFileSync(result.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, 'utf8')).config.defaultModelSelection).toBeUndefined();
   }, 30_000);
 });
+
+describe('ensureZcodeProviderHelper', () => {
+  it('materialises the embedded bridge and is idempotent', async () => {
+    const { ensureZcodeProviderHelper } = await import('../src/services/zcode-model-config.js');
+    const { ZCODE_PROVIDER_HELPER_SOURCE } = await import('../src/services/zcode-provider-helper-data.js');
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zcode-helper-')); directories.push(root);
+    const target = join(root, 'bin', 'zcode-provider-helper.mjs');
+
+    // 干净安装：文件不存在 → 必须写出来，否则 fail-closed 的 provider 准备会 ENOENT。
+    expect(existsSync(target)).toBe(false);
+    expect(ensureZcodeProviderHelper(target)).toBe(target);
+    expect(readFileSync(target, 'utf8')).toBe(ZCODE_PROVIDER_HELPER_SOURCE);
+
+    // 幂等：内容一致时不动 mtime，热 spawn 不该反复写盘。
+    const before = statSync(target).mtimeMs;
+    ensureZcodeProviderHelper(target);
+    expect(statSync(target).mtimeMs).toBe(before);
+
+    // 内容漂移（旧版本残留）→ 覆盖回内嵌真源。
+    writeFileSync(target, '# stale\n');
+    ensureZcodeProviderHelper(target);
+    expect(readFileSync(target, 'utf8')).toBe(ZCODE_PROVIDER_HELPER_SOURCE);
+  });
+
+  // 干净机器上没有 zcode-src 也没有 bun。原先这里 fail-closed，导致「一条 zcode
+  // 话题都起不来」。正确行为是降级：不覆盖模型，让 ZCode 用它自己保存的选择启动。
+  it('degrades to no model override when the ZCode codec is unavailable', async () => {
+    const { prepareZcodeSessionModel } = await import('../src/services/zcode-model-config.js');
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zcode-missing-')); directories.push(root);
+    const result = await prepareZcodeSessionModel({
+      sessionId: randomUUID(),
+      dataDir: root,
+      env: { BOTMUX_ZCODE_SOURCE_DIR: join(root, 'no-such-tree'), BOTMUX_ZCODE_BUN: join(root, 'no-bun') },
+      resume: false,
+      helperPath: join(root, 'helper.mjs'),
+    });
+    expect(result).toEqual({});
+  });
+});

@@ -522,7 +522,7 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks';
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
     /** 可选：SessionStart「真就绪」hook 命令。
      *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart

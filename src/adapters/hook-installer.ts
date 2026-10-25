@@ -9,13 +9,13 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
-import { hookCommandParts } from './hook-command.js';
+import { hookCommandParts, zcodeSessionHookCommandParts } from './hook-command.js';
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks';
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
   /** Claude read-isolation: merge the shared settings `env` map into a
    *  per-bot settings file before installing hooks. Shared values win so
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
@@ -932,6 +932,92 @@ function installGrokHooks(configPath: string, sessionStartCommand: string | unde
   }
 }
 
+// ─── ZCode hooks.events 格式 ──────────────────────────────────────────────────
+//
+// ZCode reads lifecycle hooks from `~/.zcode/cli/config.json`:
+//   { "hooks": { "enabled": true, "events": { "SessionStart": [ { "hooks": [
+//       { "type": "process", "command": "<node>", "args": ["<cli.js>",
+//         "zcode-session-hook"], "timeoutMs": 3000 } ] } ] } } }
+//
+// Why this exists: the bridge records the native session identity and the
+// per-turn submit receipt. Without it `writeInput` never sees a receipt, so
+// every message is reported as `submit_unconfirmed` while the PTY already ran
+// it — and exact-resume loses the conversation on the next respawn. The bridge
+// itself is `botmux zcode-session-hook` (a subcommand, not a .mjs file) so the
+// invocation resolves identically under tsx / node dist / compiled binary:
+// tsc does not copy .mjs into dist and the npm `files` whitelist excludes it,
+// so a file-based bridge never lands on a clean install.
+//
+// Merge, never overwrite: the user's other events, other hook entries inside
+// the same event, and every unrelated top-level key must survive. Entries
+// carrying our bridge marker are replaced in place so re-running is idempotent
+// and never stacks duplicate hooks.
+
+const ZCODE_HOOK_MARKER = 'zcode-session-hook';
+const ZCODE_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop'] as const;
+const ZCODE_HOOK_TIMEOUT_MS = 3000;
+
+interface ZcodeHookEntry {
+  type?: string;
+  command?: string;
+  args?: string[];
+  timeoutMs?: number;
+}
+
+interface ZcodeHookGroup {
+  hooks?: ZcodeHookEntry[];
+}
+
+function isOurZcodeEntry(entry: ZcodeHookEntry): boolean {
+  if (entry?.type !== 'process') return false;
+  if (Array.isArray(entry.args) && entry.args.some(a => typeof a === 'string' && a.includes(ZCODE_HOOK_MARKER))) return true;
+  // Older hand-installed configs pointed straight at the .mjs bridge.
+  return typeof entry.command === 'string' && entry.command.includes(ZCODE_HOOK_MARKER);
+}
+
+function installZcodeHooks(configPath: string, parts: { cmd: string; args: string[] }): void {
+  const existing = readJsonFile<Record<string, any>>(configPath) ?? {};
+  const hooks = (existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks))
+    ? { ...existing.hooks }
+    : {};
+  const events = (hooks.events && typeof hooks.events === 'object' && !Array.isArray(hooks.events))
+    ? { ...hooks.events }
+    : {};
+
+  const entry: ZcodeHookEntry = {
+    type: 'process',
+    command: parts.cmd,
+    args: [...parts.args],
+    timeoutMs: ZCODE_HOOK_TIMEOUT_MS,
+  };
+
+  for (const event of ZCODE_HOOK_EVENTS) {
+    const groups: ZcodeHookGroup[] = Array.isArray(events[event]) ? [...events[event]] : [];
+    // Drop our own previous registrations for this event, keep every foreign one.
+    const cleaned: ZcodeHookGroup[] = [];
+    for (const group of groups) {
+      if (!group || typeof group !== 'object') continue;
+      const inner = Array.isArray(group.hooks) ? group.hooks : [];
+      const foreign = inner.filter(h => !isOurZcodeEntry(h));
+      if (foreign.length === 0 && inner.some(h => isOurZcodeEntry(h))) continue;
+      cleaned.push({ ...group, hooks: foreign });
+    }
+    cleaned.push({ hooks: [entry] });
+    events[event] = cleaned;
+  }
+
+  hooks.events = events;
+  if (hooks.enabled !== true) hooks.enabled = true;
+
+  const content = JSON.stringify({ ...existing, hooks }, null, 2) + '\n';
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 ZCode 生命周期 hook（${ZCODE_HOOK_EVENTS.join('/')}）→ ${configPath}`);
+  } else {
+    logger.info(`[hook] ZCode 生命周期 hook 已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 /**
@@ -972,6 +1058,11 @@ export function installHook(
       case 'grok-hooks':
         // Grok has no ask-hook surface yet; only SessionStart ready-gate.
         installGrokHooks(configPath, hookInstall.sessionStartCommand);
+        break;
+      case 'zcode-hooks':
+        // ZCode has no ask-hook surface: the bridge records session identity and
+        // submit receipts, which is what makes submit confirmation work at all.
+        installZcodeHooks(configPath, zcodeSessionHookCommandParts());
         break;
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）

@@ -19402,6 +19402,15 @@ switch (command) {
     await cmdSessionReady();
     break;
   }
+  case 'zcode-session-hook': {
+    // `botmux zcode-session-hook` — ZCode 生命周期 hook 客户端（SessionStart /
+    // UserPromptSubmit / Stop）。写成子命令而不是独立 .mjs：.mjs 在干净安装里
+    // 没有任何落地路径（tsc 不拷 .mjs、npm files 白名单不含它），hook 永不触发，
+    // 回执永不产生，于是每条消息都误报 submit_unconfirmed。
+    const { runZcodeSessionHookCli } = await import('./services/zcode-session-hook.js');
+    await runZcodeSessionHookCli();
+    break;
+  }
   case '__turn-idle-v2': {
     // `botmux __turn-idle-v2` — CLI 进程内结构化回合空闲上报客户端（dsh-tui 的
     // cordis wrapper 插件在 agent/status 落到 idle 时执行）；worker 侧做回合 fence。

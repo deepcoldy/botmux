@@ -106,6 +106,18 @@ export function sessionReadyHookCommand(): string {
 }
 
 /**
+ * 构造 `botmux zcode-session-hook` 的 **argv 形式** `{ cmd, args }`。
+ *
+ * 与 `hookCommandParts`（`botmux hook <cliId>`，走 askUserQuestion 转发）不同，
+ * 这个子命令是 ZCode 的生命周期桥：只记录 native session id 与每轮提交回执，
+ * 不参与 ask。它必须按 argv 写入 ZCode 的 `hooks.events.*.hooks[]`
+ * （`{type:'process', command, args}`），因为 ZCode 直接 exec 数组、不过 shell。
+ */
+export function zcodeSessionHookCommandParts(): { cmd: string; args: string[] } {
+  return botmuxInvocation(['zcode-session-hook']);
+}
+
+/**
  * 构造 dsh-tui 结构化回合空闲上报的 **shell 命令字符串** → `botmux __turn-idle-v2`。
  * 与 `sessionReadyHookCommand` 同源的路径解析与加引号策略：同样写进 CLI 进程的
  * env（`BOTMUX_TURN_IDLE_COMMAND`），由 dsh-tui 的 cordis wrapper 插件在

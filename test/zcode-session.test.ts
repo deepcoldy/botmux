@@ -14,7 +14,11 @@ import {
 const SID = 'a5d0cf1b-efc8-4c55-9302-c9568c5fa7c0';
 const NATIVE = 'sess_303c5971-88e9-4204-b396-d6309beb0aac';
 const OTHER = 'sess_11522b53-2e0b-453a-8547-bbd59971caed';
-const HOOK = fileURLToPath(new URL('../src/services/zcode-session-hook.mjs', import.meta.url));
+// The bridge is a botmux subcommand now (`botmux zcode-session-hook`), not a
+// shipped .mjs: a file-based bridge never reached a clean install. Drive the real
+// entry through tsx so the test covers the same module the CLI loads.
+const HOOK_ENTRY = fileURLToPath(new URL('../src/services/zcode-session-hook.ts', import.meta.url));
+const TSX = fileURLToPath(new URL('../node_modules/.bin/tsx', import.meta.url));
 
 describe('ZCode precise session evidence', () => {
   let root: string;
@@ -25,7 +29,7 @@ describe('ZCode precise session evidence', () => {
     const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_ZCODE_RUNTIME_DIR: join(root, 'zcode-runtime') };
     delete env.BOTMUX_SESSION_ID;
     if (sid) env.BOTMUX_SESSION_ID = sid;
-    return execFileSync(process.execPath, [HOOK], { input: JSON.stringify(input), env, encoding: 'utf8' });
+    return execFileSync(TSX, [HOOK_ENTRY, '--run'], { input: JSON.stringify(input), env, encoding: 'utf8' });
   }
 
   function database() {

@@ -57,6 +57,24 @@ export function createZcodeAdapter(pathOverride?: string): CliAdapter {
     busyPattern: ZCODE_BUSY_FOOTER,
     readyPattern: ZCODE_IDLE_PLACEHOLDER,
     /*
+     * Lifecycle bridge. Two things only the CLI itself can report:
+     *  - the native session id (exact `--resume`; without it every respawn loses
+     *    the conversation), and
+     *  - the per-turn submit receipt that `writeInput` waits for.
+     *
+     * Absent this, every submit is reported as `submit_unconfirmed` while the
+     * PTY already executed the message, because ZCode writes its receipt when
+     * the turn DEQUEUES — measured 291s behind the write during a long tool run.
+     *
+     * The bridge is the `zcode-session-hook` subcommand, not a .mjs path: tsc
+     * does not copy .mjs into dist and the npm `files` whitelist excludes it, so
+     * a file-based bridge never lands on a clean install.
+     */
+    hookInstall: {
+      configPath: '~/.zcode/cli/config.json',
+      format: 'zcode-hooks',
+    },
+    /*
      * supportsTypeAhead is deliberately NOT set. Measured on 0.16.9: a submit
      * typed during an active turn is parked in ZCode's own queue panel
      * ("Submitted after the next tool call"), and that parked item is NOT
