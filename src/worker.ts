@@ -13481,10 +13481,10 @@ async function retireCodexAppDispatchForDurableReplay(
  * after the surviving runner proves its signed generation and live engine.
  * PID marker files and the latest chat sender are not recovery authorities. */
 function restoreCodexAppAttestedTurn(
-  payload: Record<string, unknown>, control?: { generation: string; seq: number },
+  signedTurnId: unknown, control?: { generation: string; seq: number },
 ): void {
   if (currentBotmuxTurnId || !control || !codexAppRunnerProcessIdentity || codexAppCompletionAwaitingFinal
-      || payload.busy !== true || payload.tracksTurn === false
+      || typeof signedTurnId !== 'string' || !signedTurnId
       || !codexAppGenerationCommits.some(commit => commit.generation === control.generation
         && control.seq > commit.committedThrough)) return;
   const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
@@ -13492,7 +13492,8 @@ function restoreCodexAppAttestedTurn(
   if (prepared.length !== 1 || reservations.length !== 1) return;
   const entry = prepared[0];
   const sender = entry.replyTargetSenderOpenId;
-  if (entry.dispatchId !== reservations[0].dispatchId || entry.turnId !== reservations[0].turnId
+  if (entry.turnId !== signedTurnId || entry.dispatchId !== reservations[0].dispatchId
+      || entry.turnId !== reservations[0].turnId
       || entry.dispatchAttempt !== reservations[0].dispatchAttempt
       || entry.codexAppSteerable !== true || entry.replyTargetSenderIsBot !== false
       || typeof sender !== 'string' || !sender.startsWith('ou_') || !lastInitConfig?.larkAppId) return;
@@ -13540,6 +13541,9 @@ async function handleTrustedCodexAppMarker(
       rejectCodexAppControlMarker('invalid signed thinking marker');
       return false;
     }
+    // Older surviving runners already sign the exact reply turn on thinking
+    // records, even when their state predates activeReplyTurnId.
+    restoreCodexAppAttestedTurn(marker.turnId, control);
     const turn = codexAppTurnDispatchQueue.findByTurnId(marker.turnId);
     if (!turn) {
       log(`${cliName()} dropped thinking marker for unknown turn ${marker.turnId.substring(0, 12)}`);
@@ -13666,7 +13670,9 @@ async function handleTrustedCodexAppMarker(
       log('Authenticated Codex App runner is not yet accepting input; readiness deadline remains armed');
       return true;
     }
-    restoreCodexAppAttestedTurn(payload, control);
+    if (payload.busy === true && payload.tracksTurn !== false) {
+      restoreCodexAppAttestedTurn(payload.activeReplyTurnId, control);
+    }
     const state = applyTrustedCodexAppStateMarker(
       codexAppTurnLiveness,
       codexAppReadyAuthority,

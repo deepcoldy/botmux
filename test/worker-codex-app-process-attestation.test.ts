@@ -16,7 +16,8 @@ function fixture() {
     restoreCodexAppAttestedTurn: vi.fn(),
     idleDetector: { reset: vi.fn() }, queueMicrotask: vi.fn(),
   };
-  return { identity, scope, handle: loadWorkerFunction<(kind: string, payload: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope) };
+  return { identity, scope, handle: loadWorkerFunction<(kind: string, payload: any,
+    control?: { generation: string; seq: number }) => Promise<boolean>>('handleTrustedCodexAppMarker', scope) };
 }
 
 describe('worker Codex App process attestation', () => {
@@ -49,6 +50,16 @@ describe('worker Codex App process attestation', () => {
     const { scope, handle } = fixture();
     expect(await handle('state', { acceptingInput: true })).toBe(true);
     expect(scope.publishLocalProcessAttestation).not.toHaveBeenCalled();
+  });
+
+  it('uses the signed reply turn on older runners thinking records for warm recovery', async () => {
+    const { scope, handle } = fixture();
+    const proof = { generation: 'g1', seq: 6 };
+    scope.normalizeCodexAppCotMarker = () => ({ turnId: 'om_original', entries: [] });
+    scope.codexAppTurnDispatchQueue = { findByTurnId: () => ({ turnId: 'om_original' }) };
+    scope.observeCotEntries = vi.fn();
+    expect(await handle('thinking', {}, proof)).toBe(true);
+    expect(scope.restoreCodexAppAttestedTurn).toHaveBeenCalledWith('om_original', proof);
   });
 
   it('rotates a verified idle replacement before its queued input without publishing ready', async () => {
@@ -133,30 +144,28 @@ describe('authenticated Codex App turn recovery', () => {
   }
   it('restores the exact persisted human caller after a warm worker replacement', () => {
     const { scope, restore } = recoveryFixture();
-    restore({ busy: true }, { generation: 'g1', seq: 6 });
+    restore('om_original', { generation: 'g1', seq: 6 });
     expect(scope.adoptInitialActiveTurn).toHaveBeenCalledWith(expect.objectContaining({
       turnId: 'om_original', trustedCaller: { requestLarkAppId: 'cli_original',
         requestUserOpenId: 'ou_original', senderType: 'user' },
     }));
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
   });
-  it.each(['active', 'unsigned', 'generation', 'old-sequence', 'unfinished-final', 'idle', 'native-continuation', 'engine',
+  it.each(['active', 'unsigned', 'generation', 'old-sequence', 'unfinished-final', 'wrong-turn', 'missing-turn', 'engine',
     'ambiguous', 'reservation', 'callerless', 'bot', 'sender'])('does not recover ambiguous or unproven authority: %s', reason => {
     const { entry, scope, restore } = recoveryFixture();
-    const state: any = { busy: true };
     if (reason === 'active') scope.currentBotmuxTurnId = 'om_current';
     if (reason === 'generation') scope.codexAppGenerationCommits = [];
     if (reason === 'old-sequence') scope.codexAppGenerationCommits[0].committedThrough = 6;
     if (reason === 'unfinished-final') scope.codexAppCompletionAwaitingFinal = true;
-    if (reason === 'idle') state.busy = false;
-    if (reason === 'native-continuation') state.tracksTurn = false;
     if (reason === 'engine') scope.codexAppRunnerProcessIdentity = undefined;
     if (reason === 'ambiguous') scope.codexAppRecoveredDispatches.push({ ...entry, dispatchId: 'd2' });
     if (reason === 'reservation') scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [];
     if (reason === 'callerless') entry.codexAppSteerable = false;
     if (reason === 'bot') entry.replyTargetSenderIsBot = true;
     if (reason === 'sender') entry.replyTargetSenderOpenId = '';
-    restore(state, reason === 'unsigned' ? undefined : { generation: 'g1', seq: 6 });
+    restore(reason === 'wrong-turn' ? 'om_other' : reason === 'missing-turn' ? undefined : 'om_original',
+      reason === 'unsigned' ? undefined : { generation: 'g1', seq: 6 });
     expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
     expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
   });

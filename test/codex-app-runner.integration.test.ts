@@ -105,7 +105,7 @@ class ControlCollector {
     private readonly disconnectOnFirstFinalChunk = false,
     private readonly omitFirstFinalChunk = false,
     private readonly disconnectAfterFirstFinalEndBeforeAck = false,
-    private readonly applyState?: (payload: Record<string, any>) => Promise<boolean>,
+    private readonly applyState?: (payload: Record<string, any>, control: { generation: string; seq: number }) => Promise<boolean>,
   ) {
     this.socketDirectory = mkdtempSync('/tmp/bca-sock-');
     this.socketPath = codexAppControlSocketPath(this.socketDirectory, SESSION_ID);
@@ -115,6 +115,8 @@ class ControlCollector {
     this.server = createServer(socket => this.accept(socket));
     liveCollectors.add(this);
   }
+
+  get committedThrough(): number { return this.lastSeq; }
 
   listen(): Promise<void> {
     return new Promise((resolvePromise, rejectPromise) => {
@@ -216,7 +218,8 @@ class ControlCollector {
           )}\n`);
           continue;
         }
-        if (record.kind === 'state' && this.applyState && !await this.applyState(record.payload)) {
+        if (record.kind === 'state' && this.applyState
+            && !await this.applyState(record.payload, { generation: record.generation, seq: record.seq })) {
           socket.destroy();
           return;
         }
@@ -1913,6 +1916,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const fakeCodex = join(dir, 'codex');
     const logPath = join(dir, 'requests.jsonl');
     const pidPath = join(dir, 'app-server.pid');
+    const finishGate = join(dir, 'finish-gate');
+    writeFileSync(finishGate, 'ready');
     // A Node script cannot reach process attestation (/proc/exe is node).
     // Compile to an actual codex executable; do not mock the kernel proof.
     const build = spawnSync(resolveBunExecutable()!, ['build', '--compile', FAKE_SERVER_FIXTURE, '--outfile', fakeCodex],
@@ -1924,7 +1929,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const authority = new CodexAppReadyAuthority();
     let harness: Harness | undefined;
     const scope: Record<string, any> = {
-      lastInitConfig: { cliId: 'codex-app', sessionId: SESSION_ID },
+      lastInitConfig: { cliId: 'codex-app', sessionId: SESSION_ID, larkAppId: 'cli_test' },
       isCodexAppCliId: (id: string) => id === 'codex-app',
       backend: { getChildPid: () => harness?.child.pid },
       codexAppRunnerProcessIdentity: undefined,
@@ -1937,13 +1942,16 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       awaitingFirstPrompt: false, idleDetector: { reset() {} }, queueMicrotask() {},
       codexAppCompletionAwaitingFinal: false, codexAppTurnDispatchQueue: { recoveredPrefix: () => [] },
       currentBotmuxTurnId: undefined,
+      codexAppGenerationCommits: [], codexAppRecoveredDispatches: [],
+      adoptInitialActiveTurn: (entry: any) => { scope.currentBotmuxTurnId = entry.turnId; scope.restored = entry; },
+      publishSandboxRelayCapability() {}, log() {},
     };
     scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
-    const apply = loadWorkerFunction<(kind: string, payload: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
-    const control = new ControlCollector(dir, false, false, false, false, payload => apply('state', payload));
+    const apply = loadWorkerFunction<(kind: string, payload: any, control?: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
+    const control = new ControlCollector(dir, false, false, false, false, (payload, proof) => apply('state', payload, proof));
     await control.listen();
     harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
-      { env: { FAKE_CODEX_PID_PATH: pidPath } });
+      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate } });
     try {
       await waitFor(harness, () => control.states.at(-1)?.busy === false);
       expect(published).toHaveLength(1);
@@ -1977,6 +1985,30 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(submittedAfter).toBeGreaterThan(boundaryIndex);
       expect(control.authCount).toBe(1);
       expect(control.finals.map(final => final.turnId)).toEqual(['om_native_before', 'om_native_after', 'om_native_next']);
+      // Replace the observing worker during native work. The signed state must
+      // bind the exact persisted reply turn, rather than guessing from busy.
+      unlinkSync(finishGate);
+      tracker.begin('om_warm_recovery');
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('om_warm_recovery',
+        { text: 'warm recovery' }, 'om_warm_recovery')}\r`);
+      await waitFor(harness, () => readRequests(logPath).filter(request => request.method === 'turn/start').length === 4);
+      const head = { state: 'prepared', dispatchId: 'warm-dispatch', turnId: 'om_warm_recovery',
+        codexAppSteerable: true, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
+      scope.codexAppGenerationCommits = [{ generation: control.bootstrap.identity.generation,
+        committedThrough: control.committedThrough }];
+      scope.codexAppRecoveredDispatches = [head];
+      scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [head];
+      await control.restartEndpoint();
+      await waitFor(harness, () => !!scope.restored);
+      expect(scope.restored).toMatchObject({ turnId: 'om_warm_recovery',
+        trustedCaller: { requestLarkAppId: 'cli_test', requestUserOpenId: 'ou_original', senderType: 'user' } });
+      expect(control.states.at(-1)).toMatchObject({ busy: true, activeReplyTurnId: 'om_warm_recovery' });
+      scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [];
+      writeFileSync(finishGate, 'ready');
+      await waitFor(harness, () => control.finals.length === 4);
+      tracker.completeCurrent();
+      expect(control.authCount).toBe(2);
+      expect(rejected).toEqual([]);
       expect(readRequests(logPath).filter(request => request.method === 'thread/start')).toHaveLength(1);
       expect(readRequests(logPath).filter(request => request.method === 'thread/resume')).toHaveLength(1);
     } finally {

@@ -781,6 +781,7 @@ function emitRunnerState(
   busy = processing || queue.length > 0 || nativeActiveTurnId !== undefined,
   tracksTurn = activeTurn !== null,
 ): void {
+  const activeReplyTurnId = activeTurn?.accepted?.at(-1)?.replyTurnId;
   emitMarker('state', {
     busy,
     atMs: Date.now(),
@@ -788,6 +789,7 @@ function emitRunnerState(
     // signed state. The worker uses this field as a runtime type-ahead gate;
     // authentication alone never releases a prompt.
     acceptingInput: runnerReady,
+    ...(busy && tracksTurn && activeReplyTurnId ? { activeReplyTurnId } : {}),
     ...(client?.processIdentity ? { processIdentity: client.processIdentity } : {}),
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
