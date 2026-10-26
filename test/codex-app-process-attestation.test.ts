@@ -1,9 +1,14 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { captureAttachedCodexAppProcessIdentity, captureCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -30,6 +35,22 @@ function fixture() {
 }
 
 describe('Codex App signed runtime process identity', () => {
+  it.each([
+    { code: 'EACCES', exited: false }, { code: 'EIO', exited: false },
+    { code: 'EMFILE', exited: false }, { code: 'ENOENT', exited: true },
+    { code: 'ESRCH', exited: true },
+  ])('treats a stat read error $code as exited=$exited', ({ code, exited }) => {
+    const { root, identity } = fixture();
+    const path = join(root, '70', 'stat');
+    expect(existsSync(path)).toBe(true);
+    const readStat = vi.mocked(readFileSync);
+    readStat.mockClear();
+    readStat.mockImplementationOnce(() => { throw Object.assign(new Error('stat read failed'), { code }); });
+    expect(codexAppEngineHasExited(identity, root)).toBe(exited);
+    // Verify that the production ESM named binding used the failing read;
+    // returning false for the real live fixture alone would be a false green.
+    expect(readStat).toHaveBeenCalledExactlyOnceWith(path, 'utf8');
+  });
   it('distinguishes a dead/zombie engine from live or unreadable identity metadata', () => {
     const { root, identity } = fixture();
     expect(codexAppEngineHasExited(identity, root)).toBe(false);

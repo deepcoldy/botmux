@@ -77,13 +77,16 @@ describe('worker Codex App process attestation', () => {
 
   it.each([
     { busy: true },
+    { busy: true, tracksTurn: false },
     { processIdentityBoundary: 'idle_restart', busy: true },
     { processIdentityBoundary: 'idle_restart', busy: false, tracksTurn: false },
     { processIdentityBoundary: 'idle_restart', busy: true, tracksTurn: false, acceptingInput: false },
   ])('rejects a replacement without an authenticated pre-submit idle boundary: %j', async marker => {
     const { identity, scope, handle } = fixture();
-    scope.codexAppRunnerProcessIdentity = { ...identity, enginePid: 69, engineProcStart: '690' };
+    const previous = { ...identity, enginePid: 69, engineProcStart: '690' };
+    scope.codexAppRunnerProcessIdentity = previous;
     expect(await handle('state', { acceptingInput: true, ...marker, processIdentity: identity })).toBe(false);
+    expect(scope.codexAppRunnerProcessIdentity).toEqual(previous);
     expect(scope.publishLocalProcessAttestation).not.toHaveBeenCalled();
   });
 
@@ -128,7 +131,7 @@ describe('worker Codex App process attestation', () => {
 
 describe('authenticated Codex App turn recovery', () => {
   function recoveryFixture() {
-    const entry = { state: 'prepared', dispatchId: 'd1', turnId: 'om_original',
+    const entry = { state: 'prepared', dispatchId: 'd1', turnId: 'om_original', dispatchAttempt: 1,
       codexAppSteerable: true, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
     const scope: Record<string, any> = {
       currentBotmuxTurnId: undefined, codexAppRunnerProcessIdentity: { enginePid: 70 },
@@ -150,6 +153,20 @@ describe('authenticated Codex App turn recovery', () => {
         requestUserOpenId: 'ou_original', senderType: 'user' },
     }));
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+  it.each(['dispatchId', 'turnId', 'dispatchAttempt'])('rejects a reservation with a mismatched %s', field => {
+    const { entry, scope, restore } = recoveryFixture();
+    scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [{ ...entry,
+      [field]: field === 'dispatchAttempt' ? 2 : 'other' }];
+    restore('om_original', { generation: 'g1', seq: 6 });
+    expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
+    expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
+  });
+  it.each([null, undefined, 42, {}, [], '', false])('rejects a non-string or empty signed turn: %j', signedTurn => {
+    const { scope, restore } = recoveryFixture();
+    restore(signedTurn, { generation: 'g1', seq: 6 });
+    expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
+    expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
   });
   it.each(['active', 'unsigned', 'generation', 'old-sequence', 'unfinished-final', 'wrong-turn', 'missing-turn', 'engine',
     'ambiguous', 'reservation', 'callerless', 'bot', 'sender'])('does not recover ambiguous or unproven authority: %s', reason => {

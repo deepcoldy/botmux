@@ -8,6 +8,10 @@ worker 重建后，只有存活 runner 的签名代次匹配 daemon 持久 ACK �
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。
 
+本机 Linux 的适用范围不包括开启 `bwrap --unshare-pid` 的文件沙箱：runner 读取沙箱内 `/proc`，worker 核对宿主 `/proc`，PID 空间不同，无法将沙箱内的 `processIdentity` 建立为宿主可验证的引擎血缘；这条执行证明不适用，保持 blocked。此限制不是本 PR 引入的回归：PR 前后的沙箱内跨轮工具判定均无法证明该宿主血缘，没有新增放行路径。跨命名空间身份映射需要独立设计宿主/沙箱 PID 对照，不在本 PR 范围，后续跟踪见 [#2383](https://github.com/deepcoldy/botmux/issues/2383)。
+
+`coreOnlyPidNamespaceDegrade()` 去掉 `--unshare-pid` 的降级仅可能出现在 `BOTMUX_CORE_ONLY=1` 且宿主无法创建该命名空间时。core-only 合成的会话为 `apiOnly`，`larkTransportEnabled` 对它直接返回 false，不消费这套执行证明；普通带飞书通道的会话不走该降级。因此同一飞书会话不会因宿主探测结果在这两种证明行为之间翻转。
+
 Codex 的原生 `codex-code-mode-host` 会跨轮复用，属于引擎的工具派发进程。只有它是已证明 Codex 根进程的直接子进程、内核报告的可执行文件位于同一发布目录且没有额外启动参数时，血缘检查才允许本轮新工具经过它；不凭进程名或命令行自报身份。常驻 host 自身、上一轮工具及其后续子进程仍不能取得本轮权限。`actor current` 和增量授权共用这条检查，并继续核对当前真人发送者及授权期间的轮次变化。
 
 成功响应：

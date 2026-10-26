@@ -13671,6 +13671,7 @@ async function handleTrustedCodexAppMarker(
       return true;
     }
     if (payload.busy === true && payload.tracksTurn !== false) {
+      // Restore this turn's caller/identity before applying its busy state.
       restoreCodexAppAttestedTurn(payload.activeReplyTurnId, control);
     }
     const state = applyTrustedCodexAppStateMarker(
