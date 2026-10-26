@@ -114,7 +114,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
-import { buildMarkdownCard } from './im/lark/md-card.js';
+import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -517,7 +517,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
-import { AutoCompactCoordinator } from './core/auto-compact.js';
+import { AutoCompactCoordinator, isAutoCompactEligible } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -5969,9 +5969,7 @@ function autoCompactThreshold(): number | undefined {
 
 function autoCompactPercent(ds: DaemonSession): number | undefined {
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-  const value = getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true })
-    .context?.percentUsed;
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return contextPercentUsed(getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true }));
 }
 
 /** Final fire-time gate: a human/business turn admitted during the debounce
@@ -5980,23 +5978,30 @@ function autoCompactPercent(ds: DaemonSession): number | undefined {
 function autoCompactEligible(ds: DaemonSession): boolean {
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  return ds.session.status === 'active'
-    && !!ds.worker && !ds.worker.killed
-    && ds.workerReady === true && ds.cliReady === true
-    && ds.lastScreenStatus === 'idle'
-    && !ds.streamCardPending
-    && !isSessionTransferring(ds)
-    && !hasProtectedSessionMutationOwnership(ds)
-    && !hasPendingSessionTurns(ds.session.sessionId)
-    && !ds.pendingPrompt && !ds.pendingRawInput && !ds.pendingFollowUpInput
-    && (ds.session.queuedActivationTail?.length ?? 0) === 0
-    && !ds.cascadeInFlight
-    && !ds.usageLimit && !ds.agentAttention
-    && (ds.finalOutputDeliveriesInFlight?.size ?? 0) === 0
-    && !ds.adoptedFrom && !ds.session.adoptedFrom
-    && !ds.session.headless && !ds.session.vcMeetingReceiver
-    && backendType !== 'remote-runner'
-    && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact');
+  return isAutoCompactEligible({
+    sessionActive: ds.session.status === 'active',
+    workerAlive: !!ds.worker && !ds.worker.killed,
+    workerReady: ds.workerReady === true,
+    cliReady: ds.cliReady === true,
+    idle: ds.lastScreenStatus === 'idle',
+    streamCardSettled: !ds.streamCardPending,
+    transferring: isSessionTransferring(ds),
+    protectedMutation: hasProtectedSessionMutationOwnership(ds),
+    pendingTurns: hasPendingSessionTurns(ds.session.sessionId),
+    pendingPrompt: !!ds.pendingPrompt,
+    pendingRawInput: !!ds.pendingRawInput,
+    pendingFollowUpInput: !!ds.pendingFollowUpInput,
+    queuedActivationCount: ds.session.queuedActivationTail?.length ?? 0,
+    cascadeInFlight: !!ds.cascadeInFlight,
+    usageLimited: !!ds.usageLimit,
+    agentAttention: !!ds.agentAttention,
+    finalDeliveriesInFlight: ds.finalOutputDeliveriesInFlight?.size ?? 0,
+    adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
+    headless: !!ds.session.headless,
+    vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+    remoteRunner: backendType === 'remote-runner',
+    supportsCompact: resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
+  });
 }
 
 function observeAutoCompact(ds: DaemonSession, status: string): void {
@@ -6004,9 +6009,10 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
     sessionId: ds.session.sessionId,
     idle: status === 'idle',
     threshold: autoCompactThreshold(),
+    readThreshold: autoCompactThreshold,
     readPercent: () => autoCompactPercent(ds),
     eligible: () => autoCompactEligible(ds),
-    trigger: () => {
+    trigger: (threshold) => {
       if (!autoCompactEligible(ds)) return false;
       const anchor = sessionAnchorId(ds);
       const turnId = `auto-compact:${Date.now().toString(36)}`;
@@ -6020,7 +6026,7 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
         inThread: ds.scope === 'thread',
         turnId,
         onDelivered: () => logger.info(
-          `[${tag(ds)}] Auto compact admitted at context >= ${autoCompactThreshold() ?? 75}%`,
+          `[${tag(ds)}] Auto compact admitted at context >= ${threshold}%`,
         ),
       });
       return true;
