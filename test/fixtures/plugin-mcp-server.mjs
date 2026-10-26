@@ -43,7 +43,13 @@ server.setRequestHandler(ListToolsRequestSchema, request => {
       };
 });
 
-server.setRequestHandler(CallToolRequestSchema, request => {
+server.setRequestHandler(CallToolRequestSchema, async request => {
+  if (serverName === 'slow') {
+    const delayMs = Number(request.params.arguments?.delayMs ?? 0);
+    if (Number.isFinite(delayMs) && delayMs > 0) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, delayMs));
+    }
+  }
   if (serverName === 'link-ref') {
     const authorizationUrl = 'https://auth.example.test/authorize'
       + '?code=code-value&token=token-value&signature=sig-value&state=state-value'

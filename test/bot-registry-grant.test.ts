@@ -104,7 +104,7 @@ describe('bot-registry grant additions', () => {
           toolTimeoutMs: 120_000,
         },
         'bad/id': { toolTimeoutMs: 10_000 },
-        tooLong: { toolTimeoutMs: 2_147_483_648 },
+        toolong: { toolTimeoutMs: 2_147_483_648 },
         empty: { env: { 'bad-key': 'drop' }, toolTimeoutMs: 0 },
       },
     }]));

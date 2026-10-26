@@ -61,6 +61,65 @@ describe('plugin MCP Gateway', () => {
     expect(pluginMcpToolTimeoutOptions()).toEqual({});
   });
 
+  it('enforces the session snapshot timeout across the real Gateway tool route', async () => {
+    installFixturePlugin('plugin-slow', 'slow');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'configured-timeout',
+      pluginIds: ['plugin-slow'],
+      pluginRuntime: { 'plugin-slow': { toolTimeoutMs: 100 } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'configured-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-timeout-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const startedAt = Date.now();
+    try {
+      await expect(client.callTool({
+        name: 'echo',
+        arguments: { delayMs: 2_000 },
+      })).rejects.toThrow(/timed out|-32001/i);
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeGreaterThanOrEqual(75);
+      expect(elapsedMs).toBeLessThan(1_000);
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
+  it('keeps the downstream SDK default when the snapshot omits a timeout', async () => {
+    installFixturePlugin('plugin-slow', 'slow');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'default-timeout',
+      pluginIds: ['plugin-slow'],
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'default-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-default-timeout-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const result = await client.callTool({ name: 'echo', arguments: { delayMs: 150 } });
+      expect((result.content[0] as any).text).toContain('slow:echo');
+    } finally {
+      await client.close();
+      await gateway.close();
+    }
+  });
+
   function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
