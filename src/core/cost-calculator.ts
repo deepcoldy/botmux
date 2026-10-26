@@ -1352,8 +1352,12 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (q.cliId === 'zcode') {
     // ZCode keeps no transcript botmux can parse; its own `model_usage` ledger
     // is the source of truth. The native id is persisted on the session after
-    // the first turn, and read back from the hook marker until then.
-    const native = q.cliSessionId || readZcodeSessionMarker(q.sessionId)?.cliSessionId;
+    // the first turn, and read back from the hook marker until then. The marker
+    // lives under the session data root, which is NOT always ~/.botmux/data:
+    // pass the same dir the worker writes it to or a custom SESSION_DATA_DIR
+    // silently loses usage and context.
+    const native = q.cliSessionId
+      || readZcodeSessionMarker(q.sessionId, { dataDir: config.session.dataDir })?.cliSessionId;
     if (!native) return null;
     const usage = readZcodeUsage(native);
     if (!usage) return null;

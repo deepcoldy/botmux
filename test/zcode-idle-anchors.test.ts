@@ -150,8 +150,9 @@ describe('zcode adapter: idle anchors', () => {
   it('interrupts with Escape, because Ctrl+C exits the CLI', () => {
     // Verified on 0.16.9: one Ctrl+C during `sleep 40` killed the whole zcode
     // process (tmux session gone). Escape aborted the same turn and left the
-    // composer usable. The card's Stop button routes through
-    // handleExactTurnInterrupt(), which reads this field.
+    // composer usable. Both the card's Stop button (card-handler stop_turn)
+    // and `/stop` go through handleTermAction(), which normalises interrupt
+    // keys to this field; handleExactTurnInterrupt() reads it too.
     expect(adapter.interruptKey).toBe('esc');
   });
 });

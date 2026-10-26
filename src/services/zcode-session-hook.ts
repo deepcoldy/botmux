@@ -66,7 +66,13 @@ async function createOnce(path: string, record: unknown): Promise<boolean> {
 }
 
 export function zcodeRuntimeRoot(env: NodeJS.ProcessEnv = process.env): string {
+  // The worker reads markers from `config.session.dataDir` (SESSION_DATA_DIR),
+  // but BOTMUX_ZCODE_RUNTIME_DIR is only injected on a non-reattach launch that
+  // actually prepared the provider override. On restore/adopt/degrade, and with
+  // a custom data root, the hook used to fall back to the HOME default and the
+  // two sides disagreed — every message then reported submit_unconfirmed.
   return env.BOTMUX_ZCODE_RUNTIME_DIR?.trim()
+    || (env.SESSION_DATA_DIR?.trim() ? join(env.SESSION_DATA_DIR.trim(), 'zcode-runtime') : '')
     || join(homedir(), '.botmux', 'data', 'zcode-runtime');
 }
 

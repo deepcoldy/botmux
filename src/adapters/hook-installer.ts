@@ -969,14 +969,29 @@ interface ZcodeHookGroup {
 }
 
 function isOurZcodeEntry(entry: ZcodeHookEntry): boolean {
-  if (entry?.type !== 'process') return false;
+  if (!entry || typeof entry !== 'object') return false;
   if (Array.isArray(entry.args) && entry.args.some(a => typeof a === 'string' && a.includes(ZCODE_HOOK_MARKER))) return true;
-  // Older hand-installed configs pointed straight at the .mjs bridge.
+  // Older hand-installed configs pointed at the .mjs bridge in two shapes: as a
+  // `process` entry (interpreter in `command`, bridge in `args` — covered
+  // above) and as a bare `command` entry whose command IS the bridge path. The
+  // latter must match too, or it survives alongside our new entry and the event
+  // runs the bridge twice.
   return typeof entry.command === 'string' && entry.command.includes(ZCODE_HOOK_MARKER);
 }
 
 function installZcodeHooks(configPath: string, parts: { cmd: string; args: string[] }): void {
-  const existing = readJsonFile<Record<string, any>>(configPath) ?? {};
+  // A corrupt config must never be rewritten from scratch: `readJsonFile`
+  // returns null for both "missing" and "unparseable", and spreading that null
+  // would silently drop the user's mcp/providers and every other top-level key.
+  let existing: Record<string, any> = {};
+  if (existsSync(configPath)) {
+    const parsed = readJsonFile<Record<string, any>>(configPath);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      logger.warn(`[hook] ${configPath} 不是合法 JSON 对象，拒绝写入以免覆盖用户配置；请先修复该文件`);
+      return;
+    }
+    existing = parsed;
+  }
   const hooks = (existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks))
     ? { ...existing.hooks }
     : {};
@@ -1007,7 +1022,14 @@ function installZcodeHooks(configPath: string, parts: { cmd: string; args: strin
   }
 
   hooks.events = events;
-  if (hooks.enabled !== true) hooks.enabled = true;
+  // Never turn hooks ON behind the user's back: an explicit `enabled: false` is
+  // their decision and also covers their own unrelated hooks. Ours are
+  // registered anyway, so enabling later starts working with no second install.
+  if (hooks.enabled === false) {
+    logger.warn(`[hook] ${configPath} 的 hooks.enabled 显式为 false，保留该设置；ZCode 生命周期 hook 已注册但不会触发`);
+  } else {
+    hooks.enabled = true;
+  }
 
   const content = JSON.stringify({ ...existing, hooks }, null, 2) + '\n';
   const changed = writeIfChanged(configPath, content);

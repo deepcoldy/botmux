@@ -49,7 +49,6 @@ export function ensureZcodeProviderHelper(helperPath = defaultZcodeHelperPath())
 export async function prepareZcodeSessionModel(opts: ZcodeModelPreparationOptions): Promise<Record<string, string>> {
   if (!/^[0-9a-f-]{36}$/i.test(opts.sessionId)) throw new Error('Invalid ZCode botmux session identity');
   const bun = opts.env.BOTMUX_ZCODE_BUN?.trim() || locateExecutable('bun') || join(homedir(), '.bun', 'bin', 'bun');
-  const helper = opts.helperPath ?? ensureZcodeProviderHelper(defaultZcodeHelperPath(opts.env));
 
   // The bridge validates against ZCode's OWN schema, so it needs that source
   // tree plus bun to import its TypeScript. Neither ships with botmux nor with
@@ -66,6 +65,20 @@ export async function prepareZcodeSessionModel(opts: ZcodeModelPreparationOption
       : `bun (looked for ${bun}; set BOTMUX_ZCODE_BUN)`;
     console.log(
       `[zcode] 未找到 ${missing}，跳过每话题模型覆盖，改用 ZCode 自己保存的模型选择`
+      + (opts.model ? `（本会话请求的 ${opts.model} 不会生效）` : ''),
+    );
+    return {};
+  }
+  // Materialise the bridge only now: it is useless without the codec, and a
+  // write failure (read-only HOME, occupied ~/.botmux/bin, unwritable custom
+  // path) must degrade like a missing codec instead of aborting the launch.
+  let helper: string;
+  try {
+    helper = opts.helperPath ?? ensureZcodeProviderHelper(defaultZcodeHelperPath(opts.env));
+  } catch (error) {
+    console.log(
+      `[zcode] provider helper 无法落盘（${error instanceof Error ? error.message : String(error)}），`
+      + '跳过每话题模型覆盖，改用 ZCode 自己保存的模型选择'
       + (opts.model ? `（本会话请求的 ${opts.model} 不会生效）` : ''),
     );
     return {};

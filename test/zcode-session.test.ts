@@ -126,4 +126,20 @@ describe('ZCode precise session evidence', () => {
     expect(zcodeSessionDbPath({ ZCODE_SESSION_DB_PATH: '/exact/session.sqlite', ZCODE_STORAGE_DIR: '/different' })).toBe('/exact/session.sqlite');
     expect(zcodeSessionDbPath({ ZCODE_SESSION_DB: '/legacy/session.sqlite' })).toBe('/legacy/session.sqlite');
   });
+
+  // The worker reads markers from config.session.dataDir. BOTMUX_ZCODE_RUNTIME_DIR
+  // is only injected on a non-reattach launch that prepared the provider
+  // override, so restore/adopt/degrade and custom data roots used to write into
+  // ~/.botmux/data while the reader looked elsewhere — every message then
+  // reported submit_unconfirmed.
+  it('falls back to SESSION_DATA_DIR when the runtime dir was not injected', () => {
+    const hookEnv: NodeJS.ProcessEnv = { ...process.env, BOTMUX_SESSION_ID: SID, SESSION_DATA_DIR: join(root, 'custom-data') };
+    delete hookEnv.BOTMUX_ZCODE_RUNTIME_DIR;
+    execFileSync(TSX, [HOOK_ENTRY, '--run'], {
+      input: JSON.stringify({ sessionId: NATIVE, hookEventName: 'SessionStart', source: 'startup' }),
+      env: hookEnv, encoding: 'utf8',
+    });
+    expect(readZcodeSessionMarker(SID, { dataDir: join(root, 'custom-data') }))
+      .toMatchObject({ cliSessionId: NATIVE, source: 'startup' });
+  });
 });

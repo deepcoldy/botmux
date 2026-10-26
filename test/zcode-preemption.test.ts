@@ -25,9 +25,20 @@ const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'
 const start = source.indexOf('/** Key name → ANSI escape sequence (for PtyBackend) */');
 const end = source.indexOf('/**\n * Execute an AI-provided key sequence', start);
 if (start < 0 || end < start) throw new Error('preemption helpers not found');
-const helpers = transpileModule(source.slice(start, end), {
-  compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
-}).outputText;
+// `preemptedTurnId` / `preemptCooldownUntil` are module-level `let`s in
+// worker.ts. Left inside the slice they become script-level bindings in the vm
+// and SHADOW the context-provided globals, so the harness would neither seed
+// nor observe the real state — the once-per-turn guard could be deleted and
+// every test still passed on the 2s cooldown alone. Declare them with `var`
+// (a bare `var` does not overwrite an existing global binding) so worker.ts's
+// own references resolve to the harness state.
+const helpers = transpileModule(
+  source.slice(start, end)
+    .replace(/^let preemptedTurnId.*$/m, 'var preemptedTurnId;')
+    .replace(/^let preemptCooldownUntil.*$/m, 'var preemptCooldownUntil;'),
+  { compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None } },
+).outputText;
+
 
 /** Live pane tail captured from zcode 0.16.9 mid-turn. */
 const BUSY_SCREEN = [
@@ -192,9 +203,13 @@ describe('preemptActiveTurnForNewMessage', () => {
   it('preempts a turn only once', () => {
     const h = harness();
     expect(h.preempt()).toBe(true);
+    // Clear the cooldown so the assertion below can only pass because of the
+    // once-per-turn guard, not because 2s have not elapsed yet.
+    h.context.preemptCooldownUntil = 0;
     // A second message while the first replacement is still landing must queue
     // behind it, not fire another interrupt into the same dying turn.
     expect(h.preempt({ turnId: 'om_second' })).toBe(false);
+    expect(h.controlKey).toHaveBeenCalledTimes(1);
   });
 
   it('ignores a message from the same turn that is already running', () => {

@@ -80,14 +80,17 @@ describe('worker exact interrupt acknowledgement and crash replay', () => {
     // ctrlc — otherwise the card's Stop button kills the session.
     const h = harness(true, 'esc');
     await h.interrupt();
-    expect(h.controlKey).toHaveBeenCalledWith('esc', expect.any(Function));
+    // `expect.anything()`, not `expect.any(Function)`: the second argument is a
+    // callback created inside the vm realm, and Bun's instanceof check rejects
+    // cross-realm functions (vitest happens to accept them).
+    expect(h.controlKey).toHaveBeenCalledWith('esc', expect.anything());
     expect(h.control).toHaveBeenCalledWith(expect.anything(), 'esc');
   });
 
   it('defaults to Ctrl+C for adapters that do not override the key', async () => {
     const h = harness();
     await h.interrupt();
-    expect(h.controlKey).toHaveBeenCalledWith('ctrlc', expect.any(Function));
+    expect(h.controlKey).toHaveBeenCalledWith('ctrlc', expect.anything());
     expect(h.control).toHaveBeenCalledWith(expect.anything(), 'ctrlc');
   });
 

@@ -1043,4 +1043,46 @@ describe('installHook — zcode-hooks', () => {
     expect(hooks[0].args).toContain('zcode-session-hook');
     expect(hooks[0].args.join(' ')).not.toContain('.mjs');
   });
+
+  // 旧手工装法的另一种形态：`type: 'command'`，command 直接就是 .mjs 路径。
+  // 只认 `process` 会让它活下来，与我们的新条目并存、每次事件跑两遍。
+  it('replaces a legacy bare-command bridge entry', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      hooks: { enabled: true, events: { Stop: [{ hooks: [
+        { type: 'command', command: '/home/u/.botmux/bin/zcode-session-hook.mjs', timeoutMs: 3000 },
+      ] }] } },
+    }));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    const hooks = doc.hooks.events.Stop.flatMap((g: any) => g.hooks);
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].type).toBe('process');
+    expect(JSON.stringify(hooks)).not.toContain('.mjs');
+  });
+
+  // 用户显式关掉了 hooks（他自己的其它 hook 也靠这个开关），不能被我们悄悄打开。
+  it('respects an explicit hooks.enabled: false', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ hooks: { enabled: false } }));
+    install(configPath);
+    const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(doc.hooks.enabled).toBe(false);
+    // 仍然注册事件：用户之后自己打开开关时无需重装。
+    expect(doc.hooks.events.SessionStart.flatMap((g: any) => g.hooks)[0].args)
+      .toContain('zcode-session-hook');
+  });
+
+  // 坏 JSON 时 readJsonFile 返回 null，若继续 `{...null, hooks}` 会把用户的
+  // mcp / providers 等顶层配置整体抹掉。必须拒绝写入。
+  it('refuses to overwrite a corrupt config file', () => {
+    const dir = makeTmpDir();
+    const configPath = join(dir, 'config.json');
+    const corrupt = '{"mcp": {"servers": {"keep": {"command": "x"}}';
+    writeFileSync(configPath, corrupt);
+    install(configPath);
+    expect(readFileSync(configPath, 'utf8')).toBe(corrupt);
+  });
 });

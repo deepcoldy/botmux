@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, statSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync, rmSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -111,6 +111,34 @@ describe('ensureZcodeProviderHelper', () => {
       env: { BOTMUX_ZCODE_SOURCE_DIR: join(root, 'no-such-tree'), BOTMUX_ZCODE_BUN: join(root, 'no-bun') },
       resume: false,
       helperPath: join(root, 'helper.mjs'),
+    });
+    expect(result).toEqual({});
+  });
+
+  // The helper is only useful once the codec exists, and writing it can fail in
+  // ordinary deployments (read-only HOME, ~/.botmux/bin occupied by a file,
+  // unwritable custom BOTMUX_ZCODE_PROVIDER_HELPER). A write failure must
+  // degrade like a missing codec instead of aborting the topic launch.
+  it('degrades to no model override when the helper cannot be written', async () => {
+    const { prepareZcodeSessionModel } = await import('../src/services/zcode-model-config.js');
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zcode-unwritable-')); directories.push(root);
+    // A fake source tree so the codec check passes; bun only has to exist.
+    mkdirSync(join(root, 'src', 'packages/provider-node/src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'packages/provider-node/src/index.ts'), 'export {};\n');
+    // The helper's parent path is a regular file → mkdirSync throws ENOTDIR.
+    const blocked = join(root, 'blocked');
+    writeFileSync(blocked, 'not a directory\n');
+    const result = await prepareZcodeSessionModel({
+      sessionId: randomUUID(),
+      dataDir: root,
+      // No explicit helperPath: the default path is resolved from this env, so
+      // the embedded bridge actually has to be materialised (and fails).
+      env: {
+        BOTMUX_ZCODE_SOURCE_DIR: join(root, 'src'),
+        BOTMUX_ZCODE_BUN: process.execPath,
+        BOTMUX_ZCODE_PROVIDER_HELPER: join(blocked, 'bin', 'zcode-provider-helper.mjs'),
+      },
+      resume: false,
     });
     expect(result).toEqual({});
   });
