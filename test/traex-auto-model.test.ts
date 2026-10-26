@@ -69,8 +69,8 @@ describe('normalizeTraexAutoModelConfig', () => {
     expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: {} }).config?.previousSettings).toEqual({});
     expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: { model: ' ' } }).config?.previousSettings).toEqual({});
   });
-  it.each([null, [], 'model', { model: 1 }, { model: ' AUTO ' }, { model: 'x'.repeat(257) },
-    { reasoningEffort: 'typo' }, { modelBackendVariant: 'giant' },
+  it.each([[null], [[]], ['model'], [{ model: 1 }], [{ model: ' AUTO ' }], [{ model: 'x'.repeat(257) }],
+    [{ reasoningEffort: 'typo' }], [{ modelBackendVariant: 'giant' }],
   ])('rejects invalid normal settings snapshots (%j)', previousSettings => {
     expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'], previousSettings }).error).toContain('previousSettings');
   });
