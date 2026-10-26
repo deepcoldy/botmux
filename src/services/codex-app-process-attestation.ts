@@ -10,6 +10,20 @@ export interface CodexAppProcessIdentity {
   engineProcStart: string;
 }
 
+/** An idle replacement may supersede an exited (including unreaped zombie)
+ * engine, never a live engine. Unreadable/invalid metadata is not exit proof. */
+export function codexAppEngineHasExited(identity: CodexAppProcessIdentity, procRoot = '/proc'): boolean {
+  if (procRoot === '/proc' && process.platform !== 'linux') return false;
+  try {
+    const raw = readFileSync(join(procRoot, String(identity.enginePid), 'stat'), 'utf8');
+    const token = procStatStartTimeDigits(raw);
+    const fields = procStatFieldsAfterComm(raw);
+    return !!token && (token !== identity.engineProcStart || fields?.[0] === 'Z' || fields?.[0] === 'X');
+  } catch (error) {
+    return ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
+  }
+}
+
 function start(pid: number, procRoot: string): string | undefined {
   try { return procStatStartTimeDigits(readFileSync(join(procRoot, String(pid), 'stat'), 'utf8')); }
   catch { return undefined; }

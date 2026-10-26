@@ -1635,6 +1635,14 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     strictThreadResume = true;
     startupDeadlineAtMs ??= Date.now() + DEFAULT_REQUEST_TIMEOUT_MS;
     await initializeAppServer(startupDeadlineAtMs);
+    // No native turn has been submitted to the replacement engine yet. Publish
+    // its proof before thread/resume or turn/start can emit activity/tools.
+    // The queued input is still work: never publish prompt-ready at this edge.
+    emitMarker('state', {
+      busy: true, tracksTurn: false, acceptingInput: runnerReady, atMs: Date.now(),
+      ...(client.processIdentity ? { processIdentity: client.processIdentity } : {}),
+      processIdentityBoundary: 'idle_restart',
+    });
   }
   if (threadReady && threadId) return threadId;
 

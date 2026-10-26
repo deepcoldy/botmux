@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -15,7 +15,10 @@ import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { resolveBunExecutable, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
+import { applyTrustedCodexAppStateMarker, CodexAppReadyAuthority, CodexAppTurnLiveness } from '../src/utils/codex-app-turn-liveness.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
@@ -102,6 +105,7 @@ class ControlCollector {
     private readonly disconnectOnFirstFinalChunk = false,
     private readonly omitFirstFinalChunk = false,
     private readonly disconnectAfterFirstFinalEndBeforeAck = false,
+    private readonly applyState?: (payload: Record<string, any>) => Promise<boolean>,
   ) {
     this.socketDirectory = mkdtempSync('/tmp/bca-sock-');
     this.socketPath = codexAppControlSocketPath(this.socketDirectory, SESSION_ID);
@@ -159,7 +163,8 @@ class ControlCollector {
     const finalAssembler = new CodexAppControlFinalAssembler();
     const challenge = generateCodexAppControlChallenge();
     let authenticated = false;
-    socket.on('data', chunk => {
+    let processing = Promise.resolve();
+    socket.on('data', chunk => { processing = processing.then(async () => {
       const decoded = decoder.push(chunk);
       if (decoded.droppedMalformed) socket.destroy();
       for (const line of decoded.lines) {
@@ -211,6 +216,10 @@ class ControlCollector {
           )}\n`);
           continue;
         }
+        if (record.kind === 'state' && this.applyState && !await this.applyState(record.payload)) {
+          socket.destroy();
+          return;
+        }
         this.markers.push({ kind: record.kind, payload: record.payload });
         if (record.kind === 'final-chunk'
             && this.disconnectOnFirstFinalChunk
@@ -253,7 +262,7 @@ class ControlCollector {
           record.seq,
         )}\n`);
       }
-    });
+    }).catch(() => socket.destroy()); });
     socket.on('error', () => undefined);
     socket.on('close', () => this.sockets.delete(socket));
     socket.write(`${encodeCodexAppControlChallenge(SESSION_ID, challenge)}\n`);
@@ -1892,6 +1901,82 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const fatals = control.markers.filter(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal');
       expect(fatals[0].payload.category).toBe('protocol');
       expect(control.finals.some((f: any) => f.content?.includes('answer under id B'))).toBe(false);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux' || !resolveBunExecutable())('registers native engines across idle recovery on the authenticated worker path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-native-engine-recovery-'));
+    const fakeCodex = join(dir, 'codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const pidPath = join(dir, 'app-server.pid');
+    // A Node script cannot reach process attestation (/proc/exe is node).
+    // Compile to an actual codex executable; do not mock the kernel proof.
+    const build = spawnSync(resolveBunExecutable()!, ['build', '--compile', FAKE_SERVER_FIXTURE, '--outfile', fakeCodex],
+      { encoding: 'utf8', timeout: 60_000 });
+    expect(build.status, build.stderr).toBe(0);
+    const published: any[] = [];
+    const rejected: string[] = [];
+    const tracker = new CodexAppTurnLiveness();
+    const authority = new CodexAppReadyAuthority();
+    let harness: Harness | undefined;
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'codex-app', sessionId: SESSION_ID },
+      isCodexAppCliId: (id: string) => id === 'codex-app',
+      backend: { getChildPid: () => harness?.child.pid },
+      codexAppRunnerProcessIdentity: undefined,
+      captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity,
+      publishLocalProcessAttestation: () => published.push(scope.codexAppRunnerProcessIdentity),
+      rejectCodexAppControlMarker: (reason: string) => rejected.push(reason),
+      codexAppSignedStateReadiness: (payload: any) => payload.acceptingInput ? 'ready' : 'waiting',
+      applyTrustedCodexAppStateMarker, codexAppTurnLiveness: tracker, codexAppReadyAuthority: authority,
+      codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
+      awaitingFirstPrompt: false, idleDetector: { reset() {} }, queueMicrotask() {},
+      codexAppCompletionAwaitingFinal: false, codexAppTurnDispatchQueue: { recoveredPrefix: () => [] },
+    };
+    const apply = loadWorkerFunction<(kind: string, payload: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
+    const control = new ControlCollector(dir, false, false, false, false, payload => apply('state', payload));
+    await control.listen();
+    harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
+      { env: { FAKE_CODEX_PID_PATH: pidPath } });
+    try {
+      await waitFor(harness, () => control.states.at(-1)?.busy === false);
+      expect(published).toHaveLength(1);
+      for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
+        if (index === 1) {
+          const pid = Number(readFileSync(pidPath, 'utf8'));
+          process.kill(pid, 'SIGTERM');
+          await waitFor(harness, () => {
+            try { process.kill(pid, 0); return false; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; throw error; }
+          });
+        }
+        // Production reserves a local liveness slot BEFORE the runner discovers
+        // the dead engine. This must not be confused with native execution.
+        tracker.begin(turnId);
+        authority.beginWork();
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
+        await waitFor(harness, () => control.finals.length === index + 1);
+        tracker.completeCurrent();
+        await waitFor(harness, () => control.states.at(-1)?.busy === false);
+      }
+      expect(rejected).toEqual([]);
+      expect(published).toHaveLength(2);
+      expect(published[1].enginePid).not.toBe(published[0].enginePid);
+      const boundary = control.states.find(state => state.processIdentityBoundary === 'idle_restart');
+      expect(boundary).toMatchObject({ busy: true, tracksTurn: false, processIdentity: published[1] });
+      const boundaryIndex = control.markers.findIndex(marker => marker.payload === boundary);
+      const submittedAfter = control.markers.findIndex((marker, index) => index > boundaryIndex
+        && marker.kind === 'activity' && marker.payload.phase === 'submitted');
+      expect(boundaryIndex).toBeGreaterThan(-1);
+      expect(submittedAfter).toBeGreaterThan(boundaryIndex);
+      expect(control.authCount).toBe(1);
+      expect(control.finals.map(final => final.turnId)).toEqual(['om_native_before', 'om_native_after', 'om_native_next']);
+      expect(readRequests(logPath).filter(request => request.method === 'thread/start')).toHaveLength(1);
+      expect(readRequests(logPath).filter(request => request.method === 'thread/resume')).toHaveLength(1);
     } finally {
       await stopChild(harness.child);
       await control.close();

@@ -656,7 +656,7 @@ import {
   CodexAppTurnLiveness,
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
-import { captureAttachedCodexAppProcessIdentity, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
+import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -13590,8 +13590,21 @@ async function handleTrustedCodexAppMarker(
         codexAppRunnerProcessIdentity = identity;
         publishLocalProcessAttestation(backendPid);
       } else if (JSON.stringify(identity) !== JSON.stringify(codexAppRunnerProcessIdentity)) {
-        rejectCodexAppControlMarker('app-server process changed within control generation');
-        return false;
+        // A local submit slot can already exist while the runner is recovering
+        // an idle engine, so tracker.hasActiveTurn() is not a native-busy proof.
+        // Only the signed pre-submit recovery boundary can rotate the root,
+        // after the old engine has exited and the replacement passed the same
+        // kernel/stdio checks as initial registration. Ordinary state changes
+        // must not resnapshot tools or bless an engine swap during native work.
+        if (payload.processIdentityBoundary !== 'idle_restart'
+            || payload.busy !== true || payload.tracksTurn !== false
+            || payload.acceptingInput !== true || codexAppCompletionAwaitingFinal
+            || !codexAppEngineHasExited(codexAppRunnerProcessIdentity)) {
+          rejectCodexAppControlMarker('app-server process changed outside idle recovery');
+          return false;
+        }
+        codexAppRunnerProcessIdentity = identity;
+        publishLocalProcessAttestation(backendPid);
       }
     }
     const readiness = codexAppSignedStateReadiness(payload);

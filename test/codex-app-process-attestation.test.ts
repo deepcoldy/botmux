@@ -1,8 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { captureAttachedCodexAppProcessIdentity, captureCodexAppProcessIdentity, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
+import { captureAttachedCodexAppProcessIdentity, captureCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
 
 const roots: string[] = [];
@@ -30,6 +30,20 @@ function fixture() {
 }
 
 describe('Codex App signed runtime process identity', () => {
+  it('distinguishes a dead/zombie engine from live or unreadable identity metadata', () => {
+    const { root, identity } = fixture();
+    expect(codexAppEngineHasExited(identity, root)).toBe(false);
+    const path = join(root, '70', 'stat');
+    const raw = readFileSync(path, 'utf8');
+    writeFileSync(path, raw.replace(') S ', ') Z '));
+    expect(codexAppEngineHasExited(identity, root)).toBe(true);
+    writeFileSync(path, raw);
+    expect(codexAppEngineHasExited({ ...identity, engineProcStart: '699' }, root)).toBe(true);
+    writeFileSync(path, 'invalid stat');
+    expect(codexAppEngineHasExited(identity, root)).toBe(false);
+    unlinkSync(path);
+    expect(codexAppEngineHasExited(identity, root)).toBe(true);
+  });
   it('captures the native stdio server behind the persistent npm launcher', () => {
     const { root, identity } = fixture();
     expect(captureCodexAppProcessIdentity(60, root)).toEqual(identity);
@@ -104,6 +118,17 @@ describe('Codex App signed runtime process identity', () => {
     const request = () => resolveDaemonCurrentExecution({ sessionId: 's1', peer: { pid: 100, procStart: '1000' },
       findSession: () => ds, procRoot: root });
     expect(request()).toMatchObject({ status: 'verified', turnId: 'turn2' });
+    proc(root, 71, 60, '/release/bin/codex', ['codex', 'app-server', '--listen', 'stdio://']);
+    proc(root, 101, 71, '/bin/sh', ['sh', '-c', 'new tool']);
+    ds.localProcessAttestation.enginePid = 71;
+    ds.localProcessAttestation.engineProcStart = '710';
+    // An old tool/dispatcher remains alive, but cannot follow a replacement
+    // engine into the next execution. Only the new engine's tool is accepted.
+    expect(request()).toBeNull();
+    expect(resolveDaemonCurrentExecution({ sessionId: 's1', peer: { pid: 101, procStart: '1010' },
+      findSession: () => ds, procRoot: root })).toMatchObject({ status: 'verified' });
+    ds.localProcessAttestation.enginePid = 70;
+    ds.localProcessAttestation.engineProcStart = '700';
     ds.managedTurnOrigin.preexistingProcessIdentities.push('100:1000');
     ds.managedTurnOrigin.turnId = 'turn3';
     expect(request()).toBeNull();
