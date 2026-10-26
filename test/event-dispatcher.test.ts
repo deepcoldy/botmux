@@ -242,7 +242,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -4179,6 +4179,7 @@ describe('message listener polling backfill', () => {
     __resetEventClaimsForTest();
     _resetGrantPending();
     __resetMessageListenerPollCursorForTest();
+    __resetListenerCircuitsForTest();
     mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
     setupBotState({
       allowedUsers: [USER_OPEN_ID],
@@ -4727,6 +4728,97 @@ describe('message listener polling backfill', () => {
 
     expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat_listener', expect.any(Object));
     vi.useRealTimers();
+  });
+
+  it('opens a circuit after 3 permanent 230002 polls, DMs admin once, skips polls, then resumes on a successful probe', async () => {
+    mockSendUserMessage.mockClear();
+    const notInChat = {
+      message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230002, msg: 'Bot/User can NOT be out of the chat.' } },
+    };
+    mockListChatMessagesUntil.mockRejectedValue(notInChat);
+
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3);
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+
+    // 熔断后本拍不再向飞书发请求。
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3);
+
+    // 未到慢探测节拍（10 分钟）仍然跳过。
+    let t = Date.now();
+    __setListenerClockForTest(() => t + 9 * 60_000);
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3);
+
+    // 到探测节拍放行一次，成功即自动回岗。
+    t += 10 * 60_000;
+    mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(1);
+
+    // 回岗后的两次失败不再告警（本串告警只发一次；也尚未重新达到熔断阈值）。
+    mockListChatMessagesUntil.mockRejectedValue(notInChat);
+    for (let i = 0; i < 2; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    __setListenerClockForTest(null);
+  });
+
+  it('never circuits on rate-limit code 230020 and never DMs admin', async () => {
+    mockSendUserMessage.mockClear();
+    mockListChatMessagesUntil.mockReset().mockRejectedValue({
+      message: 'rate limited (code: 230020)',
+      response: { status: 400, data: { code: 230020, msg: 'rate limited' } },
+    });
+    for (let i = 0; i < 5; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+    // 每一拍都照常请求（没有跳过），且不发假的「被移出群」私信。
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(5);
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('dedupes admin DMs per app when several chats circuit-open in the same window', async () => {
+    mockSendUserMessage.mockClear();
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_one: {
+          enabled: true,
+          prompt: 'p1',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+        chat_two: {
+          enabled: true,
+          prompt: 'p2',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    mockListChatMessagesUntil.mockReset().mockRejectedValue({
+      message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230002 } },
+    });
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+    // 两个群都熔断（各请求 3 次），但同一 app 一个窗口只私信一次。
+    expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(6);
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
   });
 });
 

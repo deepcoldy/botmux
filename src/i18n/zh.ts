@@ -1358,6 +1358,7 @@ export const messages: Record<string, string> = {
   'worker.working_dir_missing_opening_text': '⚠️ 工作目录不存在：{path}\n这条消息还没有开始处理，CLI 也没有在其它目录运行。在本话题发送 `/repo <路径|项目名>` 选一个目录，消息会在那里开始。',
   'worker.cli_install_changed': '♻️ {cli} 已升级到 {installed}，当前进程还是旧版 {running}，旧进程按需加载的模块会报 Cannot find module。本轮结束后会自动休眠这个会话，下一条消息用新版本冷启动并接着原会话；刚才失败的消息重发即可。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
+  'worker.crash_permanent_exit_stopped': '⚠️ {cliName} 因确定性错误退出（退出码 {code}），已停止自动重启——这类失败重启也不会变好（常见原因：身份/凭证缺失、CLI 未安装或路径不可用）。修复后发消息可重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
   'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',

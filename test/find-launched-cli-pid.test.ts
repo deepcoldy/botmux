@@ -145,7 +145,12 @@ function runWorkerWiring(late: boolean, options: {
       ...opts,
       probes: {
         readCmdline: context.readCmdline, childrenOf: context.getChildPids,
-        commOf: context.readComm, scopePayloadOf: context.sessionScopePayloadPid,
+        commOf: context.readComm,
+        // Synthetic table: no modelled pid is a zombie. An injected probe keeps
+        // the walk off the host's real /proc (a low synthetic pid such as 150
+        // may exist on the host and would be read by the default probe).
+        isZombie: () => false,
+        scopePayloadOf: context.sessionScopePayloadPid,
       },
     }),
   });

@@ -856,6 +856,8 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { classifyLarkError } from './im/lark/error-classify.js';
+import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { pruneBotAttachments } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
@@ -29697,6 +29699,12 @@ function handleChatModeConverted(chatId: string, larkAppId: string): boolean {
 export const __testOnly_handleChatModeConverted = handleChatModeConverted;
 
 let docCommentPollRunning = false;
+// 永久失败文档（失权/删除）的 per-file 熔断；探测节拍 10 分钟，跨 daemon 重启
+// 不持久化（重启后重新计数，可接受——3 次连续 4xx 即再次熔断）。
+const docCommentPollCircuits = new ListenerCircuitBreaker({
+  permanentThreshold: 3,
+  probeIntervalMs: 10 * 60_000,
+});
 
 async function retryPendingDocCommentDeliveries(
   larkAppId: string,
@@ -29775,13 +29783,50 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
     const pendingRetry = await retryPendingDocCommentDeliveries(larkAppId);
     const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
       .filter(sub => sub.managedBy === 'watch-comment' && isPollingDocTriggerMode(sub.commentTriggerMode));
+    // 永久失权/删除的文档熔断后，每 10 分钟只探测一次，避免 5s 节拍对死文档空转。
+    const liveKeys = new Set(subs.map(sub => `${larkAppId}:${sub.fileToken}`));
+    docCommentPollCircuits.prune(liveKeys);
     for (const snapshot of subs) {
+      const circuitKey = `${larkAppId}:${snapshot.fileToken}`;
+      // pending 重试阻塞中的文件本轮不会被处理，判断要放在 shouldPoll 之前，
+      // 否则每 5s 空耗一次熔断慢探测额度（探测间隔 10 分钟）。
+      if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
+      if (!docCommentPollCircuits.shouldPoll(circuitKey)) continue;
+
+      // 第一段：只有「读评论列表」的可达性结果决定熔断。游标写入、评论投递等
+      // 处理阶段的错误与「文档是否永久不可达」无关（投递失败被收敛为游标不推进、
+      // 下轮重试），不能进熔断——历史上一个 try 包住整条链路，处理阶段抛出的
+      // 403/404 会把一篇可读文档推入熔断。
+      let comments;
       try {
-        if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
-        const comments = await listDocComments(larkAppId, {
+        comments = await listDocComments(larkAppId, {
           fileToken: snapshot.fileToken,
           fileType: snapshot.fileType,
         });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
+        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
+        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
+        // 永久错误（真实形态：DocProviderRejectedError 的 httpStatus 403/404、
+        // UserTokenForbidden/DocSubscriptionPermission 的业务码 1069603）连续命中即
+        // 熔断，不再每 5s 空转；瞬时网络/限流错误不熔断，下一拍继续。
+        const classified = classifyLarkError(err);
+        if (classified.classification === 'permanent'
+          && docCommentPollCircuits.recordPermanent(circuitKey)) {
+          logger.warn(`[doc-comment-poll] circuit OPEN file=${snapshot.fileToken.slice(0, 12)} code=${classified.larkCode ?? classified.httpStatus ?? '?'}`);
+          recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, {
+            outcome: 'poll-circuit-open',
+            error: `permanent ${classified.larkCode ?? classified.httpStatus ?? ''} ${message}`.slice(0, 300),
+          });
+        }
+        continue;
+      }
+      docCommentPollCircuits.recordSuccess(circuitKey); // 文档可达：若此前在熔断则自动恢复
+
+      // 第二段：游标/基线/评论投递。失败保留原有 poll-failed 观测，但不触碰熔断状态。
+      try {
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
         if (!current || current.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(current.commentTriggerMode)) continue;
@@ -29877,10 +29922,9 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
           (reply) => { commitDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
+        // 处理/投递阶段失败：保留可观测性，但不改变熔断状态（文档本身本拍可达）。
         const message = err instanceof Error ? err.message : String(err);
-        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
-        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
-        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} processing failed: ${message}`);
         recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
       }
     }
@@ -32722,6 +32766,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
+  scheduler.setScheduleFailureAlert((task, consecutiveFailures, lastError) => {
+    // 周期任务连续失败达到阈值：私信一个可操作的管理员一次，避免像协作人
+    // 日更那样静默失败十余天无人知。无可用管理员则只留 error 日志。
+    const bot = getBot(cfg.larkAppId);
+    const adminOpenId = bot?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+    const detail = (lastError ?? '').slice(0, 200);
+    const text =
+      `[botmux 定时任务告警]「${task.name}」(id=${task.id}) 已连续失败 ${consecutiveFailures} 次。\n` +
+      `最近错误：${detail || '(无错误信息)'}\n` +
+      `任务仍按计划触发；请到工作台查看该任务（${task.parsed.display}），确认目标群是否还在、授权与工作目录是否有效。成功执行一次后本告警自动解除。`;
+    if (adminOpenId) {
+      void sendUserMessage(cfg.larkAppId, adminOpenId, text, 'text')
+        .then(() => logger.info(`[scheduler] failure alert DM sent for task=${task.id} to ${adminOpenId.substring(0, 12)}`))
+        .catch(err => logger.warn(`[scheduler] failure alert DM failed for task=${task.id}: ${err instanceof Error ? err.message : String(err)}`));
+    } else {
+      logger.error(`[scheduler] task ${task.id} failed ${consecutiveFailures}x but no admin open id available to alert`);
+    }
+  });
   scheduler.startScheduler();
 
   // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。

@@ -391,6 +391,8 @@ function migrate(raw: any): ScheduledTask | null {
     lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
+    consecutiveFailures: typeof raw.consecutiveFailures === 'number' ? raw.consecutiveFailures : undefined,
+    failureAlertSent: raw.failureAlertSent === true ? true : undefined,
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
@@ -605,6 +607,28 @@ function load(appId?: string): void {
  *  up front. */
 const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
 
+/** 周期任务连续失败达到此次数后发出一次告警（成功即清零）。 */
+export const SCHEDULE_FAILURE_ALERT_THRESHOLD = 3;
+
+/**
+ * 连续失败计数 / 告警水印的唯一推进规则，schedule-store（JSON legacy 路径）
+ * 与 scheduler（authority store 生产路径）共用，避免两份实现漂移：
+ *  - 成功：计数清零、水印清除，下一轮失败串允许再告警一次；
+ *  - 失败：计数 +1，达到阈值且本串尚未告警时 crossedFailureThreshold=true，
+ *    由调用方据此投递一次告警；阈值之后继续失败不再重复 crossed。
+ */
+export function nextFailureTracking(
+  current: { consecutiveFailures?: number; failureAlertSent?: boolean } | undefined,
+  success: boolean,
+): { consecutiveFailures: number; failureAlertSent: boolean; crossedFailureThreshold: boolean } {
+  if (success) return { consecutiveFailures: 0, failureAlertSent: false, crossedFailureThreshold: false };
+  const consecutiveFailures = (current?.consecutiveFailures ?? 0) + 1;
+  const alreadyAlerted = current?.failureAlertSent === true;
+  const crossedFailureThreshold =
+    consecutiveFailures >= SCHEDULE_FAILURE_ALERT_THRESHOLD && !alreadyAlerted;
+  return { consecutiveFailures, failureAlertSent: alreadyAlerted || crossedFailureThreshold, crossedFailureThreshold };
+}
+
 function assertValidTaskId(id: string): void {
   if (!TASK_ID_RE.test(id)) {
     throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
@@ -766,7 +790,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'consecutiveFailures' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {
@@ -882,7 +906,9 @@ export function markRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
-): void {
+): { removedAfterTimes?: number; crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  let crossedFailureThreshold = false;
+  let consecutiveFailures = 0;
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
@@ -895,6 +921,12 @@ export function markRun(
     task.lastStatus = success ? 'ok' : 'error';
     task.lastError = success ? undefined : error;
     task.lastDeliveryError = deliveryError;
+
+    const tracking = nextFailureTracking(task, success);
+    task.consecutiveFailures = tracking.consecutiveFailures;
+    task.failureAlertSent = tracking.failureAlertSent;
+    crossedFailureThreshold = tracking.crossedFailureThreshold;
+    consecutiveFailures = tracking.consecutiveFailures;
 
     // Advance repeat counter
     if (task.repeat) {
@@ -917,6 +949,9 @@ export function markRun(
   if (completedRepeat !== undefined) {
     logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
   }
+  return completedRepeat !== undefined
+    ? { removedAfterTimes: completedRepeat, crossedFailureThreshold, consecutiveFailures }
+    : { crossedFailureThreshold, consecutiveFailures };
 }
 
 export function listTasks(appId?: string): ScheduledTask[] {
