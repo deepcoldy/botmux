@@ -140,7 +140,7 @@ describe('managed Orca conversations', () => {
     await f.start(runner);
     const done = f.wait('final'); await f.turn(runner);
     expect(await done).toMatchObject({ content: '', turnId: 'bot-turn' });
-    expect(f.events.find(e => e.type === 'outbound_message')).toMatchObject({ content: 'verified answer', responseKind: 'final' });
+    expect(f.events.find(e => e.type === 'outbound_message')).toMatchObject({ content: 'verified answer', responseKind: 'final', mention: 'none' });
     const launch = f.runtime.calls.find(c => c.method === 'agent.launchReplay')!.params;
     expect(launch).toMatchObject({ agent: 'codex', surface: 'chat', target: { kind: 'existing', worktree: 'id:workspace' } });
     expect(launch).not.toHaveProperty('prompt');
@@ -231,6 +231,43 @@ describe('managed Orca conversations', () => {
     const outbound = f.wait('outbound_message'); await f.turn(first); await outbound; await first.dispose();
     const failed = f.wait('failure'); await f.resume(f.create(), initial);
     expect(await failed).toMatchObject({ status: 'ambiguous' });
+    expect(f.events.filter(e => e.type === 'outbound_message')).toHaveLength(1);
+  });
+
+  it.each(['rejected', 'unknown'] as const)('preserves a %s delivery diagnostic across runner recovery without resending', async outcome => {
+    const f = fixture(false); const first = f.create(); await f.start(first);
+    const outbound = f.wait('outbound_message'); await f.turn(first); const message = await outbound;
+    await first.handle(remoteRunnerCommand('outbound_message_result', {
+      requestId: 'receipt', operationId: message.operationId, turnId: message.turnId, generation: message.generation,
+      result: { outcome, code: 'send_policy', message: 'explicit mention required' },
+    }));
+    expect(f.events.at(-1)).toMatchObject({ type: 'failure', status: outcome === 'rejected' ? 'failed' : 'ambiguous' });
+    expect(f.events.at(-1).message).toContain('send_policy: explicit mention required');
+    const initial = f.events.find(e => e.type === 'ready').state;
+    await first.dispose();
+    const recovered = f.wait('failure'); const second = f.create(); await f.resume(second, initial);
+    expect((await recovered).message).toContain('send_policy: explicit mention required');
+    expect(f.events.filter(e => e.type === 'outbound_message')).toHaveLength(1);
+    expect(f.runtime.sends.size).toBe(1);
+    const next = f.wait(outcome === 'rejected' ? 'outbound_message' : 'failure');
+    await second.handle(remoteRunnerCommand('turn', { requestId: 'next', turnId: 'next-turn', content: 'new request' }));
+    expect(await next).toMatchObject(outcome === 'rejected'
+      ? { type: 'outbound_message', turnId: 'next-turn' }
+      : { type: 'failure', code: 'orca_request_failed', turnId: 'next-turn' });
+    expect(f.runtime.sends.size).toBe(outcome === 'rejected' ? 2 : 1);
+  });
+
+  it('resumes a host-settled rejected reply without leaving the conversation blocked', async () => {
+    const f = fixture(false); const first = f.create(); await f.start(first);
+    const outbound = f.wait('outbound_message'); await f.turn(first); const message = await outbound;
+    await first.handle(remoteRunnerCommand('outbound_message_result', {
+      requestId: 'receipt', operationId: message.operationId, turnId: message.turnId, generation: message.generation,
+      result: { outcome: 'rejected', code: 'send_policy', message: 'refused before delivery' },
+    }));
+    const state = f.events.findLast(e => e.type === 'lineage_changed').state;
+    await first.dispose(); await f.resume(f.create(), state);
+    expect(f.events.at(-1)).toMatchObject({ type: 'ready' });
+    expect(f.events.at(-1)).not.toHaveProperty('recoveredTurn');
     expect(f.events.filter(e => e.type === 'outbound_message')).toHaveLength(1);
   });
 

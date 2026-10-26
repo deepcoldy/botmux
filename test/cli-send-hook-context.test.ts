@@ -58,7 +58,7 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 const replyCaptureFixture = join(__dirname, 'fixtures', 'send-reply-card-capture.ts');
 
 /** Run `botmux send` through the real CLI with Lark HTTP captured (no network). */
-function runCapturedSend(args: string[], session: Record<string, unknown>, turnId = 'om_turn_capture') {
+function runCapturedSend(args: string[], session: Record<string, unknown>, turnId = 'om_turn_capture', remoteRunner = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-capture-'));
   const dataDir = join(root, 'data');
   try {
@@ -70,6 +70,7 @@ function runCapturedSend(args: string[], session: Record<string, unknown>, turnI
     seedPersistedSessionRows(dataDir, 'cli_test', { sid_capture: {
       sessionId: 'sid_capture', status: 'active', cliId: 'codex', larkAppId: 'cli_test',
       chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      ...(remoteRunner ? { cliId: 'orca-codex', backendType: 'remote-runner', pid: process.pid } : {}),
       ...session,
     } });
     const result = spawnSyncTsScript(replyCaptureFixture, ['send', ...args], {
@@ -79,6 +80,7 @@ function runCapturedSend(args: string[], session: Record<string, unknown>, turnI
       env: {
         PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
         BOTMUX_SESSION_ID: 'sid_capture', BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: 'cli_test',
+        ...(remoteRunner ? { BOTMUX_HOST_RELAY_AUTHORIZED: '1' } : {}),
       },
     });
     const requests = String(result.stdout).split('\n')
@@ -91,6 +93,25 @@ function runCapturedSend(args: string[], session: Record<string, unknown>, turnI
 }
 
 describe('cmdSend hook context wiring', () => {
+  it.each(['chat', 'thread'] as const)('delivers an Orca final in %s scope when the requester also mentions an alarm bot', scope => {
+    const session = { scope, quoteTargetId: 'om_turn_capture', quoteTargetSenderOpenId: 'ou_requester',
+      replyTargets: { om_turn_capture: { updatedAt: new Date().toISOString(), senderOpenId: 'ou_requester',
+        participants: [{ openId: 'ou_requester', isBot: false }, { openId: 'ou_alarm', isBot: true }] } } };
+    const args = ['--remote-runner-outbound', '--response-kind', 'final'];
+    const refused = runCapturedSend([...args, '--mention-back', 'diagnosis'], session, 'om_turn_capture', true);
+    expect(refused.status).toBe(2);
+    expect(refused.requests).toEqual([]);
+    const delivered = runCapturedSend([...args, '--no-mention', 'diagnosis'], session, 'om_turn_capture', true);
+    expect(delivered.status, delivered.stderr).toBe(0);
+    expect(delivered.requests).toHaveLength(1);
+    const request = delivered.requests[0];
+    expect(request.path).toBe(`/open-apis/im/v1/messages/${scope === 'chat' ? 'om_turn_capture' : 'om_root'}/reply`);
+    expect(request.body.reply_in_thread === true).toBe(scope === 'thread');
+    expect(JSON.stringify(request.body)).toContain('diagnosis');
+    expect(JSON.stringify(request.body)).not.toContain('ou_alarm');
+    expect(JSON.stringify(request.body)).not.toContain('ou_requester');
+  }, 40_000);
+
   it('strips a trailing memory citation before the direct send renders the reply', () => {
     const citation = [
       '<oai-mem-citation>', '<citation_entries>', 'MEMORY.md:10-12|note=[routing context]',

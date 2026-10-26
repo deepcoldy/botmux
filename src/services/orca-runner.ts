@@ -131,7 +131,7 @@ export class OrcaRunner {
       this.store!.save(state);
     }
     // Only an exact terminal identity plus our durable delivery receipt permits cleanup.
-    if (command.type === 'resume' && state.pending?.delivery === 'delivered'
+    if (command.type === 'resume' && (state.pending?.delivery === 'delivered' || state.pending?.delivery === 'rejected')
         && command.state.providerState?.settledTurnId === state.pending.turnId) {
       delete state.pending;
       this.store!.save(state);
@@ -223,7 +223,7 @@ export class OrcaRunner {
   }
 
   private settled(pending: OrcaPendingTurn): boolean {
-    return !!pending.completed?.failed || pending.delivery === 'delivered';
+    return !!pending.completed?.failed || pending.delivery === 'delivered' || pending.delivery === 'rejected';
   }
 
   private finish(pending: OrcaPendingTurn): void {
@@ -233,6 +233,11 @@ export class OrcaRunner {
         message: pending.completed!.failed, status: 'failed', retryable: false });
     } else if (pending.delivery === 'delivered') {
       this.emit({ type: 'final', turnId: pending.turnId, content: '', state: this.backendState() });
+    } else if (pending.delivery === 'rejected' || pending.delivery === 'unknown') {
+      this.emit({ type: 'lineage_changed', state: this.backendState() });
+      this.emit({ type: 'failure', turnId: pending.turnId, code: 'orca_reply_unconfirmed',
+        message: `Orca completed this turn, but the Bot reply was ${pending.delivery}: ${pending.deliveryError || 'inspect the answer in Orca'}`,
+        status: pending.delivery === 'rejected' ? 'failed' : 'ambiguous', retryable: false });
     } else if (pending.delivery) {
       throw new Error('Bot reply delivery is unconfirmed; inspect the answer in Orca. It will not be sent twice automatically');
     } else {
@@ -241,7 +246,7 @@ export class OrcaRunner {
       this.emit({ type: 'outbound_message', operationId: orcaTurnOperationId(pending),
         turnId: pending.turnId, generation: this.state!.generation,
         content: orcaReplyContent(pending.completed!.content),
-        responseKind: 'final', mention: 'requester' });
+        responseKind: 'final', mention: 'none' });
     }
   }
 
@@ -252,11 +257,11 @@ export class OrcaRunner {
       throw new Error('Orca delivery receipt does not match the pending reply');
     }
     pending.delivery = command.result.outcome;
+    if (command.result.outcome !== 'delivered') {
+      pending.deliveryError = `${command.result.code}: ${command.result.message}`;
+    }
     this.store!.save(this.state!);
-    if (command.result.outcome === 'delivered') this.finish(pending);
-    else this.emit({ type: 'failure', turnId: pending.turnId, code: 'orca_reply_unconfirmed',
-      message: `Bot reply was not confirmed (${command.result.outcome}); inspect the answer in Orca`,
-      status: 'ambiguous', retryable: false });
+    this.finish(pending);
   }
 
   private async close(requestId: string): Promise<void> {

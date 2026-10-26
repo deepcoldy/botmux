@@ -12,6 +12,7 @@ interface PendingTurn {
   startedAtMs: number;
   completed?: { content: string; failed?: string };
   delivery?: 'prepared' | 'delivered' | 'rejected' | 'unknown';
+  deliveryError?: string;
 }
 export interface OrcaChatTurn extends PendingTurn {
   cursor: OrcaCursor;
