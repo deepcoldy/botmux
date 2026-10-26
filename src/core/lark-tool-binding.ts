@@ -169,6 +169,9 @@ export function prepareLarkToolEnv(input: {
   defaultAs?: 'bot' | 'user';
   effectivePath?: string;
   runner?: { command: string; args: string[] };
+  /** Sandboxed session: the wrapper must name its runner by realpath, since a
+   *  fresh bwrap root has no alias for a symlinked home. */
+  canonicalPaths?: boolean;
 }): LarkToolBinding {
   const rootDir = resolveLarkToolDataDir(input.dataDir);
   const binDir = sessionIdentityBinDir(rootDir, input.sessionId);
@@ -204,10 +207,14 @@ export function prepareLarkToolEnv(input: {
   const runner = input.runner ?? (moduleDir.endsWith('/src/core')
     ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../lark-tool-runner.ts')] }
     : resolveEntrySpawn('lark-tool-runner', resolve(moduleDir, '..')));
+  const inSessionPath = (p: string): string => {
+    if (!input.canonicalPaths || !p.startsWith('/')) return p;
+    try { return realpathSync(p); } catch { return p; }
+  };
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
-    `exec ${[runner.command, ...runner.args, '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
+    `exec ${[inSessionPath(runner.command), ...runner.args.map(inSessionPath), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');

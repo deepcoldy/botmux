@@ -27,7 +27,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -22020,7 +22020,16 @@ async function spawnCli(
   if (!boundLark && process.env.SESSION_DATA_DIR) {
     cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
   }
-  const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
+  // A bwrap sandbox only mounts canonical paths: on a symlinked home/data root
+  // (`/home/u` -> `/data00/home/u`) a lexical helper path (GIT_ASKPASS, git
+  // credential helper, ZDOTDIR, ...) does not exist inside. The lark-bound
+  // branch already resolves the root; do the same for the plain trigger-user
+  // branch, sandbox only so unsandboxed sessions keep their exact env.
+  const identityDataDir = boundLark
+    ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!)
+    : process.env.SESSION_DATA_DIR && sandboxRequested
+      ? canonicalPathNearest(process.env.SESSION_DATA_DIR)
+      : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtraArgs = resolveCliExtraArgs();
 
@@ -22268,9 +22277,10 @@ async function spawnCli(
     childIdentityModel,
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
-      : undefined);
+      : undefined,
+    { canonicalPaths: sandboxRequested });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
-    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file
     // sandbox the agent runs as the same OS user as botmux and can read every
@@ -23645,7 +23655,7 @@ async function spawnCli(
           accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
           if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is unavailable');
           aidenCodexShimDir = installAidenCodexShim(
-            join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
+            join(sessionIdentityBinDir(sandboxRequested ? canonicalPathNearest(process.env.SESSION_DATA_DIR) : process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
           );
         } catch (e) {
           if (aidenCodexIdentityShellEnv) {
