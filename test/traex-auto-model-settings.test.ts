@@ -68,7 +68,9 @@ describe('TraeX auto-model settings', () => {
       });
       // Old clients omitting the field preserve it; an invalid pool is atomic.
       expect((await save({ cliId: 'traex', model: 'auto' })).status).toBe(200);
-      const configuredPool = { ...pool, modelSettings: {
+      const configuredPool = { ...pool, previousSettings: {
+        model: 'normal-model', reasoningEffort: 'xhigh', modelBackendVariant: 'max',
+      }, modelSettings: {
         'gpt-5.6-sol': { reasoningEffort: 'xhigh', modelBackendVariant: 'max' },
         'gpt-6-astra': { reasoningEffort: 'high', modelBackendVariant: 'standard' },
         'glm-5.1': {},
@@ -79,6 +81,8 @@ describe('TraeX auto-model settings', () => {
       expect(configuredBody).toMatchObject({ traexAutoModel: configuredPool });
       expect(configured.status).toBe(200);
       expect(getBot('auto_test').config.traexAutoModel).toEqual(configuredPool);
+      expect(loadBotConfigs()[0]!.traexAutoModel).toEqual(configuredPool);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ traexAutoModel: configuredPool });
       const invalidEffort = await save({ cliId: 'traex', model: 'auto', traexAutoModel: {
         ...configuredPool, modelSettings: { 'gpt-6-astra': { reasoningEffort: 'ultra' } },
       } });
@@ -102,8 +106,14 @@ describe('TraeX auto-model settings', () => {
       expect((await save({ cliId: 'traex', model: 'auto', traexAutoModel: { ...pool, models: ['auto'] } })).status).toBe(400);
       expect(readFileSync(path, 'utf8')).toBe(before);
       expect((await save({ cliId: 'traex', model: 'auto', traexAutoModel: null })).status).toBe(400);
-      expect((await save({ cliId: 'traex', model: pool.models[0], traexAutoModel: null })).status).toBe(200);
+      const disabled = await save({ cliId: 'traex', model: '', reasoningEffort: '', modelBackendVariant: '', traexAutoModel: null });
+      expect(disabled.status).toBe(200);
       expect(getBot('auto_test').config.traexAutoModel).toBeUndefined();
+      const inherited = loadBotConfigs()[0]!;
+      expect(inherited.model).toBeUndefined();
+      expect(inherited.reasoningEffort).toBeUndefined();
+      expect(inherited.modelBackendVariant).toBeUndefined();
+      expect(resolveSessionLaunchModelChoice({ session: { cliId: 'traex' } }, inherited).model).toBeUndefined();
       expect(resolveSessionLaunchModelChoice({ session: { cliId: 'claude-code' } }, {
         cliId: 'claude-code', model: 'auto', traexAutoModel: pool as any,
       })).toEqual({ model: 'auto' });
@@ -253,7 +263,7 @@ describe('TraeX auto-model settings', () => {
       expect(rendered!.root.findByProps({ dataInput: 'autoModel0' }).props.value).toBe('draft-model');
       toggle(false);
       await act(async () => { await rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
-      expect(saved).toMatchObject({ model: 'draft-model', traexAutoModel: null });
+      expect(saved).toMatchObject({ model: '', reasoningEffort: '', modelBackendVariant: '', traexAutoModel: null });
       expect(entries.size).toBe(1);
       act(() => rendered!.unmount());
       await mount();

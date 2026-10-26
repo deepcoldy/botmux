@@ -44,12 +44,87 @@ describe('Auto editor save and draft continuity', () => {
     await act(async () => { rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
     expect(saved.reasoningEffort).toBe('xhigh');
   });
-  it('disabling preserves preferred model reasoning advertised by the live catalog', async () => {
-    await mount({ larkAppId: 'review-disable', cliId: 'traex', model: 'auto', traexAutoModel: pool });
+  it('disabling a legacy pool inherits defaults and clears shared overrides', async () => {
+    await mount({ larkAppId: 'review-disable', cliId: 'traex', model: 'auto', traexAutoModel: pool,
+      reasoningEffort: 'high', modelBackendVariant: 'max' });
     act(() => rendered!.root.findByProps({ 'data-input': 'autoModelEnabled' }).props.onChange({ currentTarget: { checked: false } }));
     await act(async () => { rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
-    expect(saved.model).toBe(model);
-    expect(saved.reasoningEffort).toBe('xhigh');
+    expect(saved).toMatchObject({ model: '', reasoningEffort: '', modelBackendVariant: '', traexAutoModel: null });
+  });
+  it('restores edited normal settings after saving Auto and remounting with a different pool draft', async () => {
+    let bot: any = { larkAppId: 'restore-saved', cliId: 'traex', model, reasoningEffort: 'low', modelBackendVariant: 'max' };
+    const normal = { model: 'future-live-model', reasoningEffort: 'xhigh', modelBackendVariant: 'standard' };
+    const models = { ...catalog, models: [model, normal.model], modelCapabilities: [
+      ...catalog.modelCapabilities, { ...catalog.modelCapabilities[0]!, slug: normal.model },
+    ] };
+    const remember = (patch: any) => { bot = { ...bot, ...patch }; };
+    await mount(bot, remember, models);
+    act(() => {
+      rendered!.root.findByProps({ dataInput: 'agentModel' }).props.onChange(normal.model);
+      rendered!.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.onChange(normal.reasoningEffort);
+      rendered!.root.findByProps({ dataInput: 'agentModelBackendVariant' }).props.onChange(normal.modelBackendVariant);
+    });
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(true));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onModels([model]));
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    expect(saved.traexAutoModel.previousSettings).toEqual(normal);
+    expect(bot.model).toBe('auto');
+    act(() => rendered!.unmount());
+    writeAutoModelDraft(bot.larkAppId, { models: ['draft-only-model'], modelSettings: {},
+      reselectPerTurn: false, timeoutSeconds: '15', cooldownSeconds: '30' });
+    await mount(bot, remember, models);
+    expect(rendered!.root.findByType(TraexAutoModelEditor).props.models).toEqual(['draft-only-model']);
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(false));
+    expect(rendered!.root.findByProps({ dataInput: 'agentModel' }).props.value).toBe(normal.model);
+    expect(rendered!.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe(normal.reasoningEffort);
+    expect(rendered!.root.findByProps({ dataInput: 'agentModelBackendVariant' }).props.value).toBe(normal.modelBackendVariant);
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    expect(saved).toMatchObject({ ...normal, traexAutoModel: null });
+    // Each new enable captures the latest normal edits, not the old snapshot.
+    act(() => rendered!.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.onChange('high'));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(true));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(false));
+    expect(rendered!.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('high');
+  });
+  it.each([
+    {},
+    { model },
+    { reasoningEffort: 'high', modelBackendVariant: 'standard' },
+  ])('preserves independently inherited settings through an unsaved toggle (%j)', async normal => {
+    await mount({ larkAppId: 'restore-inherit', cliId: 'traex', ...normal });
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(true));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onModels([model]));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(false));
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    expect(saved).toMatchObject({
+      model: 'model' in normal ? normal.model : '',
+      reasoningEffort: 'reasoningEffort' in normal ? normal.reasoningEffort : '',
+      modelBackendVariant: 'modelBackendVariant' in normal ? normal.modelBackendVariant : '',
+      traexAutoModel: null,
+    });
+  });
+  it('does not carry another Bot snapshot into a legacy pool when the editor is reused', async () => {
+    await mount({ larkAppId: 'snapshot-a', cliId: 'traex', model: 'auto',
+      traexAutoModel: { ...pool, previousSettings: { model, reasoningEffort: 'high' } } });
+    await act(async () => rendered!.update(React.createElement(BotAgentSection, {
+      bot: { larkAppId: 'snapshot-b', cliId: 'traex', model: 'auto', traexAutoModel: pool },
+      sessionFallback: 'traex', cliState, patchBot: vi.fn(),
+    })));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(false));
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    expect(saved).toMatchObject({ model: '', reasoningEffort: '', modelBackendVariant: '', traexAutoModel: null });
+  });
+  it('keeps the original snapshot after a failed Auto save', async () => {
+    await mount({ larkAppId: 'restore-failed', cliId: 'traex', model, reasoningEffort: 'high', modelBackendVariant: 'standard' });
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => init?.method === 'PUT'
+      ? { ok: false, status: 500, json: async () => ({ ok: false, error: 'fixture_failure' }) }
+      : { ok: true, status: 200, json: async () => catalog }));
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(true));
+    await act(async () => rendered!.root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+    act(() => rendered!.root.findByType(TraexAutoModelEditor).props.onEnabled(false));
+    expect(rendered!.root.findByProps({ dataInput: 'agentModel' }).props.value).toBe(model);
+    expect(rendered!.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('high');
+    expect(rendered!.root.findByProps({ dataInput: 'agentModelBackendVariant' }).props.value).toBe('standard');
   });
   it('saving disabled state does not mark it dirty again', async () => {
     await mount({ larkAppId: 'review-disable-dirty', cliId: 'traex', model: 'auto', traexAutoModel: pool });
