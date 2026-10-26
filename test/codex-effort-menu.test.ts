@@ -75,6 +75,22 @@ describe('Codex CLI effort menu', () => {
     expect(keys.filter(key => key === 's')).toHaveLength(1);
   });
 
+  it('waits for the picker to visibly close after a native settings receipt', async () => {
+    const { io } = fixture();
+    const screen = io.screen;
+    const settings = io.settings;
+    let closingFrames = 0;
+    io.screen = async () => {
+      if (settings() && closingFrames++ < 2) {
+        return picker('Advanced Reasoning', ['Max', 'Ultra'], 0);
+      }
+      return screen();
+    };
+    expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'max'))
+      .toEqual({ status: 'future_only', reason: 'cli_next_turn' });
+    expect(closingFrames).toBeGreaterThanOrEqual(3);
+  });
+
   it('selects Ultra session-only when a forked Codex 0.164 menu says enter apply', async () => {
     const { io, keys } = fixture({ effort: 'ultra', applyFooter: true });
     expect(await applyCodexEffortMenu(io, 'gpt-6-astra', 'ultra'))

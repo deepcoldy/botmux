@@ -2766,6 +2766,8 @@ export interface RoutingContext {
   /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
    *  一次性副作用（thread.reply hook、learnFromMentions），且不被级联在飞的推迟闸拦住。 */
   cascadeBodyReentry?: true;
+  /** An already-authorized effort command re-enters ordinary task admission. */
+  effortTaskReentry?: true;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */

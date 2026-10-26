@@ -98,6 +98,8 @@ const mocks = vi.hoisted(() => {
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     }),
+    sendWorkerInput: vi.fn(() => true),
+    updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
@@ -150,7 +152,10 @@ vi.mock('../src/services/session-store.js', async () => {
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: mocks.forkWorker };
+  return { ...actual, forkWorker: mocks.forkWorker,
+    sendWorkerInput: (...args: any[]) => String(args[2] ?? '').startsWith('om_effort')
+      ? mocks.sendWorkerInput(...args) : actual.sendWorkerInput(...args),
+    updateCodexCliEffort: mocks.updateCodexCliEffort };
 });
 
 vi.mock('../src/core/session-manager.js', async () => {
@@ -339,6 +344,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    mocks.sendWorkerInput.mockReset().mockReturnValue(true);
+    mocks.updateCodexCliEffort.mockReset().mockResolvedValue({ status: 'future_only', reason: 'cli_next_turn' });
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -347,6 +354,116 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       allowedUsers: [OWNER],
     });
     bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it('runs an attached effort task through ordinary admission and propagates acceptance', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_task';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    const ctx = makeCtx(anchor, 'om_effort_task_input');
+    await handleThreadReply(makeEventData(ctx.messageId, '/effort ultra 检查投递', anchor), ctx);
+    expect(mocks.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
+    expect(mocks.sendWorkerInput.mock.calls[0][1].content).toContain('检查投递');
+    expect(mocks.sendWorkerInput.mock.calls[0][1].content).not.toContain('/effort ultra');
+    expect(ctx.ingressAdmission.admitted).toBe(true);
+  });
+
+  it('never sends the attached task to a worker replaced during resource preparation', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_resource_race';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    mocks.downloadResources.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: vi.fn() } as any;
+      ds.session.workerGeneration = 2;
+      return { attachments: [], needLogin: false };
+    });
+    await handleThreadReply(makeEventData('om_effort_race', '/effort ultra 检查投递', anchor), makeCtx(anchor, 'om_effort_race'));
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('附带任务未投递');
+  });
+
+  it('keeps an OAuth-looking URL in the attached task on the model input path', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_url';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    const task = 'http://127.0.0.1:1455/auth/callback?code=example';
+    await handleThreadReply(makeEventData('om_effort_url_task', '/effort ultra ' + task, anchor), makeCtx(anchor, 'om_effort_url_task'));
+    expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
+    expect(mocks.sendWorkerInput.mock.calls[0][1].content).toContain(task);
+  });
+
+  it('propagates a canonical durable-primary retry without submitting a second task', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_primary_retry';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    ds.cliReady = false;
+    const ctx = { ...makeCtx(anchor, 'om_effort_primary_task'),
+      durablePrimaryDispatch: { attempt: 1, signal: new AbortController().signal } };
+    await handleThreadReply(makeEventData(ctx.messageId, '/effort ultra 检查投递', anchor), ctx);
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission.retryReason).toBeTruthy();
+    expect(repliedText()).not.toContain('附带任务未投递');
+  });
+
+  it('does not invite a retry after input acceptance even if persistence fails', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_post_accept';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    mocks.sendWorkerInput.mockImplementationOnce(() => {
+      mocks.updateSession.mockImplementationOnce(() => { throw new Error('post-accept persistence'); });
+      return true;
+    });
+    const ctx = makeCtx(anchor, 'om_effort_post_accept_task');
+    await handleThreadReply(makeEventData(ctx.messageId, '/effort ultra 检查投递', anchor), ctx);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
+    expect(ctx.ingressAdmission.admitted).toBe(true);
+    expect(repliedText()).not.toContain('附带任务未投递');
+  });
+
+  it('preserves post image resources on the ordinary attached-task path', async () => {
+    getBot(APP).config.cliId = 'codex';
+    const anchor = 'om_effort_image';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.session.workerGeneration = 1;
+    ds.session.cliSessionId = 'native-1';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    const event = makeEventData('om_effort_image_task', '', anchor);
+    event.message.message_type = 'post';
+    event.message.content = JSON.stringify({ zh_cn: { title: '', content: [[
+      { tag: 'text', text: '/effort ultra 检查这张图' }, { tag: 'img', image_key: 'img_effort' },
+    ]] } });
+    await handleThreadReply(event, makeCtx(anchor, 'om_effort_image_task'));
+    expect(mocks.downloadResources).toHaveBeenCalledWith(APP, 'om_effort_image_task',
+      expect.arrayContaining([expect.objectContaining({ type: 'image', key: 'img_effort' })]), OWNER);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
   });
 
   it('thread reply delivery failure replies with the notice and rethrows the original error', async () => {

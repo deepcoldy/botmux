@@ -3718,8 +3718,9 @@ function codexCliEffortNeedsRecovery(): boolean {
     return false;
   }
   try {
-    const screen = isObserveBackend(hold.backend)
-      ? hold.backend.captureCurrentScreen() : renderer?.rawSnapshot() ?? '';
+    // Observe backends return ANSI full history for web seeding. Input admission
+    // must instead inspect the current viewport's text, never old picker rows.
+    const screen = stripAnsiScreenText(captureBackendScreen(hold.backend));
     if (hasEmptyCodexComposer(screen) && !parseCodexEffortMenu(screen)) {
       codexCliEffortRecovery = undefined;
       return false;

@@ -593,6 +593,8 @@ export interface CommandHandlerDeps {
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
+  /** Task text attached to a successful native effort change uses normal input delivery. */
+  submitEffortTask?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -1876,20 +1878,46 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }
-        const effort = message.content.replace(/^\/effort\b/i, '').trim().toLowerCase();
-        if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) {
+        const match = /^\/effort\s+(low|medium|high|xhigh|max|ultra)(?:\s+([\s\S]*))?$/i.exec(message.content.trim());
+        if (!match) {
           await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
           break;
         }
+        const effort = match[1]!.toLowerCase();
+        const task = match[2]?.trim();
         const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId;
+        const worker = ds.worker;
+        const generation = ds.session.workerGeneration;
+        const nativeId = ds.session.cliSessionId;
         const result = await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort);
         const replyKey = result.reason
           ? `cmd.effort.${result.reason}`
           : result.status === 'invalid' && !result.choices?.length
             ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
-        await sessionReply(rootId, t(replyKey, {
-          effort, choices: result.choices?.join(', ') ?? '',
-        }, loc));
+        try {
+          await sessionReply(rootId, t(replyKey, {
+            effort, choices: result.choices?.join(', ') ?? '',
+          }, loc));
+        } catch (error) {
+          if (!task) throw error;
+          logger.warn(`[${logTag}] Effort receipt reply failed; continuing attached task admission`);
+        }
+        if (task) {
+          const current = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds
+            && ds.worker === worker && ds.session.workerGeneration === generation
+            && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+          const saved = result.status === 'applied' || result.status === 'future_only';
+          let accepted = false;
+          if (saved && current && deps.submitEffortTask) {
+            try { accepted = await deps.submitEffortTask(ds, message, task, deps.invocationReplyTarget); }
+            catch (error) {
+              // The callback has not confirmed acceptance; do not silently
+              // lose the original task when sender/resource preparation fails.
+              logger.error(`[${logTag}] Effort task callback failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+          if (!accepted) await sessionReply(rootId, t('cmd.effort.task_not_submitted', { task }, loc));
+        }
         break;
       }
       case '/cli': {

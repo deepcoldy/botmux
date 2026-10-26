@@ -19925,10 +19925,12 @@ async function admitFollowerBehindOpening(
     turnId: string;
     dispatchAttempt?: number;
     build: () => Promise<CliTurnPayload>;
+    isCurrent?: () => boolean;
   },
 ): Promise<void> {
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
+    if (follower.isCurrent && !follower.isCurrent()) throw new Error('Effort task session changed before queued activation admission');
     admitQueuedActivationTail(ds, {
       userPrompt: follower.userPrompt,
       cliInput,
@@ -21632,13 +21634,18 @@ async function stageCrossPrincipalInterruption(args: {
   owner: TrustedCaller;
   proposer: TrustedCaller;
   message: CrossPrincipalInterruptionMessage;
+  isCurrent?: () => boolean;
+  onAdmitted?: () => void;
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
+  if (args.isCurrent && !args.isCurrent()) return false;
   if (ds.session.status !== 'active') return true;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
   if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
+    args.onAdmitted?.();
     return true;
   }
+  if (args.isCurrent && !args.isCurrent()) return false;
   if (ds.session.status !== 'active') return true;
   const staged = stageCrossPrincipalInterruptionRecord({
     session: ds.session,
@@ -21651,6 +21658,7 @@ async function stageCrossPrincipalInterruption(args: {
     message,
   });
   if (!staged.inserted) {
+    args.onAdmitted?.();
     logger.info(`[${tag(ds)}] duplicate cross-principal handoff merged turn=${message.turnId.slice(0, 12)}`);
     if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
       return true;
@@ -21660,6 +21668,7 @@ async function stageCrossPrincipalInterruption(args: {
   // Durable write is the ownership handoff boundary. The worker-pool clears its
   // original delivery record only after this function returns true.
   persistCrossPrincipalQueue(ds);
+  args.onAdmitted?.();
   if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
     return true;
   }
@@ -26506,6 +26515,7 @@ async function handleThreadReplyAdmitted(
   ctx: RoutingContext,
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
+  effortSessionIsCurrent?: () => boolean,
 ): Promise<void> {
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
@@ -26681,6 +26691,9 @@ async function handleThreadReplyAdmitted(
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
   let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  // The administrative effort prefix was already consumed. Its attached task
+  // remains literal model text while quota/resources/principal admission run.
+  if (ctx.effortTaskReentry) cmdContent = '';
   // Keep the three values consumed by the remainder of this function in lock
   // step. In particular, workflow/slash parsing reads cmdContent while worker
   // injection reads content/parsed.content; listener input is never trusted as
@@ -26738,8 +26751,8 @@ async function handleThreadReplyAdmitted(
   // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
   // the mention-stripped cmdContent so pasting the callback back into the
   // topic still works.
-  const callbackText = isCallbackUrl(content) ? content
-    : isCallbackUrl(cmdContent) ? cmdContent : null;
+  const callbackText = !ctx.effortTaskReentry && isCallbackUrl(content) ? content
+    : !ctx.effortTaskReentry && isCallbackUrl(cmdContent) ? cmdContent : null;
   if (callbackText) {
     const result = await handleCallbackUrl(callbackText);
     if (result) {
@@ -26893,7 +26906,7 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = askCustomReplyCandidate({
+  const askCandidate = ctx.effortTaskReentry ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -26953,6 +26966,7 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(runtimeSessionKey);
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
@@ -27109,6 +27123,7 @@ async function handleThreadReplyAdmitted(
     return;
   }
   // 种子 = 闸刚校验的 parsed.content。prepared 重投时闸已在新话题入口跑过（那边已调度）；
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // 免@ 命令模板与监听器包装的正文不是用户在说事。
   if (groupAutoTitlePending && !prepared?.quotaChecked && !threadCommandPrompt && !listenerPrompt) {
     const seed = groupAutoTitleSeedFrom(parsed.content, parsed.mentions);
@@ -27142,6 +27157,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
@@ -27242,6 +27258,7 @@ async function handleThreadReplyAdmitted(
     await admitFollowerBehindOpening(ds, tailReservation, {
       userPrompt: promptContent,
       turnId: parsed.messageId,
+      ...(effortSessionIsCurrent ? { isCurrent: effortSessionIsCurrent } : {}),
       build: async () => {
         const tailBot = getBot(ds.larkAppId);
         const botCfg = tailBot.config;
@@ -27249,6 +27266,7 @@ async function handleThreadReplyAdmitted(
         // <user_message> 壳与 <sender/> 标签。
         const tailSender = await getThreadSender();
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
+        if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
@@ -27772,6 +27790,7 @@ async function handleThreadReplyAdmitted(
     return;
   }
 
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
@@ -27795,13 +27814,16 @@ async function handleThreadReplyAdmitted(
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
     const taskController = activePrincipalTurn.controller ?? activePrincipalTurn.caller;
     const sender = await getThreadSender();
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     messageQueue.ensureQueue(anchor);
     messageQueue.appendMessage(anchor, parsed);
     publishSessionMessagePreviewPatch(ds);
-    markIngressAdmitted(ctx);
+    if (!ctx.effortTaskReentry) markIngressAdmitted(ctx);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId);
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     await stageCrossPrincipalInterruption({
       ds,
+      ...(ctx.effortTaskReentry ? { isCurrent: effortSessionIsCurrent, onAdmitted: () => markIngressAdmitted(ctx) } : {}),
       ownerTurnId: activePrincipalTurn.turnId,
       owner: taskController,
       proposer: threadTrustedCaller,
@@ -27873,6 +27895,7 @@ async function handleThreadReplyAdmitted(
     const turnSender = await getThreadSender();
     // transcript 模式按轮重算 solo（bridge 会话本就是裸文本，跳过）。
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildGroupContextBridgeInput(promptContent, ds.session.sessionId, {
@@ -27955,6 +27978,7 @@ async function handleThreadReplyAdmitted(
         mentions: parsed.mentions,
       };
     }
+    if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     // A principal lane is concurrent with other lanes, but strictly serial
     // inside itself for the ENTIRE CLI turn.  Admission-key serialization only
     // covers routing/materialisation and therefore cannot protect the mutable
@@ -28626,6 +28650,7 @@ interface ThreadSlashContext {
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
@@ -28752,6 +28777,31 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       messageId: parsed.messageId,
       replyRootId,
     });
+    invocationDeps.submitEffortTask = async (ds, message, text) => {
+      const worker = ds.worker;
+      const generation = ds.session.workerGeneration;
+      const nativeId = ds.session.cliSessionId;
+      const current = () => activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId)) === ds
+        && ds.worker === worker && !!worker && !worker.killed
+        && ds.session.workerGeneration === generation && ds.session.cliSessionId === nativeId
+        && ds.session.status === 'active';
+      const taskCtx: RoutingContext = { ...ctx, ingressAdmission: { admitted: false },
+        cascadeBodyReentry: true, effortTaskReentry: true, commandTrigger: undefined };
+      if (!current()) return false;
+      try {
+        await handleThreadReplyAdmitted(data, taskCtx, undefined, {
+          parsed: { ...message, content: text }, resources: [...resources],
+        }, current);
+      } catch (error) {
+        logger.error(`[${tag(ds)}] Attached effort task admission failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      ctx.ingressAdmission ??= { admitted: false };
+      ctx.ingressAdmission.admitted ||= taskCtx.ingressAdmission?.admitted === true;
+      if (taskCtx.ingressAdmission?.retryReason) ctx.ingressAdmission.retryReason = taskCtx.ingressAdmission.retryReason;
+      // Post-admission persistence/notification failures must never invite a
+      // retry of an input already owned by a worker or a durable FIFO.
+      return taskCtx.ingressAdmission?.admitted === true || !!taskCtx.ingressAdmission?.retryReason;
+    };
     const effectiveThreadChatId = existingDs?.chatId ?? chatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);
     if (restrictedText) {

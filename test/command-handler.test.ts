@@ -10327,6 +10327,75 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
 });
 
 describe('Codex App /effort command', () => {
+  it.each(['/effort ultra 检查输入投递', '/effort ultra\n检查输入投递'])('submits task text after the CLI effort receipt: %s', async content => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    const submit = vi.fn(async () => true);
+    Object.assign(deps, { submitEffortTask: submit });
+    const message = makeLarkMessage(content);
+    await handleCommand('/effort', ROOT_ID, message, deps, LARK_APP_ID);
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(submit).toHaveBeenCalledWith(ds, message, '检查输入投递', undefined);
+    expect(vi.mocked(updateCodexCliEffort).mock.invocationCallOrder.at(-1))
+      .toBeLessThan(submit.mock.invocationCallOrder[0]);
+  });
+
+  it('does not submit the appended task when the effort switch is refused', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    const submit = vi.fn(async () => true);
+    Object.assign(deps, { submitEffortTask: submit });
+    vi.mocked(updateCodexCliEffort).mockResolvedValueOnce({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'ultra');
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('does not send task text into a replacement session after the switch receipt', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    const submit = vi.fn(async () => true);
+    Object.assign(deps, { submitEffortTask: submit });
+    vi.mocked(updateCodexCliEffort).mockImplementationOnce(async () => {
+      ds.session.workerGeneration = (ds.session.workerGeneration ?? 0) + 1;
+      return { status: 'future_only', reason: 'cli_next_turn' };
+    });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
+    expect(submit).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
+      t('cmd.effort.task_not_submitted', { task: '检查输入投递' }), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('reports the original task if the accepted input path rejects delivery', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    const submit = vi.fn(async () => false);
+    Object.assign(deps, { submitEffortTask: submit });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
+    expect(submit).toHaveBeenCalledOnce();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
+      t('cmd.effort.task_not_submitted', { task: '检查输入投递' }), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('keeps task admission running when sending the settings reply fails', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    const submit = vi.fn(async () => true);
+    Object.assign(deps, { submitEffortTask: submit });
+    vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('reply unavailable'));
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
+  it('reports a task callback failure before acceptance', async () => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }) });
+    const deps = makeDeps(ds);
+    Object.assign(deps, { submitEffortTask: vi.fn(async () => { throw new Error('sender unavailable'); }) });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort ultra 检查输入投递'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
+      t('cmd.effort.task_not_submitted', { task: '检查输入投递' }), undefined, LARK_APP_ID, 'msg_001');
+  });
+
   it('uses the CLI menu path and explicitly reports next-turn scope', async () => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
@@ -10345,6 +10414,7 @@ describe('Codex App /effort command', () => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(getBot).mockImplementation(defaultGetBot as typeof getBot);
+    vi.mocked(updateCodexCliEffort).mockReset().mockResolvedValue({ status: 'future_only', reason: 'cli_next_turn' });
   });
 
   it.each(['applied', 'future_only', 'error', 'unavailable', 'invalid'] as const)('replies with the native %s result without creating business input', async status => {
@@ -10378,7 +10448,7 @@ describe('Codex App /effort command', () => {
       t('cmd.effort.invalid_without_choices'), undefined, LARK_APP_ID, 'msg_001');
   });
 
-  it.each(['/effort', '/effort invalid', '/effort high extra'])('shows usage for %s', async text => {
+  it.each(['/effort', '/effort invalid', '/effort ultracode'])('shows usage for %s', async text => {
     const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
     await handleCommand('/effort', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
     expect(updateCodexAppEffort).not.toHaveBeenCalled();

@@ -1,6 +1,7 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
-  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex reasoning effort: CLI uses its native menu for future turns; App active-turn updates require explicitly enabling the experimental step_model_switching feature (off by default; levels depend on the current model)',
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
+  'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
   'cmd.effort.cli_menu_unavailable': 'The Codex CLI model menu cannot be operated safely (a draft, another menu, input operation, or unsupported backend may be present). Keep your draft, close other menus and retry, or use /model manually.',
   'cmd.effort.applied': 'Future turns will use {effort}; the server accepted the active-turn update. If further inference steps occur in this turn, they can use the new setting; requests already issued keep their original parameters.',

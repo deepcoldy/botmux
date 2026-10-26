@@ -109,13 +109,14 @@ export async function applyCodexEffortMenu(
     opened = true;
     while (alive()) {
       const settings = io.settings();
-      if (selected && settings?.model && sameModelIdentity(settings.model, model) && settings.reasoningEffort === effort) {
-        confirmed = true;
-        return { status: 'future_only', reason: 'cli_next_turn' };
-      }
       const screen = await io.screen();
       if (!alive()) break;
       const menu = parseCodexEffortMenu(screen);
+      if (selected && settings?.model && sameModelIdentity(settings.model, model) && settings.reasoningEffort === effort
+        && hasEmptyCodexComposer(screen) && !menu) {
+        confirmed = true;
+        return { status: 'future_only', reason: 'cli_next_turn' };
+      }
       if (menu && !selected) {
         const current = menu.rows.findIndex(row => row.selected);
         // The `(current)` marker is primary. Codex 0.162 omits it entirely

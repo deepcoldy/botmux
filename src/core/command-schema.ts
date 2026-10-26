@@ -190,7 +190,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['cmd.effort.usage'] },
   {
     name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
     notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
