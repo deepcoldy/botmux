@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
@@ -6,6 +8,9 @@ import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
+
+// A real directory: capabilityScheduleWorkingDir realpaths both sides.
+const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node)
@@ -26,7 +31,7 @@ const handler = ${handler.getText(source)}`, {
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group',
-    session: { sessionId: 's1' }, workerGeneration: 7, workingDir: '/repo',
+    session: { sessionId: 's1' }, workerGeneration: 7, workingDir: REPO,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -38,12 +43,13 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     completeTask: vi.fn((): { ok: boolean; replay?: boolean; error?: string } => ({ ok: true })),
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
-    task: { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: '/repo' } };
+    task: { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO } };
   const authorizeScheduleSelfManage = vi.fn(async () => undefined);
   const scope: any = {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
     findActiveBySessionId: () => ds, authorizeSessionScopedIpc,
+    realpathSync,
     validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     isTrustedHostIpcRequest: () => false,
@@ -465,7 +471,7 @@ describe('managed schedule mutation route', () => {
   it('refuses to force-run a paused task (must resume first)', async () => {
     const h = harness('run');
     h.record.kind = 'direct';
-    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: '/repo', enabled: false };
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false };
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_task_disabled' } });
     expect(h.scheduler.runTaskNow).not.toHaveBeenCalled();
   });

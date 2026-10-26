@@ -99,6 +99,51 @@ describe('scheduler host authority integration', () => {
     expect(store.getRecord(APP, task.id)).toBeUndefined();
     expect(store.listTasks(APP)).toEqual([]);
     expect(scheduleStore.getTask(task.id, APP)).toBeUndefined();
+    // A failed create is a physical DELETE, not a revoke tombstone: the same id
+    // can be created again.
+    vi.restoreAllMocks();
+    const again = scheduler.addTask({ ...params, id: task.id });
+    expect(again.id).toBe(task.id);
+    expect(store.getRecord(APP, task.id)?.state).toBe('active');
+  });
+
+  describe('per-turn direct create limit', () => {
+    const turn = (turnId = 'om_turn', maxTasksPerTurn = 2) => ({ directTurn: { turnId, maxTasksPerTurn } });
+
+    it('allows distinct tasks within one turn and records the turn outside the task JSON', () => {
+      const a = scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      const b = scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(a.id).not.toBe(b.id);
+      expect(store.listTasks(APP).map(t => t.id).sort()).toEqual(['turn0001', 'turn0002']);
+      expect(store.getRecord(APP, 'turn0001')?.targetTurnId).toBe('om_turn');
+      expect(JSON.stringify(scheduleStore.getTask('turn0001', APP))).not.toContain('om_turn');
+    });
+
+    it('refuses the task past the limit, but a different turn and the host stay unaffected', () => {
+      scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(() => scheduler.addTask({ ...params, id: 'turn0003' }, turn()))
+        .toThrow('schedule_direct_task_limit');
+      expect(store.getRecord(APP, 'turn0003')).toBeUndefined();
+      expect(scheduleStore.getTask('turn0003', APP)).toBeUndefined();
+      expect(scheduler.addTask({ ...params, id: 'turn0004' }, turn('om_other')).id).toBe('turn0004');
+      expect(scheduler.addTask({ ...params, id: 'host0001' }).id).toBe('host0001');
+      expect(store.getRecord(APP, 'host0001')?.targetTurnId).toBeUndefined();
+    });
+
+    it('keeps a removed task on the turn quota', () => {
+      scheduler.addTask({ ...params, id: 'turn0001' }, turn());
+      scheduler.addTask({ ...params, id: 'turn0002' }, turn());
+      expect(scheduler.removeTask('turn0001')).toBe(true);
+      expect(store.getRecord(APP, 'turn0001')?.targetTurnId).toBe('om_turn');
+      expect(() => scheduler.addTask({ ...params, id: 'turn0003' }, turn()))
+        .toThrow('schedule_direct_task_limit');
+    });
+
+    it('replays an identical create without consuming quota', () => {
+      const first = scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1));
+      expect(scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1))).toEqual(first);
+    });
   });
 
   it('does not roll back a task belonging to a different staged precondition', () => {

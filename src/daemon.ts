@@ -8045,8 +8045,18 @@ ipcRoute('POST', DISPATCH_USER_MENTION_BIND_ROUTE, async (req, res) => {
  * so an unconstrained value (another bot's role directory, `~`) would be a
  * sandbox escape that merely fires later. Returns the path to persist. */
 function capabilityScheduleWorkingDir(ds: DaemonSession, workingDir: string): string | undefined {
+  // Session cwd branch: both sides canonical (the CLI falls back to the kernel's
+  // resolved process.cwd() while the session records the lexical path, so a
+  // symlinked $HOME makes them differ), and the request may be the cwd itself or
+  // any descendant. A symlink inside the cwd that points elsewhere resolves out.
   const own = ds.workingDir ?? ds.session.workingDir;
-  if (own && workingDir === own) return own;
+  if (own) {
+    try {
+      const ownReal = realpathSync(own);
+      const real = realpathSync(workingDir);
+      if (real === ownReal || real.startsWith(`${ownReal}/`)) return real;
+    } catch { /* either side missing → fall through to the role-library branch */ }
+  }
   const v = validateRoleLibraryPath(workingDir, undefined, ds.larkAppId);
   return v.ok ? v.resolvedPath : undefined;
 }
@@ -8303,8 +8313,23 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       ...(task.calendarDayType !== undefined ? { calendarDayType: task.calendarDayType } : {}),
     };
     if (direct) {
-      const created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
-        ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
+      let created;
+      try {
+        created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
+          ownerOpenId: controlOpenId, ownerUnionId: controlUnionId }, {
+          // turnId is the live managed origin read above — never the request body.
+          directTurn: {
+            turnId,
+            maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+              ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+          },
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message === 'schedule_direct_task_limit') {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_direct_task_limit' });
+        }
+        throw error;
+      }
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     }
     const requestHash = computeInputHash(baseParams);

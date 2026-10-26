@@ -1148,8 +1148,16 @@ export function addTask(params: {
   untilDone?: UntilDoneConfigInput;
   /** Opt-in owner notifications. */
   notify?: ScheduleNotifyEvent[];
+}, audit?: {
+  /** Server-authoritative live turn that created this direct task (never from a
+   *  request body). Recorded in the authority row's target_turn_id column only —
+   *  not in the task JSON — and counted against maxTasksPerTurn. */
+  directTurn?: { turnId: string; maxTasksPerTurn: number };
 }): ScheduledTask {
   assertScheduleAuthorityAvailable();
+  if (audit?.directTurn && !(params.larkAppId && authorityStore?.isInitialized(params.larkAppId))) {
+    throw new Error('schedule_authority_unavailable');
+  }
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
     : scheduleStore.normalizeScheduleChatTargets({
@@ -1240,7 +1248,7 @@ export function addTask(params: {
     reasoningEffort: params.reasoningEffort,
     ...untilDoneConfig,
   }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate))
+    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
     : undefined);
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
