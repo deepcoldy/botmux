@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
-import { isCliIdentityPath } from '../utils/child-env.js';
+import { GIT_CONFIG_PAIR_ENV_KEY, isCliIdentityPath } from '../utils/child-env.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import type { IdentityStorageModel } from './lark-tool-binding.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -1152,11 +1152,14 @@ export function installGitAskpass(
 }
 
 /**
- * Git config that forces an identity-bearing HTTPS path for `host`.
+ * The git `-c` content pairs that force an identity-bearing HTTPS path for
+ * `host`: a host-scoped credential helper plus two URL rewrites.
  *
- * Returned as `GIT_CONFIG_*` env entries rather than written to a config file:
- * they apply to this session's git only, leave the user's own `~/.gitconfig`
- * untouched, and vanish with the process.
+ * This array is the AUTHORITATIVE carrier of the turn's git identity: callers
+ * that forward env into a shell-wrapped pane must pass exactly these pairs
+ * (see SpawnOpts.gitConfigPairs) rather than scan the environment for numbered
+ * `GIT_CONFIG_*` entries, which an ambient layer can push past the authored
+ * set.
  *
  * Two settings, for two different escapes:
  *  - `credential.https://<host>.helper` binds the helper to that host alone, so
@@ -1166,21 +1169,100 @@ export function installGitAskpass(
  *    machine's key — the push lands under the host's identity and the whole
  *    attribution chain silently breaks.
  */
-export function gitIdentityConfigEnv(
+export function gitIdentityConfigPairs(
   askpassPath: string,
   host: string,
-): Record<string, string> {
-  const entries: Array<[string, string]> = [
+): Array<[string, string]> {
+  return [
     [`credential.https://${host}.helper`, `!f() { "${askpassPath}" "$@"; }; f`],
     [`url.https://${host}/.insteadOf`, `ssh://git@${host}/`],
     [`url.https://${host}/.insteadOf`, `git@${host}:`],
   ];
-  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(entries.length) };
-  entries.forEach(([key, value], i) => {
+}
+
+/**
+ * Encode {@link gitIdentityConfigPairs} as `GIT_CONFIG_*` env entries rather
+ * than writing a config file: they apply to this session's git only, leave the
+ * user's own `~/.gitconfig` untouched, and vanish with the process. Used by the
+ * direct-exec backends (PTY, env -i strict panes), which receive the child
+ * environment wholesale; the shell-wrapped backends instead rebuild the entries
+ * from the pair carrier.
+ */
+export function gitIdentityConfigEnv(
+  askpassPath: string,
+  host: string,
+): Record<string, string> {
+  return encodeGitConfigPairs(gitIdentityConfigPairs(askpassPath, host));
+}
+
+/**
+ * Encode turn-authored git `-c` pairs as the `GIT_CONFIG_*` env block
+ * (`GIT_CONFIG_COUNT` + contiguous 0..n-1 KEY/VALUE entries). The inverse of
+ * the pane-side rebuild in buildBotmuxEnvAssignments: direct-exec backends
+ * (PTY, env -i strict panes) consume the child environment wholesale, so the
+ * worker places exactly this encoded block there after wiping any ambient
+ * numbered git config entries.
+ */
+export function encodeGitConfigPairs(
+  pairs: ReadonlyArray<readonly [string, string]>,
+): Record<string, string> {
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs.length) };
+  pairs.forEach(([key, value], i) => {
     env[`GIT_CONFIG_KEY_${i}`] = key;
     env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   return env;
+}
+
+/**
+ * Reset the whole git command-line config channel in a child environment to
+ * exactly the turn-authored `pairs`: every inherited
+ * GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> is deleted first
+ * (nested CLIs and hooks share GIT_CONFIG_COUNT as an accumulator, so a
+ * spawned child can carry a pushed-up count and arbitrary high-index pairs),
+ * then the contiguous 0..n-1 block is published. With no authored pairs the
+ * channel is left empty rather than carrying an ambient count.
+ *
+ * This is the direct-exec counterpart of the shell pane carrier rebuild:
+ * PTY children and env -i strict panes inherit the environment wholesale, so
+ * the reset has to happen here, in the worker-built env.
+ */
+export function applyTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  pairs: ReadonlyArray<readonly [string, string]>,
+): void {
+  for (const key of Object.keys(env)) {
+    if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
+  }
+  if (pairs.length) Object.assign(env, encodeGitConfigPairs(pairs));
+}
+
+/**
+ * The single wiring seam every CLI/engine spawn site must call to install the
+ * trigger-user identity: it prepares the wrapper env (PATH shim, askpass,
+ * wrappers) AND resets the git command-line config channel to the authored
+ * pair set in one step, returning that set so pane-style backends also carry
+ * it via SpawnOpts.gitConfigPairs.
+ *
+ * Keeping prepare + reset in ONE function is load-bearing: calling only
+ * prepareTriggerUserCliEnv leaves an inherited/pushed-up GIT_CONFIG_COUNT and
+ * ambient high-index pairs in the env (the field failure — git aborts or a
+ * foreign pair silently applies), which is what happened on the RPC
+ * app-server engineEnv path before it used this seam. Native-pane spawns,
+ * PTY, env -i strict panes and RPC app-servers all go through here.
+ */
+export function prepareTurnGitConfigEnv(
+  env: NodeJS.ProcessEnv,
+  sessionDataDir: string | undefined,
+  sessionId: string,
+  policy: TriggerUserAuthConfig | undefined,
+  log: (message: string) => void,
+  model: IdentityStorageModel,
+  execution?: { appId: string; ipcPort?: number },
+): Array<[string, string]> {
+  const pairs = prepareTriggerUserCliEnv(env, sessionDataDir, sessionId, policy, log, model, execution);
+  applyTurnGitConfigEnv(env, pairs);
+  return pairs;
 }
 
 /**
@@ -1211,17 +1293,24 @@ export function findRealToolBinary(
  * Used before both native CLI and RPC app-server startup. In the proven model
  * no token is copied into the process environment or disk: the wrapper fetches
  * the current turn's identity from the daemon over the proven loopback channel
- * on each call; the single model keeps one daemon-written, turn-checked file. */
+ * on each call; the single model keeps one daemon-written, turn-checked file.
+ *
+ * Returns the git `-c` content pairs authored for THIS turn (empty when git
+ * attribution is not installed). Shell-wrapped backends must forward exactly
+ * that list via SpawnOpts.gitConfigPairs instead of reading GIT_CONFIG_* out
+ * of the environment. */
 export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
   model: IdentityStorageModel,
   execution?: { appId: string; ipcPort?: number },
-): void {
-  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
+): Array<[string, string]> {
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return [];
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  // Turn-authored git -c pairs; returned to the caller for the pane carrier.
+  let gitConfigPairs: Array<[string, string]> = [];
   let identityResolver: string[] | undefined;
   if (model === 'proven' && process.platform === 'linux' && execution) {
     const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -1316,6 +1405,10 @@ export function prepareTriggerUserCliEnv(
         // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
         // ~/.gitconfig is never touched.
         if (policy.gitHost) {
+          gitConfigPairs = gitIdentityConfigPairs(askpass, policy.gitHost);
+          // Direct-exec backends (PTY, env -i strict panes) receive childEnv
+          // wholesale, so also publish the encoded entries there. The
+          // shell-wrapped backends rebuild them from the returned carrier.
           Object.assign(childEnv, gitIdentityConfigEnv(askpass, policy.gitHost));
           log(`[trigger-user-auth] git pushes to ${policy.gitHost} authenticate as the acting user`);
         } else {
@@ -1326,4 +1419,5 @@ export function prepareTriggerUserCliEnv(
       log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
     }
   }
+  return gitConfigPairs;
 }

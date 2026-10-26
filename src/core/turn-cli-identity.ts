@@ -57,7 +57,12 @@ export interface ToolIdentityOutcome {
  * its stable user identity in the receiving app. Never accepted from CLI input. */
 export interface DelegatedCliIdentity {
   targetOpenId?: string;
+  /** The requester as seen by the ISSUING app: the key of their local
+   *  credential stores on this machine. Never valid inside the receiving app. */
   credentialOpenId: string;
+  /** Tenant-stable id of the same human, from the verified dispatch record.
+   *  The platform key: it needs no lookup in either app. */
+  unionId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
   denialReason?: 'target_access_denied' | 'target_validation_unavailable';
@@ -168,13 +173,16 @@ function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs,
 async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
   if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
   let identity: CliIdentity | null = null;
-  // Platform first (same person, keyed by the issuer-scoped open_id the daemon
-  // verified). In strict `platform` mode a non-grant is final; in `auto` an
+  // Platform first, keyed by the union_id in the verified dispatch record. The
+  // issuer-scoped credentialOpenId means nothing to this bot's app, and
+  // re-deriving the union_id from targetOpenId would hang the grant on a
+  // contact lookup that need not be reachable. In strict `platform` mode a
+  // non-grant is final and local stores are never read; in `auto` an
   // already-provisioned local HOME is still honoured below.
   const source = credentialSourceOf(args.botConfig.triggerUserAuth);
   if (source !== 'local') {
     const platform = await resolvePlatformIdentity({
-      botConfig: args.botConfig, tool, openId: user.credentialOpenId,
+      botConfig: args.botConfig, tool, unionId: user.unionId,
       sessionId: args.sessionId, ...(args.turnId ? { turnId: args.turnId } : {}),
     });
     if (platform.state === 'granted') identity = platform.identity;

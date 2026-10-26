@@ -73,6 +73,8 @@ export interface ReproduceCommandInput {
   env?: NodeJS.ProcessEnv;
   /** 每 bot 注入 env（bots.json env，含 provider 凭证）。 */
   injectEnv?: Record<string, string>;
+  /** Turn-authored git `-c` pairs; rebuilt into GIT_CONFIG_* assignments. */
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
 }
 
 // 组装近似复现命令。riff / mojo（远端后端）返回 null。其余后端返回：
@@ -85,7 +87,7 @@ export function buildReproduceCommand(input: ReproduceCommandInput): string | nu
 
   const parts: string[] = [];
   // 权威注入 env（KEY=VAL 列表），VAL 做 bash 转义后作为命令前缀。
-  for (const assignment of buildBotmuxEnvAssignments(input.env, input.injectEnv)) {
+  for (const assignment of buildBotmuxEnvAssignments(input.env, input.injectEnv, undefined, input.gitConfigPairs)) {
     const eq = assignment.indexOf('=');
     if (eq <= 0) continue;
     const key = assignment.slice(0, eq);

@@ -53,6 +53,9 @@ export function parseLarkToolInvocation(
 ): LarkToolInvocation {
   const output: string[] = [], command: string[] = [];
   let metadata = parseHelp(readHelp(command));
+  // Root flags stay available on every child command; only root-local
+  // help/version stop at the root. Bound CLI help omits them on children.
+  const inheritedFlags = new Map([...metadata.flags].filter(([, flag]) => flag.name !== '--help' && flag.name !== '--version'));
   let mode = binding.defaultAs, sawAs = false, sawProfile = false;
   let showHelp = false, version = false, doctorOffline = false, literalIndex = -1;
   let passthroughProfile: string | undefined;
@@ -111,6 +114,7 @@ export function parseLarkToolInvocation(
       if (!metadata.commands.has(arg) && next.usage === metadata.usage) {
         throw new Error(`Unknown lark-cli command ${arg}`);
       }
+      next.flags = new Map([...inheritedFlags, ...next.flags]);
       command.push(arg); metadata = next;
     }
     output.push(arg);

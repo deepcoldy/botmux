@@ -804,6 +804,45 @@ describe('target daemon consumes signed message authority', () => {
       .toContain('scheduled-original-user');
   });
 
+  it.each(['signed kickoff', 'delegated scheduled turn'] as const)(
+    'asks the platform with the union_id the daemon verified for a %s, with the contact API down',
+    async kind => {
+      const h = await targetHarness();
+      const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+      const grants: any[] = [];
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+        resolveUnionId: async () => { throw new Error('contact API unavailable'); },
+        requestGrant: async req => {
+          grants.push(req);
+          return { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'platform-alice' } } } as any;
+        },
+      });
+      try {
+        h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }) });
+        let turnId = 'om_kickoff';
+        if (kind === 'delegated scheduled turn') {
+          turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+          const task = { id: 'a1b2c3d4', chatId: 'oc_chat' };
+          h.scopeValues.scheduleAuthorityStore = { getRecord: () => ({
+            kind: 'delegated', state: 'active', task,
+            controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+            credentialOpenId: ALICE, runScopes: ['bytedcli'], selfManage: true, sourceMessageId: 'om_root',
+          }) };
+          h.scopeValues.authorizeDelegatedScheduleRun = vi.fn(async () => ({ task, targetOpenId: 'ou_alice_target' }));
+          h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: ['bytedcli'] } });
+          h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+        }
+        await h.run(turnId);
+        expect(identityBody('bytedcli', turnId)).toContain('platform-alice');
+        expect(grants.map(grant => grant.unionId)).toEqual(['on_alice']);
+      } finally {
+        __setPlatformCredentialDepsForTest(null);
+      }
+    },
+  );
+
   it('withholds every identity publication while the worker decision conflicts', async () => {
     const h = await targetHarness();
     const publish = vi.fn();

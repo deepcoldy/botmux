@@ -76,6 +76,13 @@ export function assertChangedBotsCodexProfile(previous: any[], next: any[]): voi
     if (codexProfile) assertCodexProfileConfig(entry);
   }
 }
+/**
+ * NOTE: like {@link botOneShotProbeEnv}, this direct-launch env does not reset
+ * the GIT_CONFIG_* command-line channel (no prepareTurnGitConfigEnv step —
+ * these profile launches run outside the identity-wrapped spawn/RPC paths).
+ * An ambient/per-bot GIT_CONFIG_COUNT or numbered pair can reach git here;
+ * tracked as follow-up after #2203.
+ */
 export function codexProfileEnvironment(cfg: ProfileLaunch): NodeJS.ProcessEnv {
   return { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy) };
 }

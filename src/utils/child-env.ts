@@ -498,13 +498,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // per-host credential config are set on childEnv, which a tmux pane does not
   // inherit, so a push would carry the machine's identity instead.
   'GIT_ASKPASS',
-  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
-  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
-  // a prefix rule here would widen what any session can push into a pane.
   'GIT_CONFIG_COUNT',
-  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
-  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
-  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
@@ -636,7 +630,7 @@ export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   if (managed(env.GIT_ASKPASS)) {
     // These entries are emitted together by gitIdentityConfigEnv for the turn.
     for (const key of Object.keys(env)) {
-      if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete env[key];
+      if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
     }
   }
   for (const key of ['ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS']) {
@@ -711,13 +705,26 @@ const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Plain pattern source (no anchors) for the numbered git config transport
+ * pairs `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`. Shared, in this one
+ * string, by the JS predicate below AND the pane wrapper's `sed -E` snippet:
+ * never slice a RegExp.source into shell code (a changed flag/anchor there
+ * would fail silently in the shell).
+ */
+export const GIT_CONFIG_PAIR_ENV_SHELL_PATTERN = 'GIT_CONFIG_(KEY|VALUE)_[0-9]+';
+
+/** Numbered git config pair names carried in the environment. */
+export const GIT_CONFIG_PAIR_ENV_KEY = new RegExp(`^${GIT_CONFIG_PAIR_ENV_SHELL_PATTERN}$`);
+
+/**
  * True for any env key botmux must keep out of the tmux CLIENT env it hands to
  * the `tmux` binary. This is stricter than server-global scrub: besides
- * botmux-owned routing/profile vars, we also strip daemon-side GitHub tokens so
- * a botmux-started tmux server never seeds them into its shared global env.
+ * botmux-owned routing/profile vars, we also strip daemon-side GitHub tokens
+ * and any numbered git config pairs so a botmux-started tmux server never
+ * seeds them into its shared global env.
  */
 export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
-  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key);
+  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key) || GIT_CONFIG_PAIR_ENV_KEY.test(key);
 }
 
 /**
@@ -725,6 +732,13 @@ export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
  * SERVER global environment. This intentionally excludes user-wide GitHub
  * tokens: botmux panes must `unset` them locally, but daemon startup must not
  * rewrite a shared tmux server's general-purpose env table.
+ *
+ * The numbered git config pairs are deliberately NOT matched here: a shared
+ * server the user owns can legitimately hold their own `GIT_CONFIG_KEY_<n>`.
+ * Deleting those would rewrite the user's server env the same way the
+ * user-wide token carve-out forbids. Panes strip the pairs locally instead
+ * (see the pane wrapper unset clause), and the per-pane env(1) prefix
+ * re-publishes only the turn-authored pair set.
  */
 export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
   return key.startsWith('BOTMUX') || TMUX_SERVER_GLOBAL_SCRUB_KEYS.has(key);

@@ -2460,7 +2460,9 @@ export function canRunDaemonCommand(
  * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
- * 只回一次，见 claimThrottleNotice）；bot 发送方不传，保持静默，免得两个 bot 互相回话。
+ * 只回一次，见 claimThrottleNotice）；卡片就回复在申请人自己消息下面时不回（卡片本身就是说明），
+ * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传，保持静默，免得两个
+ * bot 互相回话。
  * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
@@ -2564,8 +2566,9 @@ export async function maybeSendGrantRequestCard(
     logger.debug(`grant request card send failed: ${err}`);
     return;
   }
-  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
-  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
+  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。卡就回复在申请人自己的消息下面，
+  // 它本身就是「在等管理员处理」的说明，待处理期间申请人再来找 bot 不另发文字提示。
+  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce, { shownToRequester: true });
 }
 
 function logSilentGrantDrop(
@@ -2574,7 +2577,8 @@ function logSilentGrantDrop(
   logger.info(`[grant:${larkAppId}] blocked @ from ${requesterOpenId?.substring(0, 12) ?? '?'} in ${chatId.substring(0, 12)}: no request card (${reason})`);
 }
 
-/** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。 */
+/** 申请人在申请卡待处理 / 刚被拒绝期间又来找 bot：回一句原因，免得 ta 以为 bot 坏了。
+ *  待处理的卡就在申请人眼前（回复在原会话）时不回：卡片本身已经说明在等管理员。 */
 async function replyThrottledRequester(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string,
 ): Promise<void> {

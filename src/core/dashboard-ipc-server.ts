@@ -3209,6 +3209,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // app's availability range normally excludes them.
   const resolved = await resolveBoundLarkUserCredential({
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
+    ...(delegated ? { unionId: delegated.unionId } : {}),
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
   if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'

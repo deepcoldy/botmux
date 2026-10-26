@@ -96,20 +96,36 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
   });
   afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
-  it('group: card first, one "still pending" reply for that card, then silence', async () => {
+  it('group: the card replies to the requester and is the only answer while it is pending', async () => {
     registerRestrictedBot();
     await maybeSendGrantRequestCard(APP, groupMsg('om_1'), GROUP, REQUESTER, undefined, asHuman);
     expect(replies()).toHaveLength(1);
+    expect(replies()[0]!.slice(1, 2)).toEqual(['om_1']);
     expect(replies()[0]![3]).toBe('interactive');
 
+    // The requester can see that card, which already says it waits for an
+    // admin: no extra "still pending" text on their next messages.
     await maybeSendGrantRequestCard(APP, groupMsg('om_2'), GROUP, REQUESTER, undefined, asHuman);
-    expect(replies()).toHaveLength(2);
-    expect(replies()[1]!.slice(0, 3)).toEqual([APP, 'om_2', pendingText()]);
-    expect(replies()[1]![3] ?? 'text').toBe('text');
-
     await maybeSendGrantRequestCard(APP, groupMsg('om_3'), GROUP, REQUESTER, undefined, asHuman);
-    expect(replies()).toHaveLength(2);
+    expect(replies()).toHaveLength(1);
     expect(isThrottled(APP, GROUP, REQUESTER)).toBe(true);
+  });
+
+  it('group: a card visible to the requester stays the only answer across a daemon restart', async () => {
+    registerRestrictedBot();
+    await maybeSendGrantRequestCard(APP, groupMsg('om_v1'), GROUP, REQUESTER, undefined, asHuman);
+    _simulateRestartForTest();
+    await maybeSendGrantRequestCard(APP, groupMsg('om_v2'), GROUP, REQUESTER, undefined, asHuman);
+    expect(replies().map(c => [c[1], c[3] ?? 'text'])).toEqual([['om_v1', 'interactive']]);
+    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(true);
+  });
+
+  it('an owner /grant card the requester did not ask for still gets one reminder', async () => {
+    registerRestrictedBot();
+    markPendingDelivered(APP, GROUP, [REQUESTER], openPendingMulti(APP, GROUP, [REQUESTER], 3, undefined, 60_000));
+    await maybeSendGrantRequestCard(APP, groupMsg('om_o1'), GROUP, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_o2'), GROUP, REQUESTER, undefined, asHuman);
+    expect(replies().map(c => [c[1], c[2]])).toEqual([['om_o1', pendingText()]]);
   });
 
   it('callers without the option (bot senders) stay silent while throttled', async () => {
@@ -131,19 +147,20 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
     expect(replies()[1]!.slice(0, 3)).toEqual([APP, 'om_d2', deniedText()]);
   });
 
-  it('a later card gets its own reminder', async () => {
-    registerRestrictedBot();
-    await maybeSendGrantRequestCard(APP, groupMsg('om_n1'), GROUP, REQUESTER, undefined, asHuman);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_n2'), GROUP, REQUESTER, undefined, asHuman);
+  it('a later card forwarded to the admin gets its own reminder', async () => {
+    registerRestrictedBot({ grantRequestToOwnerDm: true });
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_n1'), P2P, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_n2'), P2P, REQUESTER, undefined, asHuman);
     // 授权后额度用尽被收回 / 管理员处置后重新申请：pending 清掉，下一条消息发新卡。
-    clearPending(APP, GROUP, REQUESTER);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_n3'), GROUP, REQUESTER, undefined, asHuman);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_n4'), GROUP, REQUESTER, undefined, asHuman);
-    expect(replies().map(c => [c[1], c[3] ?? 'text'])).toEqual([
-      ['om_n1', 'interactive'],
-      ['om_n2', 'text'],
-      ['om_n3', 'interactive'],
-      ['om_n4', 'text'],
+    clearPending(APP, P2P, REQUESTER);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_n3'), P2P, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_n4'), P2P, REQUESTER, undefined, asHuman);
+    expect(sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(replies().map(c => [c[1], c[2] === pendingText() ? 'pending' : 'ack'])).toEqual([
+      ['om_n1', 'ack'],
+      ['om_n2', 'pending'],
+      ['om_n3', 'ack'],
+      ['om_n4', 'pending'],
     ]);
   });
 
@@ -155,11 +172,11 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
   });
 
   it('a failed reminder is not counted, the next message retries it', async () => {
-    registerRestrictedBot();
-    await maybeSendGrantRequestCard(APP, groupMsg('om_f1'), GROUP, REQUESTER, undefined, asHuman);
+    registerRestrictedBot({ grantRequestToOwnerDm: true });
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_f1'), P2P, REQUESTER, undefined, asHuman);
     vi.mocked(replyMessage).mockRejectedValueOnce(new Error('send failed'));
-    await maybeSendGrantRequestCard(APP, groupMsg('om_f2'), GROUP, REQUESTER, undefined, asHuman);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_f3'), GROUP, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_f2'), P2P, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_f3'), P2P, REQUESTER, undefined, asHuman);
     expect(replies().map(c => c[1])).toEqual(['om_f1', 'om_f2', 'om_f3']);
     expect(replies()[2]![2]).toBe(pendingText());
   });
@@ -207,17 +224,18 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
     expect(replies()[1]![2]).toBe(pendingText());
   });
 
-  it('after a daemon restart the persisted card still throttles and reminds at most once more', async () => {
-    registerRestrictedBot();
-    await maybeSendGrantRequestCard(APP, groupMsg('om_r1'), GROUP, REQUESTER, undefined, asHuman);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_r2'), GROUP, REQUESTER, undefined, asHuman);
+  it('after a daemon restart a forwarded card still throttles and reminds at most once more', async () => {
+    registerRestrictedBot({ grantRequestToOwnerDm: true });
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_r1'), P2P, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_r2'), P2P, REQUESTER, undefined, asHuman);
     _simulateRestartForTest();
-    await maybeSendGrantRequestCard(APP, groupMsg('om_r3'), GROUP, REQUESTER, undefined, asHuman);
-    await maybeSendGrantRequestCard(APP, groupMsg('om_r4'), GROUP, REQUESTER, undefined, asHuman);
-    expect(replies().map(c => [c[1], c[3] ?? 'text'])).toEqual([
-      ['om_r1', 'interactive'],
-      ['om_r2', 'text'],
-      ['om_r3', 'text'],
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_r3'), P2P, REQUESTER, undefined, asHuman);
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_r4'), P2P, REQUESTER, undefined, asHuman);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replies().map(c => [c[1], c[2] === pendingText() ? 'pending' : 'ack'])).toEqual([
+      ['om_r1', 'ack'],
+      ['om_r2', 'pending'],
+      ['om_r3', 'pending'],
     ]);
   });
 });

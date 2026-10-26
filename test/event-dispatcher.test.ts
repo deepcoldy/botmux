@@ -8583,7 +8583,7 @@ describe('im.message.receive_v1 — blocked @ while the grant request card is pe
   const mention = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
   const replyShapes = () => mockReplyMessage.mock.calls.map((c: any[]) => [c[1], c[3] ?? 'text']);
 
-  it('human: first @ sends the card, the next @ gets one reminder, nothing reaches a session', async () => {
+  it('human: first @ sends the card, later @s get no extra text, nothing reaches a session', async () => {
     for (const id of ['om_stranger_1', 'om_stranger_2', 'om_stranger_3']) {
       await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
         senderOpenId: STRANGER,
@@ -8597,12 +8597,11 @@ describe('im.message.receive_v1 — blocked @ while the grant request card is pe
       await flushEventWork();
     }
 
+    // The card is a reply to the stranger's own message and already says it
+    // waits for an admin; a "still pending" text after it would only repeat it.
     expect(replyShapes()).toEqual([
       ['om_stranger_1', 'interactive'],
-      ['om_stranger_2', 'text'],
     ]);
-    expect((mockReplyMessage.mock.calls[1] as any[])[2])
-      .toBe(t('card.grant.request_still_pending', undefined, localeForBot(MY_APP_ID)));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });

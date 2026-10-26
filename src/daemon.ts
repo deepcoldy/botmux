@@ -4249,9 +4249,14 @@ function delegatedScheduleCliIdentity(
 ): DelegatedCliIdentity {
   const credentialOpenId = authority.credentialOpenId ?? authority.controlOpenId;
   if (!credentialOpenId) throw new Error('delegated schedule credential identity is missing');
+  // The delegated controller IS the credential holder (both come from the same
+  // signed dispatch), and authorizeDelegatedScheduleRun has just re-resolved
+  // this union_id in this app.
+  if (!authority.controlUnionId) throw new Error('delegated schedule controller identity is missing');
   return {
     targetOpenId,
     credentialOpenId,
+    unionId: authority.controlUnionId,
     tools: [...authority.runScopes],
     dispatchRoot: authority.sourceMessageId ?? authority.task.rootMessageId ?? authority.task.chatId,
   };
@@ -4412,7 +4417,8 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       // Keep a denial tied to the originating task even if contact/membership
       // lookup throws; never turn this back into "ask the peer bot to log in".
       delegatedIdentity = {
-        credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
+        credentialOpenId: delegation.authority.openId, unionId: delegation.authority.unionId,
+        tools: [], dispatchRoot: delegation.rootId,
         denialReason: 'target_access_denied',
       };
       const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
