@@ -425,6 +425,7 @@ import {
   withActiveSessionKeyLock,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
+  getDaemonSessionUsageSnapshot,
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
@@ -516,6 +517,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
+import { AutoCompactCoordinator } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -5955,6 +5957,75 @@ function getActiveCount(): number {
     if (ds.worker && !ds.worker.killed) count++;
   }
   return count;
+}
+
+const autoCompactCoordinator = new AutoCompactCoordinator();
+
+function autoCompactThreshold(): number | undefined {
+  const dashboard = readGlobalConfig().dashboard;
+  if (dashboard?.autoCompactEnabled !== true) return undefined;
+  return dashboard.autoCompactThreshold ?? 75;
+}
+
+function autoCompactPercent(ds: DaemonSession): number | undefined {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const value = getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true })
+    .context?.percentUsed;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Final fire-time gate: a human/business turn admitted during the debounce
+ * window always wins. Auto-compaction is local maintenance, never a reason to
+ * wake a worker, mutate an adopted pane, or overtake queued durable input. */
+function autoCompactEligible(ds: DaemonSession): boolean {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  return ds.session.status === 'active'
+    && !!ds.worker && !ds.worker.killed
+    && ds.workerReady === true && ds.cliReady === true
+    && ds.lastScreenStatus === 'idle'
+    && !ds.streamCardPending
+    && !isSessionTransferring(ds)
+    && !hasProtectedSessionMutationOwnership(ds)
+    && !hasPendingSessionTurns(ds.session.sessionId)
+    && !ds.pendingPrompt && !ds.pendingRawInput && !ds.pendingFollowUpInput
+    && (ds.session.queuedActivationTail?.length ?? 0) === 0
+    && !ds.cascadeInFlight
+    && !ds.usageLimit && !ds.agentAttention
+    && (ds.finalOutputDeliveriesInFlight?.size ?? 0) === 0
+    && !ds.adoptedFrom && !ds.session.adoptedFrom
+    && !ds.session.headless && !ds.session.vcMeetingReceiver
+    && backendType !== 'remote-runner'
+    && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact');
+}
+
+function observeAutoCompact(ds: DaemonSession, status: string): void {
+  autoCompactCoordinator.observe({
+    sessionId: ds.session.sessionId,
+    idle: status === 'idle',
+    threshold: autoCompactThreshold(),
+    readPercent: () => autoCompactPercent(ds),
+    eligible: () => autoCompactEligible(ds),
+    trigger: () => {
+      if (!autoCompactEligible(ds)) return false;
+      const anchor = sessionAnchorId(ds);
+      const turnId = `auto-compact:${Date.now().toString(36)}`;
+      deliverPassthroughToExistingSession(ds, '/compact', '/compact', anchor, ds.larkAppId, {
+        // Bind any native acknowledgement to the real topic root rather than a
+        // synthetic, non-existent Lark message id.
+        messageId: anchor,
+        replyRootId: anchor,
+        senderIsBot: true,
+        substitute: false,
+        inThread: ds.scope === 'thread',
+        turnId,
+        onDelivered: () => logger.info(
+          `[${tag(ds)}] Auto compact admitted at context >= ${autoCompactThreshold() ?? 75}%`,
+        ),
+      });
+      return true;
+    },
+  });
 }
 
 /**
@@ -30666,6 +30737,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      observeAutoCompact(ds, context.status);
       if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       try {
         if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
