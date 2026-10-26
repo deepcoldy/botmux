@@ -8083,6 +8083,13 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (!verified.ok || (ds && ds.larkAppId !== selfDaemonLarkAppId)) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
   }
+  // The Remote Runner relay is a host-side caller (it signs with the daemon
+  // secret). A capability-only caller must not be able to claim that role:
+  // otherwise a bot-authored sandboxed turn could name any admin as the
+  // controller and create a task owned by them.
+  if (remoteRunnerSessionTool && !trustedHost) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_host_required' });
+  }
   if (!scheduleAuthorityStore) {
     return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
   }

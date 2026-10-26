@@ -50,7 +50,9 @@ function harness(overrides: Record<string, unknown> = {}) {
     readJsonBody: async () => body,
     findActiveBySessionId: () => ds,
     authorizeSessionScopedIpc,
-    isTrustedHostIpcRequest: () => false,
+    // The Remote Runner relay is a host re-exec that signs with the daemon
+    // secret; every other caller here is a capability-only (sandboxed) CLI.
+    isTrustedHostIpcRequest: () => body.remoteRunnerSessionTool === true,
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
@@ -97,6 +99,20 @@ describe('delegated schedule add route', () => {
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
       ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
     }));
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a capability-only caller claiming the host Remote Runner relay', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.isTrustedHostIpcRequest = () => false;
+    expect(await h.run()).toMatchObject({
+      status: 403, value: { error: 'schedule_session_tool_host_required' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
