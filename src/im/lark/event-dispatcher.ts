@@ -1468,9 +1468,11 @@ export function learnSameOwnerSiblingCrossRef(
   } catch {
     return false;
   }
-  const name = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName?.trim();
+  const rawName = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName;
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
   if (!name) return false;
-  const sameName = entries.filter(e => e.botName?.trim().toLowerCase() === name.toLowerCase()).length;
+  const sameName = entries.filter(e => typeof e.botName === 'string'
+    && e.botName.trim().toLowerCase() === name.toLowerCase()).length;
   if (sameName !== 1) return false;
   updateBotOpenIdCrossRef(dataDir, larkAppId, [{ name, id: { open_id: senderOpenId } }]);
   return isKnownPeerBot(dataDir, larkAppId, senderOpenId);
