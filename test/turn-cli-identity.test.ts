@@ -550,6 +550,7 @@ describe('target daemon consumes signed message authority', () => {
       },
       resolveScheduledRunIdentity,
       noteScheduledIdentityGap: vi.fn(),
+      noteScheduledIdentityRestored: vi.fn(),
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
@@ -763,6 +764,7 @@ describe('target daemon consumes signed message authority', () => {
     expect(env).not.toContain('must-not-use-bob');
     expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledTimes(1);
     expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledWith(h.ds, task, firstScheduledTurn, gap);
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
   });
 
   it('a creator who still has access gets no claim card', async () => {
@@ -772,6 +774,9 @@ describe('target daemon consumes signed message authority', () => {
     await h.run(firstScheduledTurn);
     expect(identityBody('bytedcli', firstScheduledTurn)).toContain('creator-alice');
     expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    // A card still asking for a claimant from an earlier fire gets settled.
+    expect(h.scopeValues.noteScheduledIdentityRestored).toHaveBeenCalledWith(h.ds, expect.objectContaining({ id: 'a1b2c3d4' }),
+      firstScheduledTurn, { ok: true, openId: ALICE, unionId: 'on_alice', source: 'creator' });
   });
 
   it('publishes a denial when the scheduled creator has not authorized the tool', async () => {
@@ -820,6 +825,7 @@ describe('target daemon consumes signed message authority', () => {
     await h.run(firstScheduledTurn);
     expect(published('bytedcli', firstScheduledTurn)).toBe(false);
     expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(h.scopeValues.noteScheduledIdentityRestored).not.toHaveBeenCalled();
   });
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();

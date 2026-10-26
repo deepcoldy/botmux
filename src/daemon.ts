@@ -4367,8 +4367,10 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   const senderOpenId = identity.ok ? identity.openId : undefined;
   // A scheduled run has no inbound event to learn the union_id from; the host
   // authority recorded it with the creator or the claim.
-  if (identity.ok) noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
-  else noteScheduledIdentityGap(ds, task, turnId, identity);
+  if (identity.ok) {
+    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+    noteScheduledIdentityRestored(ds, task, turnId, identity);
+  } else noteScheduledIdentityGap(ds, task, turnId, identity);
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
@@ -4399,6 +4401,21 @@ function noteScheduledIdentityGap(
   }).catch(error => logger.warn(
     `[schedule-claim] could not post claim card for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
   ));
+}
+
+/** The task has a usable identity on this turn: settle a claim card that is
+ *  still asking for a claimant (core/schedule-identity-claim). Same
+ *  off-the-critical-path contract as the gap path. */
+function noteScheduledIdentityRestored(
+  ds: DaemonSession,
+  task: import('./types.js').ScheduledTask,
+  turnId: string,
+  identity: Extract<ScheduledRunIdentity, { ok: true }>,
+): void {
+  void scheduleIdentityClaims.noteIdentityRestored({ appId: ds.larkAppId, task, turnId, identity })
+    .catch(error => logger.warn(
+      `[schedule-claim] could not settle claim card for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
+    ));
 }
 
 function scheduleAuthorityForClaims(): ScheduleAuthorityStore {

@@ -52,8 +52,9 @@ export interface ScheduleClaimCardRecord {
   messageId: string;
   chatId: string;
   /** `pending` = still asking for a claimant; `claimed` = last rendered with a
-   *  claimant. Only a pending card is refreshed in place on later fires. */
-  status: 'pending' | 'claimed';
+   *  claimant; `resolved` = the creator regained access before anyone claimed.
+   *  Only a pending card is refreshed in place on later fires. */
+  status: 'pending' | 'claimed' | 'resolved';
   reason?: ScheduleIdentityGapReason;
   /** Scheduled turn that last refreshed the card: a re-publication of the same
    *  turn (restore, identity-model replay) must not count as another fire. */
@@ -203,7 +204,7 @@ export class ScheduleAuthorityStore {
           task_id TEXT NOT NULL,
           message_id TEXT NOT NULL,
           chat_id TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','claimed')),
+          status TEXT NOT NULL CHECK(status IN ('pending','claimed','resolved')),
           reason TEXT,
           last_turn_id TEXT,
           last_fired_at TEXT,
@@ -471,7 +472,7 @@ export class ScheduleAuthorityStore {
       taskId,
       messageId: String(row.message_id),
       chatId: String(row.chat_id),
-      status: row.status === 'claimed' ? 'claimed' : 'pending',
+      status: row.status === 'claimed' || row.status === 'resolved' ? row.status : 'pending',
       ...(reason ? { reason } : {}),
       ...(typeof row.last_turn_id === 'string' ? { lastTurnId: row.last_turn_id } : {}),
       ...(typeof row.last_fired_at === 'string' ? { lastFiredAt: row.last_fired_at } : {}),

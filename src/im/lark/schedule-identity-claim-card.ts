@@ -1,10 +1,11 @@
 /**
  * 定时任务身份认领卡（发卡与回调见 core/schedule-identity-claim）。
  *
- * 三种状态：
+ * 四种状态：
  *   - pending：任务到点时没有可用身份。写清是哪个任务、为什么要认领、认领后会以
  *     认领人身份跑什么（提示词摘要），只有一个「认领」按钮。
  *   - claimed：已认领。显示认领人和认领时间，按钮是「改为我认领」「重新执行」。
+ *   - resolved：没人认领前创建人恢复了权限，任务按创建人跑，无需认领，去掉按钮。
  *   - gone：任务已删除，去掉按钮。
  *
  * 按钮 value 只带任务 id 和 `claim_rev`（渲染这张卡时任务当前认领的时间，没有认领为
@@ -54,6 +55,10 @@ export type ScheduleClaimCardInput =
   | (CommonInput & {
     state: 'claimed';
     claim: { openId: string; claimedAt: string };
+  })
+  | (CommonInput & {
+    state: 'resolved';
+    creatorOpenId: string;
   })
   | { state: 'gone'; taskId: string; locale: Locale };
 
@@ -147,6 +152,18 @@ export function buildScheduleIdentityClaimCard(input: ScheduleClaimCardInput): R
       { tag: 'markdown', content: `<font color='grey'>${t('scheduler.claim.note_pending', undefined, loc)}</font>` },
       button(t('scheduler.claim.button_claim', undefined, loc), 'primary',
         SCHEDULE_IDENTITY_CLAIM_ACTION, input.task.id, input.currentClaimedAt ?? ''),
+    ]);
+  }
+  if (input.state === 'resolved') {
+    return card(t('scheduler.claim.title_resolved', undefined, loc), 'green', [
+      {
+        tag: 'markdown',
+        content: [
+          taskLines(input),
+          t('scheduler.claim.resolved_body', { who: mention(input.creatorOpenId) }, loc),
+        ].join('\n'),
+      },
+      promptBlock(input),
     ]);
   }
   return card(t('scheduler.claim.title_claimed', undefined, loc), 'green', [

@@ -122,6 +122,8 @@ function harness(options: { tools?: string[] } = {}) {
         await claims.noteIdentityGap({
           appId: APP, task, turnId, fireChatId: CHAT, location: { kind: 'chat', chatId: CHAT }, gap: identity,
         });
+      } else {
+        await claims.noteIdentityRestored({ appId: APP, task, turnId, identity });
       }
       return { identity, turnId };
     },
@@ -440,6 +442,20 @@ describe('claim card buttons', () => {
     expect(h.deps.runTaskNow).toHaveBeenCalledTimes(1);
   });
 
+  it('does not queue a run that would have nobody to run as', async () => {
+    const h = harness();
+    const card = await pending(h);
+    const claimed = (await h.click('schedule_identity_claim', card.card, ALICE, card.messageId)).card.data;
+    h.allowed.delete(ALICE.open);
+    // The claimed card is still on screen; no fire has replaced it yet.
+    const result = await h.click('schedule_identity_rerun', claimed, BOB, card.messageId);
+    expect(result.toast).toMatchObject({ type: 'error', content: expect.stringContaining('请先重新认领') });
+    expect(h.deps.runTaskNow).not.toHaveBeenCalled();
+    expect(text(result.card.data)).toContain(`认领人 <at id=${ALICE.open}></at> 已无权操作本 Bot`);
+    expect(buttons(result.card.data).map(b => b.value.action)).toEqual(['schedule_identity_claim']);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: card.messageId, status: 'pending', reason: 'claimant_revoked' });
+  });
+
   it('a stale card cannot start a run either', async () => {
     const h = harness();
     const card = await pending(h);
@@ -473,8 +489,101 @@ describe('claim card buttons', () => {
     expect(text(card.card)).toContain(`创建人 <at id=${ALICE.open}></at> 已无权操作本 Bot`);
     h.allowed.add(ALICE.open);
     const result = await h.click('schedule_identity_claim', card.card, BOB, card.messageId);
-    expect(result.toast.content).toContain('已刷新');
+    expect(result.toast.content).toContain('无需认领');
     expect(authorityTask().runAsClaim).toBeUndefined();
+    // The refreshed card says what is true now, with nothing left to click.
+    expect(text(result.card.data)).toContain(`创建人 <at id=${ALICE.open}></at> 已恢复权限`);
+    expect(buttons(result.card.data)).toEqual([]);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('resolved');
+  });
+
+  it('settles a pending card at the next fire once the creator can act again', async () => {
+    const h = harness();
+    h.allowed.delete(ALICE.open);
+    await pending(h, { ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    h.allowed.add(ALICE.open);
+    h.tick();
+    await h.fire();
+    expect(h.updates.map(u => u.messageId)).toEqual(['om_card_1']);
+    expect(text(h.updates[0]!.card)).toContain('已恢复权限');
+    expect(buttons(h.updates[0]!.card)).toEqual([]);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('resolved');
+    // Nothing more to do while the identity stays usable.
+    h.tick();
+    await h.fire();
+    expect(h.updates).toHaveLength(1);
+    // Losing access again is news: a fresh card, the settled one stays as history.
+    h.allowed.delete(ALICE.open);
+    h.tick();
+    await h.fire();
+    expect(h.sent.map(x => x.messageId)).toEqual(['om_card_1', 'om_card_2']);
+  });
+
+  it('a claimant who regains access keeps the task: the pending card settles and cannot be used to move it', async () => {
+    const h = harness();
+    const card = await pending(h);
+    await h.click('schedule_identity_claim', card.card, ALICE, card.messageId);
+    h.allowed.delete(ALICE.open);
+    h.tick();
+    await h.fire();
+    const lapsed = h.sent[1]!;
+    h.allowed.add(ALICE.open);
+    // Before the next fire, someone else answers the "claimant lost access" card.
+    const result = await h.click('schedule_identity_claim', lapsed.card, BOB, lapsed.messageId);
+    expect(result.toast.content).toContain('无需认领');
+    expect(authorityTask().runAsClaim).toMatchObject({ openId: ALICE.open });
+    expect(text(result.card.data)).toContain(`<at id=${ALICE.open}></at>`);
+    expect(buttons(result.card.data).map(b => b.value.action))
+      .toEqual(['schedule_identity_reclaim', 'schedule_identity_rerun']);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: lapsed.messageId, status: 'claimed' });
+  });
+
+  it('settles the pending card at the next fire once the claimant can act again', async () => {
+    const h = harness();
+    const card = await pending(h);
+    await h.click('schedule_identity_claim', card.card, ALICE, card.messageId);
+    h.allowed.delete(ALICE.open);
+    h.tick();
+    await h.fire();
+    h.allowed.add(ALICE.open);
+    h.tick();
+    await h.fire();
+    expect(h.updates.map(u => u.messageId)).toEqual(['om_card_2']);
+    expect(text(h.updates[0]!.card)).toContain(`<at id=${ALICE.open}></at>`);
+    expect(store.getClaimCard(APP, 'a1b2c3d4')?.status).toBe('claimed');
+  });
+
+  it('a hand-made "take over" click cannot claim a task that still has its creator', async () => {
+    const h = harness();
+    addTask({ ownerOpenId: ALICE.open, ownerUnionId: ALICE.union });
+    const result = await h.claims.handleCardAction({
+      operator: { open_id: BOB.open, union_id: BOB.union },
+      action: { value: { action: 'schedule_identity_reclaim', task_id: 'a1b2c3d4', claim_rev: '' } },
+      context: { open_message_id: 'om_any', open_chat_id: CHAT },
+    }, APP);
+    expect(result.toast.content).toContain('无需认领');
+    expect(authorityTask().runAsClaim).toBeUndefined();
+  });
+
+  it('refuses a delegated task: its identity comes from the delegation', async () => {
+    const h = harness();
+    scheduler.commitDelegatedTask({
+      params: {
+        id: 'd1d2d3d4', name: 'poll', schedule: 'every 30m', prompt: 'check', workingDir: '/repo',
+        chatId: CHAT, executionPosition: 'top-level', larkAppId: APP,
+      },
+      grantId: 'grant-d1', requestHash: 'hash-d1',
+      control: { openId: ALICE.open, unionId: ALICE.union, runScopes: [], selfManage: false },
+      sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
+      targetTurnId: 'om_kickoff', targetGeneration: 1, maxTasksPerTurn: 64,
+    });
+    const result = await h.claims.handleCardAction({
+      operator: { open_id: BOB.open, union_id: BOB.union },
+      action: { value: { action: 'schedule_identity_claim', task_id: 'd1d2d3d4', claim_rev: '' } },
+      context: { open_message_id: 'om_any', open_chat_id: CHAT },
+    }, APP);
+    expect(result).toEqual({ toast: { type: 'error', content: expect.stringContaining('不支持认领') } });
+    expect(authorityTask('d1d2d3d4').runAsClaim).toBeUndefined();
   });
 
   it('patches the task’s current card too when an older copy is clicked', async () => {

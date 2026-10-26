@@ -198,17 +198,34 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
       (openId, unionId) => deps.canOperate(appId, chatId, openId, unionId));
   }
 
-  /** The card as it should look for the task's current state, used to refresh
-   *  a card that was clicked while out of date. */
-  function currentCard(appId: string, chatId: string, task: ScheduledTask): Record<string, unknown> {
-    const claim = parseScheduleRunAsClaim(task.runAsClaim);
+  /** The card as it should look for the task's current state, and the card
+   *  record status that goes with it. A task whose claimant or creator can act
+   *  again is never rendered as asking for a claim. */
+  function renderCurrent(appId: string, chatId: string, task: ScheduledTask, lastFiredAt?: string): {
+    card: Record<string, unknown>;
+    status: ScheduleClaimCardRecord['status'];
+    reason?: ScheduleIdentityGapReason;
+  } {
     const identity = identityOf(appId, chatId, task);
-    if (claim && identity.ok && identity.source === 'claim') return claimedCard(appId, task, claim);
-    const record = deps.getCard(appId, task.id);
-    const gap: Extract<ScheduledRunIdentity, { ok: false }> = identity.ok
-      ? { ok: false, reason: record?.reason ?? 'no_creator' }
-      : identity;
-    return pendingCard(appId, task, gap, record?.lastFiredAt ?? task.lastRunAt ?? deps.now().toISOString());
+    if (identity.ok) {
+      const claim = parseScheduleRunAsClaim(task.runAsClaim);
+      if (identity.source === 'claim' && claim) return { card: claimedCard(appId, task, claim), status: 'claimed' };
+      return {
+        card: buildScheduleIdentityClaimCard({ state: 'resolved', ...common(appId, task), creatorOpenId: identity.openId }),
+        status: 'resolved',
+      };
+    }
+    const fired = lastFiredAt ?? deps.getCard(appId, task.id)?.lastFiredAt ?? task.lastRunAt ?? deps.now().toISOString();
+    return { card: pendingCard(appId, task, identity, fired), status: 'pending', reason: identity.reason };
+  }
+
+  /** Keep the task's card record in step with what the clicked card now shows,
+   *  when the clicked card is that record's card. */
+  function syncRecord(appId: string, taskId: string, messageId: string | undefined,
+    status: ScheduleClaimCardRecord['status'], reason?: ScheduleIdentityGapReason): void {
+    const record = deps.getCard(appId, taskId);
+    if (!record || !messageId || record.messageId !== messageId || record.status === status) return;
+    deps.putCard({ ...recordFields(record), status, ...(reason ? { reason } : {}) });
   }
 
   function toast(appId: string, type: 'success' | 'info' | 'error', key: string, vars?: Record<string, string>) {
@@ -274,6 +291,41 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
     });
   }
 
+  /** A scheduled turn of `task` has a usable identity again. If the task's
+   *  card is still asking for a claimant, turn it into what is now true —
+   *  claimed, or resolved by the creator — instead of leaving it orange. Does
+   *  nothing (one record read) for the usual task that has no pending card. */
+  function noteIdentityRestored(input: {
+    appId: string;
+    task: ScheduledTask;
+    turnId: string;
+    identity: Extract<ScheduledRunIdentity, { ok: true }>;
+  }): Promise<void> {
+    const { appId, task, turnId, identity } = input;
+    if (deps.getCard(appId, task.id)?.status !== 'pending') return Promise.resolve();
+    return serialized(`${appId}:${task.id}`, async () => {
+      const record = deps.getCard(appId, task.id);
+      if (record?.status !== 'pending') return;
+      const claim = parseScheduleRunAsClaim(task.runAsClaim);
+      const resolved = identity.source === 'claim' && claim
+        ? { card: claimedCard(appId, task, claim), status: 'claimed' as const }
+        : {
+          card: buildScheduleIdentityClaimCard({ state: 'resolved', ...common(appId, task), creatorOpenId: identity.openId }),
+          status: 'resolved' as const,
+        };
+      try {
+        await deps.updateCard(appId, record.messageId, JSON.stringify(resolved.card));
+      } catch (error) {
+        if (!deps.isCardGone(error)) {
+          deps.log.warn(`[schedule-claim] could not settle card task=${task.id} message=${record.messageId}: ${errorText(error)}`);
+          return;
+        }
+      }
+      deps.putCard({ ...recordFields(record), status: resolved.status, lastTurnId: turnId });
+      deps.log.info(`[schedule-claim] card settled task=${task.id} message=${record.messageId} status=${resolved.status}`);
+    });
+  }
+
   async function handleCardAction(data: CardActionData, appId: string): Promise<any> {
     const value = data.action?.value ?? {};
     const action = value.action;
@@ -319,27 +371,40 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
       audit('denied');
       return { toast: toast(appId, 'error', 'scheduler.claim.toast_denied') };
     }
+    const clickedMessageId = data.context?.open_message_id ?? data.open_message_id;
+    const refreshed = (key: string) => {
+      const now = renderCurrent(appId, chatId, task);
+      syncRecord(appId, taskId, clickedMessageId, now.status, now.reason);
+      return { toast: toast(appId, 'info', key), card: rawCard(now.card) };
+    };
     const current = parseScheduleRunAsClaim(task.runAsClaim);
     if ((current?.claimedAt ?? null) !== expectedClaimedAt) {
       audit('stale');
-      return { toast: toast(appId, 'info', 'scheduler.claim.toast_stale'), card: rawCard(currentCard(appId, chatId, task)) };
+      return refreshed('scheduler.claim.toast_stale');
     }
+    const identity = identityOf(appId, chatId, task);
 
     if (action === SCHEDULE_IDENTITY_RERUN_ACTION) {
       if (!task.enabled) return { toast: toast(appId, 'error', 'scheduler.claim.toast_rerun_disabled') };
+      // A run now would go out without anyone's identity and be refused.
+      if (!identity.ok) {
+        audit('no_identity');
+        const result = refreshed('scheduler.claim.toast_rerun_no_identity');
+        return { ...result, toast: { ...result.toast, type: 'error' } };
+      }
       const queued = deps.runTaskNow(appId, taskId);
-      audit(queued ? 'queued' : 'busy', ` run_as_union=${current?.unionId ?? 'none'}`);
+      audit(queued ? 'queued' : 'busy', ` run_as_union=${identity.unionId}`);
       return { toast: queued ? toast(appId, 'success', 'scheduler.claim.toast_rerun_ok') : toast(appId, 'info', 'scheduler.claim.toast_rerun_busy') };
     }
 
-    // A pending card for a task whose creator has meanwhile regained access
-    // must not hand the task to someone else: that task has an identity.
-    if (!current) {
-      const identity = identityOf(appId, chatId, task);
-      if (identity.ok) {
-        audit('not_needed');
-        return { toast: toast(appId, 'info', 'scheduler.claim.toast_stale'), card: rawCard(currentCard(appId, chatId, task)) };
-      }
+    // "Claim" answers a card that said the task has nobody to run as. If the
+    // creator or the claimant can act again, that card is out of date: handing
+    // the task to the clicker would silently move a working identity. Taking
+    // over is what "claim it for me instead" on a claimed card is for (and
+    // that button only exists while there is a claim).
+    if ((action === SCHEDULE_IDENTITY_CLAIM_ACTION || !current) && identity.ok) {
+      audit('not_needed');
+      return refreshed('scheduler.claim.toast_not_needed');
     }
     const claim: ScheduleRunAsClaim = { openId, unionId, larkAppId: appId, claimedAt: deps.now().toISOString() };
     const result = deps.claimRunAs(appId, taskId, claim, expectedClaimedAt);
@@ -347,15 +412,16 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
       if (result.error === 'not_found') return goneResponse(appId, taskId);
       const latest = deps.getAuthority(appId, taskId)?.task ?? task;
       audit(result.error);
+      const now = renderCurrent(appId, chatId, latest);
+      syncRecord(appId, taskId, clickedMessageId, now.status, now.reason);
       return {
         toast: toast(appId, 'info', result.error === 'already_claimant'
           ? 'scheduler.claim.toast_already_claimant' : 'scheduler.claim.toast_stale'),
-        card: rawCard(currentCard(appId, chatId, latest)),
+        card: rawCard(now.card),
       };
     }
     audit('claimed', ` previous_union=${result.previous?.unionId ?? 'none'}`);
     const claimed = claimedCard(appId, result.task, claim);
-    const clickedMessageId = data.context?.open_message_id ?? data.open_message_id;
     const record = deps.getCard(appId, taskId);
     const recordMessageId = record?.messageId ?? clickedMessageId;
     if (recordMessageId) {
@@ -380,7 +446,12 @@ export function createScheduleIdentityClaims(deps: ScheduleIdentityClaimDeps) {
     };
   }
 
-  return { noteIdentityGap, handleCardAction };
+  return { noteIdentityGap, noteIdentityRestored, handleCardAction };
+}
+
+function recordFields(record: ScheduleClaimCardRecord): Omit<ScheduleClaimCardRecord, 'createdAt' | 'updatedAt'> {
+  const { createdAt: _created, updatedAt: _updated, ...fields } = record;
+  return fields;
 }
 
 function errorText(error: unknown): string {
