@@ -13477,6 +13477,37 @@ async function retireCodexAppDispatchForDurableReplay(
   return true;
 }
 
+/** Recover only an unambiguous human dispatch from daemon-owned init state,
+ * after the surviving runner proves its signed generation and live engine.
+ * PID marker files and the latest chat sender are not recovery authorities. */
+function restoreCodexAppAttestedTurn(
+  payload: Record<string, unknown>, control?: { generation: string; seq: number },
+): void {
+  if (currentBotmuxTurnId || !control || !codexAppRunnerProcessIdentity || codexAppCompletionAwaitingFinal
+      || payload.busy !== true || payload.tracksTurn === false
+      || !codexAppGenerationCommits.some(commit => commit.generation === control.generation
+        && control.seq > commit.committedThrough)) return;
+  const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
+  const reservations = codexAppTurnDispatchQueue.recoveredPrefix();
+  if (prepared.length !== 1 || reservations.length !== 1) return;
+  const entry = prepared[0];
+  const sender = entry.replyTargetSenderOpenId;
+  if (entry.dispatchId !== reservations[0].dispatchId || entry.turnId !== reservations[0].turnId
+      || entry.dispatchAttempt !== reservations[0].dispatchAttempt
+      || entry.codexAppSteerable !== true || entry.replyTargetSenderIsBot !== false
+      || typeof sender !== 'string' || !sender.startsWith('ou_') || !lastInitConfig?.larkAppId) return;
+  const caller: TrustedCaller = {
+    requestLarkAppId: lastInitConfig.larkAppId, requestUserOpenId: sender, senderType: 'user',
+  };
+  adoptInitialActiveTurn({
+    turnId: entry.turnId,
+    dispatchAttempt: entry.dispatchAttempt, linkRefMode: entry.linkRefMode,
+    trustedCaller: caller, callerOpenId: sender,
+  });
+  publishSandboxRelayCapability();
+  log('Restored active Codex App human turn from the authenticated generation and exact durable dispatch');
+}
+
 async function handleTrustedCodexAppMarker(
   kind: string,
   payload: Record<string, unknown>,
@@ -13635,6 +13666,7 @@ async function handleTrustedCodexAppMarker(
       log('Authenticated Codex App runner is not yet accepting input; readiness deadline remains armed');
       return true;
     }
+    restoreCodexAppAttestedTurn(payload, control);
     const state = applyTrustedCodexAppStateMarker(
       codexAppTurnLiveness,
       codexAppReadyAuthority,

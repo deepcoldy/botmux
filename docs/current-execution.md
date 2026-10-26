@@ -2,6 +2,8 @@
 
 Codex App 的独立 runner 通过已认证的签名 state 上报原生 app-server 的 PID 与启动时间；worker 再核对本会话 backend 血缘及继承的 RPC stdin/stdout 管道，随后沿私有 IPC 发布引擎根。npm 的 Node 启动器不再造成跨轮工具被误判。接管旧 runner 时，只在签名通道认证后识别同一可执行文件、同一 session 的唯一 runner 及其直接启动的 RPC 子进程；歧义或无法证明时仍拒绝。普通 busy/idle 不重新快照正在执行的工具。引擎空闲退出后，runner 在新引擎投递原生轮次前发布签名的 `idle_restart` 边界；只有旧引擎已退出、没有待收尾 final 且新身份重新通过内核和 stdio 验证时，worker 才更新引擎根，不发布额外 prompt-ready。旧工具和旧代次不能获得新轮权限。
 
+worker 重建后，只有存活 runner 的签名代次匹配 daemon 持久 ACK 记录、签名序号越过原 ACK、引擎已证明、busy state 表示仍在跟踪原生轮次，且 daemon 下发的 prepared 记录与恢复队列都唯一并精确匹配时，才恢复该记录中的真人轮次。真人来源必须由 daemon 冻结的普通交互标记和 sender 共同证明；不使用 PID marker、最新聊天发送人、callerless/机器人记录或有歧义的队列补身份。
+
 `botmux execution current --json` 返回调用工具进程所属的当前执行。适用于本机 Linux 的普通消息与机器 Trigger；不要求该轮存在真人 caller 或已验证邮箱。
 
 命令复用 ancestor routing 和 loopback transport，仅发送 sessionId 到 `POST /api/current-execution`。daemon 从真实 TCP socket 确定调用 PID，再核对 Worker/CLI/RPC engine 的进程启动标识、当前代次及本轮之前已存在的进程树。宿主 HMAC、环境中的 TURN_ID、请求自报的 turn、旧进程或其他会话均不能代替这条检查。远程后端、没有可验证本机血缘或不支持进程证明的平台返回 blocked，不退回环境值。

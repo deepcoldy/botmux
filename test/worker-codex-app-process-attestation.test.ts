@@ -13,6 +13,7 @@ function fixture() {
     applyTrustedCodexAppStateMarker: () => ({ accepted: true, busy: true }),
     codexAppTurnLiveness: {}, codexAppReadyAuthority: {}, codexAppProofDeadline: { clear: vi.fn() },
     cleanupCodexAppControlBootstrap: vi.fn(), awaitingFirstPrompt: false,
+    restoreCodexAppAttestedTurn: vi.fn(),
     idleDetector: { reset: vi.fn() }, queueMicrotask: vi.fn(),
   };
   return { identity, scope, handle: loadWorkerFunction<(kind: string, payload: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope) };
@@ -111,5 +112,52 @@ describe('worker Codex App process attestation', () => {
     scope.codexRpcEngine = { appServerPid: 71 };
     loadWorkerFunction<(pid: number) => void>('publishLocalProcessAttestation', scope)(40);
     expect(scope.send).toHaveBeenLastCalledWith(expect.objectContaining({ enginePid: 71, engineProcStart: '400' }));
+  });
+});
+
+describe('authenticated Codex App turn recovery', () => {
+  function recoveryFixture() {
+    const entry = { state: 'prepared', dispatchId: 'd1', turnId: 'om_original',
+      codexAppSteerable: true, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
+    const scope: Record<string, any> = {
+      currentBotmuxTurnId: undefined, codexAppRunnerProcessIdentity: { enginePid: 70 },
+      codexAppCompletionAwaitingFinal: false,
+      codexAppGenerationCommits: [{ generation: 'g1', committedThrough: 5 }],
+      codexAppRecoveredDispatches: [entry],
+      codexAppTurnDispatchQueue: { recoveredPrefix: () => [entry] },
+      lastInitConfig: { larkAppId: 'cli_original' },
+      adoptInitialActiveTurn: vi.fn(), publishSandboxRelayCapability: vi.fn(), log: vi.fn(),
+    };
+    return { entry, scope, restore: loadWorkerFunction<(payload: any, control?: any) => void>(
+      'restoreCodexAppAttestedTurn', scope) };
+  }
+  it('restores the exact persisted human caller after a warm worker replacement', () => {
+    const { scope, restore } = recoveryFixture();
+    restore({ busy: true }, { generation: 'g1', seq: 6 });
+    expect(scope.adoptInitialActiveTurn).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_original', trustedCaller: { requestLarkAppId: 'cli_original',
+        requestUserOpenId: 'ou_original', senderType: 'user' },
+    }));
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+  it.each(['active', 'unsigned', 'generation', 'old-sequence', 'unfinished-final', 'idle', 'native-continuation', 'engine',
+    'ambiguous', 'reservation', 'callerless', 'bot', 'sender'])('does not recover ambiguous or unproven authority: %s', reason => {
+    const { entry, scope, restore } = recoveryFixture();
+    const state: any = { busy: true };
+    if (reason === 'active') scope.currentBotmuxTurnId = 'om_current';
+    if (reason === 'generation') scope.codexAppGenerationCommits = [];
+    if (reason === 'old-sequence') scope.codexAppGenerationCommits[0].committedThrough = 6;
+    if (reason === 'unfinished-final') scope.codexAppCompletionAwaitingFinal = true;
+    if (reason === 'idle') state.busy = false;
+    if (reason === 'native-continuation') state.tracksTurn = false;
+    if (reason === 'engine') scope.codexAppRunnerProcessIdentity = undefined;
+    if (reason === 'ambiguous') scope.codexAppRecoveredDispatches.push({ ...entry, dispatchId: 'd2' });
+    if (reason === 'reservation') scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [];
+    if (reason === 'callerless') entry.codexAppSteerable = false;
+    if (reason === 'bot') entry.replyTargetSenderIsBot = true;
+    if (reason === 'sender') entry.replyTargetSenderOpenId = '';
+    restore(state, reason === 'unsigned' ? undefined : { generation: 'g1', seq: 6 });
+    expect(scope.adoptInitialActiveTurn).not.toHaveBeenCalled();
+    expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
   });
 });

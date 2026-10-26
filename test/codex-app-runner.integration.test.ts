@@ -1936,7 +1936,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
       awaitingFirstPrompt: false, idleDetector: { reset() {} }, queueMicrotask() {},
       codexAppCompletionAwaitingFinal: false, codexAppTurnDispatchQueue: { recoveredPrefix: () => [] },
+      currentBotmuxTurnId: undefined,
     };
+    scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
     const apply = loadWorkerFunction<(kind: string, payload: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
     const control = new ControlCollector(dir, false, false, false, false, payload => apply('state', payload));
     await control.listen();
