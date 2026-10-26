@@ -499,7 +499,7 @@ describe('target daemon consumes signed message authority', () => {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
-    const { trustedCallerForScheduledTask } = await import('../src/core/scheduled-turn-provenance.js');
+    const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
@@ -548,7 +548,8 @@ describe('target daemon consumes signed message authority', () => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
       },
-      trustedCallerForScheduledTask,
+      resolveScheduledRunIdentity,
+      noteScheduledIdentityGap: vi.fn(),
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
@@ -730,6 +731,49 @@ describe('target daemon consumes signed message authority', () => {
     expect(env).not.toContain('unauthorized-human');
   });
 
+  it('runs a claimed task as its claimant, ahead of a creator who still has access', async () => {
+    const h = await targetHarness();
+    directSchedule(h, {
+      ownerOpenId: BOB, ownerUnionId: 'on_bob',
+      runAsClaim: { openId: ALICE, unionId: 'on_alice', larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' },
+    });
+    h.scopeValues.canOperate.mockReturnValue(true);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'claimant-alice' });
+    bytedcliJwts.set(BOB, { cloudJwt: 'creator-bob' });
+    await h.run(firstScheduledTurn);
+    const env = identityBody('bytedcli', firstScheduledTurn);
+    expect(env).toContain('claimant-alice');
+    expect(env).not.toContain('creator-bob');
+    expect(h.scopeValues.canOperate).toHaveBeenCalledWith(APP, 'oc_chat', ALICE, 'on_alice');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ ownerOpenId: undefined, ownerUnionId: undefined }, { ok: false, reason: 'no_creator' }],
+    [{ ownerOpenId: BOB, ownerUnionId: 'on_bob' }, { ok: false, reason: 'creator_revoked', lapsedOpenId: BOB }],
+    [{ runAsClaim: { openId: BOB, unionId: 'on_bob', larkAppId: APP, claimedAt: '2026-10-26T02:00:00.000Z' } },
+      { ok: false, reason: 'claimant_revoked', lapsedOpenId: BOB }],
+  ])('asks the chat for a claimant when a scheduled turn has no usable identity: %o', async (patch, gap) => {
+    const h = await targetHarness();
+    const { task } = directSchedule(h, patch);
+    bytedcliJwts.set(BOB, { cloudJwt: 'must-not-use-bob' });
+    await h.run(firstScheduledTurn);
+    const env = identityBody('bytedcli', firstScheduledTurn);
+    expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(env).not.toContain('must-not-use-bob');
+    expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledTimes(1);
+    expect(h.scopeValues.noteScheduledIdentityGap).toHaveBeenCalledWith(h.ds, task, firstScheduledTurn, gap);
+  });
+
+  it('a creator who still has access gets no claim card', async () => {
+    const h = await targetHarness();
+    directSchedule(h);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'creator-alice' });
+    await h.run(firstScheduledTurn);
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('creator-alice');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+  });
+
   it('publishes a denial when the scheduled creator has not authorized the tool', async () => {
     const h = await targetHarness();
     directSchedule(h);
@@ -772,8 +816,10 @@ describe('target daemon consumes signed message authority', () => {
   it('keeps disabled trigger-user authentication inert for scheduled turns', async () => {
     const h = await targetHarness();
     h.scopeValues.getBot = () => ({ config: botConfig({ enabled: false }) });
+    directSchedule(h, { ownerOpenId: undefined, ownerUnionId: undefined });
     await h.run(firstScheduledTurn);
     expect(published('bytedcli', firstScheduledTurn)).toBe(false);
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
   });
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();

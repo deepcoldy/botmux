@@ -21,6 +21,7 @@ import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from 
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
+import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
@@ -961,10 +962,14 @@ async function handleScheduleCommand(
       const display = task.parsed?.display ?? task.schedule;
       // Whose identity this task's turns run as. Worth a line of its own: with
       // it absent the task still runs, but identity-bound tools fail closed,
-      // and that is otherwise only discoverable at fire time.
-      const runAsStr = task.ownerUnionId
-        ? `\n   runAs: ${task.ownerOpenId ?? task.ownerUnionId}`
-        : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
+      // and that is otherwise only discoverable at fire time. A claim from the
+      // claim card outranks the creator, so it is what this line shows.
+      const runAs = scheduledTaskRunAs(task, larkAppId ?? task.larkAppId ?? '');
+      const runAsStr = runAs?.source === 'claim'
+        ? `\n   runAs: ${runAs.openId}（认领于 ${new Date(runAs.claimedAt!).toLocaleString(timeLocale, { timeZone })}）`
+        : runAs
+          ? `\n   runAs: ${runAs.openId ?? runAs.unionId}`
+          : '\n   runAs: —（无创建人身份，按身份鉴权的工具会 fail-closed）';
       return `${status} [${task.id}] ${display} | ${task.name}${task.silent ? ' 🔇' : ''}\n   prompt: ${task.prompt.substring(0, 50)}${task.prompt.length > 50 ? '...' : ''}${runAsStr}${nextStr}${lastStr}`;
     });
     await sessionReply(rootId, `${t('schedule.list_header', { count: tasks.length }, loc)}\n\n${lines.join('\n\n')}`);

@@ -57,6 +57,17 @@ turn 到达终态后回收内存身份时，以下身份轮次必须保留，缺
 
 Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发与首次发布走同一个入口（`prepareTurnCliIdentity`），`schedule:` 轮次重新从 schedule authority 解析创建人；若改用按真人发送者解析的路径，定时轮次没有发送者，创建人身份会被重发成匿名拒绝。Delegated 定时任务可以没有真人 actor，凭精确执行绑定的有效工具委托解析授权目标。每次运行继续执行已有的任务状态、目标用户、工具范围和凭证检查。撤销授权、范围不符和凭证失效仍会阻止对应调用。
 
+### 无身份定时任务的认领卡片
+
+开着身份鉴权（`triggerUserAuth` 开且至少管一个工具）时，direct/legacy 定时任务到点若没有可用身份——没有记录创建人（早期任务、bot 轮次或平台创建），或创建人/认领人已过不了 `canOperate`——本次照常无身份执行（受管工具被拒），同时在任务所在群发一张认领卡片（任务绑定固定话题时回复在话题里）。卡片写明任务、需要认领的原因和提示词摘要。
+
+- **一个任务一张卡**：卡片记录存在 `schedule-authority.sqlite` 的 `schedule_identity_claim_cards` 表。待认领期间每次到点只原地更新这张卡；同一执行轮次的重发（重启恢复、身份模型切换重发）不算新的到点。已认领的卡在认领人失权后、或旧卡超出飞书可编辑期限/被撤回时才发新卡。
+- **身份来源**：只取卡片回调的 `operator.open_id` / `operator.union_id`（缺 union_id 时用该 open_id 查通讯录），按钮 value 只带任务 id 和 `claim_rev`。认领写进 authority 记录里任务的 `runAsClaim`（并投影到 `schedules.json`），创建人字段不变。
+- **解析顺序**：`scheduledTaskRunAs` 统一为「认领人优先，否则创建人」，到点发布、失败续跑和工作流命令授权都经它；每次到点仍对其过 `canOperate`。
+- **权限**：认领、「改为我认领」、「重新执行」都要求点击人对本 Bot 过 `canOperate`，否则只回个人可见提示、不改状态。`claim_rev` 在 authority 写事务里做比较，旧卡或并发点击不会覆盖较新的认领。「重新执行」与 `/schedule run` 同入口，暂停的任务拒绝。
+- **审计**：每次点击记一行 `[schedule-claim] action=… outcome=… task=… chat=… operator_union=… operator_open=… at=…`；`/schedule list` 的 runAs 显示认领人与认领时间。
+- Delegated 任务不发卡（身份来自委托）。认领后改提示词不会让认领失效，与创建人语义一致。
+
 `auth request` 固定应用、授权用户及 scopes，`auth wait` 固定 requestId。隔离会话每次轮询读取当前执行 claim；服务端核对该执行与原授权用户。相同用户的后续执行可以接收完成的授权；其他用户开始执行时拒绝原请求。目标身份材料缺失是终态错误（`auth_identity_snapshot_missing`，同轮重试无效），材料存在但活动 turn 标记未翻转才保持 `pending`。
 
 ## 常用 Case

@@ -10,7 +10,8 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleRunAsClaim } from '../types.js';
+import { parseScheduleRunAsClaim } from './schedule-run-as.js';
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
@@ -1232,6 +1233,45 @@ export function runTaskNow(id: string): boolean {
     ? undefined : { ...current, nextRunAt: new Date().toISOString() })) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
   return true;
+}
+
+export type ClaimTaskRunAsResult =
+  | { ok: true; task: ScheduledTask; previous?: ScheduleRunAsClaim }
+  | { ok: false; error: 'not_found' | 'stale' | 'already_claimant'; current?: ScheduleRunAsClaim };
+
+/**
+ * Record `claim` as the task's run-as identity (claim card). Compare-and-set
+ * on the claim the clicked card was rendered for — `expectedClaimedAt` is that
+ * claim's time, or null for a card that showed no claim — evaluated inside the
+ * authority write transaction, so of two near-simultaneous clicks only the
+ * first lands and a stale card can never overwrite a newer claim.
+ */
+export function claimTaskRunAs(
+  id: string,
+  appId: string,
+  claim: ScheduleRunAsClaim,
+  expectedClaimedAt: string | null,
+): ClaimTaskRunAsResult {
+  assertScheduleAuthorityAvailable();
+  let refusal: Extract<ClaimTaskRunAsResult, { ok: false }> | undefined;
+  let previous: ScheduleRunAsClaim | undefined;
+  const task = mutateRuntimeTask(id, current => {
+    const existing = parseScheduleRunAsClaim(current.runAsClaim);
+    if ((existing?.claimedAt ?? null) !== expectedClaimedAt) {
+      refusal = { ok: false, error: 'stale', ...(existing ? { current: existing } : {}) };
+      return undefined;
+    }
+    if (existing?.unionId === claim.unionId) {
+      refusal = { ok: false, error: 'already_claimant', current: existing };
+      return undefined;
+    }
+    previous = existing;
+    return { ...current, runAsClaim: claim };
+  }, appId);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (refusal) return refusal;
+  publishScheduleTaskUpdated(id, { runAsClaim: claim });
+  return { ok: true, task, ...(previous ? { previous } : {}) };
 }
 
 export function getNextRun(id: string): Date | null {

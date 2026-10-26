@@ -22,6 +22,7 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
 
 /** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
  *  here because this module is the storage layer and must not depend on the CLI
@@ -376,6 +377,9 @@ function migrate(raw: any): ScheduledTask | null {
     // "no creator".
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
+    // Same trap as the creator pair above: a claim that is not rebuilt here is
+    // dropped on the next reload and the task falls back to having no identity.
+    runAsClaim: parseScheduleRunAsClaim(raw.runAsClaim),
     enabled: raw.enabled !== false,
     disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
       ? raw.disabledReason

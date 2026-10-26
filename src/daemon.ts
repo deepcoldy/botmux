@@ -83,7 +83,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -544,6 +544,7 @@ import {
   resumeSession,
   takeOverDurableActiveRemoteSession,
   closeCliMismatchedSessionsForBot,
+  resolveScheduledTaskExecutionPosition,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
@@ -558,7 +559,8 @@ import {
 } from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -683,7 +685,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
-import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { handleCardAction, resolveCardOperatorUnionId, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
@@ -4357,16 +4359,16 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     || !scheduleStore.effectiveScheduleChatIds(task).includes(ds.chatId)) {
     throw new Error('scheduled turn target does not match its authority');
   }
-  const caller = trustedCallerForScheduledTask(task, ds.larkAppId);
-  // open_id is app-scoped. Ownerless/legacy tasks and creators whose access
-  // was removed receive a denial, even if this session once held valid tokens.
-  const senderOpenId = caller?.requestLarkAppId === ds.larkAppId
-    && caller.requestUserOpenId
-    && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId, caller.requestUserUnionId)
-    ? caller.requestUserOpenId : undefined;
+  // The claimant from the claim card, else the creator (scheduledTaskRunAs).
+  // open_id is app-scoped. Ownerless/legacy tasks and people whose access was
+  // removed receive a denial, even if this session once held valid tokens.
+  const identity = resolveScheduledRunIdentity(task, ds.larkAppId,
+    (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId));
+  const senderOpenId = identity.ok ? identity.openId : undefined;
   // A scheduled run has no inbound event to learn the union_id from; the host
-  // authority recorded it when the task was created by that same person.
-  if (senderOpenId) noteSenderUnionId(ds.larkAppId, senderOpenId, caller?.requestUserUnionId);
+  // authority recorded it with the creator or the claim.
+  if (identity.ok) noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+  else noteScheduledIdentityGap(ds, task, turnId, identity);
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
@@ -4377,6 +4379,61 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     storageModel: identityModelForPublication(ds),
   });
 }
+
+/** Ask the task's chat for a claimant (core/schedule-identity-claim). Off the
+ *  turn's critical path: the run proceeds without an identity either way, and
+ *  a Lark failure here must not fail it. */
+function noteScheduledIdentityGap(
+  ds: DaemonSession,
+  task: import('./types.js').ScheduledTask,
+  turnId: string,
+  gap: Extract<ScheduledRunIdentity, { ok: false }>,
+): void {
+  const location = claimCardLocation({
+    position: resolveScheduledTaskExecutionPosition(task),
+    task,
+    fireChatId: ds.chatId,
+  });
+  void scheduleIdentityClaims.noteIdentityGap({
+    appId: ds.larkAppId, task, turnId, fireChatId: ds.chatId, location, gap,
+  }).catch(error => logger.warn(
+    `[schedule-claim] could not post claim card for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
+  ));
+}
+
+function scheduleAuthorityForClaims(): ScheduleAuthorityStore {
+  if (!scheduleAuthorityStore) throw new Error('schedule_authority_store_unavailable');
+  return scheduleAuthorityStore;
+}
+
+const scheduleIdentityClaims = createScheduleIdentityClaims({
+  getAuthority: (appId, taskId) => scheduleAuthorityForClaims().getRecord(appId, taskId),
+  getCard: (appId, taskId) => scheduleAuthorityForClaims().getClaimCard(appId, taskId),
+  putCard: record => scheduleAuthorityForClaims().putClaimCard(record),
+  claimRunAs: (appId, taskId, claim, expectedClaimedAt) =>
+    scheduler.claimTaskRunAs(taskId, appId, claim, expectedClaimedAt),
+  // Same entry as `/schedule run`. This daemon only receives callbacks for its
+  // own app, whose tasks are the ones its scheduler owns.
+  runTaskNow: (_appId, taskId) => scheduler.runTaskNow(taskId),
+  canOperate: (appId, chatId, openId, unionId) => canOperate(appId, chatId, openId, unionId),
+  resolveOperator: (data, appId) => resolveCardOperatorUnionId(data, appId),
+  sendCard: (appId, chatId, card) => sendMessage(appId, chatId, card, 'interactive'),
+  replyCard: (appId, rootMessageId, card) => replyMessage(appId, rootMessageId, card, 'interactive', true),
+  updateCard: (appId, messageId, card) => updateMessage(appId, messageId, card),
+  isCardGone: error => error instanceof MessageUpdateExpiredError
+    || error instanceof MessageWithdrawnError
+    || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+  governedTools: appId => {
+    try {
+      const policy = getBot(appId).config.triggerUserAuth;
+      return policy?.enabled ? policy.tools : [];
+    } catch { return []; }
+  },
+  locale: appId => localeForBot(appId),
+  timeZone: () => scheduleTimeZone(),
+  now: () => new Date(),
+  log: { info: message => logger.info(message), warn: message => logger.warn(message) },
+});
 
 async function prepareDelegatedScheduledTurnIdentity(
   ds: DaemonSession,
@@ -6976,6 +7033,7 @@ const cardDeps: CardHandlerDeps = {
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
+  scheduleIdentityClaimCardAction: (data, appId) => scheduleIdentityClaims.handleCardAction(data, appId),
   completionProposalDeps: {
     store: completionProposalStore,
     loadBaseCard: (messageId, larkAppId) => readCompletionProposalBaseCard(messageId, larkAppId),

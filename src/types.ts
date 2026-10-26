@@ -74,7 +74,8 @@ export interface TrustedCaller {
   requestLarkAppId?: string;
   /** Where this identity came from. Absent = the ordinary IM path (the sender of
    *  the inbound message that opened this turn). `'schedule_creator'` = a
-   *  daemon-fired scheduled turn running as the task's creator; `taskId` names
+   *  daemon-fired scheduled turn running as the task's run-as identity (its
+   *  creator, or the person who claimed it from the claim card); `taskId` names
    *  the task. `'failed_turn_recovery'` = automatic recovery of a recorded
    *  failed human turn; it does not prove a new human action. Consumers that must
    *  distinguish "a human asked just now" from
@@ -1541,6 +1542,16 @@ export interface ParsedSchedule {
 
 export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 'task';
 
+export interface ScheduleRunAsClaim {
+  openId: string;
+  unionId: string;
+  larkAppId: string;
+  /** ISO time of the claim. Also the claim's revision: card buttons carry it
+   *  so a click on a card rendered for an older claim cannot overwrite a newer
+   *  one. */
+  claimedAt: string;
+}
+
 export interface ScheduledTask {
   id: string;
   /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
@@ -1613,6 +1624,16 @@ export interface ScheduledTask {
    *  which is what keeps identity-bound tools fail-closed instead of silently
    *  running as the bot. */
   ownerUnionId?: string;
+  /** A person who took over this task's run-as identity from the claim card
+   *  (posted when trigger-user auth is on and the task has no usable identity).
+   *  Written only by the daemon, from the Lark-verified card-callback operator,
+   *  into the host authority record; the creator fields above stay untouched so
+   *  the creator remains on record. When present it outranks the creator for
+   *  every scheduled turn of this task (see `scheduledTaskRunAs`), and the
+   *  claimant is re-checked against the bot's live access at every fire like a
+   *  creator would be. `larkAppId` is the bot that received the callback: an
+   *  open_id is only meaningful for that app. */
+  runAsClaim?: ScheduleRunAsClaim;
   enabled: boolean;
   /** Why an enabled task became disabled. Missing means a legacy/unknown
    *  disable and is never enough to extend scheduled-turn authority. */
