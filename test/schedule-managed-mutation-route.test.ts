@@ -105,6 +105,37 @@ describe('managed schedule mutation route', () => {
     expect(h.scheduler.updateTask).toHaveBeenCalledOnce();
   });
 
+  it.each(['remove', 'pause', 'resume', 'run'] as const)(
+    'refuses a capability-only %s of a task in another chat', async action => {
+      const h = harness(action);
+      h.record.kind = 'direct';
+      h.record.task.enabled = true;
+      h.record.task.chatId = 'oc_other';
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_scope_forbidden' } });
+      const method = { remove: 'removeTask', pause: 'disableTask', resume: 'enableTask', run: 'runTaskNow' }[action];
+      expect(h.scheduler[method]).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['remove', 'pause', 'resume', 'run'] as const)(
+    'refuses a capability-only %s of a task pinned outside the caller\'s reach', async action => {
+      const h = harness(action);
+      h.record.kind = 'direct';
+      h.record.task.enabled = true;
+      h.record.task.workingDir = '/Users/ksher';
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    },
+  );
+
+  it('still lets the host run a task in another chat', async () => {
+    const h = harness('run');
+    h.record.kind = 'direct';
+    h.record.task.enabled = true;
+    h.record.task.chatId = 'oc_other';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+  });
+
   it('still lets the host update a task pinned anywhere', async () => {
     const h = harness('update');
     h.record.kind = 'direct';
@@ -434,7 +465,7 @@ describe('managed schedule mutation route', () => {
   it('refuses to force-run a paused task (must resume first)', async () => {
     const h = harness('run');
     h.record.kind = 'direct';
-    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: false };
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: '/repo', enabled: false };
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_task_disabled' } });
     expect(h.scheduler.runTaskNow).not.toHaveBeenCalled();
   });

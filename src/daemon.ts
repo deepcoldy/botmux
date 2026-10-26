@@ -8479,12 +8479,21 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   if (action === 'update' && authority.task.preconditionRef) {
     return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
   }
-  // Rewriting the prompt of a task pinned outside the caller's reach would hand
-  // a capability-only caller that directory's readWrite at the next run — the
-  // same escape capabilityScheduleWorkingDir closes on create.
-  if (action === 'update' && !trustedHost
-    && (!ds || !capabilityScheduleWorkingDir(ds, authority.task.workingDir))) {
-    return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
+  // A capability-only caller borrows the current human administrator's
+  // authority, but the request bytes come from the (untrusted) agent. Keep it
+  // to the tasks this conversation could have created: same chat, and a
+  // workingDir within its reach. Otherwise it could run / pause / remove any
+  // task of this bot, or rewrite the prompt of one pinned to a wider directory
+  // and get that directory's readWrite at the next run — the escape
+  // capabilityScheduleWorkingDir closes on create. Self-management of the
+  // currently running scheduled task keeps its own authorization above.
+  if (!trustedHost && !scheduledSelfManager) {
+    if (!ds || authority.task.chatId !== ds.chatId) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_scope_forbidden' });
+    }
+    if (!capabilityScheduleWorkingDir(ds, authority.task.workingDir)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
+    }
   }
   let ok = false;
   let error: string | undefined;
