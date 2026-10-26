@@ -15,7 +15,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const workingDirHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'capabilityScheduleWorkingDir');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${workingDirHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
@@ -23,7 +26,7 @@ const handler = ${handler.getText(source)}`, {
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group',
-    session: { sessionId: 's1' }, workerGeneration: 7,
+    session: { sessionId: 's1' }, workerGeneration: 7, workingDir: '/repo',
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -35,12 +38,13 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     completeTask: vi.fn((): { ok: boolean; replay?: boolean; error?: string } => ({ ok: true })),
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
-    task: { id: 'a1b2c3d4', chatId: 'oc_chat' } };
+    task: { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: '/repo' } };
   const authorizeScheduleSelfManage = vi.fn(async () => undefined);
   const scope: any = {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
     findActiveBySessionId: () => ds, authorizeSessionScopedIpc,
+    validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
@@ -83,6 +87,32 @@ function configureProviderActor(
 }
 
 describe('managed schedule mutation route', () => {
+  it('refuses a capability-only update of a task pinned outside the caller\'s reach', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/Users/ksher';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    expect(h.scheduler.updateTask).not.toHaveBeenCalled();
+  });
+
+  it('allows a capability-only update of a task in the caller\'s own role library', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/roles/cli_target/shared/pm';
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: '/roles/cli_target/shared/pm' }));
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.scope.validateRoleLibraryPath).toHaveBeenCalledWith('/roles/cli_target/shared/pm', undefined, 'cli_target');
+    expect(h.scheduler.updateTask).toHaveBeenCalledOnce();
+  });
+
+  it('still lets the host update a task pinned anywhere', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.workingDir = '/Users/ksher';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+  });
+
   it('runs the fixed protected task for a current same-app human administrator without a union lookup', async () => {
     const h = harness('run');
     h.record.kind = 'direct';

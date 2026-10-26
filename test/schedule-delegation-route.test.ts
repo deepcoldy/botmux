@@ -19,7 +19,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
 const handler = (route.expression as ts.CallExpression).arguments[2];
 const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'scheduleCallerForTurn');
+const workingDirHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'capabilityScheduleWorkingDir');
 const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+${workingDirHelper?.getText(source) ?? ''}
 const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
@@ -48,6 +51,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     task: { ...body.task, enabled: true, createdAt: '2026-09-28T00:00:00.000Z' } }));
   const scope: any = {
     readJsonBody: async () => body,
+    validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     findActiveBySessionId: () => ds,
     authorizeSessionScopedIpc,
     // The Remote Runner relay is a host re-exec that signs with the daemon
@@ -317,6 +321,50 @@ describe('until-done schedule creation', () => {
 });
 
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it('refuses a capability-only caller pinning the task outside its cwd and own role library', async () => {
+    const h = directHumanHarness();
+    h.body.task.workingDir = '/Users/ksher';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    expect(h.scope.validateRoleLibraryPath).toHaveBeenCalledWith('/Users/ksher', undefined, 'cli_target');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('persists the resolved own-role-library path for a capability-only caller', async () => {
+    const h = directHumanHarness();
+    h.body.task.workingDir = '~/botmux-roles/cli_target/shared/pm';
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: '/roles/cli_target/shared/pm' }));
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: '/roles/cli_target/shared/pm',
+    }));
+  });
+
+  it('lets the host pin any working directory', async () => {
+    const h = directHumanHarness();
+    h.body.task.workingDir = '/Users/ksher';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: '/Users/ksher' }));
+  });
+
+  it('refuses a capability-only p2p caller aiming at a chat the operator is not in', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.body.task.chatId = 'oc_elsewhere';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_someone_else']);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.listChatMemberOpenIds).toHaveBeenCalledWith('cli_target', 'oc_elsewhere');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps a capability-only p2p caller free to schedule into its own chat', async () => {
+    const h = directHumanHarness();
+    h.ds.chatType = 'p2p';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => []);
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
   it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = 'chat';
