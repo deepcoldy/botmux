@@ -13,6 +13,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
@@ -26,6 +27,7 @@ function makeCli(opts: {
   staticBusyPattern?: RegExp;
   staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
+  readyPatternStrong?: RegExp;
   firstPromptQuiescenceMs?: number;
 } = {}): CliAdapter {
   return {
@@ -39,6 +41,7 @@ function makeCli(opts: {
     staticBusyPattern: opts.staticBusyPattern,
     staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
+    readyPatternStrong: opts.readyPatternStrong,
     firstPromptQuiescenceMs: opts.firstPromptQuiescenceMs,
     systemHints: [],
     altScreen: false,
@@ -66,6 +69,72 @@ describe('IdleDetector: constructor', () => {
     const cli = makeCli({ readyPattern: />\s*$/ });
     const detector = new IdleDetector(cli);
     expect(detector).toBeInstanceOf(IdleDetector);
+    detector.dispose();
+  });
+});
+
+// ─── Weak rule-joined ready evidence ──────────────────────────────────────
+
+describe('IdleDetector: isReadyEvidenceWeak()', () => {
+  const withRuleArm = /(?:^|[\n\r]|(?<![─━])[─━]{3,})\s*[›❯](?!\s*\d+\.)|\d+% left/;
+  const withoutRuleArm = /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/;
+  const makeTraexish = () => new IdleDetector(makeCli({
+    readyPattern: withRuleArm,
+    readyPatternStrong: withoutRuleArm,
+  }));
+
+  it('tags a prompt joined to a horizontal rule (cursor-addressed redraw) as weak', () => {
+    const detector = makeTraexish();
+    detector.feed('──────────────────────────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.dispose();
+  });
+
+  it('treats a line-anchored prompt as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('banner line\n❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('treats a numeric Context status bar as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('GPT-6 xhigh · ~ · Context 99% left');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('upgrades to strong when a later chunk carries line-anchored evidence', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.feed('repaint\n❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('clears the weak tag on reset', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.reset();
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('treats viewport-verified seeding as strong', () => {
+    const detector = makeTraexish();
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(true);
+    detector.seedReadyEvidence(true);
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
+    detector.dispose();
+  });
+
+  it('never tags evidence weak when the adapter declares no strong sibling', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: withRuleArm }));
+    detector.feed('──────❯ Ask TraeCode CLI to do anything');
+    expect(detector.isReadyEvidenceWeak()).toBe(false);
     detector.dispose();
   });
 });
@@ -755,6 +824,30 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
 
     detector.feed('Queued for capacity\nContext 100% left\n› Ask TraeCode CLI to do anything');
     vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('checks the clear match start rather than rule characters elsewhere in the match', () => {
+    const detector = new IdleDetector(makeCli({
+      staticBusyPattern: /QUEUED/,
+      staticBusyClearPattern: /PROMPT>[^\n]*/,
+      readyPattern: /PROMPT>/,
+    }));
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+    detector.feed('QUEUED\nPROMPT> ───');
+    vi.advanceTimersByTime(5_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('preserves MiniMax line-start clearing when a running marker precedes its prompt', () => {
+    const detector = new IdleDetector(createMinimaxAdapter('/bin/true'));
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+    detector.feed('[MiniMax Code] running…\n›');
+    vi.advanceTimersByTime(5_500);
     expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
@@ -1702,6 +1795,29 @@ describe('IdleDetector: first-prompt extended quiescence', () => {
     expect(cb).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+});
+
+describe('IdleDetector: screenShowsPrompt()', () => {
+  it('reflects whether the input prompt is currently rendered, independent of the idle edge', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    expect(detector.screenShowsPrompt()).toBe(false);
+    // Prompt drawn, but no quiescence window elapsed yet: isIdleNow is still
+    // false while screenShowsPrompt is already true.
+    detector.feed('some streaming text\r\n❯ ');
+    expect(detector.screenShowsPrompt()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    // A busy redraw pushes the prompt out of the tail.
+    detector.feed('• Working (3s • esc to interrupt) ' + 'x'.repeat(600));
+    expect(detector.screenShowsPrompt()).toBe(false);
+    detector.dispose();
+  });
+
+  it('is false for an adapter without a readyPattern', () => {
+    const detector = new IdleDetector(makeCli());
+    detector.feed('❯ ');
+    expect(detector.screenShowsPrompt()).toBe(false);
     detector.dispose();
   });
 });

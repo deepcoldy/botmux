@@ -1,3 +1,4 @@
+import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
@@ -60,6 +61,10 @@ import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenanc
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import {
+  ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
+  type PluginMcpRuntimeOptions,
+} from './core/plugins/mcp/runtime-options.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
 import { parseGrantStateFields } from './services/grant-state.js';
@@ -88,7 +93,7 @@ import {
   setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
-import { knownTraexReasoningEffortsForModel, cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
@@ -114,6 +119,7 @@ import {
 } from './services/traex-auto-model.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import { cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
+import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1607,6 +1613,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Named Codex config layer. Frozen with its home when a session is created. */
+  codexProfile?: string;
   /** Codex-only service tier for newly created sessions. Missing inherits Codex. */
   serviceTier?: CodexServiceTier;
   /** Native TraeCode spawn_agent model/effort override policy. */
@@ -1630,7 +1638,9 @@ export interface BotConfig {
    * with later transcript text. Missing/false keeps the legacy notice. */
   suppressDeliveredFinalFailureNotice?: boolean;
   /**
-   * Codex App only: tune or mute the once-per-turn "no observable progress"
+   * Codex CLI: cliEnabled opts into daemon-owned 5/15 minute notices for
+   * direct human IM turns (timeoutMs overrides the first threshold). No replay.
+   * Codex App: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
    * keeps polling, so the dashboard stalled projection and the
    * `session.requires_attention` hook stay observable. `timeoutMs` overrides
@@ -2071,6 +2081,24 @@ export interface BotConfig {
    */
   grantRequestToOwnerDm?: boolean;
   /**
+   * 信任同一 owner 的同机 Bot。默认开启（undefined = on），只有显式 false 才关。
+   * 「同机 Bot」= 本机 bots.json 里登记的另一个 Bot，身份由飞书盖章的 union_id 精确对上；
+   * 「同一 owner」= 对方 Bot 的每个管理员都是本 Bot 的管理员（按 union_id 比，见
+   * services/bot-admin-unions-store.ts）。命中后：
+   * - 对方可以对本 Bot 执行管理命令（canOperate，与跨部署团队 Bot 同权）；
+   * - 对方在群里 @ 本 Bot 时，同一条消息里点名的人自动获得本群对话授权（见 im/lark/delegated-grant.ts）。
+   * owner 不同的同机 Bot 不受影响（仍只能对话）；关闭后所有同机 Bot 都只能对话。
+   */
+  trustSameOwnerBots?: boolean;
+  /**
+   * 委托授权的外部 bot 显式名单：名单里的 bot 在群里发消息 @ 本 bot 时，同一条消息里
+   * 被它点名的人自动获得本群对话授权（talk-only，见 im/lark/delegated-grant.ts 的
+   * configuredExternalBot 腿）。条目是发送方在本 bot 视角的 open_id（ou_）或 app_id
+   * （cli_）。是 trustSameOwnerBots（同 owner 同机 Bot）之外的第二条委托来源，两者互相
+   * 独立。解析时 trim、丢空白项；未配置 / 空名单 = 行为与现状完全一致。
+   */
+  grantDelegateBots?: string[];
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -2120,6 +2148,12 @@ export interface BotConfig {
    * undefined.
    */
   envUnset?: string[];
+  /**
+   * Host-only runtime options for enabled plugin MCP subprocesses. Keys are
+   * plugin ids. Environment values and timeouts are written only to the 0600
+   * session MCP runtime snapshot and are never injected into the model CLI.
+   */
+  pluginRuntime?: Record<string, PluginMcpRuntimeOptions>;
   /** Explicit process inheritance policy; missing retains historical behavior. */
   envPolicy?: EnvPolicy;
   /**
@@ -2357,6 +2391,13 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
+   * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
+   * 该群里常驻一行 `<botmux_steward>` 提示。缺省 = 关，老用户行为不变。
+   * 校验与「等于默认不写盘」见 core/decision-board/model.ts 的 normalizeStewardConfig。
+   */
+  steward?: StewardConfig;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -3513,6 +3554,35 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
   }
 }
 
+/**
+ * {@link loadBotConfigs} 的按原文缓存版：bots.json 内容没变就复用上次的解析结果（几十个 bot
+ * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
+ * 读文件失败的语义与 loadBotConfigs 一致。
+ */
+let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
+export function loadBotConfigsCached(): readonly BotConfig[] {
+  const synthetic = maybeSynthesizeCoreOnlyConfig();
+  if (synthetic) return synthetic;
+  const filePath = resolveBotConfigPath();
+  let text: string;
+  try {
+    text = readFileSync(filePath, 'utf-8');
+  } catch {
+    return parseBotConfigFile(filePath);
+  }
+  if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {
+    return parsedBotConfigsCache.configs;
+  }
+  let configs: BotConfig[];
+  try {
+    configs = parseBotConfigsFromText(text);
+  } catch (err: any) {
+    throw new Error(`${err?.message ?? err} (file: ${filePath})`);
+  }
+  parsedBotConfigsCache = { path: filePath, text, configs };
+  return configs;
+}
+
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
@@ -3585,6 +3655,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
       throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
     }
+    const codexProfile = normalizeCodexProfile(entry.codexProfile);
+    // 配置层门控：只看条目自身字段（不读 env/平台），与所有 bots.json 写入面共用。
+    if (codexProfile) assertCodexProfileConfig(entry);
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
@@ -3798,6 +3871,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? entry.grantDefaultDurationMs
       : undefined;
 
+    // grantDelegateBots：委托授权的外部 bot 显式名单（ou_ open_id 或 cli_ app_id）。
+    // 归一化：trim、丢空白项、去重；非数组 / 空名单 → undefined（bots.json 保持干净，
+    // 未配置时行为与现状完全一致）。
+    const grantDelegateBotsList = [...new Set(normalizeStringList(entry.grantDelegateBots))];
+    const grantDelegateBots = grantDelegateBotsList.length > 0 ? grantDelegateBotsList : undefined;
+
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
     // 名字内空白按 `-` 连接（/Ultra Goal → /ultra-goal）、自动补前导 `/`、
     // 按 /^\/[a-z0-9][a-z0-9:_-]*$/ 过滤、去重。非法/缺省 → undefined。
@@ -3863,6 +3942,26 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
     const envUnsetList = botEnvLayer({ env: entry.env, envUnset: entry.envUnset }).unset;
     const envUnset = envUnsetList.length > 0 ? envUnsetList : undefined;
+    const pluginRuntime = entry.pluginRuntime && typeof entry.pluginRuntime === 'object' && !Array.isArray(entry.pluginRuntime)
+      ? Object.fromEntries(Object.entries(entry.pluginRuntime)
+        .filter(([pluginId, value]) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(pluginId)
+          && value !== null && typeof value === 'object' && !Array.isArray(value))
+        .map(([pluginId, value]) => {
+          const record = value as Record<string, unknown>;
+          const runtimeEnv = sanitizePerBotEnv(record.env);
+          const toolTimeoutMs = typeof record.toolTimeoutMs === 'number'
+            && Number.isInteger(record.toolTimeoutMs)
+            && record.toolTimeoutMs > 0
+            && record.toolTimeoutMs <= ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS
+            ? record.toolTimeoutMs
+            : undefined;
+          return [pluginId, {
+            ...(Object.keys(runtimeEnv).length > 0 ? { env: runtimeEnv } : {}),
+            ...(toolTimeoutMs === undefined ? {} : { toolTimeoutMs }),
+          }] as const;
+        })
+        .filter(([, value]) => Object.keys(value).length > 0))
+      : undefined;
 
     const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
     for (const warning of normalizedReplyStyle.warnings) {
@@ -4073,9 +4172,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
-        && sharedEffortModels.every(candidate => (entryCliId === 'traex' && knownTraexReasoningEffortsForModel(candidate ?? '') === undefined)
-          || cliModelSupportsReasoningEffort(entryCliId, candidate, entry.reasoningEffort))
+        && (entryCliId === 'traex' || sharedEffortModels.every(candidate =>
+          cliModelSupportsReasoningEffort(entryCliId, candidate, entry.reasoningEffort)))
         ? entry.reasoningEffort : undefined,
+      codexProfile,
       serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
         ? entry.serviceTier
         : undefined,
@@ -4185,6 +4285,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       // 默认关，只落显式 true。
       grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
+      // 默认开，只落显式 false。
+      trustSameOwnerBots: entry.trustSameOwnerBots === false ? false : undefined,
+      grantDelegateBots,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
@@ -4193,6 +4296,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       startupCommands,
       env,
       envUnset,
+      pluginRuntime: pluginRuntime && Object.keys(pluginRuntime).length > 0 ? pluginRuntime : undefined,
       envPolicy,
       skills,
       plugins,
@@ -4278,6 +4382,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
+      steward: (() => {
+        const parsed = normalizeStewardConfig(entry.steward);
+        return parsed.ok ? parsed.value ?? undefined : undefined;
+      })(),
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()

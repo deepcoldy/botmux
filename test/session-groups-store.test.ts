@@ -284,6 +284,22 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
       argv: ['/custom/bin/grok', '-p'],
     });
   });
+
+  it('supports pi in ONE_SHOT_ARGV with pi -p', () => {
+    expect(ONE_SHOT_ARGV.pi).toEqual(['pi', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.pi)).toEqual({ argv: ['pi', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/pi' }, ONE_SHOT_ARGV.pi)).toEqual({
+      argv: ['/custom/bin/pi', '-p'],
+    });
+  });
+
+  it('supports oh-my-pi in ONE_SHOT_ARGV with omp -p', () => {
+    expect(ONE_SHOT_ARGV['oh-my-pi']).toEqual(['omp', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({ argv: ['omp', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/omp' }, ONE_SHOT_ARGV['oh-my-pi'])).toEqual({
+      argv: ['/custom/bin/omp', '-p'],
+    });
+  });
 });
 
 describe('buildTitlePrompt', () => {

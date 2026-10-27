@@ -1,6 +1,5 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -11,6 +10,7 @@ import {
   type GatewayTrustedTurnIdentityProvider,
 } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
+import { sessionMcpGatewaySocketDir } from './socket-dir.js';
 
 export interface SessionMcpGatewayHost {
   socketPath: string;
@@ -31,54 +31,12 @@ export function sessionMcpGatewayPathRegex(
   return `^${escapeForRegex(root)}/bmcp-${uid}-[^/]+(?:/|$)`;
 }
 
-/** Root for every Gateway socket directory.
- *
- * spawnCli repoints the worker's own TMPDIR at the per-session scratch tree
- * (~/.cache/botmux/session-tmp/<profile>/<sessionId>, #1592) before the host
- * binds. Following tmpdir() after that would place g.sock ~125 bytes deep on
- * macOS and listen() fails with EINVAL, so the worker pins the inherited root
- * first. Unpinned callers keep the plain tmpdir() behaviour. */
-let pinnedGatewaySocketRoot: string | undefined;
-
-export function pinSessionMcpGatewaySocketRoot(root: string): void {
-  pinnedGatewaySocketRoot ??= root;
-}
-
-export function sessionMcpGatewaySocketRoot(): string {
-  return pinnedGatewaySocketRoot ?? tmpdir();
-}
-
-/** Deterministic per-session Gateway socket directory.
- *
- * The name is a pure function of (dataDir, sessionId) — NO random component —
- * so a replacement worker (daemon restart / upgrade) re-serves the socket at
- * the exact path a surviving persistent pane's relay already holds in its
- * environment, and the relay can simply reconnect instead of the worker having
- * to kill the pane and cold-resume the CLI.
- *
- * Stays under sessionMcpGatewaySocketRoot() (not dataDir, and not the session
- * scratch TMPDIR) to keep the Unix socket below macOS's short sun_path limit,
- * and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
- * deny regex (sessionMcpGatewayPathRegex) covers it unchanged. The predictable
- * name is safe because ensurePrivateGatewayDir fails closed unless the
- * directory is a real 0700 directory owned by this uid — a squatter can only
- * DoS session startup, never observe traffic (connections still require the
- * rotating auth token). */
-export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): string {
-  const uid = process.getuid?.() ?? 0;
-  const sessionKey = createHash('sha256')
-    .update(dataDir)
-    .update('\0')
-    .update(sessionId)
-    .digest('hex')
-    .slice(0, 16);
-  return join(sessionMcpGatewaySocketRoot(), `bmcp-${uid}-${sessionKey}`);
-}
-
-/** Deterministic per-session Gateway socket path (see sessionMcpGatewaySocketDir). */
-export function sessionMcpGatewaySocketPath(sessionId: string, dataDir: string): string {
-  return join(sessionMcpGatewaySocketDir(sessionId, dataDir), 'g.sock');
-}
+export {
+  pinSessionMcpGatewaySocketRoot,
+  sessionMcpGatewaySocketDir,
+  sessionMcpGatewaySocketPath,
+  sessionMcpGatewaySocketRoot,
+} from './socket-dir.js';
 
 /** Create-or-verify the deterministic socket directory. Fail closed on
  *  anything that is not a 0700 directory owned by this uid: a symlink or a
@@ -218,7 +176,9 @@ export async function startSessionMcpGatewayHost(opts: {
         // pane's view. The replacement host reuses the directory in place,
         // rotates the token, and re-binds the socket at the same path so the
         // pane's relay can reconnect. A token file without a listener grants
-        // nothing.
+        // nothing. The directory itself goes when the session is durably
+        // closed (removeSessionMcpGatewayDir, run by the daemon after the
+        // worker exits) or when the orphan sweep finds nobody using it.
         rmSync(socketPath, { force: true });
         const serverClosed = new Promise<void>((resolve) => {
           if (!server.listening) {

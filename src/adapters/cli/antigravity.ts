@@ -10,8 +10,8 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 import { findAntigravityConversationId, findAntigravityConversationIdByPid } from '../../services/antigravity-discovery.js';
 import {
-  antigravityTranscriptPath,
   drainAntigravityTranscript,
+  resolveAntigravityTranscriptPath,
   type AntigravityTranscriptState,
 } from '../../services/antigravity-transcript.js';
 
@@ -42,10 +42,12 @@ import {
  *      verification.
  *
  *    - Conversation transcript: `~/.gemini/antigravity-cli/brain/<id>/
- *      .system_generated/logs/transcript.jsonl` (line-delimited JSON, fields:
- *      step_index/source/type/status/created_at/content). Useful for an
- *      `/adopt` bridge later; not consumed for submit verification (the
- *      conversationId rotates per spawn and we don't capture it here).
+ *      .system_generated/logs/transcript_full.jsonl` (line-delimited JSON,
+ *      fields: step_index/source/type/status/created_at/content), next to a
+ *      compact `transcript.jsonl` that cuts long fields (see
+ *      services/antigravity-transcript.ts). Not consumed for submit
+ *      verification (the conversationId rotates per spawn and we don't
+ *      capture it here).
  *
  *    - Bracketed paste (`\e[200~...\e[201~`) does NOT work: agy treats the
  *      markers as literal text. Use sendText + Enter directly.
@@ -269,7 +271,9 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
 /** Antigravity brain transcript. Zero-prompt only (no /adopt bridge). The transcript is
  *  created lazily after the first submit, so a file born after spawn is the live turn
  *  (`birth-aware`). Its provisional trailing final lives in driver state that the worker
- *  commits on the steady-state ingest tick only. */
+ *  commits on the steady-state ingest tick only. Locates the full log first and the compact
+ *  log only when no full log exists (the worker moves a compact bind over at a turn
+ *  boundary once the full log appears). */
 export const antigravityBridgeSpec: StructuredBridgeSpec = {
   drain: (path, offset, ctx) => drainAntigravityTranscript(
     path,
@@ -279,14 +283,10 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
   ),
   stateCommit: 'ingest',
   locate: {
-    bySessionId: sessionId => {
-      const path = antigravityTranscriptPath(sessionId);
-      return path && existsSync(path) ? path : undefined;
-    },
+    bySessionId: sessionId => resolveAntigravityTranscriptPath(sessionId) ?? undefined,
     byPid: pid => {
       const conversationId = findAntigravityConversationIdByPid(pid);
-      const path = conversationId ? antigravityTranscriptPath(conversationId) : null;
-      return path && existsSync(path) ? path : undefined;
+      return conversationId ? resolveAntigravityTranscriptPath(conversationId) ?? undefined : undefined;
     },
   },
   spawn: { sessionId: 'cli', baseline: 'birth-aware' },
@@ -470,8 +470,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     supportsTypeAhead: true,
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;
-      const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
-      if (!isAntigravityTranscriptBusy(transcriptPath)) return false;
+      const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
+      if (!transcriptPath || !isAntigravityTranscriptBusy(transcriptPath)) return false;
       try {
         // The transcript lags reality when a turn was killed (e.g. /close
         // mid tool call, worker crash) and the conversation is later resumed:

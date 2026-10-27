@@ -53,8 +53,10 @@ import {
   applySessionCommandUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
+  listActiveSessionIdsAcrossStores,
   listSessionsStrict,
   SessionStoreSqliteUnavailableError,
+  SessionStoreUnmigratedError,
 } from '../src/services/session-store.js';
 import {
   readPersistedSessionRows,
@@ -540,5 +542,61 @@ describe('SQLite capability gate', () => {
     expect(copies.matches).toHaveLength(1);
     expect(copies.unreadableStores).toBe(1);
     expect(copies.matches[0]?.title).toBe('other-bot');
+  });
+});
+
+// ─── 跨 bot 共享树清扫的保护集合 ─────────────────────────────────────────────
+
+describe('listActiveSessionIdsAcrossStores', () => {
+  const noKnownBots = () => new Set<string>();
+
+  it('unions the active rows of every bot store and leaves closed rows out', () => {
+    seedPersistedSessionRows(tempDir, 'appA', {
+      a1: row('a1'),
+      aClosed: row('aClosed', { status: 'closed' }),
+    });
+    seedPersistedSessionRows(tempDir, 'appB', {
+      b1: row('b1'),
+      bClosed: row('bClosed', { status: 'closed' }),
+    });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })].sort())
+      .toEqual(['a1', 'b1']);
+  });
+
+  it('is empty before any store exists', () => {
+    expect(listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }).size).toBe(0);
+  });
+
+  it('throws when one store cannot be read instead of returning the rest', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })).toThrow();
+  });
+
+  it('throws while a bot that still exists has not imported its JSON store', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-appA.json', { a1: row('a1') });
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appA']) }))
+      .toThrow(SessionStoreUnmigratedError);
+  });
+
+  it('ignores the leftover JSON store of a bot removed from this machine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    seedJson('sessions-gone.json', { g1: row('g1') });
+
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appB']) })])
+      .toEqual(['b1']);
+  });
+
+  it('propagates a missing SQLite engine', () => {
+    seedPersistedSessionRows(tempDir, 'appB', { b1: row('b1') });
+    __testOnly_setSqliteUnavailable(true);
+
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots }))
+      .toThrow(SessionStoreSqliteUnavailableError);
   });
 });

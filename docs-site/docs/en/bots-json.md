@@ -58,7 +58,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, whitespace inside a name joins with `-` (`/Ultra Goal` → `/ultra-goal`), only `[a-z0-9:_-]` kept, deduplicated; in dashboard free text, separate entries with commas/newlines or a space before the next `/`); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). In the Dashboard it is "Inherit host environment" above the session environment table. |
-| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. It is the bot layer's "set" in the session environment; also editable in the Dashboard ("Bot settings → Runtime environment → Session environment") |
+| `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. It is the bot layer's "set" in the session environment; also editable in the Dashboard ("Bot settings → Advanced → Startup environment → Session environment") |
 | `envUnset` | Inherited variable names removed from this bot's sessions, e.g. `["BYTECLOUD_AUTH_AS"]` (the bot layer's "remove", see below). botmux-reserved names and `PATH` / `HOME` cannot be removed; a name also listed in `env` is treated as set. Effective from the next session |
 | `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexCapacityRecovery` | **Off by default**. Set `true` to continue explicit model-capacity failures in managed Codex Lark sessions, or use `/botconfig set codexCapacityRecovery on` / `off`. At most two recovery inputs are appended per task and may remain in native model context; disabling this does not delete history. Not provider-specific; ordinary rate limits and quota exhaustion are excluded. |
@@ -220,16 +220,22 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
 | `grantRequestToOwnerDm` | Off by default. When `true` and no admin in the conversation can click the request card (no admin in the group, or a rejected DM), the card is sent to the primary owner's DM instead; the requester gets a neutral acknowledgement and the outcome is posted back to the original conversation. Capped per owner (20 cards per hour; failed sends do not count); over the cap or on a send failure no card is posted and the next message retries. Requires `autoGrantRequestCards` to stay on. See [Permissions & Access · Grant request cards](/en/permissions#grant-request-cards) |
+| `trustSameOwnerBots` | Enabled by default. Bots on this machine whose admins are all admins of this bot (other apps in this machine's `bots.json`, identified by union_id) can run admin commands and can talk to this bot even before this bot has recognized them; when they @mention this bot the people mentioned in the same message get talk access in that group (quota / duration follow the `/grant` defaults). Bots with a different owner are unaffected. Set to `false` and bots on this machine can only talk. See [Permissions · Bots on this machine](/en/permissions#bots-on-this-machine-admin-commands-and-delegated-grants-trustsameownerbots) |
+| `grantDelegateBots` | Unset by default (an empty list changes nothing). An explicit list of external grant-delegate bots — the second delegation source besides same-owner bots on this machine (`trustSameOwnerBots`); the two are independent. Entries are the trusted bot's `ou_` open_id as seen by this bot, or its `cli_` app_id (trimmed, blank entries dropped). When a listed bot posts a group message that @mentions this bot, every other person it @mentions in the same message automatically gets a **chat-scoped talk grant** (written to `chatGrants`, talk-only — never management access) with the `/grant` default quota/duration (3 messages / 1 hour when unconfigured), plus a grant-result card. Built for external platforms that create groups with their own bot and post a kickoff card naming the requester. Skipped for people who can already talk, the sender itself, @all, and blocked users (a delegate bot that is itself blocked is skipped entirely); nothing is written to `allowedUsers` / `allowedChatGroups` / `globalGrants`. Also editable in Dashboard **Bot Config → Authorization & Quota** or via `/botconfig set grantDelegateBots …`. See [Permissions & Access · Grant-delegate bots](/en/permissions#grant-delegate-bots-grantdelegatebots) |
 | `blockedUsers` | Block list (same identifier forms as `allowedUsers`: email / mobile / `on_xxx` / `ou_xxx`), a sender-dimension global deny: effective in both groups and DMs, and evaluated before every allow leg — on-call, whole-group open, guest grants, team trust. A blocked sender gets no grant request card. Owners / admins cannot be blocked (the write entry refuses it). It does not affect message-listener matching. Also maintained in Dashboard **Bot Config** and the group-member modal. See [Permissions & Access · Block list](/en/permissions#block-list-blockedusers) |
 
 ## File sandbox
 
 | Field | Description |
 |------|------|
-| `sandbox` | When `true`, launch new sessions in the Linux file sandbox. Writes are isolated and must be landed with `/land` |
-| `sandboxHidePaths` | Paths masked inside the sandbox with empty dirs/files so the bot cannot read them, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
-| `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
-| `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
+| `sandbox` | File sandbox mode: `"oncall"` (or `true`, default whitelist sandbox for confidentiality), `"scratch"` (full-root Copy-on-Write draft sandbox), or `false` / `"off"` (disabled). Supported on Linux and macOS. See [Sandbox documentation](/en/sandbox) |
+| `scratchStorage` | Effective only under `sandbox: "scratch"`. `"tmpfs"` (default, in-memory ephemeral) or `"disk"` (persists across daemon restarts for cold recovery) |
+| `scratchTmpfsSizeMb` | Effective only under `sandbox: "scratch"`. Upper tmpfs limit in MB (default `0` uses kernel default ≈ half of RAM) |
+| `scratchDenyPaths` | Effective only under `sandbox: "scratch"`. Additional paths masked on top of the natively readable root (botmux credentials are fixed-masked by default) |
+| `sandboxHidePaths` | Effective only under `sandbox: "oncall"`. Paths masked inside the sandbox with empty dirs/files, e.g. `["~/.ssh", "~/.botmux/bots.json"]` |
+| `sandboxReadonlyPaths` | Effective only under `sandbox: "oncall"`. Extra existing paths mounted read-only inside the sandbox (shared snapshots, reference repos, docs) |
+| `sandboxNetwork` | Network policy. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` to block normal network egress |
+| `sandboxNetworkPolicy` | Granular destination IP policy object (Linux + PTY). Configures independent `public` and `private` IP filtering rules (`allow / block / allowlist / denylist`) and trusted proxy egress |
 
 > ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
 
@@ -251,11 +257,37 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `doneReactionEmoji` | Feishu emoji_type for the "done" reaction in card-off sessions; `undefined` = default `DONE` (✅). Set it equal to `receivedReactionEmoji` to keep the marker unchanged on turn-end — handy for CLIs whose idle detection can fire early (e.g. Pi), avoiding a premature, misleading ✅ |
 | `writableTerminalLinkInCard` | When `true`, the card body directly embeds a **writable** terminal link (with token, anyone who can see the card can operate it); by default it's hidden behind a "Get write permission" button and sent privately to whoever clicks. Meaningless when `disableStreamingCard` is enabled |
 | `privateCard` | When `true`, `/card` uses an ephemeral private card visible only to `allowedUsers` (talk grantees and the bare triggerer don't receive it), only effective in plain `group` chats, and cannot live-update. Only affects the `/card` command itself |
+| `feedback` | Object. Configuration for 3-state final answer feedback (`positive / progress / negative`). Disabled by default. See [Final Answer Feedback (`feedback`)](#final-answer-feedback-feedback) |
+
+### Final Answer Feedback (`feedback`)
+
+Enable `feedback.enabled: true` in a `bots.json` entry to collect structured feedback (`positive / progress / negative`) on final answer cards. Button labels, styles, negative reasons, and comment dialog are configurable.
+
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "visibleSemantics": ["positive", "progress", "negative"],
+    "buttons": [
+      { "key": "conclusive_usable", "label": "结论可用", "semantic": "positive", "style": "primary" },
+      { "key": "effective_progress", "label": "有效推进", "semantic": "progress", "style": "default" },
+      { "key": "incorrect", "label": "结论有误", "semantic": "negative", "style": "danger" }
+    ],
+    "negativeFollowup": {
+      "reasons": [{ "key": "wrong_result", "label": "结论或结果错误" }],
+      "comment": { "enabled": true, "required": false, "maxLength": 1000 }
+    }
+  }
+}
+```
+
+Editable visually in Dashboard → Bot Config → Cards → Final Answer Feedback, or via `/botconfig set feedback '<json>'`. Data is stored in local `botmux-feedback.sqlite`. See [`docs/feedback-capability-current-implementation.md`](https://github.com/deepcoldy/botmux/blob/master/docs/feedback-capability-current-implementation.md).
 
 ## Prompt injection
 
 | Field | Description |
 |-------|-------------|
+| `promptInjection` | `"none"` or `"default"` (default). Set to `"none"` to enable **Zero Prompt Injection mode**: bypasses botmux system prompts, per-turn reminders, identity envelopes, and skills to pass raw task prompts directly to the CLI, with answers collected via transcript capture. See [Zero Prompt Injection](#zero-prompt-injection-promptinjection-none) |
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
 | `senderTagHideEmail` | Boolean, default `false` (off). Omits only the `email` attribute from newly built `<sender>` tags, retaining name, ID and type. Saved independently of `senderTag`; does not change identity caches, authorization or `--mention-back`, nor scrub queued inputs, history or message text. Hot-update with `/botconfig set senderTagHideEmail on\|off` |
 | `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
@@ -305,6 +337,22 @@ Or write it directly into the bot's config:
 - Turning it off costs two **observability** signals: (1) `/adopt` loses one fingerprint for recognizing this bot's own sessions (the remaining structural checks still cover every prompt shape we ship, so self-produced sessions are not listed as external); (2) dashboard session insight can no longer read speaker type or A2A agent name from the tag, falling back to the `[来自 … 的 @mention]` handoff marker — with no such marker, that turn shows no source.
 - Applies immediately (from the next turn); it does not rewrite queued or in-flight turns, nor backfill existing history.
 - The dashboard "Speaker Tag" toggle saves this field.
+
+### Zero Prompt Injection (`promptInjection: "none"`)
+
+Best suited for multi-agent pipelines (lead-bot dispatching sub-bots) or scenarios requiring 100% clean task prompts with no botmux wrapper.
+
+- 📖 **Showcase and Guide**: [Feishu Illustrated Showcase](https://bytedance.larkoffice.com/docx/IECddVsSFotuuXx8gf3cQdKqnCd)
+- 📑 **Technical Spec**: [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md)
+
+Enablement:
+1. **Dashboard**: Bot Config → Select Bot → Advanced → Toggle "Zero Injection"; or toggle the "Zero Injection" group under Agent Config.
+2. **`bots.json`**: Set `"promptInjection": "none"` on the bot entry.
+
+**Key Features**:
+- **Clean Task Passthrough**: Only passes task body and attachments; skips botmux system prompts, per-turn reminders, identity envelopes, roles, whiteboards, and skills. CLI-native prompts and repo `AGENTS.md` remain intact.
+- **Transcript Capture & Mentions**: Collects final answers from the underlying CLI transcript, automatically mentioning the task initiator. Mentions like `@Reviewer` in answer text are translated to real Feishu @ tags.
+- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Antigravity (local PTY / tmux backends).
 
 ## Proactive start
 
@@ -475,7 +523,7 @@ A session's environment is assembled in this order:
 - No migration: `env` already is the bot layer's set and `envPolicy` the inheritance mode. Without `envUnset` / `sessionEnv` the session environment is exactly what it was before.
 - Sessions on the riff / mojo backends do not run on this host: only the bot's own `env` is sent along; the global layer and removals do not apply.
 
-**Managing it in the Dashboard**: the global layer is under "Settings → Session environment", the bot layer under "Bot settings → Runtime environment → Session environment". The table lists each variable's name, effective value and source (inherited / global / bot); you can set, override, remove, restore inherited, or paste in bulk (same formats as `env`). Credential-like values are masked; only the local owner (local management cookie) can reveal them, and other managers see every value masked.
+**Managing it in the Dashboard**: the global layer is under "Settings → Session environment", the bot layer under "Bot settings → Advanced → Startup environment → Session environment". The table lists each variable's name, effective value and source (inherited / global / bot); you can set, override, remove, restore inherited, or paste in bulk (same formats as `env`). By default the table lists only what this layer sets or removes (the global layer on the Settings page, this bot on the bot page); everything inherited — on the bot page that includes the global layer's sets and removals — folds into a single "N inherited, show" row and is listed when you expand it or search for a name. Reserved variables and the tmux server global environments likewise start as one-line summaries you can open. Credential-like values are masked; only the local owner (local management cookie) can reveal them, and other managers see every value masked.
 
 **When it applies**: changes apply to new sessions without restarting the daemon. Running sessions keep the environment they started with; the page lists the ones still on the old environment, which pick the change up after a restart. "More → View session environment" in the session drawer shows the real environment of a running session's CLI process (read-only, masked, sources inferred by value; Linux only).
 
@@ -496,7 +544,7 @@ Omit `envPolicy` or use `{ "mode": "inherit" }` to retain historical host inheri
 
 The fixed baseline contains PATH, HOME, user identity, temporary directories, standard locale, terminal and XDG paths; see `src/core/env-policy.ts` for the complete list. `inherit` adds exact names without wildcards. Proxy, CA, toolchain and model-auth variables require explicit approval here or this bot's `env`. Configured `env` wins over inherited values and stays per child/pane. Botmux injects its own identity/control variables; reserved names including `BOTMUX*`, `__OWNER_OPEN_ID` and `CODEX_HOME` cannot be overridden or inherited as user grants. Non-reserved adapter variables such as `TRAE_HOME` and `CLI_EXTRA_ARGS` also require an explicit `inherit` grant or a value in this bot's `env`. Process-level `GROK_HOME`, `DSH_HOME` and `LARKSUITE_CLI_DATA_DIR` may be explicitly inherited. Mandatory sensitive-variable filtering remains enforced in strict mode.
 
-Set the policy in the Dashboard with "Inherit host environment" above the session environment table (Bot settings → Runtime environment), with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
+Set the policy in the Dashboard with "Inherit host environment" above the session environment table (Bot settings → Advanced → Startup environment), with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
 
 **Combining network policies:** When using a version that provides `sandboxNetworkPolicy`, the `HTTPS_PROXY` example above must also satisfy this table. An exact environment grant controls whether a value reaches the CLI; it does not authorize network access or silently remove/rewrite a proxy.
 

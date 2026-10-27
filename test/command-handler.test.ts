@@ -246,6 +246,8 @@ vi.mock('../src/services/git-worktree.js', () => ({
   worktreeRootFor: vi.fn(async (dir: string) => dir),
   withWorktreeTargetLock: vi.fn(async (_path: string, fn: () => Promise<unknown>) => fn()),
   removeRepoWorktree: vi.fn(async () => {}),
+  // The recovery card asks where a deleted worktree came from; none here.
+  resolveDeletedWorktreeOrigin: vi.fn(async () => null),
   worktreeSafetyStatus: vi.fn(async () => ({
     dirty: false,
     dirtyCount: 0,
@@ -682,6 +684,7 @@ import {
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
+import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
@@ -700,7 +703,7 @@ import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
-import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
+import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
@@ -868,7 +871,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/dash', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -4441,6 +4444,36 @@ describe('handleCommand', () => {
       );
     });
 
+    // A live CLI in a deleted directory (a merged PR's worktree removed): the
+    // restart would kill it and then be refused. Keep it running and bring up
+    // the recovery card instead.
+    it('does not restart a live CLI whose working directory is gone; the recovery card comes up instead', async () => {
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+        workingDir: '/gone/merged-worktree',
+      });
+      // The module mock's default dir is '/home/testuser/projects'; put it back
+      // (clearAllMocks in beforeEach keeps return values).
+      vi.mocked(getSessionWorkingDir).mockReturnValue('/gone/merged-worktree');
+      vi.mocked(existsSync).mockImplementation(p => String(p) !== '/gone/merged-worktree');
+      const deps = makeDeps(ds);
+
+      try {
+        await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+      } finally {
+        vi.mocked(getSessionWorkingDir).mockReturnValue('/home/testuser/projects');
+      }
+
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(workerSend).not.toHaveBeenCalled();
+      const replies = vi.mocked(deps.sessionReply).mock.calls;
+      expect(replies.filter(c => c[2] === 'interactive')).toHaveLength(1);
+      expect(vi.mocked(buildRepoSelectCard).mock.calls.at(-1)?.[5]).toMatchObject({ missingPath: '/gone/merged-worktree' });
+      expect(replies.map(c => String(c[1])).join()).not.toContain('正在重启');
+      expect(ds.workingDirRecovery?.path).toBe('/gone/merged-worktree');
+    });
+
     it('uses the frozen configured runtime name in restart feedback', async () => {
       const ds = makeDaemonSession({
         session: makeSession({
@@ -5354,6 +5387,88 @@ describe('handleCommand', () => {
       expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('未结算');
       expect(forkWorker).not.toHaveBeenCalled();
       expect(ds.pendingRepo).toBe(false);
+    });
+
+    // #2224: `/cd` and `/restart` in that state answered 「Codex App 仍有未结算
+    // 消息」 — there is no turn to wait for; the message waits for a directory.
+    it('guides /cd to /repo instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeRefusedOpeningDs();
+      const workingDirBefore = ds.workingDir;
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(ds.workingDir).toBe(workingDirBefore);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('guides /cd to /repo when the refused opening lands while /cd waits for the mutation gate', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeDaemonSession({ worker: null, hasHistory: false });
+      const workingDirBefore = ds.workingDir;
+      const deps = makeDeps(ds);
+      // Another mutation holds the bot's gate while the opening is refused.
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>(resolve => { releaseGate = resolve; });
+      let gateEntered!: () => void;
+      const entered = new Promise<void>(resolve => { gateEntered = resolve; });
+      const peer = withBotTurnMutation(LARK_APP_ID, async () => { gateEntered(); await gateHeld; });
+      await entered;
+
+      const cd = handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+      // Past the preflight: the target was validated, the mutation is queued.
+      await vi.waitFor(() => expect(existsSync).toHaveBeenCalledWith('/home/testuser/project-a'));
+      // Meanwhile the session's first message is refused for a missing directory.
+      ds.initialStartPending = true;
+      ds.pendingPrompt = 'first prompt';
+      Object.assign(ds.session, {
+        queued: true,
+        queuedPrompt: 'first prompt',
+        pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first prompt' },
+      });
+      releaseGate();
+      await peer;
+      await cd;
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('未结算');
+      expect(ds.workingDir).toBe(workingDirBefore);
+      expect(killWorker).not.toHaveBeenCalled();
+    });
+
+    it('guides /restart to /repo instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+    });
+
+    it('still refuses /cd and /restart while an activation is actually in flight', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/cd', ROOT_ID, makeLarkMessage('/cd /home/testuser/project-a'), deps, LARK_APP_ID);
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => String(c[1]));
+      expect(said).toHaveLength(2);
+      for (const reply of said) expect(reply).toContain('未结算');
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(killWorker).not.toHaveBeenCalled();
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {
@@ -6390,6 +6505,33 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('定时任务列表');
       expect(replyContent).toContain('task-1');
       expect(replyContent).toContain('Daily news');
+    });
+
+    it('shows who each task runs as: the claimant first, then the creator, else none', async () => {
+      const base = {
+        schedule: '50 17 * * *',
+        parsed: { kind: 'cron' as const, expr: '50 17 * * *', display: '每日 17:50' },
+        prompt: 'Check AI news', workingDir: '~/projects', chatId: CHAT_ID, enabled: true,
+        createdAt: new Date().toISOString(), larkAppId: LARK_APP_ID,
+      };
+      vi.mocked(scheduleStore.listTasks).mockReturnValue([
+        { ...base, id: 'claimed1', name: 'Claimed', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator',
+          runAsClaim: { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: LARK_APP_ID,
+            claimedAt: '2026-10-26T02:00:00.000Z' } },
+        { ...base, id: 'created1', name: 'Created', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator' },
+        { ...base, id: 'nobody01', name: 'Nobody' },
+      ]);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(null);
+
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule list'), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      const runAs = (id: string) => reply.split(`[${id}]`)[1]!.split('\n').find(line => line.includes('runAs:'));
+      expect(runAs('claimed1')).toMatch(/runAs: ou_claimant（认领于 .+）/);
+      expect(runAs('created1')).toContain('runAs: ou_creator');
+      expect(runAs('nobody01')).toContain('runAs: —');
     });
 
     it('should remove a task by id', async () => {

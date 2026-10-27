@@ -49,12 +49,18 @@ export interface TrustedResultDeliveryReceipt {
 export async function resolveTrustedResultDeliveryLinkRefs(input: {
   delivery: TrustedResultDelivery;
   mode: LinkRefMode;
-  resolve: (payload: OutboundLinkRefPayload) => Promise<ResolvedOutboundLinkRefs>;
+  resolve: (
+    payload: OutboundLinkRefPayload,
+    responseKind: 'final' | 'auxiliary',
+  ) => Promise<ResolvedOutboundLinkRefs>;
   persist?: (delivery: TrustedResultDelivery) => void | Promise<void>;
 }): Promise<TrustedResultDelivery> {
   let delivery = input.delivery;
   if (input.mode === 'enabled' && delivery.markdown !== undefined) {
-    const resolved = await input.resolve({ text: delivery.markdown });
+    const resolved = await input.resolve(
+      { text: delivery.markdown },
+      delivery.responseKind ?? 'final',
+    );
     delivery = {
       ...delivery,
       markdown: resolved.text ?? delivery.markdown,

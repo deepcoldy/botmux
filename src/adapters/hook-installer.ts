@@ -9,13 +9,13 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
-import { hookCommandParts } from './hook-command.js';
+import { hookCommandParts, zcodeSessionHookCommandParts } from './hook-command.js';
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks';
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
   /** Claude read-isolation: merge the shared settings `env` map into a
    *  per-bot settings file before installing hooks. Shared values win so
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
@@ -33,6 +33,9 @@ export interface HookInstallConfig {
   /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
    *  仅 claude-settings：写全局 settings.json 的 hooks.UserPromptSubmit。 */
   readonly userPromptSubmitCommand?: string;
+  /** 可选：StopFailure hook 命令。
+   *  仅 claude-settings：写全局 settings.json 的 hooks.StopFailure。 */
+  readonly stopFailureCommand?: string;
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -144,6 +147,7 @@ function isBotmuxHookCommand(command: string, suffix: string): boolean {
   const slash = Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\'));
   const basename = target.slice(slash + 1);
   return basename === 'cli.js'
+    || basename === 'cli.ts'
     || basename === 'botmux'
     || basename === 'botmux.exe'
     || /^botmux-linux-(?:x64|arm64)(?:-musl)?$/.test(basename)
@@ -279,6 +283,24 @@ function removeBotmuxPromptHookGroups(hooks: Record<string, ClaudeHookGroup[]>, 
   else hooks[eventName] = filtered;
 }
 
+/** 判断某 hook group 是否是 botmux StopFailure hook（用于幂等替换），同上结构化识别。 */
+function isBotmuxStopFailureHookGroup(group: ClaudeHookGroup): boolean {
+  return Array.isArray(group?.hooks) && group.hooks.some(
+    (e) =>
+      !!e &&
+      e.type === 'command' &&
+      typeof e.command === 'string' &&
+      isBotmuxHookCommand(e.command, '__claude-stop-failure-v1'),
+  );
+}
+
+function removeBotmuxStopFailureHookGroups(hooks: Record<string, ClaudeHookGroup[]>, eventName: string): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxStopFailureHookGroup(g));
+  if (filtered.length === 0) delete hooks[eventName];
+  else hooks[eventName] = filtered;
+}
+
 /**
  * Read-only preflight used by the worker before it arms the ready gate.
  * Installation is intentionally best-effort, so the gate must not assume that
@@ -359,6 +381,7 @@ function installClaudeSettings(
   inheritClaudeEnvFrom?: string,
   userPromptSubmitCommand?: string,
   inheritClaudeEnvExclude: readonly string[] = [],
+  stopFailureCommand?: string,
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -430,6 +453,17 @@ function installClaudeSettings(
     existingHooks['UserPromptSubmit'] = [
       ...(existingHooks['UserPromptSubmit'] ?? []),
       { hooks: [{ type: 'command', command: userPromptSubmitCommand, timeout: 10 }] },
+    ];
+  }
+
+  // StopFailure hook（幂等替换旧的 botmux 条目）。不写 matcher = 所有错误类型，
+  // 分类在 worker 侧做（与 transcript 同一个分类器）。Claude 不等 StopFailure hook
+  // 跑完；timeout 10s 只为收掉意外挂住的子进程（客户端只发一次本地 IPC）。
+  if (stopFailureCommand) {
+    removeBotmuxStopFailureHookGroups(existingHooks, 'StopFailure');
+    existingHooks['StopFailure'] = [
+      ...(existingHooks['StopFailure'] ?? []),
+      { hooks: [{ type: 'command', command: stopFailureCommand, timeout: 10 }] },
     ];
   }
 
@@ -899,6 +933,114 @@ function installGrokHooks(configPath: string, sessionStartCommand: string | unde
   }
 }
 
+// ─── ZCode hooks.events 格式 ──────────────────────────────────────────────────
+//
+// ZCode reads lifecycle hooks from `~/.zcode/cli/config.json`:
+//   { "hooks": { "enabled": true, "events": { "SessionStart": [ { "hooks": [
+//       { "type": "process", "command": "<node>", "args": ["<cli.js>",
+//         "zcode-session-hook"], "timeoutMs": 3000 } ] } ] } } }
+//
+// Why this exists: the bridge records the native session identity and the
+// per-turn submit receipt. Without it `writeInput` never sees a receipt, so
+// every message is reported as `submit_unconfirmed` while the PTY already ran
+// it — and exact-resume loses the conversation on the next respawn. The bridge
+// itself is `botmux zcode-session-hook` (a subcommand, not a .mjs file) so the
+// invocation resolves identically under tsx / node dist / compiled binary:
+// tsc does not copy .mjs into dist and the npm `files` whitelist excludes it,
+// so a file-based bridge never lands on a clean install.
+//
+// Merge, never overwrite: the user's other events, other hook entries inside
+// the same event, and every unrelated top-level key must survive. Entries
+// carrying our bridge marker are replaced in place so re-running is idempotent
+// and never stacks duplicate hooks.
+
+const ZCODE_HOOK_MARKER = 'zcode-session-hook';
+const ZCODE_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop'] as const;
+const ZCODE_HOOK_TIMEOUT_MS = 3000;
+
+interface ZcodeHookEntry {
+  type?: string;
+  command?: string;
+  args?: string[];
+  timeoutMs?: number;
+}
+
+interface ZcodeHookGroup {
+  hooks?: ZcodeHookEntry[];
+}
+
+function isOurZcodeEntry(entry: ZcodeHookEntry): boolean {
+  if (!entry || typeof entry !== 'object') return false;
+  if (Array.isArray(entry.args) && entry.args.some(a => typeof a === 'string' && a.includes(ZCODE_HOOK_MARKER))) return true;
+  // Older hand-installed configs pointed at the .mjs bridge in two shapes: as a
+  // `process` entry (interpreter in `command`, bridge in `args` — covered
+  // above) and as a bare `command` entry whose command IS the bridge path. The
+  // latter must match too, or it survives alongside our new entry and the event
+  // runs the bridge twice.
+  return typeof entry.command === 'string' && entry.command.includes(ZCODE_HOOK_MARKER);
+}
+
+function installZcodeHooks(configPath: string, parts: { cmd: string; args: string[] }): void {
+  // A corrupt config must never be rewritten from scratch: `readJsonFile`
+  // returns null for both "missing" and "unparseable", and spreading that null
+  // would silently drop the user's mcp/providers and every other top-level key.
+  let existing: Record<string, any> = {};
+  if (existsSync(configPath)) {
+    const parsed = readJsonFile<Record<string, any>>(configPath);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      logger.warn(`[hook] ${configPath} 不是合法 JSON 对象，拒绝写入以免覆盖用户配置；请先修复该文件`);
+      return;
+    }
+    existing = parsed;
+  }
+  const hooks = (existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks))
+    ? { ...existing.hooks }
+    : {};
+  const events = (hooks.events && typeof hooks.events === 'object' && !Array.isArray(hooks.events))
+    ? { ...hooks.events }
+    : {};
+
+  const entry: ZcodeHookEntry = {
+    type: 'process',
+    command: parts.cmd,
+    args: [...parts.args],
+    timeoutMs: ZCODE_HOOK_TIMEOUT_MS,
+  };
+
+  for (const event of ZCODE_HOOK_EVENTS) {
+    const groups: ZcodeHookGroup[] = Array.isArray(events[event]) ? [...events[event]] : [];
+    // Drop our own previous registrations for this event, keep every foreign one.
+    const cleaned: ZcodeHookGroup[] = [];
+    for (const group of groups) {
+      if (!group || typeof group !== 'object') continue;
+      const inner = Array.isArray(group.hooks) ? group.hooks : [];
+      const foreign = inner.filter(h => !isOurZcodeEntry(h));
+      if (foreign.length === 0 && inner.some(h => isOurZcodeEntry(h))) continue;
+      cleaned.push({ ...group, hooks: foreign });
+    }
+    cleaned.push({ hooks: [entry] });
+    events[event] = cleaned;
+  }
+
+  hooks.events = events;
+  // Never turn hooks ON behind the user's back: an explicit `enabled: false` is
+  // their decision and also covers their own unrelated hooks. Ours are
+  // registered anyway, so enabling later starts working with no second install.
+  if (hooks.enabled === false) {
+    logger.warn(`[hook] ${configPath} 的 hooks.enabled 显式为 false，保留该设置；ZCode 生命周期 hook 已注册但不会触发`);
+  } else {
+    hooks.enabled = true;
+  }
+
+  const content = JSON.stringify({ ...existing, hooks }, null, 2) + '\n';
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 ZCode 生命周期 hook（${ZCODE_HOOK_EVENTS.join('/')}）→ ${configPath}`);
+  } else {
+    logger.info(`[hook] ZCode 生命周期 hook 已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 /**
@@ -925,6 +1067,7 @@ export function installHook(
           hookInstall.inheritClaudeEnvFrom,
           hookInstall.userPromptSubmitCommand,
           hookInstall.inheritClaudeEnvExclude,
+          hookInstall.stopFailureCommand,
         );
         break;
       case 'opencode-plugin':
@@ -938,6 +1081,11 @@ export function installHook(
       case 'grok-hooks':
         // Grok has no ask-hook surface yet; only SessionStart ready-gate.
         installGrokHooks(configPath, hookInstall.sessionStartCommand);
+        break;
+      case 'zcode-hooks':
+        // ZCode has no ask-hook surface: the bridge records session identity and
+        // submit receipts, which is what makes submit confirmation work at all.
+        installZcodeHooks(configPath, zcodeSessionHookCommandParts());
         break;
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）

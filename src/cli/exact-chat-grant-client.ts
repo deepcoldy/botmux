@@ -87,7 +87,13 @@ export async function requestExactChatGrant(
 
 export interface BotChatGrantMatrixDeps {
   findDaemon(larkAppId: string): ExactChatGrantDaemon | null;
-  secret: string;
+  /** A function is called once, right before the first receiver that has
+   * something to write — a matrix with nothing to write never reads it. */
+  secret: string | (() => string);
+  /** Write only the receiver ← subject pairs this returns true for; omitted =
+   * every pair. A receiver left with no subject is skipped entirely: its
+   * daemon is neither looked up nor called. */
+  needsGrant?(receiverLarkAppId: string, subjectLarkAppId: string): boolean;
   request?: typeof requestExactChatGrant;
   retryDelaysMs?: number[];
 }
@@ -104,9 +110,10 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * Establish a full-mesh, talk-only grant matrix for local bots in one chat.
- * Every receiver resolves the other stable app ids in its own Lark namespace.
- * The operation is idempotent; any unresolved/offline receiver fails closed.
+ * Establish a full-mesh, talk-only grant matrix for local bots in one chat
+ * (minus the pairs `needsGrant` rules out). Every receiver resolves the other
+ * stable app ids in its own Lark namespace. The operation is idempotent; any
+ * unresolved/offline receiver that has something to write fails closed.
  */
 export async function ensureBotChatGrantMatrix(
   chatId: string,
@@ -120,19 +127,23 @@ export async function ensureBotChatGrantMatrix(
   const request = deps.request ?? requestExactChatGrant;
   const retryDelays = deps.retryDelaysMs ?? [250, 750, 1_500];
   const receivers: BotChatGrantMatrixResult['receivers'] = [];
+  let secret: string | undefined;
 
   for (const receiverLarkAppId of participants) {
+    const subjectLarkAppIds = participants.filter(appId => appId !== receiverLarkAppId
+      && (deps.needsGrant?.(receiverLarkAppId, appId) ?? true));
+    if (subjectLarkAppIds.length === 0) continue;
+    secret ??= typeof deps.secret === 'function' ? deps.secret() : deps.secret;
     const daemon = deps.findDaemon(receiverLarkAppId);
     if (!daemon) {
       throw new ExactChatGrantClientError(`receiver daemon offline: ${receiverLarkAppId}`);
     }
-    const subjectLarkAppIds = participants.filter(appId => appId !== receiverLarkAppId);
     let lastError: unknown;
     for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
       try {
         await request({
           daemon,
-          secret: deps.secret,
+          secret,
           operation: 'grant',
           receiverLarkAppId,
           chatId,

@@ -113,7 +113,7 @@ tail -f /tmp/botmux-hook.log
 
 可信 `botmux_group_join` 块只证明宿主观察到的入群生命周期、opening 上下文及 turn 归属，**不证明首轮 caller 已认证为真人**。没有平台 bot 证据时，首轮 caller 不带 `senderType`，因此不会获得要求 user caller 的自动续跑租约、用户级派发、失败恢复及 `schedule:create` 直连等特权。下游仍须在需要时独立核验身份和授权；一次 contact 查询不能替代这些 turn 级检查。事件缺少 `operatorOpenId` 时，只要 gate 放行仍可自动开工，但 opening 不含 `<sender>`、`operator_open_id`，也没有可信 caller。
 
-独立的会话 controller 仍按用户 owner 语义登记 operator（既有 `trustedSessionController` 行为），operator 是应用时也不例外；这不是对首轮 caller 的真人认证。显式开启实验性 `crossPrincipalInterruption`（默认关闭）后，该应用后续以 bot 身份发言不会匹配用户型 owner，会进入跨主体处理。基于 owner 的展示与确认行为也保留既有 user 语义；入群 gate 不收紧这套独立机制。
+已知邀请人是应用或机器人时（身份缓存 `type` 为 `app`/`bot`，或同机 peer cross-ref），不会把该操作人写成会话 owner / `lastCallerOpenId`，也不会把首轮 reply target 登记成 `isBot: false` 的真人 sender。因此 `trustedSessionController` 不会为这次入群铸出 user 型 controller，回合结束后的 schedule / dispatch 恢复也不会把该操作人当成真人发起人。这条拒绝与 `autoStartOnGroupJoinGateRequired` 无关：gate 关闭时首轮 prompt 仍与旧版本逐字一致，但应用/机器人操作人同样不获得真人身份。没有这类证据时，仍按既有入群语义把操作人登记为真人 sender 与 owner。显式开启实验性 `crossPrincipalInterruption`（默认关闭）后，只有真正登记下来的真人 owner 才会走 user 型 controller。
 
 普通 hook 是「通知」——跑完没人看结果。gate 事件 + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。`prompt.submit` 用于消息进入 CLI 前的自定义权限校验；`chat.bot_added` 只裁决 `autoStartOnGroupJoin`，不会阻止异步观察 hook、`groupJoinCommand` 或 owner 自动入群。
 

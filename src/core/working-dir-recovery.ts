@@ -106,6 +106,36 @@ export function recoveryCardForm(
   };
 }
 
+/**
+ * Answer a restart (`/restart`, a card's restart button) of a session that
+ * cannot start where it is, instead of restarting it. A first message refused
+ * for its missing directory has no CLI to restart: point at `/repo`. Any other
+ * session whose working directory is gone — a scheduled or board session
+ * refused at its first start, a deleted PR worktree — would only have the
+ * restart refused by forkWorker, after any live CLI was killed for it: it gets
+ * the recovery card, or while that card is up, one line pointing at it.
+ * Resolves true when the restart must not go ahead.
+ */
+export async function answerRestartWithoutWorkingDir(
+  ds: DaemonSession,
+  reply: (content: string) => Promise<unknown>,
+  deps: WorkingDirRecoveryDeps,
+): Promise<boolean> {
+  const loc = localeForBot(ds.larkAppId);
+  if (onlyUnstartedOpeningHolds(ds)) {
+    await reply(t('worker.working_dir_missing_opening_text', { path: getSessionWorkingDir(ds) }, loc));
+    return true;
+  }
+  const path = missingStartDir(ds);
+  if (!path) return false;
+  if (ds.workingDirRecovery?.path === path) {
+    await reply(t('cmd.restart.working_dir_missing', { path }, loc));
+  } else {
+    await publishWorkingDirRecovery(ds, path, deps);
+  }
+  return true;
+}
+
 export interface WorkingDirRecoveryDeps {
   sessionReply: (
     rootId: string,

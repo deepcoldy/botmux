@@ -207,7 +207,7 @@ describe('createGroupCompletionStatus', () => {
     });
   });
 
-  it('reports completion only after collaboration and requested kickoff both succeed', () => {
+  it('reports completion once a requested kickoff was sent', () => {
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: true,
@@ -219,6 +219,11 @@ describe('createGroupCompletionStatus', () => {
       collaborationReady: true,
       kickoffAccepted: true,
     });
+  });
+
+  it('reports missing bot-to-bot grants without failing the created group', () => {
+    // The grants are best-effort: a non-zero exit here would make callers that
+    // retry on failure create a second group.
     expect(createGroupCompletionStatus({
       chatId: 'oc_created',
       collaborationReady: false,
@@ -226,7 +231,18 @@ describe('createGroupCompletionStatus', () => {
       kickoffMessageId: null,
       kickoffError: null,
     })).toMatchObject({
-      success: false,
+      success: true,
+      collaborationReady: false,
+      kickoffAccepted: true,
+    });
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: false,
+      kickoffRequested: true,
+      kickoffMessageId: 'om_kickoff',
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
       collaborationReady: false,
       kickoffAccepted: true,
     });

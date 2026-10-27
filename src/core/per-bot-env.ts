@@ -113,8 +113,14 @@ export function reservedSessionEnvKeys(): { keys: string[]; prefixes: string[] }
  * can never take effect there; with both off they are ordinary user variables.
  */
 const IDENTITY_SHELL_ENV_KEYS: ReadonlySet<string> = new Set(['ZDOTDIR', 'BASH_ENV']);
-/** Git attribution for the acting person (gitIdentityConfigEnv emits COUNT=3,
- *  so the numbered keys are exactly 0..2). Injected only by trigger-user auth. */
+/** Git attribution for the acting person (gitIdentityConfigPairs emits three
+ *  pairs, so the numbered keys are exactly 0..2). Injected only by trigger-user
+ *  auth. Note this is NOT the pane forwarding list: pane forwarding is driven
+ *  by the SpawnOpts.gitConfigPairs carrier, not by any env allowlist. A
+ *  bots.json `env` entry named GIT_CONFIG_KEY_<n> (sanitizePerBotEnv does not
+ *  reserve it) is therefore silently inert — every backend drops it rather
+ *  than mixing operator-configured entries into the turn-authored git config
+ *  block. */
 const IDENTITY_GIT_ENV_KEYS: ReadonlySet<string> = new Set([
   'GIT_ASKPASS', 'GIT_CONFIG_COUNT',
   'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',

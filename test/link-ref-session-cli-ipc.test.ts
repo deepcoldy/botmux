@@ -78,6 +78,22 @@ function installRuntime(registerSources = vi.fn(() => ({
   return registerSources;
 }
 
+function installResolveRuntime() {
+  const resolveForDaemon = vi.fn((_key, _mode, payload) => ({ ...payload, refCount: 0 }));
+  setLinkRefRuntime({ resolveForDaemon } as unknown as LinkRefRuntime);
+  return resolveForDaemon;
+}
+
+async function postResolve(body: Record<string, unknown>): Promise<Response> {
+  const server = await ensureServer();
+  const path = `/api/sessions/${SESSION_ID}/link-refs/resolve`;
+  return fetch(`http://127.0.0.1:${server.port}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...body, originCapability: CAPABILITY }),
+  });
+}
+
 async function post(input: {
   sessionId?: string;
   auth?: 'capability' | 'signed' | 'none';
@@ -243,6 +259,44 @@ describe('POST /api/sessions/:sessionId/link-refs/register', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/link-refs/resolve', () => {
+  it.each(['progress', 'final', 'auxiliary'] as const)(
+    'passes the validated %s response kind to the daemon runtime',
+    async (responseKind) => {
+      installSession({ linkRefMode: 'enabled' });
+      const resolveForDaemon = installResolveRuntime();
+
+      const response = await postResolve({ responseKind, payload: { text: 'visible' } });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        payload: { text: 'visible', refCount: 0 },
+      });
+      expect(resolveForDaemon).toHaveBeenCalledWith({
+        appId: 'app-live',
+        sessionId: SESSION_ID,
+        turnId: 'turn-live',
+        dispatchAttempt: 7,
+      }, 'enabled', { text: 'visible' }, responseKind);
+    },
+  );
+
+  it.each(['completion', '', null, 1])(
+    'rejects invalid response kind %j before resolution',
+    async (responseKind) => {
+      installSession({ linkRefMode: 'enabled' });
+      const resolveForDaemon = installResolveRuntime();
+
+      const response = await postResolve({ responseKind, payload: { text: 'visible' } });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ ok: false, error: 'invalid_link_ref_payload' });
+      expect(resolveForDaemon).not.toHaveBeenCalled();
+    },
+  );
+});
+
 // Regression: link-refs/resolve must share the narrow untrushed-auth aperture
 // with link-refs/register. In an isolated (bwrap / macOS Seatbelt) session the
 // CLI has no host HMAC secret; if resolve is absent from routeHasNarrowUntrustedAuth
@@ -291,7 +345,7 @@ import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js
 describe('routeHasNarrowUntrustedAuth session-route set invariant', () => {
   const sessionRoutes = [
     'slash', 'cd', 'close', 'preview', 'chat-rename', 'chat-manager', 'rename',
-    'project', 'project-dispatch-policy', 'continuation', 'durable-send',
+    'project', 'decision-board', 'project-dispatch-policy', 'continuation', 'durable-send',
     'turn-delivery', 'deferred-topic', 'link-refs/register', 'link-refs/resolve',
     'auth-request', 'auth-status',
   ] as const;

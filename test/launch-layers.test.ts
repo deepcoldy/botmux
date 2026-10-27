@@ -9,7 +9,7 @@ const SCOPE_ARGV = wrapCommandInSessionScope('6b50f4a4-3392-43df-837b-02261f498b
   undefined, { cleanupSupported: true, memoryControllerSupported: false }, {}).args;
 const CLAUDE_ARGV = ['/root/.local/bin/claude', '--resume', 'x'];
 
-interface Proc { argv: string[]; children?: number[]; comm?: string }
+interface Proc { argv: string[]; children?: number[]; comm?: string; zombie?: boolean }
 
 function walk(table: Record<number, Proc>, pane: number, relay = true) {
   const proc = (pid: number): Proc | undefined => table[pid];
@@ -19,11 +19,14 @@ function walk(table: Record<number, Proc>, pane: number, relay = true) {
       readCmdline: pid => proc(pid)?.argv ?? [],
       childrenOf: pid => proc(pid)?.children ?? [],
       commOf: pid => proc(pid)?.comm,
+      isZombie: pid => proc(pid)?.zombie === true,
       scopePayloadOf: pid => sessionScopePayloadPid(pid, {
         platform: 'linux',
         readFile: path => {
-          const p = proc(Number(path.split('/')[2]));
+          const pid = Number(path.split('/')[2]);
+          const p = proc(pid);
           if (!p) throw new Error('process gone');
+          if (path.endsWith('/stat')) return `${pid} (${p.comm ?? 'x'}) ${p.zombie ? 'Z' : 'S'} 1 1 1`;
           return path.endsWith('/cmdline') ? `${p.argv.join('\0')}\0` : `${(p.children ?? []).join(' ')} `;
         },
       }),
@@ -38,6 +41,34 @@ describe('unwrapBotmuxLaunchLayers', () => {
       150: { argv: SCOPE_ARGV, children: [175], comm: 'sh' },
       175: { argv: CLAUDE_ARGV, comm: 'claude' },
     }, 100)).toEqual({ pid: 175, layers: ['program-status-relay', 'session-scope'], chain: [100, 150, 175] });
+  });
+
+  it('unwraps past an unreaped zombie the pane\'s login shell left under the relay', () => {
+    // A login shell ran an rc hook in the background (autojump) and then
+    // exec'd into the relay, which never reaps that child.
+    expect(walk({
+      100: { argv: RELAY_ARGV, children: [120, 150] },
+      120: { argv: [], comm: 'autojump', zombie: true },
+      150: { argv: SCOPE_ARGV, children: [175], comm: 'sh' },
+      175: { argv: CLAUDE_ARGV, comm: 'claude' },
+    }, 100)).toEqual({ pid: 175, layers: ['program-status-relay', 'session-scope'], chain: [100, 150, 175] });
+  });
+
+  it('unwraps a scope supervisor past a zombie child', () => {
+    expect(walk({
+      100: { argv: RELAY_ARGV, children: [150] },
+      150: { argv: SCOPE_ARGV, children: [160, 175], comm: 'sh' },
+      160: { argv: [], comm: 'sh', zombie: true },
+      175: { argv: CLAUDE_ARGV, comm: 'claude' },
+    }, 100)).toEqual({ pid: 175, layers: ['program-status-relay', 'session-scope'], chain: [100, 150, 175] });
+  });
+
+  it('still stops at a layer with two live children', () => {
+    expect(walk({
+      100: { argv: RELAY_ARGV, children: [120, 150] },
+      120: { argv: ['/usr/bin/autojump'], comm: 'autojump' },
+      150: { argv: SCOPE_ARGV, children: [175], comm: 'sh' },
+    }, 100)).toEqual({ pid: 100, layers: [], chain: [100] });
   });
 
   it('unwraps a scope supervisor that is the pane itself (no relay)', () => {

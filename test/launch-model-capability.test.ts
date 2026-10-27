@@ -21,7 +21,7 @@ import type { CliId } from '../src/adapters/cli/types.js';
 import { LAUNCH_MODEL_CLI_IDS, botAcceptsLaunchModel } from '../src/core/launch-model-capability.js';
 
 /** 只有后端（不是 buildArgs）把模型带出去的 CLI —— 探测看不见，必须显式记账。 */
-const BACKEND_CARRIED: ReadonlySet<CliId> = new Set<CliId>(['mojo', 'remote-runner']);
+const BACKEND_CARRIED: ReadonlySet<CliId> = new Set<CliId>(['mojo', 'remote-runner', 'zcode']);
 
 const PROBE_OPTS = {
   sessionId: 'sid-launch-model-probe',
@@ -60,7 +60,9 @@ describe('LAUNCH_MODEL_CLI_IDS 与适配器实况一致', () => {
 });
 
 describe('botAcceptsLaunchModel', () => {
+  // ZCode has no --model flag: worker supplies an isolated, validated config.
   it('清单内的 CLI 放行', () => {
+    expect(botAcceptsLaunchModel({ cliId: 'zcode' })).toBe(true);
     expect(botAcceptsLaunchModel({ cliId: 'claude-code' })).toBe(true);
     expect(botAcceptsLaunchModel({ cliId: 'mojo' })).toBe(true);
     expect(botAcceptsLaunchModel({ cliId: 'codem' })).toBe(true);

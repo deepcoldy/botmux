@@ -58,6 +58,19 @@ describe('LinkRefLedger', () => {
     expect([...ledger.resolveBatch(key, registered.map((entry) => entry.refId)).values()]).toEqual(urls);
   });
 
+  it('lists only byte-identical URLs registered for the exact turn identity', () => {
+    const other = { ...key, turnId: 'turn-b' };
+    ledger.openTurn(key);
+    ledger.openTurn(other);
+    ledger.registerBatch(key, [candidate('https://example.test/p')]);
+    ledger.registerBatch(other, [candidate('https://example.test/other')]);
+
+    expect(ledger.listRegistered(key).map(entry => entry.originalUrl))
+      .toEqual(['https://example.test/p']);
+    expect(ledger.listRegistered(other).map(entry => entry.originalUrl))
+      .toEqual(['https://example.test/other']);
+  });
+
   it('preserves mappings after close and reopen', () => {
     ledger.openTurn(key);
     const url = 'https://example.test/p';

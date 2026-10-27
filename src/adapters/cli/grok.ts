@@ -12,6 +12,7 @@ import {
   grokHooksDir,
   grokPromptHistoryPath,
   grokSkillsDir,
+  grokUnifiedLogPath,
 } from '../../services/grok-paths.js';
 import {
   discoverGrokSessions,
@@ -22,7 +23,9 @@ import {
   grokSessionDirExists,
   grokSessionExists,
   matchGrokPromptAppend,
+  matchGrokPromptEnqueue,
 } from '../../services/grok-transcript.js';
+import { ensureGrokFolderTrust } from '../../services/grok-folder-trust.js';
 import { builtinSkillBlockForInjectsSessionContext } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 
@@ -75,9 +78,8 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  bodies never self-submit.
  *  There is deliberately NO Enter-only retry for an unconfirmed submit:
  *  `submitted:false` does not prove the body is parked in the composer.
- *  Every mid-turn submit verifies late by design (grok queues it and
- *  appends prompt_history only at dequeue — see below), so an Enter-only
- *  path would routinely fire a bare Enter at an EMPTY composer, which with
+ *  A mid-turn submit leaves the composer EMPTY (grok queues it — see below),
+ *  so an Enter-only path would fire a bare Enter at it, which with
  *  a queued follow-up is send-now (cancels the running turn — the exact
  *  hazard #865 removed the second Enter for), and would swallow a genuine
  *  identical resend (Enter without ever pasting the new message). An
@@ -89,12 +91,18 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  (`user_message_chunk` / `agent_message_chunk` + `turn_completed`),
  *  drained via `drainGrokUpdates`. Submit VERIFY uses the bucket-level
  *  `prompt_history.jsonl`: an idle-composer submit appends at submit time
- *  (0.5–1s on 1.0.5). KNOWN LIMIT (1.0.5, measured): a mid-turn submit
- *  parks in grok's own queue and appends only at DEQUEUE — the instant the
- *  previous turn completes — so busy-turn verify misses regardless of the
- *  poll window (the bound is the running turn's duration, unbounded) and
- *  the caller sees a spurious「提交未确认」. Pre-existing on master; the
- *  verify-semantics fix (dequeue-independent evidence) is a separate PR.
+ *  (0.5–1s on 1.0.5). A mid-turn submit parks in grok's own queue and
+ *  appends — like its `user_message_chunk` — only at DEQUEUE, the instant
+ *  the previous turn completes, which no poll window can wait out. Its
+ *  receipt is instead the `prompt.enqueue` line `$GROK_HOME/logs/unified.jsonl`
+ *  gets when Enter lands, idle or mid-turn (measured on 1.0.5 / 1.0.13 /
+ *  1.0.67 / 1.0.70): bound to this process by `pid` and to this body by its
+ *  UTF-8 byte length (see matchGrokPromptEnqueue). That confirms the submit
+ *  like any type-ahead CLI's; the structured bridge then owns the dequeue —
+ *  the hand-off lease starts when the predecessor's turn completes, and a
+ *  user event that never follows is reported as an uncollected turn. Without
+ *  the line (no cliPid, a PID-namespaced sandbox) the deferred recheck still
+ *  falls back to prompt_history.
  *  Ready gate: Do NOT arm ready-gate (no `injectsReadyHook`).
  *  Measured on Grok 1.0.46 / 1.0.50: a bare spawn DOES create a session and
  *  DOES fire the SessionStart hook pre-prompt (~1.2s on a light GROK_HOME).
@@ -121,6 +129,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  ## Plan mode
  *  Claude disallows EnterPlanMode/ExitPlanMode for Feishu UX (blocking
  *  approval). Grok's TUI equivalent is `--no-plan`.
+ *
+ *  ## Folder trust (≥1.0.64)
+ *  While any user-level hook exists (Botmux installs its own under
+ *  `$GROK_HOME/hooks/`), Grok opens on "Do you trust the contents of this
+ *  directory?" in every untrusted folder, before the composer — the argv
+ *  prompt never starts. `ensureWorkspaceTrust` pre-writes the workspace root
+ *  into `$GROK_HOME/trusted_folders.toml` under Grok's own flock, never
+ *  overriding an explicit `trusted = false` (see grok-folder-trust.ts).
  *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
@@ -178,6 +194,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // `deferFirstPromptTimeoutUntilReady: true` to detect composer readiness.
     injectsSessionContext: true,
     deferFirstPromptTimeoutUntilReady: true,
+    ensureWorkspaceTrust: workingDir => ensureGrokFolderTrust(workingDir),
 
     buildArgs({
       sessionId,
@@ -293,7 +310,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       // Submit verify against the bucket-level prompt_history.jsonl (one
       // {timestamp, session_id, prompt} line per submit; idle-composer
       // submits append at submit time, mid-turn queued submits only at
-      // dequeue — see header). Requires cliCwd: without
+      // dequeue, so those confirm via the unified log's enqueue line — see
+      // header). Requires cliCwd: without
       // it we cannot safely pick a bucket (scanning every cwd's history
       // would risk cross-session false matches + persist wrong cliSessionId).
       // Production always sets cliCwd (spawn + adopt); missing cwd → fail
@@ -347,12 +365,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       const historyPath = grokPromptHistoryPath(cwd);
       const baseByte = grokFileSize(historyPath);
+      const unifiedLogPath = grokUnifiedLogPath();
+      const unifiedLogBaseByte = grokFileSize(unifiedLogPath);
+      const writeStartedAtMs = Date.now();
 
       if (!deliverBody()) return { submitted: false };
       await delay(scaleMs(200));
       // One paste + one Enter per call, and NEVER an Enter without a paste
       // in the same call: `submitted:false` is not proof the body is parked
-      // in the composer (every mid-turn submit verifies late — see header),
+      // in the composer (a queued mid-turn submit empties it — see header),
       // and a bare Enter on an empty composer with a queued follow-up is
       // send-now (cancels the running turn). An unconfirmed submit is
       // recovered by the worker's flush retry (full re-paste) and the
@@ -369,8 +390,21 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           : undefined;
         return matchGrokPromptAppend(historyPath, base, content, { preferSessionId });
       };
+      // Busy-turn receipt: the composer logged accepting this body into its
+      // queue (see header). prompt_history follows only at dequeue, so the
+      // turn's start is then owned by the structured bridge's hand-off lease.
+      const probeQueued = (): { found: boolean; cliSessionId?: string } => {
+        const pid = pty.cliPid;
+        if (!pid || !matchGrokPromptEnqueue(unifiedLogPath, unifiedLogBaseByte, content, {
+          pid,
+          sinceMs: writeStartedAtMs,
+        })) return { found: false };
+        const sessionId = findGrokSessionByPid(pid)?.sessionId;
+        return sessionId ? { found: true, cliSessionId: sessionId } : { found: true };
+      };
 
-      // Keep polling for a late history append. An unconfirmed submit is
+      // Keep polling for a late history append: an idle submit records it
+      // within ~1s and carries the owning session id. An unconfirmed submit is
       // recovered by the worker's flush retry and the deferred recheck —
       // never by a second in-band Enter.
       const confirm = (hit: { found: boolean; cliSessionId?: string }) =>
@@ -386,9 +420,12 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       const late = probe();
       if (late.found) return confirm(late);
+      const queued = probeQueued();
+      if (queued.found) return confirm(queued);
 
       const recheck = () => {
-        const hit = probe();
+        const history = probe();
+        const hit = history.found ? history : probeQueued();
         if (!hit.found) return false;
         return hit.cliSessionId
           ? { submitted: true as const, cliSessionId: hit.cliSessionId }

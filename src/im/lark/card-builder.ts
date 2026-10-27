@@ -28,6 +28,7 @@ import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
+import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -136,7 +137,7 @@ export function contextCompactThreshold(): number {
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard', 'replyCardActions'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm', 'trustSameOwnerBots'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -171,7 +172,7 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     text: {
       tag: 'lark_md',
       content: t('card.config.summary', {
-        cli: data.cliId, model: data.model ?? def, lang: data.lang ?? def, admins: data.admins,
+        cli: data.cliId, model: (data.model ? data.modelChoiceLabels?.[data.model] ?? data.model : def), lang: data.lang ?? def, admins: data.admins,
       }, locale),
     },
   });
@@ -184,8 +185,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   ];
   if (data.modelChoices.length > 0) {
     runSelects.push(configSelect('model', data.model ?? CONFIG_UNSET,
-      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: m, value: m }))],
+      [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: data.modelChoiceLabels?.[m] ?? m, value: m }))],
       { action: 'config_set', field: 'model', ...locVal }));
+  }
+  if (data.reasoningEfforts && data.reasoningEfforts.length > 0) {
+    runSelects.push(configSelect(t('card.config.effort', undefined, locale),
+      data.reasoningEffort ?? CONFIG_UNSET,
+      [{ text: def, value: CONFIG_UNSET }, ...data.reasoningEfforts.map(level => ({ text: level, value: level }))],
+      { action: 'config_set', field: 'reasoningEffort', ...locVal }));
   }
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
@@ -205,6 +212,8 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     ],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
+
+  if (data.cliId === 'zcode') elements.push({ tag: 'div', text: { tag: 'plain_text', content: locale === 'en' ? 'Model changes apply to new topics. Existing topics keep their own model and conversation.' : '模型修改对新话题生效；已有话题保留各自的模型和对话。' } });
 
   // ── 布尔开关分组 ─────────────────────────────────────────────────────────
   const onMap = new Map(data.booleans.map(b => [b.key, b.on]));
@@ -539,6 +548,19 @@ export function buildSessionCard(
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
  * Lark bridge so future replies route back into this topic.
  */
+/**
+ * The closed card's worktree section (#698), present only when the session's
+ * working dir is a worktree botmux created. Absent → the card is byte-for-byte
+ * the legacy one. Present → the card is shareable-updatable so the click result
+ * can replace it in place.
+ */
+export interface ClosedCardWorktreeCleanup {
+  /** Markdown under the body: the offer, "checking…", or the click result. */
+  note: string;
+  /** Show the button: the offer, or a refusal the user can fix and retry. */
+  button: boolean;
+}
+
 export function buildSessionClosedCard(
   sessionId: string,
   rootId: string,
@@ -549,6 +571,7 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
+  worktreeCleanup?: ClosedCardWorktreeCleanup,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
@@ -565,19 +588,37 @@ export function buildSessionClosedCard(
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const card = simpleCard({
-    title: t('card.status.session_closed', undefined, locale),
-    template: 'grey',
-    markdown: body,
-    buttons: [
-      callbackButton(
-        t('card.btn.resume_session', undefined, locale),
-        'primary',
-        { action: 'resume', ...actionBase },
-      ),
+  const resumeButton = callbackButton(
+    t('card.btn.resume_session', undefined, locale),
+    'primary',
+    { action: 'resume', ...actionBase },
+  );
+  if (!worktreeCleanup) {
+    return JSON.stringify(simpleCard({
+      title: t('card.status.session_closed', undefined, locale),
+      template: 'grey',
+      markdown: body,
+      buttons: [resumeButton],
+    }));
+  }
+  // The button carries only the session id: the directory is re-read from the
+  // session row and botmux's creation record on click, never from the card.
+  const buttons = worktreeCleanup.button
+    ? [resumeButton, callbackButton(
+        t('card.btn.cleanup_worktree', undefined, locale),
+        'default',
+        { action: CLEANUP_SESSION_WORKTREE_ACTION, root_id: rootId, session_id: sessionId },
+      )]
+    : [resumeButton];
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.status.session_closed', undefined, locale), 'grey'),
+    elements: [
+      { tag: 'markdown', content: body },
+      { tag: 'markdown', content: worktreeCleanup.note },
+      { tag: 'action', actions: buttons },
     ],
-  });
-  return JSON.stringify(card);
+    extraConfig: { update_multi: true },
+  }));
 }
 
 /** Parent-topic panel for `/fork <task>`. Links and live/closed state are

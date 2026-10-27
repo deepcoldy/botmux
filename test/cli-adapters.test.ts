@@ -307,6 +307,13 @@ describe('claude-code buildArgs', () => {
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
+  it('installs the StopFailure hook globally, next to the other botmux Claude hooks', () => {
+    // Claude ends API-error turns without running Stop hooks; this is the only
+    // structured signal botmux gets for them (see services/claude-stop-failure.ts).
+    expect(adapter.hookInstall?.format).toBe('claude-settings');
+    expect(adapter.hookInstall?.stopFailureCommand?.endsWith(' __claude-stop-failure-v1')).toBe(true);
+  });
+
   it('ignores initialPrompt (not passed via args)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, initialPrompt: 'hello' });
     expect(args).not.toContain('hello');

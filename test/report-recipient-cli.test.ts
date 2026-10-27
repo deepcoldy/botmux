@@ -9,6 +9,10 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  describeReportRelayFallback,
+  UNDELIVERED_REPORT_RELAY_REASON_TEXT,
+} from '../src/core/report-session-relay.js';
 import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
 import {
@@ -290,9 +294,12 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.outbound).toMatchObject({ method: 'reply', request: { path: { message_id: THREAD }, data: { reply_in_thread: true } } });
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
     expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
+    // An implicit root opts into the relay fallback, but never claims the root
+    // was named: the daemon must keep answering a registry miss with 404.
     expect(result.requests).toEqual([{ url: '/api/report-relay', body: {
       sessionId: 'current-thread', dispatchRoot: THREAD, content: 'Ready for review',
       originCapability: CAPABILITY, originTurnId: 'turn-report', originDispatchAttempt: 2,
+      relayFallback: 'publish',
     } }]);
   });
 
@@ -643,5 +650,102 @@ describe('report issue notice source', () => {
     expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: true });
     expect(result.outbound).toMatchObject({ method: 'create', request: { data: { receive_id: CHAT } } });
     expect(result.topicReads).toEqual(topicPolicy === 'stop' ? [THREAD] : []); expect(result.requests).toEqual([]);
+  });
+});
+
+describe('report CLI relay fallback (#2262)', () => {
+  const failureLine = (stderr: string) => {
+    const line = stderr.split('\n').find(entry => entry.startsWith('{"success":false'));
+    return line ? JSON.parse(line) : undefined;
+  };
+
+  it('asks for the visible fallback on default relay and names an explicit root', async () => {
+    const result = await runReport({ args: ['--dispatch-root', 'om_relay_seed'], relayStatus: 200, relayBody: {
+      ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+    } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ relayFallback: 'publish', explicitDispatchRoot: true });
+    expect(result.output).toMatchObject({ delivery: 'orchestrator-session', reportedTo: 'orchestrator' });
+    expect(result.output).not.toHaveProperty('relayDelivered');
+  });
+
+  it('does not ask for the fallback when the report is published anyway', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish'],
+      relayStatus: 200, relayBody: { ok: true, publishedMessageId: 'om_result',
+        publicationTarget: { mode: 'thread', rootMessageId: THREAD, chatId: CHAT } },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests[0].body).not.toHaveProperty('relayFallback');
+    expect(result.requests[0].body).not.toHaveProperty('explicitDispatchRoot');
+  });
+
+  it('reports a published fallback as a visible delivery the orchestrator did not get', async () => {
+    const relayFallback = {
+      reason: 'orchestrator_offline', reasonText: UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline,
+      relayStatus: 503, relayError: 'orchestrator_daemon_offline', published: true,
+    };
+    const publicationTarget = { mode: 'thread', rootMessageId: 'om_relay_seed', chatId: CHAT };
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: { ok: true, delivery: 'publish', publishedMessageId: 'om_fallback', deliveryKey: 'f'.repeat(64),
+        projectSynced: false, publicationTarget, relayFallback },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      success: true, delivery: 'lark-message', reportedTo: 'om_fallback', placementSource: 'relay-fallback',
+      relayDelivered: false, publishedMessageId: 'om_fallback', publicationTarget, messageTarget: publicationTarget,
+      relayFailure: { reason: 'orchestrator_offline', status: 503, error: 'orchestrator_daemon_offline' },
+      notice: describeReportRelayFallback(relayFallback),
+    });
+    expect(result.output.notice).toContain(UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline);
+    // The daemon already published it; the CLI must not post a second copy.
+    expect(result.outbound).toBeUndefined();
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread', turnId: 'turn-report', deliveryKind: 'dispatch_report',
+      messageId: 'om_fallback', targetChatId: CHAT, targetRootMessageId: 'om_relay_seed',
+      dispatchRootId: 'om_relay_seed',
+    });
+    expect(result.bridgeMarkers[0]).not.toHaveProperty('targetSessionId');
+  });
+
+  it('fails loudly with the reason when the fallback could not be published', async () => {
+    const relayFallback = {
+      reason: 'orchestrator_session_closed', relayStatus: 409, relayError: 'fallback_scope_unsupported',
+      published: false, publicationError: 'report_publication_unavailable', blockedBy: 'private_card',
+    };
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 409,
+      relayBody: { ok: false, error: 'fallback_scope_unsupported', relayFallback },
+    });
+    expect(result.status).toBe(1);
+    expect(result.output).toBeUndefined();
+    expect(failureLine(result.stderr)).toMatchObject({
+      success: false, error: 'fallback_scope_unsupported',
+      notice: describeReportRelayFallback(relayFallback),
+      relayFailure: { reason: 'orchestrator_session_closed', status: 409, error: 'fallback_scope_unsupported' },
+      publicationError: 'report_publication_unavailable', publicationBlockedBy: 'private_card',
+    });
+    expect(result.outbound).toBeUndefined();
+    expect(result.bridgeMarkers).toEqual([]);
+  });
+
+  it('does not trust a fallback that claims publication without a message id', async () => {
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: { ok: true, relayFallback: { reason: 'orchestrator_offline', relayStatus: 503, published: true } },
+    });
+    expect(result.status).toBe(1);
+    expect(failureLine(result.stderr).notice).not.toBe(describeReportRelayFallback({
+      reason: 'orchestrator_offline', published: true,
+    }));
+    expect(result.bridgeMarkers).toEqual([]);
   });
 });

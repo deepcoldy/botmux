@@ -30,6 +30,8 @@ export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
   'reasonix', 'dsh', 'minimax', 'antigravity', 'remote-runner',
   // PTY 之外：MojoBackend 把 botmux 解析出的 model 拼进 `mojo -p --model`。
   'mojo',
+  // ZCode receives a validated session-specific provider config in worker.
+  'zcode',
 ]);
 
 /**

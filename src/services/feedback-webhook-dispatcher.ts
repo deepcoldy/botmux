@@ -109,7 +109,13 @@ async function nativeRequest(input: WebhookRequestInput): Promise<{ status: numb
   return new Promise((resolve, reject) => {
     const req = httpsRequest(input.url, {
       method: 'POST', headers: input.headers, timeout: input.timeoutMs, signal: input.signal,
-      lookup: (_hostname, _options, callback) => callback(null, input.pinnedAddress, isIP(input.pinnedAddress) as 4 | 6),
+      lookup: (_hostname, options, callback) => {
+        const family = isIP(input.pinnedAddress) as 4 | 6;
+        // Socket family autoselection requests all:true on Node and Bun.
+        // Preserve the already-validated IP; never resolve DNS a second time.
+        if (options.all) callback(null, [{ address: input.pinnedAddress, family }]);
+        else callback(null, input.pinnedAddress, family);
+      },
     }, res => {
       const chunks: Buffer[] = []; let size = 0;
       res.on('data', chunk => { if (size < 16_384) { const b = Buffer.from(chunk); chunks.push(b.subarray(0, 16_384 - size)); size += b.length; } });

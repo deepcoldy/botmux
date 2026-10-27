@@ -77,6 +77,31 @@ describe('LinkRef resolver', () => {
     expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
   });
 
+  it('keeps refs literal inside CommonMark indented code blocks', () => {
+    const refId = register('https://example.test/private');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = `    ${placeholder}`;
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
+  });
+
+  it('expands refs in an indented paragraph continuation that is not code', () => {
+    const refId = register('https://example.test/continued');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = `paragraph\n    ${placeholder}`;
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text)
+      .toBe('paragraph\n    https://example.test/continued');
+  });
+
+  it('resumes inline literal detection immediately after an indented code block', () => {
+    const refId = register('https://example.test/private');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = `    code block\n\`${placeholder}\``;
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
+  });
+
   it.each([
     ['unclosed inline code on the same line', '`unfinished %s'],
     ['unclosed inline code on an earlier line', '`unfinished\n%s'],
@@ -88,6 +113,34 @@ describe('LinkRef resolver', () => {
 
     expect(resolveOutboundLinkRefs(ledger, key, { text: template.replace('%s', placeholder) }).text)
       .toContain('https://example.test/recovered');
+  });
+
+  it('keeps a LinkRef literal inside a closed blockquote fence', () => {
+    const refId = register('https://example.test/private');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = ['> 示例：', '>', '> ```text', `> ${placeholder}`, '> ```'].join('\n');
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text).toBe(text);
+  });
+
+  it('expands a registered LinkRef after an unclosed blockquote fence', () => {
+    const refId = register('https://example.test/recovered');
+    const placeholder = `{{botmux_link:${refId}}}`;
+    const text = ['> ```text', '> unfinished', `> ${placeholder}`].join('\n');
+
+    expect(resolveOutboundLinkRefs(ledger, key, { text }).text)
+      .toContain('https://example.test/recovered');
+  });
+
+  it('rejects an unknown LinkRef after an unclosed blockquote fence', () => {
+    const text = [
+      '> ```text',
+      '> unfinished',
+      '> {{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+    ].join('\n');
+
+    expect(() => resolveOutboundLinkRefs(ledger, key, { text }))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_unknown' }));
   });
 
   it('handles many unmatched fence candidates without rescanning the remaining document', () => {
@@ -153,6 +206,43 @@ describe('LinkRef resolver', () => {
       refCount: 0,
     });
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'does not query a missing turn ledger for %s output without refs',
+    (responseKind) => {
+      const missingKey = { ...key, turnId: 'missing' };
+      const spy = vi.spyOn(ledger, 'listRegistered');
+
+      expect(resolveOutboundLinkRefs(ledger, missingKey, { text: '你好' }, responseKind)).toEqual({
+        text: '你好',
+        refCount: 0,
+      });
+      expect(spy).not.toHaveBeenCalled();
+    },
+  );
+
+  it('treats a missing final turn as having no registered source URLs', () => {
+    const missingKey = { ...key, turnId: 'missing-final' };
+
+    expect(resolveOutboundLinkRefs(ledger, missingKey, { text: '纯文本回答' }, 'final')).toEqual({
+      text: '纯文本回答',
+      refCount: 0,
+    });
+  });
+
+  it('treats an expired final turn as having no registered source URLs', () => {
+    let now = Date.now();
+    const root = mkdtempSync(join(tmpdir(), 'botmux-link-ref-resolver-expired-'));
+    const expiringLedger = new LinkRefLedger(root, { now: () => now });
+    const expiringKey = { ...key, turnId: 'expired-final' };
+    expiringLedger.openTurn(expiringKey);
+    now += 8 * 24 * 60 * 60_000;
+
+    expect(resolveOutboundLinkRefs(expiringLedger, expiringKey, { text: '纯文本回答' }, 'final'))
+      .toEqual({ text: '纯文本回答', refCount: 0 });
+    expiringLedger.close();
+    rmSync(root, { recursive: true, force: true });
   });
 
   it('rejects unknown and cross-turn refs with stable codes', () => {

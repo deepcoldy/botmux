@@ -9,6 +9,10 @@ export interface TraexAutoModelSettings {
   modelBackendVariant?: 'standard' | 'max';
 }
 
+export interface TraexAutoModelPreviousSettings extends TraexAutoModelSettings {
+  model?: string;
+}
+
 export interface TraexAutoModelConfig {
   enabled: true;
   models: string[];
@@ -17,6 +21,10 @@ export interface TraexAutoModelConfig {
   modelSettings?: Record<string, TraexAutoModelSettings>;
   /** Off by default: a topic retains its selected model across turns. */
   reselectPerTurn?: boolean;
+  /** Dashboard restores these overrides when Auto is disabled. Missing fields
+   * inherit defaults; older configs without a snapshot also inherit. This is
+   * editor metadata and does not participate in the runtime switching policy. */
+  previousSettings?: TraexAutoModelPreviousSettings;
   queueTimeoutMs: number;
   switchCooldownMs?: number;
 }
@@ -103,6 +111,31 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
     }
   }
 
+  let previousSettings: TraexAutoModelPreviousSettings | undefined;
+  if (value.previousSettings !== undefined) {
+    if (!value.previousSettings || typeof value.previousSettings !== 'object' || Array.isArray(value.previousSettings)) {
+      return { error: 'traexAutoModel.previousSettings must be an object' };
+    }
+    const previous = value.previousSettings as Record<string, unknown>;
+    if (previous.model !== undefined && (typeof previous.model !== 'string'
+      || previous.model.trim().length > 256 || previous.model.trim().toLowerCase() === TRAEX_AUTO_MODEL_ID)) {
+      return { error: 'traexAutoModel.previousSettings.model must be a normal model or empty' };
+    }
+    if (previous.reasoningEffort !== undefined
+      && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(previous.reasoningEffort as string)) {
+      return { error: 'traexAutoModel.previousSettings.reasoningEffort is invalid' };
+    }
+    if (previous.modelBackendVariant !== undefined
+      && previous.modelBackendVariant !== 'standard' && previous.modelBackendVariant !== 'max') {
+      return { error: 'traexAutoModel.previousSettings.modelBackendVariant is invalid' };
+    }
+    previousSettings = {
+      ...(typeof previous.model === 'string' && previous.model.trim() ? { model: previous.model.trim() } : {}),
+      ...(previous.reasoningEffort !== undefined ? { reasoningEffort: previous.reasoningEffort as TraexAutoModelSettings['reasoningEffort'] } : {}),
+      ...(previous.modelBackendVariant !== undefined ? { modelBackendVariant: previous.modelBackendVariant } : {}),
+    };
+  }
+
   const queueTimeoutMs = value.queueTimeoutMs === undefined
     ? TRAEX_AUTO_MODEL_DEFAULT_QUEUE_TIMEOUT_MS
     : value.queueTimeoutMs;
@@ -130,6 +163,7 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
       models,
       ...(modelSettings ? { modelSettings } : {}),
       ...(value.reselectPerTurn !== undefined ? { reselectPerTurn: value.reselectPerTurn as boolean } : {}),
+      ...(previousSettings !== undefined ? { previousSettings } : {}),
       queueTimeoutMs: queueTimeoutMs as number,
       ...(cooldown !== undefined ? { switchCooldownMs: cooldown as number } : {}),
     },
@@ -278,6 +312,21 @@ export class TraexAutoModelController {
    * follow it; process startup alone does not finish a capacity transition. */
   awaitingModelActivity(): boolean {
     return this.awaitingActivity;
+  }
+
+  /** Submission can leave the previous composer visible until the first
+   * native activity frame. Keep follow-ups outside the CLI during that gap. */
+  markInputSubmitted(turnId: string): void {
+    if (turnId === this.turnId) this.awaitingActivity = true;
+  }
+
+  /** An unplanned process death can never paint the activity frame a
+   *  submitted input was waiting for: the crash-restarted process evaluates
+   *  the turn afresh, so its recovery input must not be held for a dead
+   *  process's frame. A PLANNED model switch keeps the latch — its
+   *  replacement owns the same waiting window and buffering contract. */
+  noteProcessExited(planned: boolean): void {
+    if (!planned) this.awaitingActivity = false;
   }
 
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {

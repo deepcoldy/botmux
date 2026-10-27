@@ -35,7 +35,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { effectiveScheduleChatIds } from '../services/schedule-store.js';
+import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
+import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
 
 /** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
  *  producers (see schedule-store.createTask): legacy `randomUUID().substring(0,
@@ -70,32 +72,35 @@ export function mintScheduledContinuationTurnId(
 }
 
 /**
- * Identity a scheduled turn runs as: the task's creator, as captured at
- * creation time. The turn itself is authenticated by the daemon-minted
+ * Identity a scheduled turn runs as: the person who claimed the task from the
+ * claim card, otherwise the task's creator as captured at creation time (see
+ * scheduledTaskRunAs). The turn itself is authenticated by the daemon-minted
  * `schedule:<taskId>:<uuid>` turn id (authorizeScheduledTurn above) — this
  * only decides WHICH identity that authenticated turn carries. Shared by the
  * scheduler fire path and the ordinary-turn recovery continuation so a
  * continuation runs as exactly the identity its original fire ran as.
  *
- * Returns undefined when the task has no creator union_id (legacy tasks,
- * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
- * fail-closed story: with no identity on the turn, identity-bound tools refuse
- * to run instead of falling back to the bot's own access, while everything that
- * does not need a user identity keeps working.
+ * Returns undefined when the task has neither a claim nor a creator union_id
+ * (legacy tasks, CLI-created tasks, bot-created tasks). That is deliberate and
+ * is the whole fail-closed story: with no identity on the turn, identity-bound
+ * tools refuse to run instead of falling back to the bot's own access, while
+ * everything that does not need a user identity keeps working.
  */
 export function trustedCallerForScheduledTask(
   task: ScheduledTask,
   larkAppId: string,
 ): TrustedCaller | undefined {
-  if (!task.ownerUnionId) return undefined;
+  const runAs = scheduledTaskRunAs(task, larkAppId);
+  if (!runAs) return undefined;
   return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
-    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    ...(runAs.openId ? { requestUserOpenId: runAs.openId } : {}),
+    requestUserUnionId: runAs.unionId,
+    requestLarkAppId: runAs.larkAppId,
     // A persisted ownerUnionId is written only for a daemon-authenticated
-    // human creator.  Preserve that positive fact on the synthetic fire so
-    // strict Remote Runner transports do not downgrade the scheduled turn to
-    // an unknown caller (bot-created / legacy tasks returned above).
+    // human creator, and a claim only from a Lark-verified card operator.
+    // Preserve that positive fact on the synthetic fire so strict Remote
+    // Runner transports do not downgrade the scheduled turn to an unknown
+    // caller (bot-created / legacy tasks returned above).
     senderType: 'user',
     source: 'schedule_creator',
     taskId: task.id,
@@ -163,13 +168,22 @@ export function authorizeScheduledTurn(input: {
   const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
   if (task.enabled === false) {
-    const autoCompletedStillLive = task.parsed?.kind === 'once'
-      && task.disabledReason === 'once_completed'
+    // A one-shot that ran, or an until-done task closed by its own run, keeps
+    // authority for that exact still-live turn.
+    const autoCompletedStillLive = isAutoCompletedSchedule(task)
       && input.isScheduledTurnLive?.(input.turnId) === true;
     if (!autoCompletedStillLive) return { error: 'task_disabled' };
   }
 
-  const ownerOpenId = typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '';
+  // A claim from the claim card replaces the creator as the acting identity.
+  // Its open_id was issued to the bot that received the card callback, so it
+  // only binds that bot's turns.
+  const claim = parseScheduleRunAsClaim(task.runAsClaim);
+  if (claim && claim.larkAppId !== (task.larkAppId ?? input.sessionLarkAppId)) {
+    return { error: 'binding_mismatch' };
+  }
+  const ownerOpenId = claim?.openId
+    ?? (typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '');
   if (!ownerOpenId) return { error: 'task_owner_missing' };
 
   // The task must be bound to the presenting session's bot/chat. A task

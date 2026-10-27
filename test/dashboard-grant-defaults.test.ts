@@ -360,6 +360,87 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.checked).toBe(true);
   });
 
+  it('shows the same-owner bot trust toggle on by default and saves turning it off', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url, body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: false,
+          grantRequestToOwnerDm: false,
+          trustSameOwnerBots: false,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const toggle = root.findByProps({ 'data-action': 'toggle-trust-same-owner-bots' });
+    expect(toggle.props.checked).toBe(true);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: false } }));
+
+    expect(requests).toEqual([{ url: '/api/bots/app_grant/grant-prefs', body: { trustSameOwnerBots: false } }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ trustSameOwnerBots: false }));
+    expect(root.findByProps({ 'data-action': 'toggle-trust-same-owner-bots' }).props.checked).toBe(false);
+    expect(renderGrantSection({ trustSameOwnerBots: false }).root
+      .findByProps({ 'data-action': 'toggle-trust-same-owner-bots' }).props.checked).toBe(false);
+  });
+
+  it('saves the delegate-bots list normalized through the grant-prefs endpoint and clears it on empty save', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    let saved: string[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push({ url, body });
+      if ('grantDelegateBots' in body) saved = body.grantDelegateBots;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: false,
+          grantRequestToOwnerDm: false,
+          trustSameOwnerBots: true,
+          grantDelegateBots: saved,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const input = root.findByProps({ 'data-input': 'grantDelegateBots' });
+    expect(input.props.value).toBe('');
+
+    await flushAction(() => input.props.onChange({ currentTarget: { value: ' ou_platform_bot,, cli_platform  ou_platform_bot ' } }));
+    await flushAction(() => root.findByProps({ 'data-input': 'grantDelegateBots' }).props.onBlur());
+
+    expect(requests).toEqual([{
+      url: '/api/bots/app_grant/grant-prefs',
+      body: { grantDelegateBots: ['ou_platform_bot', 'cli_platform'] },
+    }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({
+      grantDelegateBots: ['ou_platform_bot', 'cli_platform'],
+    }));
+    expect(root.findByProps({ 'data-input': 'grantDelegateBots' }).props.value).toBe('ou_platform_bot, cli_platform');
+
+    // 清空输入并保存 → 发空名单（daemon 删 key）；已配置的行初始渲染显示名单。
+    await flushAction(() => root.findByProps({ 'data-input': 'grantDelegateBots' }).props.onChange({ currentTarget: { value: '  ' } }));
+    await flushAction(() => root.findByProps({ 'data-input': 'grantDelegateBots' }).props.onBlur());
+    expect(requests[1]!.body).toEqual({ grantDelegateBots: [] });
+
+    expect(renderGrantSection({ grantDelegateBots: ['ou_x'] }).root
+      .findByProps({ 'data-input': 'grantDelegateBots' }).props.value).toBe('ou_x');
+  });
+
   it('greys out the owner-DM forwarding toggle while auto grant cards are off', () => {
     (globalThis as any).fetch = vi.fn();
     const off = renderGrantSection({ autoGrantRequestCards: false, grantRequestToOwnerDm: true });

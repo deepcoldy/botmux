@@ -95,6 +95,9 @@ export interface TraexDrainOptions {
    *  different offset and must not disturb the production drainer's pending
    *  turn state. */
   probe?: boolean;
+  /** Restart scans need activity from a bounded tail that can start mid-turn.
+   *  Submit-confirmation probes keep their existing user/terminal-only output. */
+  includeHistoryCot?: boolean;
 }
 
 export interface TraexRuntimeSnapshot {
@@ -1010,14 +1013,26 @@ export function drainTraexRollout(
     const sourceTurnId = typeof payload.turn_id === 'string' && payload.turn_id.length > 0
       ? payload.turn_id
       : undefined;
+    // A cold or MCP-heavy first turn can persist task_started long before the
+    // UserMessage display completion (observed gaps of 90-117s). Surface the
+    // native lifecycle edge so the queue holds a provisional claim instead of
+    // expiring the short pre-start lease while TraeX is running the turn.
+    // Nested turns (root_turn_id differs) never start a Lark turn.
+    if (obj.type === 'event_msg'
+      && payload.type === 'task_started'
+      && sourceTurnId
+      && (payload.root_turn_id === undefined || payload.root_turn_id === sourceTurnId)) {
+      events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
+      continue;
+    }
     // The append-only history is TraeX's canonical model/tool timeline. Its
     // event_msg records mirror reasoning and tool completion, so consuming
     // those too would duplicate nodes. One mutation can carry parallel calls
     // or results; preserve their item order in one cosmetic event.
-    if (!probe && obj.type === 'history_mutation') {
+    if ((!probe || opts?.includeHistoryCot === true) && obj.type === 'history_mutation') {
       const cotEntries = traexHistoryCotEntries(payload, sourceSessionId);
       if (cotEntries && cotEntries.length > 0) {
-        if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
+        if (!probe && sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
       }
       continue;

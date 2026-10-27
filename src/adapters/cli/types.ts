@@ -62,6 +62,10 @@ export type SubmitRecheckResult = boolean | {
   /** Positive native ownership of the matched record (see the Codex adapter).
    *  Absent means "submitted, but not proven to be THIS pane's conversation". */
   ownershipProven?: boolean;
+  /** Session id of a matched record whose ownership could not be proven yet
+   *  (see the Codex adapter). A candidate, never a binding: callers may use it
+   *  only after independently proving the observed CLI process owns it. */
+  unprovenCliSessionId?: string;
 };
 
 /** What the adapter can prove about a failed runner-protocol write.
@@ -82,6 +86,10 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
+   * An exact post-write history match then proves ownership even when the OS
+   * sandbox prevents reading the CLI's open rollout file descriptors. */
+  correlateTranscript?: true;
   trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
@@ -118,19 +126,31 @@ export interface McpGatewayInstallSpec {
   readonly format: 'codex-toml' | 'claude-json';
 }
 
-/** UTF-8 budget for a first prompt baked into tmux launch argv.
- *  tmux 3.3a rejects the whole `new-session` command around 16 KB (~12 KB ok,
- *  16,384 "command too long"). 8 KB plus a ~3.5 KB shell wrapper stays under
- *  that ceiling when the launch argv is mostly this prompt (routing envelope
- *  included). Adapters that also bake a large non-prompt arg need a tighter
- *  budget — Grok's `--rules` uses {@link GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
+/** UTF-8 budget for a first prompt baked into launch argv.
+ *  Sized for the old inline tmux launch, which tmux rejects past 16,364 packed
+ *  bytes ("command too long"): 8 KB plus a ~3.5 KB shell wrapper stayed under
+ *  it. tmux panes now read their launch argv from a private file
+ *  (backend/pane-launch.ts), so that cap no longer binds; the budget stays so
+ *  which first prompts are baked vs typed after startup is unchanged.
+ *  Grok, which also bakes `--rules`, uses
+ *  {@link GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
 export const TMUX_INITIAL_PROMPT_ARG_BUDGET = 8192;
 
 /** Grok bakes `buildBotmuxSystemPromptText` via `--rules` (~4.5 KB, more with
- *  a skill catalog) into the same tmux command as the positional user turn.
- *  An 8192-byte user prompt on top of that and the shell wrapper crosses the
- *  ~16 KB ceiling. 4096 keeps the sum near 14 KB. */
+ *  a skill catalog) next to the positional user turn; 4096 kept that inline
+ *  sum near 14 KB. Kept as-is for the same reason as
+ *  {@link TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
 export const GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET = 4096;
+
+/** Result of {@link CliAdapter.ensureWorkspaceTrust}. `folder` is the key the
+ *  CLI itself consults (e.g. a git root), not necessarily the working dir. */
+export interface WorkspaceTrustOutcome {
+  status: 'trusted' | 'already-trusted' | 'explicitly-untrusted' | 'not-needed' | 'skipped';
+  folder: string;
+  /** The CLI's trust store that was (or would have been) edited. */
+  storePath?: string;
+  reason?: string;
+}
 
 export interface CliAdapter {
   /** Unique identifier */
@@ -247,6 +267,7 @@ export interface CliAdapter {
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** Codex-only thread service tier. Missing inherits the executor's config. */
+    codexProfile?: string;
     serviceTier?: CodexServiceTier;
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
@@ -368,6 +389,9 @@ export interface CliAdapter {
   findInitialPromptArgSubmission?(baseline: number, content: string): {
     submitted: boolean;
     cliSessionId?: string;
+    /** The store could not be read this time (gone, unopenable, query
+     *  failed): `submitted: false` is then no evidence the prompt is absent. */
+    unreadable?: true;
   };
   isInitialPromptComplete?(baseline: number, cliSessionId: string): boolean;
 
@@ -441,6 +465,8 @@ export interface CliAdapter {
     cliSessionId?: string;
     /** Positive native ownership of the submit evidence; see SubmitRecheckResult. */
     ownershipProven?: boolean;
+    /** Not-yet-owned session id candidate; see SubmitRecheckResult. */
+    unprovenCliSessionId?: string;
     submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
@@ -506,7 +532,7 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks';
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
     /** 可选：SessionStart「真就绪」hook 命令。
      *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
@@ -518,6 +544,11 @@ export interface CliAdapter {
      *  以 additionalContext 注入为该轮 system-reminder；缺 env/未命中时
      *  空输出 exit 0（fail-open）。 */
     readonly userPromptSubmitCommand?: string;
+    /** 可选：StopFailure hook 命令。
+     *  - claude-settings：写进全局 settings.json 的 hooks.StopFailure
+     *  Claude 只在回合因 API 错误结束时跑它（不跑 Stop），worker 据此兜底
+     *  transcript 没收口的失败回合；缺 env 时静默 exit 0。 */
+    readonly stopFailureCommand?: string;
   };
 
   /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
@@ -551,6 +582,14 @@ export interface CliAdapter {
     /** Only supplied for an authoritative current viewport. Adapters may use
      * explicit terminal interruption evidence when native state omits it. */
     getCurrentScreen?: () => string;
+    /** 该会话对应的 CLI 进程是否存活（worker 持有 pane 子进程 pid）：
+     *  - true：进程存活。native state 里存在「回合未闭合」结构信号时应判忙，
+     *    即使状态库长时间无写入——前台长工具期间落库可能静默数分钟
+     *    （实测 opencode2 sleep 150：149s 零行更新，progress 为 ephemeral）；
+     *  - false：进程已退出，未闭合结构按崩溃 / 孤儿 fail-open；
+     *  - undefined：拿不到 pid（如无 pid 的 adopt），适配器回退到自身的
+     *    状态库时效窗口。 */
+    isCliProcessAlive?: () => boolean | undefined;
   }) => boolean;
 
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
@@ -588,6 +627,17 @@ export interface CliAdapter {
    *
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
+
+  /** Stricter sibling of `readyPattern` that recognizes ONLY evidence the CLI
+   *  already emitted before a weak rule-joined arm was added to readyPattern.
+   *  When a ready match fails this pattern too, the IdleDetector tags the
+   *  evidence as weak (`isReadyEvidenceWeak()`): a cursor-addressed repaint
+   *  whose prompt is joined to a horizontal rule in the stripped byte stream
+   *  can be a loading cell or an unsent draft rather than an initialized
+   *  composer. The worker consults the rendered viewport predicate before
+   *  acting on weak evidence during the first prompt. Undefined means the
+   *  adapter has no weak arm and all matches are strong. */
+  readonly readyPatternStrong?: RegExp;
 
   /** Optional first-start screen gate. Some CLIs draw their composer before
    * initialization finishes. A pending marker holds screen idle and queued
@@ -679,6 +729,30 @@ export interface CliAdapter {
    *  suppresses type-ahead when `disableCliBypass` is enabled because Enter
    *  approves `agy`'s blocking permission dialog. */
   readonly supportsTypeAhead?: boolean;
+
+  /** Terminal key that interrupts the CLI's CURRENT turn without exiting it.
+   *  Defaults to `ctrlc`. Override only where Ctrl+C is an exit gesture:
+   *  ZCode quits the whole CLI on a single Ctrl+C even mid-turn (verified on
+   *  0.16.9), while Escape is its documented interrupt key — the busy footer
+   *  literally reads `esc to interrupt`. Without this, the card's Stop button
+   *  kills the session instead of cancelling the turn. */
+  readonly interruptKey?: 'ctrlc' | 'esc';
+
+  /** When true, a NEW user message arriving while this CLI is busy preempts the
+   *  running turn: the adapter's `interruptKey` is delivered first, the
+   *  superseded turn is settled as `cancelled`, and only then does the new
+   *  message run.
+   *
+   *  Opt in only for CLIs whose busy state has NO usable steer channel. ZCode
+   *  parks a mid-turn submit in its own queue panel and never drains it — the
+   *  user's instruction is silently dropped — so waiting for the turn to end is
+   *  not merely slow, it is a lost message. This flag is the opposite trade-off
+   *  from `supportsTypeAhead`: interrupt-and-replace instead of park-and-merge.
+   *
+   *  The worker only applies it to genuine user IM turns (never to internal
+   *  notifications, replays, or `queueAfterActiveTurn` inputs) and only when the
+   *  CLI is positively observed busy. */
+  readonly preemptsOnNewMessage?: boolean;
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible
@@ -807,6 +881,15 @@ export interface CliAdapter {
    *  interactive trust dialog). `~/.claude.json` for Claude Code; inside the
    *  data root for forks that set CLAUDE_CONFIG_DIR. */
   readonly claudeStateJsonPath?: string;
+
+  /** Pre-answer the CLI's OWN startup folder-trust question for `workingDir`
+   *  before a Botmux-owned fresh/resume spawn (never adopt, never a warm
+   *  reattach, never a remote backend). Claude-family trust is seeded from
+   *  `claudeStateJsonPath` and Codex trust rides on its argv; this hook is for
+   *  CLIs whose trust lives in a store the worker must edit (Grok). Must never
+   *  throw: failures come back as `skipped` and the spawn proceeds — the
+   *  startup-blocker probe then reports the dialog if it does appear. */
+  readonly ensureWorkspaceTrust?: (workingDir: string) => Promise<WorkspaceTrustOutcome>;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
    *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem
@@ -1025,7 +1108,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。
@@ -1038,7 +1121,6 @@ export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex
 export function isCodexAppCliId(cliId: string | null | undefined): cliId is 'codex-app' {
   return cliId === 'codex-app';
 }
-
 /** Codex 家族（官方 codex TUI 与 Codex App runner 共用同一份 rollout / CODEX_HOME / service tier 语义）。 */
 export function isCodexFamilyCliId(cliId: string | null | undefined): cliId is 'codex' | 'codex-app' {
   return cliId === 'codex' || cliId === 'codex-app';

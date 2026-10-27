@@ -1,6 +1,6 @@
 import { isProgramStatusRelayArgv } from './program-status-relay-launch.js';
 import { getChildPids, readCmdline, readComm } from './session-discovery.js';
-import { sessionScopePayloadPid } from './session-scope.js';
+import { isZombieProcess, sessionScopePayloadPid } from './session-scope.js';
 
 /** A launch layer botmux itself puts between a pane process and the CLI. */
 export type BotmuxLaunchLayer = 'program-status-relay' | 'session-scope';
@@ -9,6 +9,8 @@ export interface LaunchLayerProbes {
   readCmdline: (pid: number) => string[];
   childrenOf: (pid: number) => number[];
   commOf: (pid: number) => string | undefined;
+  /** An exited, unreaped child (see {@link isZombieProcess}). */
+  isZombie: (pid: number) => boolean;
   /** The session-scope supervisor's payload pid, or `pid` itself when `pid` is
    *  not that supervisor (see {@link sessionScopePayloadPid}). */
   scopePayloadOf: (pid: number) => number;
@@ -18,6 +20,7 @@ const DEFAULT_PROBES: LaunchLayerProbes = {
   readCmdline,
   childrenOf: getChildPids,
   commOf: readComm,
+  isZombie: pid => isZombieProcess(pid),
   scopePayloadOf: pid => sessionScopePayloadPid(pid),
 };
 
@@ -39,7 +42,8 @@ export interface UnwrappedLaunchLayers {
  * The relay stays outermost: its launch shim is a shell script with `$VAR`
  * references, which systemd-run would expand. Each layer is recognised only by
  * its exact argv and must have exactly one child (the relay's transient `stty`
- * does not count); anything else ends the walk where it is. So a layer that has
+ * and exited, unreaped children do not count); anything else ends the walk
+ * where it is. So a layer that has
  * not forked or exec'd yet stops the walk short — callers that launched it poll
  * until `layers` holds everything they launched.
  *
@@ -56,7 +60,10 @@ export function unwrapBotmuxLaunchLayers(
   const chain = [panePid];
   let pid = panePid;
   if (opts.relay && isProgramStatusRelayArgv(probes.readCmdline(pid))) {
-    const children = probes.childrenOf(pid).filter(child => probes.commOf(child) !== 'stty');
+    // An unreaped zombie is no payload: the pane's login shell may have left
+    // one (a backgrounded rc hook) before it exec'd into the relay.
+    const children = probes.childrenOf(pid)
+      .filter(child => probes.commOf(child) !== 'stty' && !probes.isZombie(child));
     if (children.length !== 1) return { pid, layers, chain };
     pid = children[0];
     layers.push('program-status-relay');

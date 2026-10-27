@@ -515,6 +515,14 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
+  it('reads a valid MCP Gateway timeout ceiling and drops unsafe values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 900_000 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBe(900_000);
+    invalidateGlobalConfigCache();
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 2_147_483_648 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBeUndefined();
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache

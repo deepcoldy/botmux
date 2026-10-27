@@ -115,6 +115,28 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices[1]).toContain(r.dir);
   });
 
+  it('records the worktree it created so the closed card can offer cleanup, but not a reused one', async () => {
+    const repo = makeRepo('recorded');
+    const { mod } = await loadWithBot(repo, false);
+    const { findBotmuxWorktreeFor, deleteBotmuxWorktree } = await import('../src/services/botmux-worktree-store.js');
+    const { config } = await import('../src/config.js');
+    const target = join(tempRoot, 'recorded-shared');
+    const ctx = {
+      isBotDefaultDir: true, locale: 'zh' as const, force: true,
+      worktreePath: target, branch: 'wt/botmux-topic', reuseExisting: true,
+    };
+
+    const first = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+    expect(findBotmuxWorktreeFor(config.session.dataDir, first.dir)).toMatchObject({
+      dir: target, main: repo, branch: 'wt/botmux-topic', larkAppId: 'app_wt',
+    });
+
+    deleteBotmuxWorktree(config.session.dataDir, target);
+    const second = await mod.maybeCreateDefaultWorktree('app_wt', repo, ctx);
+    expect(second.dir).toBe(target);
+    expect(findBotmuxWorktreeFor(config.session.dataDir, target)).toBeUndefined();
+  });
+
   it('does not push for an invalid codex-app + riff backend pair', async () => {
     const repo = makeRepo('codex-invalid-riff');
     const { mod } = await loadWithBot(repo, true, { cliId: 'codex-app', backendType: 'riff' });

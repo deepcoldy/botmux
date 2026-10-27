@@ -52,7 +52,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>] [--until-done [--deadline <time>] [--retry-every <duration>]] [--notify failing,expired]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
@@ -91,6 +91,23 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
 \`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
+### 跟进任务：等某件事发生后再做（--until-done）
+
+用户要你「等 X 之后再做 Y」「每天看一下，好了就处理」「某天之后去清理」时，建一个 \`--until-done\` 任务，不要在 prompt 里自己设计循环和停止条件：
+
+\`\`\`bash
+botmux schedule add "7 10 * * *" "PR #123 合入后，把集群切回 upstream 并清理临时 worktree" --until-done --deadline 2026-11-20 --silent
+botmux schedule add "2026-10-30T10:00" "删除升级前的备份目录" --until-done --retry-every 6h
+\`\`\`
+
+- 没做完：按计划继续执行；执行出错、daemon 停机错过的那次会自动补跑，不会悄悄跳过。一次性任务没做完时每隔 \`--retry-every\`（默认 1d）再执行。
+- 每次执行时 prompt 末尾会附上第几次执行、截止时间和收尾方法，prompt 里只写清「等什么、做什么」。
+- 做完：在这次执行里**先**运行 \`botmux schedule done self --note "<一句话结果>"\`，再发最终答复。任务关闭但保留记录，不要用 pause/remove 代替。
+- \`--deadline\`：到点做最后一次收尾执行（prompt 会注明），之后任务关闭为「已到期」。
+- \`--notify failing,expired\`：按需在创建任务的话题里 @ 创建人（连续失败 3 次 / 截止收尾时）；默认不通知。
+- \`botmux schedule list\` 显示每个任务的状态与执行账本（执行 / 跳过 / 失败 / 错过次数）。
+- 机器人代为创建的委托任务暂不支持 \`--until-done\`。
 
 如果任务需要先发送最终结果再删除自身，必须把两个动作合并到同一次发送：
 

@@ -91,11 +91,17 @@ runner 忽略坏帧及非协议输入，后续合法消息仍可执行。输入�
 
 ## 验证
 
+MiniMax 的 final `errorCode` 会进入 worker 的真实终态：`turn_budget_exhausted` 与 `execution_failed` 为 `failed`，`cancelled` 为 `cancelled`。普通回复卡显示两类失败的错误码；主动取消通过既有停止状态收尾。HTTP 等待不会把错误诊断当成成功答案，异步结果保存原始失败码或 `interrupted` 状态；开启轮次结果查询时，`execution.errorCode` 保留原因。后续成功轮次不会继承前一轮的错误。
+
+![MiniMax 失败原因卡片本地预览](assets/minimax-failure-reasons.png)
+
+仓库的 **MiniMax native long task** 工作流每天 UTC 03:20 在主线自动执行，也可通过 Actions 的 **Run workflow** 对指定分支手动运行。它在隔离目录安装固定的 mcode 0.6.5，在 Node 与 Bun 两个 job 中各跑新建/恢复两条 610 秒探针，日志保留 14 天。合成 Provider 由测试自动创建，不需要真实模型账号。该工作流独立于普通 PR CI；普通测试不依赖安装 mcode。
+
 ```bash
 bun run test -- test/minimax-acp.test.ts test/minimax-user-input.test.ts test/minimax-acp-continuation.test.ts test/minimax-usage.test.ts test/sandbox.test.ts test/fs-policy.test.ts
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
-# 可选：真实 exec 默认预算的 610 秒边界探针，使用隔离数据目录与本地合成模型服务
+# 本地显式运行：真实 exec 默认预算的 610 秒边界探针
 BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-exec-long.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
 BOTMUX_MCODE_TMUX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-tmux.e2e.ts
@@ -103,6 +109,8 @@ bun run test -- test/pty-reader-compat.test.ts
 bun run test -- test/minimax-usage.test.ts
 bun run build
 ```
+
+显式设置 `BOTMUX_MCODE_LONG_E2E=1` 后，缺少 `BOTMUX_MCODE_E2E_BIN` 或原生 CLI 无法执行均会失败；未开启时仍跳过长测。Bun 原生测试入口为 `BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun test ./test/minimax-exec-long.e2e.ts --timeout=750000`。
 
 原生测试使用隔离 HOME/数据目录及本地合成 OpenAI 服务，实际执行 Bash 写文件，检查 Shell owner 身份和第二轮原生历史。Linux 文件沙盒场景用真实 PTY 拉起 mcode，保持运行超过 90 秒，再验证同一会话恢复；Node 和 Bun 直接驱动均已通过。tmux 测试通过 daemon 使用的 `TmuxPipeBackend` 验证工具、owner、用量回传以及销毁并重建 runner 后按精确 ID 恢复历史，Node 和 Bun 均已通过。该测试仅销毁自己创建的唯一命名会话，不操作共享 tmux server 或其它会话。
 

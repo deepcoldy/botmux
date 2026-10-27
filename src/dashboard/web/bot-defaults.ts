@@ -83,6 +83,13 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle',
     ],
   },
+  // 管家：和「群负责人」同属「谁来接待 / 跟进」一类开关，紧挨着会话模式那一格放。
+  {
+    id: 'steward',
+    tab: 'sessions',
+    titleKey: 'botDefaults.sectionSteward',
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardGuide'],
+  },
   {
     id: 'substitute',
     tab: 'sessions',
@@ -119,7 +126,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
       'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
-      'botDefaults.grantRequestToOwnerDm', 'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
+      'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDelegateBots',
+      'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
     ],
   },
   { id: 'blocked-users', tab: 'security', titleKey: 'blocked.sectionTitle' },
@@ -174,6 +182,13 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionCodexAppDisplay',
     fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify'],
   },
+  {
+    id: 'codex-runtime',
+    tab: 'advanced',
+    titleKey: 'botDefaults.sectionCodexRuntime',
+    tile: 'codex-app-display',
+    fieldKeys: ['botDefaults.cliProgressNotify'],
+  },
   { id: 'envelope-injection', tab: 'advanced', titleKey: 'botDefaults.envelopeInjection', fieldKeys: ['botDefaults.envelopeInjectionAuto'] },
   { id: 'prompt-injection', tab: 'advanced', titleKey: 'botDefaults.promptInjection', fieldKeys: ['botDefaults.promptInjectionToggle'] },
   { id: 'reply-delivery', tab: 'advanced', titleKey: 'botDefaults.replyDelivery', tile: 'prompt-injection', fieldKeys: ['botDefaults.replyDeliveryTranscript'] },
@@ -221,6 +236,7 @@ export type CliOption = {
   gateway?: 'ttadk';
   acceptsModel?: boolean;
   available?: boolean;
+  availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
@@ -276,6 +292,7 @@ export type BotSubstituteMode = {
 };
 
 export type BotDefaultsRow = {
+  envRevision?: string;
   larkAppId: string;
   botName?: string;
   cliId?: string;
@@ -296,6 +313,7 @@ export type BotDefaultsRow = {
   traexAutoModelBlockedReason?: 'rpc_input' | null;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  codexProfile?: string | null;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
@@ -344,6 +362,9 @@ export type BotDefaultsRow = {
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
+    /** `--mention` handoffs to bots on this machine carry this turn's sender.
+     *  Absent = on (the default); only `false` is stored. */
+    delegateOnMention?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
@@ -422,6 +443,8 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** 管家（决策看板）配置；null / 缺省 = 未开启。 */
+  steward?: import('../../core/decision-board/model.js').StewardConfig | null;
   /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */
@@ -464,6 +487,8 @@ export type BotDefaultsRow = {
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
   grantRequestToOwnerDm?: boolean;
+  trustSameOwnerBots?: boolean;
+  grantDelegateBots?: string[];
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;

@@ -15,6 +15,7 @@ const JSON_HEAD = { 'content-type': 'application/json' };
 const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = [
   ['PUT', '/api/bots/cli_a/working-dir-mode', '/api/bot-working-dir-mode', 'raw'],
   ['PUT', '/api/bots/cli_a/agent', '/api/bot-agent', 'raw'],
+  ['GET', '/api/bots/cli_a/codex-profiles', '/api/bot-codex-profiles', 'none'],
   ['PUT', '/api/bots/cli_a/skills', '/api/bot-skills', 'raw'],
   ['PUT', '/api/bots/cli_a/brand-label', '/api/bot-brand-label', 'raw'],
   ['PUT', '/api/bots/cli_a/reply-style', '/api/bot-reply-style', 'json'],
@@ -24,6 +25,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/cantalk-daemon-commands', '/api/bot-cantalk-daemon-commands', 'raw'],
   ['PUT', '/api/bots/cli_a/launch-shell', '/api/bot-launch-shell', 'raw'],
   ['PUT', '/api/bots/cli_a/oncall-group', '/api/bot-oncall-group', 'raw'],
+  ['PUT', '/api/bots/cli_a/steward', '/api/bot-steward', 'json'],
   ['PUT', '/api/bots/cli_a/actor-owner-bindings', '/api/bot-actor-owner-bindings', 'raw'],
   ['PUT', '/api/bots/cli_a/feedback', '/api/bot-feedback', 'raw'],
   ['PUT', '/api/bots/cli_a/chats/oc_1/feedback', '/api/chat-feedback/oc_1', 'raw'],

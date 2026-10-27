@@ -3,6 +3,7 @@
  *
  * Run: pnpm vitest run test/group-join-shared-routing.test.ts
  */
+import { cardVisibleText } from './helpers/card-visible-text.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -103,7 +104,8 @@ async function loadModules() {
   const policy = await import('../src/core/trusted-session-controller.js');
   const interruptions = await import('../src/core/cross-principal-interruption-store.js');
   const identities = await import('../src/im/lark/identity-cache.js');
-  return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore, identities };
+  const replyTarget = await import('../src/core/reply-target.js');
+  return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore, identities, replyTarget };
 }
 
 beforeAll(async () => {
@@ -431,9 +433,49 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(identities.getIdentity(appId, operator)?.type).toBe('bot');
     const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
     expect(ds?.activeInteractiveTurn?.caller.senderType).toBe('bot');
-    expect(ds?.activeInteractiveTurn?.controller).toMatchObject({
-      requestUserOpenId: operator, senderType: 'user',
+    // A known app/bot operator is the turn caller, not a human owner or sender.
+    expect(ds?.activeInteractiveTurn?.controller).toBeUndefined();
+    expect(ds?.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.lastCallerOpenId).toBeUndefined();
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+    expect(modules.replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
+  });
+
+  it.each(['peer', 'bot', 'app'] as const)('does not record a %s operator as the human sender when the join gate is off', async (evidence) => {
+    const { daemon, registry, identities, types, replyTarget } = modules;
+    const appId = `app_join_legacy_bot_${evidence}`;
+    const chatId = `oc_join_legacy_bot_${evidence}`;
+    const operator = 'ou_legacy_bot_operator';
+    mocks.listChatMemberOpenIds.mockResolvedValue([operator]);
+    if (evidence === 'peer') {
+      writeFileSync(join(process.env.SESSION_DATA_DIR!, `bot-openids-${appId}.json`), JSON.stringify({ peer: operator }));
+    } else {
+      identities.recordIdentity(appId, { openId: operator, type: evidence, source: 'sender', name: 'Peer' });
+    }
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [operator], autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir(`repo-legacy-bot-${evidence}`), regularGroupReplyMode: 'shared',
     });
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toBeDefined();
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+    expect(replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
+    expect(ds?.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.lastCallerOpenId).toBeUndefined();
+    expect(ds?.activeInteractiveTurn).toBeUndefined();
+    // Legacy toggle still does not inject a sender tag or call the contact cache writer.
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]?.[1].content).not.toContain('<sender ');
   });
 
   it('starts without sender or caller authority when the join event has no operator', async () => {
@@ -786,7 +828,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_missing_default';
     const chatId = 'oc_join_missing_default';
-    const missing = join(tempRoot, 'gone', 'botmux');
+    // Keep `_`: markdown escaping must differ from the visible path we assert.
+    const missing = join(tempRoot, 'gone_dir', 'botmux');
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -807,7 +850,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const cardCall = mocks.replyMessage.mock.calls.find(call => (call as unknown[])[3] === 'interactive') as unknown[] | undefined;
     // The card belongs under the shared join seed, like the ordinary picker.
     expect(cardCall?.[1]).toBe('om_join_seed');
-    expect(String(cardCall?.[2])).toContain(missing);
+    expect(cardVisibleText(String(cardCall?.[2]))).toContain(missing);
     expect(String(cardCall?.[2])).toContain('repo_manual_submit');
     expect(String(cardCall?.[2])).not.toContain('skip_repo');
   });

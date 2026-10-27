@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
@@ -10,7 +11,23 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunAsClaim } from '../types.js';
+import { parseScheduleRunAsClaim } from './schedule-run-as.js';
+import {
+  completeUntilDone,
+  isUntilDoneClosed,
+  isUntilDoneOpen,
+  markUntilDoneFinalRun,
+  recordMissed,
+  recordRunOutcome,
+  resolveUntilDoneConfig,
+  scheduleNotificationsFor,
+  settleUntilDoneRun,
+  settleUntilDoneSkip,
+  untilDoneDeadlineDue,
+  untilDoneResumeNextRunAt,
+  type UntilDoneConfigInput,
+} from '../services/schedule-until-done.js';
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
@@ -23,6 +40,8 @@ export interface ScheduleExecutionContext {
 
 // Callback set by daemon to execute a scheduled task
 let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
+/** Daemon-installed delivery for opt-in owner notifications (`task.notify`). */
+let scheduleNotifier: ((task: ScheduledTask, event: ScheduleNotifyEvent) => Promise<void> | void) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -106,6 +125,30 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   return record?.state === 'revoked' ? undefined : record?.task;
 }
 
+/** Fire-time guard for tasks created through a live conversation turn.
+ *
+ * Every such task has a non-null authority `targetTurnId` (direct and
+ * delegated alike) and its workingDir was canonicalized before it was
+ * persisted; workingDir is immutable after creation (no update path writes it).
+ * So a stored value that no longer equals its own realpath can only mean the
+ * directory — or an ancestor the agent can write — was swapped for a symlink
+ * after creation, and spawning would grant the link target readWrite. Host
+ * (`!ds`) and legacy rows have no targetTurnId and are never re-checked, so a
+ * symlinked `$HOME` does not stop them. Reads the authority record, never the
+ * sandbox-writable JSON projection. Returns the refusal reason, or undefined. */
+export function scheduledWorkingDirSwapReason(task: ScheduledTask): string | undefined {
+  const appId = authorityAppId(task.larkAppId);
+  if (!authorityStore || !appId || !authorityStore.isInitialized(appId)) return;
+  const record = authorityStore.getRecord(appId, task.id);
+  if (!record?.targetTurnId) return;
+  const stored = record.task.workingDir;
+  let real: string | undefined;
+  try { real = realpathSync(stored); } catch { /* missing → refuse below */ }
+  if (real === stored && task.workingDir === stored) return;
+  return `schedule_working_dir_swapped: task ${task.id} workingDir ${stored} now resolves to `
+    + `${real ?? '(missing)'}${task.workingDir === stored ? '' : ` (fire input ${task.workingDir})`}`;
+}
+
 function project(task: ScheduledTask): ScheduledTask {
   try { scheduleStore.projectAuthoritativeTask(task, task.larkAppId); }
   catch (error) { logger.warn(`[scheduler] failed to refresh projection for ${task.id}: ${error}`); }
@@ -171,6 +214,69 @@ export function setExecuteCallback(
   executeCallback = cb;
 }
 
+/**
+ * 连续失败告警回调：某个任务连续失败达到阈值（且本串尚未告警过）时触发一次，
+ * daemon 注入「私信任务相关管理员」的投递；成功恢复后水印清零，允许下次再报。
+ * 数据层阈值判定在 schedule-store.markRun，本回调只负责投递，纯通知失败
+ * 不影响任务状态。
+ */
+export type ScheduleFailureAlert = (task: ScheduledTask, consecutiveFailures: number, lastError: string | undefined) => void;
+let failureAlert: ScheduleFailureAlert | null = null;
+export function setScheduleFailureAlert(cb: ScheduleFailureAlert | null): void {
+  failureAlert = cb;
+}
+
+function emitFailureAlertIfNeeded(
+  task: ScheduledTask,
+  result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number },
+): void {
+  if (!result.crossedFailureThreshold || !failureAlert) return;
+  try {
+    failureAlert(task, result.consecutiveFailures ?? scheduleStore.SCHEDULE_FAILURE_ALERT_THRESHOLD, task.lastError);
+  } catch (err) {
+    logger.warn(`[scheduler] failure alert delivery failed for ${task.id}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+export function setScheduleNotifier(
+  notifier: ((task: ScheduledTask, event: ScheduleNotifyEvent) => Promise<void> | void) | null,
+): void {
+  scheduleNotifier = notifier;
+}
+
+/** Deliver the owner notifications a settlement earned (before → current).
+ *  A failure streak is notified once per streak: the marker is persisted only
+ *  after delivery succeeded, so a dropped notification (transport disabled,
+ *  send error) is retried by the next failing settlement instead of being
+ *  silenced for the rest of the streak. */
+function notifyAfterSettle(before: ScheduledTask | undefined, id: string): void {
+  if (!before) return;
+  if (!scheduleNotifier) return;
+  const after = runtimeTask(id, before.larkAppId);
+  if (!after) return;
+  const events = scheduleNotificationsFor(before, after);
+  if (events.length === 0) return;
+  void (async () => {
+    for (const event of events) {
+      try {
+        await scheduleNotifier?.(after, event);
+      } catch (error) {
+        logger.warn(
+          `[scheduler] ${event} notification for task ${id} failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        // Not delivered: leave the streak unmarked so a later settlement retries.
+        continue;
+      }
+      if (event === 'failing') {
+        mutateRuntimeTask(id, current => current.runStats
+          ? { ...current, runStats: { ...current.runStats, failingNotifiedAt: new Date().toISOString() } }
+          : undefined, before.larkAppId);
+      }
+    }
+  })();
+}
+
 function createExecutionContext(
   trigger: ScheduleExecutionContext['trigger'],
   startedAt = new Date().toISOString(),
@@ -214,41 +320,71 @@ function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
 }
 
 function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: string): void {
+  const before = runtimeTask(id);
   if (!authorityStore) {
     scheduleStore.markSkipped(id, nextRunAt, runId);
-    return;
+  } else {
+    mutateRuntimeTask(id, task => {
+      if (task.lastRunId !== runId) return;
+      return settleUntilDoneSkip({ ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped',
+        lastError: undefined, lastDeliveryError: undefined,
+        runStats: recordRunOutcome(task.runStats, 'skipped'),
+        ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) }, runId, Date.now());
+    });
   }
-  mutateRuntimeTask(id, task => {
-    if (task.lastRunId !== runId) return;
-    return { ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped',
-      lastError: undefined, lastDeliveryError: undefined,
-      ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) };
-  });
+  notifyAfterSettle(before, id);
 }
 
 /** Record a calendar block (non-working day / explicit skip) for a claimed run.
  * Must write the authoritative SQLite row when the store is installed, exactly
  * like markRuntimeSkipped — otherwise the run stays latched as `running` and
- * the lastRunId guard blocks every future claim. */
+ * the lastRunId guard blocks every future claim. A calendar `error` counts as
+ * a failed ledger run and crosses the same shared failure counter, so it can
+ * trigger the admin alert too (deliberately more consistent — same threshold,
+ * one streak, one fact source). */
 function markRuntimeCalendarBlocked(
   id: string,
   check: NonNullable<ScheduledTask['lastCalendarCheck']>,
   runId: string,
-): void {
+): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  const before = runtimeTask(id);
   if (!authorityStore) {
-    scheduleStore.markCalendarBlocked(id, check, runId);
-    return;
+    const result = scheduleStore.markCalendarBlocked(id, check, runId);
+    notifyAfterSettle(before, id);
+    return result;
   }
+  let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (task.lastRunId !== runId) return;
+    if (check.status !== 'error') {
+      return {
+        ...task,
+        lastStatus: 'skipped',
+        lastCalendarCheck: check,
+        lastError: undefined,
+        lastDeliveryError: undefined,
+        runStats: recordRunOutcome(task.runStats, 'skipped'),
+      };
+    }
+    const tracking = scheduleStore.nextFailureTracking(task.runStats, false);
+    result = {
+      crossedFailureThreshold: tracking.crossedFailureThreshold,
+      consecutiveFailures: tracking.consecutiveFailures,
+    };
     return {
       ...task,
-      lastStatus: check.status === 'error' ? 'error' : 'skipped',
+      lastStatus: 'error',
       lastCalendarCheck: check,
-      lastError: check.status === 'error' ? check.reason : undefined,
+      lastError: check.reason,
       lastDeliveryError: undefined,
+      failureAlertSent: (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined,
+      runStats: tracking.runStats,
     };
   });
+  // A calendar `error` counts as a failed run in the ledger; it must earn the
+  // same failing notification a dispatch failure would.
+  notifyAfterSettle(before, id);
+  return result;
 }
 
 /** Persist a passing calendar observation. Under the authority store this must
@@ -270,29 +406,51 @@ function markRuntimeRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
-): void {
+): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  const before = runtimeTask(id);
   if (!authorityStore) {
-    scheduleStore.markRun(id, success, error, deliveryError, runId);
-    return;
+    const result = scheduleStore.markRun(id, success, error, deliveryError, runId) ?? {};
+    notifyAfterSettle(before, id);
+    return result;
   }
-  if (!runtimeTask(id)) return;
+  if (!before) return {};
+  let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
-    return {
+    const tracking = scheduleStore.nextFailureTracking(task.runStats, success);
+    result = {
+      crossedFailureThreshold: tracking.crossedFailureThreshold,
+      consecutiveFailures: tracking.consecutiveFailures,
+    };
+    // A person paused this task while the run was in flight. The run must not
+    // consume it as a completed one-shot: the manual marker has to survive into
+    // settleUntilDoneRun, which keeps the task paused instead of resurrecting it.
+    const manualPauseInFlight = !!task.untilDone && task.enabled === false && task.disabledReason === 'manual';
+    const consumedByRun = (finiteComplete || task.parsed.kind === 'once') && !manualPauseInFlight;
+    const settled: ScheduledTask = {
       ...task,
       lastRunAt: new Date().toISOString(),
       lastStatus: success ? 'ok' : 'error',
       lastError: success ? undefined : error,
       lastDeliveryError: deliveryError,
+      // 管理员 DM 水印（#2334 语义保留）：落盘即记账，投递为 fire-and-forget；
+      // owner 侧的 failingNotifiedAt 在 runStats 内、投递成功才写，两者不合并。
+      failureAlertSent: success
+        ? undefined
+        : (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined,
       repeat,
-      enabled: finiteComplete || task.parsed.kind === 'once' ? false : task.enabled,
-      disabledReason: finiteComplete || task.parsed.kind === 'once' ? 'once_completed' : task.disabledReason,
-      nextRunAt: finiteComplete || task.parsed.kind === 'once' ? undefined : task.nextRunAt,
+      runStats: tracking.runStats,
+      ...(consumedByRun ? { enabled: false, disabledReason: 'once_completed', nextRunAt: undefined } : {}),
     };
+    // Until-done tasks are not consumed by a run (one-shot or failed): they
+    // stay until marked done or their deadline's closing run is dispatched.
+    return settleUntilDoneRun(settled, { success, runId, nowMs: Date.now() });
   });
+  notifyAfterSettle(before, id);
+  return result;
 }
 
 function recordDispatchOutcome(
@@ -709,28 +867,54 @@ async function tick(): Promise<void> {
     if (!task.enabled) continue;
     if (!taskBelongsToThisDaemon(task)) continue;
 
-    let nextRunAt = task.nextRunAt;
-    if (!nextRunAt) {
-      // Recover: compute from parsed + lastRunAt
-      const recovered = computeNextRun(task.parsed, task.lastRunAt);
-      if (!recovered) continue;
-      nextRunAt = recovered;
-      mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt }));
-    }
+    // An until-done task past its deadline gets its closing run now, whatever
+    // its regular schedule says (see schedule-until-done.ts).
+    const deadlineDue = untilDoneDeadlineDue(task, now);
+    if (!deadlineDue) {
+      // A failed closing run owns its retry window: while it is open the
+      // regular cadence must not claim — even when some writer (a resume, a
+      // queued run-now, a cron timezone realign, a schedule edit) has moved
+      // nextRunAt into the past. The window, not that value, is the claim
+      // floor; the closing retry re-arms the cadence when it settles.
+      const closingRetryAt = task.untilDone?.status === 'open' ? task.untilDone.finalRetryAt : undefined;
+      if (closingRetryAt && now < Date.parse(closingRetryAt)) continue;
+      let nextRunAt = task.nextRunAt;
+      if (!nextRunAt) {
+        // Recover: compute from parsed + lastRunAt
+        const recovered = computeNextRun(task.parsed, task.lastRunAt);
+        if (!recovered) continue;
+        nextRunAt = recovered;
+        mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt }));
+      }
 
-    const nextMs = new Date(nextRunAt).getTime();
-    if (nextMs > now) continue;
+      const nextMs = new Date(nextRunAt).getTime();
+      if (nextMs > now) continue;
 
-    // Fast-forward stale automatic occurrences. A durable manual request must
-    // reach claimRun, which consumes it, instead of leaking into a future tick.
-    if (task.parsed.kind !== 'once' && !task.manualRunRequested) {
-      const grace = computeGraceSeconds(task.parsed);
-      if ((now - nextMs) / 1000 > grace) {
-        const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
-        if (newNext) {
-          logger.info(`[scheduler] Task "${task.name}" missed window (${Math.round((now-nextMs)/1000)}s late, grace=${grace}s), fast-forward to ${newNext}`);
-          mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt: newNext }));
-          continue;
+      // Fast-forward stale automatic occurrences. A durable manual request must
+      // reach claimRun, which consumes it, instead of leaking into a future tick.
+      // Either way the missed occurrence is recorded in the task's ledger; an
+      // open until-done task catches up once instead of skipping ahead.
+      // A run still in flight is not a miss — the claim below refuses it, and
+      // re-recording every tick would inflate the missed ledger for the whole
+      // overlap (the same gate keeps a busy normal task from fast-forwarding
+      // past occurrences its running turn still owns).
+      if (task.parsed.kind !== 'once' && !task.manualRunRequested && task.lastStatus !== 'running') {
+        const grace = computeGraceSeconds(task.parsed);
+        if ((now - nextMs) / 1000 > grace) {
+          const missedAt = new Date(nextMs).toISOString();
+          const lateSeconds = Math.round((now - nextMs) / 1000);
+          if (isUntilDoneOpen(task)) {
+            logger.info(`[scheduler] Task "${task.name}" missed window (${lateSeconds}s late, grace=${grace}s); until-done task catches up now`);
+            mutateRuntimeTask(task.id, current => ({ ...current, runStats: recordMissed(current.runStats, missedAt) }));
+          } else {
+            const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
+            if (newNext) {
+              logger.info(`[scheduler] Task "${task.name}" missed window (${lateSeconds}s late, grace=${grace}s), fast-forward to ${newNext}`);
+              mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt: newNext,
+                runStats: recordMissed(current.runStats, missedAt) }));
+              continue;
+            }
+          }
         }
       }
     }
@@ -746,18 +930,20 @@ async function tick(): Promise<void> {
       lastRunAt: executionContext.startedAt,
       nextRunAt: newNext ?? undefined,
       lastRunId: executionContext.runId,
+      ...(deadlineDue ? { untilDone: markUntilDoneFinalRun(task, executionContext.runId).untilDone } : {}),
     }) : undefined;
     const claimedTask = legacyClaim
       ? (legacyClaim.ok ? legacyClaim.task : undefined)
       : mutateRuntimeTask(task.id, current => {
           if (current.lastStatus === 'running' || !current.enabled) return;
-          return { ...current, lastRunAt: executionContext.startedAt,
+          const claimed: ScheduledTask = { ...current, lastRunAt: executionContext.startedAt,
             nextRunAt: newNext ?? undefined, lastRunId: executionContext.runId,
             lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
             // Re-arm for the next cycle: a pending manual flag belongs only to
             // the run that is being claimed now (mirrors legacy claimRun, which
             // deletes the field from storage and returns it on the snapshot).
             manualRunRequested: undefined };
+          return deadlineDue ? markUntilDoneFinalRun(claimed, executionContext.runId) : claimed;
         });
     if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) continue;
     // Mirror claimRun: the claimed snapshot must still carry the manual flag
@@ -771,11 +957,14 @@ async function tick(): Promise<void> {
     // the manual calendar check rather than the scheduled non-working-day gate.
     if (claimedTask.manualRunRequested) executionContext.trigger = 'dashboard';
     // Admission uses the locked task snapshot, before any Bash gate/model/message.
-    const calendarCheck = executionContext.trigger === 'scheduler'
+    // A deadline closing run is not a calendar occurrence: the deadline is an
+    // absolute promise, so it is admitted like a manual run.
+    const calendarCheck = executionContext.trigger === 'scheduler' && !deadlineDue
       ? checkTaskCalendar(claimedTask, claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope() ?? undefined)
       : manualCalendarCheck(claimedTask);
     if (calendarCheck && calendarCheck.status !== 'bypassed' && !calendarCheck.matches) {
-      markRuntimeCalendarBlocked(claimedTask.id, calendarCheck, executionContext.runId);
+      const calendarResult = markRuntimeCalendarBlocked(claimedTask.id, calendarCheck, executionContext.runId);
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, calendarResult);
       const status = calendarCheck.status === 'error' ? 'error' : 'skipped';
       logger.info(`[scheduler] Calendar ${calendarCheck.calendar}: ${calendarCheck.reason} (${calendarCheck.date ?? 'unknown date'}), task ${claimedTask.id} ${status}`);
       const appId = claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope();
@@ -810,7 +999,9 @@ async function tick(): Promise<void> {
         .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
-          markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+          const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+          const freshTask = runtimeTask(taskId) ?? claimedTask;
+          emitFailureAlertIfNeeded(freshTask, runResult);
           cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
@@ -824,13 +1015,15 @@ async function tick(): Promise<void> {
           emitScheduleFiredHook(claimedTask, 'error', err);
         });
     } else {
-      markRuntimeRun(
+      // 回调缺失本身是持续故障：阈值 crossed 时同样要告警，不能把水印静默落库。
+      const runResult = markRuntimeRun(
         claimedTask.id,
         false,
         'scheduler execute callback is not initialised',
         undefined,
         executionContext.runId,
       );
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
     }
   }
 }
@@ -846,11 +1039,16 @@ async function tick(): Promise<void> {
 export function planCronRealign(
   tasks: ScheduledTask[],
   belongs: (t: ScheduledTask) => boolean = () => true,
+  nowMs = Date.now(),
 ): Array<{ id: string; nextRunAt: string }> {
   const updates: Array<{ id: string; nextRunAt: string }> = [];
   for (const task of tasks) {
     if (!task.enabled || task.manualRunRequested || task.parsed.kind !== 'cron') continue;
     if (!belongs(task)) continue;
+    // A closing-run retry window parks the task on finalRetryAt; a timezone
+    // realign must not move it back onto the regular cron grid inside it.
+    const closingRetryAt = task.untilDone?.status === 'open' ? task.untilDone.finalRetryAt : undefined;
+    if (closingRetryAt && nowMs < Date.parse(closingRetryAt)) continue;
     const next = computeNextRun(task.parsed);
     if (next && next !== task.nextRunAt) updates.push({ id: task.id, nextRunAt: next });
   }
@@ -873,13 +1071,16 @@ export function startScheduler(): void {
   const startupTasks = runtimeTasks();
   for (const task of startupTasks) {
     if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
-    markRuntimeRun(
+    // 重启把在途任务对账为失败时，水印也可能在这一步跨过阈值——必须补发告警，
+    // 否则 failureAlertSent 已落库而私信永不发出，此后持续真失败也不再 crossed。
+    const runResult = markRuntimeRun(
       task.id,
       false,
       'schedule run interrupted by daemon restart',
       undefined,
       task.lastRunId,
     );
+    emitFailureAlertIfNeeded(runtimeTask(task.id) ?? task, runResult);
   }
   const tasks = runtimeTasks();
   const enabled = tasks.filter(t => t.enabled);
@@ -968,8 +1169,20 @@ export function addTask(params: {
   model?: string;
   /** See ScheduledTask.reasoningEffort. */
   reasoningEffort?: ScheduleReasoningEffort;
+  /** `--until-done`: keep running until marked done or the deadline closes it. */
+  untilDone?: UntilDoneConfigInput;
+  /** Opt-in owner notifications. */
+  notify?: ScheduleNotifyEvent[];
+}, audit?: {
+  /** Server-authoritative live turn that created this direct task (never from a
+   *  request body). Recorded in the authority row's target_turn_id column only —
+   *  not in the task JSON — and counted against maxTasksPerTurn. */
+  directTurn?: { turnId: string; maxTasksPerTurn: number };
 }): ScheduledTask {
   assertScheduleAuthorityAvailable();
+  if (audit?.directTurn && !(params.larkAppId && authorityStore?.isInitialized(params.larkAppId))) {
+    throw new Error('schedule_authority_unavailable');
+  }
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
     : scheduleStore.normalizeScheduleChatTargets({
@@ -983,6 +1196,13 @@ export function addTask(params: {
   if (!calendar && dayType === 'restday') throw new Error('calendar_required');
   const calendarDayType = calendar && dayType === 'restday' ? dayType : undefined;
   if (calendar && parsed.kind === 'once') throw new Error('calendar_once_unsupported');
+  const untilDoneConfig = resolveUntilDoneConfig({
+    untilDone: params.untilDone,
+    notify: params.notify,
+    parsed,
+    repeat: params.repeat,
+    nowMs: Date.now(),
+  });
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
     ?? (params.deliver === 'new-topic'
@@ -1051,8 +1271,9 @@ export function addTask(params: {
     followActive: params.followActive === true ? true : undefined,
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
+    ...untilDoneConfig,
   }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate))
+    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
     : undefined);
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
@@ -1190,9 +1411,11 @@ export function removeTask(id: string): boolean {
 export function enableTask(id: string): boolean {
   const task = runtimeTask(id);
   if (!task) return false;
+  // A finished (done / expired) until-done task is closed for good.
+  if (isUntilDoneClosed(task)) return false;
   // Repeating resume must not move a pending manual request to a future tick.
   if (task.enabled && task.manualRunRequested) return true;
-  const next = computeNextRun(task.parsed);
+  const next = untilDoneResumeNextRunAt(task, Date.now()) ?? computeNextRun(task.parsed);
   if (!authorityStore) {
     scheduleStore.updateTask(id, {
       enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
@@ -1224,7 +1447,10 @@ export function runTaskNow(id: string): boolean {
   // Ask the owning daemon to execute ASAP by advancing nextRunAt.  Its tick
   // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
   // which was wrong in multi-bot setups — the callback on this daemon may
-  // not even be the right bot for this task.
+  // not even be the right bot for this task.  Inside a closing-run retry
+  // window the tick's window gate absorbs the request: the cadence stays
+  // parked on the closing retry (unlike runNow, this path cannot bypass
+  // the tick, so no separate check is needed here).
   if (!authorityStore) {
     const requested = scheduleStore.requestRunNow(id);
     if (!requested.ok) return false;
@@ -1232,6 +1458,111 @@ export function runTaskNow(id: string): boolean {
     ? undefined : { ...current, nextRunAt: new Date().toISOString() })) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
   return true;
+}
+
+/**
+ * Whether an edit may record a new creator on this task. Not for a delegated
+ * task: it runs as its delegation, never as a creator. Not for a task whose
+ * creator was captured under another app either: that open_id belongs to the
+ * other app, and rewriting creatorLarkAppId would also move where its creator
+ * notices go.
+ */
+export function taskAcceptsRecordedCreator(id: string, appId?: string): boolean {
+  const effectiveAppId = authorityAppId(appId);
+  if (effectiveAppId && authorityStore?.isInitialized(effectiveAppId)
+    && authorityStore.getRecord(effectiveAppId, id)?.kind === 'delegated') return false;
+  const task = runtimeTask(id, appId);
+  if (!task) return false;
+  return !task.creatorLarkAppId || task.creatorLarkAppId === task.larkAppId;
+}
+
+export type ClaimTaskRunAsResult =
+  | { ok: true; task: ScheduledTask; previous?: ScheduleRunAsClaim }
+  | { ok: false; error: 'not_found' | 'stale' | 'already_claimant'; current?: ScheduleRunAsClaim };
+
+/**
+ * Record `claim` as the task's run-as identity (claim card). Compare-and-set
+ * on the claim the clicked card was rendered for — `expectedClaimedAt` is that
+ * claim's time, or null for a card that showed no claim — evaluated inside the
+ * authority write transaction, so of two near-simultaneous clicks only the
+ * first lands and a stale card can never overwrite a newer claim.
+ */
+export function claimTaskRunAs(
+  id: string,
+  appId: string,
+  claim: ScheduleRunAsClaim,
+  expectedClaimedAt: string | null,
+): ClaimTaskRunAsResult {
+  assertScheduleAuthorityAvailable();
+  let refusal: Extract<ClaimTaskRunAsResult, { ok: false }> | undefined;
+  let previous: ScheduleRunAsClaim | undefined;
+  const task = mutateRuntimeTask(id, current => {
+    const existing = parseScheduleRunAsClaim(current.runAsClaim);
+    if ((existing?.claimedAt ?? null) !== expectedClaimedAt) {
+      refusal = { ok: false, error: 'stale', ...(existing ? { current: existing } : {}) };
+      return undefined;
+    }
+    if (existing?.unionId === claim.unionId) {
+      refusal = { ok: false, error: 'already_claimant', current: existing };
+      return undefined;
+    }
+    previous = existing;
+    return { ...current, runAsClaim: claim };
+  }, appId);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (refusal) return refusal;
+  // No dashboard event: schedule rows carry no identity fields, and the event
+  // stream also reaches anonymous public-read viewers.
+  return { ok: true, task, ...(previous ? { previous } : {}) };
+}
+
+/**
+ * `botmux schedule done`: close an until-done task. Idempotent — completing a
+ * task that is already done is a replay. Only until-done tasks qualify.
+ */
+export function completeTask(id: string, note?: string): {
+  ok: boolean;
+  replay?: boolean;
+  error?: string;
+} {
+  assertScheduleAuthorityAvailable();
+  const task = runtimeTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  let outcome: ReturnType<typeof completeUntilDone> | undefined;
+  mutateRuntimeTask(id, current => {
+    outcome = completeUntilDone(current, note, Date.now());
+    return outcome.ok && !outcome.replay ? outcome.task : undefined;
+  });
+  if (!outcome) return { ok: false, error: 'not_found' };
+  if (!outcome.ok) return { ok: false, error: outcome.error };
+  if (!outcome.replay) {
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) marked done`);
+    dashboardEventBus.publish({
+      type: 'schedule.updated',
+      body: { id, patch: { enabled: false, untilDone: outcome.task.untilDone } },
+    });
+  }
+  return { ok: true, replay: outcome.replay };
+}
+
+/** CLI-side parsing of `--deadline` / `--retry-every`, reusing the schedule
+ *  grammar: a deadline is any one-shot schedule (ISO time, "7d", 明天18:00…),
+ *  a retry interval any `every …` duration. Throws stable error codes. */
+export function parseUntilDoneInput(input: { deadline?: string; retryEvery?: string }): UntilDoneConfigInput {
+  const out: UntilDoneConfigInput = {};
+  if (input.deadline !== undefined) {
+    let parsed: ParsedSchedule;
+    try { parsed = parseSchedule(input.deadline); } catch { throw new Error('until_done_deadline_invalid'); }
+    if (parsed.kind !== 'once' || !parsed.runAt) throw new Error('until_done_deadline_invalid');
+    out.deadline = parsed.runAt;
+  }
+  if (input.retryEvery !== undefined) {
+    let parsed: ParsedSchedule;
+    try { parsed = parseSchedule(`every ${input.retryEvery.trim()}`); } catch { throw new Error('until_done_retry_invalid'); }
+    if (parsed.kind !== 'interval' || !parsed.minutes) throw new Error('until_done_retry_invalid');
+    out.retryMinutes = parsed.minutes;
+  }
+  return out;
 }
 
 export function getNextRun(id: string): Date | null {
@@ -1254,6 +1585,12 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
+  // This path dispatches directly, past the tick's closing-window gate — a
+  // run-now must not preempt a pending closing retry with a regular turn.
+  const closingRetryAt = task.untilDone?.status === 'open' ? task.untilDone.finalRetryAt : undefined;
+  if (closingRetryAt && Date.now() < Date.parse(closingRetryAt)) {
+    return { ok: false, error: 'closing_retry_window' };
+  }
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
@@ -1282,7 +1619,8 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      const runResult = markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
@@ -1304,8 +1642,9 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   if (!task) return { ok: false, error: 'not_found' };
   if (task.enabled === enabled
     && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested))) return { ok: true };
+  if (enabled && isUntilDoneClosed(task)) return { ok: false, error: 'schedule_until_done_closed' };
   if (enabled) {
-    const next = computeNextRun(task.parsed);
+    const next = untilDoneResumeNextRunAt(task, Date.now()) ?? computeNextRun(task.parsed);
     if (!authorityStore) {
       scheduleStore.updateTask(id, {
         enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
@@ -1426,11 +1765,27 @@ export function updateTask(
     /** `''` / `null` clears the per-task model and falls back to the bot's. */
     model?: string | null;
     reasoningEffort?: ScheduleReasoningEffort | null;
+    /** The person who made this edit, already verified and checked against the
+     *  bot's access by the caller (Dashboard Feishu login). They become the
+     *  task's creator, and any claim from the claim card is dropped: the
+     *  claimant agreed to run the task as it was, not as edited. */
+    creator?: { openId: string; unionId: string };
   },
   options: { deferEvent?: boolean } = {},
-): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
+): {
+  ok: boolean;
+  error?: string;
+  deferredEventPatch?: Record<string, unknown>;
+  /** With `creator`: who the task ran as just before this edit, read inside
+   *  the same authority write, so a caller that must undo the edit can put
+   *  exactly that back. */
+  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>;
+} {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
+  if (updates.creator && !taskAcceptsRecordedCreator(id, task.larkAppId)) {
+    return { ok: false, error: 'creator_not_recordable' };
+  }
 
   let calendar: string | undefined;
   try { calendar = updates.calendar === undefined ? task.calendar : normalizeCalendarBinding(updates.calendar); }
@@ -1625,13 +1980,25 @@ export function updateTask(
     patch.manualRunRequested = undefined;
   }
 
-  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch }))) {
+  // Identity fields stay out of `patch`: it doubles as the dashboard event,
+  // which anonymous public-read viewers also receive.
+  const creatorPatch: Partial<ScheduledTask> = updates.creator
+    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
+    : {};
+  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined;
+  if (!mutateRuntimeTask(id, current => {
+    if (updates.creator) {
+      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId, runAsClaim: current.runAsClaim };
+    }
+    return { ...current, ...patch, ...creatorPatch };
+  })) {
     return { ok: false, error: 'not_found' };
   }
   const publishedPatch = { ...patch, ...eventPatch };
-  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  const identity = previousRunAs ? { previousRunAs } : {};
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch, ...identity };
   publishScheduleTaskUpdated(id, publishedPatch);
-  return { ok: true };
+  return { ok: true, ...identity };
 }
 
 /** Publish a task patch after a compound configuration operation has fully

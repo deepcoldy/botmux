@@ -116,12 +116,25 @@ export function resolveSessionEnv(input: {
  * Env for a one-shot CLI process run on a bot's behalf (title generation,
  * model / service-tier probes): the same layers that bot's sessions get, so a
  * proxy or provider set in the Dashboard reaches these calls too.
+ *
+ * NOTE: this does NOT reset the GIT_CONFIG_* command-line channel. The
+ * pane/PTY/strict spawns and the RPC app-server all funnel through
+ * prepareTurnGitConfigEnv, but a one-shot probe runs without identity wrappers
+ * by definition; an ambient/per-bot GIT_CONFIG_COUNT or numbered pair can
+ * reach git here. Tracked as follow-up after #2203.
  */
-export function botOneShotEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): NodeJS.ProcessEnv {
+export function botOneShotProbeEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): { env: NodeJS.ProcessEnv; fingerprint: string } {
   // A one-shot is launched directly, never behind the identity wrappers.
   const resolved = resolveSessionEnv({ bot, backendType: bot.backendType ?? 'pty', facts: { unwrapped: true } });
   return {
-    ...buildSessionChildEnv(base, bot.envPolicy, resolved.envUnset),
-    ...botInjectedEnv(resolved.env, bot.envPolicy),
+    env: {
+      ...buildSessionChildEnv(base, bot.envPolicy, resolved.envUnset),
+      ...botInjectedEnv(resolved.env, bot.envPolicy),
+    },
+    fingerprint: resolved.fingerprint,
   };
+}
+
+export function botOneShotEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): NodeJS.ProcessEnv {
+  return botOneShotProbeEnv(base, bot).env;
 }

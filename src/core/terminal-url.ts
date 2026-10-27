@@ -1,5 +1,8 @@
 import { config } from '../config.js';
 import { formatUrlHost } from './dashboard-url.js';
+import { dashboardSecretPath } from './dashboard-secret.js';
+import { deriveTerminalCardViewToken } from './terminal-write-auth.js';
+import { loadDashboardSecret } from '../dashboard/auth.js';
 import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
@@ -21,7 +24,7 @@ import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
  */
 
 interface TerminalUrlSession {
-  session: { sessionId: string; webPort?: number | null };
+  session: { sessionId: string; webPort?: number | null; terminalCardEpoch?: string };
   workerPort: number | null;
   workerToken: string | null;
   workerViewToken?: string | null;
@@ -75,6 +78,28 @@ function withCapability(base: string, name: 'token' | 'viewToken', value: string
   return value ? `${base}?${name}=${encodeURIComponent(value)}` : base;
 }
 
+/**
+ * Card read capability for a session no live worker has reported one for —
+ * e.g. restored after a daemon restart and re-rendered before its next fork
+ * (restart reconcile, 显示输出 / 刷新, a usage-limit card turning retryable).
+ * The worker's `ready` tokens live only in daemon memory, so without this the
+ * rebuilt card's link loses `viewToken` and a viewer without a Dashboard /
+ * platform login gets 403 (#2279).
+ *
+ * Same derivation, secret file and persisted epoch the worker uses in
+ * `refreshTerminalCardViewToken`, so the token a worker woken by this link
+ * accepts is exactly the one the pre-restart card carried. Read per call like
+ * the worker does — this path only runs while no worker token exists. Without
+ * a readable secret (standalone/test) or an epoch, the link stays bare as
+ * before.
+ */
+function restoredCardViewToken(session: TerminalUrlSession['session']): string | null {
+  if (!session.terminalCardEpoch) return null;
+  let secret: string | null;
+  try { secret = loadDashboardSecret(dashboardSecretPath()); } catch { return null; }
+  return secret ? deriveTerminalCardViewToken(secret, session.sessionId, session.terminalCardEpoch) : null;
+}
+
 /** Whether read-only terminal links route through the central platform's
  * authenticated front door. All three must hold:
  *  • remote access is enabled AND this machine is bound (a t- subdomain base);
@@ -110,9 +135,12 @@ export function buildTerminalUrl(
   // When 远程访问 is off the platform base is null and we fall through — first
   // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
   // `/s/<id>` form), then to the local proxy/worker port.
+  // The 'worker' scope must stay the live boot token: the dashboard derives the
+  // worker generation from it, so a card token there would mint a grant no
+  // worker accepts. Only card links fall back to the daemon-derived token.
   const readToken = opts.viewScope === 'worker'
     ? ds.workerViewToken
-    : (ds.workerCardViewToken ?? ds.workerViewToken);
+    : (ds.workerCardViewToken ?? ds.workerViewToken ?? restoredCardViewToken(ds.session));
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;
     if (platformBase) {

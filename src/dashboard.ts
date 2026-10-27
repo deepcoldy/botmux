@@ -108,6 +108,7 @@ import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from '
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
@@ -158,6 +159,7 @@ import {
 } from './dashboard/workbench-ticket.js';
 import { handleWorkbenchStandingLink } from './dashboard/standing-link.js';
 import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
+import { signTerminalWakeProof } from './core/terminal-control-grant.js';
 import {
   centralViewLinkPath,
   mintTerminalViewCapability,
@@ -178,8 +180,9 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js';
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
-import { checkCliAvailability } from './setup/cli-availability.js';
+import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
@@ -340,7 +343,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -357,6 +360,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
+import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -885,6 +889,8 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // therefore through the liveness check above — so a raw view URL aimed at the
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
+  // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
+  wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
@@ -3069,7 +3075,7 @@ function configuredBrands(): Map<string, string | undefined> {
 
 type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
   'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
-  | 'modelBackendVariant' | 'reasoningEffort' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
   | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
 >> & { cliId?: string };
 
@@ -3088,6 +3094,7 @@ function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
       traexAutoModel: b.traexAutoModel,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
+      codexProfile: b.codexProfile ?? undefined,
       serviceTier: b.serviceTier,
       nativeSubagentRuntime: b.nativeSubagentRuntime,
       turnTimeoutMs: b.turnTimeoutMs,
@@ -3140,6 +3147,7 @@ async function configuredBotDefaultsRecoveryRows(
           codexRpcInput: bot.codexRpcInput,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
+          codexProfile: bot.codexProfile ?? null,
           serviceTier: bot.serviceTier,
           nativeSubagentRuntime: bot.nativeSubagentRuntime,
           turnTimeoutMs: bot.turnTimeoutMs,
@@ -3182,6 +3190,7 @@ function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgen
     traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
     serviceTier: bot.serviceTier || fallback?.serviceTier,
     nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
@@ -4286,6 +4295,21 @@ const server = createServer(async (req, res) => {
       legacyAuthed,
       workbenchIdentity: workbenchOnlyIdentity,
     });
+
+    // 决策看板事项链接的路径入口（飞书侧栏 AppLink 指向它）。只做跳转、不返回数据，所以放在
+    // 401 之前：已登录 → SPA 的 #/board/...；未登录且配了 H5 免登 → 先走飞书免登再回到这里；
+    // 其余交给 SPA 的登录层。用路径不用 #，是因为平台冷访问 SSO 只把 pathname+search 带进 next。
+    const boardEntry = req.method === 'GET' || req.method === 'HEAD'
+      ? decisionBoardEntryRedirect(url.pathname, {
+        signedIn: decisionBoardAccess(requestIdentity, canManageHost),
+        h5: dashboardH5AuthConfig,
+      })
+      : null;
+    if (boardEntry) {
+      res.writeHead(302, { location: boardEntry, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
 
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
@@ -5776,6 +5800,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ─── 决策看板（管家 bot 的 daemon 是唯一写入方）──────────────────────────────
+    if (await handleDecisionBoardApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      proxyToDaemon,
+      readJsonBody,
+      bots: () => {
+        const online = new Map(registry.list().map(d => [d.larkAppId, d.botName] as const));
+        return monitorBotConfigs().map(cfg => ({
+          larkAppId: cfg.larkAppId,
+          botName: online.get(cfg.larkAppId) || cfg.displayName || cfg.larkAppId,
+          ...(cfg.steward ? { steward: cfg.steward } : {}),
+          online: online.has(cfg.larkAppId),
+        }));
+      },
+    })) {
+      return;
+    }
+
     // ─── Agent 配置模板（agents.json）─────────────────────────────────────────
     // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；写操作在 handler 内另要 canManageHost。
     if (await handleAgentProfilesApi(req, res, url, {
@@ -5824,11 +5867,11 @@ const server = createServer(async (req, res) => {
           // Keep the all-options scan shell-free so opening the form remains
           // instant even when most of the 20+ CLIs are absent. The selected
           // option is checked again with shell/rc resolution on submit/save.
-          const availability = checkCliAvailability({
+          const availability = preliminaryCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
-          }, { shellFallback: false });
+          });
           // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
           // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
@@ -5842,6 +5885,7 @@ const server = createServer(async (req, res) => {
             id: o.key,
             label: o.label,
             available: availability.available,
+            availabilityStatus: availability.status,
             command: availability.command,
             availabilityReason: availability.reason,
             ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
@@ -5861,6 +5905,22 @@ const server = createServer(async (req, res) => {
         // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
         ...(webSession ? { webSession } : {}),
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/cli-options/availability') {
+      const key = (url.searchParams.get('key') ?? '').trim();
+      if (!isKnownSelectionKey(key)) {
+        return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
+      }
+      const appId = url.searchParams.get('bot')?.trim();
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId) : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      return jsonRes(res, response.statusCode, response.body);
     }
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
@@ -6486,7 +6546,7 @@ const server = createServer(async (req, res) => {
       if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
       const upstream = await proxyToDaemon(larkAppId, '/api/schedules', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -6508,7 +6568,7 @@ const server = createServer(async (req, res) => {
       }
       const upstream = await proxyToDaemon(owner, `/api/schedules/${id}`, {
         method: 'PATCH',
-        headers: { 'content-type': 'application/json' },
+        headers: dashboardScheduleWriteHeaders(req, !!readPlatformBinding()),
         body: JSON.stringify(body),
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -7292,38 +7352,7 @@ const server = createServer(async (req, res) => {
             return { ...botDefaultsPayload(d, undefined, `http_${r.status}`), botIndex: d.botIndex };
           }
           const j = await r.json() as any;
-          return { ...botDefaultsPayload({
-            ...d,
-            botName: d.botName ?? j.botName,
-            cliId: j.cliId || d.cliId,
-            // New daemons return explicit null for Official/no legacy path.
-            // Respect that instead of reviving a stale fallback descriptor;
-            // older daemons omit the fields and still use bots.json fallback.
-            cliRuntime: Object.prototype.hasOwnProperty.call(j, 'cliRuntime')
-              ? j.cliRuntime ?? undefined
-              : d.cliRuntime,
-            cliPathOverride: Object.prototype.hasOwnProperty.call(j, 'cliPathOverride')
-              ? j.cliPathOverride ?? undefined
-              : d.cliPathOverride,
-            wrapperCli: j.wrapperCli || d.wrapperCli,
-            cliLaunchMode: Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode')
-              ? j.cliLaunchMode ?? undefined
-              : d.cliLaunchMode,
-            model: j.model || d.model,
-            traexAutoModel: Object.prototype.hasOwnProperty.call(j, 'traexAutoModel')
-              ? j.traexAutoModel ?? undefined
-              : d.traexAutoModel,
-            modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
-              ? j.modelBackendVariant ?? undefined
-              : d.modelBackendVariant,
-            reasoningEffort: j.reasoningEffort || d.reasoningEffort,
-            serviceTier: j.serviceTier || d.serviceTier,
-            nativeSubagentRuntime: Object.prototype.hasOwnProperty.call(j, 'nativeSubagentRuntime')
-              ? j.nativeSubagentRuntime ?? undefined
-              : d.nativeSubagentRuntime,
-            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
-            dshRuntime: typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime,
-          }, j), botIndex: d.botIndex };
+          return { ...botDefaultsPayload(mergeBotOncallFields(d, j), j), botIndex: d.botIndex };
         } catch (e: any) {
           return { ...botDefaultsPayload(d, undefined, e?.message ?? String(e)), botIndex: d.botIndex };
         }

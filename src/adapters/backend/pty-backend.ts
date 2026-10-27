@@ -1,5 +1,6 @@
 import { botInjectedEnv } from '../../core/env-policy.js';
 import { applySessionEnvUnset } from '../../core/session-env.js';
+import { GIT_CONFIG_PAIR_ENV_KEY } from '../../utils/child-env.js';
 import * as pty from '../../utils/pty.js';
 import { chmodSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -86,6 +87,15 @@ export function ptyChildEnv(opts: Pick<SpawnOpts, 'env' | 'injectEnv' | 'unsetEn
   if (!opts.injectEnv && !opts.unsetEnv?.length) return opts.env;
   const env: NodeJS.ProcessEnv = { ...opts.env };
   applySessionEnvUnset(env, opts.unsetEnv);
-  if (opts.injectEnv) Object.assign(env, opts.strictEnv ? botInjectedEnv(opts.injectEnv, { mode: 'strict' }) : opts.injectEnv);
+  if (opts.injectEnv) {
+    // The git command-line config channel is owned by the worker's
+    // turn-authored block; per-bot `env` cannot add GIT_CONFIG_* entries.
+    const injected: Record<string, string> = {};
+    for (const [key, val] of Object.entries(opts.strictEnv ? botInjectedEnv(opts.injectEnv, { mode: 'strict' }) : opts.injectEnv)) {
+      if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) continue;
+      injected[key] = val;
+    }
+    Object.assign(env, injected);
+  }
   return env as Record<string, string>;
 }

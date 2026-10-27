@@ -446,3 +446,110 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
     expect(messages[1]).toBe('echo:ping');
   });
 });
+
+describe('terminal proxy — authenticate before waking (#2004)', () => {
+  it('hands authorizeWake the parsed capability and lower-cased headers, and wakes only on "wake"', async () => {
+    const workerPort = await startFakeWorker();
+    const seen: Array<{ sessionId: string; capability: unknown; headers: Record<string, unknown> }> = [];
+    let woke = 0;
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => { woke++; return workerPort; },
+      authorizeWake: (sessionId, request) => {
+        seen.push({ sessionId, ...request });
+        return 'wake';
+      },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/sleeping/?viewToken=v1&token=t1`, {
+      headers: { Cookie: 'botmux_dashboard_token=abc', 'X-Botmux-Terminal-Wake': 'proof' },
+    });
+    expect(await res.text()).toBe('worker-saw:/?viewToken=v1&token=t1');
+    expect(woke).toBe(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sessionId).toBe('sleeping');
+    expect(seen[0].capability).toEqual({ viewToken: 'v1', token: 't1' });
+    expect(seen[0].headers.cookie).toBe('botmux_dashboard_token=abc');
+    expect(seen[0].headers['x-botmux-terminal-wake']).toBe('proof');
+  });
+
+  it('passes a repeated header as an array so no credential check can pick one copy', async () => {
+    let headers: Record<string, unknown> = {};
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => undefined,
+      authorizeWake: (_sessionId, request) => { headers = request.headers; return 'deny'; },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const sock = connect(proxy!.port, '127.0.0.1', () => {
+        sock.write('GET /s/x/ HTTP/1.1\r\nHost: a\r\nX-Botmux-Terminal-Wake: one\r\nx-botmux-terminal-wake: two\r\n\r\n');
+      });
+      sock.on('data', () => {});
+      sock.on('close', () => resolve());
+      sock.on('error', reject);
+    });
+    expect(headers['x-botmux-terminal-wake']).toEqual(['one', 'two']);
+  });
+
+  it('does not wake on "deny" or "suspended", for HTTP and WS alike', async () => {
+    let woke = 0;
+    let decision: 'deny' | 'suspended' = 'deny';
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => { woke++; return 1; },
+      resolveSessionState: () => 'starting',
+      resolveStatusPageLocale: () => 'en',
+      authorizeStatusPage: () => false,
+      authorizeWake: () => decision,
+    });
+    const denied = await fetch(`http://127.0.0.1:${proxy.port}/s/s1/`);
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).toContain('Terminal link expired');
+
+    decision = 'suspended';
+    const suspended = await fetch(`http://127.0.0.1:${proxy.port}/s/s1/?viewToken=card`);
+    expect(suspended.status).toBe(503);
+    const html = await suspended.text();
+    expect(html).toContain('Session suspended');
+    expect(html).toContain('<html lang="en">');
+
+    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/s1/?viewToken=card`);
+    const status = await new Promise<number | undefined>((resolve) => {
+      ws.on('unexpected-response', (_req, res) => resolve(res.statusCode));
+      ws.on('open', () => resolve(101));
+      ws.on('error', () => resolve(undefined));
+    });
+    ws.terminate();
+    expect(status).toBe(503);
+    expect(woke).toBe(0);
+  });
+
+  it('fails closed (no wake) when authorizeWake throws', async () => {
+    let woke = 0;
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => { woke++; return 1; },
+      authorizeWake: () => { throw new Error('secret unreadable'); },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/s1/?token=t`);
+    expect(res.status).toBe(502);
+    expect(woke).toBe(0);
+  });
+
+  it('never consults authorizeWake while a live worker is registered', async () => {
+    const workerPort = await startFakeWorker();
+    let asked = 0;
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => workerPort,
+      ensureWorkerPort: async () => undefined,
+      authorizeWake: () => { asked++; return 'deny'; },
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/live/`);
+    expect(res.status).toBe(200);
+    expect(asked).toBe(0);
+  });
+});

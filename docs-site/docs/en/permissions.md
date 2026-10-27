@@ -17,7 +17,7 @@ botmux permissions answer two questions: **who can talk to the bot** (canTalk) a
 Notes:
 
 - A bot created through normal onboarding always has its owner in `allowedUsers`, so it is a **restricted** bot by default — only listed people can use it.
-- Team-trust legs (same-team peer bots / team bots / platform team members) grant talk only; see [Roles & Teams](/en/roles).
+- Team-trust legs: same-team peer bots / team bots can talk and run admin commands, platform team members get talk only; see [Roles & Teams](/en/roles). For bots on the same machine see [Bots on this machine](#bots-on-this-machine-admin-commands-and-delegated-grants-trustsameownerbots) below.
 - Field-level reference: [bots.json · Permissions and authorization](/en/bots-json).
 
 ## Common operations
@@ -64,6 +64,37 @@ On a restricted bot, when an unauthorized person explicitly @-mentions the bot i
 - Pending requests are throttled, so one person cannot spam cards. If the same person messages the bot again while their card is pending, they get a one-line "still waiting for the admin" reply (once per card); within 10 minutes of a denial they get a one-line "not approved" reply, and after that a new message sends a fresh card.
 - **A rejected DM (p2p) is silent by default**: there is no owner present in that DM, and replying with a card would go to the stranger themselves (unusable for them, and it would expose the owner), so no card is sent.
 - **Forward request cards to the owner's DM** (`grantRequestToOwnerDm`, off by default): when enabled and no admin in the conversation can click the card, the card goes to the primary owner's DM instead — both when no admin is in the group (e.g. `autoInviteOwnerOnGroupAdd` is off and the owner stays out) and when a DM is rejected. The requester only gets a neutral acknowledgement that does not reveal the owner; after the owner approves or denies, the outcome is posted back to the original conversation; once the quota runs out, the next message re-applies automatically. If an admin is in the group, or the member lookup fails, the card is posted in the group as before. DM forwarding has an extra per-owner cap (20 cards per hour; failed sends do not count). Over the cap or on a send failure no card is posted (the group is already known to have no admin, so an in-group card would be one nobody can click); the next message retries. The group path lists chat members on every request (60-second cache); if the app lacks the member-read scope (`im:chat.members:read`) or the group has more than 2,000 members (no complete list), the card is posted in the group as before. Toggle it in the Dashboard (**Bot Config → Authorization & Quota**), via `bots.json`, or with `/botconfig set grantRequestToOwnerDm on`.
+
+## Bots on this machine: admin commands and delegated grants `trustSameOwnerBots`
+
+Other bots on the same machine (the same `bots.json`) can already talk to this bot. A bot on this machine **whose owner is the same person** gets three more abilities (on by default):
+
+- **Talk before it is recognized**: its messages are let through, with no grant card, even before this bot has learned who it is — for example when it posts a top-level message in a topic group without @mentioning this bot and this bot has `autoStartOnNewTopic` on. For the same reason `botmux create-group` no longer writes pairwise chat grants between same-owner bots on this machine (bots with a different owner still get them). If `trustSameOwnerBots` is later turned off for an existing group, that bot pair has no historical chat grant to fall back to and must be granted access again with `/grant`; if the admin identity snapshot is temporarily missing or stale, the next @mention can also self-heal through the live bot roster.
+- **Admin commands**: it can run `/cd`, `/repo`, `/restart`, `/close` and other admin commands on this bot, on par with team bots from other deployments. Commands that only accept the admin list, such as `/botconfig`, `/dashboard` and `/term`, are unaffected.
+- **Delegated grants**: when it @mentions this bot in a group, the other people it @mentions in the same message get **talk access in that group**, exactly like the owner clicking "This group" on a grant card: written to `chatGrants`, talk only, with the `/grant` defaults for quota and duration (`messageQuota.defaultLimit` / `grantDefaultDurationMs`, 3 messages / 1 hour when unset); `restrictGrantCommands` still applies. A grant result card is posted under that message and @mentions the people who were granted (other bots are shown by name only, without an @ notification). People who can already talk, @all, the sender itself and blocked users are skipped; groups only.
+
+How it decides:
+
+- **Is it a bot on this machine**: the union_id Feishu stamps on the message must match exactly one other app in this machine's `bots.json` (`apiOnly` bots excluded). Display names are not used.
+- **Same owner**: **every** admin of the other bot (`allowedUsers`) is also an admin of this bot. One extra admin this bot does not recognize is enough to rule it out — otherwise that person could operate this bot through the other one. The two sides may write admins differently (email, phone number, `on_`, `ou_`): each bot converts its own admins to union_ids with its own app credentials, and those are compared; if any of the other bot's admins cannot be converted (e.g. the app lacks contact read permission), it is ruled out as well. After an admin change it takes effect again within about 30 seconds; until then the bots are treated as having different owners.
+- Whoever can drive the other bot (its guests, people in its oncall groups) may also drive this bot through it. That is inherent to trust between bots, and the same holds for team bots from other deployments; turn the switch off if that is not acceptable.
+- When one machine hosts bots for several people, bots with a different owner can still only talk.
+
+Switch: Dashboard "Bot settings → Access & quota → Trust bots on this machine with the same owner", `trustSameOwnerBots: false` in `bots.json`, or `/botconfig set trustSameOwnerBots off`. When off, every bot on this machine can only talk (picking a repository with `/repo` is not affected by this switch).
+
+## Grant-delegate bots `grantDelegateBots`
+
+The **second delegation source** besides same-owner bots on this machine: an explicit list of external bots the owner trusts, independent of `trustSameOwnerBots` (each switch governs only its own source). The delegated grant itself works exactly as in the previous section — only "who counts as a delegate" differs.
+
+External platforms often create a group with their own bot and post a kickoff card that @mentions this bot, naming the person making the request in the same card. In restricted mode that person then hits the talk gate when they @mention this bot and must wait for the owner to click an approval card. Listing the platform bot removes that round-trip:
+
+- Entries are the trusted bot's open_id as seen by this bot (`ou_` form) or its app_id (`cli_` form); entries are trimmed and blank ones dropped.
+- When a listed bot posts a group message that **@mentions this bot**, everyone else it @mentions in the same message automatically gets a **chat-scoped talk grant**, identical to the owner clicking **Grant in this chat** on the grant card: written to `chatGrants`, talk-only (never management access), with the `/grant` default quota/duration (`messageQuota.defaultLimit` / `grantDefaultDurationMs`; 3 messages / 1 hour when unconfigured). `restrictGrantCommands` applies as usual.
+- A grant-result card is posted as a reply to that message, @mentioning the granted humans (other bots named in the message are shown as plain text without an @mention, so they are not woken by the notification).
+- Skipped for people who can already talk (owner, on-call chat, whole-group open, existing grant, open mode), the sender itself, @all, and blocked users. Group chats only — never in p2p. A delegate bot that is itself on the block list is ignored entirely (blocking it must also stop it from opening the door for others).
+- **Trust boundary**: this hands the listed bots one-shot authority over who can talk to this bot in a given group — whoever they @mention gets a time-bounded, quota-bounded talk grant. List only platform bots you fully trust. They cannot grant management access, cannot write `allowedUsers` / `allowedChatGroups` / `globalGrants`, and the grant is scoped to the group the message was posted in. When unset, behavior is unchanged.
+
+Configure it in the Dashboard ("Bot settings → Access & quota → External bots with delegated grants"), via `grantDelegateBots` in `bots.json`, or with `/botconfig set grantDelegateBots ou_xxx,cli_yyy` (`unset` clears the list).
 
 ## Common questions
 

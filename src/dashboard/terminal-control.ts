@@ -28,6 +28,14 @@ export interface TerminalDashboardActor {
    * are permanently read-only and cannot promote themselves via takeover.
    */
   terminalCapability?: 'controlled' | 'owner' | 'readonly';
+  /**
+   * #2004: a central-platform visitor the platform let in WITHOUT a sign-in —
+   * the terminal subdomain allows anonymous read-only viewing, and such a
+   * request carries a `guest` role but no `X-Botmux-Actor`. It may still watch,
+   * but it is not an authenticated identity, so it cannot wake a suspended
+   * session.
+   */
+  anonymous?: true;
 }
 
 export interface TerminalControlSocket {

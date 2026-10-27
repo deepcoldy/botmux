@@ -58,6 +58,22 @@ describe('normalizeTraexAutoModelConfig', () => {
     expect(resolveTraexAutoModelSettings(parsed.config!, 'model-49', { reasoningEffort: 'high', modelBackendVariant: 'max' })).toEqual({});
     expect(normalizeTraexAutoModelConfig({ enabled: true, models, modelSettings: { outside: {} } }).error).toContain('invalid model entry');
   });
+  it('round-trips a normal settings snapshot outside the pool without changing runtime policy', () => {
+    const config = { enabled: true as const, models: ['pool-model'], queueTimeoutMs: 30_000 };
+    const previousSettings = { model: 'normal-model', reasoningEffort: 'xhigh', modelBackendVariant: 'standard' };
+    const parsed = normalizeTraexAutoModelConfig({ ...config, previousSettings: { ...previousSettings, model: ' normal-model ' } });
+    expect(parsed.config?.previousSettings).toEqual(previousSettings);
+    expect(traexAutoModelPolicyKey(parsed.config!)).toBe(traexAutoModelPolicyKey(config));
+    const controller = new TraexAutoModelController(config);
+    expect(validTraexAutoModelRuntime(parsed.config!, controller.runtimeState('native'), 'native')).toBe(true);
+    expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: {} }).config?.previousSettings).toEqual({});
+    expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: { model: ' ' } }).config?.previousSettings).toEqual({});
+  });
+  it.each([[null], [[]], ['model'], [{ model: 1 }], [{ model: ' AUTO ' }], [{ model: 'x'.repeat(257) }],
+    [{ reasoningEffort: 'typo' }], [{ modelBackendVariant: 'giant' }],
+  ])('rejects invalid normal settings snapshots (%j)', previousSettings => {
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'], previousSettings }).error).toContain('previousSettings');
+  });
 });
 
 describe('TraexAutoModelController', () => {
@@ -446,6 +462,51 @@ describe('hand-written Auto settings and recovery defaults', () => {
 
 
 describe('current footer capacity evidence', () => {
+  it.each([16, 80])('finds live capacity above a native pending panel with %i lines', count => {
+    const queue = "◇ Queued for capacity (3h 34m 43s • esc to interrupt)\n  └ Too many requests right now. You're in the queue at position 41.";
+    const panel = ['Send after tool call · esc to interrupt and send · ↑ to edit',
+      ...Array.from({ length: count }, (_, index) => `› pending ${index}`), '────────',
+      '❯ Summarize recent commits', 'GPT-6-Astra (MAX) xhigh · ~ · Context —',
+      'Full Access · ? for shortcuts'].join('\n');
+    expect(traexCapacityQueueVisible(`${queue}\n${panel}`)).toBe(true);
+    expect(traexCapacityQueuePosition(`${queue}\n${panel}`)).toBe(41);
+    expect(traexModelProgressVisible(`${queue}\n${panel}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n◆ Working… (2s • esc to interrupt)\n${panel}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n${panel.replace('Send after', '  Send after')}`)).toBe(false);
+    expect(traexCapacityQueueVisible(`${queue}\n${panel.replace('GPT-6-Astra (MAX) xhigh · ~ · Context —', 'unrecognized footer')}`)).toBe(false);
+  });
+
+  it('holds after a fresh submission until matching activity or terminal evidence', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('first');
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('first');
+    controller.observeCapacityQueue({ turnId: 'first', queued: false, nowMs: 0 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    controller.observeCapacityQueue({ turnId: 'stale', queued: false, progressing: true, nowMs: 1 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    controller.observeCapacityQueue({ turnId: 'first', queued: false, progressing: true, nowMs: 2 });
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('stale');
+    expect(controller.awaitingModelActivity()).toBe(false);
+    controller.markInputSubmitted('first');
+    controller.endTurn('first');
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
+
+  it('disarms the activity latch on a crash exit but keeps it for a planned switch', () => {
+    const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    controller.beginTurn('turn');
+    controller.markInputSubmitted('turn');
+    controller.observeCapacityQueue({ turnId: 'turn', queued: false, nowMs: 0 });
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A planned model switch's replacement owns the same waiting window.
+    controller.noteProcessExited(true);
+    expect(controller.awaitingModelActivity()).toBe(true);
+    // A genuine crash can never paint the frame the dead process owed.
+    controller.noteProcessExited(false);
+    expect(controller.awaitingModelActivity()).toBe(false);
+  });
   it('does not switch during a long ordinary reasoning interval', () => {
     const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000 });
     controller.beginTurn('turn');

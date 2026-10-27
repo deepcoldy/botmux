@@ -1800,7 +1800,8 @@ describe('codex writeInput submission confirmation', () => {
       captureCurrentScreen: () => '', captureInputState: () => null,
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toEqual({ submitted: true });
+    // The unproven id is only a candidate, never the session.
+    expect(result).toEqual({ submitted: true, unprovenCliSessionId: 'foreign-session' });
     expect(sendText).not.toHaveBeenCalled();
     expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
     expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');

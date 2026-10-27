@@ -46,6 +46,7 @@ import { evaluateTalk, evaluateBotTalk, canRunDaemonCommand, TALK_REASONS, type 
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
+import { adminListFingerprint, writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 
 const APP = 'parity_app';
 const CHAT = 'oc_parity';
@@ -107,6 +108,23 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       writeFileSync(join(tempDir, `bot-openids-${APP}.json`), JSON.stringify({ Codex: SENDER }));
     },
     human: true, bot: true,
+  },
+  sameOwnerBot: {
+    arrange: () => {
+      restricted();
+      // 同机兄弟应用：它学到的自身 union_id 就是发送方 union，管理员与本 bot 是同一个人。
+      process.env.BOTS_CONFIG = join(tempDir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([
+        { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+        { larkAppId: 'parity_sibling', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['on_owner'] },
+      ]));
+      writeFileSync(join(tempDir, 'bot-union-ids.json'), JSON.stringify({ parity_sibling: { unionId: SENDER_UNION, learnedAt: 1 } }));
+      writeBotAdminUnions(tempDir, APP, { fingerprint: adminListFingerprint(['ou_owner']), admins: ['on_owner'], exact: true, owner: 'on_owner', updatedAt: 1 });
+      writeBotAdminUnions(tempDir, 'parity_sibling', { fingerprint: adminListFingerprint(['on_owner']), admins: ['on_owner'], exact: true, owner: 'on_owner', updatedAt: 1 });
+    },
+    human: false, bot: true,
+    why: 'sameOwnerBot 腿与 teamBot 腿同一契约：只认飞书盖章的 bot 发送方 union（人侧调用点恒不传 senderUnionId），'
+      + '且要求它精确对上本机 bots.json 里唯一一个同 owner 的兄弟应用。真人的 union 不会是某个 bot 学到的自身 union。',
   },
   teamBot: {
     arrange: () => {
@@ -201,7 +219,10 @@ describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
     bot.config.globalGrants = undefined;
     bot.config.p2pOpen = undefined;
   });
-  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+  afterEach(() => {
+    delete process.env.BOTS_CONFIG;
+    rmSync(tempDir, { recursive: true, force: true });
+  });
 
   for (const [reason, c] of Object.entries(CASES) as Array<[TalkReason, ParityCase]>) {
     it(`talk 源 "${reason}"：人=${c.human ? '放行' : '拦截'} / bot=${c.bot ? '放行' : '拦截'}`, () => {

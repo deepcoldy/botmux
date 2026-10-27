@@ -17,7 +17,7 @@ botmux 的权限回答两个问题：**谁能跟 bot 说话**（canTalk，对话
 补充：
 
 - 正常 onboarding 创建的 bot 都会把 owner 写进 `allowedUsers`，因此默认是**限制态** bot，只有名单内的人能用。
-- 团队信任腿（同团队 peer bot / team bot / 平台团队成员）只授予对话权，不在本文展开，见 [角色与团队](/roles)。
+- 团队信任腿：同团队 peer bot / team bot 可以对话和执行管理命令，平台团队成员只授予对话权，不在本文展开，见 [角色与团队](/roles)。同机 Bot 见下文 [同机 Bot](#同机-bot管理命令与点名授权-trustsameownerbots)。
 - 字段级说明见 [bots.json 配置 · 权限与授权](/bots-json#权限与授权)。
 
 ## 常用操作对照
@@ -64,6 +64,37 @@ botmux 的权限回答两个问题：**谁能跟 bot 说话**（canTalk，对话
 - 待审批期间有节流，不会被同一人的消息刷屏。这期间同一个人再找 bot，会收到一句「还在等管理员确认」（同一张卡只提示一次）；被拒绝后 10 分钟内再找 bot，会收到一句「没有通过」，过了这 10 分钟再找 bot 会重新发卡。
 - **私聊（p2p）被拒默认是静默的**：私聊里没有 owner 在场，把申请卡回给陌生人本人既无法操作又会暴露 owner，因此不发卡。
 - **申请卡转投 owner 私聊**（`grantRequestToOwnerDm`，默认关闭）：打开后，会话里没有任何管理员能点卡时，申请卡改发到主 owner 的私聊——包括群里查不到管理员（比如关掉了 `autoInviteOwnerOnGroupAdd`、owner 不进群）和私聊被挡两种情况。申请人只收到一句不含 owner 身份的中性回执；owner 批准或拒绝后，结果会回告到原会话；额度用尽后对方再发消息会自动重新申请。群里有管理员、或查群成员失败时仍按原样在群里发卡。转投私聊另有 owner 维度的总量节流（每小时 20 张，发送失败不占名额）；超出或发送失败时不发卡（群里已确认没有管理员，回落群内只会是一张没人能点的卡），下一条消息再重试。群聊路径每次都要查一次群成员（60 秒缓存），应用缺少群成员读取权限（`im:chat.members:read`）或群成员超过 2000 人（拿不到完整名单）时，会按原样在群里发卡。开关：Dashboard「Bot 配置 → 授权与额度」、`bots.json` 或 `/botconfig set grantRequestToOwnerDm on`。
+
+## 同机 Bot：管理命令与点名授权 `trustSameOwnerBots`
+
+同一台机器（同一份 `bots.json`）上的其它 Bot 本来就能和本 Bot 对话。**owner 是同一个人**的同机 Bot 还额外有三项能力（默认开启）：
+
+- **没认出也能对话**：本 Bot 还没学到它的身份时，它的消息照样放行、不弹授权卡——比如它在话题群里不 @ 直接发顶层消息，而本 Bot 开了 `autoStartOnNewTopic`。所以 `botmux create-group` 建群时也不再给同 owner 的同机 Bot 之间写两两本群授权（owner 不同的照写）。如果之后对已有群关闭 `trustSameOwnerBots`，这一对 Bot 没有历史本群授权可回退，需要重新 `/grant`；管理员身份快照暂时缺失或过期时，也可由下一次 @ 通过实时名单冷启动自愈。
+- **执行管理命令**：可以对本 Bot 执行 `/cd`、`/repo`、`/restart`、`/close` 等管理命令，与跨部署的团队 Bot 同权。`/botconfig`、`/dashboard`、`/term` 这类只认管理员名单的命令不受影响。
+- **点名授权**：它在群里发消息 @ 本 Bot 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**，与 owner 在授权卡上点「本群」同效：写 `chatGrants`，只能对话，额度 / 有效期取 `/grant` 的默认值（`messageQuota.defaultLimit` / `grantDefaultDurationMs`，未配置时 3 条 / 1 小时），`restrictGrantCommands` 照常生效。结果以一张授权结果卡回在那条消息下，@ 被授权的真人（被 @ 的其他 Bot 只显示名字，不发 @ 通知）。已经能对话的人、@所有人、发送方自己和黑名单用户跳过；只在群聊生效。
+
+怎么判断：
+
+- **是不是同机 Bot**：按飞书在消息上盖章的 union_id，精确对上本机 `bots.json` 里唯一一个其它应用（`apiOnly` 除外），不看显示名。
+- **是不是同一个 owner**：对方 Bot 的**每个**管理员（`allowedUsers`）都是本 Bot 的管理员。对方多一个本 Bot 不认的管理员就不算——否则那个人能借对方 Bot 操作本 Bot。两边可以写成不同形态（邮箱、手机号、`on_`、`ou_`）：每个 Bot 用自己的应用凭证把管理员换成 union_id 再比；对方有管理员换不出 union_id（比如应用缺通讯录读权限）时也不算。改了管理员之后约 30 秒内重新生效，在此之前按不同 owner 处理。
+- 能驱动对方 Bot 的人（它的访客、oncall 群里的人）也可能经由它驱动本 Bot——这是 Bot 之间互信本身的性质，跨部署的团队 Bot 也一样；不接受就关掉开关。
+- 一台机器托管多人的 Bot 时，owner 不同的同机 Bot 仍只能对话。
+
+开关：Dashboard「Bot 配置 → 授权与额度 → 信任同一 owner 的同机 Bot」、`bots.json` 的 `trustSameOwnerBots: false`，或 `/botconfig set trustSameOwnerBots off`。关闭后所有同机 Bot 都只能对话（同机 Bot 用 `/repo` 选仓库不受这个开关影响）。
+
+## 委托授权 bot `grantDelegateBots`
+
+同机 Bot 之外的**第二条委托来源**：owner 显式列出的外部 bot 名单，与 `trustSameOwnerBots` 互相独立（各管各的来源，一个开关不影响另一个）。点名授权的效果与上一节完全相同，差别只在「谁算委托方」。
+
+外部平台常用自己的 bot 建群拉人，再发一张 @ 本 bot 的开场卡让它开工，卡里同时 @ 提需求的人。受限模式下这个人紧接着 @ 本 bot 会撞对话闸、要等 owner 手点授权。把平台 bot 列入名单后，这一轮审批可以省掉：
+
+- 名单条目是受信 bot 的 open_id（本 bot 视角的 `ou_` 标识）或 app_id（`cli_` 标识），解析时 trim、丢空白项。
+- 名单里的 bot 在群里发消息 **@ 了本 bot** 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**：与 owner 在授权卡上点「授权本群对话」完全同效——写 `chatGrants`，仅对话权、不授管理权，额度 / 有效期取 `/grant` 默认值（`messageQuota.defaultLimit` / `grantDefaultDurationMs`，未配置时 3 条 / 1 小时），`restrictGrantCommands` 照常生效。
+- 结果以一张授权结果卡回到那条消息下，@ 被授权的真人（被 @ 的其他 bot 只显示名字，不发 @ 通知，避免唤醒误触发）。
+- 跳过：已经能对话的人（owner、oncall 群、整群放开、已有授权、开放模式）、发送方自己、@所有人、黑名单用户；只在群聊生效，私聊不触发。委托 bot 自己被拉黑时整条跳过——拉黑它必须同时挡住它替别人开门。
+- **信任边界**：等于把「本群谁能和本 bot 对话」的一次性点名权交给名单里的 bot——它 @ 谁，谁就拿到有时限、有额度的对话权。只列入你完全信任的平台 bot；它不能授管理权、不能写 `allowedUsers` / `allowedChatGroups` / `globalGrants`，授权也只限它发消息的那个群。未配置时行为与旧版完全一致。
+
+配置入口：Dashboard「Bot 配置 → 授权与额度 → 委托授权的外部 Bot 名单」、`bots.json` 的 `grantDelegateBots`，或 `/botconfig set grantDelegateBots ou_xxx,cli_yyy`（`unset` 清空）。
 
 ## 常见疑问
 

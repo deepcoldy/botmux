@@ -54,9 +54,11 @@ export interface CreateGroupCompletionStatus {
   kickoffError: string | null;
 }
 
-/** Build the machine-readable terminal status for create-group. A created chat
- * is not a successful group initialization until collaboration is ready and an
- * explicitly requested kickoff was accepted. */
+/** Build the machine-readable terminal status for create-group. Success means
+ * an explicitly requested kickoff (if any) was sent. `collaborationReady` reports
+ * whether the best-effort bot-to-bot grants were written: a miss there is a
+ * warning, and must not make callers that retry on failure create a second
+ * group. */
 export function createGroupCompletionStatus(input: {
   chatId: string;
   collaborationReady: boolean;
@@ -67,7 +69,7 @@ export function createGroupCompletionStatus(input: {
   const kickoffAccepted = !input.kickoffRequested
     || (!!input.kickoffMessageId && !input.kickoffError);
   return {
-    success: input.collaborationReady && kickoffAccepted,
+    success: kickoffAccepted,
     chatCreated: true,
     chatId: input.chatId,
     collaborationReady: input.collaborationReady,

@@ -500,6 +500,31 @@ describe('bot-config store', () => {
     expect(readConfig().noProgressNotify).toBeUndefined();
   });
 
+  it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {
+    const { store } = await loaded();
+    const noticeSpec = store.findConfigField('noProgressNotify')!;
+    const cacheSpec = store.findConfigField('promptCache')!;
+    const notice = { enabled: true, cliEnabled: true, timeoutMs: 300000 };
+    const cache = { ttl: '1h', keepalive: { enabled: true, maxPings: 2 } };
+    for (const [spec, value] of [[noticeSpec, notice], [cacheSpec, cache]] as const) {
+      const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+      expect(parsed).toEqual({ ok: true, value });
+      if (!parsed.ok) throw new Error(parsed.reason);
+      expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    }
+    expect(readConfig()).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().promptCache).toBeUndefined();
+    expect(readConfig().noProgressNotify).toEqual(notice);
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, cache)).toMatchObject({ ok: true });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('noProgressNotify')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().noProgressNotify).toBeUndefined();
+    expect(readConfig().promptCache).toEqual(cache);
+  });
+
   it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('groupCreation')!;
@@ -1952,5 +1977,81 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_missing', spec, 'x');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+});
+
+describe('codexProfile cross-field gate across generic write surfaces (#2037)', () => {
+  beforeEach(() => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-profile-gate-'));
+    process.env.BOTS_CONFIG = join(dir, 'bots.json');
+    process.env.SESSION_DATA_DIR = dir;
+  });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
+
+  async function setupRegistry() {
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
+    return { registry, store };
+  }
+  const profileBotJson = () => JSON.stringify([{
+    larkAppId: 'app_default', larkAppSecret: 'secret', cliId: 'codex', codexProfile: 'selected',
+  }]);
+
+  it.each([
+    ['startupCommands', ['/effort low']],
+    ['codexAuthSync', 'isolated'],
+    ['backendType', 'zellij'],
+  ] as const)('rejects %s from a generic /config write when a codexProfile is set', async (key, value) => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { registry, store } = await setupRegistry();
+    const before = readFileSync(process.env.BOTS_CONFIG!, 'utf8');
+    const r = await store.applyConfigField('app_default', store.findConfigField(key)!, value);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain('Codex profile');
+    expect(readFileSync(process.env.BOTS_CONFIG!, 'utf8')).toBe(before);
+    const onDisk = JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0];
+    expect(onDisk[key]).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexProfile).toBe('selected');
+  });
+
+  it('rejects a non-default service tier through the generic path while keeping the profile', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('serviceTier')!, 'priority');
+    expect(r.ok).toBe(false);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0])
+      .toMatchObject({ cliId: 'codex', codexProfile: 'selected' });
+  });
+
+  it('still accepts an unrelated field (model) for a profile bot', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('model')!, 'gpt-test');
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0])
+      .toMatchObject({ codexProfile: 'selected', model: 'gpt-test' });
+  });
+
+  it('does not affect bots without a profile: startupCommands still writes', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([{
+      larkAppId: 'app_default', larkAppSecret: 'secret', cliId: 'codex',
+    }]));
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('startupCommands')!, ['/effort low']);
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0].startupCommands)
+      .toEqual(['/effort low']);
+  });
+
+  it('writeRawConfigAtomic refuses a whole generation the loader would reject, leaving the file intact', async () => {
+    const { writeRawConfigAtomic, readRawConfig } = await import('../src/services/config-store.js');
+    const path = process.env.BOTS_CONFIG!;
+    writeFileSync(path, profileBotJson());
+    const before = readFileSync(path, 'utf8');
+    const bad = JSON.parse(before);
+    bad[0].readIsolation = true;
+    await expect(writeRawConfigAtomic(path, bad)).rejects.toThrow('Codex profile');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect((await readRawConfig(path))[0].readIsolation).toBeUndefined();
   });
 });

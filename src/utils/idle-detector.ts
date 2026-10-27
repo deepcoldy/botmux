@@ -44,6 +44,9 @@ const PROGRAM_STATUS_ZERO_WIDTH = /[\u200b-\u200d\ufeff]/g;
  *  such as Ink / Antigravity dots ⣾⣽⣻⢿⡿⣟⣯⣷), and OpenCode progress bar chars (■⬝). */
 const SPINNER_RE = /[·✢✳✶✻✽\u2800-\u28ff■⬝]/;
 
+/** Keep in sync with the rule-joined composer arm in the TraeX adapter. */
+const RULE_JOINED_CLEAR_CHAR = /[─━]/;
+
 /** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
 const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
@@ -97,6 +100,10 @@ export class IdleDetector {
   private staticBusyClearPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
+  /** Stricter readyPattern without the cursor-addressed rule arm. */
+  private readyPatternStrong: RegExp | undefined;
+  /** Whether the current ready evidence matches ONLY via a weak rule arm. */
+  private readyEvidenceWeak = false;
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
@@ -135,6 +142,7 @@ export class IdleDetector {
     this.staticBusyPattern = cli.staticBusyPattern;
     this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
+    this.readyPatternStrong = cli.readyPatternStrong;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
     this.startupResume = cli.startupResume;
@@ -178,6 +186,9 @@ export class IdleDetector {
     }
     if (this.isIdle || (this.readySeen && !recheckExisting)) return false;
     this.readySeen = true;
+    // Viewport-verified seeding (recheckExisting) has already passed the
+    // adapter's rendered composer predicate; it is never weak evidence.
+    if (recheckExisting) this.readyEvidenceWeak = false;
     this.clearTimer();
     this.quiescenceCheck();
     return true;
@@ -241,6 +252,7 @@ export class IdleDetector {
     );
     if (readyMatched) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
 
     // Pre-idle static-busy latch (capacity-queue screens).
@@ -258,6 +270,9 @@ export class IdleDetector {
     //  a submitted user message (`› text`) followed by a fresh queue line
     //  must NOT clear the latch (the queue is fresher), while a queue line
     //  followed by a real composer redraw must clear it.
+    //  Rule-joined composer matches are weaker: a cursor-addressed queue
+    //  repaint can retain the composer underneath the queue notice. Such
+    //  a match may clear only when this chunk has no queue evidence.
     // STALE-TAIL: after a clear, queue text lingering in the tail must not
     //  re-set the latch. Record the clear position in the tail; only queue
     //  evidence AFTER that position is fresh enough to set.
@@ -267,7 +282,9 @@ export class IdleDetector {
         : -1;
       const staticChunkIdx = lastMatchIndex(this.staticBusyPattern, stripped);
       const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
-      if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
+      const clearStartsOnRule = clearIdx >= 0 && RULE_JOINED_CLEAR_CHAR.test(stripped[clearIdx]!);
+      if (clearIdx >= 0 && clearIdx > staticChunkIdx
+        && (!clearStartsOnRule || staticChunkIdx < 0)) {
         this.staticBusyLatch = false;
         // Record where the clear landed in the tail so stale queue text
         // before it doesn't re-set the latch on the next chunk.
@@ -275,7 +292,10 @@ export class IdleDetector {
         this.staticBusyClearTailPos = chunkStart >= 0
           ? chunkStart + clearIdx
           : this.outputTail.length;
-      } else if (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos) {
+      } else if (staticChunkIdx >= 0
+        || (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos)) {
+        // A large repaint can evict its queue line from the rolling tail.
+        // Fresh evidence in the current chunk must still establish the hold.
         this.staticBusyLatch = true;
       }
     }
@@ -327,6 +347,7 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.readyEvidenceWeak = false;
     this.staticBusyLatch = false;
     this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
@@ -532,6 +553,21 @@ export class IdleDetector {
     return this.isIdle;
   }
 
+  /** Whether the input prompt is CURRENTLY rendered on screen, regardless of
+   *  the quiescence window that gates `isIdle`. The prompt can be visible
+   *  hundreds of milliseconds before the idle edge fires: callers that hold a
+   *  bounded wait for transcript closing records use this to stand down when
+   *  the idle edge is imminent instead of racing it. A `working` screen
+   *  (spinner, no prompt) returns false, so a turn stuck under a held busy
+   *  status with no idle edge still gets its fallback exit. */
+  screenShowsPrompt(): boolean {
+    if (!this.readyPattern) return false;
+    let screen = '';
+    try { screen = this.captureStartupScreen?.() ?? ''; } catch { return false; }
+    const stripped = this.stripAnsi(screen);
+    return this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail);
+  }
+
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
   isStartupPending(): boolean {
     return this.startupPending && !this.startupComplete;
@@ -709,7 +745,29 @@ export class IdleDetector {
       this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)
     )) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
+  }
+
+  /** Tag the latest ready match weak when it exists only through the
+   *  cursor-addressed rule arm (the strong sibling matches neither the
+   *  current chunk nor the rolling tail). Adapters without a declared strong
+   *  pattern always produce strong evidence. */
+  private tagReadyEvidence(stripped: string): void {
+    if (!this.readyPatternStrong) {
+      this.readyEvidenceWeak = false;
+      return;
+    }
+    const strong = this.readyPatternStrong.test(stripped)
+      || this.readyPatternStrong.test(this.outputTail);
+    this.readyEvidenceWeak = !strong;
+  }
+
+  /** True when the current ready evidence matched ONLY the weak rule-joined
+   *  arm. The worker requires a rendered-viewport composer check before
+   *  admitting a first prompt on weak traex evidence. */
+  isReadyEvidenceWeak(): boolean {
+    return this.readyEvidenceWeak;
   }
 
   private hasBusyProgramStatus(): boolean {

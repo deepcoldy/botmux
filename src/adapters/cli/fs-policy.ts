@@ -866,20 +866,22 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
-  // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
-  // `cli-identity/<sessionId>.bin/.data/<tool>.env` on every invocation. Bind
-  // the per-session directory, not each mutable file: atomic writes replace
-  // inodes, while a long-lived bwrap single-file bind keeps reading the old one.
+  // Trigger-user CLI identity surface (this session ONLY).
   //
-  // Granted per file/dir, never the `cli-identity/` parent: that directory holds
-  // every concurrent session's files, each with a live user token belonging to a
-  // different person. A parent grant would let one session read another's — the
-  // exact cross-person leak this feature exists to prevent — and it would fail
-  // OPEN for sessions created after spawn.
+  // In the proven model the daemon keeps token material in its own memory and
+  // hands it to the wrapper over the loopback process-proof channel, so this
+  // directory holds no tokens at all — only the wrapper binaries, shell shims
+  // and the active-turn marker. In the single-snapshot model it additionally
+  // holds the one per-tool `<tool>.env` file the daemon overwrites each turn.
   //
-  // Read-only by construction: the daemon writes these, the CLI must never be
-  // able to. Writable would let an agent publish its own identity and act as
-  // anyone whose token it could name.
+  // Granted per session directory, never the `cli-identity/` parent: that
+  // directory holds every concurrent session's identity surface. A parent
+  // grant would let one session read another's — the exact cross-person leak
+  // this feature exists to prevent — and it would fail OPEN for sessions
+  // created after spawn.
+  //
+  // Read-only by construction: the daemon writes here, the CLI must never be
+  // able to. Writable would let an agent publish its own identity.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
   }

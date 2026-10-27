@@ -151,6 +151,23 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
 }
 
 /**
+ * Was this marker written for THIS live process of THIS session? A successor
+ * worker that reattaches a persistent pane adopts the turn its CLI's marker
+ * records, so a file merely sitting at that PID's path — the leftover of a
+ * since-exited process whose PID the kernel recycled, another session's marker,
+ * a legacy marker without the worker's birth stamp — must never be adopted.
+ */
+export function markerBelongsToLiveProcess(
+  raw: string,
+  expected: { sessionId: string; procStart: string | undefined },
+): boolean {
+  const marker = parseIdentityBoundSessionMarker(raw);
+  return !!expected.procStart
+    && marker.sessionId === expected.sessionId
+    && marker.procStart === expected.procStart;
+}
+
+/**
  * Strong marker lookup for authority-bearing commands. Unlike the legacy
  * read/reply resolver, this requires the worker's JSON procStart binding and
  * verifies it against the live ancestor process before returning identity.

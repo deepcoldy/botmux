@@ -42,6 +42,7 @@ export interface DashboardBotDescriptor {
   codexRpcInput?: boolean;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  codexProfile?: string | null;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh / MiniMax runner turn budget (ms). */
@@ -124,6 +125,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     traexAutoModelBlockedReason: null,
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.codexProfile ? { codexProfile: bot.codexProfile } : {}),
     ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
     ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
@@ -235,12 +237,17 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
+    steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
     grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
+    trustSameOwnerBots: j?.trustSameOwnerBots !== false,
+    grantDelegateBots: Array.isArray(j?.grantDelegateBots)
+      ? j.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
+      : [],
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
       && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
       ? j.grantDefaultDurationMs
@@ -279,6 +286,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
     // 页面刷新即显示 ∅，看起来像没存上（而空白再保存会真的清掉）。
+    envRevision: typeof j?.envRevision === 'string' ? j.envRevision : undefined,
     envKeys: Array.isArray(j?.envKeys) ? j.envKeys.filter((k: unknown): k is string => typeof k === 'string') : [],
     envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
@@ -303,11 +311,48 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   autoInviteOwnerOnGroupAdd: any;
   larkToolBinding: boolean | undefined;
   askOptionLayout: any;
+  trustSameOwnerBots: boolean | undefined;
+  grantDelegateBots: string[] | undefined;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
+    // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
+    trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,
+    // 默认空：已配置的名单不从这里带回，离线行会显示成「未配置」。
+    grantDelegateBots: Array.isArray(rawEntry?.grantDelegateBots)
+      ? rawEntry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
+      : undefined,
+  };
+}
+
+/**
+ * Merge a live daemon's `/api/bot-default-oncall` JSON (`j`) over the registry
+ * descriptor (`d`) for GET /api/bots. Presence-sensitive fields honor an
+ * explicit null from a new daemon; when the key is absent (old daemon) the
+ * bots.json value survives. codexProfile MUST follow the same rule — a missing
+ * key must not erase a saved profile into "no profile" on page reload.
+ */
+export function mergeBotOncallFields(d: DashboardBotDescriptor, j: Record<string, any>): DashboardBotDescriptor {
+  const own = (key: string) => Object.prototype.hasOwnProperty.call(j, key);
+  return {
+    ...d,
+    botName: d.botName ?? j.botName,
+    cliId: (j.cliId || d.cliId) as DashboardBotDescriptor['cliId'],
+    cliRuntime: own('cliRuntime') ? j.cliRuntime ?? undefined : d.cliRuntime,
+    cliPathOverride: own('cliPathOverride') ? j.cliPathOverride ?? undefined : d.cliPathOverride,
+    wrapperCli: j.wrapperCli || d.wrapperCli,
+    cliLaunchMode: own('cliLaunchMode') ? j.cliLaunchMode ?? undefined : d.cliLaunchMode,
+    model: j.model || d.model,
+    traexAutoModel: own('traexAutoModel') ? j.traexAutoModel ?? undefined : d.traexAutoModel,
+    modelBackendVariant: own('modelBackendVariant') ? j.modelBackendVariant ?? undefined : d.modelBackendVariant,
+    reasoningEffort: (j.reasoningEffort || d.reasoningEffort) as DashboardBotDescriptor['reasoningEffort'],
+    codexProfile: own('codexProfile') ? (j.codexProfile ?? undefined) as DashboardBotDescriptor['codexProfile'] : d.codexProfile,
+    serviceTier: (j.serviceTier || d.serviceTier) as DashboardBotDescriptor['serviceTier'],
+    nativeSubagentRuntime: own('nativeSubagentRuntime') ? j.nativeSubagentRuntime ?? undefined : d.nativeSubagentRuntime,
+    turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
+    dshRuntime: (typeof j.dshRuntime === 'string' ? j.dshRuntime : d.dshRuntime) as DashboardBotDescriptor['dshRuntime'],
   };
 }

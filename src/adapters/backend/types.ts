@@ -218,6 +218,26 @@ export interface SpawnOpts {
    * global env have been applied, so those sources cannot re-add them.
    */
   unsetEnv?: string[];
+  /**
+   * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
+   * turn, e.g. the trigger-user credential helper + URL rewrites from
+   * gitIdentityConfigPairs. Shell-wrapped backends publish exactly this set
+   * into the pane as numbered `GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` with
+   * `GIT_CONFIG_COUNT` set to its length, renumbered from 0. The environment
+   * is NEVER scanned for numbered git config entries: ambient or per-bot
+   * `GIT_CONFIG_*` values (high indices, gaps, forged names, a stale or
+   * pushed-up count) cannot reach git in the pane this way. Empty/undefined
+   * with an ambient count present makes the pane publish `GIT_CONFIG_COUNT=0`.
+   * Direct-exec backends (PTY, env -i strict panes) ignore this and consume
+   * the encoded entries the worker already placed in `env`.
+   */
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
+  /**
+   * Botmux-owned per-session directory (pane-launch.ts paneLaunchDir) for the
+   * private file a tmux pane reads its launch argv from. Without it the tmux
+   * backend uses a fresh private temp directory.
+   */
+  paneLaunchDir?: string;
   /** Strict panes launch with env -i and skip user shell startup profiles. */
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */

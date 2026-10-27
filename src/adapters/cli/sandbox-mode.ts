@@ -73,6 +73,44 @@ export function envSandboxMode(raw: string | undefined): SandboxMode {
   throw new Error(`invalid BOTMUX_SANDBOX value: ${JSON.stringify(raw)} (expected 1, "oncall" or "scratch")`);
 }
 
+/** Network/loopback facts of the spawn a resolved sandbox mode produces.
+ *  Computed ONLY in the worker, from the same resolved mode that drives the
+ *  actual bwrap/Seatbelt launch, and reported to the daemon as the single
+ *  source of truth for the identity storage model. */
+export interface SpawnNetworkShape {
+  /** A local sandbox actually wraps the spawned CLI (resolved mode !== 'off'
+   *  on a backend with a local process). */
+  sandboxEngaged: boolean;
+  /** The `net` flag handed to the sandbox constructor; false compiles to
+   *  bwrap `--unshare-net`. */
+  netEnabled: boolean;
+  /** Whether the daemon's loopback endpoint is reachable from INSIDE the
+   *  spawned sandbox. False under `--unshare-net` and under the slirp network
+   *  policy, whose proxy namespace does not share host loopback. */
+  loopbackShared: boolean;
+}
+
+/** Derive the spawn network shape from the RESOLVED mode and the frozen
+ *  session network inputs. The two booleans are split on purpose: the slirp
+ *  policy launches with networking ON (`netEnabled: true`) while the host
+ *  loopback is still not reachable (`loopbackShared: false`). */
+export function resolveSpawnNetworkShape(input: {
+  mode: SandboxMode;
+  sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: unknown;
+}): SpawnNetworkShape {
+  if (input.mode === 'off') {
+    return { sandboxEngaged: false, netEnabled: false, loopbackShared: true };
+  }
+  // networkPolicySupportError rejects a policy everywhere except oncall/pty;
+  // the oncall slirp arm proxies networking but does not share host loopback.
+  if (input.mode === 'oncall' && input.sandboxNetworkPolicy !== undefined) {
+    return { sandboxEngaged: true, netEnabled: true, loopbackShared: false };
+  }
+  const netEnabled = input.sandboxNetwork !== false;
+  return { sandboxEngaged: true, netEnabled, loopbackShared: netEnabled };
+}
+
 /** Validate/normalise the scratch storage sub-option. */
 export function normalizeScratchStorage(raw: unknown): ScratchStorageValue {
   if (raw === undefined || raw === null) return 'tmpfs';

@@ -1,10 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { strictInputHandle } from '../src/adapters/cli/strict-input-handle.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import {
   refreshCodexTerminalSession,
   codexTerminalSessionIsBound,
+  bindCodexSessionFromCorrelatedInput,
 } from '../src/services/codex-terminal-session.js';
 
 vi.mock('../src/services/codex-transcript.js', () => ({ findCodexRolloutSetByPid: vi.fn() }));
@@ -30,6 +33,44 @@ function terminal(id = sid) {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe('Codex terminal session identity', () => {
+  it('uses the submitted ZMX handle when the worker checks correlated ownership without readable fds', () => {
+    // Execute both real worker functions, rather than reimplementing their
+    // handle selection here. Replacing the worker's wrapped lookup with the
+    // raw backend must fail this test. The fixture never launches ZMX.
+    class FakeZmxBackend {
+      cliPid = 43212;
+      write = vi.fn();
+    }
+    const backend = new FakeZmxBackend();
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(undefined);
+    const scope: Record<string, any> = {
+      backend,
+      ZmxBackend: FakeZmxBackend,
+      strictInputHandle,
+      codexTerminalSessionIsBound,
+      currentCodexObservedPid: () => scope.backend.cliPid,
+      findCodexRolloutSetByPid,
+      // No fd ownership is available: this independent fallback refuses the
+      // session, so only the real handle-bound receipt can admit it.
+      codexHistorySidIsOwned: vi.fn(() => false),
+      log: vi.fn(),
+    };
+    scope.adapterInputHandle = loadWorkerFunction('adapterInputHandle', scope);
+    const ownsSession = loadWorkerFunction<(id: string) => boolean>('codexHistorySidOwnedByCurrentPid', scope);
+    const submittedHandle = scope.adapterInputHandle(backend);
+    expect(bindCodexSessionFromCorrelatedInput(submittedHandle, backend.cliPid, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(backend, sid)).toBe(false);
+    expect(ownsSession(sid)).toBe(true);
+    expect(ownsSession(other)).toBe(false);
+
+    // An identical PID on another backend is not the submitting instance.
+    scope.backend = new FakeZmxBackend();
+    expect(ownsSession(sid)).toBe(false);
+    scope.backend = backend;
+    backend.cliPid += 1;
+    expect(ownsSession(sid)).toBe(false);
+  });
+
   it('reports missing footer evidence without writing to the terminal', async () => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal('');
