@@ -155,7 +155,7 @@ export function buildScheduleIdentityClaimCard(input: ScheduleClaimCardInput): R
     ]);
   }
   if (input.state === 'resolved') {
-    return card(t('scheduler.claim.title_resolved', undefined, loc), 'green', [
+    return card(t('scheduler.claim.title_resolved', undefined, loc), 'grey', [
       {
         tag: 'markdown',
         content: [

@@ -2048,7 +2048,7 @@ export const messages: Record<string, string> = {
   'scheduler.claim.toast_gone': '任务已被删除',
   'scheduler.claim.toast_unsupported': '这个任务不支持认领',
   'scheduler.claim.toast_failed': '操作失败：{reason}',
-  'scheduler.claim.title_resolved': '✅ 定时任务已恢复执行身份',
+  'scheduler.claim.title_resolved': '定时任务已不需要认领',
   'scheduler.claim.resolved_body': '创建人 {who} 已恢复权限，之后到点按创建人的身份执行，无需认领。',
   'scheduler.claim.toast_not_needed': '这个任务现在已有可用身份，无需认领；卡片已刷新',
   'scheduler.claim.toast_rerun_no_identity': '认领人已无权操作本 Bot，任务现在没有可用身份；请先重新认领',
