@@ -19,6 +19,7 @@
  */
 
 import { isPlatformTunnelPeer } from '../platform/tunnel-peers.js';
+import { logger } from '../utils/logger.js';
 
 /** Dashboard → daemon request header carrying the verified union_id. */
 export const DASHBOARD_SCHEDULE_CREATOR_HEADER = 'x-botmux-schedule-creator-union-id';
@@ -55,11 +56,23 @@ export function dashboardScheduleWriteHeaders(
   req: { socket?: { remoteAddress?: string | null; remotePort?: number | null }; headers: Record<string, unknown> },
   platformBound: boolean,
 ): Record<string, string> {
+  const fromPlatformTunnel = isPlatformTunnelPeer(req.socket);
   const unionId = dashboardScheduleCreatorUnionId({
     platformBound,
-    fromPlatformTunnel: isPlatformTunnelPeer(req.socket),
+    fromPlatformTunnel,
     actorHeader: req.headers['x-botmux-actor'],
   });
+  // The platform can also reach a machine directly on its LAN dashboard port
+  // (the `directHosts` it learns from heartbeats), bypassing the tunnel. That
+  // path cannot be told apart from any other LAN client, so its actor header
+  // is not believed either. Say so, or "sometimes it records me, sometimes
+  // the owner" has no explanation anywhere.
+  if (platformBound && !fromPlatformTunnel && req.headers['x-botmux-actor'] !== undefined) {
+    logger.info(
+      `[schedule-creator] X-Botmux-Actor ignored: not a platform tunnel connection `
+      + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'}); this write keeps the token-login attribution`,
+    );
+  }
   return {
     'content-type': 'application/json',
     ...(unionId ? { [DASHBOARD_SCHEDULE_CREATOR_HEADER]: unionId } : {}),

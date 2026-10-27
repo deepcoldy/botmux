@@ -15,17 +15,17 @@
  * cannot occupy a live bridge's (address, port) pair, and a port is forgotten
  * the moment its bridge connection closes.
  */
-const bridgedPorts = new Set<number>();
+const bridgedPorts = new Map<number, symbol>();
 
-/** Record a bridge connection's local port; returns its removal. */
+/** Record a bridge connection's local port; returns its removal. The removal
+ *  only clears its own registration: once a closed bridge's port has been
+ *  reused by a newer bridge, the old close must not unregister the new one. */
 export function registerPlatformTunnelBridge(localPort: number | undefined): () => void {
   if (typeof localPort !== 'number' || !Number.isInteger(localPort) || localPort <= 0) return () => {};
-  bridgedPorts.add(localPort);
-  let removed = false;
+  const registration = Symbol('platform-tunnel-bridge');
+  bridgedPorts.set(localPort, registration);
   return () => {
-    if (removed) return;
-    removed = true;
-    bridgedPorts.delete(localPort);
+    if (bridgedPorts.get(localPort) === registration) bridgedPorts.delete(localPort);
   };
 }
 

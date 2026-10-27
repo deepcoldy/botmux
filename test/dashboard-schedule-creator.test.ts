@@ -37,6 +37,7 @@ import { redactSchedulesForPublic } from '../src/dashboard/public-redact.js';
 import { createTaskWithOptionalPrecondition, updateTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
 import { schedulePreconditionPath } from '../src/services/schedule-precondition-store.js';
 import { config } from '../src/config.js';
+import { logger } from '../src/utils/logger.js';
 
 describe('platform tunnel peers', () => {
   const closers: Array<() => void> = [];
@@ -92,6 +93,16 @@ describe('platform tunnel peers', () => {
     await vi.waitFor(() => expect(isPlatformTunnelPeer(seen[0])).toBe(false));
   });
 
+  it('a reused port stays registered when the older bridge on it closes late', () => {
+    const forgetOld = registerPlatformTunnelBridge(54400);
+    const forgetNew = registerPlatformTunnelBridge(54400);
+    closers.push(forgetNew);
+    forgetOld();
+    expect(isPlatformTunnelPeer({ remoteAddress: '127.0.0.1', remotePort: 54400 })).toBe(true);
+    forgetNew();
+    expect(isPlatformTunnelPeer({ remoteAddress: '127.0.0.1', remotePort: 54400 })).toBe(false);
+  });
+
   it('never trusts a non-loopback peer, even on a bridged port number', () => {
     const forget = registerPlatformTunnelBridge(54321);
     closers.push(forget);
@@ -140,6 +151,21 @@ describe('dashboardScheduleWriteHeaders over real connections', () => {
     direct.write(request);
     await vi.waitFor(() => expect(viaDirect).toContain('}'));
     expect(forwardedBy(viaDirect)).toEqual({ 'content-type': 'application/json' });
+  });
+});
+
+describe('a platform actor header that is not believed', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('is logged, so the token-login attribution has an explanation', () => {
+    const info = vi.spyOn(logger, 'info');
+    const direct = { socket: { remoteAddress: '10.1.2.3', remotePort: 40000 }, headers: { 'x-botmux-actor': 'on_alice' } };
+    expect(dashboardScheduleWriteHeaders(direct, true)).toEqual({ 'content-type': 'application/json' });
+    expect(info.mock.calls.some(([line]) => String(line).includes('X-Botmux-Actor ignored: not a platform tunnel connection'))).toBe(true);
+    info.mockClear();
+    // Nothing to explain for a plain token-login request.
+    dashboardScheduleWriteHeaders({ socket: direct.socket, headers: {} }, true);
+    expect(info.mock.calls.some(([line]) => String(line).includes('[schedule-creator]'))).toBe(false);
   });
 });
 
@@ -410,6 +436,24 @@ describe('a failed edit does not keep the new creator', () => {
     const record = store.getRecord(APP, created.id)!;
     expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim });
     expect(record).toMatchObject({ controlOpenId: 'ou_first', controlUnionId: 'on_first' });
+  });
+
+  it('also restores the per-task model and reasoning effort the edit changed', () => {
+    const created = createTaskWithOptionalPrecondition({
+      name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+      model: 'model-before', reasoningEffort: 'high',
+    }, APP, 'printf 1');
+    scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
+      scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
+      rmSync(schedulePreconditionPath(APP, created.id), { force: true });
+    });
+    expect(() => updateTaskWithOptionalPrecondition(
+      created.id,
+      { prompt: 'edited', model: 'model-after', reasoningEffort: 'low' },
+      APP,
+      { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
+    )).toThrow('staged protected record is missing');
+    expect(store.getRecord(APP, created.id)!.task).toMatchObject({ prompt: 'p', model: 'model-before', reasoningEffort: 'high' });
   });
 
   it('restores from the authority record even when the JSON projection lags behind it', () => {

@@ -2053,7 +2053,7 @@ export const messages: Record<string, string> = {
   'scheduler.claim.toast_unsupported': 'This task cannot be claimed',
   'scheduler.claim.toast_failed': 'Failed: {reason}',
   'scheduler.claim.title_resolved': 'Scheduled task no longer needs a claim',
-  'scheduler.claim.resolved_body': 'Its creator {who} can operate this bot again; later runs use the creator’s identity, so no claim is needed.',
+  'scheduler.claim.resolved_body': 'This task now runs as its creator {who}, so no claim is needed.',
   'scheduler.claim.toast_not_needed': 'This task has a usable identity now, so no claim is needed; the card was refreshed',
   'scheduler.claim.toast_rerun_no_identity': 'The claimant can no longer operate this bot, so the task has no usable identity; claim it first',
 

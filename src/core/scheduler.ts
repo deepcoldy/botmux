@@ -1460,19 +1460,6 @@ export function runTaskNow(id: string): boolean {
   return true;
 }
 
-/** Who the task runs as, read from where the scheduler holds it (the host
- *  authority once enrolled, not the JSON projection), so a failed compound
- *  edit can put it back exactly. */
-export function runAsIdentitySnapshot(
-  id: string,
-  appId?: string,
-): Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined {
-  const task = runtimeTask(id, appId);
-  return task
-    ? { ownerOpenId: task.ownerOpenId, ownerUnionId: task.ownerUnionId, runAsClaim: task.runAsClaim }
-    : undefined;
-}
-
 /**
  * Whether an edit may record a new creator on this task. Not for a delegated
  * task: it runs as its delegation, never as a creator. Not for a task whose
@@ -1785,7 +1772,15 @@ export function updateTask(
     creator?: { openId: string; unionId: string };
   },
   options: { deferEvent?: boolean } = {},
-): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
+): {
+  ok: boolean;
+  error?: string;
+  deferredEventPatch?: Record<string, unknown>;
+  /** With `creator`: who the task ran as just before this edit, read inside
+   *  the same authority write, so a caller that must undo the edit can put
+   *  exactly that back. */
+  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>;
+} {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (updates.creator && !taskAcceptsRecordedCreator(id, task.larkAppId)) {
@@ -1990,13 +1985,20 @@ export function updateTask(
   const creatorPatch: Partial<ScheduledTask> = updates.creator
     ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
     : {};
-  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch, ...creatorPatch }))) {
+  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined;
+  if (!mutateRuntimeTask(id, current => {
+    if (updates.creator) {
+      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId, runAsClaim: current.runAsClaim };
+    }
+    return { ...current, ...patch, ...creatorPatch };
+  })) {
     return { ok: false, error: 'not_found' };
   }
   const publishedPatch = { ...patch, ...eventPatch };
-  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  const identity = previousRunAs ? { previousRunAs } : {};
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch, ...identity };
   publishScheduleTaskUpdated(id, publishedPatch);
-  return { ok: true };
+  return { ok: true, ...identity };
 }
 
 /** Publish a task patch after a compound configuration operation has fully

@@ -230,6 +230,8 @@ function restoreUpdatedTaskRow(
     patch.chatIds = before.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) patch.topicTitle = before.topicTitle;
+  if (updates.model !== undefined) patch.model = before.model;
+  if (updates.reasoningEffort !== undefined) patch.reasoningEffort = before.reasoningEffort;
   scheduler.updateRuntimeTaskState(before.id, {
     ...patch,
     chatIds: patch.chatIds === null || patch.chatIds === undefined ? undefined : [...patch.chatIds],
@@ -300,7 +302,6 @@ export function updateTaskWithOptionalPrecondition(
   // Do not expose a task-row event until the protected sidecar transition has
   // also committed. A later failure restores the row without Dashboard ever
   // observing a transient chat target or other editable value.
-  const identityBefore = updates.creator ? scheduler.runAsIdentitySnapshot(id, appId) : undefined;
   const updated = scheduler.updateTask(id, updates, { deferEvent: true });
   if (!updated.ok) {
     if (staged) {
@@ -353,7 +354,7 @@ export function updateTaskWithOptionalPrecondition(
     // Restore only fields this operation could have changed; runtime status
     // may have advanced concurrently and must not be clobbered.
     try {
-      restoreUpdatedTaskRow(before, updates, appId, identityBefore);
+      restoreUpdatedTaskRow(before, updates, appId, updated.previousRunAs);
     } catch (rollbackError) {
       logRollbackFailure(id, 'task-row rollback after update failure', rollbackError);
     }
