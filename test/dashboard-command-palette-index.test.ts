@@ -66,25 +66,40 @@ function topItem(items: PaletteItem[], query: string): PaletteItem | undefined {
   return row?.type === 'item' ? row.item : undefined;
 }
 
-function extractTagOpeningBodies(source: string, tagName: string): string[] {
-  const bodies: string[] = [];
+// 反向扫描读取的区块组件源码：配置项行写在这些组件里。
+const BOT_CONFIG_SOURCE_FILES = [
+  'bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx',
+  'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx',
+];
+
+function readBotConfigSources(): string {
+  return BOT_CONFIG_SOURCE_FILES
+    .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+}
+
+type OpeningTag = { start: number; end: number; body: string; selfClosing: boolean };
+
+function isTagBoundary(ch: string | undefined): boolean {
+  return ch === undefined || /[\s/>]/.test(ch);
+}
+
+/** 每个 `<tagName ...>` 开标签；按花括号深度和字符串边界找结尾，`{v => v > 0}` 里的 `>` 不会把标签提前截断。 */
+function openingTags(source: string, tagName: string): OpeningTag[] {
+  const tags: OpeningTag[] = [];
   const tagStart = `<${tagName}`;
   let pos = 0;
-
   while (pos < source.length) {
     const idx = source.indexOf(tagStart, pos);
     if (idx === -1) break;
-    const afterChar = source[idx + tagStart.length];
-    if (afterChar && !/[\s/>]/.test(afterChar)) {
+    if (!isTagBoundary(source[idx + tagStart.length])) {
       pos = idx + tagStart.length;
       continue;
     }
-
     let i = idx + tagStart.length;
+    const bodyStart = i;
     let braceDepth = 0;
     let inString: string | null = null;
-    const bodyStart = i;
-
+    let closed = false;
     while (i < source.length) {
       const ch = source[i]!;
       if (inString !== null) {
@@ -92,19 +107,15 @@ function extractTagOpeningBodies(source: string, tagName: string): string[] {
           i += 2;
           continue;
         }
-        if (ch === inString) {
-          inString = null;
-        }
+        if (ch === inString) inString = null;
         i++;
         continue;
       }
-
       if (ch === '"' || ch === "'" || ch === '`') {
         inString = ch;
         i++;
         continue;
       }
-
       if (ch === '{') {
         braceDepth++;
         i++;
@@ -115,21 +126,131 @@ function extractTagOpeningBodies(source: string, tagName: string): string[] {
         i++;
         continue;
       }
-
       if (ch === '>' && braceDepth === 0) {
-        bodies.push(source.slice(bodyStart, i));
-        pos = i + 1;
+        const body = source.slice(bodyStart, i);
+        tags.push({ start: idx, end: i + 1, body, selfClosing: body.trimEnd().endsWith('/') });
+        closed = true;
         break;
       }
-
       i++;
     }
-
-    if (i >= source.length) break;
+    if (!closed) break;
+    pos = i + 1;
   }
-
-  return bodies;
+  return tags;
 }
+
+/** 每个非自闭合 `<tagName>` 元素的子节点源码，到与之配对的 `</tagName>` 为止（同名嵌套计深度）。 */
+function elementChildren(source: string, tagName: string): string[] {
+  const children: string[] = [];
+  const open = `<${tagName}`;
+  const close = `</${tagName}>`;
+  for (const tag of openingTags(source, tagName)) {
+    if (tag.selfClosing) continue;
+    let depth = 1;
+    let i = tag.end;
+    while (depth > 0) {
+      const nextClose = source.indexOf(close, i);
+      if (nextClose === -1) break;
+      let nextOpen = source.indexOf(open, i);
+      while (nextOpen !== -1 && nextOpen < nextClose && !isTagBoundary(source[nextOpen + open.length])) {
+        nextOpen = source.indexOf(open, nextOpen + 1);
+      }
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        if (!openingTags(source.slice(nextOpen), tagName)[0]?.selfClosing) depth++;
+        i = nextOpen + open.length;
+        continue;
+      }
+      depth--;
+      if (depth === 0) children.push(source.slice(tag.end, nextClose));
+      i = nextClose + close.length;
+    }
+  }
+  return children;
+}
+
+/** 只留元素自己的文本子节点：嵌套元素连同属性和内容一起去掉。 */
+function directText(children: string): string {
+  let text = '';
+  let i = 0;
+  while (i < children.length) {
+    const match = /<([A-Za-z][\w.]*)/.exec(children.slice(i));
+    if (!match) {
+      text += children.slice(i);
+      break;
+    }
+    const at = i + match.index;
+    text += children.slice(i, at);
+    const name = match[1]!;
+    const rest = children.slice(at);
+    const tag = openingTags(rest, name)[0];
+    if (!tag || tag.start !== 0) {
+      text += match[0];
+      i = at + match[0].length;
+      continue;
+    }
+    if (tag.selfClosing) {
+      i = at + tag.end;
+      continue;
+    }
+    const inner = elementChildren(rest, name)[0];
+    i = inner === undefined ? at + tag.end : at + tag.end + inner.length + `</${name}>`.length;
+  }
+  return text;
+}
+
+/** JSX 文本里的 `{tr('key')}` 与三元 `{tr(cond ? 'a' : 'b')}`。 */
+function trTextKeys(text: string): string[] {
+  const keys: string[] = [];
+  for (const m of text.matchAll(/\{\s*tr\(\s*'([^']+)'\s*\)\s*\}/g)) keys.push(m[1]!);
+  for (const m of text.matchAll(/\{\s*tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\s*\)\s*\}/g)) keys.push(m[1]!, m[2]!);
+  return keys;
+}
+
+/**
+ * 区块组件里以「可见标签」写出的全部 tr() 键，按写法而非按键名找：
+ * 1. `<FieldTitle>` 的直接文本子节点（含跨行写法）；
+ * 2. 选项组的 `groupName={tr(...)}`；
+ * 3. `<ToggleRow>` 的 `title`（字面量与三元两支）；
+ * 4. `<label>` 内 `<span>` / `<strong>` / `<small>` 的直接文本子节点（裸复选框、输入框行）；
+ * 5. 紧挨 `<DropdownField>` 的 `<span>` 标题（下拉框没有 `<label>`，标题就是它前面那个 span）；
+ * 6. 按常量列表展开的键（REPLY_FOOTER_KEYS / STREAMING_CARD_BUTTON_IDS）与一键静默预设的小标题。
+ * 只认 tr() 键：硬编码中文的标题（「高级 JSON」「每聊天覆盖」，英文界面也显示中文）读不到，是已知缺口，另行跟进。
+ */
+function renderedBotConfigLabelKeys(sources: string): Set<string> {
+  const keys = new Set<string>();
+  const add = (found: Iterable<string>) => { for (const key of found) keys.add(key); };
+  for (const children of elementChildren(sources, 'FieldTitle')) add(trTextKeys(directText(children)));
+  add([...sources.matchAll(/\bgroupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!));
+  for (const tag of openingTags(sources, 'ToggleRow')) {
+    const literal = /\btitle=\{tr\('([^']+)'\)\}/.exec(tag.body);
+    if (literal) add([literal[1]!]);
+    const ternary = /\btitle=\{tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(tag.body);
+    if (ternary) add([ternary[1]!, ternary[2]!]);
+  }
+  for (const label of elementChildren(sources, 'label')) {
+    for (const tagName of ['span', 'strong', 'small']) {
+      for (const children of elementChildren(label, tagName)) add(trTextKeys(directText(children)));
+    }
+  }
+  add([...sources.matchAll(/<span>\{tr\('([^']+)'\)\}<\/span>\s*<DropdownField\b/g)].map(m => m[1]!));
+  if (sources.includes('title={tr(`botDefaults.${key}`)}')) add(REPLY_FOOTER_KEYS.map(key => `botDefaults.${key}`));
+  if (sources.includes('tr(`botDefaults.streamingButton.${id}`)')) {
+    add(STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`));
+  }
+  add([...sources.matchAll(/<h4 className="bd-card-setting-heading">\{tr\('(quietPreset\.[^']+)'\)\}<\/h4>/g)].map(m => m[1]!));
+  return keys;
+}
+
+// 反向扫描会读到、但不是配置项的标签。逐条写明理由；不在这里的键一律要登记进 BOT_DEFAULTS_SECTIONS。
+const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
+  ['botDefaults.stewardModeAppend', '「管家指引」单选组的选项；组本身只有 aria-label，搜索落到已登记的 botDefaults.stewardGuide 那一行'],
+  ['botDefaults.stewardModeReplace', '同上，「管家指引」单选组的另一个选项'],
+  ['sessionEnv.keyLabel', '新增/去掉环境变量弹窗里的表单字段名，只在弹窗打开时出现，页面上没有可定位的行'],
+  ['sessionEnv.valueLabel', '同上，环境变量弹窗里的值字段名'],
+]);
+
+const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'roles.', 'blocked.'];
 
 describe('⌘K index coverage', () => {
   it('every dashboard route is in the sidebar or NAV_SUBPAGES, or excluded on purpose with a reason', () => {
@@ -230,28 +351,14 @@ describe('⌘K index coverage', () => {
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「登记的配置项键拼错 / 已删 / 不是看得见的标签」——那样落地时按文字找不到那一行。
   it('every indexed Bot config title and option exists in both locales and is rendered as a label', () => {
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
-      .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+    const rendered = renderedBotConfigLabelKeys(readBotConfigSources());
     for (const section of BOT_DEFAULTS_SECTIONS) {
       for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
       }
-      for (const key of section.fieldKeys ?? []) {
-        // 落地时按文字找这一行，所以它得是看得见的标签：配置项标题、选项组名、开关行标题或复选框 span 文本。
-        const asLiteral = [`{tr('${key}')}</FieldTitle>`, `groupName={tr('${key}')}`, `title={tr('${key}')}`].some(form => sources.includes(form));
-        const asCheckboxSpan = sources.includes(`<span>{tr('${key}')}</span>`);
-        const asQuietPreset = key.startsWith('quietPreset.') && sources.includes(`{tr('${key}')}`);
-        const asFooter = key.startsWith('botDefaults.replyFooter')
-          && REPLY_FOOTER_KEYS.some(k => `botDefaults.${k}` === key)
-          && sources.includes('title={tr(`botDefaults.${key}`)}');
-        const asStreamingButton = key.startsWith('botDefaults.streamingButton.')
-          && STREAMING_CARD_BUTTON_IDS.some(id => `botDefaults.streamingButton.${id}` === key)
-          && sources.includes('tr(`botDefaults.streamingButton.${id}`)');
-        const asTernary = (key === 'botDefaults.cotEnabled' || key === 'botDefaults.replyCardTools')
-          && sources.includes("title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}");
-        expect(asLiteral || asCheckboxSpan || asQuietPreset || asFooter || asStreamingButton || asTernary, key).toBe(true);
-      }
+      // 落地时按文字找这一行，所以它得是看得见的标签（写法见 renderedBotConfigLabelKeys）。
+      for (const key of section.fieldKeys ?? []) expect(rendered.has(key), key).toBe(true);
     }
   });
 
@@ -259,63 +366,41 @@ describe('⌘K index coverage', () => {
   // 守的是「ToggleRow 属性中包含带有 => 箭头函数或大于号时，避免正则提前闭合导致 title 属性漏解析」。
   it('extracts ToggleRow title even when attributes before title contain arrow functions with >', () => {
     const fixture = '<ToggleRow onChange={v => { doSomething(v > 0); }} title={tr(\'botDefaults.arrowRegressionTestKey\')} />';
-    const bodies = extractTagOpeningBodies(fixture, 'ToggleRow');
-    expect(bodies.length).toBe(1);
-    const match = /\btitle=\{tr\('([^']+)'\)\}/.exec(bodies[0]!);
-    expect(match?.[1]).toBe('botDefaults.arrowRegressionTestKey');
+    expect([...renderedBotConfigLabelKeys(fixture)]).toEqual(['botDefaults.arrowRegressionTestKey']);
+  });
+
+  // 源码结构护栏(K4)：反向扫描按写法识别标签的回归护栏；
+  // 守的是「跨行的 FieldTitle、label 里的 span、下拉框前的 span 都算标签，嵌套元素里的文字和属性里的 tr() 不算」。
+  it('reads label text by JSX position, not by key name', () => {
+    const fixture = [
+      '<FieldTitle help={tr(\'botDefaults.fixtureHelp\')}>',
+      '  {tr(\'botDefaults.fixtureTitle\')}',
+      '</FieldTitle>',
+      '<label><input type="checkbox" /><span>{tr(\'botDefaults.fixtureCheckbox\')}</span></label>',
+      '<label><span><strong>{tr(\'botDefaults.fixtureLang\')}</strong><em>{tr(\'botDefaults.fixtureBadge\')}</em></span></label>',
+      '<div className="bd-field"><span>{tr(\'botDefaults.fixtureDropdown\')}</span>',
+      '  <DropdownField ariaLabel={tr(\'botDefaults.fixtureAria\')} /></div>',
+      '<div><span>{tr(\'botDefaults.fixtureDescription\')}</span></div>',
+    ].join('\n');
+    expect([...renderedBotConfigLabelKeys(fixture)].sort()).toEqual([
+      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang', 'botDefaults.fixtureTitle',
+    ]);
   });
 
   // 源码结构护栏(K4)：配置项标签写在各区块组件内部，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「区块组件里新增了可见配置项或选项组标签，却忘记在 BOT_DEFAULTS_SECTIONS.fieldKeys 登记」——
   // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
   it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
+    // 只校验全部区块的并集，不校验键登在了哪个区块：登错区块这里仍是绿的，深链会落到错的 tile 而找不到那一行。
+    // 按区块渲染范围逐块校验另行跟进。
     const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
-    const sources = ['bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx', 'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx']
-      .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
-
-    const fieldTitleMatches = [...sources.matchAll(/\{tr\('([^']+)'\)\}<\/FieldTitle>/g)].map(m => m[1]!);
-    const groupNameMatches = [...sources.matchAll(/groupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!);
-    // 覆盖 TraexAutoModelEditor 等复选框标签
-    const autoModelMatches = [...sources.matchAll(/<label className="bd-auto-model-toggle">[\s\S]*?<span>\{tr\('([^']+)'\)\}<\/span>/g)].map(m => m[1]!);
-    // 覆盖 QuietPresetSection 内联一键静默预设模块的可见标题与开关
-    const quietPresetSource = readFileSync(new URL('../src/dashboard/web/quiet-preset-section.tsx', import.meta.url), 'utf8');
-    const quietPresetMatches = [...quietPresetSource.matchAll(/\{tr\('(quietPreset\.(?:title|switch))'\)\}/g)].map(m => m[1]!);
-
-    // 提取 ToggleRow 上的 title（通过花括号状态机配对，彻底消除 => 截断缺陷）
-    const toggleRowBodies = extractTagOpeningBodies(sources, 'ToggleRow');
-    const toggleRowTitles: string[] = [];
-    const toggleRowTernaries: string[] = [];
-    for (const body of toggleRowBodies) {
-      const tm = /\btitle=\{tr\('([^']+)'\)\}/.exec(body);
-      if (tm) toggleRowTitles.push(tm[1]!);
-      const tern = /\btitle=\{tr\([^?]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(body);
-      if (tern) {
-        toggleRowTernaries.push(tern[1]!);
-        toggleRowTernaries.push(tern[2]!);
-      }
-    }
-
-    // 识别通过常量列表动态展开的标签键
-    const dynamicFooterKeys = sources.includes('title={tr(`botDefaults.${key}`)}')
-      ? REPLY_FOOTER_KEYS.map(k => `botDefaults.${k}`)
-      : [];
-    const dynamicStreamingKeys = sources.includes('tr(`botDefaults.streamingButton.${id}`)')
-      ? STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`)
-      : [];
-
-    const renderedKeys = new Set([
-      ...fieldTitleMatches,
-      ...groupNameMatches,
-      ...autoModelMatches,
-      ...quietPresetMatches,
-      ...toggleRowTitles,
-      ...toggleRowTernaries,
-      ...dynamicFooterKeys,
-      ...dynamicStreamingKeys,
-    ]);
-    const unindexedKeys = [...renderedKeys].filter(key =>
-      (key.startsWith('botDefaults.') || key.startsWith('sessionEnv.') || key.startsWith('quietPreset.')) && !indexedKeys.has(key));
-    expect(unindexedKeys, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
+    const rendered = [...renderedBotConfigLabelKeys(readBotConfigSources())]
+      .filter(key => BOT_CONFIG_KEY_NAMESPACES.some(prefix => key.startsWith(prefix)));
+    const unindexed = rendered.filter(key => !indexedKeys.has(key) && !NOT_CONFIG_LABELS.has(key));
+    expect(unindexed, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
+    // 名单只放扫描真读到、又确实没登记的键：过时或已登记的条目要删掉，不留静默豁免。
+    const stale = [...NOT_CONFIG_LABELS.keys()].filter(key => !rendered.includes(key) || indexedKeys.has(key));
+    expect(stale, 'NOT_CONFIG_LABELS entries that are no longer rendered, or are indexed after all').toEqual([]);
   });
 });
 
