@@ -8171,11 +8171,24 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (!pinned) return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
     task.workingDir = pinned;
   }
+  // Every turn-created task (direct, relay, in-session host CLI, delegated)
+  // persists a canonical workingDir: the fire-time swap check compares the
+  // stored value with its own realpath, so a lexical value would read as a swap
+  // on a machine whose $HOME is a symlink. The pin above decides whether the
+  // caller may name the directory at all; this decides what form is stored.
+  if (!existsSync(task.workingDir)) {
+    return jsonRes(res, 403, { ok: false, error: remoteRunnerSessionTool
+      ? 'schedule_session_tool_scope_invalid' : 'schedule_working_dir_forbidden' });
+  }
+  task.workingDir = realpathSync(task.workingDir);
   const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
   const expectedRoot = reply?.rootMessageId
     ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
   if (remoteRunnerSessionTool) {
-    const expectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    const rawExpectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    let expectedWorkingDir: string | undefined;
+    try { expectedWorkingDir = rawExpectedWorkingDir ? realpathSync(rawExpectedWorkingDir) : undefined; }
+    catch { expectedWorkingDir = undefined; }
     if (!expectedWorkingDir
       || task.chatId !== ds.chatId
       || task.workingDir !== expectedWorkingDir

@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
@@ -122,6 +123,30 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   }
   const record = authorityStore.getRecord(effectiveAppId, id);
   return record?.state === 'revoked' ? undefined : record?.task;
+}
+
+/** Fire-time guard for tasks created through a live conversation turn.
+ *
+ * Every such task has a non-null authority `targetTurnId` (direct and
+ * delegated alike) and its workingDir was canonicalized before it was
+ * persisted; workingDir is immutable after creation (no update path writes it).
+ * So a stored value that no longer equals its own realpath can only mean the
+ * directory — or an ancestor the agent can write — was swapped for a symlink
+ * after creation, and spawning would grant the link target readWrite. Host
+ * (`!ds`) and legacy rows have no targetTurnId and are never re-checked, so a
+ * symlinked `$HOME` does not stop them. Reads the authority record, never the
+ * sandbox-writable JSON projection. Returns the refusal reason, or undefined. */
+export function scheduledWorkingDirSwapReason(task: ScheduledTask): string | undefined {
+  const appId = authorityAppId(task.larkAppId);
+  if (!authorityStore || !appId || !authorityStore.isInitialized(appId)) return;
+  const record = authorityStore.getRecord(appId, task.id);
+  if (!record?.targetTurnId) return;
+  const stored = record.task.workingDir;
+  let real: string | undefined;
+  try { real = realpathSync(stored); } catch { /* missing → refuse below */ }
+  if (real === stored && task.workingDir === stored) return;
+  return `schedule_working_dir_swapped: task ${task.id} workingDir ${stored} now resolves to `
+    + `${real ?? '(missing)'}${task.workingDir === stored ? '' : ` (fire input ${task.workingDir})`}`;
 }
 
 function project(task: ScheduledTask): ScheduledTask {

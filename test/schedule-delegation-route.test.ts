@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
@@ -62,7 +62,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     task: { ...body.task, enabled: true, createdAt: '2026-09-28T00:00:00.000Z' } }));
   const scope: any = {
     readJsonBody: async () => body,
-    realpathSync,
+    realpathSync, existsSync,
     validateRoleLibraryPath: vi.fn((): { ok: boolean; resolvedPath?: string } => ({ ok: false })),
     findActiveBySessionId: () => ds,
     authorizeSessionScopedIpc,
@@ -333,6 +333,40 @@ describe('until-done schedule creation', () => {
 });
 
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it('canonicalizes every session-bound create before storing it (relay and in-session host CLI)', async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-canon-')));
+    const real = join(base, 'real');
+    mkdirSync(real);
+    const link = join(base, 'link');
+    symlinkSync(real, link);
+    // Remote Runner relay: the session records the lexical (symlinked) cwd.
+    const relay = directHumanHarness();
+    relay.ds.workingDir = link;
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.executionPosition = 'topic';
+    relay.body.task.rootMessageId = 'om_root';
+    relay.body.task.workingDir = link;
+    expect(await relay.run()).toMatchObject({ status: 201, value: { task: { workingDir: real } } });
+    // In-session CLI holding the host secret: no pin, still canonical.
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = link;
+    expect(await host.run()).toMatchObject({ status: 201 });
+    expect(host.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: real }), DIRECT_TURN);
+  });
+
+  it('refuses a session-bound create naming a missing directory with the existing codes', async () => {
+    const missing = join(REPO, 'does-not-exist');
+    const host = directHumanHarness();
+    host.scope.isTrustedHostIpcRequest = () => true;
+    host.body.task.workingDir = missing;
+    expect(await host.run()).toMatchObject({ status: 403, value: { error: 'schedule_working_dir_forbidden' } });
+    const relay = directHumanHarness();
+    relay.body.remoteRunnerSessionTool = true;
+    relay.body.task.workingDir = missing;
+    expect(await relay.run()).toMatchObject({ status: 403, value: { error: 'schedule_session_tool_scope_invalid' } });
+  });
+
   it('accepts the canonical cwd and its descendants when the session records a symlinked path', async () => {
     const base = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-link-')));
     const real = join(base, 'real');
@@ -397,20 +431,22 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
 
   it('persists the resolved own-role-library path for a capability-only caller', async () => {
     const h = directHumanHarness();
+    const roleDir = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-role-')));
     h.body.task.workingDir = '~/botmux-roles/cli_target/shared/pm';
-    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: '/roles/cli_target/shared/pm' }));
+    h.scope.validateRoleLibraryPath = vi.fn(() => ({ ok: true, resolvedPath: roleDir }));
     expect(await h.run()).toMatchObject({ status: 201 });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
-      workingDir: '/roles/cli_target/shared/pm',
+      workingDir: roleDir,
     }), DIRECT_TURN);
   });
 
   it('lets the host pin any working directory', async () => {
     const h = directHumanHarness();
-    h.body.task.workingDir = '/Users/ksher';
+    const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-elsewhere-')));
+    h.body.task.workingDir = elsewhere;
     h.scope.isTrustedHostIpcRequest = () => true;
     expect(await h.run()).toMatchObject({ status: 201 });
-    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: '/Users/ksher' }), DIRECT_TURN);
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ workingDir: elsewhere }), DIRECT_TURN);
   });
 
   it('refuses a capability-only p2p caller aiming at a chat the operator is not in', async () => {

@@ -18,11 +18,10 @@ describe('schedule IPC error text for sandboxed sessions', () => {
     expect(scheduleIpcErrorMessage(undefined)).toBeUndefined();
   });
 
-  it('is applied on the CLI add and mutate response paths', () => {
-    const cli = readFileSync('src/cli.ts', 'utf8');
-    expect(cli.match(/scheduleIpcErrorMessage\(body\.error\)/g)?.length).toBe(3);
-  });
-
+  // 源码结构护栏(K4)：机器可校验的跨文件一致性——映射表里的错误码必须恰好是 daemon
+  // 实际发出的码，否则 daemon 改名后 CLI 会静默退回裸码；daemon handler 没有可导出的
+  // 码表 seam，只能读源码比对。CLI 两处响应点的接线由 schedule-cli-update.test.ts 的
+  // 行为用例覆盖。
   it('names exactly the codes the daemon emits', () => {
     const daemon = readFileSync('src/daemon.ts', 'utf8');
     for (const code of ['schedule_working_dir_forbidden', 'schedule_mutation_scope_forbidden', 'schedule_direct_task_limit']) {

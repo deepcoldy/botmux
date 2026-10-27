@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
+import type { ScheduledTask } from '../src/types.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -105,6 +106,59 @@ describe('scheduler host authority integration', () => {
     const again = scheduler.addTask({ ...params, id: task.id });
     expect(again.id).toBe(task.id);
     expect(store.getRecord(APP, task.id)?.state).toBe('active');
+  });
+
+  describe('fire-time workingDir swap check (authority record, turn-created tasks only)', () => {
+    const turn = { directTurn: { turnId: 'om_turn', maxTasksPerTurn: 64 } };
+    const realDir = (name: string) => {
+      const dir = join(dataDir, '..', name);
+      mkdirSync(dir, { recursive: true });
+      return realpathSync(dir);
+    };
+    const swap = (dir: string, target: string) => {
+      renameSync(dir, `${dir}.moved`);
+      symlinkSync(target, dir);
+    };
+
+    it('passes an untouched canonical directory and refuses it once swapped for a symlink', () => {
+      const dir = realDir('cwd/sub');
+      const task = scheduler.addTask({ ...params, id: 'swap0001', workingDir: dir }, turn);
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toBeUndefined();
+      swap(dir, realDir('home'));
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/^schedule_working_dir_swapped: task swap0001/);
+    });
+
+    it('refuses a swapped delegated task too', () => {
+      const dir = realDir('deleg/sub');
+      const result = scheduler.commitDelegatedTask({
+        params: { ...params, id: 'deleg001', workingDir: dir },
+        grantId: 'grant-deleg', requestHash: 'hash-deleg',
+        control: { openId: 'ou_user', unionId: 'on_user', credentialOpenId: 'ou_user', runScopes: [], selfManage: false },
+        sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
+        targetTurnId: 'om_kickoff', targetGeneration: 1, maxTasksPerTurn: 64,
+      });
+      expect(result.ok).toBe(true);
+      const task = (result as { task: ScheduledTask }).task;
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toBeUndefined();
+      swap(dir, realDir('elsewhere'));
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/schedule_working_dir_swapped/);
+    });
+
+    it('refuses a missing directory and a fire input that disagrees with the authority record', () => {
+      const dir = realDir('gone');
+      const task = scheduler.addTask({ ...params, id: 'swap0002', workingDir: dir }, turn);
+      expect(scheduler.scheduledWorkingDirSwapReason({ ...task, workingDir: realDir('projection') }))
+        .toMatch(/fire input/);
+      rmSync(dir, { recursive: true });
+      expect(scheduler.scheduledWorkingDirSwapReason(task)).toMatch(/\(missing\)/);
+    });
+
+    it('never re-checks host-created or legacy tasks, even at a symlinked path', () => {
+      const link = join(realDir('host'), 'link');
+      symlinkSync(realDir('target'), link);
+      const host = scheduler.addTask({ ...params, id: 'host0009', workingDir: link });
+      expect(scheduler.scheduledWorkingDirSwapReason(host)).toBeUndefined();
+    });
   });
 
   describe('per-turn direct create limit', () => {

@@ -15,7 +15,7 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import * as scheduleStore from '../services/schedule-store.js';
-import { updateRuntimeTaskState } from './scheduler.js';
+import { scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -4405,6 +4405,15 @@ export async function executeScheduledTask(
     );
   }
   const larkAppId = bot.config.larkAppId;
+
+  // Refuse — before any session is chosen or spawned — a turn-created task whose
+  // canonical workingDir has been swapped for a symlink since creation. The
+  // throw is recorded as this fire's failure; it is never skipped silently.
+  const workingDirSwap = scheduledWorkingDirSwapReason(task);
+  if (workingDirSwap) {
+    logger.error(`[scheduler] refusing to fire: ${workingDirSwap}`);
+    throw new Error(workingDirSwap);
+  }
 
   // --follow-active: keep the last landing point while a human holds it open;
   // otherwise re-target to where a human spoke most recently (persisting the

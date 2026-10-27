@@ -298,6 +298,9 @@ describe('roleLibraryWorkingDirEscapes（worker spawn 前的软链接替换闸�
     expect(() => assertWorkingDirStaysInRoleLibrary(wd, subtreeReal, 'cli_self')).toThrow(/symlink swap/);
   });
 
+  // 源码结构护栏(K3)：高危回归绊线（沙盒逃逸）。只能读源码：硬闸位于 worker.ts 的
+  // spawnCli 闭包内、没有导出 seam；纯函数行为由本 describe 其余用例覆盖，这条钉的是
+  // 接线——恰好一次、位于 buildFsPolicy 之前、失败必须 log 后 throw 而不能被吞。
   it('worker 对每次沙盒 spawn、在 buildFsPolicy 之前无条件调用硬闸并拒绝启动', () => {
     const src = readFileSync('src/worker.ts', 'utf8');
     const call = '      assertWorkingDirStaysInRoleLibrary(cfg.workingDir, roleLibSubtree, cfg.larkAppId);\n';
