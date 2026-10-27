@@ -1427,6 +1427,22 @@ export function runTaskNow(id: string): boolean {
   return true;
 }
 
+/**
+ * Whether an edit may record a new creator on this task. Not for a delegated
+ * task: it runs as its delegation, never as a creator. Not for a task whose
+ * creator was captured under another app either: that open_id belongs to the
+ * other app, and rewriting creatorLarkAppId would also move where its creator
+ * notices go.
+ */
+export function taskAcceptsRecordedCreator(id: string, appId?: string): boolean {
+  const effectiveAppId = authorityAppId(appId);
+  if (effectiveAppId && authorityStore?.isInitialized(effectiveAppId)
+    && authorityStore.getRecord(effectiveAppId, id)?.kind === 'delegated') return false;
+  const task = runtimeTask(id, appId);
+  if (!task) return false;
+  return !task.creatorLarkAppId || task.creatorLarkAppId === task.larkAppId;
+}
+
 export type ClaimTaskRunAsResult =
   | { ok: true; task: ScheduledTask; previous?: ScheduleRunAsClaim }
   | { ok: false; error: 'not_found' | 'stale' | 'already_claimant'; current?: ScheduleRunAsClaim };
@@ -1462,7 +1478,8 @@ export function claimTaskRunAs(
   }, appId);
   if (!task) return { ok: false, error: 'not_found' };
   if (refusal) return refusal;
-  publishScheduleTaskUpdated(id, { runAsClaim: claim });
+  // No dashboard event: schedule rows carry no identity fields, and the event
+  // stream also reaches anonymous public-read viewers.
   return { ok: true, task, ...(previous ? { previous } : {}) };
 }
 
@@ -1715,11 +1732,19 @@ export function updateTask(
     /** `''` / `null` clears the per-task model and falls back to the bot's. */
     model?: string | null;
     reasoningEffort?: ScheduleReasoningEffort | null;
+    /** The person who made this edit, already verified and checked against the
+     *  bot's access by the caller (Dashboard Feishu login). They become the
+     *  task's creator, and any claim from the claim card is dropped: the
+     *  claimant agreed to run the task as it was, not as edited. */
+    creator?: { openId: string; unionId: string };
   },
   options: { deferEvent?: boolean } = {},
 ): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
+  if (updates.creator && !taskAcceptsRecordedCreator(id, task.larkAppId)) {
+    return { ok: false, error: 'creator_not_recordable' };
+  }
 
   let calendar: string | undefined;
   try { calendar = updates.calendar === undefined ? task.calendar : normalizeCalendarBinding(updates.calendar); }
@@ -1914,7 +1939,12 @@ export function updateTask(
     patch.manualRunRequested = undefined;
   }
 
-  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch }))) {
+  // Identity fields stay out of `patch`: it doubles as the dashboard event,
+  // which anonymous public-read viewers also receive.
+  const creatorPatch: Partial<ScheduledTask> = updates.creator
+    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
+    : {};
+  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch, ...creatorPatch }))) {
     return { ok: false, error: 'not_found' };
   }
   const publishedPatch = { ...patch, ...eventPatch };

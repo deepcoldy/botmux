@@ -138,7 +138,7 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
- *  and every executable/authority-bearing precondition field from
+ *  the run-as identity fields, and every executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
  *  ref/hash are stripped defensively even though authenticated management rows
@@ -152,6 +152,11 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const {
       prompt: _prompt,
       workingDir: _workingDir,
+      // Who a task runs as is personal data. Rows never carry it; strip it from
+      // event patches too in case a write path ever includes it.
+      ownerOpenId: _ownerOpenId,
+      ownerUnionId: _ownerUnionId,
+      runAsClaim: _runAsClaim,
       ...rest
     } = projected as Record<string, unknown>;
     return rest;

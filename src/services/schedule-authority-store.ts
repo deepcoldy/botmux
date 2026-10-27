@@ -455,6 +455,17 @@ export class ScheduleAuthorityStore {
         SET state = ?, task_json = ?, canonical_hash = ?, updated_at = ?
         WHERE app_id = ? AND task_id = ?
       `).run(state, JSON.stringify(next), taskHash(next), new Date().toISOString(), appId, taskId);
+      // For a non-delegated task the control columns ARE its creator (captured
+      // from the task at creation). Keep them in step when an edit records a
+      // new creator. A delegated task's control is the delegation and is never
+      // derived from the task row.
+      if (record.kind !== 'delegated'
+        && (next.ownerOpenId !== record.task.ownerOpenId || next.ownerUnionId !== record.task.ownerUnionId)) {
+        this.db.prepare(`
+          UPDATE schedule_authority_tasks SET control_open_id = ?, control_union_id = ?
+          WHERE app_id = ? AND task_id = ?
+        `).run(next.ownerOpenId ?? null, next.ownerUnionId ?? null, appId, taskId);
+      }
       this.db.exec('COMMIT;');
       return next;
     } catch (error) {

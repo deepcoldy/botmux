@@ -8,6 +8,11 @@ import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, 
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { canOperate } from '../im/lark/event-dispatcher.js';
+import {
+  DASHBOARD_SCHEDULE_CREATOR_HEADER,
+  dashboardCreatorFromRequest,
+  resolveDashboardScheduleCreator,
+} from './dashboard-schedule-creator.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -224,7 +229,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -6148,6 +6153,41 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
 // Create a new scheduled task from the dashboard. chatIds selects one or more
 // chats owned by this bot; legacy clients may keep sending only chatId.
 // workingDir defaults to the daemon's cwd.
+/** The person a Dashboard schedule write is recorded as (see
+ *  core/dashboard-schedule-creator), or undefined when the write keeps the
+ *  token-login attribution. Every outcome is logged: this decides whose
+ *  identity the task will later run with. */
+async function dashboardScheduleCreator(
+  req: IncomingMessage,
+  appId: string,
+  chatId: string,
+  action: 'create' | 'update',
+  taskId?: string,
+): Promise<{ openId: string; unionId: string } | undefined> {
+  const unionId = dashboardCreatorFromRequest(
+    isTrustedHostIpcRequest(req),
+    req.headers[DASHBOARD_SCHEDULE_CREATOR_HEADER],
+  );
+  if (!unionId) return undefined;
+  const creator = await resolveDashboardScheduleCreator({
+    appId,
+    chatId,
+    unionId,
+    resolveOpenId: async (app, union) => {
+      const resolved = await resolveTargetAppOpenId(app, union);
+      return resolved.status === 'resolved' ? resolved.openId : undefined;
+    },
+    canOperate: (app, chat, openId, union) => canOperate(app, chat, openId, union),
+  });
+  const subject = `action=${action} app=${appId}${taskId ? ` task=${taskId}` : ''} chat=${chatId} union=${unionId}`;
+  if (!creator.ok) {
+    logger.warn(`[schedule-creator] dashboard feishu login not recorded (${creator.reason}) ${subject}`);
+    return undefined;
+  }
+  logger.info(`[schedule-creator] dashboard feishu login recorded as creator ${subject} open=${creator.openId}`);
+  return { openId: creator.openId, unionId: creator.unionId };
+}
+
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -6258,9 +6298,13 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
-    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
-    let ownerUnionId: string | undefined;
-    if (ownerOpenId) {
+    // Signed in through the platform with Feishu: that person is the creator.
+    // Otherwise (token login, or the person cannot operate this bot) keep the
+    // historical attribution to the bot owner below.
+    const dashboardCreator = await dashboardScheduleCreator(req, cachedLarkAppId, chatId, 'create');
+    let ownerOpenId = dashboardCreator?.openId ?? getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined = dashboardCreator?.unionId;
+    if (!dashboardCreator && ownerOpenId) {
       const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
       const bot = getBot(cachedLarkAppId);
       // The deployment identity is tenant-stable, but it is authoritative for
@@ -6287,9 +6331,9 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
-      // Stamp the bot owner as creator: dashboard is local + token-protected,
-      // and the daemon re-checks the owner is still allowed at every run
-      // mutation (scheduled-turn-provenance).
+      // The Feishu-login person, else the bot owner (token login: the dashboard
+      // is local + token-protected). Either way the daemon re-checks the
+      // creator is still allowed at every run (scheduled-turn-provenance).
       ownerOpenId,
       ownerUnionId,
       deliver,
@@ -6324,6 +6368,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
     chatId?: string; chatIds?: readonly string[] | null;
     model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
+    creator?: { openId: string; unionId: string };
   } = {};
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
@@ -6410,6 +6455,19 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     if (modelWrite.model !== undefined) updates.model = modelWrite.model;
     if (modelWrite.reasoningEffort !== undefined) updates.reasoningEffort = modelWrite.reasoningEffort;
+  }
+  const existingTask = scheduleStore.getTask(p.id, cachedLarkAppId);
+  if (existingTask && !scheduler.taskAcceptsRecordedCreator(p.id, cachedLarkAppId)) {
+    // Delegated task, or creator captured under another app: a Dashboard edit
+    // here leaves who it runs as untouched (see taskAcceptsRecordedCreator).
+    if (dashboardCreatorFromRequest(isTrustedHostIpcRequest(req), req.headers[DASHBOARD_SCHEDULE_CREATOR_HEADER])) {
+      logger.warn(`[schedule-creator] dashboard feishu login not recorded (task_keeps_identity) action=update app=${cachedLarkAppId} task=${p.id}`);
+    }
+  } else if (existingTask) {
+    const creator = await dashboardScheduleCreator(
+      req, cachedLarkAppId, updates.chatId ?? existingTask.chatId, 'update', p.id,
+    );
+    if (creator) updates.creator = creator;
   }
   let result;
   try {

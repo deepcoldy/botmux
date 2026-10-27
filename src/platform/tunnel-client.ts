@@ -5,6 +5,7 @@ import net from 'node:net';
 import { hostname, networkInterfaces } from 'node:os';
 import { WebSocket, type RawData } from 'ws';
 import { setPlatformTeams, clearPlatformBinding, type PlatformBinding, type PlatformTeam } from './binding.js';
+import { registerPlatformTunnelBridge } from './tunnel-peers.js';
 
 /** 本机一个 botmux bot 的概要（上报给平台，供团队页「人→机器→bot」展示 + 拉群）。 */
 export interface PlatformBotInfo {
@@ -495,6 +496,11 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
  */
 export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): void {
   const tcp = net.connect(dashboardPort, '127.0.0.1');
+  // Lets the dashboard recognise requests that really came through the
+  // platform (and only those) as carrying platform-injected identity headers.
+  let forgetBridge = (): void => {};
+  tcp.on('connect', () => { forgetBridge = registerPlatformTunnelBridge(tcp.localPort); });
+  tcp.on('close', () => forgetBridge());
   // 交互式终端关 Nagle：终端输出常被拆成「回显字符 + 光标/颜色控制序列」这类分帧小包，
   // Nagle 会把紧随其后的小包扣到对端 delayed-ACK(~40ms)才发出。网页终端经平台隧道中转时
   // 这条桥接 socket 串在链路中间，用户就感到每隔一下卡 ~40ms；本机直连不经隧道故不卡。
