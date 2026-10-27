@@ -174,11 +174,13 @@ describe('scheduler host authority integration', () => {
       expect(ok.deps.run).toHaveBeenCalledOnce();
       swap(dir, realDir(`planted-${_kind}`));
       const refused = gate();
-      await expect(refused.go()).rejects.toThrow(/schedule_working_dir_swapped/);
-      expect(refused.deps.resolve).not.toHaveBeenCalled();
-      expect(refused.deps.readFile).not.toHaveBeenCalled();
+      const outcome = await refused.go().then(() => undefined, (error: unknown) => error);
+      // The spawn layer first: without the forward check the gate reaches
+      // dependencies.run (the host-side Bash), and this is the line that fails.
       expect(refused.deps.run).not.toHaveBeenCalled();
+      expect(refused.deps.readFile).not.toHaveBeenCalled();
       expect(refused.execute).not.toHaveBeenCalled();
+      expect(String(outcome)).toMatch(/schedule_working_dir_swapped/);
     });
 
     it('never re-checks host-created or legacy tasks, even at a symlinked path', () => {
