@@ -18,7 +18,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TmuxPipeBackend, resolvePaneDeath } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxPipeBackend, resolvePaneDeath, settlePaneDeath, type PaneDeathResolution } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
@@ -37,7 +37,9 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
   const saved: Record<string, string | undefined> = {};
   let seq = 0;
 
-  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  // Bounded like the corpse describe below: a hung call must not eat the hook budget (#2434).
+  const tmux = (...args: string[]) =>
+    spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8', timeout: 5_000 });
 
   /** One backend launch; resolves with the (code, signal) onExit reported. */
   const runToExit = async (script: string): Promise<{ code: number | null; signal: string | null }> => {
@@ -485,3 +487,51 @@ describe('resolvePaneDeath three-way verdict: alive / dead / unknown', () => {
     expect(r1).toEqual({ kind: 'dead', status: 127 });
   });
 });;
+
+/**
+ * #2434: on a starved host every 1s probe of a teardown round times out, so the
+ * round ends `unknown`. That must be re-read later, not reported as code 1.
+ */
+describe('settlePaneDeath defers an unknown teardown verdict', () => {
+  const DELAYS = [10, 30, 90];
+  const run = (first: PaneDeathResolution, later: PaneDeathResolution[]) => {
+    const waits: number[] = [];
+    const queue: Array<() => void> = [];
+    let reads = 0;
+    let result: PaneDeathResolution | undefined;
+    settlePaneDeath(
+      first,
+      () => later[Math.min(reads++, later.length - 1)]!,
+      (fn, ms) => { waits.push(ms); queue.push(fn); },
+      d => { result = d; },
+      DELAYS,
+    );
+    while (queue.length) queue.shift()!();
+    return { result, waits, reads };
+  };
+
+  it('settles a decisive first verdict at once, without scheduling', () => {
+    expect(run({ kind: 'dead', status: 77 }, [])).toEqual({ result: { kind: 'dead', status: 77 }, waits: [], reads: 0 });
+    expect(run({ kind: 'alive' }, []).waits).toEqual([]);
+  });
+
+  it('adopts the real code from a deferred re-read instead of reporting 1', () => {
+    const r = run({ kind: 'unknown' }, [{ kind: 'unknown' }, { kind: 'dead', status: 77 }]);
+    expect(r.result).toEqual({ kind: 'dead', status: 77 });
+    expect(r.waits).toEqual([10, 30]);
+    expect(r.reads).toBe(2);
+  });
+
+  it('gives up as unknown only after every deferred re-read stays unreadable', () => {
+    const r = run({ kind: 'unknown' }, [{ kind: 'unknown' }]);
+    expect(r.result).toEqual({ kind: 'unknown' });
+    expect(r.waits).toEqual(DELAYS);
+    expect(r.reads).toBe(DELAYS.length);
+  });
+
+  it('does not deliver a verdict before the deferred read runs', () => {
+    let result: PaneDeathResolution | undefined;
+    settlePaneDeath({ kind: 'unknown' }, () => ({ kind: 'dead', status: 3 }), () => {}, d => { result = d; }, DELAYS);
+    expect(result).toBeUndefined();
+  });
+});

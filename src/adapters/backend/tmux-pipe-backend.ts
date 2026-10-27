@@ -196,6 +196,41 @@ export function resolvePaneDeath(
   return sawDead ? { kind: 'dead', status: null } : { kind: 'unknown' };
 }
 
+/** Re-read delays when a teardown read is `unknown`. A starved host times out
+ *  every 1s probe of a round, so we wait for the scheduler instead of
+ *  inventing exit code 1 (#2434). Deferred rounds use a longer per-call cap. */
+const PANE_DEATH_DEFER_DELAYS_MS: readonly number[] = [1000, 3000, 9000];
+const PANE_DEATH_DEFER_PROBE_TIMEOUT_MS = 5000;
+let paneDeathDeferDelaysMs = PANE_DEATH_DEFER_DELAYS_MS;
+
+/** Test seam: suites whose mocked tmux never answers the death probe pass []
+ *  to keep teardown synchronous. Pass null to restore the real delays. */
+export function setPaneDeathDeferDelaysForTests(delays: readonly number[] | null): void {
+  paneDeathDeferDelaysMs = delays ?? PANE_DEATH_DEFER_DELAYS_MS;
+}
+
+/**
+ * Drive `read` until it yields a decisive verdict, deferring an `unknown`
+ * through `delays` via `schedule` (injected for tests). Only a still-`unknown`
+ * after the last delay is handed to `done` as `unknown`.
+ */
+export function settlePaneDeath(
+  first: PaneDeathResolution,
+  read: () => PaneDeathResolution,
+  schedule: (fn: () => void, ms: number) => void,
+  done: (death: PaneDeathResolution) => void,
+  delays: readonly number[] = PANE_DEATH_DEFER_DELAYS_MS,
+): void {
+  const step = (death: PaneDeathResolution, round: number): void => {
+    if (death.kind !== 'unknown' || round >= delays.length) {
+      done(death);
+      return;
+    }
+    schedule(() => step(read(), round + 1), delays[round]!);
+  };
+  step(first, 0);
+}
+
 /** Build the readable startup error for a pane whose CLI process died
  *  immediately. Pure (no tmux calls) so the wording is unit-testable. */
 export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDeathEvidence): Error {
@@ -1364,8 +1399,18 @@ export class TmuxPipeBackend implements SessionBackend {
     // while it is dead, and `#{pane_dead_status}` is the only carrier of
     // 77/127 through tmux. Order matters — after the kill below there is no
     // pane left to ask.
-    const death = this.readPaneDeath();
+    const first = this.readPaneDeath();
     this.teardownFifoReader();
+    settlePaneDeath(
+      first,
+      () => this.readPaneDeath(PANE_DEATH_DEFER_PROBE_TIMEOUT_MS),
+      (fn, ms) => { setTimeout(fn, ms); },
+      death => this.finishPaneExit(death),
+      paneDeathDeferDelaysMs,
+    );
+  }
+
+  private finishPaneExit(death: PaneDeathResolution): void {
     // We get here only after the lifecycle watcher's OWN authoritative miss
     // sequence (N consecutive misses + final confirm), so the owned pane is
     // already judged gone. Reap its remnant for anything but an explicit
@@ -1381,9 +1426,8 @@ export class TmuxPipeBackend implements SessionBackend {
     //    not kill a live pane.
     if (death.kind !== 'alive') this.killDeadPaneRemnant();
     // Only a confirmed-dead pane with a published status carries a real code.
-    // Both `unknown` and a status-less (signal) death fall back to the
-    // historic sentinel 1 — but the bounded re-reads make `unknown` rare, so a
-    // transient timeout no longer silently turns a real 77/127 into 1.
+    // A status-less (signal) death and an `unknown` that survived every
+    // deferred re-read fall back to the historic sentinel 1.
     this.fireExit(death.kind === 'dead' ? (death.status ?? 1) : 1, null);
   }
 
@@ -1404,7 +1448,7 @@ export class TmuxPipeBackend implements SessionBackend {
    * pane still answers a pane_id, which is exactly the trap that would make a
    * liveness probe report `exists` forever (see probePaneAddressability).
    */
-  private readPaneDeath(): PaneDeathResolution {
+  private readPaneDeath(probeTimeoutMs: number = PANE_DEATH_PROBE_TIMEOUT_MS): PaneDeathResolution {
     // One display-message round; an error is an unreadable (empty) line.
     const readLine = (): string => {
       try {
@@ -1412,7 +1456,7 @@ export class TmuxPipeBackend implements SessionBackend {
           execFileSync(
             'tmux',
             [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_dead}:#{pane_dead_status}'],
-            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: probeTimeoutMs, env: tmuxEnv() },
           ) ?? '',
         ).trim();
       } catch {

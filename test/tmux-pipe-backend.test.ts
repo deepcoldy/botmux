@@ -66,6 +66,7 @@ import {
   normaliseCaptureLineEndings,
   tmuxLifecycleInitialDelayMs,
   setStartupTmuxRetrySleepForTests,
+  setPaneDeathDeferDelaysForTests,
   buildPipePaneStartupError,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { resetTmuxVersionCacheForTests, getTmuxVersionCached } from '../src/setup/ensure-tmux.js';
@@ -77,6 +78,8 @@ import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 // Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
 // stub the sleep for the whole suite so retry tests don't add real seconds.
 setStartupTmuxRetrySleepForTests(() => {});
+// Mocked tmux mostly never answers the death probe; deferral is pinned in its own case.
+setPaneDeathDeferDelaysForTests([]);
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -1855,6 +1858,44 @@ describe('TmuxPipeBackend send failure handling', () => {
     expect(killCalls).toHaveLength(1); // unknown still reaps: the pane was already authoritatively missing
     expect(exits).toEqual([[1, null]]); // no real code readable -> historic sentinel
     expect(deathReads.length).toBeGreaterThan(1); // retried instead of giving up on the first unreadable read
+  });
+
+  it('handlePaneExit defers an unknown verdict and reports the code a later re-read finds (#2434)', () => {
+    setPaneDeathDeferDelaysForTests([1000]);
+    vi.useFakeTimers();
+    try {
+      const be = new TmuxPipeBackend('bmx-defer', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((c, s) => exits.push([c, s]));
+      be.spawn('', [], spawnOpts());
+      let starved = true;
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        const a = Array.isArray(args) ? (args as string[]) : [];
+        if (a.includes('load-buffer') || a.includes('paste-buffer')) {
+          throw Object.assign(new Error('gone'), {
+            status: 1, signal: null, stderr: Buffer.from("can't find pane: bmx-defer"),
+          });
+        }
+        if (a.includes('display-message') && a.some(f => String(f).includes('#{pane_dead_status}'))) {
+          if (starved) throw new Error('tmux client timeout');
+          return Buffer.from('1:77') as any;
+        }
+        return '' as any;
+      }) as typeof execFileSync);
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      expect(() => be.pasteText('x')).not.toThrow();
+      const kills = () => mockedExecFileSync.mock.calls.filter(([, a]) => (a as string[]).includes('kill-session'));
+      expect(exits).toEqual([]); // no fabricated code 1 while the host is starved
+      expect(kills()).toHaveLength(0);
+      starved = false;
+      vi.advanceTimersByTime(1000);
+      expect(exits).toEqual([[77, null]]);
+      expect(kills()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      setPaneDeathDeferDelaysForTests([]);
+    }
   });
 
   it('handlePaneExit does NOT kill a pane tmux explicitly answers alive (defense-in-depth)', () => {
