@@ -44,7 +44,8 @@ function createFixture(
       cwd: repo,
       env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
         BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId, BOTMUX_TURN_ID: turnId,
-        BOTMUX_LARK_APP_ID: 'cli_test', ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
+        BOTMUX_LARK_APP_ID: 'cli_test', BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1',
+        ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
       encoding: 'utf8', timeout: 30_000,
     });
     const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
@@ -216,6 +217,26 @@ describe('botmux send per-turn final idempotency', () => {
       expect(changed.requests).toHaveLength(0);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it('replays an image-only final after the relay restages identical bytes', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const retryImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'same-image-bytes');
+    writeFileSync(retryImage, 'same-image-bytes');
+    try {
+      const first = f.run('final', '', ['--images', firstImage]);
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+
+      const retry = f.run('final', '', ['--images', retryImage]);
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        messageId: 'om_separate_message', replayed: true,
+      });
+      expect(retry.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
 
   it('refuses the same final body with a new attachment instead of silently dropping it', () => {
     const f = createFixture();

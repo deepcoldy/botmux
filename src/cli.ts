@@ -9799,8 +9799,12 @@ async function relaySend(
     const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
+  const images: string[] = [];
+  for (const p of argValues(rest, '--image', '--images')) {
+    copyOutboxAttachment(p, images);
+  }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+  for (const p of argValues(rest, '--file', '--files')) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
@@ -9842,6 +9846,7 @@ async function relaySend(
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
     completionProposalFile: completionProposalBase,
+    images,
     attachments,
     videos,
     videoCovers,
@@ -11898,6 +11903,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         dispatchAttempt: originDispatchAttempt,
       }
     : undefined;
+  // Relay staging paths and mtimes are attempt-local. Durable final replay must
+  // identify images by bytes so the same sandbox request can recover after a
+  // lost relay response without being rejected as a different attachment.
+  const durableImageIdentities = currentTurnId && effectiveResponseKind === 'final'
+    ? await Promise.all(images.map(async image => {
+        const inspection = await inspectFileOnlyAttachment(image, [], true);
+        return { sha256: inspection.sha256! };
+      }))
+    : images.map(sendAttachmentIdentity);
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -11957,7 +11971,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       urgent: urgent.requested ? urgent.mode : undefined,
     },
     attachments: {
-      images: images.map(sendAttachmentIdentity),
+      images: durableImageIdentities,
       files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
         ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
         : files.map(sendAttachmentIdentity),
