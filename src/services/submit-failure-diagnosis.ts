@@ -211,3 +211,44 @@ export function decideSessionStartGatedSubmitWarning(state: {
   if (waitedMs < (state.minWaitMs ?? SUBMIT_GATED_MIN_WAIT_MS)) return { warn: false, reason: 'min-wait' };
   return { warn: true, reason: 'record-missing-after-session-start' };
 }
+
+/** Hard ceiling for the busy-turn wait. See `shouldWaitThroughBusyTurn`. */
+export const SUBMIT_BUSY_TURN_MAX_WAITS = 12;
+
+/**
+ * Whether a missing transcript record should be attributed to "the CLI is still
+ * running this turn" instead of a failed submit.
+ *
+ * Evidence used: the adapter's own `busyPattern` on the live screen (e.g. ZCode's
+ * `esc to interrupt`). That is a POSITIVE signal, unlike the weak "the PTY
+ * repainted recently" clock that `still_active` represents: a draft parked in the
+ * composer renders the IDLE footer, so a busy footer can only be drawn while some
+ * accepted input is executing. A composer holding text cannot fake it — which is
+ * exactly the case the SessionStart gate exists to catch.
+ *
+ * Why this is needed: on several CLIs the submit receipt is written when the turn
+ * DEQUEUES, not when Enter lands. Measured 2026-10-25 on ZCode: receipt landed
+ * 291s after the write, while a long tool call ran; botmux's budget was ~100s
+ * (20s × 2 rechecks + 3 weak-activity silences), so it warned mid-turn while the
+ * message had in fact executed. A fixed chain can never cover a turn longer than
+ * the chain, so positive busy evidence must extend the wait.
+ *
+ * Bounded on purpose: the ceiling keeps a CLI that never finishes from muting the
+ * warning forever, and once the footer clears the next recheck falls straight
+ * through to the ordinary verdict.
+ */
+export function shouldWaitThroughBusyTurn(state: {
+  /** Adapter busyPattern matched the live screen (positive mid-turn evidence). */
+  busy: boolean;
+  /** Screen-gate verdict already computed for this recheck. */
+  diagnosisReason: SubmitFailureDiagnosisReason;
+  /** How many times busy evidence has already extended this chain. */
+  waitsSoFar: number;
+  maxWaits?: number;
+}): boolean {
+  if (!state.busy) return false;
+  // A gate screen means the CLI is parked on a question; it is not executing.
+  if (state.diagnosisReason === 'logged_out') return false;
+  if (state.diagnosisReason === 'interactive_menu') return false;
+  return state.waitsSoFar < (state.maxWaits ?? SUBMIT_BUSY_TURN_MAX_WAITS);
+}

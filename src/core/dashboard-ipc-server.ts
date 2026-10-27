@@ -26,7 +26,7 @@ import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-aut
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
-import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
@@ -1158,6 +1158,10 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
+  // `botmux send --mention` handoff: an isolated CLI (macOS read isolation)
+  // has no host secret either; both handlers verify the live turn capability.
+  if (method === 'POST' && pathname === DISPATCH_USER_MENTION_PREPARE_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_USER_MENTION_BIND_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -3209,6 +3213,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // app's availability range normally excludes them.
   const resolved = await resolveBoundLarkUserCredential({
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
+    ...(delegated ? { unionId: delegated.unionId } : {}),
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
   if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
@@ -9943,6 +9948,10 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
 //   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
 //     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
 const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback', 'credentialSource']);
+// delegateOnMention is NOT in the set above: a save that does not mention it
+// (an older Dashboard bundle) keeps the stored value through the merge below,
+// so a deliberate `false` is never silently turned back on. The current page
+// always sends it, which overrides the preserved value.
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
   let body: { triggerUserAuth?: unknown };

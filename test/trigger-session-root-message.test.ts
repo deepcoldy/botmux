@@ -141,6 +141,8 @@ import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } fro
 import { sessionKey } from '../src/core/types.js';
 import { admitQueuedActivationTail, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -636,6 +638,50 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 
+  it.each(['codex', 'claude-code'])('keeps a default report trigger reportable on a live %s worker', async (cliId) => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId, workingDir: '/tmp' } });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    const req = request({ sessionId: ds.session.sessionId });
+    req.source = { type: 'ui', connectorId: 'botmux-report', requestId: 'report-mock' };
+    req.envelope = { format: 'botmux-report/v1', sourceName: 'dependency', trusted: false, rawText: 'dependency verified' };
+    const result = await triggerSessionTurn(req, {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+    const turnId = send.mock.calls[0][0].turnId;
+    expect(turnId).toBe(result.triggerId);
+    const secret = 'test-binding-secret';
+    const capability = 'a'.repeat(64);
+    const relay = authorizeReportSessionRelayRequest({
+      raw: { sessionId: ds.session.sessionId, dispatchRoot: ROOT, content: 'verified result', originCapability: capability },
+      trustedHost: false,
+      session: { sessionId: ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+        receiver: false, scope: 'thread', rootMessageId: ROOT,
+        liveOrigin: { capability, turnId } },
+      selfLarkAppId: APP,
+      registry: { [ROOT]: { reportBinding: createDispatchReportBinding(secret, {
+        dispatchRoot: ROOT, targetLarkAppId: 'app_parent', targetSessionId: 'parent',
+        sourceName: 'task', issuedAt: new Date().toISOString(),
+      }) } },
+      bindingSecret: secret,
+    });
+    expect(relay).toMatchObject({ ok: true, target: { sessionId: 'parent' } });
+    expect(ds.suppressedTriggerFinalTurns?.size ?? 0).toBe(0);
+  });
+
+  it('preserves the shared topic anchor for a default external trigger with its own turn id', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ scope: 'chat', worker: { killed: false, send } as any,
+      currentReplyTarget: { turnId: 'om_previous', rootMessageId: ROOT } });
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = CHAT;
+    const result = await triggerSessionTurn(request({ sessionId: ds.session.sessionId }), {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(CHAT, APP), ds]]),
+    });
+    expect(send.mock.calls[0][0].turnId).toBe(result.triggerId);
+    expect(resolveSessionReplyTarget(ds, result.triggerId)).toMatchObject({ mode: 'thread', rootMessageId: ROOT });
+  });
+
   it('reuses an existing root session whose worker is live', async () => {
     const send = vi.fn();
     const ds = existingDs({ worker: { killed: false, send } as any });
@@ -645,7 +691,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'delivered', target: { sessionId: 'sess_existing', chatId: CHAT } });
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).not.toHaveBeenCalled();
-    expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
+    expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:'), turnId: res.triggerId });
   });
 
   it.each([

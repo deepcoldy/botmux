@@ -1798,3 +1798,26 @@ describe('IdleDetector: first-prompt extended quiescence', () => {
     detector.dispose();
   });
 });
+
+describe('IdleDetector: screenShowsPrompt()', () => {
+  it('reflects whether the input prompt is currently rendered, independent of the idle edge', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    expect(detector.screenShowsPrompt()).toBe(false);
+    // Prompt drawn, but no quiescence window elapsed yet: isIdleNow is still
+    // false while screenShowsPrompt is already true.
+    detector.feed('some streaming text\r\n❯ ');
+    expect(detector.screenShowsPrompt()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    // A busy redraw pushes the prompt out of the tail.
+    detector.feed('• Working (3s • esc to interrupt) ' + 'x'.repeat(600));
+    expect(detector.screenShowsPrompt()).toBe(false);
+    detector.dispose();
+  });
+
+  it('is false for an adapter without a readyPattern', () => {
+    const detector = new IdleDetector(makeCli());
+    detector.feed('❯ ');
+    expect(detector.screenShowsPrompt()).toBe(false);
+    detector.dispose();
+  });
+});

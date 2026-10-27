@@ -30,7 +30,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { sessionIdentityBinDir, publishActiveTurn, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -86,7 +86,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -596,7 +596,7 @@ import {
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
-import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure } from './services/submit-failure-diagnosis.js';
+import { decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -1527,7 +1527,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
       });
     }
-    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
+    // RPC app-server env uses the same prepare+reset seam as spawnCli: without
+    // the reset its inherit:'all' shell tools would carry an ambient/pushed-up
+    // GIT_CONFIG_COUNT and any per-bot/ambient numbered pair straight to git.
+    prepareTurnGitConfigEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
       engineIdentityModel,
       engineIdentityModel === 'proven'
         ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
@@ -8243,6 +8246,9 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   const drained = drainTranscript(matched, 0);
   bridgeOffset = drained.newOffset;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
+  // Switched files: re-arm marker verdicts for the new transcript; absorb
+  // re-proves `seen` if the new file carries a marker.
+  beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, matched);
   // The switch moved us onto another Claude session: rebind the fallback
@@ -8516,6 +8522,9 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   const result = drainTranscript(newPath, 0);
   bridgeOffset = result.newOffset;
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
+  // New file = new writer generation: verdicts from the old transcript must
+  // not carry over; absorb re-proves `seen` from the new file.
+  beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
@@ -8828,13 +8837,211 @@ function bridgeHeadTurnAwaitingTerminal(opts: { startedOnly?: boolean } = {}): b
  *  whose duration marker still did not come says anything about the CLI. */
 function noteBridgeTurnCloseWaitExpired(): void {
   const head = bridgeQueue.peek()[0];
-  if (head && bridgeQueue.isAwaitingDurationMarker(head)) bridgeQueue.noteDurationMarkerWaitExpired();
+  // Negative marker evidence is valid only for the CURRENT live writer.
+  // Exclude a journal-restored turn (a cross-process dead writer) and a turn
+  // carried across a transcript rotation (the old file's writer, whose marker
+  // can never arrive on the new file): this helper is shared by the PTY/Herdr
+  // idle settle's onTimeout AND the no-idle watchdog, so both entries need it.
+  if (head
+    && !head.restoredFromJournal
+    && !head.carriedAcrossGeneration
+    && bridgeQueue.isAwaitingDurationMarker(head)) {
+    bridgeQueue.noteDurationMarkerWaitExpired();
+  }
 }
 
 /** The PTY idle edge's settle (see the idle handler in spawnCli). Module-level
  *  so a new input or an explicit busy marker can drop it: the edge it holds
  *  belongs to a turn the CLI has already moved past. */
 let idleTranscriptSettle: TranscriptTerminalSettle | null = null;
+/** True between an idle settle's request and its proceed/cancel. While set the
+ *  provisional-exit watchdog must not be armed: the idle edge owns the wait
+ *  for the head turn's closing records. */
+let idleTranscriptSettleInFlight = false;
+/** Watchdog counterpart for turns whose idle edge never fires (a background
+ *  task can keep program-status `working`, and stale status keeps waiting).
+ *  It is armed only while no idle settle is in flight and disarmed the moment
+ *  one starts. The handle is BOUND to one turn + transcript generation, so a
+ *  deadline left by a completed/rotated turn can never settle the new head. */
+let provisionalExitTimer: ReturnType<typeof setTimeout> | null = null;
+/** Identity + activity snapshot the armed deadline belongs to. Whenever ingest
+ *  attributes NEW records to this same turn, its bound restarts: the bound is
+ *  "2s of transcript QUIET", not "2s after the first terminal block" — a final
+ *  message flushed block-by-block seconds apart would otherwise settle on a
+ *  truncated body (worst case a thinking-only block with zero answer uuids). */
+let provisionalExitBoundTurn: BridgePendingTurn | null = null;
+let provisionalExitBoundActivitySeq = 0;
+/** Bumped on every transcript switch. The watchdog's deadline belongs to one
+ *  generation; a rotation arms the next turn's own deadline fresh. */
+let bridgeTranscriptGeneration = 0;
+
+/** Build a settle that tracks its in-flight state and owns the watchdog
+ *  lifecycle: requesting an idle wait disarms the watchdog (the idle edge's
+ *  own settle takes over); cancel/proceed lets bridgeIngest re-arm it if the
+ *  head is still waiting afterwards. */
+function makeBridgeTranscriptSettle(
+  awaitingTerminal: () => boolean,
+  onTimeout?: () => void,
+): TranscriptTerminalSettle {
+  const inner = createTranscriptTerminalSettle({ awaitingTerminal, onTimeout });
+  return {
+    request: (proceed: () => void): void => {
+      disarmProvisionalExitWatch();
+      idleTranscriptSettleInFlight = true;
+      inner.request(() => {
+        idleTranscriptSettleInFlight = false;
+        proceed();
+      });
+    },
+    cancel: (): void => {
+      idleTranscriptSettleInFlight = false;
+      inner.cancel();
+    },
+  };
+}
+
+/** Begin a new writer/transcript generation: void the old watchdog deadline,
+ *  bump the generation guard, and forget marker verdicts. Called on watcher
+ *  teardown/start and every in-process transcript switch. */
+function beginNewBridgeTranscriptGeneration(): void {
+  disarmProvisionalExitWatch();
+  // Pending turns are carried onto the new file; tag them so a watchdog
+  // releasing one does not teach the new generation it is marker-less.
+  bridgeQueue.markPendingTurnsCarriedAcrossGeneration();
+  bridgeTranscriptGeneration++;
+  bridgeQueue.resetDurationMarkerVerdicts();
+}
+
+/** Void the armed deadline and its turn binding. */
+function disarmProvisionalExitWatch(): void {
+  if (provisionalExitTimer) {
+    clearTimeout(provisionalExitTimer);
+    provisionalExitTimer = null;
+  }
+  provisionalExitBoundTurn = null;
+}
+
+/** Re-evaluate the watchdog after transcript ingest. When a fresh turn's head
+ *  is waiting for its closing records and no idle edge is handling that wait,
+ *  arm a bounded timer that applies the same verdict the idle settle's
+ *  onTimeout would (and drains the turn). The deadline is bound to that exact
+ *  turn + transcript generation: a deadline left by a completed or rotated
+ *  turn is void and can never settle the new head — the new head gets its own
+ *  deadline armed on its next ingest. While armed, NEW assistant records
+ *  attributed to the SAME bound turn restart the bound, so a split final
+ *  message whose blocks flush more than one bound apart settles with its whole
+ *  body instead of its first block. A journal-restored head is a dead writer's
+ *  snapshot: it still needs the exit to settle, but must not teach the current
+ *  CLI that it is marker-less. */
+function updateProvisionalExitWatch(): void {
+  if (idleTranscriptSettleInFlight) return;
+  if (!bridgeJsonlPath || lastInitConfig?.adoptMode) return;
+  const head = bridgeQueue.peek()[0];
+  if (!head || head.isLocal || !bridgeQueue.isFreshHeadAwaitingMarker(head)) return;
+  if (provisionalExitTimer) {
+    if (provisionalExitBoundTurn === head) {
+      // Same turn: extend ONLY when it received new attributed records; on
+      // transcript quiet the old deadline keeps running. New bytes for any
+      // other turn (a follower became head after the bound turn closed) are
+      // handled in the branch below.
+      if ((head.attributedActivitySeq ?? 0) <= provisionalExitBoundActivitySeq) return;
+      disarmProvisionalExitWatch();
+    } else {
+      // The armed deadline belongs to a turn already gone from the head
+      // (closed normally while it was running). Its identity gate can never
+      // emit THIS turn, so drop it and arm the current head its own window
+      // now instead of letting the stale timer skew the new bound.
+      disarmProvisionalExitWatch();
+    }
+  }
+  const boundTurn = head;
+  const boundGeneration = bridgeTranscriptGeneration;
+  provisionalExitBoundTurn = boundTurn;
+  provisionalExitBoundActivitySeq = boundTurn.attributedActivitySeq ?? 0;
+  const reArm = (): void => {
+    // The voided deadline belonged to an older head: give the CURRENT head its
+    // own full window now (it may already be waiting) rather than holding it
+    // to what remained of the old timer.
+    try { updateProvisionalExitWatch(); } catch { /* observer only */ }
+  };
+  provisionalExitTimer = setTimeout(() => {
+    provisionalExitTimer = null;
+    provisionalExitBoundTurn = null;
+    if (boundGeneration !== bridgeTranscriptGeneration) { reArm(); return; }
+    // Drain unread bytes FIRST, then verify. A global drain called here would
+    // itself ingest and could hand the head to a following type-ahead turn;
+    // ingest explicitly so the post-read state is what we verify against.
+    try { bridgeIngest(); } catch (err: any) {
+      log(`Provisional exit ingest failed: ${err.message}`);
+    }
+    // The ingest itself can discover a transcript rotation (performRotationSwitch
+    // → beginNewBridgeTranscriptGeneration), which bumps the generation while
+    // CARRYING the same bound turn object over. The pre-ingest check cannot
+    // see that; an old-generation deadline must not record its negative verdict
+    // into the new generation. Re-verify before any emit.
+    if (boundGeneration !== bridgeTranscriptGeneration) { reArm(); return; }
+    const current = bridgeQueue.peek()[0];
+    if (current !== boundTurn
+      || current.turnId !== boundTurn.turnId
+      || current.dispatchAttempt !== boundTurn.dispatchAttempt) {
+      // New bytes closed the bound turn and advanced to another turn (or the
+      // head otherwise changed): the bound turn is emitted through the normal
+      // drains below, and the new head gets its own watchdog. Never fall
+      // through to a global boundary drain here.
+      reArm();
+      return;
+    }
+    // Stand down only when an idle edge is CONFIRMED, an idle settle is
+    // polling, OR the composer is visible without an authoritative `working`
+    // hold — that last shape is the quiescence window right before the idle
+    // edge fires (PTY backends have no OSC status at all). The prompt being
+    // visible ALONGSIDE a held `working` status (a background task keeps OSC
+    // busy forever with the composer on screen) is exactly the shape this
+    // fallback must rescue, so a held working status overrides the visible
+    // prompt and the fallback fires.
+    // Boundary note: Claude's own readyPattern (/❯/) also matches while it is
+    // busy, so screenShowsPrompt() is structurally true for Claude and the
+    // held-working check is the real discriminator there. Adapters without an
+    // OSC status never hold `working`, so they stand down on the visible
+    // prompt and the fallback structurally never fires for them — they keep
+    // relying on the idle edge, by design.
+    const heldWorking = idleDetector?.programStatusHeldWorking() === true;
+    const idleImminent = idleDetector?.isIdleNow()
+      || idleTranscriptSettleInFlight
+      || (!heldWorking && idleDetector?.screenShowsPrompt() === true);
+    if (idleImminent) { reArm(); return; }
+    // Emit ONLY the bound turn:
+    //  - still awaiting its marker after the bound: apply the same wait-expired
+    //    verdict an idle settle would, then release at the terminal boundary;
+    //  - already closed by the just-ingested records (marker, next-turn start,
+    //    API error): a normal explicit drain sends exactly its real outcome.
+    // onlyTurn stops the drain before any follower regardless.
+    if (bridgeQueue.isFreshHeadAwaitingMarker(current)) {
+      // The helper itself excludes a restored/carried head (a dead writer's
+      // snapshot must not teach THIS writer it is marker-less); the exclusion
+      // has this single home, so no extra guard is taken here.
+      noteBridgeTurnCloseWaitExpired();
+      // No explicitTerminalOnly → emitReadyTurns uses its terminal-boundary
+      // drain; onlyTurn keeps it to the bound turn.
+      emitReadyTurns({
+        onlyTurn: { turnId: boundTurn.turnId, dispatchAttempt: boundTurn.dispatchAttempt },
+      });
+    } else {
+      emitReadyTurns({
+        explicitTerminalOnly: true,
+        onlyTurn: { turnId: boundTurn.turnId, dispatchAttempt: boundTurn.dispatchAttempt },
+      });
+    }
+    // bridgeIngest() above armed a fresh deadline against the pre-drain head
+    // (this callback cleared the armed handle on entry). Whatever the queue
+    // now holds — the bound turn already popped, or a gate withheld it — that
+    // deadline is stale: void it and let the CURRENT head earn its own window
+    // instead of waiting for this one to misfire and skew its bound.
+    disarmProvisionalExitWatch();
+    updateProvisionalExitWatch();
+  }, PROVISIONAL_EXIT_WATCH_MS);
+  provisionalExitTimer.unref?.();
+}
 
 function bridgeIngest(): void {
   // Defensive TTL: sweep any pending+unstarted mark whose Lark message
@@ -8938,6 +9145,9 @@ function bridgeIngest(): void {
     cliTranscriptEverExisted = true;
   }
   bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
+  // its closing records. No-op while an idle settle owns the wait.
+  updateProvisionalExitWatch();
   // Fold background task launches / stops and the main turn's start / end, so
   // the idle edge (markPromptReady) and the card know what is still running.
   observeClaudeBackgroundTasks(result.events);
@@ -9130,6 +9340,12 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // candidates are accepted only if their sessionId is in this set
   // (populated here, by pid resolver hits, and by per-tick fd probes).
   bridgeRememberSessionIdForPath(bridgeJsonlPath);
+  // Every watcher start re-arms marker verdicts for the transcript it is
+  // about to watch. Teardown already resets for a clean generation change, but
+  // a resume→fresh fallback can start a watcher without one. The
+  // baseline-existing branch re-proves `seen` from its file; fresh-empty
+  // starts undecided, so its first split final gets the provisional wait.
+  beginNewBridgeTranscriptGeneration();
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -9194,6 +9410,11 @@ function stopBridgeWatcher(): void {
   // A fresh backend must not inherit a terminal/fingerprint from the exited
   // process; durable replay is owned by the receiver with a new attempt.
   bridgeQueue.clearPending();
+  // The marker verdicts describe the generation that just exited too: the
+  // next CLI (including a fresh-empty watcher with no baseline) must relearn
+  // them from its own transcript, or an idle-expired `absent` from the old
+  // writer strips its first turn's split-final protection.
+  beginNewBridgeTranscriptGeneration();
   // A watcher teardown means this worker process has now had at least one CLI
   // generation, so any FUTURE baseline is an in-worker restart — never the
   // first-baseline cross-process recovery the journal is for. Disarm journal
@@ -9312,7 +9533,12 @@ function bridgeDrainAndMaybeEmit(opts: { releaseHeldTerminals?: boolean } = {}):
  *
  *  Caches per-path drains so a batch of turns from the same file only reads
  *  the transcript once (O(jsonl size) per distinct path). */
-function emitReadyTurns(opts: { explicitTerminalOnly?: boolean; releaseHeldTerminals?: boolean } = {}): void {
+function emitReadyTurns(opts: {
+  explicitTerminalOnly?: boolean;
+  releaseHeldTerminals?: boolean;
+  /** Pass-through identity gate for the no-idle watchdog. */
+  onlyTurn?: { turnId: string; dispatchAttempt?: number };
+} = {}): void {
   // Retire the journal entries of turns the queue dropped head-of-line. These
   // never reach `ready`, so this must run BEFORE the empty-`ready` early return
   // below — a drop very often coincides with a tick that emits nothing.
@@ -9324,11 +9550,12 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean; releaseHeldTermi
   }
   const release = opts.releaseHeldTerminals ? { releaseHeldTerminals: true } : {};
   const ready = bridgeQueue.drainEmittable(opts.explicitTerminalOnly
-    ? { explicitTerminalOnly: true, ...release }
+    ? { explicitTerminalOnly: true, ...release, onlyTurn: opts.onlyTurn }
     : {
         terminalBoundary: true,
         requireExplicitTerminalForDurable: true,
         ...release,
+        onlyTurn: opts.onlyTurn,
       });
   if (ready.length === 0) return;
   // Every popped turn is terminal (emitted or suppressed below) — retire its
@@ -11075,6 +11302,7 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  const hasAssistantFinal = result.events.some(event => event.kind === 'assistant_final');
   observeStructuredBackgroundTasks(result);
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
@@ -11090,6 +11318,10 @@ function codexBridgeIngest(opts: {
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
+  // TRAE's structured assistant_final is authoritative. Emit immediately so
+  // result delivery never depends on the remote TUI composer being recognized
+  // as ready after ANSI/CUP redraws.
+  if (structuredBridgeIs('traex') && hasAssistantFinal) emitReadyCodexTurns();
   // Transcript-driven idle: a normal `assistant_final` or no-output
   // `turn_aborted` is Codex declaring end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
@@ -11105,7 +11337,7 @@ function codexBridgeIngest(opts: {
   // about to wake the planner for another round.
   if (opts.signalIdle !== false
     && !structuredBridgeIs('antigravity')
-    && result.events.some(event => event.kind === 'assistant_final')) {
+    && hasAssistantFinal) {
     idleDetector?.fireIdle();
   }
 }
@@ -17053,6 +17285,11 @@ const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
  *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
  *  机制自然终止链，这是保险上限。 */
 const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
+/** 正面忙碌证据（适配器 busyPattern 命中）比"PTY 刚有活动"强得多：它证明 CLI 正在
+ *  执行某一轮。确认回执在多个 CLI 上要等回合出队才落盘（ZCode 实测 291s，Grok 忙碌
+ *  追加约 104s），20s 链必然在回合中途就误报。这里给 12 次（约 +240s）上限；回合
+ *  结束、忙碌页脚消失后，下一次重查立刻回到正常告警路径。 */
+const SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA = 12;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -17186,6 +17423,7 @@ function scheduleSubmitFailureNotify(
   };
   let deferredRecheckAttempts = 0;
   let activeSilenceExtra = 0;
+  let busySilenceExtra = 0;
   // With botmux's SessionStart hook armed, that signal and the transcript are
   // the only arbiters (see decideSessionStartGatedSubmitWarning).
   const sessionStartGated = readyGate.isArmed;
@@ -17271,20 +17509,6 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
-    if (sessionStartGated) {
-      const gated = decideSessionStartGatedSubmitWarning({
-        sessionStartAtMs: sessionStartSignalAtMs,
-        waitingSinceMs: activityBaselineMs,
-        nowMs: Date.now(),
-      });
-      if (!gated.warn) {
-        log(`Deferred recheck: no ${transcriptLabel} record yet (${gated.reason}) — waiting for the record or SessionStart before warning. preview="${preview}"`);
-        armDeferredRecheck();
-        return;
-      }
-      log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
-    }
-
     // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
     // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
     let submitDiagnosisScreen = '';
@@ -17301,6 +17525,47 @@ function scheduleSubmitFailureNotify(
       cliId: lastInitConfig?.cliId,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
+    // 正面忙碌证据：CLI 此刻正在跑一轮（适配器 busyPattern，如 ZCode 的
+    // "esc to interrupt"）。输入框里卡着的草稿显示的是空闲页脚，所以忙碌页脚
+    // 只可能来自"某个输入已被接受并正在执行"。确认回执在多个 CLI 上要等这一轮
+    // 出队才落盘（ZCode 实测 291s，Grok 约 104s），固定 20s 链必然在回合中途误报。
+    // 只要还在忙就继续等；回合结束、页脚消失后立刻回到下面正常的告警判定。
+    // 必须放在 SessionStart 门控之前：门控只认 transcript，而 transcript 恰好
+    // 就是迟到的那个。
+    const busyNow = (() => {
+      if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
+      try {
+        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
+      } catch { return false; }
+    })();
+    if (
+      shouldWaitThroughBusyTurn({
+        busy: busyNow,
+        diagnosisReason: submitDiagnosis.reason,
+        waitsSoFar: busySilenceExtra,
+        maxWaits: SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA,
+      })
+      && chainIsCurrent()
+    ) {
+      busySilenceExtra += 1;
+      log(`Deferred recheck sees the CLI positively mid-turn (busy footer) — input was accepted, waiting for the receipt. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+
+    if (sessionStartGated) {
+      const gated = decideSessionStartGatedSubmitWarning({
+        sessionStartAtMs: sessionStartSignalAtMs,
+        waitingSinceMs: activityBaselineMs,
+        nowMs: Date.now(),
+      });
+      if (!gated.warn) {
+        log(`Deferred recheck: no ${transcriptLabel} record yet (${gated.reason}) — waiting for the record or SessionStart before warning. preview="${preview}"`);
+        armDeferredRecheck();
+        return;
+      }
+      log(`Deferred recheck: ${gated.reason} — PTY activity is not submit evidence. preview="${preview}"`);
+    }
     if (
       submitDiagnosis.reason === 'still_active'
       && !sessionStartGated
@@ -22208,7 +22473,12 @@ async function spawnCli(
       ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
     });
   }
-  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
+  // gitConfigPairs is the single authoritative git `-c` set for this turn: the
+  // seam installs identity AND resets childEnv's channel to exactly that set,
+  // so PTY / env -i strict (which inherit childEnv wholesale) are as clean as
+  // the shell-wrappered panes; pane backends additionally carry the same list
+  // via SpawnOpts.gitConfigPairs.
+  const gitConfigPairs = prepareTurnGitConfigEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log,
     childIdentityModel,
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
@@ -23962,6 +24232,7 @@ async function spawnCli(
       cwd: spawnCwd,
       env: childEnv,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      gitConfigPairs,
     });
   } catch (err: any) {
     capturedSpawnCommand = null;
@@ -24042,6 +24313,7 @@ async function spawnCli(
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      gitConfigPairs,
       // Already removed from childEnv; shell-wrapped backends also `env -u`
       // them after the pane's rcfile / terminal-server env (session env overlay).
       unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
@@ -24593,7 +24865,10 @@ async function spawnCli(
     // sandbox (the host-side transcript reader can't resolve its mirror).
     attachStructuredBridgeAtSpawn(cfg, spawnBridge, {
       resume: effectiveResume,
-      cliSessionId: effectiveCliSessionId,
+      // A fresh RPC turn executes on an app-server thread before the remote
+      // viewer starts. Its first turn bypasses writeInput, so this is the only
+      // attach boundary that can bind the rollout from byte zero.
+      cliSessionId: effectiveCliSessionId ?? remoteThreadId,
       adapterSessionId: effectiveAdapterSessionId,
     });
   } else if (cfg.cliId === 'coco') {
@@ -24734,10 +25009,10 @@ async function spawnCli(
   // Wait (bounded) for the transcript to close it; immediate when it already
   // has, and for every CLI without a Claude transcript bridge.
   idleTranscriptSettle?.cancel();
-  const ptyIdleSettle = createTranscriptTerminalSettle({
-    awaitingTerminal: () => bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
-    onTimeout: noteBridgeTurnCloseWaitExpired,
-  });
+  const ptyIdleSettle = makeBridgeTranscriptSettle(
+    () => bridgeHeadTurnAwaitingTerminal({ startedOnly: true }),
+    noteBridgeTurnCloseWaitExpired,
+  );
   idleTranscriptSettle = ptyIdleSettle;
 
   // Set up idle detection. Remote backends (riff / mojo) have no PTY output and
@@ -24817,10 +25092,10 @@ async function spawnCli(
     onPtyData(data);
   });
   if (observedBackend instanceof HerdrBackend) {
-    const transcriptSettle = createTranscriptTerminalSettle({
-      awaitingTerminal: () => bridgeHeadTurnAwaitingTerminal(),
-      onTimeout: noteBridgeTurnCloseWaitExpired,
-    });
+    const transcriptSettle = makeBridgeTranscriptSettle(
+      () => bridgeHeadTurnAwaitingTerminal(),
+      noteBridgeTurnCloseWaitExpired,
+    );
     const promptReadyEdgesAtSpawn = promptReadyEdges;
     observedBackend.onAgentStatus((status) => {
       if (backend !== observedBackend) return;
@@ -28751,6 +29026,10 @@ process.on('message', async (raw: unknown) => {
             deferred.identity,
             deferred.generation,
           );
+          // A fast first RPC turn may persist task_complete while the remote
+          // viewer is still spawning. Drain at the attach/deferral boundary
+          // instead of waiting for the next bridge timer tick.
+          codexBridgeDrainAndMaybeEmit({ signalIdle: false });
         }
 
         // Queue the initial prompt — flushed when CLI shows idle.

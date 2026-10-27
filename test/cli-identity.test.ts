@@ -14,7 +14,7 @@
  * Run:  npx vitest run --project unit test/cli-identity.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +38,9 @@ import {
   renderGitAskpassScript,
   installGitAskpass,
   gitIdentityConfigEnv,
+  gitIdentityConfigPairs,
+  applyTurnGitConfigEnv,
+  prepareTurnGitConfigEnv,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -237,13 +240,207 @@ describe('tmux env passthrough covers the identity vars', () => {
     }
   });
 
-  // The numbered git-config keys are listed literally, so the list has to match
-  // however many entries gitIdentityConfigEnv actually emits.
-  it('forwards every numbered git-config key that is actually emitted', async () => {
-    const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
-    const emitted = Object.keys(gitIdentityConfigEnv('/tmp/askpass', 'git.example.com'));
-    for (const key of emitted) {
-      expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
+  // The numbered git-config keys are no longer a static pane allowlist: the
+  // pane transport rebuilds them from the turn-authored pair carrier
+  // (SpawnOpts.gitConfigPairs), so the contract is that every pair
+  // gitIdentityConfigPairs emits reaches a pane via buildBotmuxEnvAssignments
+  // with COUNT equal to the pair count.
+  it('forwards every emitted git-config pair through the pane carrier', async () => {
+    const { buildBotmuxEnvAssignments } = await import('../src/adapters/backend/tmux-backend.js');
+    const pairs = gitIdentityConfigPairs('/tmp/askpass', 'git.example.com');
+    const assignments = buildBotmuxEnvAssignments(
+      // Even a poisoned ambient block (pushed-up COUNT, high-index pairs) must
+      // not influence the carrier-derived output.
+      { GIT_CONFIG_COUNT: '14', GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/evil' },
+      undefined,
+      undefined,
+      pairs,
+    );
+    expect(assignments).toContain(`GIT_CONFIG_COUNT=${pairs.length}`);
+    expect(assignments).not.toContain(expect.stringMatching(/GIT_CONFIG_KEY_(?:[3-9]|\d{2})/));
+    expect(assignments).not.toContain('GIT_CONFIG_KEY_14=core.hooksPath');
+    pairs.forEach(([key, value], i) => {
+      expect(assignments).toContain(`GIT_CONFIG_KEY_${i}=${key}`);
+      expect(assignments).toContain(`GIT_CONFIG_VALUE_${i}=${value}`);
+    });
+  });
+
+  it('zeroes an ambient GIT_CONFIG_COUNT when no pair carrier is forwarded', async () => {
+    const { buildBotmuxEnvAssignments } = await import('../src/adapters/backend/tmux-backend.js');
+    const assignments = buildBotmuxEnvAssignments({ GIT_CONFIG_COUNT: '14' });
+    expect(assignments).toContain('GIT_CONFIG_COUNT=0');
+    expect(assignments.filter(a => a.startsWith('GIT_CONFIG_KEY_'))).toEqual([]);
+  });
+});
+
+describe('applyTurnGitConfigEnv resets the direct-exec channel', () => {
+  it('wipes an inherited pushed-up count and high-index pairs, then writes only the authored block', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GIT_CONFIG_COUNT: '14',
+      GIT_CONFIG_KEY_0: 'stale.k0', GIT_CONFIG_VALUE_0: 'stale-v0',
+      GIT_CONFIG_KEY_2: 'stale.k2', GIT_CONFIG_VALUE_2: 'stale-v2',
+      GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/evil',
+      UNRELATED: 'keep',
+    };
+    applyTurnGitConfigEnv(env, gitIdentityConfigPairs('/tmp/askpass', 'git.example.com'));
+    expect(env.GIT_CONFIG_COUNT).toBe('3');
+    expect(env.GIT_CONFIG_KEY_0).toBe('credential.https://git.example.com.helper');
+    expect(env.GIT_CONFIG_KEY_2).toBe('url.https://git.example.com/.insteadOf');
+    expect(env.GIT_CONFIG_KEY_14).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_14).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_3).toBeUndefined();
+    expect(env.UNRELATED).toBe('keep');
+  });
+
+  it('leaves no GIT_CONFIG_* trace with zero authored pairs even under ambient COUNT=14', () => {
+    const env: NodeJS.ProcessEnv = {
+      GIT_CONFIG_COUNT: '14', GIT_CONFIG_KEY_0: 'k', GIT_CONFIG_VALUE_0: 'v', UNRELATED: 'keep',
+    };
+    applyTurnGitConfigEnv(env, []);
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
+    expect(env.UNRELATED).toBe('keep');
+  });
+});
+
+describe('prepareTriggerUserCliEnv returns the turn git-config carrier', () => {
+  it('returns the host-scoped attribution pairs for an installed bytedcli wrapper', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'pr2203-prepare-data-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'pr2203-prepare-bin-'));
+    const bytedcli = join(binDir, 'bytedcli');
+    writeFileSync(bytedcli, '#!/bin/sh\nexit 0\n');
+    chmodSync(bytedcli, 0o755);
+    const env: NodeJS.ProcessEnv = { PATH: binDir };
+    const policy = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+      gitHost: 'git.example.com',
+    };
+    try {
+      const pairs = prepareTriggerUserCliEnv(
+        env, dataDir, 'sess-carrier', policy as never, () => {}, 'single',
+      );
+      expect(pairs).toHaveLength(3);
+      expect(pairs.map(([key]) => key)).toEqual([
+        'credential.https://git.example.com.helper',
+        'url.https://git.example.com/.insteadOf',
+        'url.https://git.example.com/.insteadOf',
+      ]);
+      expect(pairs[1][1]).toBe('ssh://git@git.example.com/');
+      expect(pairs[2][1]).toBe('git@git.example.com:');
+      expect(env.GIT_ASKPASS).toBeDefined();
+      expect(existsSync(env.GIT_ASKPASS as string)).toBe(true);
+      expect(pairs[0][1]).toContain(env.GIT_ASKPASS as string);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression for the RPC app-server gap (engineEnv): that spawn site used to
+// call only prepareTriggerUserCliEnv, dropping the carrier and skipping the
+// channel reset, so an ambient pushed-up COUNT / foreign pair / per-bot pair
+// reached git inside the model's inherit:'all' shell tools. Every spawn site
+// (native pane, PTY, env -i strict, RPC engine) must funnel through the seam.
+describe('prepareTurnGitConfigEnv resets every spawn site channel', () => {
+  let dataDir = '';
+  let binDir = '';
+  const gitEnvBase = (): NodeJS.ProcessEnv => ({
+    PATH: process.env.PATH,
+    HOME: tmpdir(),
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+  });
+  const identityPolicy = () => ({
+    enabled: true,
+    tools: ['bytedcli'],
+    fallback: 'bot-identity' as const,
+    gitHost: 'git.example.com',
+  });
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'pr2203-seam-data-'));
+    binDir = mkdtempSync(join(tmpdir(), 'pr2203-seam-bin-'));
+    const bytedcli = join(binDir, 'bytedcli');
+    writeFileSync(bytedcli, '#!/bin/sh\nexit 0\n');
+    chmodSync(bytedcli, 0o755);
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  const poisonShapes: Record<string, NodeJS.ProcessEnv> = {
+    'field COUNT=14 + pair@14': {
+      GIT_CONFIG_COUNT: '14',
+      GIT_CONFIG_KEY_0: 'stale.k', GIT_CONFIG_VALUE_0: 'sv',
+      GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/gcw/evil-hooks',
+    },
+    'bare COUNT=14': { GIT_CONFIG_COUNT: '14' },
+    'forged contiguous pair@0 (per-bot or ambient)': {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/tmp/gcw/evil-hooks',
+    },
+  };
+
+  for (const [shapeName, poison] of Object.entries(poisonShapes)) {
+    it(`identity ON: leaves only the authored block for ${shapeName}`, () => {
+      const env: NodeJS.ProcessEnv = { ...gitEnvBase(), PATH: `${binDir}:${process.env.PATH ?? ''}`, ...poison };
+      const pairs = prepareTurnGitConfigEnv(
+        env, dataDir, 'sess-seam-on', identityPolicy(), () => {}, 'single',
+      );
+      expect(pairs).toHaveLength(3);
+      expect(env.GIT_CONFIG_COUNT).toBe('3');
+      expect(env.GIT_CONFIG_KEY_0).toBe('credential.https://git.example.com.helper');
+      expect(env.GIT_CONFIG_KEY_14).toBeUndefined();
+      expect(env.GIT_CONFIG_VALUE_14).toBeUndefined();
+      // No foreign hooksPath survives anywhere in the channel.
+      for (const key of Object.keys(env)) {
+        if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) expect(env[key]).not.toContain('evil-hooks');
+      }
+    });
+
+    it(`identity OFF: empties the whole channel for ${shapeName} (the engineEnv gap)`, () => {
+      const env: NodeJS.ProcessEnv = { ...gitEnvBase(), PATH: `${binDir}:${process.env.PATH ?? ''}`, ...poison };
+      const pairs = prepareTurnGitConfigEnv(
+        env, dataDir, 'sess-seam-off', undefined, () => {}, 'single',
+      );
+      expect(pairs).toEqual([]);
+      expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+      for (const key of Object.keys(env)) {
+        expect(key, key).not.toMatch(/^GIT_CONFIG_(KEY|VALUE)_\d+$/);
+      }
+      // The whole point: real git parses and just finds no key (exit 1), never 128.
+      const r = spawnSync('git', ['config', '--get', 'x.nonexistent'], { env, encoding: 'utf8' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).not.toContain('missing config');
+    });
+  }
+
+  it('identity ON: the authored block actually reaches a real git invocation', () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'pr2203-seam-repo-'));
+    try {
+      spawnSync('git', ['init', '-q'], { cwd: repoDir, env: { PATH: process.env.PATH }, encoding: 'utf8' });
+      const env: NodeJS.ProcessEnv = {
+        ...gitEnvBase(), HOME: repoDir, PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        GIT_CONFIG_COUNT: '14', GIT_CONFIG_KEY_14: 'core.hooksPath', GIT_CONFIG_VALUE_14: '/tmp/gcw/evil-hooks',
+      };
+      prepareTurnGitConfigEnv(env, dataDir, 'sess-seam-git', identityPolicy(), () => {}, 'single');
+      const helper = spawnSync('git', ['config', '--get', 'credential.https://git.example.com.helper'], {
+        cwd: repoDir, env, encoding: 'utf8',
+      });
+      expect(helper.status, helper.stderr).toBe(0);
+      // Ambient high-index hooksPath must be gone; the fresh repo has none of
+      // its own either, so the channel is the only place it could come from.
+      const hooks = spawnSync('git', ['config', '--get', 'core.hooksPath'], { cwd: repoDir, env, encoding: 'utf8' });
+      expect(hooks.status).toBe(1);
+      expect(hooks.stdout).toBe('');
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
     }
   });
 });

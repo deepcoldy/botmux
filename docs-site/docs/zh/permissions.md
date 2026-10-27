@@ -69,7 +69,7 @@ botmux 的权限回答两个问题：**谁能跟 bot 说话**（canTalk，对话
 
 同一台机器（同一份 `bots.json`）上的其它 Bot 本来就能和本 Bot 对话。**owner 是同一个人**的同机 Bot 还额外有三项能力（默认开启）：
 
-- **没认出也能对话**：本 Bot 还没学到它的身份时，它的消息照样放行、不弹授权卡——比如它在话题群里不 @ 直接发顶层消息，而本 Bot 开了 `autoStartOnNewTopic`。所以 `botmux create-group` 建群时也不再给同 owner 的同机 Bot 之间写两两本群授权（owner 不同的照写）。
+- **没认出也能对话**：本 Bot 还没学到它的身份时，它的消息照样放行、不弹授权卡——比如它在话题群里不 @ 直接发顶层消息，而本 Bot 开了 `autoStartOnNewTopic`。所以 `botmux create-group` 建群时也不再给同 owner 的同机 Bot 之间写两两本群授权（owner 不同的照写）。如果之后对已有群关闭 `trustSameOwnerBots`，这一对 Bot 没有历史本群授权可回退，需要重新 `/grant`；管理员身份快照暂时缺失或过期时，也可由下一次 @ 通过实时名单冷启动自愈。
 - **执行管理命令**：可以对本 Bot 执行 `/cd`、`/repo`、`/restart`、`/close` 等管理命令，与跨部署的团队 Bot 同权。`/botconfig`、`/dashboard`、`/term` 这类只认管理员名单的命令不受影响。
 - **点名授权**：它在群里发消息 @ 本 Bot 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**，与 owner 在授权卡上点「本群」同效：写 `chatGrants`，只能对话，额度 / 有效期取 `/grant` 的默认值（`messageQuota.defaultLimit` / `grantDefaultDurationMs`，未配置时 3 条 / 1 小时），`restrictGrantCommands` 照常生效。结果以一张授权结果卡回在那条消息下，@ 被授权的真人（被 @ 的其他 Bot 只显示名字，不发 @ 通知）。已经能对话的人、@所有人、发送方自己和黑名单用户跳过；只在群聊生效。
 

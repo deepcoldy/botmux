@@ -266,6 +266,21 @@ describe('schedule-store', () => {
       const store2 = await freshImport();
       expect(store2.getTask(task.id)?.ownerOpenId).toBe('ou_creator');
     });
+
+    it('keeps a claim-card run-as identity across reloads and drops a malformed one', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask(TASK_PARAMS);
+      const claim = {
+        openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: TEST_APP,
+        claimedAt: '2026-10-26T10:00:00.000Z',
+      };
+      store1.projectAuthoritativeTask({ ...task, runAsClaim: claim }, TEST_APP);
+      const store2 = await freshImport();
+      expect(store2.getTask(task.id)?.runAsClaim).toEqual(claim);
+      store2.projectAuthoritativeTask({ ...task, runAsClaim: { ...claim, unionId: 'ou_not_a_union' } }, TEST_APP);
+      const store3 = await freshImport();
+      expect(store3.getTask(task.id)?.runAsClaim).toBeUndefined();
+    });
   });
 
   describe('getTask', () => {

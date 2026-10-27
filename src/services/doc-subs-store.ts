@@ -122,7 +122,8 @@ export type DocWatchOutcome =
   | 'not-mentioned'
   | 'self-authored'
   | 'audit-rejected'
-  | 'poll-failed';
+  | 'poll-failed'
+  | 'poll-circuit-open';
 
 /** `lastError` 落盘上限，避免一条长报错把订阅表撑大。 */
 export const DOC_WATCH_LAST_ERROR_MAX = 300;

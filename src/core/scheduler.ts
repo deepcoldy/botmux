@@ -10,7 +10,8 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleRunAsClaim } from '../types.js';
+import { parseScheduleRunAsClaim } from './schedule-run-as.js';
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
@@ -171,6 +172,30 @@ export function setExecuteCallback(
   executeCallback = cb;
 }
 
+/**
+ * 连续失败告警回调：某个任务连续失败达到阈值（且本串尚未告警过）时触发一次，
+ * daemon 注入「私信任务相关管理员」的投递；成功恢复后水印清零，允许下次再报。
+ * 数据层阈值判定在 schedule-store.markRun，本回调只负责投递，纯通知失败
+ * 不影响任务状态。
+ */
+export type ScheduleFailureAlert = (task: ScheduledTask, consecutiveFailures: number, lastError: string | undefined) => void;
+let failureAlert: ScheduleFailureAlert | null = null;
+export function setScheduleFailureAlert(cb: ScheduleFailureAlert | null): void {
+  failureAlert = cb;
+}
+
+function emitFailureAlertIfNeeded(
+  task: ScheduledTask,
+  result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number },
+): void {
+  if (!result.crossedFailureThreshold || !failureAlert) return;
+  try {
+    failureAlert(task, result.consecutiveFailures ?? scheduleStore.SCHEDULE_FAILURE_ALERT_THRESHOLD, task.lastError);
+  } catch (err) {
+    logger.warn(`[scheduler] failure alert delivery failed for ${task.id}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function createExecutionContext(
   trigger: ScheduleExecutionContext['trigger'],
   startedAt = new Date().toISOString(),
@@ -270,29 +295,37 @@ function markRuntimeRun(
   error?: string,
   deliveryError?: string,
   runId?: string,
-): void {
+): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
   if (!authorityStore) {
-    scheduleStore.markRun(id, success, error, deliveryError, runId);
-    return;
+    return scheduleStore.markRun(id, success, error, deliveryError, runId) ?? {};
   }
-  if (!runtimeTask(id)) return;
+  if (!runtimeTask(id)) return {};
+  let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
+    const tracking = scheduleStore.nextFailureTracking(task, success);
+    result = {
+      crossedFailureThreshold: tracking.crossedFailureThreshold,
+      consecutiveFailures: tracking.consecutiveFailures,
+    };
     return {
       ...task,
       lastRunAt: new Date().toISOString(),
       lastStatus: success ? 'ok' : 'error',
       lastError: success ? undefined : error,
       lastDeliveryError: deliveryError,
+      consecutiveFailures: tracking.consecutiveFailures,
+      failureAlertSent: tracking.failureAlertSent,
       repeat,
       enabled: finiteComplete || task.parsed.kind === 'once' ? false : task.enabled,
       disabledReason: finiteComplete || task.parsed.kind === 'once' ? 'once_completed' : task.disabledReason,
       nextRunAt: finiteComplete || task.parsed.kind === 'once' ? undefined : task.nextRunAt,
     };
   });
+  return result;
 }
 
 function recordDispatchOutcome(
@@ -810,7 +843,9 @@ async function tick(): Promise<void> {
         .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
-          markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+          const runResult = markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
+          const freshTask = runtimeTask(taskId) ?? claimedTask;
+          emitFailureAlertIfNeeded(freshTask, runResult);
           cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
@@ -824,13 +859,15 @@ async function tick(): Promise<void> {
           emitScheduleFiredHook(claimedTask, 'error', err);
         });
     } else {
-      markRuntimeRun(
+      // 回调缺失本身是持续故障：阈值 crossed 时同样要告警，不能把水印静默落库。
+      const runResult = markRuntimeRun(
         claimedTask.id,
         false,
         'scheduler execute callback is not initialised',
         undefined,
         executionContext.runId,
       );
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
     }
   }
 }
@@ -873,13 +910,16 @@ export function startScheduler(): void {
   const startupTasks = runtimeTasks();
   for (const task of startupTasks) {
     if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
-    markRuntimeRun(
+    // 重启把在途任务对账为失败时，水印也可能在这一步跨过阈值——必须补发告警，
+    // 否则 failureAlertSent 已落库而私信永不发出，此后持续真失败也不再 crossed。
+    const runResult = markRuntimeRun(
       task.id,
       false,
       'schedule run interrupted by daemon restart',
       undefined,
       task.lastRunId,
     );
+    emitFailureAlertIfNeeded(runtimeTask(task.id) ?? task, runResult);
   }
   const tasks = runtimeTasks();
   const enabled = tasks.filter(t => t.enabled);
@@ -1234,6 +1274,45 @@ export function runTaskNow(id: string): boolean {
   return true;
 }
 
+export type ClaimTaskRunAsResult =
+  | { ok: true; task: ScheduledTask; previous?: ScheduleRunAsClaim }
+  | { ok: false; error: 'not_found' | 'stale' | 'already_claimant'; current?: ScheduleRunAsClaim };
+
+/**
+ * Record `claim` as the task's run-as identity (claim card). Compare-and-set
+ * on the claim the clicked card was rendered for — `expectedClaimedAt` is that
+ * claim's time, or null for a card that showed no claim — evaluated inside the
+ * authority write transaction, so of two near-simultaneous clicks only the
+ * first lands and a stale card can never overwrite a newer claim.
+ */
+export function claimTaskRunAs(
+  id: string,
+  appId: string,
+  claim: ScheduleRunAsClaim,
+  expectedClaimedAt: string | null,
+): ClaimTaskRunAsResult {
+  assertScheduleAuthorityAvailable();
+  let refusal: Extract<ClaimTaskRunAsResult, { ok: false }> | undefined;
+  let previous: ScheduleRunAsClaim | undefined;
+  const task = mutateRuntimeTask(id, current => {
+    const existing = parseScheduleRunAsClaim(current.runAsClaim);
+    if ((existing?.claimedAt ?? null) !== expectedClaimedAt) {
+      refusal = { ok: false, error: 'stale', ...(existing ? { current: existing } : {}) };
+      return undefined;
+    }
+    if (existing?.unionId === claim.unionId) {
+      refusal = { ok: false, error: 'already_claimant', current: existing };
+      return undefined;
+    }
+    previous = existing;
+    return { ...current, runAsClaim: claim };
+  }, appId);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (refusal) return refusal;
+  publishScheduleTaskUpdated(id, { runAsClaim: claim });
+  return { ok: true, task, ...(previous ? { previous } : {}) };
+}
+
 export function getNextRun(id: string): Date | null {
   const task = runtimeTask(id);
   if (!task?.nextRunAt) return null;
@@ -1282,7 +1361,8 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      const runResult = markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      emitFailureAlertIfNeeded(runtimeTask(claimedTask.id) ?? claimedTask, runResult);
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
