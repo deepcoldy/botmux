@@ -538,6 +538,25 @@ describe('claim card buttons', () => {
     expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: lapsed.messageId, status: 'claimed' });
   });
 
+  it('a click on an older copy of the card does not move the record of the current one', async () => {
+    const h = harness();
+    const first = await pending(h);
+    await h.click('schedule_identity_claim', first.card, ALICE, first.messageId);
+    h.allowed.delete(ALICE.open);
+    h.tick();
+    await h.fire();
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: 'om_card_2', status: 'pending' });
+    h.allowed.add(ALICE.open);
+    // Someone still looking at the very first (unclaimed) copy clicks it.
+    const stale = await h.click('schedule_identity_claim', first.card, BOB, first.messageId);
+    expect(stale.toast.content).toContain('已刷新');
+    expect(store.getClaimCard(APP, 'a1b2c3d4')).toMatchObject({ messageId: 'om_card_2', status: 'pending' });
+    // So the next fire still settles the card everyone sees now.
+    h.tick();
+    await h.fire();
+    expect(h.updates.map(u => u.messageId)).toEqual(['om_card_2']);
+  });
+
   it('settles the pending card at the next fire once the claimant can act again', async () => {
     const h = harness();
     const card = await pending(h);
