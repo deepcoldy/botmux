@@ -2804,6 +2804,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4881,6 +4883,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6011,6 +6016,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),

@@ -667,6 +667,9 @@ export interface Session {
     committedAt: string;
     dispatchAttempt?: number;
   }>;
+  /** Confirmed settings for an exact durable Inbox task that may retry before
+   * provider submission. Never itself authorizes a business-turn replay. */
+  codexEffortTaskConfirmations?: import('./services/codex-effort-task-state.js').EffortTaskConfirmation[];
   /** Explicit opt-in lease for one authorization-inheriting long-running task.
    * The field name is retained for persisted-state compatibility. */
   readonlyTaskContinuation?: import('./services/readonly-task-continuation.js').ReadonlyTaskContinuationState;

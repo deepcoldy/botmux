@@ -321,6 +321,14 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
 - 菜单完成需要原生设置回执和空输入框同时出现。tmux 的恢复 hold 使用当前 viewport 并去掉 ANSI 控制符；不把 full-history ANSI 种子当作纯文本输入证据。
 - 不重写 legacy oracle；有效 effort 多行任务的路由扩展登记于 INTENTIONAL，并增加有效档位的定向夹具。
 
+### Codex effort 已确认任务的持久重试（2026-10-27）
+
+- primary Inbox 的同一消息重试保存已确认设置阶段，绑定任务/发送者/资源/回复上下文的 hash、原 CLI/native/Worker 代次；不得仅凭当前 effort 值重复打开菜单或复用另一条消息的确认。
+- 设置确认后、本地及 canonical 预准入检查点完成后才尝试任务准入。检查点使用既有同身份 active Session 的 exact lane，保留 admission/control 历史；不产生当前输入的提交回执。
+- 临时未就绪或检查点故障继续 retry；claim 丢失与代替换停止投递。direct IPC 接纳在原生 provider submit proof 到达之前保持 retry；proof 到达后同消息只完成 Inbox，不二次发任务。
+- canonical admission 以同一次原子写保存 terminal 处理证明，ignored 也先持久化 retirement；终态只用于去重和容量回收，不能授权发送任务。pending 不被淘汰，canonical/local 合并保留 pending 且 terminal 不回退。
+- 跨 principal 的 settle、inserted、duplicate merged 三条接纳路径及 await 后代替换均经真实 handleThreadReply 和删除式变异覆盖。
+
 按分期在 `feat/command_op` 上实施时的决策与拿不准的点，供事后追溯。每期以一个标题含「收口」的 commit 作为分界，中间可以有多次提交。
 
 ### PR-1 头部 `/repo wt`（2026-09-11 夜）

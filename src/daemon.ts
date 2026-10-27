@@ -127,6 +127,7 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import {
@@ -28055,6 +28056,9 @@ async function handleThreadReplyAdmitted(
       if (accepted) {
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
+        if (ctx.effortTaskReentry && ctx.durablePrimaryDispatch && !hasDurablePrimaryInputCommit(ds, parsed.messageId)) {
+          retryDurablePrimaryIngress(ctx, 'attached task provider submit receipt is still pending');
+        }
         beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller) {
           setActiveInteractiveTurn(
@@ -28072,6 +28076,7 @@ async function handleThreadReplyAdmitted(
               parsed.messageId,
               ctx.durablePrimaryDispatch.signal,
             );
+            if (ctx.effortTaskReentry && ctx.ingressAdmission) delete ctx.ingressAdmission.retryReason;
           } catch (error) {
             if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
             retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
@@ -28778,16 +28783,23 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       replyRootId,
     });
     invocationDeps.submitEffortTask = async (ds, message, text) => {
+      const committed = !!ctx.durablePrimaryDispatch && hasDurablePrimaryInputCommit(ds, message.messageId);
+      const sessionId = ds.session.sessionId;
       const worker = ds.worker;
+      const workerGeneration = ds.workerGeneration;
       const generation = ds.session.workerGeneration;
       const nativeId = ds.session.cliSessionId;
       const current = () => activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId)) === ds
-        && ds.worker === worker && !!worker && !worker.killed
-        && ds.session.workerGeneration === generation && ds.session.cliSessionId === nativeId
+        && ds.session.sessionId === sessionId
+        && !ctx.durablePrimaryDispatch?.signal.aborted
+        && (committed || (ds.worker === worker && !!worker && !worker.killed
+          && ds.workerGeneration === workerGeneration
+          && ds.session.workerGeneration === generation && ds.session.cliSessionId === nativeId))
         && ds.session.status === 'active';
       const taskCtx: RoutingContext = { ...ctx, ingressAdmission: { admitted: false },
         cascadeBodyReentry: true, effortTaskReentry: true, commandTrigger: undefined };
       if (!current()) return false;
+      if (ctx.durablePrimaryDispatch?.signal.aborted) return false;
       try {
         await handleThreadReplyAdmitted(data, taskCtx, undefined, {
           parsed: { ...message, content: text }, resources: [...resources],
@@ -28802,6 +28814,19 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // retry of an input already owned by a worker or a durable FIFO.
       return taskCtx.ingressAdmission?.admitted === true || !!taskCtx.ingressAdmission?.retryReason;
     };
+    if (ctx.durablePrimaryDispatch) {
+      invocationDeps.effortTaskReplay = {
+        inputHash: effortTaskFingerprint({ ...parsed, content: commandContent }, resources),
+        checkpoint: async (session, isCurrent) => {
+          if (ctx.durablePrimaryDispatch?.signal.aborted) throw new Error('Effort task Inbox claim was aborted');
+          if (!ctx.checkpointPreAdmissionSession) throw new Error('Effort task canonical checkpoint is unavailable');
+          await ctx.checkpointPreAdmissionSession(session, isCurrent);
+          if (ctx.durablePrimaryDispatch?.signal.aborted) throw new Error('Effort task Inbox claim was aborted');
+        },
+        retry: reason => { retryDurablePrimaryIngress(ctx, reason); },
+        complete: () => markIngressAdmitted(ctx),
+      };
+    }
     const effectiveThreadChatId = existingDs?.chatId ?? chatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);
     if (restrictedText) {
