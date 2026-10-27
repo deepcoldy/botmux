@@ -517,7 +517,7 @@ import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclare
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { SLASH_COMMAND_SHAPE } from './core/passthrough-commands.js';
-import { AutoCompactCoordinator, isAutoCompactEligible } from './core/auto-compact.js';
+import { AutoCompactCoordinator, isAutoCompactEligible, supportsNativeAutoCompact } from './core/auto-compact.js';
 import type { CommandHandlerDeps } from './core/command-handler.js';
 import { findInheritablePeer } from './core/inherit-peer.js';
 import { isCallbackUrl, handleCallbackUrl } from './utils/user-token.js';
@@ -5996,11 +5996,13 @@ function autoCompactEligible(ds: DaemonSession): boolean {
     usageLimited: !!ds.usageLimit,
     agentAttention: !!ds.agentAttention,
     finalDeliveriesInFlight: ds.finalOutputDeliveriesInFlight?.size ?? 0,
+    backgroundTaskCount: ds.backgroundTaskCount ?? 0,
     adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom,
     headless: !!ds.session.headless,
     vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
     remoteRunner: backendType === 'remote-runner',
-    supportsCompact: resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
+    supportsCompact: supportsNativeAutoCompact(effectiveCliId)
+      && resolvePassthroughCommands(ds.larkAppId, effectiveCliId).has('/compact'),
   });
 }
 
@@ -6012,6 +6014,9 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
     readThreshold: autoCompactThreshold,
     readPercent: () => autoCompactPercent(ds),
     eligible: () => autoCompactEligible(ds),
+    onError: (error) => logger.warn(
+      `[${tag(ds)}] Auto compact coordinator failed safely: ${error instanceof Error ? error.message : String(error)}`,
+    ),
     trigger: (threshold) => {
       if (!autoCompactEligible(ds)) return false;
       const anchor = sessionAnchorId(ds);
@@ -6025,6 +6030,7 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
         substitute: false,
         inThread: ds.scope === 'thread',
         turnId,
+        requireSafeComposer: true,
         onDelivered: () => logger.info(
           `[${tag(ds)}] Auto compact admitted at context >= ${threshold}%`,
         ),
@@ -23411,6 +23417,9 @@ function deliverPassthroughToExistingSession(
      *  `quoteTargetId` 仍指向真实消息，所以派生 turn 期间 current-turn provenance 的
      *  `quoteTargetId === turnId` 校验不成立——级联里的透传本就不产生需要归属的 CLI 回复。 */
     turnId?: string;
+    /** Unattended maintenance must only write when the worker can prove that
+     * the real, empty CLI composer is visible. */
+    requireSafeComposer?: true;
   },
 ): void {
   const turnId = turn.turnId ?? turn.messageId;
@@ -23456,6 +23465,7 @@ function deliverPassthroughToExistingSession(
       // mojo turn, so it needs the live credential snapshot too.
       ...(mojoLivePatchForSession(ds) ?? {}),
       turnId,
+      ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
     });
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
@@ -31003,7 +31013,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onSessionClosed: finalizeClosedXpiSharedCwdMember,
+    async onSessionClosed(session, context) {
+      autoCompactCoordinator.cancel(session.sessionId);
+      await finalizeClosedXpiSharedCwdMember(session, context);
+    },
     onReceiverResetReady(_ds, context) {
       acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
         context.sessionId,

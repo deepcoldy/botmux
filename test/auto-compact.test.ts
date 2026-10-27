@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   AutoCompactCoordinator,
   isAutoCompactEligible,
+  supportsNativeAutoCompact,
   type AutoCompactEligibilitySnapshot,
 } from '../src/core/auto-compact.js';
+import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 describe('AutoCompactCoordinator', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -113,6 +117,76 @@ describe('AutoCompactCoordinator', () => {
     vi.advanceTimersByTime(1_000);
     expect(trigger).toHaveBeenCalledWith(85);
   });
+
+  it.each(['readThreshold', 'readPercent', 'eligible', 'trigger'] as const)(
+    'contains %s failures and leaves coordinator state self-consistent',
+    (stage) => {
+      const onError = vi.fn();
+      const trigger = vi.fn(() => {
+        if (stage === 'trigger') throw new Error('trigger failed');
+        return true;
+      });
+      let percentReads = 0;
+      const coordinator = new AutoCompactCoordinator(1_000, 60_000, () => Date.now());
+      const observation = {
+        sessionId: 's1', idle: true, threshold: 75,
+        readThreshold: () => {
+          if (stage === 'readThreshold') throw new Error('threshold failed');
+          return 75;
+        },
+        readPercent: () => {
+          percentReads++;
+          if (stage === 'readPercent' && percentReads > 1) throw new Error('percent failed');
+          return 90;
+        },
+        eligible: () => {
+          if (stage === 'eligible') throw new Error('eligibility failed');
+          return true;
+        },
+        trigger,
+        onError,
+      };
+
+      coordinator.observe(observation);
+      expect(() => vi.advanceTimersByTime(1_000)).not.toThrow();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: `${stage === 'readThreshold' ? 'threshold' : stage === 'readPercent' ? 'percent' : stage === 'eligible' ? 'eligibility' : 'trigger'} failed` }));
+      expect(vi.getTimerCount()).toBe(0);
+
+      if (stage === 'trigger') {
+        // Dispatch claimed the cooldown before the failing write, so a noisy
+        // worker cannot create a tight retry loop.
+        coordinator.observe({ ...observation, trigger: () => true });
+        expect(vi.getTimerCount()).toBe(0);
+      } else {
+        // Pre-dispatch failures do not poison the session: a later healthy
+        // observation can arm and complete normally.
+        coordinator.observe({
+          ...observation,
+          readThreshold: () => 75,
+          readPercent: () => 90,
+          eligible: () => true,
+          trigger: () => true,
+        });
+        expect(vi.getTimerCount()).toBe(1);
+        expect(() => vi.advanceTimersByTime(1_000)).not.toThrow();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+
+  it('contains the initial percentage read failure', () => {
+    const onError = vi.fn();
+    const coordinator = new AutoCompactCoordinator();
+    expect(() => coordinator.observe({
+      sessionId: 's1', idle: true, threshold: 75,
+      readThreshold: () => 75,
+      readPercent: () => { throw new Error('bot unregistered'); },
+      eligible: () => true,
+      trigger: () => true,
+      onError,
+    })).not.toThrow();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'bot unregistered' }));
+  });
 });
 
 describe('isAutoCompactEligible', () => {
@@ -134,6 +208,7 @@ describe('isAutoCompactEligible', () => {
     usageLimited: false,
     agentAttention: false,
     finalDeliveriesInFlight: 0,
+    backgroundTaskCount: 0,
     adopted: false,
     headless: false,
     vcMeetingReceiver: false,
@@ -163,6 +238,7 @@ describe('isAutoCompactEligible', () => {
     ['usageLimited', true],
     ['agentAttention', true],
     ['finalDeliveriesInFlight', 1],
+    ['backgroundTaskCount', 1],
     ['adopted', true],
     ['headless', true],
     ['vcMeetingReceiver', true],
@@ -174,4 +250,111 @@ describe('isAutoCompactEligible', () => {
       expect(isAutoCompactEligible({ ...eligible, [key]: value })).toBe(false);
     },
   );
+});
+
+describe('supportsNativeAutoCompact', () => {
+  it('admits only CLIs with a confirmed native compact command', () => {
+    expect(supportsNativeAutoCompact('claude-code')).toBe(true);
+    expect(supportsNativeAutoCompact('codex')).toBe(true);
+    expect(supportsNativeAutoCompact('traex')).toBe(true);
+    expect(supportsNativeAutoCompact('grok')).toBe(true);
+    expect(supportsNativeAutoCompact('seed')).toBe(false);
+    expect(supportsNativeAutoCompact('relay')).toBe(false);
+    expect(supportsNativeAutoCompact('gemini')).toBe(false);
+    expect(supportsNativeAutoCompact('cursor')).toBe(false);
+  });
+});
+
+describe('auto-compact unattended worker write gate', () => {
+  const RULE = '─'.repeat(80);
+  const COMPOSER = [RULE, '❯ ', RULE].join('\n');
+  const PERMISSION_DIALOG = [
+    '⏺ BOTMUX_NOTHING_TO_SEND',
+    '',
+    RULE,
+    ' Bash command',
+    '',
+    '   rm -rf build',
+    '   Clean the build directory',
+    '',
+    ' Do you want to proceed?',
+    ' ❯ 1. Yes',
+    "   2. Yes, and don't ask again for rm commands in this project",
+    '   3. No, and tell Claude what to do differently (esc)',
+    '',
+    ' Esc to cancel · Tab to amend',
+  ].join('\n');
+
+  function harness(overrides: Record<string, unknown> = {}) {
+    const scope: Record<string, any> = {
+      renderer: { rawSnapshot: vi.fn(() => COMPOSER) },
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      promptCacheKeepaliveRefusal,
+      backend: {},
+      cliAdapter: { readyPattern: /❯/ },
+      cliRestartInProgress: false,
+      isPromptReady: true,
+      tuiPromptBlocking: false,
+      bareShellLaunchBlocked: false,
+      isFlushing: false,
+      injectionFlushing: false,
+      pendingMessages: [],
+      pendingRawInputs: [],
+      pendingInjections: [],
+      pendingSessionRename: null,
+      ...overrides,
+    };
+    const refuse = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => string | undefined>(
+      'unattendedRawInputRefusal',
+      scope,
+    );
+    return { refuse, scope };
+  }
+
+  it('leaves ordinary human raw input unchanged', () => {
+    const { refuse, scope } = harness({ renderer: undefined, backend: undefined });
+    expect(refuse({})).toBeUndefined();
+    expect(scope.backendScreenEvidenceIsAuthoritativeForMutation).toBeDefined();
+  });
+
+  it('admits unattended input only with a live empty framed composer', () => {
+    const { refuse, scope } = harness();
+    expect(refuse({ requireSafeComposer: true })).toBeUndefined();
+    expect(scope.renderer.rawSnapshot).toHaveBeenCalledWith({ preserveFormatting: true });
+  });
+
+  it('refuses a permission selector even though it contains the ready pattern', () => {
+    const { refuse } = harness({ renderer: { rawSnapshot: () => PERMISSION_DIALOG } });
+    expect(refuse({ requireSafeComposer: true })).toBe('action_prompt_open');
+  });
+
+  it.each([
+    ['missing backend', { backend: undefined }, 'no_backend'],
+    ['missing adapter', { cliAdapter: undefined }, 'no_backend'],
+    ['restart', { cliRestartInProgress: true }, 'restarting'],
+    ['prompt not ready', { isPromptReady: false }, 'prompt_not_ready'],
+    ['TUI prompt', { tuiPromptBlocking: true }, 'tui_prompt_open'],
+    ['bare shell', { bareShellLaunchBlocked: true }, 'bare_shell'],
+    ['message flush', { isFlushing: true }, 'input_pending'],
+    ['injection flush', { injectionFlushing: true }, 'input_pending'],
+    ['queued message', { pendingMessages: [{}] }, 'input_pending'],
+    ['queued raw input', { pendingRawInputs: [{}] }, 'input_pending'],
+    ['queued injection', { pendingInjections: [{}] }, 'input_pending'],
+    ['queued rename', { pendingSessionRename: {} }, 'input_pending'],
+    ['non-authoritative backend', { backendScreenEvidenceIsAuthoritativeForMutation: () => false }, 'no_screen_evidence'],
+    ['missing renderer', { renderer: undefined }, 'no_screen_evidence'],
+    ['missing ready pattern', { cliAdapter: {} }, 'no_screen_evidence'],
+  ] as const)('fails closed for %s', (_name, override, reason) => {
+    const { refuse } = harness(override);
+    expect(refuse({ requireSafeComposer: true })).toBe(reason);
+  });
+
+  it('keeps the daemon-to-worker and close cleanup wiring as a K4 structural guard', () => {
+    const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    expect(daemon).toContain('requireSafeComposer: true');
+    expect(worker).toContain('const unattendedRefusal = unattendedRawInputRefusal(msg)');
+    expect(worker).toContain("emitTurnTerminal(msg.turnId, 'failed', 'safe_composer_required')");
+    expect(daemon).toContain('autoCompactCoordinator.cancel(session.sessionId)');
+  });
 });

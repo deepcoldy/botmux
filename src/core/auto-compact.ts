@@ -10,6 +10,16 @@
 export const AUTO_COMPACT_DEFAULT_DELAY_MS = 5_000;
 export const AUTO_COMPACT_DEFAULT_COOLDOWN_MS = 10 * 60_000;
 
+/** CLIs whose native interactive command set is known to include `/compact`.
+ * Human passthrough remains intentionally best-effort across a wider roster;
+ * unattended maintenance is narrower because an unknown command would consume
+ * a turn without doing useful work. */
+const NATIVE_AUTO_COMPACT_CLIS = new Set(['claude-code', 'codex', 'traex', 'grok']);
+
+export function supportsNativeAutoCompact(cliId: string): boolean {
+  return NATIVE_AUTO_COMPACT_CLIS.has(cliId);
+}
+
 export interface AutoCompactObservation {
   sessionId: string;
   idle: boolean;
@@ -18,6 +28,7 @@ export interface AutoCompactObservation {
   readPercent: () => number | undefined;
   eligible: () => boolean;
   trigger: (threshold: number) => boolean;
+  onError?: (error: unknown) => void;
 }
 
 export interface AutoCompactEligibilitySnapshot {
@@ -38,6 +49,7 @@ export interface AutoCompactEligibilitySnapshot {
   usageLimited: boolean;
   agentAttention: boolean;
   finalDeliveriesInFlight: number;
+  backgroundTaskCount: number;
   adopted: boolean;
   headless: boolean;
   vcMeetingReceiver: boolean;
@@ -65,6 +77,7 @@ export function isAutoCompactEligible(input: AutoCompactEligibilitySnapshot): bo
     && !input.usageLimited
     && !input.agentAttention
     && input.finalDeliveriesInFlight === 0
+    && input.backgroundTaskCount === 0
     && !input.adopted
     && !input.headless
     && !input.vcMeetingReceiver
@@ -97,7 +110,14 @@ export class AutoCompactCoordinator {
       this.cancelTimer(input.sessionId);
       return;
     }
-    const initialPercent = input.readPercent();
+    let initialPercent: number | undefined;
+    try {
+      initialPercent = input.readPercent();
+    } catch (error) {
+      input.onError?.(error);
+      this.cancel(input.sessionId);
+      return;
+    }
     if (initialPercent === undefined || initialPercent < threshold) {
       this.cancel(input.sessionId);
       return;
@@ -110,16 +130,23 @@ export class AutoCompactCoordinator {
 
     state.timer = setTimeout(() => {
       state.timer = undefined;
-      const freshThreshold = input.readThreshold();
-      const freshPercent = input.readPercent();
-      if (freshThreshold === undefined || !Number.isFinite(freshThreshold)
-        || freshThreshold < 1 || freshThreshold > 100
-        || freshPercent === undefined || freshPercent < freshThreshold
-        || !input.eligible()) return;
-      // Claim the cooldown before dispatch. Even a rejected worker send must not
-      // create a tight retry loop on every idle/status observation.
-      state.lastAttemptAt = this.now();
-      input.trigger(freshThreshold);
+      try {
+        const freshThreshold = input.readThreshold();
+        const freshPercent = input.readPercent();
+        if (freshThreshold === undefined || !Number.isFinite(freshThreshold)
+          || freshThreshold < 1 || freshThreshold > 100
+          || freshPercent === undefined || freshPercent < freshThreshold
+          || !input.eligible()) return;
+        // Claim the cooldown before dispatch. Even a rejected worker send must not
+        // create a tight retry loop on every idle/status observation.
+        state.lastAttemptAt = this.now();
+        input.trigger(freshThreshold);
+      } catch (error) {
+        // Timer callbacks are daemon background work. Never let a transient
+        // registry/store failure escape as an uncaught exception and terminate
+        // the process.
+        input.onError?.(error);
+      }
     }, this.delayMs);
     state.timer.unref?.();
     this.states.set(input.sessionId, state);

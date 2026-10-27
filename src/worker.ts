@@ -121,7 +121,7 @@ import {
   POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
-import { promptCacheKeepaliveRefusal } from './core/prompt-cache-keepalive-gate.js';
+import { promptCacheKeepaliveRefusal, type PromptCacheKeepaliveRefusal } from './core/prompt-cache-keepalive-gate.js';
 import {
   decideCodexRunnerFreshness,
   CodexRunnerFreshnessInputQueue,
@@ -28520,6 +28520,31 @@ function log(msg: string): void {
   process.stdout.write(`[${ts}] [worker:${sessionId.substring(0, 8) || '??'}] ${msg}\n`);
 }
 
+/** Fail-closed probe for unattended raw input. Human passthrough intentionally
+ * bypasses this additional gate; maintenance commands must prove that the live,
+ * empty composer is on screen before the caller can write and press Enter. */
+function unattendedRawInputRefusal(
+  msg: { requireSafeComposer?: true },
+): PromptCacheKeepaliveRefusal | undefined {
+  if (!msg.requireSafeComposer) return undefined;
+  let maintenanceScreen: string | undefined;
+  if (renderer && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try { maintenanceScreen = renderer.rawSnapshot({ preserveFormatting: true }); } catch { maintenanceScreen = undefined; }
+  }
+  return promptCacheKeepaliveRefusal({
+    hasBackend: !!backend && !!cliAdapter,
+    restarting: cliRestartInProgress,
+    promptReady: isPromptReady,
+    tuiPromptOpen: tuiPromptBlocking,
+    bareShell: bareShellLaunchBlocked,
+    inputPending: isFlushing || injectionFlushing || pendingMessages.length > 0
+      || pendingRawInputs.length > 0 || pendingInjections.length > 0
+      || pendingSessionRename !== null,
+    screen: maintenanceScreen,
+    readyPattern: cliAdapter?.readyPattern,
+  });
+}
+
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
 process.on('message', async (raw: unknown) => {
@@ -29397,6 +29422,12 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      const unattendedRefusal = unattendedRawInputRefusal(msg);
+      if (unattendedRefusal) {
+        log(`Refused unattended raw input without safe composer evidence: ${unattendedRefusal}`);
+        if (msg.turnId) emitTurnTerminal(msg.turnId, 'failed', 'safe_composer_required');
+        break;
+      }
       if (/^\/(?:model|new|clear)\b/i.test(msg.content.trim())) {
         // An explicit native setting/session command takes precedence until
         // the next worker init; the pool must not undo a manual model choice.
