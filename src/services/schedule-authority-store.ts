@@ -334,10 +334,14 @@ export class ScheduleAuthorityStore {
     };
   }
 
-  createDirect(task: ScheduledTask): ScheduledTask {
+  createDirect(task: ScheduledTask, turn?: { turnId: string; maxTasksPerTurn: number }): ScheduledTask {
     const appId = task.larkAppId;
     if (typeof appId !== 'string' || !appId) {
       throw new Error('schedule_authority_app_required');
+    }
+    if (turn && (typeof turn.turnId !== 'string' || !turn.turnId
+      || !Number.isSafeInteger(turn.maxTasksPerTurn) || turn.maxTasksPerTurn < 1)) {
+      throw new Error('schedule_authority_invalid_task_limit');
     }
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE;');
@@ -349,14 +353,26 @@ export class ScheduleAuthorityStore {
         this.db.exec('COMMIT;');
         return existing.task;
       }
+      if (turn) {
+        // Same shape as commitDelegated's per-grant count. Revoked rows still
+        // count, so remove-then-recreate cannot refill the turn's quota; legacy
+        // rows (NULL target_turn_id) never match.
+        const committedForTurn = this.db.prepare(`
+          SELECT COUNT(*) AS count FROM schedule_authority_tasks
+          WHERE app_id = ? AND kind = 'direct' AND target_turn_id = ?
+        `).get(appId, turn.turnId) as { count?: number | bigint } | undefined;
+        if (Number(committedForTurn?.count ?? 0) >= turn.maxTasksPerTurn) {
+          throw new Error('schedule_direct_task_limit');
+        }
+      }
       this.db.prepare(`
         INSERT INTO schedule_authority_tasks
           (schema_version, app_id, task_id, kind, state, task_json, canonical_hash,
-           control_open_id, control_union_id, run_scopes_json, created_at, updated_at)
-        VALUES (1, ?, ?, 'direct', ?, ?, ?, ?, ?, '[]', ?, ?)
+           control_open_id, control_union_id, run_scopes_json, target_turn_id, created_at, updated_at)
+        VALUES (1, ?, ?, 'direct', ?, ?, ?, ?, ?, '[]', ?, ?, ?)
       `).run(
         appId, task.id, stateFor(task), JSON.stringify(task), taskHash(task),
-        task.ownerOpenId ?? null, task.ownerUnionId ?? null, now, now,
+        task.ownerOpenId ?? null, task.ownerUnionId ?? null, turn?.turnId ?? null, now, now,
       );
       this.db.exec('COMMIT;');
       return task;

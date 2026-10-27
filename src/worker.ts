@@ -80,7 +80,7 @@ import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-t
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
-import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
@@ -23297,6 +23297,19 @@ async function spawnCli(
             + 'EPERM in this sandboxed session. Rename the per-bot dir to the appId; see docs/roles/deploy-runbook.md.');
         }
       } catch { /* diagnostics only — never block the spawn */ }
+    }
+    // Hard gate, independent of the diagnostic above (that one only runs when the
+    // subtree is missing). The own role-library subtree is readWrite, so a
+    // sandboxed agent can swap its workingDir (or an ancestor inside the subtree)
+    // for a symlink to `$HOME`; the next spawn — scheduled task fire, /cd respawn —
+    // would then canonicalize the link target and grant it readWrite. Refuse the
+    // spawn instead of confining to the wrong directory.
+    try {
+      assertWorkingDirStaysInRoleLibrary(cfg.workingDir, roleLibSubtree, cfg.larkAppId);
+    } catch (err) {
+      const msg = `[file-sandbox] refusing to start session ${cfg.sessionId}: ${(err as Error).message}`;
+      log(msg);
+      throw new Error(msg);
     }
 
     const fsPolicyCtx = {

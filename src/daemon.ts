@@ -559,6 +559,7 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
+import { validateRoleLibraryPath } from './core/role-library.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -8037,6 +8038,29 @@ ipcRoute('POST', DISPATCH_USER_MENTION_BIND_ROUTE, async (req, res) => {
   }
 });
 
+/** A capability-only (sandboxed / read-isolated) caller may only pin a schedule
+ * to a directory it could already reach: its own session cwd, or its own
+ * role-library subtree — the same boundary `/cd` enforces. The scheduled run
+ * spawns a fresh session whose fs-policy grants readWrite on that workingDir,
+ * so an unconstrained value (another bot's role directory, `~`) would be a
+ * sandbox escape that merely fires later. Returns the path to persist. */
+function capabilityScheduleWorkingDir(ds: DaemonSession, workingDir: string): string | undefined {
+  // Session cwd branch: both sides canonical (the CLI falls back to the kernel's
+  // resolved process.cwd() while the session records the lexical path, so a
+  // symlinked $HOME makes them differ), and the request may be the cwd itself or
+  // any descendant. A symlink inside the cwd that points elsewhere resolves out.
+  const own = ds.workingDir ?? ds.session.workingDir;
+  if (own) {
+    try {
+      const ownReal = realpathSync(own);
+      const real = realpathSync(workingDir);
+      if (real === ownReal || real.startsWith(`${ownReal}/`)) return real;
+    } catch { /* either side missing → fall through to the role-library branch */ }
+  }
+  const v = validateRoleLibraryPath(workingDir, undefined, ds.larkAppId);
+  return v.ok ? v.resolvedPath : undefined;
+}
+
 /** Resolve schedule control from the exact live turn, not the busy/idle hint.
  * The caller must still pass the route's managed-origin proof. Registry-based
  * recovery of the caller follows the shared registryTurnMayAuthenticateHuman
@@ -8082,6 +8106,13 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   });
   if (!verified.ok || (ds && ds.larkAppId !== selfDaemonLarkAppId)) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
+  }
+  // The Remote Runner relay is a host-side caller (it signs with the daemon
+  // secret). A capability-only caller must not be able to claim that role:
+  // otherwise a bot-authored sandboxed turn could name any admin as the
+  // controller and create a task owned by them.
+  if (remoteRunnerSessionTool && !trustedHost) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_host_required' });
   }
   if (!scheduleAuthorityStore) {
     return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
@@ -8135,11 +8166,29 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (!ds.managedTurnOrigin?.turnId || ds.workerGeneration === undefined) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
   }
+  if (!trustedHost) {
+    const pinned = capabilityScheduleWorkingDir(ds, task.workingDir);
+    if (!pinned) return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
+    task.workingDir = pinned;
+  }
+  // Every turn-created task (direct, relay, in-session host CLI, delegated)
+  // persists a canonical workingDir: the fire-time swap check compares the
+  // stored value with its own realpath, so a lexical value would read as a swap
+  // on a machine whose $HOME is a symlink. The pin above decides whether the
+  // caller may name the directory at all; this decides what form is stored.
+  if (!existsSync(task.workingDir)) {
+    return jsonRes(res, 403, { ok: false, error: remoteRunnerSessionTool
+      ? 'schedule_session_tool_scope_invalid' : 'schedule_working_dir_forbidden' });
+  }
+  task.workingDir = realpathSync(task.workingDir);
   const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
   const expectedRoot = reply?.rootMessageId
     ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
   if (remoteRunnerSessionTool) {
-    const expectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    const rawExpectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    let expectedWorkingDir: string | undefined;
+    try { expectedWorkingDir = rawExpectedWorkingDir ? realpathSync(rawExpectedWorkingDir) : undefined; }
+    catch { expectedWorkingDir = undefined; }
     if (!expectedWorkingDir
       || task.chatId !== ds.chatId
       || task.workingDir !== expectedWorkingDir
@@ -8242,7 +8291,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     }
     if (!controlOpenId || !controlUnionId
       || !getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId)
-      || (ds.chatType === 'group'
+      // A capability-only caller in a p2p turn must not aim the task at another
+      // chat the bot happens to be in unless the operator is a member there.
+      || ((ds.chatType === 'group' || (!trustedHost && task.chatId !== ds.chatId))
         && !(await listChatMemberOpenIds(ds.larkAppId, task.chatId)).includes(controlOpenId))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_operator_denied' });
     }
@@ -8275,8 +8326,23 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       ...(task.calendarDayType !== undefined ? { calendarDayType: task.calendarDayType } : {}),
     };
     if (direct) {
-      const created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
-        ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
+      let created;
+      try {
+        created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
+          ownerOpenId: controlOpenId, ownerUnionId: controlUnionId }, {
+          // turnId is the live managed origin read above — never the request body.
+          directTurn: {
+            turnId,
+            maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+              ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+          },
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message === 'schedule_direct_task_limit') {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_direct_task_limit' });
+        }
+        throw error;
+      }
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     }
     const requestHash = computeInputHash(baseParams);
@@ -8450,6 +8516,22 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   if (action === 'update' && authority.task.preconditionRef) {
     return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
+  }
+  // A capability-only caller borrows the current human administrator's
+  // authority, but the request bytes come from the (untrusted) agent. Keep it
+  // to the tasks this conversation could have created: same chat, and a
+  // workingDir within its reach. Otherwise it could run / pause / remove any
+  // task of this bot, or rewrite the prompt of one pinned to a wider directory
+  // and get that directory's readWrite at the next run — the escape
+  // capabilityScheduleWorkingDir closes on create. Self-management of the
+  // currently running scheduled task keeps its own authorization above.
+  if (!trustedHost && !scheduledSelfManager) {
+    if (!ds || authority.task.chatId !== ds.chatId) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_scope_forbidden' });
+    }
+    if (!capabilityScheduleWorkingDir(ds, authority.task.workingDir)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
+    }
   }
   let ok = false;
   let error: string | undefined;
