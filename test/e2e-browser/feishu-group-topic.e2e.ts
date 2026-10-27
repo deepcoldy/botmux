@@ -11,24 +11,17 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   expectedReplyMarker,
   sendMentionMessage,
-  navigateToMessenger,
   openGroupChat,
   getGroupChatName,
   openThreadForMessage,
   scrollThreadToBottom,
   waitForModelTextReply,
-  closeSession,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('group chat topic reply mode', () => {
@@ -38,34 +31,20 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openGroupChat(page, agent, getGroupChatName());
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openGroupChat(p, a, getGroupChatName())));
     });
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('bot uses topic replies in a regular group', async () => {
       const msg = testMessage('topic-mode');
       await sendMentionMessage(page, agent, 'Claude', msg);
 
-      // 关键：用 openThreadForMessage（走「话题」tab）找到并打开这个测试话题。
-      // 如果 bot 用的是普通内联回复而不是话题回复，这条消息根本不会出现在
-      // 「话题」筛选结果里 —— 所以这一步成功本身就证明了话题模式启用。
+      // 关键：用 openThreadForMessage（点消息列表里以这条消息为标题的话题条目）
+      // 找到并打开这个测试话题。如果 bot 用的是普通内联回复而不是话题回复，
+      // 列表里就不会有这样的话题条目 —— 所以这一步成功本身就证明了话题模式启用。
       await openThreadForMessage(agent, { msgHint: msg, timeoutMs: 120_000, page });
 
       await scrollThreadToBottom(agent);

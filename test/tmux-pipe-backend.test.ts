@@ -1058,8 +1058,13 @@ describe('TmuxPipeBackend managed session', () => {
 
       const args = newSessionArgs();
       const cIdx = scriptIndex(args);
+      // The creating command chains `\; set-option … remain-on-exit failed`
+      // (atomic with creation — see createDetachedSession), so the launch
+      // clause is no longer the argv tail. Slice exactly the clause.
+      const launchClause = args.slice(cIdx - 2, cIdx + 3);
       // fish gets its post-script args as $argv: no POSIX `_` sentinel.
-      expect(args.slice(cIdx - 2)).toEqual([shell.path, '-i', '-c', 'source $argv[1]', args[cIdx + 2]]);
+      expect(launchClause).toEqual([shell.path, '-i', '-c', 'source $argv[1]', args[cIdx + 2]]);
+      expect(args.slice(cIdx + 3)).toEqual([';', 'set-option', '-t', 'bmx-fish-pipe', 'remain-on-exit', 'failed']);
       const { body } = takePaneLaunchFile(args);
       expect(body).toContain(`set argv '/tmp'`);
       expect(body).toContain('cd -- $argv[1]');
@@ -1083,7 +1088,8 @@ describe('TmuxPipeBackend managed session', () => {
 
     const args = newSessionArgs();
     const cIdx = scriptIndex(args);
-    expect(args.slice(cIdx - 1)).toEqual(['/bin/sh', '-c', '. "$1"', '_', args[cIdx + 3]]);
+    expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', '. "$1"', '_', args[cIdx + 3]]);
+    expect(args.slice(cIdx + 4)).toEqual([';', 'set-option', '-t', 'bmx-posix-pipe', 'remain-on-exit', 'failed']);
     const { body } = takePaneLaunchFile(args);
     expect(body).toContain(`set -- '/tmp'`);
     expect(body).toContain('cd -- "$1" && shift');

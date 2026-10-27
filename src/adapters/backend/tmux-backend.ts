@@ -330,7 +330,16 @@ export class TmuxBackend {
    * verdict, only "nothing here can be attached to".
    */
   static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
-    return TmuxBackend.classifyHasSession(name, true, socketName);
+    const probe = TmuxBackend.classifyHasSession(name, true, socketName);
+    // A session whose pane is a KEPT CORPSE (`remain-on-exit failed`, set by
+    // TmuxPipeBackend for status reporting) answers has-session but has no live
+    // CLI. For LAUNCH selection — and only there — that must read 'missing', or
+    // the next generation would "reattach" to a dead pane. Deliberately not in
+    // classifyHasSession: that is the generic existence probe used by dozens of
+    // call sites (teardown verification, restore, read isolation), each of
+    // which wants a single cheap round-trip and its own verdict on a stall.
+    if (probe === 'exists' && TmuxBackend.isPaneDead(name, socketName)) return 'missing';
+    return probe;
   }
 
   /**
@@ -386,6 +395,23 @@ export class TmuxBackend {
         return 'missing';
       }
       return 'unknown';
+    }
+  }
+
+  /** True only when tmux explicitly flags the target pane dead. Any
+   *  inconclusive answer (probe error, timeout, an option this tmux does not
+   *  report) is `false` — a liveness probe must never invent a death. */
+  static isPaneDead(name: string, socketName?: string): boolean {
+    try {
+      const out = String(
+        execFileSync(
+          'tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '-t', name, '#{pane_dead}'],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], env: tmuxEnv(), timeout: 2000 },
+        ) ?? '',
+      ).trim();
+      return out === '1';
+    } catch {
+      return false;
     }
   }
 

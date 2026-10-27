@@ -4051,6 +4051,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
   const credentialSource = policy?.credentialSource ?? 'auto';
+  const delegateOnMention = policy?.delegateOnMention !== false;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4092,11 +4093,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource });
+    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
   }
 
   function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next });
+    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  }
+
+  function setDelegateOnMention(next: boolean): void {
+    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
   }
 
   return (
@@ -4109,7 +4114,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
         )}
       />
       {enabled ? (
@@ -4156,6 +4161,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
             </p>
           ) : null}
+          <ToggleRow
+            checked={delegateOnMention}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-delegate-on-mention"
+            title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
+            help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
+            onChange={checked => setDelegateOnMention(checked)}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>

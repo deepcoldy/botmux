@@ -25,6 +25,8 @@ Projects created by `midscene-test create` select `cases/**/*.{yaml,yml}` by def
 
 **Config file:** `midscene.config.ts`
 
+**Case files:** `cases/core-group-modes.yaml` (Execution Project: feishu-core-group-modes)
+
 **Case files:** `cases/core-claude.yaml` (Execution Project: feishu-core-claude)
 
 **Case files:** `cases/core-codex.yaml` (Execution Project: feishu-core-codex)
@@ -34,8 +36,6 @@ Projects created by `midscene-test create` select `cases/**/*.{yaml,yml}` by def
 **Case files:** `cases/core-dm-modes-claude.yaml` (Execution Project: feishu-core-dm-modes-claude)
 
 **Case files:** `cases/core-dm-modes-codex.yaml` (Execution Project: feishu-core-dm-modes-codex)
-
-**Case files:** `cases/core-group-modes.yaml` (Execution Project: feishu-core-group-modes)
 
 **Case files:** `cases/core-queue.yaml` (Execution Project: feishu-core-queue)
 
