@@ -29,13 +29,19 @@ if (start < 0 || end < start) throw new Error('preemption helpers not found');
 // worker.ts. Left inside the slice they become script-level bindings in the vm
 // and SHADOW the context-provided globals, so the harness would neither seed
 // nor observe the real state — the once-per-turn guard could be deleted and
-// every test still passed on the 2s cooldown alone. Declare them with `var`
-// (a bare `var` does not overwrite an existing global binding) so worker.ts's
-// own references resolve to the harness state.
+// every test still passed on the 2s cooldown alone.
+//
+// The declarations must be REMOVED, not rewritten to `var`: `let` and `var`
+// both create a binding in the vm script scope, and on Bun that script-level
+// `var` still blocks the host's assignment to `ctx.preemptCooldownUntil` while
+// Node happens to let it through. That asymmetry made the `var` version of this
+// harness falsely green under `bun test` — the cooldown could not be cleared,
+// so the once-per-turn guard was never actually exercised. With the lines gone,
+// the context injection is the only binding and both engines see the state.
 const helpers = transpileModule(
   source.slice(start, end)
-    .replace(/^let preemptedTurnId.*$/m, 'var preemptedTurnId;')
-    .replace(/^let preemptCooldownUntil.*$/m, 'var preemptCooldownUntil;'),
+    .replace(/^let preemptedTurnId.*$\n?/m, '')
+    .replace(/^let preemptCooldownUntil.*$\n?/m, ''),
   { compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None } },
 ).outputText;
 

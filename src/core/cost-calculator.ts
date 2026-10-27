@@ -23,10 +23,12 @@ import {
 import { __resetCodexCompactionCountForTest, readCodexCompactionCount } from '../services/codex-compaction-count.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
 import { readZcodeUsage } from '../services/zcode-usage.js';
-import { readZcodeSessionMarker } from '../services/zcode-session.js';
+import { readZcodeSessionMarker, zcodeSessionDbPath } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { getBot } from '../bot-registry.js';
+import { botOneShotEnv } from './session-env-resolve.js';
 import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -1348,6 +1350,18 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
+/** The same inheritance policy, global/bot overlay and removals as the CLI
+ *  child. Unknown/unregistered bot falls back to ambient: a read must not throw. */
+function resolveZcodeUsageEnv(larkAppId?: string): NodeJS.ProcessEnv {
+  if (!larkAppId) return process.env;
+  try {
+    const bot = getBot(larkAppId);
+    return botOneShotEnv(process.env, bot.config);
+  } catch {
+    return process.env;
+  }
+}
+
 function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (q.cliId === 'zcode') {
     // ZCode keeps no transcript botmux can parse; its own `model_usage` ledger
@@ -1359,7 +1373,14 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     const native = q.cliSessionId
       || readZcodeSessionMarker(q.sessionId, { dataDir: config.session.dataDir })?.cliSessionId;
     if (!native) return null;
-    const usage = readZcodeUsage(native);
+    // The worker resolves ZCODE_SESSION_DB_PATH / ZCODE_SESSION_DB from the
+    // bot's own env (worker.ts `zcodeResumeDbPath`); neither key is reserved,
+    // so a bot may legitimately point its ledger elsewhere. Reading the ledger
+    // through the ambient env alone would then find the session at spawn but
+    // show no tokens or model on the card, silently. Resolve both the path and
+    // the context-window config from the same per-bot env the worker uses.
+    const zcodeEnv = resolveZcodeUsageEnv(q.larkAppId);
+    const usage = readZcodeUsage(native, zcodeSessionDbPath(zcodeEnv), zcodeEnv);
     if (!usage) return null;
     const agg = newTokenUsageAggregate();
     agg.inputTokens = usage.inputTokens;

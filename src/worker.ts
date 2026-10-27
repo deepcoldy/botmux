@@ -21646,7 +21646,7 @@ async function spawnCli(
     : undefined;
   // Exact native identities survive worker/CLI replacement. No latest-session guessing.
   const zcodeResumeDbPath = cfg.cliId === 'zcode'
-    ? zcodeSessionDbPath({ ...process.env, ...botInjectedEnv(cfg.env, cfg.envPolicy) }) : undefined;
+    ? zcodeSessionDbPath({ ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...botInjectedEnv(cfg.env, cfg.envPolicy) }) : undefined;
   if (cfg.cliId === 'zcode' && !effectiveCliSessionId) {
     const marker = readZcodeSessionMarker(cfg.sessionId, { dataDir: config.session.dataDir });
     if (marker) { effectiveCliSessionId = marker.cliSessionId; persistCliSessionId(marker.cliSessionId); }
@@ -21962,7 +21962,7 @@ async function spawnCli(
     if (sandboxRequested) throw new Error('ZCode provider bridge is not yet validated in the OS file sandbox');
     Object.assign(perBotInjectEnv, await prepareZcodeSessionModel({
       sessionId: cfg.sessionId, dataDir: config.session.dataDir,
-      env: { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...perBotInjectEnv },
+      env: { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...perBotInjectEnv },
       model: cfg.model, reasoningEffort: cfg.reasoningEffort, resume: effectiveResume,
     }));
   }

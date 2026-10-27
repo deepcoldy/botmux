@@ -10,6 +10,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { botmuxShellCommand } from '../src/adapters/hook-command.js';
 import {
   cleanupTraexAskHooks,
   hasInstalledSessionReadyHook,
@@ -21,6 +23,16 @@ import {
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), 'botmux-hook-test-'));
+}
+
+function extractEmbeddedArgs(content: string): string[] {
+  const match = content.match(/const ARGS = (\[[^\n]*\]);/);
+  if (!match) throw new Error('generated plugin has no argv array');
+  return JSON.parse(match[1]);
+}
+
+function hasCliEntry(args: readonly string[]): boolean {
+  return args.some((arg) => /[/\\](?:src[/\\]cli\.ts|dist[/\\]cli\.js)$/.test(arg));
 }
 
 // ─── claude-settings 格式 ─────────────────────────────────────────────────────
@@ -54,6 +66,28 @@ describe('installHook — claude-settings', () => {
     expect(entry.type).toBe('command');
     expect(typeof entry.timeout).toBe('number');
     expect(entry.timeout).toBeGreaterThan(0);
+  });
+
+  it('keeps source hook installation idempotent across checkout paths', () => {
+    const command = (checkout: string, subcommand: string[]) => botmuxShellCommand(
+      subcommand, false, pathToFileURL(join(tmpDir, checkout, 'src', 'adapters', 'hook-command.ts')).href,
+    );
+    for (const checkout of ['first checkout', "second ' checkout"]) {
+      const hookInstall = {
+        configPath, format: 'claude-settings' as const,
+        sessionStartCommand: command(checkout, ['session-ready']),
+        userPromptSubmitCommand: command(checkout, ['user-prompt-hook']),
+      };
+      installHook('claude-code', hookInstall, command(checkout, ['hook', 'claude-code']));
+      expect(hasInstalledSessionReadyHook(hookInstall)).toBe(true);
+      expect(hasInstalledPromptHook(hookInstall)).toBe(true);
+    }
+    const hooks = JSON.parse(readFileSync(configPath, 'utf8')).hooks;
+    for (const event of ['PreToolUse', 'SessionStart', 'UserPromptSubmit']) {
+      expect(hooks[event]).toHaveLength(1);
+      expect(hooks[event][0].hooks).toHaveLength(1);
+      expect(hooks[event][0].hooks[0].command).toContain('second');
+    }
   });
 
   it('(b) 幂等——二次调用后文件内容与第一次完全相同', () => {
@@ -688,10 +722,11 @@ describe('installHook — opencode-plugin', () => {
     // 答案 POST 回 OpenCode 的 reply 端点解阻塞
     expect(content).toContain('/question/');
     expect(content).toContain('/reply');
-    // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
-    expect(content).toContain('"hook"');
-    expect(content).toContain('"opencode"');
-    expect(content).toContain('cli.js');
+    // args 以 JSON 数组嵌入，包含当前运行时的 CLI 入口、hook 子命令与 cliId。
+    const args = extractEmbeddedArgs(content);
+    expect(args).toContain('hook');
+    expect(args).toContain('opencode');
+    expect(hasCliEntry(args)).toBe(true);
     // 绝不能再出现「把带引号命令字符串 .split(" ")」的旧写法
     expect(content).not.toContain('.split(');
     expect(content).not.toContain('parts[0]');
@@ -745,10 +780,11 @@ describe('installHook — opencode2-plugin', () => {
     expect(content).toContain('service.json');
     expect(content).toContain('x-opencode-directory');
     expect(content).toContain('"opencode:"');
-    // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
-    expect(content).toContain('"hook"');
-    expect(content).toContain('"opencode2"');
-    expect(content).toContain('cli.js');
+    // args 以 JSON 数组嵌入，包含当前运行时的 CLI 入口、hook 子命令与 cliId。
+    const args = extractEmbeddedArgs(content);
+    expect(args).toContain('hook');
+    expect(args).toContain('opencode2');
+    expect(hasCliEntry(args)).toBe(true);
     expect(content).not.toContain('.split(');
   });
 
@@ -1041,7 +1077,8 @@ describe('installHook — zcode-hooks', () => {
     const hooks = doc.hooks.events.UserPromptSubmit.flatMap((g: any) => g.hooks);
     expect(hooks).toHaveLength(1);
     expect(hooks[0].args).toContain('zcode-session-hook');
-    expect(hooks[0].args.join(' ')).not.toContain('.mjs');
+    expect(hooks[0].args).not.toContain('/home/u/.botmux/bin/zcode-session-hook.mjs');
+    expect(hasCliEntry(hooks[0].args)).toBe(true);
   });
 
   // 旧手工装法的另一种形态：`type: 'command'`，command 直接就是 .mjs 路径。
@@ -1059,7 +1096,9 @@ describe('installHook — zcode-hooks', () => {
     const hooks = doc.hooks.events.Stop.flatMap((g: any) => g.hooks);
     expect(hooks).toHaveLength(1);
     expect(hooks[0].type).toBe('process');
-    expect(JSON.stringify(hooks)).not.toContain('.mjs');
+    expect(hooks[0].command).not.toBe('/home/u/.botmux/bin/zcode-session-hook.mjs');
+    expect(hooks[0].args).toContain('zcode-session-hook');
+    expect(hasCliEntry(hooks[0].args)).toBe(true);
   });
 
   // 用户显式关掉了 hooks（他自己的其它 hook 也靠这个开关），不能被我们悄悄打开。

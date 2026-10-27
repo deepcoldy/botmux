@@ -147,6 +147,7 @@ function isBotmuxHookCommand(command: string, suffix: string): boolean {
   const slash = Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\'));
   const basename = target.slice(slash + 1);
   return basename === 'cli.js'
+    || basename === 'cli.ts'
     || basename === 'botmux'
     || basename === 'botmux.exe'
     || /^botmux-linux-(?:x64|arm64)(?:-musl)?$/.test(basename)
