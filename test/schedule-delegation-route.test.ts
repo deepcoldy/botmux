@@ -294,7 +294,7 @@ describe('until-done schedule creation', () => {
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
       untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
-    }));
+    }), DIRECT_TURN);
   });
 
   it('passes until-done settings from the host terminal to addTask', async () => {

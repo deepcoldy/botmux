@@ -462,9 +462,21 @@ describe('managed schedule mutation route', () => {
     const h = harness('resume');
     h.record.kind = 'direct';
     h.record.state = 'completed';
-    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: false,
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false,
       disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_until_done_closed' } });
+    expect(h.scheduler.enableTask).not.toHaveBeenCalled();
+  });
+
+  it('does not reveal another chat\'s closed until-done state to a capability-only caller', async () => {
+    // The scope guard must run before the until-done check: a caller outside
+    // the task's chat learns nothing about its state, only that it is out of scope.
+    const h = harness('resume');
+    h.record.kind = 'direct';
+    h.record.state = 'completed';
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_other', workingDir: REPO, enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_scope_forbidden' } });
     expect(h.scheduler.enableTask).not.toHaveBeenCalled();
   });
 
