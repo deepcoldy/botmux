@@ -203,6 +203,7 @@ describe('plugin MCP Gateway installer', () => {
       type: 'stdio',
       command: join(home, '.botmux', 'bin', 'botmux'),
       args: ['mcp', 'serve'],
+      timeout: 600_000,
       env: {
         [MCP_GATEWAY_OWNER_ENV]: '1',
         BOTMUX_SESSION_ID: '${BOTMUX_SESSION_ID:-}',

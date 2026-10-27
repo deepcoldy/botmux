@@ -120,6 +120,70 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('does not let progress notifications extend a plugin call past its total timeout', async () => {
+    installFixturePlugin('plugin-progress', 'progress');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'progress-timeout',
+      pluginIds: ['plugin-progress'],
+      pluginRuntime: { 'plugin-progress': { toolTimeoutMs: 500 } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'progress-timeout',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-progress-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const startedAt = Date.now();
+    try {
+      await expect(client.callTool(
+        { name: 'echo', arguments: {}, _meta: { progressToken: 'progress-token' } },
+        undefined,
+        { timeout: 10_000 },
+      )).rejects.toThrow(/timed out|-32001/i);
+      const elapsedMs = Date.now() - startedAt;
+      expect(elapsedMs).toBeGreaterThanOrEqual(400);
+      expect(elapsedMs).toBeLessThan(1_500);
+    } finally {
+      await client.close().catch(() => undefined);
+      await gateway.close();
+    }
+  });
+
+  it('injects runtime env into only the configured plugin process', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    installFixturePlugin('plugin-b', 'beta');
+    const dataDir = join(home, '.botmux', 'data');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'runtime-env-isolation',
+      pluginIds: ['plugin-a', 'plugin-b'],
+      pluginRuntime: { 'plugin-a': { env: { PRIVATE_MCP_TOKEN: 'runtime-token' } } },
+      dataDir,
+    });
+    const gateway = new PluginMcpGateway(undefined, {
+      ...process.env,
+      BOTMUX_SESSION_ID: 'runtime-env-isolation',
+      SESSION_DATA_DIR: dataDir,
+    });
+    const client = new Client({ name: 'gateway-runtime-env-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const withEnv = await client.callTool({ name: 'plugin-a__echo', arguments: {} });
+      expect((withEnv.content[0] as { text: string }).text).toContain('token=runtime-token');
+      const withoutEnv = await client.callTool({ name: 'plugin-b__echo', arguments: {} });
+      expect((withoutEnv.content[0] as { text: string }).text).toMatch(/token=$/);
+    } finally {
+      await client.close().catch(() => undefined);
+      await gateway.close();
+    }
+  });
+
   function installFixturePlugin(pluginId: string, fixtureName: string, env?: Record<string, string>) {
     const source = join(home, `${pluginId}-src`);
     mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });

@@ -262,6 +262,7 @@ function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
     type: 'stdio',
     command: entry.command,
     args: entry.args,
+    timeout: effectiveMcpGatewayMaxToolTimeoutMs(entry.maxToolTimeoutMs),
     env: {
       [MCP_GATEWAY_OWNER_ENV]: '1',
       // Claude expands these from the owning CLI process when it starts the
