@@ -43,7 +43,10 @@ const logPath = process.env.FAKE_DSH_LOG;
 if (process.argv[2] === 'plugin') {
   process.exit(0);
 }
-if (logPath) appendFileSync(logPath, JSON.stringify({ argv: process.argv.slice(2) }) + '\n');
+if (process.argv.includes('--version')) {
+  process.stdout.write(process.env.FAKE_DSH_VERSION ?? '0.2.1-rc.2');
+  process.exit(0);
+}
 const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
   ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
   : {};
@@ -64,6 +67,25 @@ for (const name of expectedAbsentEnv) {
     process.exit(2);
   }
 }
+
+const launch = {
+  argv: process.argv.slice(2),
+  cwd: process.cwd(),
+  dshHome: process.env.DSH_HOME,
+  sessionRoot: process.env.DSH_SESSION_ROOT,
+  askTimeout: process.env.BOTMUX_DSH_ASK_TIMEOUT_MS,
+};
+if (process.argv.includes('--dump-config')) {
+  if (logPath) appendFileSync(logPath, JSON.stringify({ dump: launch }) + '\n');
+  if (process.env.FAKE_DSH_CONFIG_ERROR) {
+    process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+    process.stderr.write(process.env.FAKE_DSH_CONFIG_ERROR);
+    process.exit(2);
+  }
+  process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+  process.exit(0);
+}
+if (logPath) appendFileSync(logPath, JSON.stringify(launch) + '\n');
 
 let inputBuffer = '';
 let promptCount = 0;

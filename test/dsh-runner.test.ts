@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -122,6 +122,18 @@ llm-pi-ai:
 agent-default-model:
   provider: super-relay
   model: model_hub/es1_orange_o48
+`;
+
+const PROFILE_MODEL = `
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: flatkey
+    model: deepseek-v4-1-flash-1017
+- id: unrelated-plugin
+  config:
+    value: !!js "(() => { throw new Error('must not execute'); })()"
+    apiKey: config-secret-must-not-be-logged
 `;
 
 describe('dsh-runner', () => {
@@ -651,5 +663,105 @@ agent-default-model:
     const initEntry = entries.find((r: any) => r.initialize);
     expect(initEntry.initialize.provider).toBe('deepseek-official');
     expect(initEntry.initialize.model).toBe('deepseek-v4-pro');
+  });
+
+  it('uses the composed profile model after legacy settings have been imported', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    mkdirSync(join(home, '.dsh'), { recursive: true });
+    writeFileSync(join(home, '.dsh', 'settings.yaml.imported'), SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+    });
+    h.child.stdin.write(makeFrame('你好'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+    expect(h.stdout + h.stderr).not.toContain('config-secret-must-not-be-logged');
+    const diagnostic = h.stderr.split('\n').find(line => line.startsWith('[botmux:dsh] {'))!;
+    expect(JSON.parse(diagnostic.slice('[botmux:dsh] '.length))).toEqual({
+      profile: 'botmux', provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+      providerSource: 'profile', modelSource: 'profile',
+    });
+  });
+
+  it.each([undefined, 'explicit-model'])('prefers the composed profile over old settings with model override %s', async model => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', model ? ['--model', model] : [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: model ?? 'deepseek-v4-1-flash-1017',
+    });
+  });
+
+  it('queries and launches the same profile, patch, cwd and environment', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    h = spawnRunner('happy', [
+      '--dsh-profile', 'custom-profile', '--bridge-patch', './overlay with spaces.yml',
+      '--turn-timeout-ms', '10000',
+    ], { DSH_HOME: join(home, 'custom-dsh'), FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const launch = entries.find(entry => entry.argv);
+    expect(launch).toMatchObject({
+      argv: ['--profile', 'custom-profile', '--patch=./overlay with spaces.yml'],
+      cwd: realpathSync(home), dshHome: join(home, 'custom-dsh'),
+      sessionRoot: join(home, 'custom-dsh', 'sessions', 'botmux', 'test-session'),
+      askTimeout: '5000',
+    });
+    expect(entries.find(entry => entry.dump)?.dump).toEqual({
+      ...launch, argv: [...launch.argv, '--dump-config'],
+    });
+  });
+
+  it.each(['0.1.1-rc.1', '0.1.6', '0.1.7-alpha.0'])('retains legacy settings precedence for DSH %s', async version => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: version }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'super-relay', model: 'model_hub/es1_orange_o48',
+    });
+  });
+
+  it('uses profile settings at the migration release boundary', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: '0.1.7-alpha.1' }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+    });
+  });
+
+  it.each([
+    { FAKE_DSH_CONFIG_ERROR: 'query-secret-must-not-be-logged', FAKE_DSH_CONFIG: PROFILE_MODEL },
+    { FAKE_DSH_CONFIG: 'not-an-entry-list' },
+    { FAKE_DSH_CONFIG: '- config: [yaml-secret-must-not-be-logged' },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: !!js process.env.PROVIDER') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('model: deepseek-v4-1-flash-1017', 'model: !!js process.env.MODEL') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: ""') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: 42') },
+    { FAKE_DSH_CONFIG: '- id: agent-default-model\n  config: !!js process.env.MODEL_CONFIG' },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('    provider: flatkey', '    __jsExpr: process.env.MODEL_CONFIG\n    provider: flatkey') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: true\n  name:') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: !!js process.env.DISABLED\n  name:') },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL + PROFILE_MODEL },
+    { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: 'unknown' },
+  ])('fails before SDK initialization when the profile cannot be resolved: %j', async env => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], env, home);
+    await waitFor(() => h!.child.exitCode !== null, { label: 'configuration failure' });
+
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
+    expect(h.stdout + h.stderr).not.toContain('secret-must-not-be-logged');
+    expect(h.stdout + h.stderr).toContain('dsh');
   });
 });
