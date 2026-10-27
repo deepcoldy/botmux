@@ -43,10 +43,6 @@ const logPath = process.env.FAKE_DSH_LOG;
 if (process.argv[2] === 'plugin') {
   process.exit(0);
 }
-if (process.argv.includes('--version')) {
-  process.stdout.write(process.env.FAKE_DSH_VERSION ?? '0.2.1-rc.2');
-  process.exit(0);
-}
 const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
   ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
   : {};

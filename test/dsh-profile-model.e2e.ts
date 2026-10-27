@@ -3,13 +3,14 @@
  * then set BOTMUX_TEST_DSH_NODE_MODULES to that installation's node_modules.
  * Uses a temporary DSH_HOME and a loopback model endpoint; no real API keys.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { resolveDshModel } from '../src/dsh-runner-config.js';
+import { isMap, parseDocument, type YAMLSeq } from 'yaml';
 
 const modules = process.env.BOTMUX_TEST_DSH_NODE_MODULES;
 
@@ -21,6 +22,8 @@ describe.skipIf(!modules)('real DSH profile model selection', () => {
   let server: Server;
   let overlay: string;
   const calls: Array<{ model: string; path: string; credentialMatched: boolean }> = [];
+
+  beforeEach(() => { calls.length = 0; });
 
   beforeAll(async () => {
     root = mkdtempSync(join(tmpdir(), 'botmux-dsh-profile-'));
@@ -81,7 +84,7 @@ describe.skipIf(!modules)('real DSH profile model selection', () => {
   disabled: true
 `);
     }
-    writeFileSync(join(dshHome, '.credentials.yaml'), 'version: 1\nrefs:\n  BOTMUX_DSH_FIXTURE_KEY: fixture-key\n');
+    writeFileSync(join(dshHome, '.credentials.yaml'), 'version: 1\nrefs:\n  BOTMUX_DSH_FIXTURE_KEY: fixture-key\n', { mode: 0o600 });
     writeFileSync(join(dshHome, 'settings.yaml.imported'), 'agent-default-model:\n  provider: obsolete\n  model: obsolete\n');
     overlay = join(root, 'overlay with spaces.yml');
     writeFileSync(overlay, '- id: agent-default-model\n  config:\n    provider: flatkey\n    model: overlay-model\n');
@@ -104,10 +107,18 @@ describe.skipIf(!modules)('real DSH profile model selection', () => {
     expect(select('botmux', overlay, 'profile-model')).toMatchObject({ provider: 'flatkey', model: 'profile-model' });
   });
 
-  it('completes a real SDK turn using the custom route and its managed credential without an official key', async () => {
+  function cloneHome(name: string): string {
+    const home = join(root, name);
+    mkdirSync(home);
+    cpSync(join(dshHome, 'profiles'), join(home, 'profiles'), { recursive: true });
+    writeFileSync(join(home, '.credentials.yaml'), readFileSync(join(dshHome, '.credentials.yaml')), { mode: 0o600 });
+    return home;
+  }
+
+  async function completeTurn(home: string, sessionId: string): Promise<void> {
     const child = spawnTsScript(resolve('src/dsh-runner.ts'), [
-      '--session-id', 'real-profile-test', '--dsh-bin', dshBin, '--cwd', root,
-    ], { cwd: resolve('.'), env, stdio: 'pipe' });
+      '--session-id', sessionId, '--dsh-bin', dshBin, '--cwd', root,
+    ], { cwd: resolve('.'), env: { ...env, DSH_HOME: home }, stdio: 'pipe' });
     let stdout = '';
     let stderr = '';
     let submitted = false;
@@ -131,7 +142,6 @@ describe.skipIf(!modules)('real DSH profile model selection', () => {
         child.once('exit', code => reject(new Error(`real DSH exited ${code}\n${stderr}`)));
       });
       expect(final.content).toBe('PROFILE_OK');
-      expect(calls).toEqual([{ model: 'profile-model', path: '/v1/chat/completions', credentialMatched: true }]);
     } finally {
       clearTimeout(timer!);
       child.stdin!.end();
@@ -139,5 +149,62 @@ describe.skipIf(!modules)('real DSH profile model selection', () => {
       await exited;
       clearTimeout(killTimer);
     }
+  }
+
+  it('completes a real SDK turn using the custom route and its managed credential without an official key', async () => {
+    await completeTurn(dshHome, 'real-profile-test');
+    expect(calls).toEqual([{ model: 'profile-model', path: '/v1/chat/completions', credentialMatched: true }]);
+  });
+
+  it('uses pending legacy settings on first boot and follows the profile after migration', async () => {
+    const home = cloneHome('migration');
+    const patchPath = join(home, 'profiles', 'botmux', 'cordis.patch.yml');
+    const patch = parseDocument(readFileSync(patchPath, 'utf8'));
+    patch.delete(0); // Leave the bundle's official default in place until DSH imports the legacy selection.
+    writeFileSync(patchPath, String(patch));
+    writeFileSync(join(home, 'settings.yaml'), 'agent-default-model:\n  provider: flatkey\n  model: profile-model\n');
+
+    await completeTurn(home, 'before-migration');
+    expect(existsSync(join(home, 'settings.yaml'))).toBe(false);
+    expect(existsSync(join(home, 'settings.yaml.imported'))).toBe(true);
+    expect(calls).toEqual([{ model: 'profile-model', path: '/v1/chat/completions', credentialMatched: true }]);
+
+    const migrated = parseDocument(readFileSync(patchPath, 'utf8'));
+    migrated.add({ id: 'agent-default-model', config: { provider: 'flatkey', model: 'overlay-model' } });
+    writeFileSync(patchPath, String(migrated));
+    await completeTurn(home, 'after-migration');
+    expect(calls.at(-1)).toEqual({ model: 'overlay-model', path: '/v1/chat/completions', credentialMatched: true });
+  });
+
+  it('uses a default model nested in a real bundle group for configuration and an SDK turn', async () => {
+    const home = cloneHome('grouped');
+    const profile = join(home, 'profiles', 'botmux');
+    const runtimeModules = resolve(modules!);
+    unlinkSync(join(profile, 'node_modules')); // Replace only the fixture's symlink; never modify shared dependencies.
+    const bundle = join(profile, 'node_modules', 'grouped-base');
+    mkdirSync(bundle, { recursive: true });
+    symlinkSync(join(runtimeModules, '@deepseek-ai'), join(profile, 'node_modules', '@deepseek-ai'), 'dir');
+    writeFileSync(join(bundle, 'package.json'), JSON.stringify({
+      name: 'grouped-base', version: '0.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }));
+    const base = parseDocument(readFileSync(join(runtimeModules, '@deepseek-ai/dsh-base/cordis.patch.yml'), 'utf8'), {
+      customTags: [{ tag: 'tag:yaml.org,2002:js', resolve: (value: string) => value }],
+    });
+    const rows = base.getIn([0, 'insert'], true) as YAMLSeq;
+    const index = rows.items.findIndex(row => isMap(row) && row.get('id') === 'agent-default-model');
+    expect(index).toBeGreaterThanOrEqual(0);
+    base.setIn([0, 'insert', index], {
+      id: 'model-group', name: 'cordis:group', group: true, config: [rows.items[index]],
+    });
+    writeFileSync(join(bundle, 'cordis.patch.yml'), String(base));
+    const pkgPath = join(profile, 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg.dsh.profile.bundles = ['grouped-base', '@deepseek-ai/dsh-sdk-app'];
+    writeFileSync(pkgPath, JSON.stringify(pkg));
+
+    expect(resolveDshModel({ dshBin, launchArgs: ['--profile', 'botmux'], cwd: root, env: { ...env, DSH_HOME: home }, dshHome: home }))
+      .toMatchObject({ provider: 'flatkey', model: 'profile-model' });
+    await completeTurn(home, 'grouped-profile-test');
+    expect(calls).toEqual([{ model: 'profile-model', path: '/v1/chat/completions', credentialMatched: true }]);
   });
 });

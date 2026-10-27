@@ -685,14 +685,14 @@ agent-default-model:
     });
   });
 
-  it.each([undefined, 'explicit-model'])('prefers the composed profile over old settings with model override %s', async model => {
+  it.each([undefined, 'explicit-model'])('preserves pending legacy settings with model override %s', async model => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
     writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
     h = spawnRunner('happy', model ? ['--model', model] : [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
     await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
 
     expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
-      provider: 'flatkey', model: model ?? 'deepseek-v4-1-flash-1017',
+      provider: 'super-relay', model: model ?? 'model_hub/es1_orange_o48',
     });
   });
 
@@ -717,26 +717,79 @@ agent-default-model:
     });
   });
 
-  it.each(['0.1.1-rc.1', '0.1.6', '0.1.7-alpha.0'])('retains legacy settings precedence for DSH %s', async version => {
+  it('uses profile fields that are absent from pending legacy settings', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
-    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
-    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: version }, home);
+    writeNativeDshConfig(home, 'agent-default-model:\n  model: saved-model\n');
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
     await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
 
     expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
-      provider: 'super-relay', model: 'model_hub/es1_orange_o48',
+      provider: 'flatkey', model: 'saved-model',
     });
   });
 
-  it('uses profile settings at the migration release boundary', async () => {
+  it.each(['', 'null'])('uses profile settings when the legacy document is empty (%j)', async settings => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
-    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
-    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: '0.1.7-alpha.1' }, home);
-    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
-
+    writeNativeDshConfig(home, settings);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›') || h!.child.exitCode !== null, { label: 'configuration result' });
     expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
       provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
     });
+  });
+
+  it.each(['group: true', 'name: cordis:group', 'name: "@deepseek-ai/cordis-plugin-group"'])('reads default model settings through nested groups (%s)', async group => {
+    const config = `
+- id: outer-group
+  ${group}
+  config:
+    - id: inner-group
+      group: true
+      config:
+        - id: agent-default-model
+          config:
+            provider: nested-provider
+            model: nested-model
+- id: unrelated-plugin
+  config:
+    - id: agent-default-model
+      config:
+        provider: not-a-plugin-entry
+        model: not-a-model
+- id: empty-group
+  name: cordis:group
+`;
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: config });
+    await waitFor(() => h!.stdout.includes('›') || h!.child.exitCode !== null, { label: 'configuration result' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'nested-provider', model: 'nested-model',
+    });
+  });
+
+  it.each(['true', '!!js process.env.DISABLED'])('rejects a default model inside a group with disabled=%s', async disabled => {
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: `
+- id: model-group
+  group: true
+  disabled: ${disabled}
+  config:
+${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
+` });
+    await waitFor(() => h!.child.exitCode !== null || h!.stdout.includes('›'), { label: 'group configuration result' });
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
+  });
+
+  it('rejects duplicate default models across group boundaries', async () => {
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: `${PROFILE_MODEL}
+- id: model-group
+  group: true
+  config:
+${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
+` });
+    await waitFor(() => h!.child.exitCode !== null || h!.stdout.includes('›'), { label: 'duplicate configuration result' });
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
   });
 
   it.each([
@@ -752,7 +805,6 @@ agent-default-model:
     { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: true\n  name:') },
     { FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: !!js process.env.DISABLED\n  name:') },
     { FAKE_DSH_CONFIG: PROFILE_MODEL + PROFILE_MODEL },
-    { FAKE_DSH_CONFIG: PROFILE_MODEL, FAKE_DSH_VERSION: 'unknown' },
   ])('fails before SDK initialization when the profile cannot be resolved: %j', async env => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
     writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
