@@ -58,6 +58,22 @@ describe('normalizeTraexAutoModelConfig', () => {
     expect(resolveTraexAutoModelSettings(parsed.config!, 'model-49', { reasoningEffort: 'high', modelBackendVariant: 'max' })).toEqual({});
     expect(normalizeTraexAutoModelConfig({ enabled: true, models, modelSettings: { outside: {} } }).error).toContain('invalid model entry');
   });
+  it('round-trips a normal settings snapshot outside the pool without changing runtime policy', () => {
+    const config = { enabled: true as const, models: ['pool-model'], queueTimeoutMs: 30_000 };
+    const previousSettings = { model: 'normal-model', reasoningEffort: 'xhigh', modelBackendVariant: 'standard' };
+    const parsed = normalizeTraexAutoModelConfig({ ...config, previousSettings: { ...previousSettings, model: ' normal-model ' } });
+    expect(parsed.config?.previousSettings).toEqual(previousSettings);
+    expect(traexAutoModelPolicyKey(parsed.config!)).toBe(traexAutoModelPolicyKey(config));
+    const controller = new TraexAutoModelController(config);
+    expect(validTraexAutoModelRuntime(parsed.config!, controller.runtimeState('native'), 'native')).toBe(true);
+    expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: {} }).config?.previousSettings).toEqual({});
+    expect(normalizeTraexAutoModelConfig({ ...config, previousSettings: { model: ' ' } }).config?.previousSettings).toEqual({});
+  });
+  it.each([[null], [[]], ['model'], [{ model: 1 }], [{ model: ' AUTO ' }], [{ model: 'x'.repeat(257) }],
+    [{ reasoningEffort: 'typo' }], [{ modelBackendVariant: 'giant' }],
+  ])('rejects invalid normal settings snapshots (%j)', previousSettings => {
+    expect(normalizeTraexAutoModelConfig({ enabled: true, models: ['m1'], previousSettings }).error).toContain('previousSettings');
+  });
 });
 
 describe('TraexAutoModelController', () => {

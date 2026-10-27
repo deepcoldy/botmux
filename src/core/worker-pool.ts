@@ -763,6 +763,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
@@ -16664,6 +16665,14 @@ function setupWorkerHandlers(
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        // 恢复健康即清零崩溃重启计数：计数只描述「连续失败」。CLI 真的跑到
+        // 了可输入 prompt，说明此前那些崩溃并不构成持续的确定性故障——此前若
+        // 有一次历史性永久退出（127/77）留在计数里，不清掉的话这条会话此后任何
+        // 一次永久退出都会立即放弃自动重启（实测隔 90 天仍如此）。见
+        // restart-policy 的「恢复健康即清零」约定。
+        if (restartCounts.delete(ds.session.sessionId)) {
+          logger.info(`[${t}] Cleared crash-restart streak after a successful ready`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -18006,18 +18015,25 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Rate-limit auto-restart to prevent crash loops
+        // Rate-limit auto-restart to prevent crash loops. 判定纳入退出码语义：
+        // 永久失败（身份 77/命令缺失 127）只给一次重启且不被 60s 时间窗豁免，
+        // 避免慢启动 CLI 的确定性失败无限静默重启（见 restart-policy）。
         const key = ds.session.sessionId;
-        const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
-        const now = Date.now();
-        if (now - rc.lastAt > 60_000) rc.count = 0; // reset after 1 min
-        rc.count++;
-        rc.lastAt = now;
-        restartCounts.set(key, rc);
-
-        if (rc.count > 3) {
+        const decision = decideAutoRestart({
+          prev: restartCounts.get(key),
+          now: Date.now(),
+          code: msg.code,
+        });
+        if (decision.shouldRestart) {
+          restartCounts.set(key, decision.next);
+        } else {
+          const rc = decision.next;
+          restartCounts.set(key, rc);
           ds.managedTurnOrigin = undefined;
-          logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
+          const reasonText = decision.reason === 'permanent_exit'
+            ? `exited with permanent code ${msg.code ?? '?'} after ${rc.count} attempt(s)`
+            : `crashed ${rc.count} times in 1 min`;
+          logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} ${reasonText}, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working"
           // forever. Backends without a Web Terminal pass an empty read URL;
@@ -18076,7 +18092,11 @@ function setupWorkerHandlers(
             killWorker(ds);
           }
           const cliName = sessionCliDisplayName(ds, botCfg);
-          const parts = [tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
+          // 卡片文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃
+          // 可能相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
+          const parts = [decision.reason === 'permanent_exit'
+            ? tr('worker.crash_permanent_exit_stopped', { cliName, code: msg.code ?? '?' }, loc)
+            : tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
           if (keepDiagnosticWorker) {
             parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
           }

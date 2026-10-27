@@ -68,6 +68,7 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 - 默认开启（未配置或显式开启）。已接入的会话恢复或重启时重新评估配置。
 - 当关闭该配置并重启（`/restart`）或恢复时，自动清理会话目录下的 `lark-tool-binding.json`、`lark-config/` 及托管包装脚本 `binDir/lark-cli`，且不会误伤 `triggerUserAuth` 包装脚本（如 `bytedcli` 或 trigger-user `lark-cli`）或其它文件。
+- 绑定入口与 `triggerUserAuth` 包装脚本共用同一个 `binDir`，绑定会话不论是否开启按触发人鉴权都会把它放到 PATH 最前面。因此 `triggerUserAuth` 关闭（或不再覆盖某个工具）时，该工具的 trigger-user 包装脚本必须移除，否则它会继续拦截调用，而 daemon 已不再发布身份，每次调用都被拒绝：worker 每次 spawn 时按当时的配置移除，只移除带 trigger-user 包装脚本标记的文件。与 `triggerUserAuth` 的「下个会话生效」一致，关闭或重新开启都只对之后 spawn 的 worker 生效（新会话、`/restart`、daemon 重启）；运行中的 worker 保持它启动时的包装，不在运行中删除，避免运行中再打开时包装已经不在、工具静默以本机登录态执行。
 - 远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话不使用应用绑定。
 - Linux 本机受管会话的 user 调用须通过当前执行的进程证明，覆盖标准 PTY/Tmux 与托管 RPC（如 Codex）。macOS 保留应用绑定和当前用户解析，不提供旧后台进程跨轮隔离保证。
 

@@ -1627,6 +1627,10 @@ export interface ScheduledTask {
   lastRunId?: string;
   lastError?: string;
   lastDeliveryError?: string;
+  /** 连续失败次数：成功归零。用于在阈值处发一次告警，避免周期任务永久静默失败。 */
+  consecutiveFailures?: number;
+  /** 是否已就当前这串连续失败发过告警（成功恢复后清零，允许下次再报）。 */
+  failureAlertSent?: boolean;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
   /** Delivery target:

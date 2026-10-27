@@ -1,4 +1,6 @@
-/** Representative Cobra help grammar, including value flags and local commands. */
+/** Representative Cobra help grammar, including value flags and local commands.
+ * A managed binding writes a config with no logged-in profiles, so the native
+ * CLI prints --profile only on root and omits Global Flags on every child. */
 const root = `Usage:
   lark-cli [command]
 Available Commands:
@@ -24,16 +26,12 @@ Available Commands:
 ${commands.map(c => `  ${c}      command`).join('\n')}
 Flags:
   -h, --help   help
-Global Flags:
-      --profile string   profile
 `;
 const leaf = (command: string, flags: string) => `Usage:
   lark-cli ${command} [flags]
 Flags:
 ${flags}
   -h, --help   help
-Global Flags:
-      --profile string   profile
 `;
 export const LARK_TOOL_HELP: Record<string, string> = {
   '': root,

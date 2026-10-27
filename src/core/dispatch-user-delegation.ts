@@ -11,6 +11,10 @@ import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 export const DISPATCH_USER_DELIVERY_ROUTE = '/api/dispatch-user/deliver';
 export const SCHEDULE_DELEGATED_ADD_ROUTE = '/api/schedule/delegated-add';
 export const SCHEDULE_MANAGED_MUTATE_ROUTE = '/api/schedule/managed-mutate';
+/** `botmux send --mention <bot on this machine>`: the CLI writes the message
+ *  itself, so the daemon signs the delegation in two steps around that write. */
+export const DISPATCH_USER_MENTION_PREPARE_ROUTE = '/api/dispatch-user/mention-prepare';
+export const DISPATCH_USER_MENTION_BIND_ROUTE = '/api/dispatch-user/mention-bind';
 /** Limit the complete UTF-8 JSON request, including routing and encoded brief. */
 export const DISPATCH_USER_DELIVERY_MAX_BYTES = 64 * 1024;
 const identity = (prefix: string) => z.string().regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{1,128}$`));
@@ -42,7 +46,11 @@ const payloadBase = {
   sourceAppId: identity('cli_'),
   sourceSessionId: z.string().min(1).max(256),
   sourceTurnId: z.string().min(1).max(256),
-  rootId: identity('om_'),
+  /** Thread the dispatched message is posted into. Absent on a
+   *  `botmux send --mention` handoff: that message may land at the chat's top
+   *  level, quoted or in a thread, so the record is pinned to the exact message
+   *  id instead, after the daemon verified this bot posted it into `chatId`. */
+  rootId: identity('om_').optional(),
   chatId: identity('oc_'),
   targetAppIds: z.array(identity('cli_')).min(1).max(64),
   issuedAt: z.number().int().nonnegative(),
@@ -163,41 +171,88 @@ function readStore(dataDir: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+type DispatchUserPayloadInput = Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'>;
+
 /** Register before sending; the receiver may observe the event before send resolves.
  * A pending record grants nothing. It only lets that receiver wait for the exact
  * message-id binding. Crash/timeout remains a refusal, never a root-wide grant. */
+export async function registerPendingDispatchUser(input: {
+  dataDir: string;
+  secret: string;
+  payload: DispatchUserPayloadInput;
+}): Promise<SignedDispatchUser> {
+  const v2 = scheduleCreateCapabilities(input.payload.authority).length > 0;
+  const pending = signDispatchUser(input.secret, {
+    sourceAppId: input.payload.sourceAppId, sourceSessionId: input.payload.sourceSessionId,
+    sourceTurnId: input.payload.sourceTurnId,
+    ...(input.payload.rootId ? { rootId: input.payload.rootId } : {}),
+    chatId: input.payload.chatId,
+    targetAppIds: input.payload.targetAppIds, authority: input.payload.authority,
+    domain: v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
+    deliveryId: randomUUID(), issuedAt: Date.now(),
+  } as DispatchUserPayload);
+  await updateDispatchRegistry(dispatchUserStorePath(input.dataDir), store => {
+    store[`pending:${pending.payload.deliveryId}`] = pending;
+  });
+  return pending;
+}
+
+/** The still-unbound registration for `deliveryId`, verified. */
+export function readPendingDispatchUser(dataDir: string, secret: string, deliveryId: string): DispatchUserPayload | undefined {
+  const payload = verifyDispatchUser(secret, readStore(dataDir)[`pending:${deliveryId}`]);
+  return payload && payload.deliveryId === deliveryId && !payload.messageId ? payload : undefined;
+}
+
+/** Bind a registration to the message it was sent as. Throws when the message
+ * id already carries a record or the registration is gone. */
+export async function bindPendingDispatchUser(input: {
+  dataDir: string;
+  secret: string;
+  deliveryId: string;
+  messageId: string;
+}): Promise<DispatchUserPayload> {
+  const key = `pending:${input.deliveryId}`;
+  let bound: DispatchUserPayload | undefined;
+  await updateDispatchRegistry(dispatchUserStorePath(input.dataDir), store => {
+    const pending = verifyDispatchUser(input.secret, store[key]);
+    if (!pending || pending.deliveryId !== input.deliveryId || pending.messageId) {
+      throw new Error('dispatch registration is missing or already bound');
+    }
+    if (store[input.messageId] !== undefined) throw new Error('duplicate dispatch message identity');
+    const completed = signDispatchUser(input.secret, { ...pending, messageId: input.messageId });
+    store[input.messageId] = completed;
+    delete store[key];
+    bound = completed.payload;
+  });
+  return bound!;
+}
+
+export async function dropPendingDispatchUser(dataDir: string, deliveryId: string): Promise<void> {
+  await updateDispatchRegistry(dispatchUserStorePath(dataDir), store => { delete store[`pending:${deliveryId}`]; });
+}
+
 export async function deliverDispatchWithUser(input: {
   dataDir: string;
   secret: string;
-  payload: Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'>;
+  payload: DispatchUserPayloadInput;
   send: () => Promise<string>;
 }): Promise<string> {
-  const capabilities = scheduleCreateCapabilities(input.payload.authority);
-  const v2 = capabilities.length > 0;
-  const issuedAt = Date.now();
-  const pending = signDispatchUser(input.secret, {
-    sourceAppId: input.payload.sourceAppId, sourceSessionId: input.payload.sourceSessionId,
-    sourceTurnId: input.payload.sourceTurnId, rootId: input.payload.rootId, chatId: input.payload.chatId,
-    targetAppIds: input.payload.targetAppIds, authority: input.payload.authority,
-    domain: v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
-    deliveryId: randomUUID(), issuedAt,
-  } as DispatchUserPayload);
-  const key = `pending:${pending.payload.deliveryId}`;
-  const path = dispatchUserStorePath(input.dataDir);
-  await updateDispatchRegistry(path, store => { store[key] = pending; });
+  const pending = await registerPendingDispatchUser(input);
+  const deliveryId = pending.payload.deliveryId;
+  let messageId: string;
   try {
-    const messageId = await input.send();
-    const completed = signDispatchUser(input.secret, { ...pending.payload, messageId });
-    await updateDispatchRegistry(path, store => {
-      if (store[messageId] !== undefined) throw new Error('duplicate dispatch message identity');
-      store[messageId] = completed;
-      delete store[key];
-    });
-    return messageId;
+    messageId = await input.send();
   } catch (error) {
-    await updateDispatchRegistry(path, store => { delete store[key]; });
+    await dropPendingDispatchUser(input.dataDir, deliveryId);
     throw error;
   }
+  try {
+    await bindPendingDispatchUser({ dataDir: input.dataDir, secret: input.secret, deliveryId, messageId });
+  } catch (error) {
+    await dropPendingDispatchUser(input.dataDir, deliveryId);
+    throw error;
+  }
+  return messageId;
 }
 
 export async function resolveDispatchUser(input: {
@@ -209,19 +264,72 @@ export async function resolveDispatchUser(input: {
   turnId: string;
   waitMs?: number;
 }): Promise<DispatchUserPayload | undefined> {
-  if (!input.rootId) return;
   const deadline = Date.now() + (input.waitMs ?? 5000);
-  const matches = (p: DispatchUserPayload): boolean => p.rootId === input.rootId
-    && p.chatId === input.chatId && p.targetAppIds.includes(input.appId);
+  const addressed = (p: DispatchUserPayload): boolean => p.chatId === input.chatId
+    && p.targetAppIds.includes(input.appId);
+  // A dispatch record names its thread. A --mention handoff record has none:
+  // it is pinned to one exact message whose author and chat were verified
+  // before binding, so it applies to that message wherever it landed.
+  const rootMatches = (p: DispatchUserPayload): boolean => p.rootId === undefined
+    || p.rootId === input.rootId;
   do {
     const store = readStore(input.dataDir);
     const exact = verifyDispatchUser(input.secret, store[input.turnId]);
-    if (exact && exact.messageId === input.turnId && matches(exact)) return exact;
+    if (exact && exact.messageId === input.turnId && addressed(exact) && rootMatches(exact)) return exact;
     const pending = Object.entries(store).some(([key, raw]) => {
       const p = key.startsWith('pending:') ? verifyDispatchUser(input.secret, raw) : undefined;
-      return p && !p.messageId && matches(p) && Date.now() - p.issuedAt < 30_000;
+      return p && !p.messageId && addressed(p)
+        && (p.rootId === undefined || p.rootId === input.rootId)
+        && Date.now() - p.issuedAt < 30_000;
     });
     if (!pending || Date.now() >= deadline) return;
     await delay(25);
   } while (Date.now() <= deadline);
+}
+
+/**
+ * Whether a message the CLI reports as its handoff is really that handoff:
+ * posted by this bot, into the registered chat, after the registration. Without this a registration could be bound to some other
+ * message — e.g. another bot's message to the same target, whose turn would
+ * then run with this turn's human.
+ */
+export function handoffMessageMatches(detail: unknown, expected: {
+  messageId: string;
+  appId: string;
+  chatId: string;
+  issuedAt: number;
+}): boolean {
+  const record = detail as { items?: unknown[] } | null | undefined;
+  const item = (Array.isArray(record?.items) ? record!.items[0] : undefined) as {
+    message_id?: unknown; chat_id?: unknown; create_time?: unknown;
+    sender?: { id?: unknown; id_type?: unknown; sender_type?: unknown };
+  } | undefined;
+  if (!item || item.message_id !== expected.messageId || item.chat_id !== expected.chatId) return false;
+  // Lark stamps a bot's message 'app' or (seen on cross-bot cards) 'bot'; the
+  // identity claim is the app id either way.
+  const sender = item.sender;
+  if (!sender || (sender.sender_type !== 'app' && sender.sender_type !== 'bot')
+    || sender.id !== expected.appId
+    || (sender.id_type !== undefined && sender.id_type !== 'app_id')) return false;
+  const created = Number(item.create_time);
+  // Lark stamps create_time in ms; allow the two clocks a minute of skew.
+  return Number.isFinite(created) && created >= expected.issuedAt - 60_000;
+}
+
+/** Fetch the handoff message for {@link handoffMessageMatches}. A message read
+ *  right after the send can briefly be unreadable; retry a provider failure a
+ *  couple of times (well inside the receiver's 5 s wait) before giving up. A
+ *  message that IS returned is never re-read: a mismatch is final. */
+export async function readHandoffMessage<T>(
+  read: () => Promise<T>,
+  options: { attempts?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<T> {
+  const attempts = options.attempts ?? 3;
+  const sleep = options.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await sleep(options.intervalMs ?? 200);
+    try { return await read(); } catch (error) { lastError = error; }
+  }
+  throw lastError;
 }

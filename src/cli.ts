@@ -291,7 +291,7 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
-import { DISPATCH_USER_DELIVERY_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
@@ -339,6 +339,7 @@ import {
   hasKnownBotMention,
   knownBotOpenIdsFromCrossRef,
   loadBotMentionIdentityMap,
+  mentionedBotAppIds,
   orderedFooterRecipients,
 } from './utils/bot-routing.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -12709,22 +12710,76 @@ async function cmdSend(rest: string[]): Promise<void> {
     return result.messageId;
   };
   let turnPrimaryReplayed = false;
+  // A --mention handoff to a bot on this machine carries this turn's sender to
+  // it, as `botmux dispatch` does: the daemon decides who that human is and
+  // signs the delegation for the exact message; this process only names the
+  // target bots. Best effort by design — any refusal or failure leaves the
+  // message exactly as it would have been, its receiver just has no sender.
+  // Computed when the primary message is about to leave, not here: prose
+  // `@Bot` mentions are resolved into `mentions` further down, and a bot woken
+  // that way is just as much a handoff target as an explicit --mention.
+  let handoffOriginClaim: ReturnType<typeof freezeDispatchOriginClaim> = null;
+  const prepareMentionHandoff = async (): Promise<string | undefined> => {
+    const handoffTargetAppIds = !noMention && !remoteRunnerOutbound
+      ? mentionedBotAppIds(mentions, botEntries, crossRef, appId)
+      : [];
+    if (handoffTargetAppIds.length === 0) return undefined;
+    handoffOriginClaim = freezeDispatchOriginClaim(sid);
+    try {
+      const response = await postCurrentSessionDaemonRoute({
+        path: DISPATCH_USER_MENTION_PREPARE_ROUTE, sessionId: sid, larkAppId: appId, originClaim: handoffOriginClaim,
+        body: { chatId: targetChatId, targetAppIds: handoffTargetAppIds },
+      });
+      const result: any = await response.json().catch(() => null);
+      return response.ok && result?.ok === true && result.delegated === true && typeof result.deliveryId === 'string'
+        ? result.deliveryId
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const bindMentionHandoff = async (deliveryId: string | undefined, messageId: string | undefined): Promise<void> => {
+    if (!deliveryId) return;
+    let error: string | undefined;
+    try {
+      const response = await postCurrentSessionDaemonRoute({
+        path: DISPATCH_USER_MENTION_BIND_ROUTE, sessionId: sid, larkAppId: appId, originClaim: handoffOriginClaim,
+        body: { deliveryId, ...(messageId ? { messageId } : {}) },
+      });
+      if (!response.ok) error = String(((await response.json().catch(() => null)) as any)?.error ?? response.status);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    if (messageId && error) {
+      console.error(`ℹ️ 消息已发出，但没能把本轮发起人的身份交给被 @ 的 Bot（${error}）；它这一轮按没有发起人处理。`);
+    }
+  };
   const dispatchPrimary = async (
     primaryContent: string,
     msgType: string,
     originAlreadyRevalidated = false,
     uuid?: string,
   ): Promise<string> => {
-    const result = await executeTurnPrimary(
-      turnRequestIdentity,
-      providerUuid => dispatchPrimaryUnlocked(
-        primaryContent,
-        msgType,
-        originAlreadyRevalidated,
-        uuid ?? providerUuid,
-      ),
-    );
+    const handoffDeliveryId = await prepareMentionHandoff();
+    let result: Awaited<ReturnType<typeof executeTurnPrimary>>;
+    try {
+      result = await executeTurnPrimary(
+        turnRequestIdentity,
+        providerUuid => dispatchPrimaryUnlocked(
+          primaryContent,
+          msgType,
+          originAlreadyRevalidated,
+          uuid ?? providerUuid,
+        ),
+      );
+    } catch (error) {
+      await bindMentionHandoff(handoffDeliveryId, undefined);
+      throw error;
+    }
     turnPrimaryReplayed ||= result.replayed;
+    // A replayed primary was sent (and bound) by the concurrent attempt that
+    // won; this registration has nothing of its own to bind, so withdraw it.
+    await bindMentionHandoff(handoffDeliveryId, result.replayed ? undefined : result.messageId);
     return result.messageId;
   };
 

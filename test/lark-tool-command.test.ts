@@ -73,4 +73,36 @@ describe('lark-cli argv metadata', () => {
     expect(invocation.args).toEqual(['docs', '+fetch', '--doc', 'doc-1']);
     expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--as', 'bot']);
   });
+  it.each([
+    [['docs', '--profile', 'cli_current', '+fetch', '--doc', 'doc-1'], ['docs', '+fetch', '--doc', 'doc-1']],
+    [['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_current'], ['docs', '+fetch', '--doc', 'doc-1']],
+    [['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_current', '--dry-run'], ['docs', '+fetch', '--doc', 'doc-1', '--dry-run']],
+    [['docs', '+fetch', '--profile=cli_current', '--doc', 'doc-1'], ['docs', '+fetch', '--doc', 'doc-1']],
+  ])('accepts the bound app --profile at group or leaf position under bound help metadata: %s', (input, stripped) => {
+    const invocation = parse(input);
+    expect(invocation.passthroughProfile).toBeUndefined();
+    expect(invocation.args).toEqual(stripped);
+    expect(larkToolExecutionArgs(invocation)).toEqual([...stripped, '--as', 'bot']);
+  });
+  it.each([
+    ['docs', '--profile', 'cli_other', '+fetch', '--doc', 'doc-1'],
+    ['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other'],
+    ['docs', '+fetch', '--doc', 'doc-1', '--profile=cli_other'],
+    ['docs', '+fetch', '--profile=cli_other', '--doc', 'doc-1', '--dry-run'],
+  ])('passes a foreign --profile through at group or leaf position: %s', (...args) => {
+    const invocation = parse(args);
+    expect(invocation.passthroughProfile).toBe('cli_other');
+    expect(invocation.args).toEqual(args);
+    expect(larkToolExecutionArgs(invocation)).toEqual(args);
+  });
+  it('keeps an explicit --as user alongside a trailing foreign profile', () => {
+    const invocation = parse(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as=user']);
+    expect(invocation.passthroughProfile).toBe('cli_other');
+    expect(invocation.mode).toBe('user');
+    expect(larkToolExecutionArgs(invocation)).toEqual(['docs', '+fetch', '--doc', 'doc-1', '--profile', 'cli_other', '--as', 'user']);
+  });
+  it('does not inherit root-local help/version flags onto a leaf', () => {
+    expect(() => parse(['docs', '+fetch', '--version'])).toThrow('Unknown lark-cli flag');
+    expect(() => parse(['docs', '+fetch', '-v'])).toThrow('Unknown lark-cli flag');
+  });
 });

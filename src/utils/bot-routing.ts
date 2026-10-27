@@ -104,6 +104,42 @@ export function knownBotOpenIdsFromCrossRef(
   return out;
 }
 
+/**
+ * App ids of the known bots among `mentions` (self excluded), resolved by
+ * open_id only: `crossRef` maps a bot's name to the open_id THIS app sees it
+ * as, and an entry's own `botOpenId` covers the rest. A name in a mention is
+ * never trusted for this — it is just display text. The daemon still checks
+ * each id against the bots configured on this machine before using it.
+ */
+export function mentionedBotAppIds(
+  mentions: readonly OutgoingMention[],
+  entries: readonly BotMentionEntry[],
+  crossRef: Readonly<Record<string, string>>,
+  selfAppId: string,
+): string[] {
+  // A name two bots share cannot say which one the open_id belongs to.
+  const appIdByName = new Map<string, string | null>();
+  for (const entry of entries) {
+    if (!entry.botName) continue;
+    const seen = appIdByName.get(entry.botName);
+    appIdByName.set(entry.botName, seen === undefined || seen === entry.larkAppId ? entry.larkAppId : null);
+  }
+  const appIdByOpenId = new Map<string, string>();
+  for (const [name, openId] of Object.entries(crossRef)) {
+    const appId = appIdByName.get(name);
+    if (openId && appId) appIdByOpenId.set(openId, appId);
+  }
+  for (const entry of entries) {
+    if (entry.botOpenId && !appIdByOpenId.has(entry.botOpenId)) appIdByOpenId.set(entry.botOpenId, entry.larkAppId);
+  }
+  const out = new Set<string>();
+  for (const mention of mentions) {
+    const appId = appIdByOpenId.get(mention.open_id);
+    if (appId && appId !== selfAppId) out.add(appId);
+  }
+  return [...out];
+}
+
 export function hasKnownBotMention(
   _text: string,
   mentions: OutgoingMention[],
